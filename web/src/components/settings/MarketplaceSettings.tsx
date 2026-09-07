@@ -43,6 +43,12 @@ const TYPE_ICON: Record<string, string> = {
 
 const TYPE_ORDER = ["connector", "skill", "expert"];
 
+/** Module-level SWR cache: re-opening the Extensions page (or the settings
+ * tab) renders the last catalog instantly while a fresh fetch runs in the
+ * background. Mutating actions already call load(), so installed state stays
+ * fresh; a full page reload drops it (the gateway round trip is fast). */
+let cachedCatalog: CatalogResponse | null = null;
+
 /** Fetch + install + enable cloud/BYOA connectors from the marketplace catalog
  * (P1-4 / P2-8). Cloud entries are metered (`credits_per_use`) and routed
  * through the cloud relay once enabled; BYOA entries are local and free.
@@ -58,7 +64,7 @@ export function MarketplaceSettings({
   initialType?: string;
   onSummonExpert?: (agentId: string) => void;
 }) {
-  const [data, setData] = useState<CatalogResponse | null>(null);
+  const [data, setData] = useState<CatalogResponse | null>(cachedCatalog);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -73,6 +79,7 @@ export function MarketplaceSettings({
       const body = (await transport.getConnectorsCatalog()) as CatalogResponse;
       if ((body as { error?: string }).error) throw new Error((body as { error?: string }).error);
       setData(body);
+      cachedCatalog = body;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

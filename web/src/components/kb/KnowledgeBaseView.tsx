@@ -121,6 +121,38 @@ function resultSummary(r: PushResult | PullResult, verb: string): string {
 const isUrlSource = (sourceId: string) => /^https?:\/\//i.test(sourceId);
 const basename = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
+/** Module-level SWR snapshot: re-opening the KB page renders the last data
+ * instantly while the refresh (several local requests plus cloud round
+ * trips) runs in the background. Mutating actions already call load(), so
+ * freshness after upload/delete/push/pull is preserved by those calls. View
+ * state (panel, upload dialog, selection) is intentionally not cached. */
+interface KbSnapshot {
+  configured: boolean | null;
+  reason: string | null;
+  collections: CollectionSummary[];
+  rows: DocRow[];
+  cloudSt: CloudStatus | null;
+  cloudKbs: CloudKb[];
+  cloudFiles: Record<string, Set<string>>;
+  cloudLoaded: boolean;
+}
+
+const KB_EMPTY_SNAPSHOT: KbSnapshot = {
+  configured: null,
+  reason: null,
+  collections: [],
+  rows: [],
+  cloudSt: null,
+  cloudKbs: [],
+  cloudFiles: {},
+  cloudLoaded: false,
+};
+
+let kbCache: KbSnapshot | null = null;
+const cacheKb = (patch: Partial<KbSnapshot>) => {
+  kbCache = { ...(kbCache ?? KB_EMPTY_SNAPSHOT), ...patch };
+};
+
 /** Per-document cloud backup state, derived from the cloud KB's file list. */
 type BackupState =
   | { kind: "backed-up" }
@@ -138,24 +170,26 @@ type BackupState =
  * cloud is storage only — indexing/retrieval stays local.
  */
 export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
-  const [configured, setConfigured] = useState<boolean | null>(null);
-  const [reason, setReason] = useState<string | null>(null);
-  const [collections, setCollections] = useState<CollectionSummary[]>([]);
-  const [rows, setRows] = useState<DocRow[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [configured, setConfigured] = useState<boolean | null>(kbCache?.configured ?? null);
+  const [reason, setReason] = useState<string | null>(kbCache?.reason ?? null);
+  const [collections, setCollections] = useState<CollectionSummary[]>(kbCache?.collections ?? []);
+  const [rows, setRows] = useState<DocRow[]>(kbCache?.rows ?? []);
+  const [loading, setLoading] = useState(!kbCache);
   const [error, setError] = useState<string | null>(null);
   const [busyDoc, setBusyDoc] = useState<string | null>(null);
   const [busyPush, setBusyPush] = useState<string | null>(null);
   const [pushNote, setPushNote] = useState<string | null>(null);
 
   // Cloud (graceful: the page works without it, backup cells show "—").
-  const [cloudSt, setCloudSt] = useState<CloudStatus | null>(null);
-  const [cloudKbs, setCloudKbs] = useState<CloudKb[]>([]);
-  const [cloudFiles, setCloudFiles] = useState<Record<string, Set<string>>>({});
+  const [cloudSt, setCloudSt] = useState<CloudStatus | null>(kbCache?.cloudSt ?? null);
+  const [cloudKbs, setCloudKbs] = useState<CloudKb[]>(kbCache?.cloudKbs ?? []);
+  const [cloudFiles, setCloudFiles] = useState<Record<string, Set<string>>>(
+    kbCache?.cloudFiles ?? {}
+  );
   // True once the per-KB file lists have loaded (or definitively failed) —
   // backup indicators stay hidden until then instead of flashing "not backed
   // up" while the check is still in flight.
-  const [cloudLoaded, setCloudLoaded] = useState(false);
+  const [cloudLoaded, setCloudLoaded] = useState(kbCache?.cloudLoaded ?? false);
   const [pullAgent, setPullAgent] = useState<Record<string, string>>({});
   const [pullNotes, setPullNotes] = useState<Record<string, string>>({});
   const pollTimer = useRef<number | null>(null);
@@ -222,11 +256,16 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     const cols = body.collections as unknown as CollectionSummary[];
     setCollections(cols);
     const results = await Promise.all(cols.map((c) => transport.listKbDocs(c.collection)));
-    setRows(
-      results.flatMap((r, i) =>
-        (r.docs as unknown as KbDoc[]).map((d) => ({ ...d, collection: cols[i].collection }))
-      )
+    const nextRows = results.flatMap((r, i) =>
+      (r.docs as unknown as KbDoc[]).map((d) => ({ ...d, collection: cols[i].collection }))
     );
+    setRows(nextRows);
+    cacheKb({
+      configured: body.configured,
+      reason: body.reason,
+      collections: cols,
+      rows: nextRows,
+    });
   }, []);
 
   // Cloud state is best-effort and slower (network round trips to Syscity
@@ -237,28 +276,33 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     try {
       st = await cloudStatus();
       setCloudSt(st);
+      cacheKb({ cloudSt: st });
     } catch {
       setCloudSt(null);
       setCloudKbs([]);
       setCloudFiles({});
       setCloudLoaded(true);
+      cacheKb({ cloudSt: null, cloudKbs: [], cloudFiles: {}, cloudLoaded: true });
       return;
     }
     if (!st.enabled || !st.logged_in) {
       setCloudKbs([]);
       setCloudFiles({});
       setCloudLoaded(true);
+      cacheKb({ cloudKbs: [], cloudFiles: {}, cloudLoaded: true });
       return;
     }
     try {
       const transport = getActiveTransport();
       if (!transport) {
         setCloudLoaded(true);
+        cacheKb({ cloudLoaded: true });
         return;
       }
       const kbBody = (await transport.cloudKbList()) as { knowledge_bases?: CloudKb[] } | undefined;
       const kbs = kbBody?.knowledge_bases ?? [];
       setCloudKbs(kbs);
+      cacheKb({ cloudKbs: kbs });
       const docLists = await Promise.all(
         kbs.map((k) =>
           transport
@@ -272,12 +316,15 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
             .catch(() => [k.name, new Set<string>()] as const)
         )
       );
-      setCloudFiles(Object.fromEntries(docLists));
+      const filesMap = Object.fromEntries(docLists);
+      setCloudFiles(filesMap);
       setCloudLoaded(true);
+      cacheKb({ cloudFiles: filesMap, cloudLoaded: true });
     } catch {
       setCloudKbs([]);
       setCloudFiles({});
       setCloudLoaded(true);
+      cacheKb({ cloudKbs: [], cloudFiles: {}, cloudLoaded: true });
     }
   }, []);
 
