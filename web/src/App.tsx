@@ -8,6 +8,7 @@ import {
   setActiveTransport,
   type ChatMessage,
 } from "@/SyscityWebSocketTransport";
+import { useTranslation } from "react-i18next";
 import { cloudSubmitToken } from "@/lib/cloud";
 import { useChatStore } from "@/stores/chatStore";
 import { Titlebar } from "@/components/chrome/Titlebar";
@@ -128,6 +129,7 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
 
 /* ── ChatApp ── */
 function ChatApp() {
+  const { t } = useTranslation("app");
   const transport = useMemo(() => new SyscityWebSocketTransport(), []);
   useEffect(() => {
     setActiveTransport(transport);
@@ -794,7 +796,7 @@ function ChatApp() {
           kbOpen
             ? { title: "Knowledge Base" }
             : marketplaceOpen
-              ? { title: "Extensions" }
+              ? { title: t("App.extensionsTitle") }
               : undefined
         }
         sessionTitle={

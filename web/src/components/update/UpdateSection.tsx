@@ -1,16 +1,17 @@
+import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { useUpdate, isTauri } from "@/hooks/useUpdate";
 import { Section } from "@/components/ui/Section";
 import { Button } from "@/components/ui/Button";
 
-const PHASE_LABEL: Record<string, string> = {
-  idle: "Idle",
-  checking: "Checking…",
-  downloading: "Downloading…",
-  verifying: "Verifying…",
-  applying: "Applying…",
-  restarting: "Restarting…",
-  error: "Failed",
+const PHASE_KEY: Record<string, string> = {
+  idle: "UpdateBanner.idle",
+  checking: "UpdateBanner.checking",
+  downloading: "UpdateBanner.downloading",
+  verifying: "UpdateBanner.verifying",
+  applying: "UpdateBanner.applying",
+  restarting: "UpdateBanner.restarting",
+  error: "UpdateBanner.error",
 };
 
 /** Row helper mirroring the existing Gateway info rows. */
@@ -28,6 +29,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
  * a "Check for updates" button, and a one-click update with progress.
  */
 export function UpdateSection() {
+  const { t } = useTranslation("update");
   const { status, progress, busy, error, message, runUpdate, checkNow } = useUpdate();
 
   const phase = progress?.phase || "idle";
@@ -35,11 +37,11 @@ export function UpdateSection() {
   const enabled = status?.enabled ?? false;
 
   return (
-    <Section title="Update">
+    <Section title={t("UpdateSection.title")}>
       <div className="space-y-2">
-        <Row label="Current Version">v{status?.current || "—"}</Row>
-        <Row label="Latest Version">
-          {status?.update_available ? `v${status.latest || "?"}` : "已是最新"}
+        <Row label={t("UpdateSection.currentVersion")}>v{status?.current || "—"}</Row>
+        <Row label={t("UpdateSection.latestVersion")}>
+          {status?.update_available ? `v${status.latest || "?"}` : t("UpdateBanner.upToDate")}
         </Row>
 
         <div className="flex flex-wrap items-center gap-2 px-3 py-2">
@@ -47,17 +49,17 @@ export function UpdateSection() {
             {active ? (
               <span className="inline-flex items-center gap-2">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                {PHASE_LABEL[phase]} {progress?.percent ?? 0}%
+                {t(PHASE_KEY[phase] ?? "UpdateBanner.idle")} {progress?.percent ?? 0}%
               </span>
             ) : isTauri() ? (
-              "Check & Update"
+              t("UpdateSection.checkAndUpdate")
             ) : (
-              "Update Now"
+              t("UpdateSection.updateNow")
             )}
           </Button>
           {!isTauri() && (
             <Button variant="ghost" onClick={() => checkNow()} disabled={!enabled || active}>
-              Check for updates
+              {t("UpdateSection.checkForUpdates")}
             </Button>
           )}
         </div>
@@ -78,12 +80,12 @@ export function UpdateSection() {
         {error && <div className="px-3 text-xs text-red-500">{error}</div>}
         {!enabled && status && (
           <div className="px-3 text-xs text-secondary">
-            Online updates are disabled in the gateway configuration.
+            {t("UpdateSection.disabledNote")}
           </div>
         )}
         {isTauri() && (
           <div className="px-3 text-[11px] text-secondary/70">
-            Desktop build — updates use the built-in Tauri updater and restart the app.
+            {t("UpdateSection.tauriNote")}
           </div>
         )}
       </div>

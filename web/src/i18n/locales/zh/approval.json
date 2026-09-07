@@ -1,1 +1,11 @@
-{}
+{
+  "ApprovalModal.title": "需要批准工具调用",
+  "ApprovalModal.by": " 由 ",
+  "ApprovalModal.denyReasonPlaceholder": "拒绝原因（可选）…",
+  "ApprovalModal.approving": "批准中…",
+  "ApprovalModal.approve": "批准",
+  "ApprovalModal.denying": "拒绝中…",
+  "ApprovalModal.deny": "拒绝",
+  "ApprovalModal.denyDots": "拒绝…",
+  "ApprovalModal.later": "稍后"
+}

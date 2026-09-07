@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Cloud, X } from "lucide-react";
 
 const HINT_KEY = "syscity_cloud_enabled_hint";
@@ -11,6 +12,7 @@ const HINT_KEY = "syscity_cloud_enabled_hint";
  * it reappears only after another login.
  */
 export function CloudEnabledBanner() {
+  const { t } = useTranslation("update");
   const [visible, setVisible] = useState(() => {
     try {
       return localStorage.getItem(HINT_KEY) === "1";
@@ -25,11 +27,7 @@ export function CloudEnabledBanner() {
     <div className="shrink-0 px-4 py-2.5 border-b border-subtle bg-primary-50 dark:bg-primary-900/20 flex items-start gap-3">
       <Cloud className="w-4 h-4 text-primary-500 shrink-0 mt-0.5" />
       <div className="text-xs text-primary flex-1 min-w-0 leading-relaxed">
-        <span className="font-semibold">Cloud enabled</span> — cloud models and
-        web search are available automatically. Browse the full catalog in
-        Settings → Extensions (incl. cloud procurement connectors); view
-        credits/usage under Cloud. Knowledge-base documents can be uploaded
-        from the cloud console or in chat via{" "}
+        {t("CloudEnabledBanner.body")}{" "}
         <code className="text-[10px] px-1 py-0.5 rounded bg-black/5 dark:bg-white/10">Cloud KB</code>.
       </div>
       <button
@@ -43,7 +41,7 @@ export function CloudEnabledBanner() {
           }
         }}
         className="p-1 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
-        aria-label="Dismiss"
+        aria-label={t("CloudEnabledBanner.dismiss")}
       >
         <X className="w-4 h-4" />
       </button>

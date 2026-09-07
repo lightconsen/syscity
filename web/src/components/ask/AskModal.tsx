@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
@@ -22,6 +23,7 @@ interface AskModalProps {
 }
 
 export function AskModal({ prompt, onRespond, onDismiss }: AskModalProps) {
+  const { t } = useTranslation("ask");
   const [selected, setSelected] = useState<string | null>(
     prompt.default ?? (prompt.options.length > 0 ? prompt.options[0] ?? null : null)
   );
@@ -33,7 +35,7 @@ export function AskModal({ prompt, onRespond, onDismiss }: AskModalProps) {
 
   return (
     <Modal>
-      <h3 className="text-sm font-semibold mb-1">Question from agent</h3>
+      <h3 className="text-sm font-semibold mb-1">{t("AskModal.title")}</h3>
       <p className="text-sm text-primary mb-4 whitespace-pre-wrap">{prompt.question}</p>
 
       {hasOptions ? (
@@ -61,7 +63,7 @@ export function AskModal({ prompt, onRespond, onDismiss }: AskModalProps) {
             onKeyDown={(e) => {
               if (e.key === "Enter" && canSubmit) onRespond(freeText.trim());
             }}
-            placeholder="Type your answer…"
+            placeholder={t("AskModal.placeholder")}
             autoFocus
           />
         </div>
@@ -73,10 +75,10 @@ export function AskModal({ prompt, onRespond, onDismiss }: AskModalProps) {
           disabled={!canSubmit}
           onClick={() => onRespond(answer.trim())}
         >
-          Answer
+          {t("AskModal.answer")}
         </Button>
         <Button variant="ghost" onClick={onDismiss}>
-          Not now
+          {t("AskModal.notNow")}
         </Button>
       </div>
     </Modal>

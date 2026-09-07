@@ -1,1 +1,6 @@
-{}
+{
+  "AskModal.title": "来自助手的提问",
+  "AskModal.placeholder": "输入你的回答…",
+  "AskModal.answer": "回答",
+  "AskModal.notNow": "暂不回答"
+}

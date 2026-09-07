@@ -1,14 +1,15 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { X, Download } from "lucide-react";
 import { useUpdate } from "@/hooks/useUpdate";
 import { Button } from "@/components/ui/Button";
 
-const PHASE_LABEL: Record<string, string> = {
-  checking: "Checking…",
-  downloading: "Downloading…",
-  verifying: "Verifying…",
-  applying: "Applying…",
-  restarting: "Restarting…",
+const PHASE_KEY: Record<string, string> = {
+  checking: "UpdateBanner.checking",
+  downloading: "UpdateBanner.downloading",
+  verifying: "UpdateBanner.verifying",
+  applying: "UpdateBanner.applying",
+  restarting: "UpdateBanner.restarting",
 };
 
 const DISMISSED_KEY = "syscity_update_banner_dismissed";
@@ -20,6 +21,7 @@ const DISMISSED_KEY = "syscity_update_banner_dismissed";
  * routes to the Tauri updater command.
  */
 export function UpdateBanner() {
+  const { t } = useTranslation("update");
   const { status, progress, busy, error, runUpdate } = useUpdate();
   const [dismissed, setDismissed] = useState<string | null>(() =>
     localStorage.getItem(DISMISSED_KEY)
@@ -38,7 +40,7 @@ export function UpdateBanner() {
       <span className="text-xs text-primary flex-1 min-w-0">
         {active ? (
           <span className="flex items-center gap-2">
-            {PHASE_LABEL[phase] || "Updating…"}
+            {PHASE_KEY[phase] ? t(PHASE_KEY[phase]) : t("UpdateBanner.updating")}
             <span className="hidden sm:inline text-secondary">{percent}%</span>
             {phase === "downloading" && (
               <span className="w-24 h-1.5 rounded-full bg-black/10 dark:bg-white/10 overflow-hidden">
@@ -51,7 +53,7 @@ export function UpdateBanner() {
           </span>
         ) : (
           <span>
-            v{status.latest || "?"} 可用（当前 v{status.current}）— 更新 syscity
+            {t("UpdateBanner.available", { latest: status.latest || "?", current: status.current })}
           </span>
         )}
       </span>
@@ -62,7 +64,7 @@ export function UpdateBanner() {
       )}
       {!active && !error && (
         <Button variant="primary-sm" onClick={() => runUpdate()}>
-          Update
+          {t("UpdateBanner.update")}
         </Button>
       )}
       <button
@@ -72,7 +74,7 @@ export function UpdateBanner() {
           if (status.latest) localStorage.setItem(DISMISSED_KEY, status.latest);
         }}
         className="p-1 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition"
-        aria-label="Dismiss"
+        aria-label={t("UpdateBanner.dismiss")}
       >
         <X className="w-4 h-4" />
       </button>

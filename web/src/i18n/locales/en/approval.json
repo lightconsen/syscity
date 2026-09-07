@@ -1,1 +1,11 @@
-{}
+{
+  "ApprovalModal.title": "Tool approval required",
+  "ApprovalModal.by": " by ",
+  "ApprovalModal.denyReasonPlaceholder": "Reason for denying (optional)…",
+  "ApprovalModal.approving": "Approving…",
+  "ApprovalModal.approve": "Approve",
+  "ApprovalModal.denying": "Denying…",
+  "ApprovalModal.deny": "Deny",
+  "ApprovalModal.denyDots": "Deny…",
+  "ApprovalModal.later": "Later"
+}

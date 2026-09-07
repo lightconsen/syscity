@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
@@ -29,6 +30,7 @@ const RISK_BADGE: Record<string, string> = {
 };
 
 export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProps) {
+  const { t } = useTranslation("approval");
   const [reason, setReason] = useState("");
   const [showReason, setShowReason] = useState(false);
   const [busy, setBusy] = useState<"approve" | "deny" | null>(null);
@@ -44,7 +46,7 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
     <Modal>
       <div className="mb-4">
         <div className="flex items-center gap-2 mb-2">
-          <h3 className="text-sm font-semibold">Tool approval required</h3>
+          <h3 className="text-sm font-semibold">{t("ApprovalModal.title")}</h3>
           <span
             className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${badge}`}
           >
@@ -53,7 +55,7 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
         </div>
         <p className="text-xs text-secondary mb-1">
           <span className="font-medium text-primary">{prompt.tool_name}</span>
-          {" by "}
+          {t("ApprovalModal.by")}
           <span className="text-primary">{prompt.requested_by}</span>
         </p>
         <p className="text-sm text-primary whitespace-pre-wrap mt-2">
@@ -69,7 +71,7 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
             onKeyDown={(e) => {
               if (e.key === "Enter" && !busy) decide("deny");
             }}
-            placeholder="Reason for denying (optional)…"
+            placeholder={t("ApprovalModal.denyReasonPlaceholder")}
             autoFocus
           />
         </div>
@@ -81,7 +83,7 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
           disabled={busy !== null}
           onClick={() => decide("approve")}
         >
-          {busy === "approve" ? "Approving…" : "Approve"}
+          {busy === "approve" ? t("ApprovalModal.approving") : t("ApprovalModal.approve")}
         </Button>
         {showReason ? (
           <Button
@@ -90,15 +92,15 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
             onClick={() => decide("deny")}
             className="text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
           >
-            {busy === "deny" ? "Denying…" : "Deny"}
+            {busy === "deny" ? t("ApprovalModal.denying") : t("ApprovalModal.deny")}
           </Button>
         ) : (
           <Button variant="ghost" onClick={() => setShowReason(true)}>
-            Deny…
+            {t("ApprovalModal.denyDots")}
           </Button>
         )}
         <Button variant="ghost" onClick={onDismiss}>
-          Later
+          {t("ApprovalModal.later")}
         </Button>
       </div>
     </Modal>

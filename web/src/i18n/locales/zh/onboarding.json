@@ -1,1 +1,20 @@
-{}
+{
+  "WelcomeScreen.title": "欢迎使用 Syscity",
+  "WelcomeScreen.configureModel": "配置你的第一个 LLM 模型",
+  "WelcomeScreen.cloudSuffix": " — 或登录 Syscity Cloud，零配置使用云端模型。",
+  "WelcomeScreen.or": "或",
+  "WelcomeScreen.cloudSignIn": "登录 Syscity Cloud（无需 API 密钥）",
+  "IdentityWizard.title": "打造专属身份",
+  "IdentityWizard.subtitle": "为你的助手设定身份，并让它了解一点你的情况。",
+  "IdentityWizard.errSave": "保存身份失败",
+  "IdentityWizard.agentName": "助手名称",
+  "IdentityWizard.vibe": "风格",
+  "IdentityWizard.emoji": "表情符号",
+  "IdentityWizard.useEmoji": "使用 {{emoji}} 作为表情",
+  "IdentityWizard.yourName": "你的称呼（如何称呼你）",
+  "IdentityWizard.city": "城市",
+  "IdentityWizard.aboutYou": "关于你",
+  "IdentityWizard.aboutYouPlaceholder": "任何有助于助手了解你的信息…",
+  "IdentityWizard.saving": "保存中…",
+  "IdentityWizard.saveContinue": "保存并继续"
+}

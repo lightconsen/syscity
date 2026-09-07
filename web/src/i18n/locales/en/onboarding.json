@@ -1,1 +1,20 @@
-{}
+{
+  "WelcomeScreen.title": "Welcome to Syscity",
+  "WelcomeScreen.configureModel": "Configure your first LLM model",
+  "WelcomeScreen.cloudSuffix": " — or sign in to Syscity Cloud to use cloud models with zero config.",
+  "WelcomeScreen.or": "or",
+  "WelcomeScreen.cloudSignIn": "Sign in to Syscity Cloud (no API key needed)",
+  "IdentityWizard.title": "Make it yours",
+  "IdentityWizard.subtitle": "Give your assistant an identity and tell it a little about you.",
+  "IdentityWizard.errSave": "Failed to save identity",
+  "IdentityWizard.agentName": "Agent name",
+  "IdentityWizard.vibe": "Vibe",
+  "IdentityWizard.emoji": "Emoji",
+  "IdentityWizard.useEmoji": "Use {{emoji}} as emoji",
+  "IdentityWizard.yourName": "Your name (how to address you)",
+  "IdentityWizard.city": "City",
+  "IdentityWizard.aboutYou": "About you",
+  "IdentityWizard.aboutYouPlaceholder": "Anything useful for your assistant to know about you…",
+  "IdentityWizard.saving": "Saving…",
+  "IdentityWizard.saveContinue": "Save & Continue"
+}

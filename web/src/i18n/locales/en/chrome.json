@@ -1,1 +1,12 @@
-{}
+{
+  "Statusbar.toggleTheme": "Toggle theme",
+  "Statusbar.runningTitle": "Assistant is running",
+  "Statusbar.running": "Running",
+  "Statusbar.gatewayVersion": "Gateway {{v}}",
+  "Titlebar.expandSidebar": "Expand sidebar",
+  "Titlebar.collapseSidebar": "Collapse sidebar",
+  "Titlebar.openNavigation": "Open navigation",
+  "Titlebar.settings": "Settings",
+  "Titlebar.toggleDocPanel": "Toggle document panel",
+  "Titlebar.browseFiles": "Browse workspace files"
+}

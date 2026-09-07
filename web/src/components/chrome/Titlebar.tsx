@@ -4,6 +4,7 @@ import {
   PanelRight,
   PanelLeft,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useChatStore } from "@/stores/chatStore";
 import { usePlatform } from "@/hooks/usePlatform";
 import { AccountButton } from "@/components/chat/AccountButton";
@@ -65,6 +66,7 @@ export function Titlebar({
   page,
   sessionTitle,
 }: TitlebarProps) {
+  const { t } = useTranslation("chrome");
   const platform = usePlatform();
   const currentAgent = useChatStore((s) => s.currentAgent);
   const workspacePanelOpen = useChatStore((s) => s.workspacePanelOpen);
@@ -85,8 +87,8 @@ export function Titlebar({
     <button
       onClick={onToggleSidebar}
       className="p-1 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
-      title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-      aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+      title={sidebarCollapsed ? t("Titlebar.expandSidebar") : t("Titlebar.collapseSidebar")}
+      aria-label={sidebarCollapsed ? t("Titlebar.expandSidebar") : t("Titlebar.collapseSidebar")}
       aria-pressed={!sidebarCollapsed}
     >
       {/* Counterpart of the right-side PanelRight glyph: a single panel-left
@@ -110,7 +112,7 @@ export function Titlebar({
         <button
           className="md:hidden p-2 -ml-1 rounded-lg text-secondary hover:bg-black/5 dark:hover:bg-white/5 transition"
           onClick={onOpenMobileNav}
-          aria-label="Open navigation"
+          aria-label={t("Titlebar.openNavigation")}
         >
           <Menu size={18} />
         </button>
@@ -205,14 +207,14 @@ export function Titlebar({
       {/* Right cluster (network dot + theme toggle live in the Statusbar) */}
       <div className="flex items-center gap-1 shrink-0">
         <AccountButton variant="icon" />
-        <button onClick={onOpenSettings} className={iconBtnCls} title="Settings" aria-label="Settings">
+        <button onClick={onOpenSettings} className={iconBtnCls} title={t("Titlebar.settings")} aria-label={t("Titlebar.settings")}>
           <Settings className="w-4 h-4" />
         </button>
         {!isMobile && (
           <button
             type="button"
-            title={inKbPage ? "Toggle document panel" : "Browse workspace files"}
-            aria-label={inKbPage ? "Toggle document panel" : "Browse workspace files"}
+            title={inKbPage ? t("Titlebar.toggleDocPanel") : t("Titlebar.browseFiles")}
+            aria-label={inKbPage ? t("Titlebar.toggleDocPanel") : t("Titlebar.browseFiles")}
             aria-pressed={rightPanelOpen}
             className={
               rightPanelOpen

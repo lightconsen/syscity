@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type {
   OnboardingPayload,
   SyscityWebSocketTransport,
@@ -23,6 +24,7 @@ interface IdentityWizardProps {
  * omitted and the backend writes a sensible default.
  */
 export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
+  const { t } = useTranslation("onboarding");
   const [name, setName] = useState("");
   const [vibe, setVibe] = useState("");
   const [emoji, setEmoji] = useState("🦑");
@@ -48,7 +50,7 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
     if (res.ok) {
       onComplete();
     } else {
-      setError(res.error || "Failed to save identity");
+      setError(res.error || t("IdentityWizard.errSave"));
     }
   };
 
@@ -64,22 +66,22 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
       <div className="m-auto w-full max-w-2xl px-6 py-8">
         <div className="flex flex-col items-center mb-8">
           <img src="/syscity.png" alt="Syscity" className="w-24 h-24 object-contain mb-6" />
-          <h1 className="text-3xl font-semibold mb-2">Make it yours</h1>
+          <h1 className="text-3xl font-semibold mb-2">{t("IdentityWizard.title")}</h1>
           <p className="text-secondary text-sm">
-            Give your assistant an identity and tell it a little about you.
+            {t("IdentityWizard.subtitle")}
           </p>
         </div>
 
         <div className="rounded-lg bg-card border border-subtle p-4 space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Input
-              label="Agent name"
+              label={t("IdentityWizard.agentName")}
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Syscity"
             />
             <Input
-              label="Vibe"
+              label={t("IdentityWizard.vibe")}
               value={vibe}
               onChange={(e) => setVibe(e.target.value)}
               placeholder="curious, direct, playful"
@@ -87,7 +89,7 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
           </div>
 
           <div>
-            <label className="block text-xs text-secondary mb-1">Emoji</label>
+            <label className="block text-xs text-secondary mb-1">{t("IdentityWizard.emoji")}</label>
             <div className="flex items-center gap-2">
               <Input
                 value={emoji}
@@ -106,7 +108,7 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
                         ? "border-primary-400 bg-primary-100 dark:bg-primary-900/30"
                         : "border-subtle hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
                     }`}
-                    aria-label={`Use ${e} as emoji`}
+                    aria-label={t("IdentityWizard.useEmoji", { emoji: e })}
                   >
                     {e}
                   </button>
@@ -117,13 +119,13 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Input
-              label="Your name (how to address you)"
+              label={t("IdentityWizard.yourName")}
               value={userName}
               onChange={(e) => setUserName(e.target.value)}
               placeholder="Alice"
             />
             <Input
-              label="City"
+              label={t("IdentityWizard.city")}
               value={city}
               onChange={(e) => setCity(e.target.value)}
               placeholder="Shanghai"
@@ -131,12 +133,12 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
           </div>
 
           <div>
-            <label className="block text-xs text-secondary mb-1">About you</label>
+            <label className="block text-xs text-secondary mb-1">{t("IdentityWizard.aboutYou")}</label>
             <textarea
               className={`${INPUT_CLASS} min-h-20 resize-y`}
               value={userContext}
               onChange={(e) => setUserContext(e.target.value)}
-              placeholder="Anything useful for your assistant to know about you…"
+              placeholder={t("IdentityWizard.aboutYouPlaceholder")}
             />
           </div>
 
@@ -151,7 +153,7 @@ export function IdentityWizard({ transport, onComplete }: IdentityWizardProps) {
               disabled={submitting}
               className="px-4 py-1.5 rounded-md bg-primary-500 hover:bg-primary-600 disabled:opacity-50 text-white text-xs font-medium transition"
             >
-              {submitting ? "Saving…" : "Save & Continue"}
+              {submitting ? t("IdentityWizard.saving") : t("IdentityWizard.saveContinue")}
             </button>
           </div>
         </div>

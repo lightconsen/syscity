@@ -1,1 +1,12 @@
-{}
+{
+  "Statusbar.toggleTheme": "切换主题",
+  "Statusbar.runningTitle": "助手正在运行",
+  "Statusbar.running": "运行中",
+  "Statusbar.gatewayVersion": "网关 {{v}}",
+  "Titlebar.expandSidebar": "展开侧边栏",
+  "Titlebar.collapseSidebar": "收起侧边栏",
+  "Titlebar.openNavigation": "打开导航",
+  "Titlebar.settings": "设置",
+  "Titlebar.toggleDocPanel": "切换文档面板",
+  "Titlebar.browseFiles": "浏览工作区文件"
+}

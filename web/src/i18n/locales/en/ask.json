@@ -1,1 +1,6 @@
-{}
+{
+  "AskModal.title": "Question from agent",
+  "AskModal.placeholder": "Type your answer…",
+  "AskModal.answer": "Answer",
+  "AskModal.notNow": "Not now"
+}

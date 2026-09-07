@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { Loader2, Moon, Sun } from "lucide-react";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { useChatStore } from "@/stores/chatStore";
@@ -24,6 +25,7 @@ interface StatusbarProps {
  * intentionally absent — no WS surface exposes it yet (deferred).
  */
 export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
+  const { t } = useTranslation("chrome");
   const networkStatus = useChatStore((s) => s.networkStatus);
   const isRunning = useChatStore((s) => s.isRunning);
   const { resolvedTheme, setTheme } = useThemeStore();
@@ -53,8 +55,8 @@ export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
         <button
           onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
           className="p-1 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
-          title="Toggle theme"
-          aria-label="Toggle theme"
+          title={t("Statusbar.toggleTheme")}
+          aria-label={t("Statusbar.toggleTheme")}
         >
           {resolvedTheme === "dark" ? (
             <Sun className="w-3.5 h-3.5" />
@@ -70,14 +72,14 @@ export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
       {/* Right cluster: runtime / model / gateway version */}
       <div className="flex items-center gap-3 shrink-0">
         {isRunning && (
-          <span className="flex items-center gap-1.5" title="Assistant is running">
+          <span className="flex items-center gap-1.5" title={t("Statusbar.runningTitle")}>
             <Loader2 className="w-3 h-3 animate-spin" />
-            Running
+            {t("Statusbar.running")}
           </span>
         )}
         {model && <span className="truncate max-w-[16rem]">{model}</span>}
         {version && (
-          <span className="truncate" title={`Gateway ${version}`}>
+          <span className="truncate" title={t("Statusbar.gatewayVersion", { v: version })}>
             v{version}
           </span>
         )}

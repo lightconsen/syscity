@@ -1,1 +1,24 @@
-{}
+{
+  "CloudEnabledBanner.body": "云功能已启用 — 云端模型和网络搜索自动可用。在 设置 → 扩展 中浏览完整目录（含云端采购连接器）；积分/用量可在 Cloud 区查看。知识库文档可从云端控制台上传，或在对话中通过",
+  "CloudEnabledBanner.dismiss": "关闭",
+  "UpdateBanner.idle": "空闲",
+  "UpdateBanner.checking": "检查中…",
+  "UpdateBanner.downloading": "下载中…",
+  "UpdateBanner.verifying": "校验中…",
+  "UpdateBanner.applying": "应用中…",
+  "UpdateBanner.restarting": "重启中…",
+  "UpdateBanner.error": "失败",
+  "UpdateBanner.updating": "更新中…",
+  "UpdateBanner.available": "v{{latest}} 可用（当前 v{{current}}）— 更新 syscity",
+  "UpdateBanner.upToDate": "已是最新",
+  "UpdateBanner.update": "更新",
+  "UpdateBanner.dismiss": "关闭",
+  "UpdateSection.title": "更新",
+  "UpdateSection.currentVersion": "当前版本",
+  "UpdateSection.latestVersion": "最新版本",
+  "UpdateSection.checkAndUpdate": "检查并更新",
+  "UpdateSection.updateNow": "立即更新",
+  "UpdateSection.checkForUpdates": "检查更新",
+  "UpdateSection.disabledNote": "网关配置中已禁用在线更新。",
+  "UpdateSection.tauriNote": "桌面版 — 更新使用内置 Tauri 更新器并重启应用。"
+}
