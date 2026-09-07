@@ -19,9 +19,11 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
   proto.cloudLogout = async function (this: SyscityWebSocketTransport,): Promise<void> {
     await this.sendRequestAndWait("cloud.logout", {});
   };
-  // Cloud knowledge bases — thin passthroughs to the cloud server.
+  // Cloud knowledge bases — thin passthroughs to the cloud server. Reads get
+  // a relaxed timeout: unlike local RPCs they traverse the WAN to Syscity
+  // Cloud, where the 5s default is too tight.
   proto.cloudKbList = async function (this: SyscityWebSocketTransport,): Promise<unknown> {
-    return this.sendRequestAndWait("cloud.kb.list", {});
+    return this.sendRequestAndWait("cloud.kb.list", {}, 30_000);
   };
   proto.cloudKbCreate = async function (this: SyscityWebSocketTransport, name: string): Promise<unknown> {
     return this.sendRequestAndWait("cloud.kb.create", { name });
@@ -32,7 +34,7 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
   // KB backup & sync — the cloud stores local collection snapshots; push/pull
   // walk many documents, so they need far more than the 5 s default timeout.
   proto.cloudKbDocs = async function (this: SyscityWebSocketTransport, kbId: string): Promise<unknown> {
-    return this.sendRequestAndWait("cloud.kb.docs", { kb_id: kbId });
+    return this.sendRequestAndWait("cloud.kb.docs", { kb_id: kbId }, 30_000);
   };
   proto.cloudKbPush = async function (this: SyscityWebSocketTransport, collection: string) {
     return (await this.sendRequestAndWait("cloud.kb.push", { collection }, 300_000)) as {

@@ -151,9 +151,16 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   const [cloudSt, setCloudSt] = useState<CloudStatus | null>(null);
   const [cloudKbs, setCloudKbs] = useState<CloudKb[]>([]);
   const [cloudFiles, setCloudFiles] = useState<Record<string, Set<string>>>({});
+  // True once the per-KB file lists have loaded (or definitively failed) —
+  // backup indicators stay hidden until then instead of flashing "not backed
+  // up" while the check is still in flight.
+  const [cloudLoaded, setCloudLoaded] = useState(false);
   const [pullAgent, setPullAgent] = useState<Record<string, string>>({});
   const [pullNotes, setPullNotes] = useState<Record<string, string>>({});
   const pollTimer = useRef<number | null>(null);
+
+  // Cloud popover (opened from the toolbar status chip; click-away closes).
+  const [cloudOpen, setCloudOpen] = useState(false);
 
   // Upload dialog.
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -193,71 +200,91 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
 
   const cloudReady = !!cloudSt?.enabled && !!cloudSt.logged_in;
 
+  // Local data only — the page can render as soon as this lands.
+  const loadLocal = useCallback(async () => {
+    const transport = getActiveTransport();
+    if (!transport) throw new Error("No gateway connection");
+    const body = await transport.listKbCollections();
+    setConfigured(body.configured);
+    setReason(body.reason);
+    const cols = body.collections as unknown as CollectionSummary[];
+    setCollections(cols);
+    const results = await Promise.all(cols.map((c) => transport.listKbDocs(c.collection)));
+    setRows(
+      results.flatMap((r, i) =>
+        (r.docs as unknown as KbDoc[]).map((d) => ({ ...d, collection: cols[i].collection }))
+      )
+    );
+  }, []);
+
+  // Cloud state is best-effort and slower (network round trips to Syscity
+  // Cloud): status failures degrade the backup column to "—"; list failures
+  // keep the sign-in state but show no backups.
+  const loadCloud = useCallback(async () => {
+    let st: CloudStatus;
+    try {
+      st = await cloudStatus();
+      setCloudSt(st);
+    } catch {
+      setCloudSt(null);
+      setCloudKbs([]);
+      setCloudFiles({});
+      setCloudLoaded(true);
+      return;
+    }
+    if (!st.enabled || !st.logged_in) {
+      setCloudKbs([]);
+      setCloudFiles({});
+      setCloudLoaded(true);
+      return;
+    }
+    try {
+      const transport = getActiveTransport();
+      if (!transport) {
+        setCloudLoaded(true);
+        return;
+      }
+      const kbBody = (await transport.cloudKbList()) as { knowledge_bases?: CloudKb[] } | undefined;
+      const kbs = kbBody?.knowledge_bases ?? [];
+      setCloudKbs(kbs);
+      const docLists = await Promise.all(
+        kbs.map((k) =>
+          transport
+            .cloudKbDocs(k.id)
+            .then((d) => {
+              const docs = ((d as { documents?: CloudKbDoc[] })?.documents ?? []).filter(
+                (x) => x.status === "stored"
+              );
+              return [k.name, new Set(docs.map((x) => x.filename))] as const;
+            })
+            .catch(() => [k.name, new Set<string>()] as const)
+        )
+      );
+      setCloudFiles(Object.fromEntries(docLists));
+      setCloudLoaded(true);
+    } catch {
+      setCloudKbs([]);
+      setCloudFiles({});
+      setCloudLoaded(true);
+    }
+  }, []);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
+    let ok = true;
     try {
-      const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
-      const body = await transport.listKbCollections();
-      setConfigured(body.configured);
-      setReason(body.reason);
-      const cols = body.collections as unknown as CollectionSummary[];
-      setCollections(cols);
-      const results = await Promise.all(cols.map((c) => transport.listKbDocs(c.collection)));
-      setRows(
-        results.flatMap((r, i) =>
-          (r.docs as unknown as KbDoc[]).map((d) => ({ ...d, collection: cols[i].collection }))
-        )
-      );
-
-      // Cloud state is best-effort: status failures degrade the backup column
-      // to "—"; list failures keep the sign-in state but show no backups.
-      let st: CloudStatus;
-      try {
-        st = await cloudStatus();
-        setCloudSt(st);
-      } catch {
-        setCloudSt(null);
-        setCloudKbs([]);
-        setCloudFiles({});
-        return;
-      }
-      try {
-        if (st.enabled && st.logged_in) {
-          const kbBody = (await transport.cloudKbList()) as
-            | { knowledge_bases?: CloudKb[] }
-            | undefined;
-          const kbs = kbBody?.knowledge_bases ?? [];
-          setCloudKbs(kbs);
-          const docLists = await Promise.all(
-            kbs.map((k) =>
-              transport
-                .cloudKbDocs(k.id)
-                .then((d) => {
-                  const docs = ((d as { documents?: CloudKbDoc[] })?.documents ?? []).filter(
-                    (x) => x.status === "stored"
-                  );
-                  return [k.name, new Set(docs.map((x) => x.filename))] as const;
-                })
-                .catch(() => [k.name, new Set<string>()] as const)
-            )
-          );
-          setCloudFiles(Object.fromEntries(docLists));
-        } else {
-          setCloudKbs([]);
-          setCloudFiles({});
-        }
-      } catch {
-        setCloudKbs([]);
-        setCloudFiles({});
-      }
+      await loadLocal();
     } catch (e) {
+      ok = false;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+    // Cloud refresh runs in the background — backup cells show "—" until it
+    // lands instead of blocking the whole page behind a spinner.
+    if (ok) void loadCloud();
+  }, [loadLocal, loadCloud]);
 
   useEffect(() => {
     load();
@@ -269,6 +296,9 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   const backupStateOf = (row: DocRow): BackupState => {
     if (!cloudSt?.enabled) return { kind: "unknown", why: "Cloud is not enabled" };
     if (!cloudSt.logged_in) return { kind: "unknown", why: "Sign in to Syscity Cloud to back up" };
+    // "unknown" renders nothing — rows stay quiet until the cloud check lands
+    // instead of flashing "not backed up" while it is still in flight.
+    if (!cloudLoaded) return { kind: "unknown", why: "Checking cloud backups…" };
     if (isUrlSource(row.source_id))
       return { kind: "not-eligible", why: "URL sources have no bytes to back up" };
     const files = cloudFiles[row.collection];
@@ -424,13 +454,8 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
 
   // ---- render ---------------------------------------------------------------
 
-  if (loading) {
-    return (
-      <div className="flex-1 flex items-center justify-center text-secondary">
-        <Loader2 className="w-5 h-5 animate-spin mr-2" /> Loading knowledge bases…
-      </div>
-    );
-  }
+  // No full-page spinner: the shell (toolbar + list) renders immediately and
+  // local data pops in as it lands; the cloud refresh is already backgrounded.
 
   // Default install state: no embedding provider configured. Guide the user
   // instead of showing an empty manager.
@@ -463,7 +488,8 @@ embedding_api_key = "sk-..."`}</pre>
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-page">
-      {/* Toolbar */}
+      {/* Toolbar — Upload is the only primary action; the cloud lives behind
+          a quiet status chip on the right (popover, click-away closes). */}
       <div className="flex items-center gap-2 px-6 md:px-8 py-3 border-b border-subtle shrink-0">
         <button
           onClick={() => {
@@ -477,25 +503,158 @@ embedding_api_key = "sk-..."`}</pre>
           <Upload className="w-3.5 h-3.5" />
           Upload
         </button>
-        {cloudReady && collections.length > 0 && (
-          <button
-            onClick={pushAll}
-            disabled={busyPush !== null}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-card text-primary border border-subtle hover:bg-black/5 dark:hover:bg-white/5 transition disabled:opacity-50"
-          >
-            {busyPush === "all" ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <CloudUpload className="w-3.5 h-3.5" />
-            )}
-            Back up all
-          </button>
-        )}
         <div className="flex-1" />
         <span className="text-[11px] text-secondary">
-          {rows.length} documents · {collections.length} collections · {totalChunks} chunks ·{" "}
-          {cloudReady ? `${backedUpCount} backed up` : "cloud off"}
+          {rows.length} documents · {collections.length} collections · {totalChunks} chunks
         </span>
+        {cloudSt?.enabled && (
+          <div className="relative">
+            <button
+              onClick={() => setCloudOpen((v) => !v)}
+              title={
+                cloudReady
+                  ? "Cloud backups"
+                  : "Sign in to back up your knowledge bases to Syscity Cloud"
+              }
+              className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-md text-[11px] font-medium border transition ${
+                cloudReady && cloudLoaded && rows.length > 0 && backedUpCount === rows.length
+                  ? "border-green-500/30 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400"
+                  : "border-subtle bg-card text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5"
+              }`}
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              {cloudReady && cloudLoaded && rows.length > 0 && (
+                <span>
+                  {backedUpCount}/{rows.length}
+                </span>
+              )}
+            </button>
+            {cloudOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setCloudOpen(false)} />
+                <div className="absolute right-0 top-full mt-2 z-50 w-[24rem] max-w-[92vw] bg-card rounded-xl shadow-xl border border-subtle overflow-hidden">
+                  <div className="flex items-center justify-between px-4 py-2.5 border-b border-subtle">
+                    <p className="text-xs font-semibold text-primary">Cloud backups</p>
+                    {cloudReady && cloudSt?.user && (
+                      <p className="text-[10px] text-secondary truncate max-w-[12rem]">
+                        {cloudSt.user.name || cloudSt.user.email}
+                      </p>
+                    )}
+                  </div>
+                  {!cloudReady ? (
+                    <div className="px-4 py-4 space-y-3">
+                      <p className="text-xs text-secondary">
+                        Back up your knowledge bases to Syscity Cloud and restore them on any
+                        device signed into the same account.
+                      </p>
+                      <button
+                        onClick={signIn}
+                        className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition"
+                      >
+                        <Cloud className="w-3.5 h-3.5" />
+                        Sign in to Syscity Cloud
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="max-h-[18rem] overflow-y-auto divide-y divide-subtle">
+                        {cloudKbs.length === 0 ? (
+                          <p className="px-4 py-6 text-center text-xs text-secondary">
+                            No backups yet — back up your collections below.
+                          </p>
+                        ) : (
+                          cloudKbs.map((kb) => {
+                            // One-click restore when the backup name maps to a local agent.
+                            const mappedAgent = kb.name.startsWith("kb-")
+                              ? agents.find((a) => a.id === kb.name.slice(3))
+                              : undefined;
+                            const chosenAgent = pullAgent[kb.id] ?? "";
+                            return (
+                              <div key={kb.id} className="px-4 py-2.5 space-y-2">
+                                <div className="flex items-center gap-2">
+                                  <Cloud className="w-3.5 h-3.5 shrink-0 text-secondary" />
+                                  <p className="text-sm text-primary truncate flex-1">{kb.name}</p>
+                                  <span className="text-[10px] text-secondary/70 shrink-0">
+                                    {kb.document_count ?? 0} docs
+                                  </span>
+                                  <button
+                                    onClick={() => deleteKb(kb)}
+                                    className="p-1 rounded-md text-secondary hover:text-red-500 hover:bg-red-500/10 transition shrink-0"
+                                    title="Delete cloud backup"
+                                    aria-label={`Delete backup ${kb.name}`}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                {pullNotes[kb.id] && (
+                                  <p className="text-[10px] text-secondary">{pullNotes[kb.id]}</p>
+                                )}
+                                <div className="flex items-center gap-2">
+                                  {mappedAgent ? (
+                                    <button
+                                      onClick={() => pull(kb, mappedAgent.id)}
+                                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition"
+                                      title={`Restore into ${mappedAgent.display_name}'s collection`}
+                                    >
+                                      Restore to {mappedAgent.display_name}
+                                    </button>
+                                  ) : (
+                                    <>
+                                      <select
+                                        value={chosenAgent}
+                                        onChange={(e) =>
+                                          setPullAgent((prev) => ({
+                                            ...prev,
+                                            [kb.id]: e.target.value,
+                                          }))
+                                        }
+                                        className="text-xs px-2 py-1.5 rounded-md bg-page text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20 max-w-36"
+                                      >
+                                        <option value="">Restore to…</option>
+                                        {agents.map((a) => (
+                                          <option key={a.id} value={a.id}>
+                                            {a.emoji} {a.display_name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <button
+                                        onClick={() => pull(kb, chosenAgent)}
+                                        disabled={!chosenAgent}
+                                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition disabled:opacity-50"
+                                      >
+                                        Restore
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                      {collections.length > 0 && (
+                        <div className="px-3 py-2.5 border-t border-subtle">
+                          <button
+                            onClick={pushAll}
+                            disabled={busyPush !== null}
+                            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-primary border border-subtle hover:bg-black/5 dark:hover:bg-white/5 transition disabled:opacity-50"
+                          >
+                            {busyPush === "all" ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <CloudUpload className="w-3.5 h-3.5" />
+                            )}
+                            Back up all collections
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
         <button
           onClick={load}
           className="p-1 rounded-md text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5 transition"
@@ -515,7 +674,13 @@ embedding_api_key = "sk-..."`}</pre>
         <div className="rounded-lg bg-card divide-y divide-subtle">
           {rows.length === 0 ? (
             <div className="py-10 text-center text-xs text-secondary">
-              No documents yet — click Upload to add files.
+              {loading ? (
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading local collections…
+                </span>
+              ) : (
+                "No documents yet — click Upload to add files."
+              )}
             </div>
           ) : (
             rows.map((d) => {
@@ -552,39 +717,31 @@ embedding_api_key = "sk-..."`}</pre>
                   >
                     {d.status}
                   </span>
-                  {/* Cloud backup state / action */}
-                  <span className="w-28 flex justify-center shrink-0">
-                    {bs.kind === "backed-up" ? (
-                      <span
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400"
-                        title="A copy is stored in Syscity Cloud"
-                      >
-                        <Cloud className="w-3 h-3" />
-                        Backed up
-                      </span>
-                    ) : bs.kind === "not-backed-up" ? (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          push(d.collection);
-                        }}
-                        disabled={busyPush !== null}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium text-primary-600 dark:text-primary-400 border border-primary-500/30 hover:bg-primary-50 dark:hover:bg-primary-900/20 transition disabled:opacity-50"
-                        title={`Back up ${d.collection} to Syscity Cloud`}
-                      >
-                        {busyPush === d.collection ? (
-                          <Loader2 className="w-3 h-3 animate-spin" />
-                        ) : (
-                          <CloudUpload className="w-3 h-3" />
-                        )}
-                        Back up
-                      </button>
-                    ) : (
-                      <span className="text-[10px] text-secondary/50" title={bs.why}>
-                        —
-                      </span>
-                    )}
-                  </span>
+                  {/* Cloud backup state: quiet micro-icon; invisible when the
+                      cloud is off, not signed in, or the source isn't
+                      eligible (URL) — the chip popover handles the rest. */}
+                  {bs.kind === "backed-up" && (
+                    <span className="shrink-0 flex justify-center w-6" title="Backed up to Syscity Cloud">
+                      <Cloud className="w-3.5 h-3.5 text-green-600 dark:text-green-400" />
+                    </span>
+                  )}
+                  {bs.kind === "not-backed-up" && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        push(d.collection);
+                      }}
+                      disabled={busyPush !== null}
+                      className="p-1.5 rounded-md text-secondary hover:text-primary-600 dark:hover:text-primary-400 hover:bg-primary-50 dark:hover:bg-primary-900/20 transition disabled:opacity-50 shrink-0"
+                      title={`Back up ${d.collection} to Syscity Cloud`}
+                    >
+                      {busyPush === d.collection ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <CloudUpload className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  )}
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -606,91 +763,6 @@ embedding_api_key = "sk-..."`}</pre>
             })
           )}
         </div>
-
-        {/* Cloud backups — restore on any device signed into the same account */}
-        {cloudSt?.enabled && !cloudSt.logged_in && (
-          <div className="flex items-center justify-between bg-card rounded-lg px-4 py-3">
-            <p className="text-xs text-secondary">
-              Sign in to Syscity Cloud to back up your knowledge bases and restore them on any
-              device.
-            </p>
-            <button
-              onClick={signIn}
-              className="ml-3 px-3 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition shrink-0"
-            >
-              Sign in
-            </button>
-          </div>
-        )}
-        {cloudReady && cloudKbs.length > 0 && (
-          <div>
-            <h3 className="text-xs uppercase tracking-wider text-secondary font-medium mb-2">
-              Cloud backups
-            </h3>
-            <div className="rounded-lg bg-card divide-y divide-subtle">
-              {cloudKbs.map((kb) => {
-                // One-click restore when the backup name maps to a local agent.
-                const mappedAgent = kb.name.startsWith("kb-")
-                  ? agents.find((a) => a.id === kb.name.slice(3))
-                  : undefined;
-                const chosenAgent = pullAgent[kb.id] ?? "";
-                return (
-                  <div key={kb.id} className="flex flex-wrap items-center gap-3 px-4 py-2.5">
-                    <Cloud className="w-4 h-4 shrink-0 text-secondary" />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm text-primary truncate">{kb.name}</p>
-                      <p className="text-[10px] text-secondary/70">
-                        {kb.document_count ?? 0} documents
-                        {pullNotes[kb.id] ? ` · ${pullNotes[kb.id]}` : ""}
-                      </p>
-                    </div>
-                    {mappedAgent ? (
-                      <button
-                        onClick={() => pull(kb, mappedAgent.id)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition shrink-0"
-                        title={`Restore into ${mappedAgent.display_name}'s collection`}
-                      >
-                        Restore to {mappedAgent.display_name}
-                      </button>
-                    ) : (
-                      <>
-                        <select
-                          value={chosenAgent}
-                          onChange={(e) =>
-                            setPullAgent((prev) => ({ ...prev, [kb.id]: e.target.value }))
-                          }
-                          className="text-xs px-2 py-1.5 rounded-md bg-page text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20 max-w-36"
-                        >
-                          <option value="">Restore to…</option>
-                          {agents.map((a) => (
-                            <option key={a.id} value={a.id}>
-                              {a.emoji} {a.display_name}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          onClick={() => pull(kb, chosenAgent)}
-                          disabled={!chosenAgent}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition disabled:opacity-50 shrink-0"
-                        >
-                          Restore
-                        </button>
-                      </>
-                    )}
-                    <button
-                      onClick={() => deleteKb(kb)}
-                      className="p-1.5 rounded-md text-secondary hover:text-red-500 hover:bg-red-500/10 transition shrink-0"
-                      title="Delete cloud backup"
-                      aria-label={`Delete backup ${kb.name}`}
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Document viewer: preview the source file (text/markdown only —
