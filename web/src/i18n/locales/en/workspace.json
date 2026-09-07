@@ -1,0 +1,17 @@
+{
+  "WorkspacePanel.defaultAgent": "Default agent",
+  "WorkspacePanel.files": "Workspace files",
+  "WorkspacePanel.title": "{{name}} · Workspace",
+  "WorkspacePanel.closeEsc": "Close workspace browser (Esc)",
+  "WorkspacePanel.close": "Close workspace browser",
+  "FileTree.failedToLoad": "Failed to load",
+  "FileTree.loading": "Loading…",
+  "FileTree.retry": "Retry",
+  "FileTree.empty": "(empty)",
+  "FilePreview.failedToLoad": "Failed to load file",
+  "FilePreview.backToTree": "Back to file tree",
+  "FilePreview.downloadFile": "Download file",
+  "FilePreview.loading": "Loading file…",
+  "FilePreview.binary": "Binary file — preview not available",
+  "FilePreview.largeFile": "Large file — showing first 256 KB of {{size}}"
+}

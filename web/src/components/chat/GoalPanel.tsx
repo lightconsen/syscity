@@ -8,6 +8,7 @@ import {
   Crosshair,
 } from "lucide-react";
 import { useGoalStore, type GoalState } from "@/stores/goalStore";
+import { useTranslation } from "react-i18next";
 
 function isActive(status: GoalState["status"]) {
   return status === "running";
@@ -24,14 +25,14 @@ function goalStatusIcon(status: GoalState["status"]) {
   }
 }
 
-function goalStatusText(status: GoalState["status"]) {
+function goalStatusKey(status: GoalState["status"]): string {
   switch (status) {
     case "running":
-      return "Running";
+      return "GoalPanel.statusRunning";
     case "done":
-      return "Completed";
+      return "GoalPanel.statusDone";
     case "aborted":
-      return "Aborted";
+      return "GoalPanel.statusAborted";
   }
 }
 
@@ -41,6 +42,7 @@ function GoalCard({
   goal: GoalState;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const { t } = useTranslation("chat");
 
   return (
     <div className="rounded-lg bg-card overflow-hidden">
@@ -65,7 +67,7 @@ function GoalCard({
               : "bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400"
           }`}
         >
-          {goalStatusText(goal.status)}
+          {t(goalStatusKey(goal.status))}
         </span>
         {expanded ? (
           <ChevronUp className="w-4 h-4 text-secondary/60" />
@@ -78,7 +80,8 @@ function GoalCard({
       {expanded && (
         <div className="px-3 pb-3 pt-1 border-t border-subtle">
           <div className="text-xs text-secondary mb-2">
-            Round {goal.round} / {goal.maxRounds} &middot; ID:{" "}
+            {t("GoalPanel.roundOf", { round: goal.round, maxRounds: goal.maxRounds })} &middot;{" "}
+            {t("GoalPanel.idLabel")}{" "}
             <code className="text-[10px] bg-sidebar px-1 rounded">
               {goal.id}
             </code>
@@ -87,7 +90,7 @@ function GoalCard({
           {goal.conditions.length > 0 && (
             <div className="space-y-1 mb-2">
               <div className="text-[11px] font-medium text-secondary/70 uppercase tracking-wider">
-                Conditions
+                {t("GoalPanel.conditions")}
               </div>
               {goal.conditions.map((c, i) => {
                 const condPassed = goal.status !== "running" && goal.status === "done"
@@ -123,7 +126,7 @@ function GoalCard({
           )}
           {goal.reason && goal.status === "aborted" && (
             <div className="text-xs text-red-500 dark:text-red-400 mt-1">
-              Reason: {goal.reason}
+              {t("GoalPanel.reason", { reason: goal.reason })}
             </div>
           )}
         </div>
@@ -135,6 +138,7 @@ function GoalCard({
 export function GoalPanel() {
   const goals = useGoalStore((s) => s.goals);
   const [collapsed, setCollapsed] = useState(false);
+  const { t } = useTranslation("chat");
 
   const goalList = Object.values(goals);
   if (goalList.length === 0) return null;
@@ -150,9 +154,11 @@ export function GoalPanel() {
       >
         <Crosshair className="w-3.5 h-3.5" />
         <span className="font-medium">
-          Goals
+          {t("GoalPanel.goals")}
           {activeCount > 0 && (
-            <span className="ml-1 text-primary-500">({activeCount} active)</span>
+            <span className="ml-1 text-primary-500">
+              {t("GoalPanel.activeCount", { count: activeCount })}
+            </span>
           )}
         </span>
         <span className="flex-1" />

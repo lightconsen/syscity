@@ -12,6 +12,7 @@ import { getCommandCompletions, type CommandDef } from "@/slash-commands";
 import { useChatStore } from "@/stores/chatStore";
 import { Mic, Paperclip, Square, Send, ChevronDown } from "lucide-react";
 import { MessageSkeleton } from "@/components/ui/Skeleton";
+import { useTranslation } from "react-i18next";
 import { NewSessionWelcome } from "./NewSessionWelcome";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 import { useTextToSpeech } from "@/hooks/useTextToSpeech";
@@ -23,6 +24,7 @@ interface ChatContentProps {
 }
 
 export function ChatContent({ transport }: ChatContentProps) {
+  const { t } = useTranslation("chat");
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composer = useComposerRuntime();
@@ -275,14 +277,14 @@ export function ChatContent({ transport }: ChatContentProps) {
 
   /* ── Mic button helpers ── */
   const micTitle = !voiceSupported
-    ? "Voice not supported"
+    ? t("ChatContent.voiceNotSupported")
     : voiceMode
       ? isListening
-        ? "Stop listening"
+        ? t("ChatContent.stopListening")
         : isSpeaking
-          ? "Speaking..."
-          : "Voice mode on"
-      : "Voice mode";
+          ? t("ChatContent.speaking")
+          : t("ChatContent.voiceModeOn")
+      : t("ChatContent.voiceMode");
 
   const micClass = () => {
     if (!voiceSupported) {
@@ -322,9 +324,9 @@ export function ChatContent({ transport }: ChatContentProps) {
           onInput={handleInput}
           onKeyDown={handleKeyDown}
           className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm text-primary placeholder:text-secondary/60 focus:outline-none min-h-[60px] max-h-[200px]"
-          placeholder="Message Syscity..."
+          placeholder={t("ChatContent.placeholder")}
           rows={1}
-          aria-label="Message input"
+          aria-label={t("ChatContent.messageInput")}
         />
 
         {/* Bottom toolbar */}
@@ -342,10 +344,10 @@ export function ChatContent({ transport }: ChatContentProps) {
             </button>
             <button
               type="button"
-              title="Attach an image or file"
-              aria-label="Attach an image or file"
+              title={t("ChatContent.attachFile")}
+              aria-label={t("ChatContent.attachFile")}
               className="p-2 rounded-lg text-secondary hover:text-primary-600 dark:hover:text-primary-400 hover:bg-black/5 dark:hover:bg-white/5 transition"
-              onClick={() => alert("Attachments coming soon")}
+              onClick={() => alert(t("ChatContent.attachmentsComingSoon"))}
             >
               <Paperclip className="w-5 h-5" />
             </button>
@@ -356,8 +358,8 @@ export function ChatContent({ transport }: ChatContentProps) {
               <button
                 type="button"
                 onClick={() => transport.abort(transport.getSessionId())}
-                title="Stop generating"
-                aria-label="Stop generating"
+                title={t("ChatContent.stopGenerating")}
+                aria-label={t("ChatContent.stopGenerating")}
                 className="shrink-0 p-2 rounded-lg bg-red-500 hover:bg-red-600 text-white transition shadow-sm"
               >
                 <Square className="w-4 h-4 fill-current" />
@@ -395,7 +397,7 @@ export function ChatContent({ transport }: ChatContentProps) {
               <div style={{ height: `${totalHeight}px`, position: "relative" }}>
                 {isLoadingHistory && (
                   <div className="py-3 text-center text-secondary text-sm">
-                    Loading older messages…
+                    {t("ChatContent.loadingOlder")}
                   </div>
                 )}
                 {virtualItems.map((virtualItem) => (
@@ -427,7 +429,7 @@ export function ChatContent({ transport }: ChatContentProps) {
             <button
               type="button"
               onClick={scrollToBottom}
-              aria-label="Scroll to bottom"
+              aria-label={t("ChatContent.scrollToBottom")}
               className="absolute bottom-28 left-1/2 -translate-x-1/2 p-2 rounded-full bg-primary-500 text-white shadow-lg hover:bg-primary-600 transition-opacity animate-bounce z-10"
             >
               <ChevronDown className="w-5 h-5" />

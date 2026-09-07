@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import {
   X,
   FileText,
@@ -134,6 +135,7 @@ export function DocumentPreviewPanel({
     };
   }, [document.filename]);
 
+  const { t } = useTranslation("common");
   const [copied, setCopied] = useState(false);
   const isTauri = typeof window !== "undefined" && "__TAURI__" in window;
 
@@ -216,7 +218,7 @@ export function DocumentPreviewPanel({
     <div
       className="flex-1 min-w-0 border-l border-subtle bg-page flex flex-col overflow-hidden"
       role="complementary"
-      aria-label="Document preview"
+      aria-label={t("DocumentPreviewPanel.ariaLabel")}
       onKeyDown={handleKeyDown}
     >
       {/* Title bar */}
@@ -249,8 +251,8 @@ export function DocumentPreviewPanel({
               type="button"
               onClick={handleOpenFolder}
               className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary hover:text-primary transition"
-              title="Open file location"
-              aria-label="Open file location"
+              title={t("DocumentPreviewPanel.openFileLocation")}
+              aria-label={t("DocumentPreviewPanel.openFileLocation")}
             >
               <FolderOpen className="w-4 h-4" />
             </button>
@@ -261,8 +263,8 @@ export function DocumentPreviewPanel({
             onClick={handleDownload}
             disabled={loadState !== "loaded"}
             className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary hover:text-primary transition disabled:opacity-30 disabled:pointer-events-none"
-            title={document.exportUrl ? `Download as ${exportExtension(document.format).toUpperCase()}` : "Download file"}
-            aria-label={document.exportUrl ? `Download as ${exportExtension(document.format).toUpperCase()}` : "Download file"}
+            title={document.exportUrl ? t("DocumentPreviewPanel.downloadAs", { ext: exportExtension(document.format).toUpperCase() }) : t("DocumentPreviewPanel.downloadFile")}
+            aria-label={document.exportUrl ? t("DocumentPreviewPanel.downloadAs", { ext: exportExtension(document.format).toUpperCase() }) : t("DocumentPreviewPanel.downloadFile")}
           >
             <Download className="w-4 h-4" />
           </button>
@@ -271,8 +273,8 @@ export function DocumentPreviewPanel({
             type="button"
             onClick={handleCopyLink}
             className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary hover:text-primary transition"
-            title={copied ? "Copied!" : "Copy link"}
-            aria-label="Copy link"
+            title={copied ? t("DocumentPreviewPanel.copied") : t("DocumentPreviewPanel.copyLink")}
+            aria-label={t("DocumentPreviewPanel.copyLink")}
           >
             {copied ? (
               <Check className="w-4 h-4 text-green-500" />
@@ -285,8 +287,8 @@ export function DocumentPreviewPanel({
             type="button"
             onClick={onClose}
             className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary hover:text-primary transition"
-            title="Close preview (Esc)"
-            aria-label="Close preview"
+            title={t("DocumentPreviewPanel.closePreviewEsc")}
+            aria-label={t("DocumentPreviewPanel.closePreview")}
           >
             <X className="w-4 h-4" />
           </button>
@@ -302,13 +304,13 @@ export function DocumentPreviewPanel({
           {loadState === "loading" && (
             <div className="flex items-center justify-center h-40 text-secondary">
               <Loader2 className="w-6 h-6 animate-spin" />
-              <span className="ml-2 text-sm">Loading document…</span>
+              <span className="ml-2 text-sm">{t("DocumentPreviewPanel.loading")}</span>
             </div>
           )}
           {loadState === "error" && (
             <div className="flex flex-col items-center justify-center h-40 text-secondary gap-2">
               <AlertCircle className="w-8 h-8 text-red-400" />
-              <p className="text-sm">Failed to load document</p>
+              <p className="text-sm">{t("DocumentPreviewPanel.loadFailed")}</p>
               <p className="text-xs opacity-60">{document.filename}</p>
             </div>
           )}
@@ -325,13 +327,13 @@ export function DocumentPreviewPanel({
           {loadState === "loading" && (
             <div className="flex items-center justify-center h-40 text-secondary">
               <Loader2 className="w-6 h-6 animate-spin" />
-              <span className="ml-2 text-sm">Loading document…</span>
+              <span className="ml-2 text-sm">{t("DocumentPreviewPanel.loading")}</span>
             </div>
           )}
           {loadState === "error" && (
             <div className="flex flex-col items-center justify-center h-40 text-secondary gap-2">
               <AlertCircle className="w-8 h-8 text-red-400" />
-              <p className="text-sm">Failed to load document</p>
+              <p className="text-sm">{t("DocumentPreviewPanel.loadFailed")}</p>
               <p className="text-xs opacity-60">{document.filename}</p>
             </div>
           )}

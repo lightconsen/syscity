@@ -12,6 +12,7 @@ import {
   Puzzle,
 } from "lucide-react";
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 interface AgentItem {
   id: string;
@@ -81,6 +82,7 @@ export function Sidebar({
   onPinSession,
 }: SidebarProps) {
 
+  const { t } = useTranslation("chat");
   const listContainerRef = useRef<HTMLDivElement>(null);
   // Session rows only read as "current" while a real conversation is on
   // screen — on the welcome page, KB, or Extensions the nav item takes over.
@@ -156,15 +158,15 @@ export function Sidebar({
       );
       let key: string;
       if (diffDays <= 0) {
-        key = "Today";
+        key = "Sidebar.today";
       } else if (diffDays === 1) {
-        key = "Yesterday";
+        key = "Sidebar.yesterday";
       } else if (diffDays <= 7) {
-        key = "Last 7 days";
+        key = "Sidebar.last7Days";
       } else if (diffDays <= 30) {
-        key = "Last 30 days";
+        key = "Sidebar.last30Days";
       } else {
-        key = "Older";
+        key = "Sidebar.older";
       }
       if (!buckets.has(key)) {
         buckets.set(key, []);
@@ -172,10 +174,10 @@ export function Sidebar({
       buckets.get(key)!.push(s);
     }
 
-    const order = ["Today", "Yesterday", "Last 7 days", "Last 30 days", "Older"];
+    const order = ["Sidebar.today", "Sidebar.yesterday", "Sidebar.last7Days", "Sidebar.last30Days", "Sidebar.older"];
     const result: { label: string; sessions: SessionItem[] }[] = [];
     if (pinned.length > 0) {
-      result.push({ label: "Pinned", sessions: pinned });
+      result.push({ label: "Sidebar.pinned", sessions: pinned });
     }
     for (const key of order) {
       const list = buckets.get(key);
@@ -212,8 +214,8 @@ export function Sidebar({
         <button
           onClick={onToggle}
           className="p-1 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
-          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={collapsed ? t("Sidebar.expand") : t("Sidebar.collapse")}
+          aria-label={collapsed ? t("Sidebar.expand") : t("Sidebar.collapse")}
         >
           {collapsed ? (
             <ChevronRight className="w-4 h-4" />
@@ -229,9 +231,9 @@ export function Sidebar({
         <button
           onClick={onShowApprovals}
           className="mx-1 mb-2 px-3 py-2 rounded-lg text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-900/40 transition text-left shrink-0"
-          title="Show pending approvals"
+          title={t("Sidebar.showPendingApprovals")}
         >
-          ⚠️ {pendingApprovals} pending approval{pendingApprovals > 1 ? "s" : ""}
+          ⚠️ {t("Sidebar.pendingApprovals", { count: pendingApprovals })}
         </button>
       )}
 
@@ -252,12 +254,12 @@ export function Sidebar({
                 ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
                 : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
             } ${collapsed ? "justify-center" : ""}`}
-            title="New session"
-            aria-label="New session"
+            title={t("Sidebar.newSession")}
+            aria-label={t("Sidebar.newSession")}
             aria-current={activeView === "chat" && chatWelcome ? "page" : undefined}
           >
             <Plus className="w-4 h-4 shrink-0" />
-            {!collapsed && <span>New Session</span>}
+            {!collapsed && <span>{t("Sidebar.newSessionLabel")}</span>}
           </button>
           {/* Extensions (marketplace): connectors, skills, experts. */}
           <button
@@ -267,12 +269,12 @@ export function Sidebar({
                 ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
                 : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
             } ${collapsed ? "justify-center" : ""}`}
-            title="Browse extensions"
-            aria-label="Extensions"
+            title={t("Sidebar.browseExtensions")}
+            aria-label={t("Sidebar.extensions")}
             aria-current={activeView === "extensions" ? "page" : undefined}
           >
             <Puzzle className="w-4 h-4 shrink-0" />
-            {!collapsed && <span>Extensions</span>}
+            {!collapsed && <span>{t("Sidebar.extensions")}</span>}
           </button>
           {/* Knowledge Base: local per-agent collections + cloud KBs. */}
           {onOpenKnowledgeBase && (
@@ -283,12 +285,12 @@ export function Sidebar({
                   ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
                   : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
               } ${collapsed ? "justify-center" : ""}`}
-              title="Manage knowledge bases"
-              aria-label="Knowledge Base"
+              title={t("Sidebar.manageKnowledgeBases")}
+              aria-label={t("Sidebar.knowledgeBase")}
               aria-current={activeView === "kb" ? "page" : undefined}
             >
               <Library className="w-4 h-4 shrink-0" />
-              {!collapsed && <span>Knowledge Base</span>}
+              {!collapsed && <span>{t("Sidebar.knowledgeBase")}</span>}
             </button>
           )}
           {!collapsed &&
@@ -296,7 +298,7 @@ export function Sidebar({
               <div key={group.label} className="mb-2">
                 <div className="px-3 pb-1">
                   <span className="text-[10px] uppercase tracking-wider text-secondary font-medium">
-                    {group.label}
+                    {t(group.label)}
                   </span>
                 </div>
                 {group.sessions.map((s) => (
@@ -339,8 +341,8 @@ export function Sidebar({
             }`}
             role="separator"
             aria-orientation="horizontal"
-            aria-label="Resize sessions and agents panels"
-            title="Drag to resize"
+            aria-label={t("Sidebar.resizePanels")}
+            title={t("Sidebar.dragToResize")}
           >
             <div className="absolute left-1/2 -translate-x-1/2 top-1/2 -translate-y-1/2 w-8 h-0.5 rounded-full bg-subtle" />
           </div>
@@ -358,7 +360,7 @@ export function Sidebar({
           {!collapsed && (
             <div className="px-3 py-2 shrink-0">
               <span className="text-[10px] uppercase tracking-wider text-secondary font-medium">
-                Agents
+                {t("Sidebar.agents")}
               </span>
             </div>
           )}
@@ -366,9 +368,9 @@ export function Sidebar({
             {agents.length === 0 && !collapsed && (
               <div className="px-3 py-4 text-xs text-secondary text-center">
                 <Bot className="w-5 h-5 mx-auto mb-2 opacity-50" />
-                <p>No agents yet</p>
+                <p>{t("Sidebar.noAgents")}</p>
                 <p className="mt-1 opacity-70">
-                  Create an agent in ~/.syscity/agents
+                  {t("Sidebar.createAgentHint")}
                 </p>
               </div>
             )}
@@ -379,7 +381,7 @@ export function Sidebar({
                 className={`w-full text-left px-3 py-2 rounded-lg text-sm transition flex items-center gap-2 text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04] ${
                   collapsed ? "justify-center" : ""
                 }`}
-                title={`New session with ${agent.display_name}`}
+                title={t("Sidebar.newSessionWith", { name: agent.display_name })}
                 role="listitem"
               >
                 <span className="text-base shrink-0" aria-hidden="true">
@@ -423,8 +425,9 @@ function SessionRow({
   onDelete,
   onPin,
 }: SessionRowProps) {
+  const { t } = useTranslation("chat");
   const isActive = session.id === currentSessionId;
-  const displayName = session.label || "Untitled";
+  const displayName = session.label || t("Sidebar.untitled");
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState(displayName);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -460,7 +463,7 @@ function SessionRow({
 
   const handleDelete = useCallback(() => {
     if (!onDelete) return;
-    if (confirm(`Delete session "${displayName}"?`)) {
+    if (confirm(t("Sidebar.deleteConfirm", { name: displayName }))) {
       onDelete(session.id);
     }
   }, [displayName, onDelete, session.id]);
@@ -540,8 +543,8 @@ function SessionRow({
                     ? "text-primary hover:text-primary"
                     : "text-secondary hover:text-primary"
                 } hover:bg-black/5 dark:hover:bg-white/5`}
-                title={session.pinned ? "Unpin session" : "Pin session"}
-                aria-label={session.pinned ? "Unpin session" : "Pin session"}
+                title={session.pinned ? t("Sidebar.unpin") : t("Sidebar.pin")}
+                aria-label={session.pinned ? t("Sidebar.unpin") : t("Sidebar.pin")}
               >
                 {session.pinned ? (
                   <PinOff className="w-3 h-3" />
@@ -557,8 +560,8 @@ function SessionRow({
                   setIsEditing(true);
                 }}
                 className="p-1 rounded-md text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5 transition"
-                title="Rename session"
-                aria-label="Rename session"
+                title={t("Sidebar.rename")}
+                aria-label={t("Sidebar.rename")}
               >
                 <Pencil className="w-3 h-3" />
               </button>
@@ -567,8 +570,8 @@ function SessionRow({
               <button
                 onClick={handleDelete}
                 className="p-1 rounded-md text-secondary hover:text-red-500 hover:bg-red-500/10 transition"
-                title="Delete session"
-                aria-label="Delete session"
+                title={t("Sidebar.deleteSession")}
+                aria-label={t("Sidebar.deleteSession")}
               >
                 <Trash2 className="w-3 h-3" />
               </button>

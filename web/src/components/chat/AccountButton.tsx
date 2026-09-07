@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import { User, LogOut, Loader2 } from "lucide-react";
 import {
   cloudLoginUrl,
@@ -33,6 +34,7 @@ const POLL_MS = 1_500;
  *   overflow-x-hidden containers never clip it, opening below the control.
  */
 export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" }) {
+  const { t } = useTranslation("chat");
   const [status, setStatus] = useState<CloudStatus | null>(null);
   const [sub, setSub] = useState<CloudSubscription | null>(null);
   const [loginPending, setLoginPending] = useState(false);
@@ -219,7 +221,9 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
             {initial}
           </span>
         ) : null}
-        <div className="text-primary font-medium truncate">{display || "Signed in"}</div>
+        <div className="text-primary font-medium truncate">
+          {display || t("AccountButton.signedIn")}
+        </div>
       </div>
       {user?.email && (
         <div className="px-2 pb-1.5 text-secondary truncate">{user.email}</div>
@@ -231,13 +235,13 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
       )}
       <div className="my-1 border-t border-subtle" />
       <div className="px-2 py-1 flex items-center justify-between gap-2">
-        <span className="text-secondary">Plan</span>
+        <span className="text-secondary">{t("AccountButton.plan")}</span>
         <span className="text-primary truncate">
-          {sub ? `${sub.plan} plan` : "…"}
+          {sub ? t("AccountButton.planName", { plan: sub.plan }) : "…"}
         </span>
       </div>
       <div className="px-2 py-1 flex items-center justify-between gap-2">
-        <span className="text-secondary">Credits</span>
+        <span className="text-secondary">{t("AccountButton.credits")}</span>
         <span className="text-primary">
           {sub ? sub.balance.toLocaleString() : "…"}
         </span>
@@ -248,7 +252,7 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
         onClick={signOut}
         className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-secondary hover:bg-black/5 dark:hover:bg-white/5 hover:text-primary transition"
       >
-        <LogOut size={12} /> Sign out
+        <LogOut size={12} /> {t("AccountButton.signOut")}
       </button>
     </div>
   );
@@ -259,8 +263,8 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
         <button
           disabled
           className={`${iconCls} opacity-70 cursor-default`}
-          title="Signing in…"
-          aria-label="Signing in…"
+          title={t("AccountButton.signingIn")}
+          aria-label={t("AccountButton.signingIn")}
         >
           <Loader2 className="w-4 h-4 animate-spin" />
         </button>
@@ -271,8 +275,8 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
         <button
           onClick={beginLogin}
           className={iconCls}
-          title="Sign in to Syscity Cloud"
-          aria-label="Sign in to Syscity Cloud"
+          title={t("AccountButton.signInToCloud")}
+          aria-label={t("AccountButton.signInToCloud")}
         >
           <User className="w-4 h-4" />
         </button>
@@ -284,8 +288,8 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
           ref={btnRef}
           onClick={toggleMenu}
           className={iconCls}
-          title={display || "Account"}
-          aria-label="Account"
+          title={display || t("AccountButton.account")}
+          aria-label={t("AccountButton.account")}
         >
           {avatarEl()}
         </button>
@@ -301,11 +305,11 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
       <button
         disabled
         className={`${rowCls} opacity-70 cursor-default`}
-        title="Signing in…"
-        aria-label="Signing in…"
+        title={t("AccountButton.signingIn")}
+        aria-label={t("AccountButton.signingIn")}
       >
         <Loader2 className="w-4 h-4 shrink-0 animate-spin" />
-        <span>Signing in…</span>
+        <span>{t("AccountButton.signingIn")}</span>
       </button>
     );
   }
@@ -315,11 +319,11 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
       <button
         onClick={beginLogin}
         className={rowCls}
-        title="Sign in to Syscity Cloud"
-        aria-label="Sign in to Syscity Cloud"
+        title={t("AccountButton.signInToCloud")}
+        aria-label={t("AccountButton.signInToCloud")}
       >
         <User className="w-4 h-4 shrink-0" />
-        <span>Sign in</span>
+        <span>{t("AccountButton.signIn")}</span>
       </button>
     );
   }
@@ -330,11 +334,13 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
         ref={btnRef}
         onClick={toggleMenu}
         className={`${rowCls} text-primary`}
-        title={display || "Account"}
-        aria-label="Account"
+        title={display || t("AccountButton.account")}
+        aria-label={t("AccountButton.account")}
       >
         {avatarEl("shrink-0")}
-        <span className="truncate flex-1 text-left">{display || "Account"}</span>
+        <span className="truncate flex-1 text-left">
+          {display || t("AccountButton.account")}
+        </span>
       </button>
       {menuOpen &&
         menuPos &&

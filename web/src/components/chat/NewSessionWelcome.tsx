@@ -7,10 +7,12 @@
  *  When an agent was summoned from the sidebar (no session yet), its identity
  *  is shown instead of the generic greeting; the session is still only
  *  created on the first message. */
+import { useTranslation } from "react-i18next";
 import { useChatStore } from "@/stores/chatStore";
 
 export function NewSessionWelcome() {
   const pendingAgent = useChatStore((s) => s.pendingAgent);
+  const { t } = useTranslation("chat");
 
   if (pendingAgent) {
     return (
@@ -19,10 +21,10 @@ export function NewSessionWelcome() {
           {pendingAgent.emoji}
         </span>
         <p className="text-primary text-base font-medium">
-          {pendingAgent.display_name} is ready
+          {t("NewSessionWelcome.agentReady", { name: pendingAgent.display_name })}
         </p>
         <p className="text-secondary text-sm mt-1.5">
-          Send a message to start a session with {pendingAgent.display_name}
+          {t("NewSessionWelcome.sendToStart", { name: pendingAgent.display_name })}
         </p>
       </div>
     );
@@ -37,10 +39,10 @@ export function NewSessionWelcome() {
         draggable={false}
       />
       <p className="text-primary text-base font-medium">
-        How can I help today?
+        {t("NewSessionWelcome.greeting")}
       </p>
       <p className="text-secondary text-sm mt-1.5">
-        Type your message or press / for commands
+        {t("NewSessionWelcome.hint")}
       </p>
     </div>
   );

@@ -1,4 +1,5 @@
 import { useMemo, useState, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { useShikiHighlighter } from "@/hooks/useShikiHighlighter";
 import { useThemeStore } from "@/stores/themeStore";
 import { Check, Copy } from "lucide-react";
@@ -9,6 +10,7 @@ interface CodeBlockProps {
 }
 
 export function CodeBlock({ code, language = "text" }: CodeBlockProps) {
+  const { t } = useTranslation("common");
   const highlighter = useShikiHighlighter();
   const resolvedTheme = useThemeStore((s) => s.resolvedTheme);
   const [copied, setCopied] = useState(false);
@@ -60,18 +62,18 @@ export function CodeBlock({ code, language = "text" }: CodeBlockProps) {
         <button
           onClick={handleCopy}
           className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] text-secondary hover:bg-black/5 dark:hover:bg-white/5 transition opacity-0 group-hover:opacity-100 focus:opacity-100"
-          aria-label="Copy code"
-          title="Copy"
+          aria-label={t("CodeBlock.copyCode")}
+          title={t("CodeBlock.copy")}
         >
           {copied ? (
             <>
               <Check className="w-3 h-3" />
-              <span>Copied</span>
+              <span>{t("CodeBlock.copied")}</span>
             </>
           ) : (
             <>
               <Copy className="w-3 h-3" />
-              <span>Copy</span>
+              <span>{t("CodeBlock.copy")}</span>
             </>
           )}
         </button>

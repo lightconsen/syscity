@@ -1,0 +1,17 @@
+{
+  "WorkspacePanel.defaultAgent": "默认 Agent",
+  "WorkspacePanel.files": "工作区文件",
+  "WorkspacePanel.title": "{{name}} · 工作区",
+  "WorkspacePanel.closeEsc": "关闭工作区浏览器 (Esc)",
+  "WorkspacePanel.close": "关闭工作区浏览器",
+  "FileTree.failedToLoad": "加载失败",
+  "FileTree.loading": "加载中…",
+  "FileTree.retry": "重试",
+  "FileTree.empty": "（空）",
+  "FilePreview.failedToLoad": "文件加载失败",
+  "FilePreview.backToTree": "返回文件树",
+  "FilePreview.downloadFile": "下载文件",
+  "FilePreview.loading": "文件加载中…",
+  "FilePreview.binary": "二进制文件 — 无法预览",
+  "FilePreview.largeFile": "文件过大 — 仅显示前 256 KB（共 {{size}}）"
+}

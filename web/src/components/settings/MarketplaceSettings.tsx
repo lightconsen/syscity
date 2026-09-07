@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Download, Loader2, Lock, RefreshCw, Sparkles, Zap } from "lucide-react";
 import { Section } from "@/components/ui/Section";
 import { getActiveTransport } from "@/SyscityWebSocketTransport";
@@ -28,10 +29,11 @@ interface CatalogResponse {
   entries: CatalogEntry[];
 }
 
-const TYPE_LABELS: Record<string, string> = {
-  connector: "Connectors",
-  skill: "Skills",
-  expert: "Experts",
+/** Catalog entry type → translation key suffix under `MarketplaceSettings.type*`. */
+const TYPE_KEY: Record<string, string> = {
+  connector: "typeConnector",
+  skill: "typeSkill",
+  expert: "typeExpert",
 };
 
 /** Fallback glyph per type, used when a catalog entry has no logo. */
@@ -64,6 +66,7 @@ export function MarketplaceSettings({
   initialType?: string;
   onSummonExpert?: (agentId: string) => void;
 }) {
+  const { t, i18n } = useTranslation("common");
   const [data, setData] = useState<CatalogResponse | null>(cachedCatalog);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -75,10 +78,10 @@ export function MarketplaceSettings({
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
-      // The browser locale (e.g. "zh-CN") becomes the cloud catalog's
+      if (!transport) throw new Error(t("MarketplaceSettings.noConnection"));
+      // The UI language (e.g. "zh-CN") becomes the cloud catalog's
       // Accept-Language on sync — `zh*` resolves the Chinese catalog.
-      const body = (await transport.getConnectorsCatalog(navigator.language)) as CatalogResponse;
+      const body = (await transport.getConnectorsCatalog(i18n.language)) as CatalogResponse;
       if ((body as { error?: string }).error) throw new Error((body as { error?: string }).error);
       setData(body);
       cachedCatalog = body;
@@ -87,11 +90,12 @@ export function MarketplaceSettings({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [i18n.language, t]);
 
   useEffect(() => {
     load();
   }, [load]);
+  // Reload the catalog when the UI language changes (per-language ETags).
 
   /** Install a catalog entry; for experts returns the installed agent id. */
   const install = async (id: string): Promise<string | null> => {
@@ -99,7 +103,7 @@ export function MarketplaceSettings({
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("MarketplaceSettings.noConnection"));
       const body = (await transport.sendRequestAndWait("connectors.catalog_install", {
         id,
       })) as { error?: string; agents?: string[] };
@@ -130,7 +134,7 @@ export function MarketplaceSettings({
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("MarketplaceSettings.noConnection"));
       const body = (await transport.sendRequestAndWait(
         action === "enable" ? "connectors.enable" : "connectors.disable",
         { id }
@@ -151,32 +155,34 @@ export function MarketplaceSettings({
   return (
     <div className="space-y-5">
       <Section
-        title="Extensions"
+        title={t("MarketplaceSettings.title")}
         right={
           <button
             onClick={load}
             disabled={loading}
             className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-sidebar hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition"
-            title="Refresh catalog"
+            title={t("MarketplaceSettings.refreshTitle")}
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-            Refresh
+            {t("MarketplaceSettings.refresh")}
           </button>
         }
       >
         {/* Type filter */}
         <div className="flex gap-1.5 mb-3 flex-wrap">
-          {["all", ...TYPE_ORDER].map((t) => (
+          {["all", ...TYPE_ORDER].map((ty) => (
             <button
-              key={t}
-              onClick={() => setTypeFilter(t)}
+              key={ty}
+              onClick={() => setTypeFilter(ty)}
               className={`px-2.5 py-1 rounded-full text-xs transition ${
-                typeFilter === t
+                typeFilter === ty
                   ? "bg-primary-500 text-white"
                   : "bg-sidebar text-secondary hover:text-primary"
               }`}
             >
-              {t === "all" ? "All" : TYPE_LABELS[t] ?? t}
+              {ty === "all"
+                ? t("MarketplaceSettings.filterAll")
+                : t(`MarketplaceSettings.${TYPE_KEY[ty] ?? ty}`, { defaultValue: ty })}
             </button>
           ))}
         </div>
@@ -184,13 +190,13 @@ export function MarketplaceSettings({
         {error && <p className="text-xs text-red-500 mb-2">{error}</p>}
         {loading && !data ? (
           <div className="flex items-center gap-2 text-secondary text-sm py-6">
-            <Loader2 size={14} className="animate-spin" /> Loading catalog...
+            <Loader2 size={14} className="animate-spin" /> {t("MarketplaceSettings.loading")}
           </div>
         ) : entries.length === 0 ? (
           <p className="text-sm text-secondary py-4">
             {data && !data.synced
-              ? "Catalog is empty. Enable cloud mode and sign in to load extensions."
-              : "No entries in this category yet."}
+              ? t("MarketplaceSettings.emptyNotSynced")
+              : t("MarketplaceSettings.emptyCategory")}
           </p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
@@ -215,11 +221,11 @@ export function MarketplaceSettings({
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="font-medium text-sm text-primary truncate">{e.display_name}</span>
                         <span className="text-[10px] px-1 py-0.5 rounded bg-sidebar text-secondary">
-                          {TYPE_LABELS[e.type] ?? e.type}
+                          {t(`MarketplaceSettings.${TYPE_KEY[e.type] ?? e.type}`, { defaultValue: e.type })}
                         </span>
                       </div>
                       <p className="text-[11px] leading-tight opacity-70 line-clamp-2 mt-0.5">
-                        {e.description || "No description"}
+                        {e.description || t("MarketplaceSettings.noDescription")}
                       </p>
                     </div>
                   </div>
@@ -235,15 +241,15 @@ export function MarketplaceSettings({
                       {e.kind === "cloud" ? (
                         <>
                           <Zap size={10} />
-                          {e.credits_per_use > 0 ? `${e.credits_per_use} credits/call` : "Cloud"}
+                          {e.credits_per_use > 0 ? t("MarketplaceSettings.creditsPerCall", { n: e.credits_per_use }) : t("MarketplaceSettings.cloud")}
                         </>
                       ) : (
-                        "Local · free"
+                        t("MarketplaceSettings.localFree")
                       )}
                     </span>
                     {e.visibility === "member" && (
                       <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sidebar text-secondary">
-                        <Lock size={10} /> Members
+                        <Lock size={10} /> {t("MarketplaceSettings.members")}
                       </span>
                     )}
                     {e.installed && (
@@ -265,7 +271,7 @@ export function MarketplaceSettings({
                         } ${busy ? "opacity-50" : ""}`}
                       >
                         {busy ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />}
-                        Summon
+                        {t("MarketplaceSettings.summon")}
                       </button>
                     ) : (
                       <button
@@ -278,7 +284,7 @@ export function MarketplaceSettings({
                         } ${busy ? "opacity-50" : ""}`}
                       >
                         {busy ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}
-                        {upToDate ? "Installed" : needsUpdate ? "Update" : "Install"}
+                        {upToDate ? t("MarketplaceSettings.installed") : needsUpdate ? t("MarketplaceSettings.update") : t("MarketplaceSettings.install")}
                       </button>
                     )}
                     {e.type !== "expert" && e.installed && e.state === "disabled" && (
@@ -287,7 +293,7 @@ export function MarketplaceSettings({
                         disabled={busyId === `${e.id}:enable`}
                         className="px-2 py-1 rounded text-[11px] bg-sidebar hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition"
                       >
-                        Enable
+                        {t("MarketplaceSettings.enable")}
                       </button>
                     )}
                     {e.type !== "expert" && e.installed && (e.state === "enabled" || e.state === "installed") && (
@@ -296,7 +302,7 @@ export function MarketplaceSettings({
                         disabled={busyId === `${e.id}:disable`}
                         className="px-2 py-1 rounded text-[11px] bg-sidebar hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition"
                       >
-                        Disable
+                        {t("MarketplaceSettings.disable")}
                       </button>
                     )}
                   </div>

@@ -20,6 +20,7 @@ import {
 import { formatDuration } from "@/lib/utils";
 import type { ChatMessage, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { useState, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { useChatStore } from "@/stores/chatStore";
 
 interface MessageBubbleProps {
@@ -84,17 +85,18 @@ function UserMessageActions({
   onEdit?: () => void;
 }) {
   const { copied, copy } = useCopied();
+  const { t } = useTranslation("chat");
 
   return (
     <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
       <ActionButton
         icon={copied ? Check : Copy}
-        title={copied ? "Copied" : "Copy"}
+        title={copied ? t("MessageBubble.copied") : t("MessageBubble.copy")}
         onClick={() => copy(content)}
         active={copied}
       />
       {onEdit && (
-        <ActionButton icon={Pencil} title="Edit" onClick={onEdit} />
+        <ActionButton icon={Pencil} title={t("MessageBubble.edit")} onClick={onEdit} />
       )}
     </div>
   );
@@ -114,12 +116,13 @@ function AssistantMessageActions({
   onVote?: (vote: "up" | "down") => void;
 }) {
   const { copied, copy } = useCopied();
+  const { t } = useTranslation("chat");
 
   return (
     <div className="flex items-center gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
       <ActionButton
         icon={copied ? Check : Copy}
-        title={copied ? "Copied" : "Copy"}
+        title={copied ? t("MessageBubble.copied") : t("MessageBubble.copy")}
         onClick={() => copy(content)}
         active={copied}
       />
@@ -127,13 +130,13 @@ function AssistantMessageActions({
         <>
           <ActionButton
             icon={ThumbsUp}
-            title="Helpful"
+            title={t("MessageBubble.helpful")}
             onClick={() => onVote("up")}
             active={vote === "up"}
           />
           <ActionButton
             icon={ThumbsDown}
-            title="Not helpful"
+            title={t("MessageBubble.notHelpful")}
             onClick={() => onVote("down")}
             active={vote === "down"}
           />
@@ -142,7 +145,7 @@ function AssistantMessageActions({
       {onRegenerate && (
         <ActionButton
           icon={RotateCcw}
-          title="Regenerate"
+          title={t("MessageBubble.regenerate")}
           onClick={onRegenerate}
         />
       )}
@@ -185,11 +188,12 @@ function InternalsToggle({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const { t } = useTranslation("chat");
   if (reasoning === 0 && toolCalls === 0) return null;
 
   const parts: string[] = [];
-  if (reasoning > 0) parts.push(`${reasoning} thinking`);
-  if (toolCalls > 0) parts.push(`${toolCalls} tool${toolCalls !== 1 ? "s" : ""}`);
+  if (reasoning > 0) parts.push(t("MessageBubble.thinkingCount", { count: reasoning }));
+  if (toolCalls > 0) parts.push(t("MessageBubble.toolCount", { count: toolCalls }));
 
   return (
     <button
@@ -210,6 +214,7 @@ function InternalsToggle({
 }
 
 export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps) {
+  const { t } = useTranslation("chat");
   const isUser = message.role === "user";
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(message.content);
@@ -252,7 +257,7 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
           <Avatar role="user" />
           <div className="flex-1 min-w-0 text-right">
             <div className="text-[11px] font-medium text-secondary mb-1 uppercase tracking-wide">
-              You
+              {t("MessageBubble.you")}
             </div>
             {isEditing ? (
               <div className="inline-block text-left w-full max-w-xl">
@@ -267,7 +272,7 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
                   className="w-full resize-none rounded-xl px-4 py-2.5 text-sm bg-card text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20"
                 />
                 <div className="mt-1 text-[10px] text-secondary text-right">
-                  Enter to save, Esc to cancel
+                  {t("MessageBubble.enterToSave")}
                 </div>
               </div>
             ) : (
@@ -427,7 +432,7 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
               {message.toolCount !== undefined && message.toolCount > 0 && (
                 <span className="flex items-center gap-1">
                   <Wrench className="w-3 h-3" />
-                  {message.toolCount} tool{message.toolCount !== 1 ? "s" : ""}
+                  {t("MessageBubble.toolCount", { count: message.toolCount })}
                 </span>
               )}
             </div>

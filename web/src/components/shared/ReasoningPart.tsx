@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 
 function BrainIcon({ className }: { className?: string }) {
   return (
@@ -10,6 +11,7 @@ function BrainIcon({ className }: { className?: string }) {
 }
 
 export function ReasoningPart({ text, nonCollapsible }: { text: string; nonCollapsible?: boolean }) {
+  const { t } = useTranslation("common");
   const [expanded, setExpanded] = useState(true);
   const [displayedText, setDisplayedText] = useState("");
   const [done, setDone] = useState(false);
@@ -101,7 +103,7 @@ export function ReasoningPart({ text, nonCollapsible }: { text: string; nonColla
       <div className="my-3">
         <div className="flex items-center gap-2 text-[11px] font-medium text-secondary mb-2">
           <BrainIcon className="w-3.5 h-3.5" />
-          <span>Thinking</span>
+          <span>{t("ReasoningPart.thinking")}</span>
         </div>
         <hr className="border-subtle mb-2" />
         <div className="text-[11px] text-secondary font-mono whitespace-pre-wrap leading-relaxed">
@@ -119,8 +121,8 @@ export function ReasoningPart({ text, nonCollapsible }: { text: string; nonColla
         className="flex items-center gap-2 my-2 px-3 py-2 rounded-lg bg-sidebar text-secondary hover:bg-black/[0.04] dark:hover:bg-white/[0.05] text-xs transition"
       >
         <BrainIcon className="w-3.5 h-3.5" />
-        <span className="font-medium">Thinking</span>
-        <span className="text-secondary/60">({text.length} chars)</span>
+        <span className="font-medium">{t("ReasoningPart.thinking")}</span>
+        <span className="text-secondary/60">({t("ReasoningPart.chars", { count: text.length })})</span>
         <svg className="w-3 h-3 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
         </svg>
@@ -139,7 +141,7 @@ export function ReasoningPart({ text, nonCollapsible }: { text: string; nonColla
         className="w-full flex items-center gap-2 px-3 py-2 text-[11px] font-medium text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition"
       >
         <BrainIcon className="w-3.5 h-3.5" />
-        <span>Thinking</span>
+        <span>{t("ReasoningPart.thinking")}</span>
         {isTyping && (
           <span className="ml-auto inline-flex gap-0.5 items-center">
             <span className="w-1 h-1 rounded-full bg-primary-400 dark:bg-primary-500 animate-bounce [animation-delay:0ms]" />
@@ -152,7 +154,7 @@ export function ReasoningPart({ text, nonCollapsible }: { text: string; nonColla
             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
             </svg>
-            done
+            {t("ReasoningPart.done")}
           </span>
         )}
       </button>

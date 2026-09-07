@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Check, ChevronDown } from "lucide-react";
 import type { ModelInfo, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { ProviderLogo } from "@/components/ui/ProviderLogo";
@@ -11,6 +12,7 @@ interface ModelSelectorProps {
 // the active session (explicit session pin -> bound agent's model -> global
 // default) and persists a session-level pin via sessions.set_model on change.
 export function ModelSelector({ transport }: ModelSelectorProps) {
+  const { t } = useTranslation("chat");
   const [sessionId, setSessionId] = useState(() => transport.getSessionId());
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [defaultModel, setDefaultModel] = useState("");
@@ -130,8 +132,10 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
         // Don't take focus on mouse click so the composer's focus-within ring
         // (and the button's own ring) never highlight when picking a model.
         onMouseDown={(e) => e.preventDefault()}
-        title={`Model: ${effective || "default"}${sessionModel ? "" : " (default)"}`}
-        aria-label="Select model"
+        title={`${t("ModelSelector.modelTitle", {
+          model: effective || t("ModelSelector.default"),
+        })}${sessionModel ? "" : t("ModelSelector.defaultSuffix")}`}
+        aria-label={t("ModelSelector.selectModel")}
         aria-haspopup="listbox"
         aria-expanded={open}
         className="flex items-center gap-1.5 max-w-[10rem] rounded-lg px-2 py-1.5 text-xs text-secondary hover:text-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] focus:outline-none transition"
@@ -146,7 +150,7 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
         <span className="truncate">
           {effectiveModel
             ? `${effectiveModel.provider_name} - ${effectiveModel.name}`
-            : effective || "Default model"}
+            : effective || t("ModelSelector.defaultModel")}
         </span>
         <ChevronDown
           className={`w-3 h-3 shrink-0 text-secondary/60 transition-transform ${open ? "rotate-180" : ""}`}
@@ -173,9 +177,13 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
             >
               <span className="w-4 h-4 shrink-0" />
               <span className="flex-1 min-w-0">
-                <span className="block text-sm text-primary">Default model</span>
+                <span className="block text-sm text-primary">
+                  {t("ModelSelector.defaultModel")}
+                </span>
                 {fallback && (
-                  <span className="block text-xs text-secondary truncate">uses {fallback}</span>
+                  <span className="block text-xs text-secondary truncate">
+                    {t("ModelSelector.uses", { model: fallback })}
+                  </span>
                 )}
               </span>
               {sessionModel === null && <Check className="w-4 h-4 text-primary shrink-0" />}

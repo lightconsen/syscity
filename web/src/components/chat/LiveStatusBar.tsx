@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 interface LiveStatusBarProps {
   liveStatus: { status: "thinking" | "tool_calling"; toolName?: string };
@@ -7,6 +8,7 @@ interface LiveStatusBarProps {
 
 export function LiveStatusBar({ liveStatus, startTime }: LiveStatusBarProps) {
   const [elapsed, setElapsed] = useState(0);
+  const { t } = useTranslation("chat");
 
   useEffect(() => {
     const id = setInterval(() => setElapsed(Date.now() - startTime), 500);
@@ -15,8 +17,8 @@ export function LiveStatusBar({ liveStatus, startTime }: LiveStatusBarProps) {
 
   const label =
     liveStatus.status === "tool_calling"
-      ? `Running ${liveStatus.toolName || "tool"}...`
-      : "Thinking...";
+      ? t("LiveStatusBar.runningTool", { tool: liveStatus.toolName || "tool" })
+      : t("LiveStatusBar.thinking");
 
   return (
     <div className="mt-2 flex items-center gap-2 text-xs text-secondary animate-pulse">
