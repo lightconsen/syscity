@@ -248,6 +248,9 @@ function ChatApp() {
   const workspacePanelOpen = useChatStore((s) => s.workspacePanelOpen);
   const setWorkspacePanelOpen = useChatStore((s) => s.setWorkspacePanelOpen);
   const currentAgent = useChatStore((s) => s.currentAgent);
+  // Message count drives the "welcome page" state (empty chat = New Session
+  // welcome), which the sidebar uses to highlight the right nav item.
+  const messageCount = useChatStore((s) => s.messages.length);
 
   // Resizable split panel state
   const [previewRatio, setPreviewRatio] = useState(() => {
@@ -789,6 +792,8 @@ function ChatApp() {
             onCreateSessionWithAgent={handleCreateSessionWithAgent}
             onOpenMarketplace={openMarketplace}
             onOpenKnowledgeBase={openKb}
+            activeView={kbOpen ? "kb" : marketplaceOpen ? "extensions" : "chat"}
+            chatWelcome={messageCount === 0}
             pendingApprovals={pendingApprovals.length}
             onShowApprovals={() => {}}
             onRenameSession={handleRenameSession}
@@ -838,6 +843,8 @@ function ChatApp() {
                   openKb();
                   setMobileNavOpen(false);
                 }}
+                activeView={kbOpen ? "kb" : marketplaceOpen ? "extensions" : "chat"}
+                chatWelcome={messageCount === 0}
                 onRenameSession={handleRenameSession}
                 onDeleteSession={handleDeleteSession}
                 onPinSession={handlePinSession}

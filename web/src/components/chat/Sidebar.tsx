@@ -48,6 +48,13 @@ interface SidebarProps {
   onOpenMarketplace: (type?: string) => void;
   /** Open the Knowledge Base management page (local + cloud). */
   onOpenKnowledgeBase?: () => void;
+  /** Which full-page view is currently showing, so the nav items can
+   *  highlight (chat = the main view; kb / extensions are the sidebar's
+   *  own pages). */
+  activeView?: "chat" | "kb" | "extensions";
+  /** The chat view is showing the New Session welcome page (no messages
+   *  yet) — highlights "New Session" instead of a session row. */
+  chatWelcome?: boolean;
   onRenameSession?: (id: string, name: string) => void | Promise<void>;
   onDeleteSession?: (id: string) => void | Promise<void>;
   onPinSession?: (id: string, pinned: boolean) => void | Promise<void>;
@@ -67,12 +74,17 @@ export function Sidebar({
   onCreateSessionWithAgent,
   onOpenMarketplace,
   onOpenKnowledgeBase,
+  activeView = "chat",
+  chatWelcome = false,
   onRenameSession,
   onDeleteSession,
   onPinSession,
 }: SidebarProps) {
 
   const listContainerRef = useRef<HTMLDivElement>(null);
+  // Session rows only read as "current" while a real conversation is on
+  // screen — on the welcome page, KB, or Extensions the nav item takes over.
+  const chatActive = activeView === "chat" && !chatWelcome;
   const [sessionRatio, setSessionRatio] = useState<number>(() => {
     const saved = localStorage.getItem("syscity_sidebar_session_ratio");
     if (saved) {
@@ -235,11 +247,14 @@ export function Sidebar({
         >
           <button
             onClick={onNewSession}
-            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04] ${
-              collapsed ? "justify-center" : ""
-            }`}
+            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
+              activeView === "chat" && chatWelcome
+                ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
+                : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+            } ${collapsed ? "justify-center" : ""}`}
             title="New session"
             aria-label="New session"
+            aria-current={activeView === "chat" && chatWelcome ? "page" : undefined}
           >
             <Plus className="w-4 h-4 shrink-0" />
             {!collapsed && <span>New Session</span>}
@@ -247,11 +262,14 @@ export function Sidebar({
           {/* Extensions (marketplace): connectors, skills, experts. */}
           <button
             onClick={() => onOpenMarketplace()}
-            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04] ${
-              collapsed ? "justify-center" : ""
-            }`}
+            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
+              activeView === "extensions"
+                ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
+                : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+            } ${collapsed ? "justify-center" : ""}`}
             title="Browse extensions"
             aria-label="Extensions"
+            aria-current={activeView === "extensions" ? "page" : undefined}
           >
             <Puzzle className="w-4 h-4 shrink-0" />
             {!collapsed && <span>Extensions</span>}
@@ -260,11 +278,14 @@ export function Sidebar({
           {onOpenKnowledgeBase && (
             <button
               onClick={onOpenKnowledgeBase}
-              className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04] ${
-                collapsed ? "justify-center" : ""
-              }`}
+              className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
+                activeView === "kb"
+                  ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
+                  : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+              } ${collapsed ? "justify-center" : ""}`}
               title="Manage knowledge bases"
               aria-label="Knowledge Base"
+              aria-current={activeView === "kb" ? "page" : undefined}
             >
               <Library className="w-4 h-4 shrink-0" />
               {!collapsed && <span>Knowledge Base</span>}
@@ -282,7 +303,7 @@ export function Sidebar({
                   <SessionRow
                     key={s.id}
                     session={s}
-                    currentSessionId={currentSessionId}
+                    currentSessionId={chatActive ? currentSessionId : ""}
                     runningSessionIds={runningSessionIds}
                     collapsed={collapsed}
                     onSwitch={() => onSwitchSession(s.id)}
@@ -298,7 +319,7 @@ export function Sidebar({
               <SessionRow
                 key={s.id}
                 session={s}
-                currentSessionId={currentSessionId}
+                currentSessionId={chatActive ? currentSessionId : ""}
                 runningSessionIds={runningSessionIds}
                 collapsed={collapsed}
                 onSwitch={() => onSwitchSession(s.id)}
