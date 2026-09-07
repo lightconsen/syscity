@@ -12,6 +12,11 @@ use crate::gateway::GatewayState;
 /// `connectors.catalog` — the marketplace catalog (cached) joined with each
 /// entry's installed state.
 ///
+/// Optional params: `{ lang }` — forwarded as `Accept-Language` when a sync
+/// happens (`catalog.json` is bilingual: `zh*` → Chinese, else English; the
+/// cloud ETag is per-language, so a language change naturally triggers a full
+/// 200 refresh and the single-slot disk cache self-heals).
+///
 /// On a first visit with an empty cache the handler one-shot syncs from the
 /// cloud catalog URL when cloud mode is active (feature + `cloud.enabled` +
 /// logged in), so member/cloud entries are visible immediately. Returns
@@ -20,6 +25,17 @@ pub(crate) async fn handle_connectors_catalog(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
+    // Params are optional (the UI may send none): `{}` or absent = no
+    // language preference.
+    #[derive(Deserialize, Default)]
+    struct Params {
+        lang: Option<String>,
+    }
+    let p: Params = req
+        .params
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
     let manager = &state.tools.connector_manager;
     let doc: Option<crate::mcp::connectors::catalog::CatalogDocument> = {
         let cached = match manager.cached_catalog().await {
@@ -40,10 +56,7 @@ pub(crate) async fn handle_connectors_catalog(
             let cfg = state.config.read().await.cloud.clone();
             if cfg.enabled && crate::cloud::session::logged_in().await {
                 let url = format!("{}/catalog.json", cfg.api_base.trim_end_matches('/'));
-                if let Ok((fresh, _)) = manager
-                    .sync_catalog(&url, cfg.catalog_lang.as_deref())
-                    .await
-                {
+                if let Ok((fresh, _)) = manager.sync_catalog(&url, p.lang.as_deref()).await {
                     Some(fresh)
                 } else {
                     None

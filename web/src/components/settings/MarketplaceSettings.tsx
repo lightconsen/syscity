@@ -76,7 +76,9 @@ export function MarketplaceSettings({
     try {
       const transport = getActiveTransport();
       if (!transport) throw new Error("No gateway connection");
-      const body = (await transport.getConnectorsCatalog()) as CatalogResponse;
+      // The browser locale (e.g. "zh-CN") becomes the cloud catalog's
+      // Accept-Language on sync — `zh*` resolves the Chinese catalog.
+      const body = (await transport.getConnectorsCatalog(navigator.language)) as CatalogResponse;
       if ((body as { error?: string }).error) throw new Error((body as { error?: string }).error);
       setData(body);
       cachedCatalog = body;
