@@ -11,6 +11,59 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-07
+
+### Added
+
+- feat(ui): titlebar session context strip + PanelLeft sidebar toggle
+- feat(chat): defer agent session creation to first message
+- feat(ui): sidebar nav highlighting by active view
+- feat(kb): document preview in resizable right panel, Titlebar toggle
+- feat(kb): cloud backups toolbar chip + popover, progressive page load
+- feat(kb): merge KB page with per-file backup and document viewer
+- feat(kb): kb.doc_content WS method for document preview
+- feat(kb): allow local_gguf embeddings for the knowledge base
+- feat(kb): Backup & Sync panel replaces cloud KB management
+- feat(cloud): KB backup & sync — cloud.kb.docs/push/pull orchestration over WS
+- feat(kb): flat local document list with Agent column
+- feat(kb): Knowledge Base view — local per-agent collections + cloud KBs
+- feat(ui): show cloud avatar in AccountButton; English cloud banner
+- feat(ui): New Session opens a welcome page; session created on first message
+- feat(ui): merge marketplace sidebar entries into one Extensions item
+- feat(ui): account button in titlebar; split marketplace entry into three
+- feat(ui): move workspace toggle from composer toolbar to the Titlebar
+- feat(ui): move status dot and theme toggle into the Statusbar zone
+- feat(ui): move sidebar header (logo + name + toggle) into the titlebar zone
+- feat(ui): align titlebar identity with the sidebar's right edge
+- feat(ui): 3-row shell with Titlebar and Statusbar
+- feat(desktop): overlay titlebar config + platform command
+- feat(release): LLM-drafted release notes via scripts/.env config
+- feat(release): full release flow in release.sh — changelog, bump, tag
+
+### Fixed
+
+- fix(rag): enable embeddings in local GGUF context params
+- fix(kb): drop duplicated count in backup/restore result notes
+- fix(rag): scope vector delete_by_source to a collection
+- fix(cloud): flatten /auth/me user identity in cloud.status/cloud.token
+- fix(web): wait for WS connection before submitting the OAuth callback token
+- fix(cloud): rewrite asset URLs to absolute on the OAuth callback route
+- fix(cloud): repair OAuth login flow (console URL + callback route)
+- fix(web): substitute {VERSION} in title for dev server and prod build
+
+### Changed
+
+- chore(web): rename app title to "Syscity Agent"
+- style(ui): dedicated bg-rail token, left rail sits a step below page
+- chore: ignore .e2e-tmp scratch directory
+- style(web): tighten sidebar top action spacing
+- style: fix ASCII diagram alignment in README
+- refactor(ui): rename MarketplaceView to ExtensionsView
+- style(ui): move workspace toggle to the far right of the Titlebar
+- style(ui): workspace toggle icon → lucide PanelRight
+- feat(ui): pane-following chrome colors for Titlebar and Statusbar
+- chore(desktop): grant core window/event capabilities
+
 ## [0.3.1] - 2026-09-04
 
 ### Highlights
