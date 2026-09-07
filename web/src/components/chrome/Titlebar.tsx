@@ -66,6 +66,14 @@ export function Titlebar({
   const currentAgent = useChatStore((s) => s.currentAgent);
   const workspacePanelOpen = useChatStore((s) => s.workspacePanelOpen);
   const setWorkspacePanelOpen = useChatStore((s) => s.setWorkspacePanelOpen);
+  const kbPanelOpen = useChatStore((s) => s.kbPanelOpen);
+  const setKbPanelOpen = useChatStore((s) => s.setKbPanelOpen);
+
+  // The "show right sidebar" button manages whichever pane the active page
+  // hosts: workspace files / document preview in chat, document preview in
+  // the Knowledge Base page.
+  const inKbPage = page?.title === "Knowledge Base";
+  const rightPanelOpen = inKbPage ? kbPanelOpen : workspacePanelOpen;
 
   const isMac = platform === "tauri-macos";
   const showSafeAreaTop = platform === "tauri-mobile" || (isMobile && !isMac);
@@ -188,15 +196,19 @@ export function Titlebar({
         {!isMobile && (
           <button
             type="button"
-            title="Browse workspace files"
-            aria-label="Browse workspace files"
-            aria-pressed={workspacePanelOpen}
+            title={inKbPage ? "Toggle document panel" : "Browse workspace files"}
+            aria-label={inKbPage ? "Toggle document panel" : "Browse workspace files"}
+            aria-pressed={rightPanelOpen}
             className={
-              workspacePanelOpen
+              rightPanelOpen
                 ? "p-1.5 rounded-md text-primary-600 dark:text-primary-400 bg-black/5 dark:bg-white/10 transition"
                 : iconBtnCls
             }
-            onClick={() => setWorkspacePanelOpen(!workspacePanelOpen)}
+            onClick={() =>
+              inKbPage
+                ? setKbPanelOpen(!kbPanelOpen)
+                : setWorkspacePanelOpen(!workspacePanelOpen)
+            }
           >
             {/* Hermes-desktop-style "show right sidebar" glyph */}
             <PanelRight className="w-4 h-4" />

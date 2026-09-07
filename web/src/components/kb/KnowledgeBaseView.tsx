@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Cloud, CloudUpload, FileText, Loader2, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { getActiveTransport } from "@/SyscityWebSocketTransport";
 import { cloudLoginUrl, cloudStatus, type CloudStatus } from "@/lib/cloud";
+import { useChatStore } from "@/stores/chatStore";
 import { MarkdownMessage } from "@/components/shared/MarkdownMessage";
 
 export interface KbAgent {
@@ -162,6 +163,16 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   // Cloud popover (opened from the toolbar status chip; click-away closes).
   const [cloudOpen, setCloudOpen] = useState(false);
 
+  // Right-side document panel. Visibility is shared with the Titlebar's
+  // "show right sidebar" button (kbPanelOpen); viewDoc holds which row it
+  // shows. The pane is resizable on md+ with the same drag-divider pattern
+  // as the chat split.
+  const kbPanelOpen = useChatStore((s) => s.kbPanelOpen);
+  const setKbPanelOpen = useChatStore((s) => s.setKbPanelOpen);
+  const [paneRatio, setPaneRatio] = useState(0.42);
+  const [paneDragging, setPaneDragging] = useState(false);
+  const paneRowRef = useRef<HTMLDivElement | null>(null);
+
   // Upload dialog.
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadAgent, setUploadAgent] = useState<string>(DEFAULT_AGENT);
@@ -182,6 +193,7 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   const openDoc = useCallback(async (row: DocRow) => {
     setViewDoc(row);
     setViewBody({ kind: "loading" });
+    setKbPanelOpen(true);
     try {
       const transport = getActiveTransport();
       if (!transport) throw new Error("No gateway connection");
@@ -196,7 +208,7 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     } catch (e) {
       setViewBody({ kind: "error", message: e instanceof Error ? e.message : String(e) });
     }
-  }, []);
+  }, [setKbPanelOpen]);
 
   const cloudReady = !!cloudSt?.enabled && !!cloudSt.logged_in;
 
@@ -290,8 +302,11 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     load();
     return () => {
       if (pollTimer.current) window.clearInterval(pollTimer.current);
+      // The panel flag is per-visit: leaving the KB page closes the pane so
+      // re-entering starts clean (the selected doc is component-local anyway).
+      setKbPanelOpen(false);
     };
-  }, [load]);
+  }, [load, setKbPanelOpen]);
 
   const backupStateOf = (row: DocRow): BackupState => {
     if (!cloudSt?.enabled) return { kind: "unknown", why: "Cloud is not enabled" };
@@ -487,10 +502,14 @@ embedding_api_key = "sk-..."`}</pre>
   const backedUpCount = rows.filter((r) => backupStateOf(r).kind === "backed-up").length;
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-page">
+    <div ref={paneRowRef} className="flex-1 flex overflow-hidden bg-page">
+      {/* Left column: toolbar + document list. The right side hosts the
+          document preview pane (md+ split with drag divider; full-screen
+          overlay below md). */}
+      <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
       {/* Toolbar — Upload is the only primary action; the cloud lives behind
           a quiet status chip on the right (popover, click-away closes). */}
-      <div className="flex items-center gap-2 px-6 md:px-8 py-3 border-b border-subtle shrink-0">
+      <div className="flex items-center gap-2 px-6 md:px-8 py-3 shrink-0">
         <button
           onClick={() => {
             setUploadAgent(DEFAULT_AGENT);
@@ -611,11 +630,14 @@ embedding_api_key = "sk-..."`}</pre>
                                         className="text-xs px-2 py-1.5 rounded-md bg-page text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20 max-w-36"
                                       >
                                         <option value="">Restore to…</option>
-                                        {agents.map((a) => (
-                                          <option key={a.id} value={a.id}>
-                                            {a.emoji} {a.display_name}
-                                          </option>
-                                        ))}
+                                        <option value={DEFAULT_AGENT}>Default agent</option>
+                                        {agents
+                                          .filter((a) => a.id !== DEFAULT_AGENT)
+                                          .map((a) => (
+                                            <option key={a.id} value={a.id}>
+                                              {a.emoji} {a.display_name}
+                                            </option>
+                                          ))}
                                       </select>
                                       <button
                                         onClick={() => pull(kb, chosenAgent)}
@@ -765,57 +787,113 @@ embedding_api_key = "sk-..."`}</pre>
         </div>
       </div>
 
-      {/* Document viewer: preview the source file (text/markdown only —
-          binary formats and URL sources show an explanatory note). */}
-      {viewDoc && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setViewDoc(null)} />
-          <div className="relative bg-card rounded-xl shadow-xl w-[42rem] max-w-[92vw] h-[80vh] flex flex-col">
-            <div className="flex items-center gap-2 px-5 py-3 border-b border-subtle shrink-0">
-              <FileText className="w-4 h-4 shrink-0 text-secondary" />
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-primary truncate">{viewDoc.doc_id}</p>
-                <p className="text-[10px] text-secondary/70 truncate">
-                  {viewDoc.collection}
-                  {viewBody.kind === "text" &&
-                    ` · ${viewBody.truncated ? "first 256 KB" : "full document"}`}
-                </p>
-              </div>
-              <button
-                onClick={() => setViewDoc(null)}
-                className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
-                title="Close"
-                aria-label="Close document viewer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto px-5 py-4">
-              {viewBody.kind === "loading" && (
-                <div className="flex items-center justify-center gap-2 text-secondary text-sm py-10">
-                  <Loader2 className="w-4 h-4 animate-spin" /> Loading…
+      </div>
+
+      {/* Drag divider (md+): same pattern as the chat right-pane split. */}
+      {kbPanelOpen && (
+        <div
+          className={`relative hidden md:block w-px shrink-0 cursor-col-resize after:absolute after:inset-y-0 after:-left-1.5 after:-right-1.5 after:content-[''] transition-colors ${
+            paneDragging ? "bg-primary-500" : "bg-black/15 dark:bg-white/25 hover:bg-primary-400/60"
+          }`}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const row = paneRowRef.current;
+            if (!row) return;
+            const rect = row.getBoundingClientRect();
+            setPaneDragging(true);
+            document.body.style.userSelect = "none";
+            document.body.style.cursor = "col-resize";
+
+            const onMove = (me: MouseEvent) => {
+              const x = Math.max(0, Math.min(rect.width, me.clientX - rect.left));
+              const ratio = x / rect.width;
+              setPaneRatio(1 - Math.max(0.2, Math.min(0.8, ratio)));
+            };
+            const onUp = () => {
+              setPaneDragging(false);
+              document.body.style.userSelect = "";
+              document.body.style.cursor = "";
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+        />
+      )}
+
+      {/* Right pane: document preview (text/markdown only — binary formats
+          and URL sources show an explanatory note). Below md it takes the
+          whole screen as an overlay; on md+ it is a resizable split column
+          whose width comes from --pane-w. Without a selected document the
+          pane shows a hint (md+ only, so mobile never gets an empty
+          full-screen aside). */}
+      {kbPanelOpen && (
+        <aside
+          className={`shrink-0 flex-col ${
+            viewDoc
+              ? "fixed inset-0 z-30 bg-page flex md:static md:z-auto md:flex-none md:w-[var(--pane-w)]"
+              : "hidden md:flex md:flex-none md:w-[var(--pane-w)] bg-page"
+          }`}
+          style={{ "--pane-w": `${paneRatio * 100}%` } as CSSProperties}
+        >
+          {viewDoc ? (
+            <>
+              <div className="flex items-center gap-2 px-4 py-3 shrink-0">
+                <FileText className="w-4 h-4 shrink-0 text-secondary" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-primary truncate">{viewDoc.doc_id}</p>
+                  <p className="text-[10px] text-secondary/70 truncate">
+                    {viewDoc.collection}
+                    {viewBody.kind === "text" &&
+                      ` · ${viewBody.truncated ? "first 256 KB" : "full document"}`}
+                  </p>
                 </div>
-              )}
-              {viewBody.kind === "error" && (
-                <p className="text-xs text-red-600 dark:text-red-400">{viewBody.message}</p>
-              )}
-              {viewBody.kind === "binary" && (
-                <p className="text-xs text-secondary py-10 text-center">
-                  Preview isn't available for binary documents (pdf/docx/xlsx) — the content is
-                  indexed and retrievable by the agent.
-                </p>
-              )}
-              {viewBody.kind === "text" &&
-                (/\.md$/i.test(basename(viewDoc.source_id)) ? (
-                  <MarkdownMessage text={viewBody.content} />
-                ) : (
-                  <pre className="text-xs font-mono whitespace-pre-wrap text-primary leading-relaxed">
-                    {viewBody.content}
-                  </pre>
-                ))}
+                <button
+                  onClick={() => {
+                    setViewDoc(null);
+                    setKbPanelOpen(false);
+                  }}
+                  className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
+                  title="Close"
+                  aria-label="Close document viewer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto px-5 py-4">
+                {viewBody.kind === "loading" && (
+                  <div className="flex items-center justify-center gap-2 text-secondary text-sm py-10">
+                    <Loader2 className="w-4 h-4 animate-spin" /> Loading…
+                  </div>
+                )}
+                {viewBody.kind === "error" && (
+                  <p className="text-xs text-red-600 dark:text-red-400">{viewBody.message}</p>
+                )}
+                {viewBody.kind === "binary" && (
+                  <p className="text-xs text-secondary py-10 text-center">
+                    Preview isn't available for binary documents (pdf/docx/xlsx) — the content is
+                    indexed and retrievable by the agent.
+                  </p>
+                )}
+                {viewBody.kind === "text" &&
+                  (/\.md$/i.test(basename(viewDoc.source_id)) ? (
+                    <MarkdownMessage text={viewBody.content} />
+                  ) : (
+                    <pre className="text-xs font-mono whitespace-pre-wrap text-primary leading-relaxed">
+                      {viewBody.content}
+                    </pre>
+                  ))}
+              </div>
+            </>
+          ) : (
+            <div className="flex-1 flex items-center justify-center px-6">
+              <p className="text-xs text-secondary text-center">
+                Select a document to preview it here.
+              </p>
             </div>
-          </div>
-        </div>
+          )}
+        </aside>
       )}
 
       {/* Upload dialog: pick files, optionally pick the destination agent

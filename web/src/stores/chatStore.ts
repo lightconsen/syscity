@@ -71,6 +71,9 @@ interface ChatState {
   messageVotes: Record<string, "up" | "down" | undefined>;
   previewDocument: PreviewDocument | null;
   workspacePanelOpen: boolean;
+  /** KB page's right-side document panel — driven by the same Titlebar
+   *  "show right sidebar" button, but scoped to the Knowledge Base view. */
+  kbPanelOpen: boolean;
 
   setMessages: (messages: ChatMessage[]) => void;
   prependMessages: (messages: ChatMessage[]) => void;
@@ -98,6 +101,7 @@ interface ChatState {
   setMessageVote: (turnId: string, vote: "up" | "down" | undefined) => void;
   setPreviewDocument: (doc: PreviewDocument | null) => void;
   setWorkspacePanelOpen: (open: boolean) => void;
+  setKbPanelOpen: (open: boolean) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -114,6 +118,7 @@ export const useChatStore = create<ChatState>((set) => ({
   messageVotes: loadMessageVotes(),
   previewDocument: null,
   workspacePanelOpen: false,
+  kbPanelOpen: false,
 
   setMessages: (messages) => set({ messages }),
   prependMessages: (messages) => set((s) => ({ messages: [...messages, ...s.messages] })),
@@ -157,4 +162,5 @@ export const useChatStore = create<ChatState>((set) => ({
     set(doc ? { previewDocument: doc, workspacePanelOpen: false } : { previewDocument: doc }),
   setWorkspacePanelOpen: (open) =>
     set(open ? { workspacePanelOpen: true, previewDocument: null } : { workspacePanelOpen: false }),
+  setKbPanelOpen: (open) => set({ kbPanelOpen: open }),
 }));
