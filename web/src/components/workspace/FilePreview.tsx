@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { AlertCircle, ArrowLeft, Download, Loader2 } from "lucide-react";
 import { MarkdownMessage } from "@/components/shared/MarkdownMessage";
 import { CodeBlock } from "@/components/shared/CodeBlock";
@@ -61,6 +62,7 @@ type LoadState =
 
 /** Inline preview of a single workspace file (markdown / code / plain text). */
 export function FilePreview({ transport, agentId, path, onBack }: FilePreviewProps) {
+  const { t } = useTranslation("workspace");
   const [state, setState] = useState<LoadState>({ status: "loading" });
 
   useEffect(() => {
@@ -82,13 +84,13 @@ export function FilePreview({ transport, agentId, path, onBack }: FilePreviewPro
         if (cancelled) return;
         setState({
           status: "error",
-          message: err instanceof Error ? err.message : "Failed to load file",
+          message: err instanceof Error ? err.message : t("FilePreview.failedToLoad"),
         });
       });
     return () => {
       cancelled = true;
     };
-  }, [transport, agentId, path]);
+  }, [transport, agentId, path, t]);
 
   const handleDownload = useCallback(() => {
     if (state.status !== "loaded" || !state.content) return;
@@ -112,8 +114,8 @@ export function FilePreview({ transport, agentId, path, onBack }: FilePreviewPro
           type="button"
           onClick={onBack}
           className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary hover:text-primary transition"
-          title="Back to file tree"
-          aria-label="Back to file tree"
+          title={t("FilePreview.backToTree")}
+          aria-label={t("FilePreview.backToTree")}
         >
           <ArrowLeft className="w-4 h-4" />
         </button>
@@ -125,8 +127,8 @@ export function FilePreview({ transport, agentId, path, onBack }: FilePreviewPro
           onClick={handleDownload}
           disabled={state.status !== "loaded" || !state.content}
           className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary hover:text-primary transition disabled:opacity-30 disabled:pointer-events-none"
-          title="Download file"
-          aria-label="Download file"
+          title={t("FilePreview.downloadFile")}
+          aria-label={t("FilePreview.downloadFile")}
         >
           <Download className="w-4 h-4" />
         </button>
@@ -137,7 +139,7 @@ export function FilePreview({ transport, agentId, path, onBack }: FilePreviewPro
         {state.status === "loading" && (
           <div className="flex items-center justify-center h-40 text-secondary">
             <Loader2 className="w-6 h-6 animate-spin" />
-            <span className="ml-2 text-sm">Loading file…</span>
+            <span className="ml-2 text-sm">{t("FilePreview.loading")}</span>
           </div>
         )}
         {state.status === "error" && (
@@ -150,7 +152,7 @@ export function FilePreview({ transport, agentId, path, onBack }: FilePreviewPro
         {state.status === "loaded" && state.binary && (
           <div className="flex flex-col items-center justify-center h-40 text-secondary gap-2">
             <AlertCircle className="w-8 h-8 opacity-60" />
-            <p className="text-sm">Binary file — preview not available</p>
+            <p className="text-sm">{t("FilePreview.binary")}</p>
             <p className="text-xs opacity-60">
               {fileName} · {formatSize(state.size)}
             </p>
@@ -160,7 +162,7 @@ export function FilePreview({ transport, agentId, path, onBack }: FilePreviewPro
           <>
             {state.truncated && (
               <div className="mb-3 px-3 py-2 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs">
-                Large file — showing first 256 KB of {formatSize(state.size)}
+                {t("FilePreview.largeFile", { size: formatSize(state.size) })}
               </div>
             )}
             {ext === "md" || ext === "markdown" ? (

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { Cloud, CloudUpload, FileText, Loader2, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { getActiveTransport } from "@/SyscityWebSocketTransport";
 import { cloudLoginUrl, cloudStatus, type CloudStatus } from "@/lib/cloud";
@@ -87,14 +89,18 @@ const statusBadge = (status: string) => {
 
 /** Display owner for a collection: the agent's name for `kb-{agent_id}`,
  * "Default" for collections not bound to an agent (shared). */
-function ownerOf(collection: string, agents: KbAgent[]): { label: string; emoji: string } {
+function ownerOf(
+  collection: string,
+  agents: KbAgent[],
+  t: TFunction
+): { label: string; emoji: string } {
   if (collection.startsWith("kb-") && collection.length > 3) {
     const id = collection.slice(3);
     const a = agents.find((x) => x.id === id);
     if (a) return { label: a.display_name, emoji: a.emoji };
     return { label: id, emoji: "🤖" };
   }
-  return { label: "Default", emoji: "📁" };
+  return { label: t("KnowledgeBaseView.defaultCollection"), emoji: "📁" };
 }
 
 /** File → base64 (same approach as AddSkillForm: no chunking, small files). */
@@ -108,12 +114,18 @@ async function fileToBase64(file: File): Promise<string> {
 }
 
 /** Human summary of a push/pull response. */
-function resultSummary(r: PushResult | PullResult, verb: string): string {
-  const parts = [`${verb} ${"pushed" in r ? r.pushed : r.pulled}`, `${r.unchanged} unchanged`];
-  if ("skipped_url" in r && r.skipped_url > 0) parts.push(`${r.skipped_url} url`);
-  if ("skipped_external" in r && r.skipped_external > 0) parts.push(`${r.skipped_external} external`);
-  if ("too_large" in r && r.too_large > 0) parts.push(`${r.too_large} too large`);
-  if (r.failed > 0) parts.push(`${r.failed} failed`);
+function resultSummary(r: PushResult | PullResult, verb: string, t: TFunction): string {
+  const parts = [
+    t("KnowledgeBaseView.summaryVerbCount", { verb, n: "pushed" in r ? r.pushed : r.pulled }),
+    t("KnowledgeBaseView.summaryUnchanged", { n: r.unchanged }),
+  ];
+  if ("skipped_url" in r && r.skipped_url > 0)
+    parts.push(t("KnowledgeBaseView.summaryUrl", { n: r.skipped_url }));
+  if ("skipped_external" in r && r.skipped_external > 0)
+    parts.push(t("KnowledgeBaseView.summaryExternal", { n: r.skipped_external }));
+  if ("too_large" in r && r.too_large > 0)
+    parts.push(t("KnowledgeBaseView.summaryTooLarge", { n: r.too_large }));
+  if (r.failed > 0) parts.push(t("KnowledgeBaseView.summaryFailed", { n: r.failed }));
   if (r.errors.length > 0) parts.push(r.errors[0]);
   return parts.join(" · ");
 }
@@ -170,6 +182,7 @@ type BackupState =
  * cloud is storage only — indexing/retrieval stays local.
  */
 export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
+  const { t } = useTranslation("kb");
   const [configured, setConfigured] = useState<boolean | null>(kbCache?.configured ?? null);
   const [reason, setReason] = useState<string | null>(kbCache?.reason ?? null);
   const [collections, setCollections] = useState<CollectionSummary[]>(kbCache?.collections ?? []);
@@ -230,7 +243,7 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     setKbPanelOpen(true);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       const body = await transport.kbDocContent(row.collection, row.doc_id);
       if (body.binary) setViewBody({ kind: "binary" });
       else
@@ -242,14 +255,14 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     } catch (e) {
       setViewBody({ kind: "error", message: e instanceof Error ? e.message : String(e) });
     }
-  }, [setKbPanelOpen]);
+  }, [setKbPanelOpen, t]);
 
   const cloudReady = !!cloudSt?.enabled && !!cloudSt.logged_in;
 
   // Local data only — the page can render as soon as this lands.
   const loadLocal = useCallback(async () => {
     const transport = getActiveTransport();
-    if (!transport) throw new Error("No gateway connection");
+    if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
     const body = await transport.listKbCollections();
     setConfigured(body.configured);
     setReason(body.reason);
@@ -266,7 +279,7 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
       collections: cols,
       rows: nextRows,
     });
-  }, []);
+  }, [t]);
 
   // Cloud state is best-effort and slower (network round trips to Syscity
   // Cloud): status failures degrade the backup column to "—"; list failures
@@ -377,23 +390,33 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     setUploading(true);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       const notes: string[] = [];
       for (const file of pendingFiles) {
         const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
         if (!ALLOWED_EXT.includes(ext)) {
-          notes.push(`${file.name}: unsupported type (.${ext})`);
+          notes.push(t("KnowledgeBaseView.unsupportedType", { name: file.name, ext }));
           continue;
         }
         if (file.size > MAX_UPLOAD_BYTES) {
-          notes.push(`${file.name}: exceeds ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`);
+          notes.push(
+            t("KnowledgeBaseView.exceedsSize", {
+              name: file.name,
+              mb: MAX_UPLOAD_BYTES / (1024 * 1024),
+            })
+          );
           continue;
         }
         try {
           const base64 = await fileToBase64(file);
           await transport.ingestKbDoc(uploadAgent || DEFAULT_AGENT, file.name, base64);
         } catch (e) {
-          notes.push(`${file.name}: ${e instanceof Error ? e.message : String(e)}`);
+          notes.push(
+            t("KnowledgeBaseView.uploadItemFailed", {
+              name: file.name,
+              error: e instanceof Error ? e.message : String(e),
+            })
+          );
         }
       }
       if (notes.length > 0) setUploadNote(notes.join(" · "));
@@ -412,12 +435,18 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       const r = (await transport.cloudKbPush(collection)) as PushResult;
-      setPushNote(`${collection}: ${resultSummary(r, "Pushed")}`);
+      const summary = resultSummary(r, t("KnowledgeBaseView.pushed"), t);
+      setPushNote(t("KnowledgeBaseView.pushNote", { collection, summary }));
       await load();
     } catch (e) {
-      setPushNote(`${collection}: ${e instanceof Error ? e.message : String(e)}`);
+      setPushNote(
+        t("KnowledgeBaseView.pushFailed", {
+          collection,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      );
     } finally {
       setBusyPush(null);
     }
@@ -429,18 +458,28 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       const parts: string[] = [];
       for (const c of collections) {
         try {
           const r = (await transport.cloudKbPush(c.collection)) as PushResult;
           if (r.pushed > 0 || r.failed > 0 || r.errors.length > 0)
-            parts.push(`${c.collection}: ${resultSummary(r, "Pushed")}`);
+            parts.push(
+              t("KnowledgeBaseView.pushNote", {
+                collection: c.collection,
+                summary: resultSummary(r, t("KnowledgeBaseView.pushed"), t),
+              })
+            );
         } catch (e) {
-          parts.push(`${c.collection}: ${e instanceof Error ? e.message : String(e)}`);
+          parts.push(
+            t("KnowledgeBaseView.pushFailed", {
+              collection: c.collection,
+              error: e instanceof Error ? e.message : String(e),
+            })
+          );
         }
       }
-      setPushNote(parts.length > 0 ? parts.join(" · ") : "All collections already backed up");
+      setPushNote(parts.length > 0 ? parts.join(" · ") : t("KnowledgeBaseView.allBackedUp"));
       await load();
     } finally {
       setBusyPush(null);
@@ -448,12 +487,17 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   };
 
   const deleteDoc = async (row: DocRow) => {
-    if (!confirm(`Delete document "${row.doc_id}" from ${row.collection}?`)) return;
+    if (
+      !confirm(
+        t("KnowledgeBaseView.confirmDeleteDoc", { id: row.doc_id, collection: row.collection })
+      )
+    )
+      return;
     setBusyDoc(`${row.collection}:${row.doc_id}`);
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       await transport.deleteKbDoc(row.collection, row.doc_id);
       await load();
     } catch (e) {
@@ -488,9 +532,12 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       const r = (await transport.cloudKbPull({ cloud_kb_id: kb.id, agent_id: agentId })) as PullResult;
-      setPullNotes((prev) => ({ ...prev, [kb.id]: resultSummary(r, "Restored") }));
+      setPullNotes((prev) => ({
+        ...prev,
+        [kb.id]: resultSummary(r, t("KnowledgeBaseView.restored"), t),
+      }));
       await load();
     } catch (e) {
       setPullNotes((prev) => ({
@@ -501,12 +548,11 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   };
 
   const deleteKb = async (kb: CloudKb) => {
-    if (!confirm(`Delete the cloud backup "${kb.name}"? The local collection is not affected.`))
-      return;
+    if (!confirm(t("KnowledgeBaseView.confirmDeleteCloudKb", { name: kb.name }))) return;
     setError(null);
     try {
       const transport = getActiveTransport();
-      if (!transport) throw new Error("No gateway connection");
+      if (!transport) throw new Error(t("KnowledgeBaseView.noGateway"));
       await transport.cloudKbDelete(kb.id);
       await load();
     } catch (e) {
@@ -527,14 +573,16 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
         <div className="max-w-lg mx-auto mt-10 text-center">
           <FileText className="w-10 h-10 mx-auto mb-3 text-secondary/60" />
           <h3 className="text-sm font-semibold text-primary mb-1">
-            Local knowledge base is not configured
+            {t("KnowledgeBaseView.notConfigured")}
           </h3>
           <p className="text-xs text-secondary mb-3">
-            {reason ?? "Embedding provider is not available."}
+            {reason ?? t("KnowledgeBaseView.noEmbeddingProvider")}
           </p>
           <div className="text-xs text-secondary bg-card rounded-lg p-3 text-left">
             <p className="mb-1">
-              In <code className="px-1 rounded bg-black/5 dark:bg-white/10">~/.syscity/config.toml</code>:
+              {t("KnowledgeBaseView.inConfig")}{" "}
+              <code className="px-1 rounded bg-black/5 dark:bg-white/10">~/.syscity/config.toml</code>
+              {t("KnowledgeBaseView.configColon")}
             </p>
             <pre className="text-[11px] whitespace-pre-wrap">{`[vector_memory]
 provider = "open_ai"
@@ -567,11 +615,15 @@ embedding_api_key = "sk-..."`}</pre>
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition"
         >
           <Upload className="w-3.5 h-3.5" />
-          Upload
+          {t("KnowledgeBaseView.upload")}
         </button>
         <div className="flex-1" />
         <span className="text-[11px] text-secondary">
-          {rows.length} documents · {collections.length} collections · {totalChunks} chunks
+          {t("KnowledgeBaseView.stats", {
+            docs: rows.length,
+            collections: collections.length,
+            chunks: totalChunks,
+          })}
         </span>
         {cloudSt?.enabled && (
           <div className="relative">
@@ -579,8 +631,8 @@ embedding_api_key = "sk-..."`}</pre>
               onClick={() => setCloudOpen((v) => !v)}
               title={
                 cloudReady
-                  ? "Cloud backups"
-                  : "Sign in to back up your knowledge bases to Syscity Cloud"
+                  ? t("KnowledgeBaseView.cloudBackups")
+                  : t("KnowledgeBaseView.cloudSignInTitle")
               }
               className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-md text-[11px] font-medium border transition ${
                 cloudReady && cloudLoaded && rows.length > 0 && backedUpCount === rows.length
@@ -600,7 +652,9 @@ embedding_api_key = "sk-..."`}</pre>
                 <div className="fixed inset-0 z-40" onClick={() => setCloudOpen(false)} />
                 <div className="absolute right-0 top-full mt-2 z-50 w-[24rem] max-w-[92vw] bg-card rounded-xl shadow-xl border border-subtle overflow-hidden">
                   <div className="flex items-center justify-between px-4 py-2.5 border-b border-subtle">
-                    <p className="text-xs font-semibold text-primary">Cloud backups</p>
+                    <p className="text-xs font-semibold text-primary">
+                      {t("KnowledgeBaseView.cloudBackups")}
+                    </p>
                     {cloudReady && cloudSt?.user && (
                       <p className="text-[10px] text-secondary truncate max-w-[12rem]">
                         {cloudSt.user.name || cloudSt.user.email}
@@ -610,15 +664,14 @@ embedding_api_key = "sk-..."`}</pre>
                   {!cloudReady ? (
                     <div className="px-4 py-4 space-y-3">
                       <p className="text-xs text-secondary">
-                        Back up your knowledge bases to Syscity Cloud and restore them on any
-                        device signed into the same account.
+                        {t("KnowledgeBaseView.cloudPopoverBody")}
                       </p>
                       <button
                         onClick={signIn}
                         className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition"
                       >
                         <Cloud className="w-3.5 h-3.5" />
-                        Sign in to Syscity Cloud
+                        {t("KnowledgeBaseView.signIn")}
                       </button>
                     </div>
                   ) : (
@@ -626,7 +679,7 @@ embedding_api_key = "sk-..."`}</pre>
                       <div className="max-h-[18rem] overflow-y-auto divide-y divide-subtle">
                         {cloudKbs.length === 0 ? (
                           <p className="px-4 py-6 text-center text-xs text-secondary">
-                            No backups yet — back up your collections below.
+                            {t("KnowledgeBaseView.noBackupsYet")}
                           </p>
                         ) : (
                           cloudKbs.map((kb) => {
@@ -641,13 +694,15 @@ embedding_api_key = "sk-..."`}</pre>
                                   <Cloud className="w-3.5 h-3.5 shrink-0 text-secondary" />
                                   <p className="text-sm text-primary truncate flex-1">{kb.name}</p>
                                   <span className="text-[10px] text-secondary/70 shrink-0">
-                                    {kb.document_count ?? 0} docs
+                                    {t("KnowledgeBaseView.docsCount", { n: kb.document_count ?? 0 })}
                                   </span>
                                   <button
                                     onClick={() => deleteKb(kb)}
                                     className="p-1 rounded-md text-secondary hover:text-red-500 hover:bg-red-500/10 transition shrink-0"
-                                    title="Delete cloud backup"
-                                    aria-label={`Delete backup ${kb.name}`}
+                                    title={t("KnowledgeBaseView.deleteCloudBackup")}
+                                    aria-label={t("KnowledgeBaseView.deleteBackupNamed", {
+                                      name: kb.name,
+                                    })}
                                   >
                                     <Trash2 className="w-3.5 h-3.5" />
                                   </button>
@@ -660,9 +715,13 @@ embedding_api_key = "sk-..."`}</pre>
                                     <button
                                       onClick={() => pull(kb, mappedAgent.id)}
                                       className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition"
-                                      title={`Restore into ${mappedAgent.display_name}'s collection`}
+                                      title={t("KnowledgeBaseView.restoreIntoCollection", {
+                                        name: mappedAgent.display_name,
+                                      })}
                                     >
-                                      Restore to {mappedAgent.display_name}
+                                      {t("KnowledgeBaseView.restoreTo", {
+                                        name: mappedAgent.display_name,
+                                      })}
                                     </button>
                                   ) : (
                                     <>
@@ -676,8 +735,12 @@ embedding_api_key = "sk-..."`}</pre>
                                         }
                                         className="text-xs px-2 py-1.5 rounded-md bg-page text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20 max-w-36"
                                       >
-                                        <option value="">Restore to…</option>
-                                        <option value={DEFAULT_AGENT}>Default agent</option>
+                                        <option value="">
+                                          {t("KnowledgeBaseView.restoreToPlaceholder")}
+                                        </option>
+                                        <option value={DEFAULT_AGENT}>
+                                          {t("KnowledgeBaseView.defaultAgent")}
+                                        </option>
                                         {agents
                                           .filter((a) => a.id !== DEFAULT_AGENT)
                                           .map((a) => (
@@ -691,7 +754,7 @@ embedding_api_key = "sk-..."`}</pre>
                                         disabled={!chosenAgent}
                                         className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition disabled:opacity-50"
                                       >
-                                        Restore
+                                        {t("KnowledgeBaseView.restore")}
                                       </button>
                                     </>
                                   )}
@@ -713,7 +776,7 @@ embedding_api_key = "sk-..."`}</pre>
                             ) : (
                               <CloudUpload className="w-3.5 h-3.5" />
                             )}
-                            Back up all collections
+                            {t("KnowledgeBaseView.backUpAll")}
                           </button>
                         </div>
                       )}
@@ -727,8 +790,8 @@ embedding_api_key = "sk-..."`}</pre>
         <button
           onClick={load}
           className="p-1 rounded-md text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5 transition"
-          title="Refresh"
-          aria-label="Refresh"
+          title={t("KnowledgeBaseView.refresh")}
+          aria-label={t("KnowledgeBaseView.refresh")}
         >
           <RefreshCw className="w-3.5 h-3.5" />
         </button>
@@ -745,22 +808,23 @@ embedding_api_key = "sk-..."`}</pre>
             <div className="py-10 text-center text-xs text-secondary">
               {loading ? (
                 <span className="inline-flex items-center gap-2">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading local collections…
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />{" "}
+                  {t("KnowledgeBaseView.loadingCollections")}
                 </span>
               ) : (
-                "No documents yet — click Upload to add files."
+                t("KnowledgeBaseView.noDocuments")
               )}
             </div>
           ) : (
             rows.map((d) => {
-              const owner = ownerOf(d.collection, agents);
+              const owner = ownerOf(d.collection, agents, t);
               const bs = backupStateOf(d);
               return (
                 <div
                   key={`${d.collection}:${d.doc_id}`}
                   className="flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-black/[0.03] dark:hover:bg-white/[0.03] transition"
                   onClick={() => openDoc(d)}
-                  title="View document"
+                  title={t("KnowledgeBaseView.viewDocument")}
                 >
                   <FileText className="w-4 h-4 shrink-0 text-secondary" />
                   <div className="min-w-0 flex-1">
@@ -768,14 +832,17 @@ embedding_api_key = "sk-..."`}</pre>
                       {d.doc_id}
                     </p>
                     <p className="text-[10px] text-secondary/70 truncate">
-                      {d.chunk_count} chunks · {new Date(d.indexed_at).toLocaleString()}
+                      {t("KnowledgeBaseView.docMeta", {
+                        chunks: d.chunk_count,
+                        date: new Date(d.indexed_at).toLocaleString(),
+                      })}
                       {d.error ? ` · ${d.error}` : ""}
                     </p>
                   </div>
                   {d.collection !== "kb-default" && (
                     <span
                       className="hidden sm:inline-flex items-center gap-1 w-28 justify-center px-2 py-0.5 rounded-full bg-black/5 dark:bg-white/10 text-[10px] text-secondary shrink-0"
-                      title={`Collection ${d.collection}`}
+                      title={t("KnowledgeBaseView.collectionNamed", { name: d.collection })}
                     >
                       <span aria-hidden="true">{owner.emoji}</span>
                       <span className="truncate">{owner.label}</span>
@@ -790,7 +857,10 @@ embedding_api_key = "sk-..."`}</pre>
                       cloud is off, not signed in, or the source isn't
                       eligible (URL) — the chip popover handles the rest. */}
                   {bs.kind === "backed-up" && (
-                    <span className="shrink-0 flex justify-center w-6" title="Backed up to Syscity Cloud">
+                    <span
+                      className="shrink-0 flex justify-center w-6"
+                      title={t("KnowledgeBaseView.backedUp")}
+                    >
                       <Cloud className="w-3.5 h-3.5 text-green-600 dark:text-green-400" />
                     </span>
                   )}
@@ -802,7 +872,7 @@ embedding_api_key = "sk-..."`}</pre>
                       }}
                       disabled={busyPush !== null}
                       className="p-1.5 rounded-md text-secondary hover:text-primary-600 dark:hover:text-primary-400 hover:bg-primary-50 dark:hover:bg-primary-900/20 transition disabled:opacity-50 shrink-0"
-                      title={`Back up ${d.collection} to Syscity Cloud`}
+                      title={t("KnowledgeBaseView.backUpCollection", { name: d.collection })}
                     >
                       {busyPush === d.collection ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -818,8 +888,8 @@ embedding_api_key = "sk-..."`}</pre>
                     }}
                     disabled={busyDoc === `${d.collection}:${d.doc_id}`}
                     className="p-1.5 rounded-md text-secondary hover:text-red-500 hover:bg-red-500/10 transition disabled:opacity-50 shrink-0"
-                    title="Delete document"
-                    aria-label={`Delete ${d.doc_id}`}
+                    title={t("KnowledgeBaseView.deleteDocument")}
+                    aria-label={t("KnowledgeBaseView.deleteNamed", { name: d.doc_id })}
                   >
                     {busyDoc === `${d.collection}:${d.doc_id}` ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -893,7 +963,11 @@ embedding_api_key = "sk-..."`}</pre>
                   <p className="text-[10px] text-secondary/70 truncate">
                     {viewDoc.collection}
                     {viewBody.kind === "text" &&
-                      ` · ${viewBody.truncated ? "first 256 KB" : "full document"}`}
+                      ` · ${
+                        viewBody.truncated
+                          ? t("KnowledgeBaseView.previewTruncated")
+                          : t("KnowledgeBaseView.previewFull")
+                      }`}
                   </p>
                 </div>
                 <button
@@ -902,8 +976,8 @@ embedding_api_key = "sk-..."`}</pre>
                     setKbPanelOpen(false);
                   }}
                   className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
-                  title="Close"
-                  aria-label="Close document viewer"
+                  title={t("KnowledgeBaseView.close")}
+                  aria-label={t("KnowledgeBaseView.closeViewer")}
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -911,7 +985,7 @@ embedding_api_key = "sk-..."`}</pre>
               <div className="flex-1 overflow-y-auto px-5 py-4">
                 {viewBody.kind === "loading" && (
                   <div className="flex items-center justify-center gap-2 text-secondary text-sm py-10">
-                    <Loader2 className="w-4 h-4 animate-spin" /> Loading…
+                    <Loader2 className="w-4 h-4 animate-spin" /> {t("KnowledgeBaseView.loading")}
                   </div>
                 )}
                 {viewBody.kind === "error" && (
@@ -919,8 +993,7 @@ embedding_api_key = "sk-..."`}</pre>
                 )}
                 {viewBody.kind === "binary" && (
                   <p className="text-xs text-secondary py-10 text-center">
-                    Preview isn't available for binary documents (pdf/docx/xlsx) — the content is
-                    indexed and retrievable by the agent.
+                    {t("KnowledgeBaseView.binaryNote")}
                   </p>
                 )}
                 {viewBody.kind === "text" &&
@@ -936,7 +1009,7 @@ embedding_api_key = "sk-..."`}</pre>
           ) : (
             <div className="flex-1 flex items-center justify-center px-6">
               <p className="text-xs text-secondary text-center">
-                Select a document to preview it here.
+                {t("KnowledgeBaseView.selectHint")}
               </p>
             </div>
           )}
@@ -949,15 +1022,19 @@ embedding_api_key = "sk-..."`}</pre>
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/40" onClick={() => !uploading && setUploadOpen(false)} />
           <div className="relative bg-card rounded-xl shadow-xl p-5 w-[26rem] max-w-[90vw] space-y-4">
-            <h3 className="text-sm font-semibold text-primary">Upload documents</h3>
+            <h3 className="text-sm font-semibold text-primary">
+              {t("KnowledgeBaseView.uploadDocuments")}
+            </h3>
             <label className="block">
-              <span className="block text-xs text-secondary mb-1">Destination agent (optional)</span>
+              <span className="block text-xs text-secondary mb-1">
+                {t("KnowledgeBaseView.destinationAgent")}
+              </span>
               <select
                 value={uploadAgent}
                 onChange={(e) => setUploadAgent(e.target.value)}
                 className="w-full text-sm px-3 py-2 rounded-md bg-page text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20"
               >
-                <option value={DEFAULT_AGENT}>Default agent</option>
+                <option value={DEFAULT_AGENT}>{t("KnowledgeBaseView.defaultAgent")}</option>
                 {agents
                   .filter((a) => a.id !== DEFAULT_AGENT)
                   .map((a) => (
@@ -968,13 +1045,13 @@ embedding_api_key = "sk-..."`}</pre>
               </select>
             </label>
             <p className="text-[10px] text-secondary/70">
-              Documents go to{" "}
+              {t("KnowledgeBaseView.uploadHintPrefix")}{" "}
               <code className="px-1 rounded bg-black/5 dark:bg-white/10">
                 kb-{uploadAgent || DEFAULT_AGENT}
               </code>{" "}
-              and are retrievable by that agent immediately. Allowed:{" "}
-              {ALLOWED_EXT.map((e) => `.${e}`).join(" ")}, up to {MAX_UPLOAD_BYTES / (1024 * 1024)}{" "}
-              MB each.
+              {t("KnowledgeBaseView.uploadHintMiddle")}{" "}
+              {ALLOWED_EXT.map((e) => `.${e}`).join(" ")}
+              {t("KnowledgeBaseView.uploadHintSize", { mb: MAX_UPLOAD_BYTES / (1024 * 1024) })}
             </p>
             <input
               ref={fileInputRef}
@@ -995,7 +1072,7 @@ embedding_api_key = "sk-..."`}</pre>
                 disabled={uploading}
                 className="px-3 py-1.5 rounded-md text-xs font-medium text-secondary hover:bg-black/5 dark:hover:bg-white/5 transition disabled:opacity-50"
               >
-                Cancel
+                {t("KnowledgeBaseView.cancel")}
               </button>
               <button
                 onClick={confirmUpload}
@@ -1003,7 +1080,7 @@ embedding_api_key = "sk-..."`}</pre>
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition disabled:opacity-50"
               >
                 {uploading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                Upload
+                {t("KnowledgeBaseView.upload")}
               </button>
             </div>
           </div>

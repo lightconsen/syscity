@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   AlertCircle,
   ChevronDown,
@@ -56,6 +57,7 @@ export function FileTree({
   onSelectFile,
   onRootResolved,
 }: FileTreeProps) {
+  const { t } = useTranslation("workspace");
   // Key: directory path relative to the workspace root ("" = root).
   const [children, setChildren] = useState<Record<string, DirState>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -75,12 +77,12 @@ export function FileTree({
           ...prev,
           [dirPath]: {
             status: "error",
-            message: err instanceof Error ? err.message : "Failed to load",
+            message: err instanceof Error ? err.message : t("FileTree.failedToLoad"),
           },
         }));
       }
     },
-    [transport, agentId, onRootResolved]
+    [transport, agentId, onRootResolved, t]
   );
 
   useEffect(() => {
@@ -116,7 +118,7 @@ export function FileTree({
       return (
         <div className="flex items-center gap-1.5 py-1 pr-2 text-sm text-secondary" style={pad}>
           <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-          <span className="text-xs">Loading…</span>
+          <span className="text-xs">{t("FileTree.loading")}</span>
         </div>
       );
     }
@@ -130,7 +132,7 @@ export function FileTree({
             className="text-xs underline shrink-0"
             onClick={() => loadDir(dirPath)}
           >
-            Retry
+            {t("FileTree.retry")}
           </button>
         </div>
       );
@@ -138,7 +140,7 @@ export function FileTree({
     if (node.entries.length === 0) {
       return (
         <div className="py-1 pr-2 text-xs text-secondary" style={pad}>
-          (empty)
+          {t("FileTree.empty")}
         </div>
       );
     }
