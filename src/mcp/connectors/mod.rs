@@ -552,12 +552,18 @@ impl ConnectorManager {
     ///
     /// When a cloud session token is stored it is attached to the request
     /// (P1-4), so the catalog carries the login-visible view (member entries).
-    pub async fn sync_catalog(&self, url: &str) -> crate::Result<(CatalogDocument, bool)> {
+    /// `lang` is forwarded as `Accept-Language` (ETags are per-language —
+    /// keep it stable between calls or expect one full refresh per change).
+    pub async fn sync_catalog(
+        &self,
+        url: &str,
+        lang: Option<&str>,
+    ) -> crate::Result<(CatalogDocument, bool)> {
         #[cfg(feature = "cloud")]
         let token = crate::cloud::session::get_token().await;
         #[cfg(not(feature = "cloud"))]
         let token: Option<String> = None;
-        self.catalog_cache().sync(url, token.as_deref()).await
+        self.catalog_cache().sync(url, token.as_deref(), lang).await
     }
 
     /// Locally cached catalog document (no network).

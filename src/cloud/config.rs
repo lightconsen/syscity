@@ -29,6 +29,13 @@ pub struct CloudConfig {
     /// engine callback through to the chosen provider's OAuth.
     #[serde(default = "default_console_url")]
     pub console_url: String,
+    /// `Accept-Language` sent when syncing the marketplace catalog
+    /// (`catalog.json` is bilingual: `zh*` → Chinese, else English). The
+    /// cached catalog + its ETag are per-language: change this value and the
+    /// next conditional request gets an ETag mismatch → full 200 refresh in
+    /// the new language (single-slot cache self-heals).
+    #[serde(default = "default_catalog_lang")]
+    pub catalog_lang: Option<String>,
 }
 
 fn default_api_base() -> String {
@@ -60,6 +67,12 @@ fn default_console_url() -> String {
     "https://cloud.syscity.net".to_string()
 }
 
+fn default_catalog_lang() -> Option<String> {
+    std::env::var("SYSCITY_CLOUD_CATALOG_LANG")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
@@ -72,6 +85,7 @@ impl Default for CloudConfig {
                 .unwrap_or_else(|_| default_redirect_base()),
             console_url: std::env::var("SYSCITY_CLOUD_CONSOLE_URL")
                 .unwrap_or_else(|_| default_console_url()),
+            catalog_lang: default_catalog_lang(),
         }
     }
 }
@@ -100,5 +114,15 @@ mod tests {
 
         let on: CloudConfig = toml::from_str("enabled = true").unwrap();
         assert!(on.enabled);
+    }
+
+    #[test]
+    fn test_catalog_lang_parses() {
+        let zh: CloudConfig = toml::from_str("catalog_lang = \"zh\"").unwrap();
+        assert_eq!(zh.catalog_lang.as_deref(), Some("zh"));
+
+        // Absent key: the env-aware default (None when the env is unset).
+        let plain: CloudConfig = toml::from_str("").unwrap();
+        assert_eq!(plain.catalog_lang, default_catalog_lang());
     }
 }

@@ -285,12 +285,18 @@ impl CatalogCache {
     /// `public` entries — §3.6). ETags are per-view, so switching between
     /// anonymous and authed views naturally refreshes the cache.
     ///
+    /// `lang` (when set) is sent as `Accept-Language` — `catalog.json` is
+    /// bilingual and ETags are per-language, so the header must be stable
+    /// across requests; changing it yields an ETag mismatch → full 200
+    /// refresh in the new language (the single-slot cache self-heals).
+    ///
     /// Returns the (possibly cached) document plus whether the cache was
     /// refreshed during this call.
     pub async fn sync(
         &self,
         url: &str,
         token: Option<&str>,
+        lang: Option<&str>,
     ) -> crate::Result<(CatalogDocument, bool)> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let meta = self.load_meta().await;
@@ -301,6 +307,9 @@ impl CatalogCache {
         }
         if let Some(token) = token {
             request = request.bearer_auth(token);
+        }
+        if let Some(lang) = lang {
+            request = request.header(reqwest::header::ACCEPT_LANGUAGE, lang);
         }
         let response = request.send().await.map_err(|e| {
             crate::error::SyscityError::Internal(format!("Catalog fetch failed: {e}"))

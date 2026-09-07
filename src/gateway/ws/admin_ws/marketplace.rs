@@ -40,7 +40,10 @@ pub(crate) async fn handle_connectors_catalog(
             let cfg = state.config.read().await.cloud.clone();
             if cfg.enabled && crate::cloud::session::logged_in().await {
                 let url = format!("{}/catalog.json", cfg.api_base.trim_end_matches('/'));
-                if let Ok((fresh, _)) = manager.sync_catalog(&url).await {
+                if let Ok((fresh, _)) = manager
+                    .sync_catalog(&url, cfg.catalog_lang.as_deref())
+                    .await
+                {
                     Some(fresh)
                 } else {
                     None
