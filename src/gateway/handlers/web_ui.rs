@@ -67,6 +67,18 @@ pub async fn register_sw_handler() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/javascript")], js)
 }
 
+/// Service worker script handler — serves the vite-plugin-pwa generated
+/// `sw.js` (workbox runtime inlined, so no sibling chunk import is needed).
+/// A dedicated handler without a `Path` extractor: the route is a literal
+/// path, and extracting `Path` from it makes axum reject every request
+/// with a 500.
+pub async fn sw_js_handler() -> impl IntoResponse {
+    if let Some((data, _)) = crate::embed::get_asset("sw.js") {
+        return ([(header::CONTENT_TYPE, "application/javascript")], data).into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 /// Web app manifest handler — serves the Vite PWA manifest.
 pub async fn manifest_handler() -> impl IntoResponse {
     let manifest = crate::embed::get_asset_string("manifest.webmanifest").unwrap_or_default();
@@ -152,6 +164,15 @@ mod tests {
     #[tokio::test]
     async fn register_sw_returns_javascript() {
         let resp = register_sw_handler().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/javascript");
+        let (_, bytes) = body(resp).await;
+        assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sw_js_returns_javascript() {
+        let resp = sw_js_handler().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/javascript");
         let (_, bytes) = body(resp).await;

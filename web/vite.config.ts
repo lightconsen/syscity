@@ -20,6 +20,9 @@ export default defineConfig({
       workbox: {
         globPatterns: ['**/*.{js,css,html,png,svg,ico}'],
         maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
+        // Inline the workbox runtime into sw.js: the gateway serves only the
+        // literal /sw.js route, so a sibling workbox-*.js chunk would 404.
+        inlineWorkboxRuntime: true,
       },
       manifest: {
         name: 'Syscity Agent',
