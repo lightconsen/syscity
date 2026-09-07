@@ -122,7 +122,7 @@ export function Titlebar({
           when collapsed they fill the whole w-16, so the toggle renders
           just after it instead. */}
       <div
-        className={`hidden md:flex shrink-0 h-full items-center bg-sidebar transition-all duration-300 ${
+        className={`hidden md:flex shrink-0 h-full items-center bg-rail transition-all duration-300 ${
           sidebarCollapsed ? "w-16" : "w-64"
         } ${sidebarCollapsed ? "justify-center" : isMac ? "pl-[72px]" : "pl-3"}`}
       >

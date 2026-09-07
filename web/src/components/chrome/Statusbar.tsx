@@ -40,7 +40,7 @@ export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
       {/* Sidebar-width zone: status + theme on the sidebar surface.
           Auto-width below md (no mirrored pane there). */}
       <div
-        className={`flex items-center gap-2 pl-3 pr-2 self-stretch shrink-0 md:transition-all md:duration-300 md:bg-[var(--bg-sidebar)] ${
+        className={`flex items-center gap-2 pl-3 pr-2 self-stretch shrink-0 md:transition-all md:duration-300 md:bg-[var(--bg-rail)] ${
           sidebarCollapsed ? "md:w-16" : "md:w-64"
         }`}
       >

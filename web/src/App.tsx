@@ -833,7 +833,7 @@ function ChatApp() {
               onClick={() => setMobileNavOpen(false)}
             />
             <div
-              className="absolute inset-y-0 left-0 w-72 max-w-[85vw] bg-sidebar shadow-xl"
+              className="absolute inset-y-0 left-0 w-72 max-w-[85vw] bg-rail shadow-xl"
               style={{
                 paddingTop: "env(safe-area-inset-top)",
                 paddingBottom: "env(safe-area-inset-bottom)",

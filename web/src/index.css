@@ -23,8 +23,11 @@
   --color-primary-dark: #1E40AF;
   --color-primary-light: #3B82F6;
   --message-list-max-width: 56rem;
-  /* Light: clean SaaS dashboard — light gray page, soft white surfaces. */
-  --bg-page: #F4F5F7;
+  /* Light: clean SaaS dashboard — light gray page, soft white surfaces.
+     The left rail sits a step below the page so the chat canvas reads
+     brightest (sidebar muted, content prominent). */
+  --bg-page: #FCFDFE;
+  --bg-rail: #ECEEF1;
   --bg-sidebar: #FFFFFF;
   --bg-card: #FFFFFF;
   --border-subtle: rgba(0, 0, 0, 0.06);
@@ -34,8 +37,10 @@
 }
 
 .dark {
-  /* Dark: near-black analytics UI — cards defined by borders, not shadows. */
+  /* Dark: near-black analytics UI — cards defined by borders, not shadows.
+     Left rail goes darker than the page for the same muted-rail contrast. */
   --bg-page: #0B0C0E;
+  --bg-rail: #08090A;
   --bg-sidebar: #111113;
   --bg-card: #16181C;
   --border-subtle: rgba(255, 255, 255, 0.08);
@@ -121,6 +126,7 @@ textarea[aria-label="Message input"]:focus-visible {
 @layer utilities {
   .bg-page { background-color: var(--bg-page); }
   .bg-sidebar { background-color: var(--bg-sidebar); }
+  .bg-rail { background-color: var(--bg-rail); }
   .bg-card { background-color: var(--bg-card); }
   .text-primary { color: var(--text-primary); }
   .text-secondary { color: var(--text-secondary); }
