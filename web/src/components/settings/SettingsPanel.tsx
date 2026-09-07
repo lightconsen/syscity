@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { useSettingsData } from "@/components/settings/useSettingsData";
 import { GeneralSettings } from "@/components/settings/GeneralSettings";
@@ -25,17 +26,18 @@ interface SettingsPanelProps {
 }
 
 export function SettingsPanel({ transport, onClose, initialTab = "general" }: SettingsPanelProps) {
+  const { t } = useTranslation("settings");
   const d = useSettingsData(transport, initialTab);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-page">
       {/* Header */}
       <div className="flex items-center justify-between px-4 md:px-5 py-3 border-b border-subtle shrink-0">
-        <h2 className="text-base font-semibold text-primary">Settings</h2>
+        <h2 className="text-base font-semibold text-primary">{t("SettingsPanel.title")}</h2>
         <button
           onClick={onClose}
           className="p-1.5 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition"
-          title="Back to chat"
+          title={t("SettingsPanel.backToChat")}
         >
           <X className="w-5 h-5" />
         </button>
@@ -44,15 +46,15 @@ export function SettingsPanel({ transport, onClose, initialTab = "general" }: Se
       {d.loading ? (
         <div className="flex-1 flex items-center justify-center text-secondary">
           <div className="w-6 h-6 border-2 border-subtle border-t-primary-500 rounded-full animate-spin mb-3 mr-3" />
-          Loading configuration...
+          {t("SettingsPanel.loading")}
         </div>
       ) : (
         <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
           {/* Tabs: horizontal strip on mobile, left sidebar on md+ */}
           <div className="flex md:flex-col gap-0.5 overflow-x-auto md:overflow-y-auto md:overflow-x-hidden border-b md:border-b-0 md:border-r border-subtle shrink-0 py-2 md:py-3 px-2 md:w-44">
-            {d.tabs.map((t) => (
-              <button key={t.id} onClick={() => d.setActiveTab(t.id)} className={`${d.tabCls(t.id)} shrink-0`}>
-                {t.label}
+            {d.tabs.map((tab) => (
+              <button key={tab.id} onClick={() => d.setActiveTab(tab.id)} className={`${d.tabCls(tab.id)} shrink-0`}>
+                {t(`SettingsPanel.tab.${tab.id}`, { defaultValue: tab.label })}
               </button>
             ))}
           </div>

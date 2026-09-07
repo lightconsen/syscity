@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import type { ModelInfo, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { Input } from "@/components/ui/Input";
 import { ProviderLogo } from "@/components/ui/ProviderLogo";
@@ -27,6 +28,7 @@ export function AddModelForm({
   globalDefaultModel,
   onAdded,
 }: AddModelFormProps) {
+  const { t } = useTranslation("settings");
   const [addModelError, setAddModelError] = useState("");
   const [providerName, setProviderName] = useState("");
   const [provider, setProvider] = useState("anthropic");
@@ -144,10 +146,10 @@ export function AddModelForm({
     if (!preset || preset.needs_api_key === false) return;
     const key = apiKey.trim();
     if (key.length < 20) return;
-    const t = setTimeout(() => {
+    const timer = setTimeout(() => {
       if (!fetchingModels) handleFetchModels();
     }, 800);
-    return () => clearTimeout(t);
+    return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiKey, provider]);
 
@@ -162,11 +164,11 @@ export function AddModelForm({
   const handleAddModel = async () => {
     setAddModelError("");
     if (!providerName.trim()) {
-      setAddModelError("Provider name is required");
+      setAddModelError(t("AddModelForm.errProviderRequired"));
       return;
     }
     if (selectedModels.length === 0) {
-      setAddModelError("Select at least one model");
+      setAddModelError(t("AddModelForm.errSelectModel"));
       return;
     }
     setModelActionLoading("add");
@@ -192,7 +194,7 @@ export function AddModelForm({
       lastMatchedRef.current = "";
       onAdded?.();
     } else {
-      setAddModelError(res.error || "Failed to add provider");
+      setAddModelError(res.error || t("AddModelForm.errAddFailed"));
     }
     setModelActionLoading("");
   };
@@ -203,7 +205,7 @@ export function AddModelForm({
   return (
     <div className="p-4 rounded-lg bg-card space-y-3">
       <div>
-        <label className="block text-xs text-secondary mb-1">Provider</label>
+        <label className="block text-xs text-secondary mb-1">{t("AddModelForm.provider")}</label>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           {modelPresets.map((p) => {
             const selected = provider === p.name;
@@ -225,7 +227,7 @@ export function AddModelForm({
                 <span className="truncate">{p.display_name}</span>
                 {alreadyConfigured && (
                   <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400 shrink-0">
-                    Configured
+                    {t("AddModelForm.configured")}
                   </span>
                 )}
               </button>
@@ -235,7 +237,7 @@ export function AddModelForm({
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <Input
-          label="Provider Name"
+          label={t("AddModelForm.providerName")}
           type="text"
           value={providerName}
           onChange={(e) => setProviderName(e.target.value)}
@@ -244,7 +246,7 @@ export function AddModelForm({
         {modelPresets.find((p) => p.name === provider)?.needs_api_key !== false && (
           <div>
             <Input
-              label="API Key"
+              label={t("AddModelForm.apiKey")}
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
@@ -257,14 +259,14 @@ export function AddModelForm({
             />
             {savedKey && (
               <p className="mt-1 text-[11px] text-secondary">
-                A key is already saved — leave blank to keep it, or enter a new one to replace it.
+                {t("AddModelForm.savedKeyHint")}
               </p>
             )}
           </div>
         )}
       </div>
       <Input
-        label="Base URL"
+        label={t("AddModelForm.baseUrl")}
         type="text"
         value={baseUrl}
         onChange={(e) => setBaseUrl(e.target.value)}
@@ -272,7 +274,7 @@ export function AddModelForm({
       />
       {existingProvider && (
         <div className="text-xs px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400">
-          Provider already configured — submitting updates its models, default, and credentials.
+          {t("AddModelForm.existingHint")}
         </div>
       )}
       {(() => {
@@ -292,19 +294,19 @@ export function AddModelForm({
         return (
           <div>
             <div className="flex items-center justify-between mb-1">
-              <label className="block text-xs text-secondary">Models</label>
+              <label className="block text-xs text-secondary">{t("AddModelForm.models")}</label>
               <button
                 type="button"
                 onClick={handleFetchModels}
                 disabled={fetchingModels}
                 className="text-xs text-primary-600 dark:text-primary-400 hover:underline disabled:opacity-50"
               >
-                {fetchingModels ? "Fetching..." : "Fetch Models"}
+                {fetchingModels ? t("AddModelForm.fetching") : t("AddModelForm.fetchModels")}
               </button>
             </div>
             {fetchingModels ? (
               <div className="w-full rounded-lg border border-subtle bg-card px-3 py-1.5 text-sm text-secondary">
-                Loading model list...
+                {t("AddModelForm.loadingList")}
               </div>
             ) : optionList.length > 0 ? (
               <div className="max-h-40 overflow-y-auto rounded-lg border border-subtle bg-card p-2 space-y-1">
@@ -322,7 +324,7 @@ export function AddModelForm({
                     <span className="truncate text-primary">{m}</span>
                     {configuredForProvider(m) && (
                       <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400 shrink-0">
-                        Configured
+                        {t("AddModelForm.configured")}
                       </span>
                     )}
                   </label>
@@ -341,14 +343,14 @@ export function AddModelForm({
               />
             )}
             {remoteModelsSource === "static" && remoteModels !== null && (
-              <div className="mt-1 text-xs text-secondary">Showing built-in model list (remote fetch unavailable).</div>
+              <div className="mt-1 text-xs text-secondary">{t("AddModelForm.staticList")}</div>
             )}
           </div>
         );
       })()}
       {selectedModels.length > 0 && (
         <div>
-          <label className="block text-xs text-secondary mb-1">Default Model</label>
+          <label className="block text-xs text-secondary mb-1">{t("AddModelForm.defaultModel")}</label>
           <select
             value={defaultModel}
             onChange={(e) => setDefaultModel(e.target.value)}
@@ -374,11 +376,11 @@ export function AddModelForm({
         >
           {modelActionLoading === "add"
             ? existingProvider
-              ? "Updating..."
-              : "Adding..."
+              ? t("AddModelForm.updating")
+              : t("AddModelForm.adding")
             : existingProvider
-              ? "Update Provider"
-              : "Add Provider"}
+              ? t("AddModelForm.updateProvider")
+              : t("AddModelForm.addProvider")}
         </button>
       </div>
     </div>

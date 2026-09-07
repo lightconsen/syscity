@@ -1,14 +1,17 @@
+import { useTranslation } from "react-i18next";
+
 interface JobsSettingsProps {
   crons: Array<Record<string, unknown>>;
 }
 
 export function JobsSettings({ crons }: JobsSettingsProps) {
+  const { t } = useTranslation("settings");
   return (
     <div className="space-y-5">
       <section>
-        <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Jobs ({crons.length})</h3>
+        <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("JobsSettings.title", { count: crons.length })}</h3>
         {crons.length === 0 ? (
-          <div className="text-sm text-secondary">No cron jobs configured.</div>
+          <div className="text-sm text-secondary">{t("JobsSettings.empty")}</div>
         ) : (
           <div className="space-y-2">
             {crons.map((job, i) => {
@@ -24,9 +27,9 @@ export function JobsSettings({ crons }: JobsSettingsProps) {
               return (
                 <div key={i} className="px-3 py-2 rounded-lg bg-card">
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-primary font-medium">{(j.name as string) || "Unnamed"}</span>
+                    <span className="text-sm text-primary font-medium">{(j.name as string) || t("JobsSettings.unnamed")}</span>
                     <span className={`text-xs px-2 py-0.5 rounded-full ${j.enabled ? "bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400" : "bg-sidebar text-secondary"}`}>
-                      {j.enabled ? "Enabled" : "Disabled"}
+                      {j.enabled ? t("JobsSettings.enabled") : t("JobsSettings.disabled")}
                     </span>
                   </div>
                   <div className="mt-1.5 space-y-1">
@@ -36,48 +39,48 @@ export function JobsSettings({ crons }: JobsSettingsProps) {
                       if (!expr) return null;
                       return (
                         <div className="flex items-center gap-2">
-                          <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Schedule</span>
+                          <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.schedule")}</span>
                           <span className="text-xs text-secondary font-mono">{expr}</span>
                         </div>
                       );
                     })()}
                     {nextRun && (
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Next Run</span>
+                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.nextRun")}</span>
                         <span className="text-xs text-secondary">{new Date(nextRun).toLocaleString()}</span>
                       </div>
                     )}
                     {lastRun && (
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Last Run</span>
+                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.lastRun")}</span>
                         <span className="text-xs text-secondary">{new Date(lastRun).toLocaleString()}</span>
                       </div>
                     )}
                     <div className="flex items-center gap-2">
-                      <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Target</span>
+                      <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.target")}</span>
                       {targetType === "shell" ? (
-                        <span className="text-xs px-1.5 py-0.5 rounded bg-sidebar text-secondary">Shell</span>
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-sidebar text-secondary">{t("JobsSettings.shell")}</span>
                       ) : targetType === "agent" ? (
-                        <span className="text-xs px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400">Agent</span>
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400">{t("JobsSettings.agent")}</span>
                       ) : (
-                        <span className="text-xs text-secondary">{targetType || "Unknown"}</span>
+                        <span className="text-xs text-secondary">{targetType || t("JobsSettings.unknown")}</span>
                       )}
                     </div>
                     {targetType === "agent" && agentId && (
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Agent</span>
+                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.agent")}</span>
                         <span className="text-xs text-secondary font-mono">{agentId}</span>
                       </div>
                     )}
                     {targetType === "shell" && command && (
                       <div className="flex items-start gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Command</span>
+                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.command")}</span>
                         <span className="text-xs text-secondary font-mono break-all">{command}</span>
                       </div>
                     )}
                     {targetType === "agent" && prompt && (
                       <div className="flex items-start gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">Prompt</span>
+                        <span className="text-[10px] uppercase tracking-wider text-secondary/70 w-16 shrink-0">{t("JobsSettings.prompt")}</span>
                         <span className="text-xs text-secondary line-clamp-2">{prompt}</span>
                       </div>
                     )}

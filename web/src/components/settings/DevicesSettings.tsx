@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { ReactNode } from "react";
 import { Camera, MapPin, Bell, Vibrate, FileUp, Wifi } from "lucide-react";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
@@ -16,6 +17,7 @@ interface DevicesSettingsProps {
 }
 
 export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) {
+  const { t } = useTranslation("settings");
   const [deviceCaps, setDeviceCaps] = useState<DeviceCapability[] | null>(null);
   const [deviceCapsLoading, setDeviceCapsLoading] = useState(false);
   const [permRequesting, setPermRequesting] = useState("");
@@ -70,7 +72,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
     const res = await transport.requestDevicePermission(perm);
     setPermRequesting("");
     if (!res) {
-      showToast(`Failed to request ${perm} permission`, "error");
+      showToast(t("DevicesSettings.errPermRequest", { perm }), "error");
       return;
     }
     // Update the grant state in the list without a full reload.
@@ -78,7 +80,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
       (caps || []).map((c) => (c.id === perm ? { ...c, granted: res.granted } : c))
     );
     showToast(
-      res.granted ? `${perm} permission granted` : `${perm} permission denied`,
+      res.granted ? t("DevicesSettings.permGranted", { perm }) : t("DevicesSettings.permDenied", { perm }),
       res.granted ? "success" : "error"
     );
   };
@@ -91,7 +93,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
   const pairAdb = async () => {
     const port = parseInt(adbPort, 10);
     if (!port || !adbCode.trim()) {
-      setAdbError("Enter the pairing port and code from the wireless-debugging screen");
+      setAdbError(t("DevicesSettings.errPairInput"));
       return;
     }
     setAdbPairing(true);
@@ -100,16 +102,16 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
     const res = await transport.adbPair(port, adbCode.trim(), connectPort);
     setAdbPairing(false);
     if (!res) {
-      setAdbError("Pairing failed — is wireless debugging enabled on this phone?");
+      setAdbError(t("DevicesSettings.errPairFailed"));
       return;
     }
     if (res.paired && res.connected) {
-      showToast("Paired with wireless debugging", "success");
+      showToast(t("DevicesSettings.pairedToast"), "success");
       setAdbError("");
     } else if (res.paired) {
-      setAdbError(res.connectOutput || "Paired, but the adb connect failed");
+      setAdbError(res.connectOutput || t("DevicesSettings.errConnectFailed"));
     } else {
-      setAdbError(res.pairOutput || "Pairing failed — check the code and port");
+      setAdbError(res.pairOutput || t("DevicesSettings.errPairCheckCode"));
     }
     setAdbStatus({ paired: res.connected, devices: res.devices });
   };
@@ -119,7 +121,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
 
   const runShortcut = async () => {
     if (!shortcutName.trim()) {
-      setShortcutMsg("Enter a shortcut name");
+      setShortcutMsg(t("DevicesSettings.errShortcutName"));
       return;
     }
     setShortcutRunning(true);
@@ -127,11 +129,11 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
     const res = await transport.runShortcut(shortcutName.trim(), shortcutInput || undefined);
     setShortcutRunning(false);
     if (!res) {
-      setShortcutMsg("Shortcuts are only available in the Syscity iOS app");
+      setShortcutMsg(t("DevicesSettings.errShortcutsUnavailable"));
     } else if (res.launched) {
-      setShortcutMsg(`Launched "${shortcutName.trim()}" in the Shortcuts app`);
+      setShortcutMsg(t("DevicesSettings.shortcutLaunched", { name: shortcutName.trim() }));
     } else {
-      setShortcutMsg("Could not launch — is the shortcut name correct?");
+      setShortcutMsg(t("DevicesSettings.errShortcutLaunch"));
     }
   };
 
@@ -150,16 +152,15 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
       {!transport.isTauri() || (deviceCaps === null && !deviceCapsLoading) ? (
         <section>
           <div className="rounded-lg bg-card border border-subtle px-4 py-6 text-center text-sm text-secondary">
-            Device capabilities (camera, location, notifications, wireless debugging)
-            are available in the Syscity mobile app.
+            {t("DevicesSettings.webOnlyNote")}
           </div>
         </section>
       ) : deviceCapsLoading ? (
-        <div className="text-sm text-secondary py-6 text-center">Loading...</div>
+        <div className="text-sm text-secondary py-6 text-center">{t("DevicesSettings.loading")}</div>
       ) : (
         <>
           <section>
-            <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Capabilities</h3>
+            <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("DevicesSettings.capabilities")}</h3>
             <div className="space-y-2">
               {(deviceCaps || []).map((cap) => (
                 <div key={cap.id} className="flex items-center justify-between px-3 py-2 rounded-lg bg-card">
@@ -176,7 +177,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                           : "bg-amber-500/10 text-amber-600 dark:text-amber-400"
                       }`}
                     >
-                      {cap.granted ? "Granted" : "Not granted"}
+                      {cap.granted ? t("DevicesSettings.granted") : t("DevicesSettings.notGranted")}
                     </span>
                     {needsDevicePermission(cap.id) && (
                       <button
@@ -184,7 +185,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                         disabled={permRequesting === cap.id}
                         className="px-2.5 py-1 text-xs rounded-md bg-primary-600 text-white hover:opacity-90 transition-opacity disabled:opacity-50"
                       >
-                        {permRequesting === cap.id ? "Requesting..." : "Request"}
+                        {permRequesting === cap.id ? t("DevicesSettings.requesting") : t("DevicesSettings.request")}
                       </button>
                     )}
                   </div>
@@ -195,16 +196,14 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
 
           {transport.isTauri() && isIOSDevice && (
             <section>
-              <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Shortcuts</h3>
+              <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("DevicesSettings.shortcuts")}</h3>
               <div className="rounded-lg bg-card border border-subtle p-3 space-y-3">
                 <p className="text-xs text-secondary">
-                  Run an iOS Shortcut from Syscity. The shortcut opens in the Shortcuts app;
-                  if its final step is "Save Syscity Output", the output is returned here for
-                  the agent to read. "Ask Syscity" inboxes prompts from Siri / automations.
+                  {t("DevicesSettings.shortcutsIntro")}
                 </p>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-xs text-secondary mb-1">Shortcut name</label>
+                    <label className="block text-xs text-secondary mb-1">{t("DevicesSettings.shortcutNameLabel")}</label>
                     <input
                       placeholder="e.g. Order Coffee"
                       value={shortcutName}
@@ -213,7 +212,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-secondary mb-1">Input (optional)</label>
+                    <label className="block text-xs text-secondary mb-1">{t("DevicesSettings.inputLabel")}</label>
                     <input
                       placeholder="Text to pass to the shortcut"
                       value={shortcutInput}
@@ -228,19 +227,19 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                     disabled={shortcutRunning}
                     className="px-3 py-1.5 text-xs font-medium rounded-lg bg-primary-600 text-white hover:opacity-90 transition-opacity disabled:opacity-50"
                   >
-                    {shortcutRunning ? "Running..." : "Run"}
+                    {shortcutRunning ? t("DevicesSettings.running") : t("DevicesSettings.run")}
                   </button>
                   <button
                     onClick={refreshShortcutResults}
                     className="px-3 py-1.5 text-xs font-medium rounded-lg bg-card border border-subtle text-primary hover:bg-accent/50 transition-colors"
                   >
-                    Fetch outputs
+                    {t("DevicesSettings.fetchOutputs")}
                   </button>
                   <button
                     onClick={refreshShortcutInbox}
                     className="px-3 py-1.5 text-xs font-medium rounded-lg bg-card border border-subtle text-primary hover:bg-accent/50 transition-colors"
                   >
-                    Fetch inbox
+                    {t("DevicesSettings.fetchInbox")}
                   </button>
                 </div>
                 {shortcutMsg && (
@@ -248,26 +247,26 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                 )}
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <div className="text-[10px] text-secondary/70 uppercase tracking-wider mb-1">Outputs</div>
+                    <div className="text-[10px] text-secondary/70 uppercase tracking-wider mb-1">{t("DevicesSettings.outputs")}</div>
                     {shortcutResults.length === 0 ? (
-                      <div className="text-xs text-secondary">None pending</div>
+                      <div className="text-xs text-secondary">{t("DevicesSettings.nonePending")}</div>
                     ) : (
                       shortcutResults.map((r, i) => (
                         <div key={i} className="text-xs text-primary font-mono break-all bg-accent/30 rounded px-2 py-1 mb-1">
-                          {r.output || "(no output)"}
+                          {r.output || t("DevicesSettings.noOutput")}
                           {r.at_ms ? <div className="text-[10px] text-secondary/70">{new Date(r.at_ms).toLocaleTimeString()}</div> : null}
                         </div>
                       ))
                     )}
                   </div>
                   <div>
-                    <div className="text-[10px] text-secondary/70 uppercase tracking-wider mb-1">Inbox</div>
+                    <div className="text-[10px] text-secondary/70 uppercase tracking-wider mb-1">{t("DevicesSettings.inbox")}</div>
                     {shortcutInbox.length === 0 ? (
-                      <div className="text-xs text-secondary">None pending</div>
+                      <div className="text-xs text-secondary">{t("DevicesSettings.nonePending")}</div>
                     ) : (
                       shortcutInbox.map((p, i) => (
                         <div key={i} className="text-xs text-primary font-mono break-all bg-accent/30 rounded px-2 py-1 mb-1">
-                          {p.prompt || "(no prompt)"}
+                          {p.prompt || t("DevicesSettings.noPrompt")}
                           {p.at_ms ? <div className="text-[10px] text-secondary/70">{new Date(p.at_ms).toLocaleTimeString()}</div> : null}
                         </div>
                       ))
@@ -279,16 +278,14 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
           )}
 
           <section>
-            <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Wireless debugging</h3>
+            <h3 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("DevicesSettings.wirelessDebugging")}</h3>
             <div className="rounded-lg bg-card border border-subtle p-3 space-y-3">
               <p className="text-xs text-secondary">
-                Pair this phone with its own wireless-debugging adb server for on-device
-                automation (screenshots, input, UI tree). On the phone: enable Developer
-                options → Wireless debugging, then use "Pair device with pairing code".
+                {t("DevicesSettings.adbIntro")}
               </p>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs text-secondary mb-1">Pairing port</label>
+                  <label className="block text-xs text-secondary mb-1">{t("DevicesSettings.pairingPort")}</label>
                   <input
                     inputMode="numeric"
                     placeholder="e.g. 45678"
@@ -298,7 +295,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-secondary mb-1">Connect port (optional)</label>
+                  <label className="block text-xs text-secondary mb-1">{t("DevicesSettings.connectPort")}</label>
                   <input
                     inputMode="numeric"
                     placeholder="e.g. 45679"
@@ -309,7 +306,7 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                 </div>
               </div>
               <div>
-                <label className="block text-xs text-secondary mb-1">Pairing code</label>
+                <label className="block text-xs text-secondary mb-1">{t("DevicesSettings.pairingCode")}</label>
                 <input
                   inputMode="numeric"
                   placeholder="6-digit code"
@@ -324,26 +321,26 @@ export function DevicesSettings({ transport, showToast }: DevicesSettingsProps) 
                   disabled={adbPairing}
                   className="px-3 py-1.5 text-xs font-medium rounded-lg bg-primary-600 text-white hover:opacity-90 transition-opacity disabled:opacity-50"
                 >
-                  {adbPairing ? "Pairing..." : "Pair"}
+                  {adbPairing ? t("DevicesSettings.pairing") : t("DevicesSettings.pair")}
                 </button>
-                <span className="text-xs text-secondary">Pairing is per-boot.</span>
+                <span className="text-xs text-secondary">{t("DevicesSettings.perBoot")}</span>
               </div>
               {adbError && (
                 <div className="text-xs text-red-600 dark:text-red-400 break-words">{adbError}</div>
               )}
               <div className="border-t border-subtle pt-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs text-secondary">Status</span>
+                  <span className="text-xs text-secondary">{t("DevicesSettings.status")}</span>
                   <button onClick={refreshAdbStatus} className="text-xs text-primary-600 hover:underline">
-                    Refresh
+                    {t("DevicesSettings.refresh")}
                   </button>
                 </div>
                 {adbStatus === null ? (
-                  <div className="text-xs text-secondary mt-1">Unknown</div>
+                  <div className="text-xs text-secondary mt-1">{t("DevicesSettings.unknown")}</div>
                 ) : adbStatus.paired ? (
-                  <div className="text-xs text-green-600 dark:text-green-400 mt-1">Paired</div>
+                  <div className="text-xs text-green-600 dark:text-green-400 mt-1">{t("DevicesSettings.statusPaired")}</div>
                 ) : (
-                  <div className="text-xs text-secondary mt-1">Not paired</div>
+                  <div className="text-xs text-secondary mt-1">{t("DevicesSettings.statusNotPaired")}</div>
                 )}
                 {adbStatus && adbStatus.devices.length > 0 && (
                   <div className="mt-1 font-mono text-[11px] text-secondary">

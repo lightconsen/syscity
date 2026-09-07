@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Section } from "@/components/ui/Section";
 
 /**
@@ -31,6 +32,7 @@ function WebConnectionSettings() {
   const [base, setBase] = useState("");
   const [token, setToken] = useState("");
   const [saving, setSaving] = useState(false);
+  const { t } = useTranslation("settings");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
@@ -53,23 +55,21 @@ function WebConnectionSettings() {
       localStorage.removeItem("syscity_gateway_token");
     }
     setSaving(false);
-    setMsg({ ok: true, text: "Saved — reloading to apply the connection…" });
+    setMsg({ ok: true, text: t("ConnectionSettings.savedReloading") });
     window.setTimeout(() => window.location.reload(), 400);
   }, [base, token]);
 
   return (
     <div className="space-y-5">
-      <Section title="Connection">
+      <Section title={t("ConnectionSettings.title")}>
         <p className="text-sm text-secondary mb-3">
-          The browser page is served by a gateway. Leave the base URL empty to
-          use the serving gateway (same-origin), or point at a remote gateway
-          and enter its token (see{" "}
+          {t("ConnectionSettings.webIntro")}{" "}
           <code className="text-primary">docs/remote-access.md</code>).
         </p>
         <div className="space-y-3 mb-4">
           <div>
             <label className="text-xs text-secondary block mb-1">
-              Gateway base URL (blank = the serving gateway)
+              {t("ConnectionSettings.baseUrlLabel")}
             </label>
             <input
               className={inputCls}
@@ -80,7 +80,7 @@ function WebConnectionSettings() {
           </div>
           <div>
             <label className="text-xs text-secondary block mb-1">
-              Token (the gateway's shared token, if auth is on)
+              {t("ConnectionSettings.tokenLabel")}
             </label>
             <input
               className={inputCls}
@@ -104,7 +104,7 @@ function WebConnectionSettings() {
           disabled={saving}
           className="px-3 py-1.5 rounded-lg bg-primary-600 text-white text-sm transition hover:bg-primary-700 disabled:opacity-50"
         >
-          {saving ? "Saving…" : "Save & reload"}
+          {saving ? t("ConnectionSettings.saving") : t("ConnectionSettings.saveReload")}
         </button>
       </Section>
     </div>
@@ -113,6 +113,7 @@ function WebConnectionSettings() {
 
 /** Tauri (desktop/mobile) connection settings — command-backed. */
 function TauriConnectionSettings() {
+  const { t } = useTranslation("settings");
   const [config, setConfig] = useState<ConnectionConfig | null>(null);
   const [host, setHost] = useState("127.0.0.1");
   const [port, setPort] = useState(18080);
@@ -172,7 +173,7 @@ function TauriConnectionSettings() {
           token: token.trim() || null,
         },
       });
-      setMsg({ ok: true, text: "Saved — restart the app to apply the new connection." });
+      setMsg({ ok: true, text: t("ConnectionSettings.savedRestart") });
     } catch (e) {
       setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -184,11 +185,10 @@ function TauriConnectionSettings() {
 
   return (
     <div className="space-y-5">
-      <Section title="Connection">
+      <Section title={t("ConnectionSettings.title")}>
         <p className="text-sm text-secondary mb-3">
-          Choose how this app talks to a Syscity Gateway: run one locally, or
-          connect to a gateway on another host (set up per{" "}
-          <code className="text-primary">docs/remote-access.md</code>).
+          {t("ConnectionSettings.tauriIntro")}{" "}
+          <code className="text-primary">docs/remote-access.md</code>.
         </p>
 
         <div className="flex items-center gap-4 mb-4">
@@ -198,7 +198,7 @@ function TauriConnectionSettings() {
               checked={config.mode === "local"}
               onChange={() => setConfig({ ...config, mode: "local" })}
             />
-            Local (embedded / reuse)
+            {t("ConnectionSettings.localMode")}
           </label>
           <label className="flex items-center gap-2 text-sm">
             <input
@@ -206,14 +206,14 @@ function TauriConnectionSettings() {
               checked={config.mode === "remote"}
               onChange={() => setConfig({ ...config, mode: "remote" })}
             />
-            Remote gateway
+            {t("ConnectionSettings.remoteMode")}
           </label>
         </div>
 
         {config.mode === "remote" && (
           <div className="space-y-3 mb-4">
             <div>
-              <label className="text-xs text-secondary block mb-1">Host</label>
+              <label className="text-xs text-secondary block mb-1">{t("ConnectionSettings.host")}</label>
               <input
                 className={inputCls}
                 value={host}
@@ -222,7 +222,7 @@ function TauriConnectionSettings() {
               />
             </div>
             <div>
-              <label className="text-xs text-secondary block mb-1">Port</label>
+              <label className="text-xs text-secondary block mb-1">{t("ConnectionSettings.port")}</label>
               <input
                 className={inputCls}
                 type="number"
@@ -232,14 +232,14 @@ function TauriConnectionSettings() {
             </div>
             <div>
               <label className="text-xs text-secondary block mb-1">
-                Token (the remote gateway's shared token)
+                {t("ConnectionSettings.remoteTokenLabel")}
               </label>
               <input
                 className={inputCls}
                 type="password"
                 value={token}
                 onChange={(e) => setToken(e.target.value)}
-                placeholder="leave blank if the gateway is unauthenticated"
+                placeholder={t("ConnectionSettings.tokenBlankHint")}
               />
             </div>
             <div className="flex items-center gap-2">
@@ -248,7 +248,7 @@ function TauriConnectionSettings() {
                 disabled={testing}
                 className="px-3 py-1.5 rounded-lg border border-subtle text-sm transition hover:bg-black/[0.03] dark:hover:bg-white/[0.04] disabled:opacity-50"
               >
-                {testing ? "Testing…" : "Test connection"}
+                {testing ? t("ConnectionSettings.testing") : t("ConnectionSettings.testConnection")}
               </button>
             </div>
           </div>
@@ -269,7 +269,7 @@ function TauriConnectionSettings() {
           disabled={saving}
           className="px-3 py-1.5 rounded-lg bg-primary-600 text-white text-sm transition hover:bg-primary-700 disabled:opacity-50"
         >
-          {saving ? "Saving…" : "Save"}
+          {saving ? t("ConnectionSettings.saving") : t("ConnectionSettings.save")}
         </button>
       </Section>
     </div>

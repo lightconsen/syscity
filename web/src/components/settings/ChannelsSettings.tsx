@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import type { ChannelConfig } from "@/components/settings/useSettingsData";
 import { AddChannelForm } from "@/components/settings/AddChannelForm";
@@ -15,15 +16,16 @@ interface ChannelsSettingsProps {
 }
 
 export function ChannelsSettings({ transport, channels, actionLoading, onToggle, onRemove, onRefresh }: ChannelsSettingsProps) {
+  const { t } = useTranslation("settings");
   const [showAddChannel, setShowAddChannel] = useState(false);
 
   return (
     <div className="space-y-5">
       <Section
-        title="Configured Channels"
+        title={t("ChannelsSettings.title")}
         right={
           <Button variant="primary-sm" onClick={() => setShowAddChannel(!showAddChannel)}>
-            {showAddChannel ? "Cancel" : "+ Add"}
+            {showAddChannel ? t("ChannelsSettings.cancel") : t("ChannelsSettings.add")}
           </Button>
         }
       >
@@ -38,7 +40,7 @@ export function ChannelsSettings({ transport, channels, actionLoading, onToggle,
         )}
 
         {channels.length === 0 ? (
-          <div className="text-sm text-secondary">No channels configured.</div>
+          <div className="text-sm text-secondary">{t("ChannelsSettings.empty")}</div>
         ) : (
           <div className="space-y-2">
             {channels.map((ch) => (
@@ -69,13 +71,13 @@ export function ChannelsSettings({ transport, channels, actionLoading, onToggle,
                         : "bg-sidebar text-secondary hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
                     }`}
                   >
-                    {actionLoading === ch.name ? "..." : ch.enabled ? "Enabled" : "Disabled"}
+                    {actionLoading === ch.name ? "..." : ch.enabled ? t("ChannelsSettings.enabled") : t("ChannelsSettings.disabled")}
                   </button>
                   <button
                     onClick={() => onRemove(ch.name)}
                     disabled={actionLoading === ch.name}
                     className="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-secondary/60 hover:text-red-600 dark:hover:text-red-400 transition"
-                    title="Remove"
+                    title={t("ChannelsSettings.remove")}
                   >
                     <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <line x1="18" y1="6" x2="6" y2="18" />

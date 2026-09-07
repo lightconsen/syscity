@@ -1,25 +1,26 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { Button } from "@/components/ui/Button";
 
-const channelCredentialFields: Record<string, Array<{ key: string; label: string; type?: string }>> = {
-  telegram: [{ key: "token", label: "Bot Token", type: "password" }],
-  discord: [{ key: "token", label: "Bot Token", type: "password" }],
-  slack: [{ key: "token", label: "Bot Token", type: "password" }],
+const channelCredentialFields: Record<string, Array<{ key: string; labelKey: string; type?: string }>> = {
+  telegram: [{ key: "token", labelKey: "AddChannelForm.credBotToken", type: "password" }],
+  discord: [{ key: "token", labelKey: "AddChannelForm.credBotToken", type: "password" }],
+  slack: [{ key: "token", labelKey: "AddChannelForm.credBotToken", type: "password" }],
   whatsapp: [
-    { key: "phone_number_id", label: "Phone Number ID" },
-    { key: "access_token", label: "Access Token", type: "password" },
+    { key: "phone_number_id", labelKey: "AddChannelForm.credPhoneNumberId" },
+    { key: "access_token", labelKey: "AddChannelForm.credAccessToken", type: "password" },
   ],
   qq: [
-    { key: "app_id", label: "App ID" },
-    { key: "app_secret", label: "App Secret", type: "password" },
-    { key: "bot_qq", label: "Bot QQ" },
+    { key: "app_id", labelKey: "AddChannelForm.credAppId" },
+    { key: "app_secret", labelKey: "AddChannelForm.credAppSecret", type: "password" },
+    { key: "bot_qq", labelKey: "AddChannelForm.credBotQq" },
   ],
   feishu: [
-    { key: "app_id", label: "App ID" },
-    { key: "app_secret", label: "App Secret", type: "password" },
+    { key: "app_id", labelKey: "AddChannelForm.credAppId" },
+    { key: "app_secret", labelKey: "AddChannelForm.credAppSecret", type: "password" },
   ],
   // signal, imessage, webchat, websocket, web_terminal: no credentials needed
 };
@@ -30,6 +31,7 @@ interface AddChannelFormProps {
 }
 
 export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
+  const { t } = useTranslation("settings");
   const [addChannelError, setAddChannelError] = useState("");
   const [newChannel, setNewChannel] = useState({
     name: "",
@@ -43,13 +45,13 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
   const handleAddChannel = async () => {
     setAddChannelError("");
     if (!newChannel.name.trim()) {
-      setAddChannelError("Channel name is required");
+      setAddChannelError(t("AddChannelForm.errNameRequired"));
       return;
     }
     const requiredFields = channelCredentialFields[newChannel.channel_type] || [];
     for (const field of requiredFields) {
       if (!newChannel.credentials[field.key]?.trim()) {
-        setAddChannelError(`${field.label} is required`);
+        setAddChannelError(t("AddChannelForm.errFieldRequired", { field: t(field.labelKey) }));
         return;
       }
     }
@@ -65,7 +67,7 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
       setNewChannel({ name: "", channel_type: "telegram", enabled: true, agent_id: "", credentials: {} });
       onAdded?.();
     } else {
-      setAddChannelError("Failed to add channel");
+      setAddChannelError(t("AddChannelForm.errAddFailed"));
     }
     setChannelActionLoading("");
   };
@@ -74,13 +76,13 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
     <div className="mb-4 p-4 rounded-lg bg-card space-y-3">
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <Input
-          label="Name"
+          label={t("AddChannelForm.nameLabel")}
           value={newChannel.name}
           onChange={(e) => setNewChannel({ ...newChannel, name: e.target.value })}
           placeholder="my-bot"
         />
         <div>
-          <label className="block text-xs text-secondary mb-1">Type</label>
+          <label className="block text-xs text-secondary mb-1">{t("AddChannelForm.typeLabel")}</label>
           <Select
             value={newChannel.channel_type}
             onChange={(e) => setNewChannel({ ...newChannel, channel_type: e.target.value, credentials: {} })}
@@ -101,7 +103,7 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <Input
-          label="Agent ID (optional)"
+          label={t("AddChannelForm.agentIdLabel")}
           value={newChannel.agent_id}
           onChange={(e) => setNewChannel({ ...newChannel, agent_id: e.target.value })}
           placeholder="default"
@@ -114,13 +116,13 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
             onChange={(e) => setNewChannel({ ...newChannel, enabled: e.target.checked })}
             className="rounded border-subtle text-primary-500 focus:ring-primary-500"
           />
-          <label htmlFor="ch-enabled" className="text-sm text-secondary">Enabled</label>
+          <label htmlFor="ch-enabled" className="text-sm text-secondary">{t("AddChannelForm.enabled")}</label>
         </div>
       </div>
       {channelCredentialFields[newChannel.channel_type]?.map((field) => (
         <Input
           key={field.key}
-          label={field.label}
+          label={t(field.labelKey)}
           type={field.type || "text"}
           value={newChannel.credentials[field.key] || ""}
           onChange={(e) =>
@@ -129,7 +131,7 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
               credentials: { ...newChannel.credentials, [field.key]: e.target.value },
             })
           }
-          placeholder={field.label}
+          placeholder={t(field.labelKey)}
         />
       ))}
       {addChannelError && (
@@ -137,7 +139,7 @@ export function AddChannelForm({ transport, onAdded }: AddChannelFormProps) {
       )}
       <div className="flex justify-end">
         <Button onClick={handleAddChannel} disabled={channelActionLoading === "add"}>
-          {channelActionLoading === "add" ? "Adding..." : "Add Channel"}
+          {channelActionLoading === "add" ? t("AddChannelForm.adding") : t("AddChannelForm.addChannel")}
         </Button>
       </div>
     </div>

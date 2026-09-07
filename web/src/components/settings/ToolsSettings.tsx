@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
 import type { SyscityConfig } from "@/components/settings/useSettingsData";
 import { Section } from "@/components/ui/Section";
@@ -22,10 +23,11 @@ interface ToolsSettingsProps {
 }
 
 export function ToolsSettings({ config, update }: ToolsSettingsProps) {
+  const { t } = useTranslation("settings");
   return (
     <div className="space-y-5">
       {/* Default Provider */}
-      <Section title="Default Search Provider">
+      <Section title={t("ToolsSettings.defaultProvider")}>
         <select
           value={config.search?.provider ?? "duckduckgo"}
           onChange={(e) => update("search.provider", e.target.value)}
@@ -38,7 +40,7 @@ export function ToolsSettings({ config, update }: ToolsSettingsProps) {
       </Section>
 
       {/* Fallback Provider Order */}
-      <Section title="Fallback Order">
+      <Section title={t("ToolsSettings.fallbackOrder")}>
         <div className="flex flex-wrap gap-2 mb-2">
           {(config.search?.providers ?? []).map((prov) => (
             <span key={prov} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs bg-sidebar text-secondary">
@@ -69,7 +71,7 @@ export function ToolsSettings({ config, update }: ToolsSettingsProps) {
             }}
             className="text-sm border border-subtle rounded-lg px-3 py-2 bg-card text-primary"
           >
-            <option value="">+ Add Provider</option>
+            <option value="">{t("ToolsSettings.addProvider")}</option>
             {SEARCH_PROVIDERS.filter((p) => !(config.search?.providers ?? []).includes(p.id)).map((p) => (
               <option key={p.id} value={p.id}>{p.label}</option>
             ))}
@@ -78,7 +80,7 @@ export function ToolsSettings({ config, update }: ToolsSettingsProps) {
       </Section>
 
       {/* API Keys */}
-      <Section title="Provider API Keys">
+      <Section title={t("ToolsSettings.apiKeys")}>
         <div className="space-y-3">
           {SEARCH_PROVIDERS.filter((p) => p.needsKey).map((p) => (
             <div key={p.id} className="flex items-center gap-3">

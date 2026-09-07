@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { ModelInfo } from "@/SyscityWebSocketTransport";
 import { Section } from "@/components/ui/Section";
 import { Select } from "@/components/ui/Select";
@@ -53,6 +54,7 @@ export function AgentsSettings({
   resetAgentParam,
   resetAgentParams,
 }: AgentsSettingsProps) {
+  const { t } = useTranslation("settings");
   const [paramTab, setParamTab] = useState<"general" | "prompt">("general");
 
   const agentId = selectedAgentId || "default";
@@ -105,13 +107,13 @@ export function AgentsSettings({
           type="button"
           onClick={() => void resetAgentParam(agentId, field)}
           className="text-[11px] text-primary-600 dark:text-primary-400 hover:underline"
-          title="Reset to global default"
+          title={t("AgentsSettings.resetToGlobal")}
         >
-          Reset
+          {t("AgentsSettings.reset")}
         </button>
       );
     }
-    return <span className="text-[10px] text-secondary/60">Inherits global</span>;
+    return <span className="text-[10px] text-secondary/60">{t("AgentsSettings.inheritsGlobal")}</span>;
   };
 
   const paramTabCls = (id: string) =>
@@ -123,9 +125,9 @@ export function AgentsSettings({
 
   return (
     <div className="space-y-5">
-      <Section title="Select Agent">
+      <Section title={t("AgentsSettings.selectAgent")}>
         {agentRegistry.length === 0 ? (
-          <div className="text-sm text-secondary">No agents in registry.</div>
+          <div className="text-sm text-secondary">{t("AgentsSettings.noAgents")}</div>
         ) : (
           <Select
             value={selectedAgentId}
@@ -143,10 +145,10 @@ export function AgentsSettings({
       <section>
         <div className="flex gap-1 border-b border-subtle mb-3">
           <button type="button" className={paramTabCls("general")} onClick={() => setParamTab("general")}>
-            General
+            {t("AgentsSettings.tabGeneral")}
           </button>
           <button type="button" className={paramTabCls("prompt")} onClick={() => setParamTab("prompt")}>
-            System Prompt
+            {t("AgentsSettings.tabPrompt")}
           </button>
         </div>
 
@@ -154,12 +156,12 @@ export function AgentsSettings({
           <div className="space-y-5">
             {/* Model */}
             <div>
-              <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Model</h4>
+              <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("AgentsSettings.model")}</h4>
               <Select
                 value={agentModels[selectedAgentId] ?? ""}
                 onChange={(e) => update(`agent_models.${selectedAgentId}`, e.target.value || null)}
               >
-                <option value="">Global default</option>
+                <option value="">{t("AgentsSettings.globalDefault")}</option>
                 {models.map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.provider_name || m.provider} - {m.name}
@@ -167,14 +169,14 @@ export function AgentsSettings({
                 ))}
               </Select>
               <div className="mt-1 text-[11px] text-secondary/70">
-                Sessions for "{selectedAgentId}" use this model unless a session overrides it. Empty = global default.
+                {t("AgentsSettings.modelHint", { agent: selectedAgentId })}
               </div>
             </div>
 
             {agentDetailLoading && (
               <div className="text-sm text-secondary flex items-center gap-2">
                 <div className="w-4 h-4 border-2 border-subtle border-t-primary-500 rounded-full animate-spin" />
-                Loading agent details...
+                {t("AgentsSettings.loadingDetails")}
               </div>
             )}
 
@@ -193,29 +195,29 @@ export function AgentsSettings({
                 {/* Personality */}
                 {selectedAgentDetail.personality && (
                   <div>
-                    <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Personality</h4>
+                    <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("AgentsSettings.personality")}</h4>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div className="px-3 py-2 rounded-lg bg-card">
-                        <div className="text-[10px] uppercase tracking-wider text-secondary/70">Display Name</div>
+                        <div className="text-[10px] uppercase tracking-wider text-secondary/70">{t("AgentsSettings.displayName")}</div>
                         <div className="text-sm text-primary">{String((selectedAgentDetail.personality as Record<string, unknown>).display_name ?? "—")}</div>
                       </div>
                       <div className="px-3 py-2 rounded-lg bg-card">
-                        <div className="text-[10px] uppercase tracking-wider text-secondary/70">Valid</div>
-                        <div className="text-sm text-primary">{(selectedAgentDetail.personality as Record<string, unknown>).is_valid ? "Yes" : "No"}</div>
+                        <div className="text-[10px] uppercase tracking-wider text-secondary/70">{t("AgentsSettings.valid")}</div>
+                        <div className="text-sm text-primary">{(selectedAgentDetail.personality as Record<string, unknown>).is_valid ? t("AgentsSettings.yes") : t("AgentsSettings.no")}</div>
                       </div>
                     </div>
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {Boolean((selectedAgentDetail.personality as Record<string, unknown>).has_heartbeat) && (
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400">Heartbeat</span>
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400">{t("AgentsSettings.heartbeat")}</span>
                       )}
                       {Boolean((selectedAgentDetail.personality as Record<string, unknown>).has_soul) && (
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400">Soul</span>
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400">{t("AgentsSettings.soul")}</span>
                       )}
                       {Boolean((selectedAgentDetail.personality as Record<string, unknown>).has_identity) && (
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400">Identity</span>
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400">{t("AgentsSettings.identity")}</span>
                       )}
                       {Boolean((selectedAgentDetail.personality as Record<string, unknown>).has_memory) && (
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400">Memory</span>
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400">{t("AgentsSettings.memory")}</span>
                       )}
                     </div>
                   </div>
@@ -226,30 +228,30 @@ export function AgentsSettings({
             {/* Runtime config */}
             {selectedAgentDetail?.config && (
               <div>
-                <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Configuration</h4>
+                <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">{t("AgentsSettings.configuration")}</h4>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="px-3 py-2 rounded-lg bg-card">
-                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">Temperature</div>
+                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">{t("AgentsSettings.temperature")}</div>
                     <div className="text-sm text-primary">{typeof (selectedAgentDetail.config as Record<string, unknown>).temperature === "number" ? ((selectedAgentDetail.config as Record<string, unknown>).temperature as number).toFixed(2) : "—"}</div>
                   </div>
                   <div className="px-3 py-2 rounded-lg bg-card">
-                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">Max Tokens</div>
+                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">{t("AgentsSettings.maxTokens")}</div>
                     <div className="text-sm text-primary">{String((selectedAgentDetail.config as Record<string, unknown>).max_tokens ?? "—")}</div>
                   </div>
                   <div className="px-3 py-2 rounded-lg bg-card">
-                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">Max Turns</div>
+                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">{t("AgentsSettings.maxTurns")}</div>
                     <div className="text-sm text-primary">{String((selectedAgentDetail.config as Record<string, unknown>).max_turns ?? "—")}</div>
                   </div>
                   <div className="px-3 py-2 rounded-lg bg-card">
-                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">Max Concurrent Tools</div>
+                    <div className="text-[10px] uppercase tracking-wider text-secondary/70">{t("AgentsSettings.maxConcurrentTools")}</div>
                     <div className="text-sm text-primary">{String((selectedAgentDetail.config as Record<string, unknown>).max_concurrent_tools ?? "—")}</div>
                   </div>
                 </div>
                 {"workspace_only" in (selectedAgentDetail.config as Record<string, unknown>) && (
                   <div className="mt-2 px-3 py-2 rounded-lg bg-card flex items-center justify-between">
-                    <span className="text-sm text-secondary">Workspace Only</span>
+                    <span className="text-sm text-secondary">{t("AgentsSettings.workspaceOnly")}</span>
                     <span className={`text-xs px-2 py-0.5 rounded-full ${(selectedAgentDetail.config as Record<string, unknown>).workspace_only ? "bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400" : "bg-sidebar text-secondary"}`}>
-                      {(selectedAgentDetail.config as Record<string, unknown>).workspace_only ? "Yes" : "No"}
+                      {(selectedAgentDetail.config as Record<string, unknown>).workspace_only ? t("AgentsSettings.yes") : t("AgentsSettings.no")}
                     </span>
                   </div>
                 )}
@@ -260,16 +262,16 @@ export function AgentsSettings({
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider">
-                  {isDefault ? "Default Agent Parameters" : `${agentId} Parameters`}
+                  {isDefault ? t("AgentsSettings.defaultParams") : t("AgentsSettings.namedParams", { name: agentId })}
                 </h4>
                 {anyOverride && (
                   <button
                     type="button"
                     onClick={() => void resetAgentParams(agentId)}
                     className="text-[11px] text-primary-600 dark:text-primary-400 hover:underline"
-                    title="Reset all parameters to global defaults"
+                    title={t("AgentsSettings.resetAllTitle")}
                   >
-                    Reset all
+                    {t("AgentsSettings.resetAll")}
                   </button>
                 )}
               </div>
@@ -277,7 +279,7 @@ export function AgentsSettings({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm text-secondary">Temperature</label>
+                  <label className="block text-sm text-secondary">{t("AgentsSettings.temperature")}</label>
                   {overrideHint("temperature")}
                 </div>
                 <div className="flex items-center gap-2">
@@ -287,7 +289,7 @@ export function AgentsSettings({
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm text-secondary">Max Tokens</label>
+                  <label className="block text-sm text-secondary">{t("AgentsSettings.maxTokens")}</label>
                   {overrideHint("max_tokens")}
                 </div>
                 <Input
@@ -300,19 +302,19 @@ export function AgentsSettings({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm text-secondary">Max Turns</label>
+                  <label className="block text-sm text-secondary">{t("AgentsSettings.maxTurns")}</label>
                   {overrideHint("max_turns")}
                 </div>
                 <Input
                   type="number"
                   value={eff.max_turns ?? ""}
-                  placeholder="Unlimited"
+                  placeholder={t("AgentsSettings.unlimited")}
                   onChange={(e) => writeNumber("max_turns", e.target.value, true)}
                 />
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm text-secondary">Max Concurrent Tools</label>
+                  <label className="block text-sm text-secondary">{t("AgentsSettings.maxConcurrentTools")}</label>
                   {overrideHint("max_concurrent_tools")}
                 </div>
                 <Input
@@ -325,7 +327,7 @@ export function AgentsSettings({
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm text-secondary">Max Context Tokens</label>
+                  <label className="block text-sm text-secondary">{t("AgentsSettings.maxContextTokens")}</label>
                   {overrideHint("max_context_tokens")}
                 </div>
                 <Input
@@ -336,11 +338,11 @@ export function AgentsSettings({
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm text-secondary">Workspace Only</label>
+                  <label className="block text-sm text-secondary">{t("AgentsSettings.workspaceOnly")}</label>
                   {overrideHint("workspace_only")}
                 </div>
                 <div className="px-3 py-2 rounded-lg bg-card flex items-center justify-between">
-                  <span className="text-xs text-secondary/70">{eff.workspace_only ? "Restricted to workspace" : "Unrestricted"}</span>
+                  <span className="text-xs text-secondary/70">{eff.workspace_only ? t("AgentsSettings.restricted") : t("AgentsSettings.unrestricted")}</span>
                   <Toggle
                     checked={eff.workspace_only}
                     onChange={() => void writeField("workspace_only", !eff.workspace_only)}
@@ -356,7 +358,7 @@ export function AgentsSettings({
         {paramTab === "prompt" && (
           <div>
             <div className="flex items-center justify-between mb-1">
-              <label className="block text-sm text-secondary">System Prompt</label>
+              <label className="block text-sm text-secondary">{t("AgentsSettings.systemPrompt")}</label>
               {overrideHint("system_prompt")}
             </div>
             {isDefault ? (
@@ -374,11 +376,11 @@ export function AgentsSettings({
                       ? void writeField("system_prompt", e.target.value)
                       : void resetAgentParam(agentId, "system_prompt")
                   }
-                  placeholder="Leave empty to inherit the personality-derived prompt"
+                  placeholder={t("AgentsSettings.promptPlaceholder")}
                   className="w-full h-[60vh] rounded-lg border border-subtle bg-card px-3 py-2 text-sm text-primary focus:outline-none focus:ring-2 focus:ring-primary-500/20 resize-none font-mono"
                 />
                 <div className="mt-1 text-[11px] text-secondary/70">
-                  A custom prompt overrides this agent's personality-derived prompt. Empty = inherit.
+                  {t("AgentsSettings.promptHint")}
                 </div>
               </>
             )}

@@ -1,4 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
+import { useTranslation } from "react-i18next";
 import type { EnvModalState } from "@/components/settings/useSettingsData";
 
 interface McpEnvModalProps {
@@ -8,14 +9,14 @@ interface McpEnvModalProps {
 }
 
 export function McpEnvModal({ envModal, setEnvModal, submitEnv }: McpEnvModalProps) {
+  const { t } = useTranslation("settings");
   if (!envModal) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
       <div className="bg-card rounded-xl p-6 max-w-md w-full mx-4 shadow-xl">
-        <h3 className="text-sm font-semibold mb-1">Configure {envModal.preset.display_name}</h3>
+        <h3 className="text-sm font-semibold mb-1">{t("McpEnvModal.title", { name: envModal.preset.display_name })}</h3>
         <p className="text-xs text-secondary mb-4">
-          Enter the tokens this MCP server needs. They are stored securely on this machine
-          and verified by connecting before enabling.
+          {t("McpEnvModal.body")}
         </p>
         <div className="space-y-3">
           {envModal.preset.env.map((v) => (
@@ -50,14 +51,14 @@ export function McpEnvModal({ envModal, setEnvModal, submitEnv }: McpEnvModalPro
             disabled={envModal.saving}
             className="flex-1 px-4 py-2 text-xs font-medium rounded-lg bg-primary-600 text-white hover:opacity-90 transition-opacity disabled:opacity-50"
           >
-            {envModal.saving ? "Validating..." : "Save & Enable"}
+            {envModal.saving ? t("McpEnvModal.validating") : t("McpEnvModal.saveEnable")}
           </button>
           <button
             onClick={() => setEnvModal(null)}
             disabled={envModal.saving}
             className="px-4 py-2 text-xs font-medium rounded-lg bg-sidebar text-secondary hover:text-primary transition-colors"
           >
-            Cancel
+            {t("McpEnvModal.cancel")}
           </button>
         </div>
       </div>
