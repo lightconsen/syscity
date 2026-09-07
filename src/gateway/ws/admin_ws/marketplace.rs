@@ -27,8 +27,16 @@ pub(crate) async fn handle_connectors_catalog(
             Ok(None) => None,
             Err(e) => return WsResponse::err(&req.id, "INTERNAL", e.to_string()),
         };
+        // A cached-but-empty catalog (e.g. first sync raced an empty cloud
+        // catalog) must not pin the empty view forever: treat it as missing
+        // so the one-shot sync below can heal it.
         #[cfg(feature = "cloud")]
-        let synced = if cached.is_none() {
+        let needs_sync = cached
+            .as_ref()
+            .map(|d| d.connectors.is_empty())
+            .unwrap_or(true);
+        #[cfg(feature = "cloud")]
+        let synced = if needs_sync {
             let cfg = state.config.read().await.cloud.clone();
             if cfg.enabled && crate::cloud::session::logged_in().await {
                 let url = format!("{}/catalog.json", cfg.api_base.trim_end_matches('/'));
