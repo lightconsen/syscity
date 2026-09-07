@@ -797,6 +797,12 @@ function ChatApp() {
               ? { title: "Extensions" }
               : undefined
         }
+        sessionTitle={
+          transport.isPendingNewSession()
+            ? ""
+            : sessionItems.find((s) => s.id === transport.getSessionId())
+                ?.label ?? ""
+        }
       />
 
       {/* Row 2: sidebar + main content. */}

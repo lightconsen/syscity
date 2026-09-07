@@ -2,8 +2,7 @@ import {
   Menu,
   Settings,
   PanelRight,
-  ChevronLeft,
-  ChevronRight,
+  PanelLeft,
 } from "lucide-react";
 import { useChatStore } from "@/stores/chatStore";
 import { usePlatform } from "@/hooks/usePlatform";
@@ -24,6 +23,9 @@ interface TitlebarProps {
    * to align with the page's content below. No icons, no close button —
    * leaving the page happens via the sidebar (sessions, New Session). */
   page?: { title: string };
+  /** Open session's title, shown left-aligned like page titles. Empty
+   *  while no session is open (welcome page, full-screen pages). */
+  sessionTitle?: string;
 }
 
 const iconBtnCls =
@@ -61,6 +63,7 @@ export function Titlebar({
   sidebarCollapsed,
   onToggleSidebar,
   page,
+  sessionTitle,
 }: TitlebarProps) {
   const platform = usePlatform();
   const currentAgent = useChatStore((s) => s.currentAgent);
@@ -84,12 +87,11 @@ export function Titlebar({
       className="p-1 rounded-md hover:bg-black/5 dark:hover:bg-white/5 text-secondary transition shrink-0"
       title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
       aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+      aria-pressed={!sidebarCollapsed}
     >
-      {sidebarCollapsed ? (
-        <ChevronRight className="w-4 h-4" />
-      ) : (
-        <ChevronLeft className="w-4 h-4" />
-      )}
+      {/* Counterpart of the right-side PanelRight glyph: a single panel-left
+          icon whose pressed state mirrors the sidebar's visibility. */}
+      <PanelLeft className="w-4 h-4" />
     </button>
   );
 
@@ -145,7 +147,9 @@ export function Titlebar({
       </div>
       {sidebarCollapsed && isMac && collapseBtn}
 
-      {/* Left cluster — starts exactly at the sidebar's right edge */}
+      {/* Left cluster — starts exactly at the sidebar's right edge. Chat-mode
+          identity lives in the center; full-screen pages keep their title
+          here, indented to align with the page content below. */}
       <div className="flex items-center gap-2 min-w-0">
         {page ? (
           <div className="flex items-center min-w-0 pl-6 md:pl-8">
@@ -161,8 +165,26 @@ export function Titlebar({
               className="w-5 h-5 shrink-0 md:hidden"
               draggable={false}
             />
-            {currentAgent ? (
-              <div className="flex items-center gap-2 text-xs text-secondary min-w-0">
+            <span className="md:hidden text-sm font-semibold text-primary whitespace-nowrap">
+              Syscity
+            </span>
+          </>
+        )}
+      </div>
+
+      {/* Session context — title plus agent identity (suppressed for the
+          default agent), left-aligned like full-screen page titles. Empty
+          while no session is open (welcome page, full-screen pages): stays
+          a window drag region. */}
+      <div className="flex-1 h-full flex items-center min-w-0 pl-6 md:pl-8">
+        {!page && sessionTitle && (
+          <div className="flex items-center gap-2 min-w-0 text-xs text-secondary">
+            <span className="font-medium text-primary truncate">
+              {sessionTitle}
+            </span>
+            {currentAgent && currentAgent.id !== "default" && (
+              <>
+                <span className="text-secondary/40 shrink-0">·</span>
                 <span className="text-sm shrink-0" aria-hidden="true">
                   {currentAgent.emoji}
                 </span>
@@ -174,18 +196,11 @@ export function Titlebar({
                     ({currentAgent.id})
                   </span>
                 )}
-              </div>
-            ) : (
-              <span className="md:hidden text-sm font-semibold text-primary whitespace-nowrap">
-                Syscity
-              </span>
+              </>
             )}
-          </>
+          </div>
         )}
       </div>
-
-      {/* Center: empty drag region */}
-      <div className="flex-1 h-full" />
 
       {/* Right cluster (network dot + theme toggle live in the Statusbar) */}
       <div className="flex items-center gap-1 shrink-0">
