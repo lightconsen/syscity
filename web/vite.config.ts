@@ -22,7 +22,7 @@ export default defineConfig({
         maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
       },
       manifest: {
-        name: 'Syscity Chat',
+        name: 'Syscity Agent',
         short_name: 'Syscity',
         description: 'AI-powered chat interface for Syscity',
         theme_color: '#B22AC2',
