@@ -80,6 +80,9 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
   /** New Session welcome page armed: the next send creates the real session
    *  first (deferred creation — no session exists until the first message). */
   private pendingNewSession = false;
+  /** Agent to bind to the deferred session (armed via armNewSession(agentId),
+   *  consumed by the first send). */
+  private pendingAgentId: string | undefined = undefined;
   private messagesListeners: Set<MessagesCallback> = new Set();
   private sessionListeners: Set<SessionCallback> = new Set();
   private runListeners: Set<(running: boolean) => void> = new Set();
@@ -417,14 +420,19 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
   }
 
   /** Arm the welcome page: clear the in-memory view without touching any
-   *  session. The real session is created on the first send (see run()). */
-  armNewSession(): void {
+   *  session. The real session is created on the first send (see run()).
+   *  An optional agentId binds the summoned agent to that future session —
+   *  clicking an agent in the sidebar navigates here instead of creating
+   *  an empty session up front. */
+  armNewSession(agentId?: string): void {
     this.pendingNewSession = true;
+    this.pendingAgentId = agentId;
     this.setMessages([]);
   }
 
   createSession(agentId?: string): string {
     this.pendingNewSession = false;
+    this.pendingAgentId = undefined;
     // Reuse an existing empty session if one exists
     const sessions = this.getLocalSessions();
     for (const sid of sessions) {
@@ -1226,7 +1234,8 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     // chat.send.
     if (this.pendingNewSession) {
       this.pendingNewSession = false;
-      this.createSession();
+      this.createSession(this.pendingAgentId);
+      this.pendingAgentId = undefined;
     }
 
     const startTime = Date.now();

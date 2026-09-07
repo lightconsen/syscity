@@ -69,6 +69,10 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
   useEffect(() => {
     let cancelled = false;
     const doLoad = async () => {
+      // Welcome page armed (agent summon): don't pull the previous session's
+      // history into it — armNewSession leaves sessionId pointing at the old
+      // session, so a remount-triggered load would clobber the empty view.
+      if (transport.isPendingNewSession()) return;
       try {
         const { messages: history, hasMore } = await transport.loadHistory(
           transport.getSessionId()
@@ -97,7 +101,16 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
 
     // Subscribe to message changes
     const unsub = transport.onMessagesChange((msgs) => {
+      const prev = useChatStore.getState().messages;
       useChatStore.getState().setMessages([...msgs]);
+      // Freshly armed welcome page ("/new" included): messages just
+      // transitioned to empty — clear a pending agent summon. The immediate
+      // replay on subscribe (e.g. ChatAppInner remounting right after an
+      // agent summon) re-delivers an already-empty list and must not wipe
+      // the summon that was just set.
+      if (msgs.length === 0 && prev.length > 0) {
+        useChatStore.getState().setPendingAgent(null);
+      }
     });
     return () => {
       cancelled = true;
@@ -580,6 +593,7 @@ function ChatApp() {
     // New Session is a page toggle: show the welcome state without creating
     // anything. The real session is created lazily on the first message sent
     // from the welcome page (transport.run() consumes the pending flag).
+    useChatStore.getState().setPendingAgent(null);
     transport.armNewSession();
   }, [transport]);
 
@@ -593,6 +607,7 @@ function ChatApp() {
       // of creating another one.
       const existing = sessions.find((s) => s.agent_id === agentId);
       if (existing) {
+        useChatStore.getState().setPendingAgent(null);
         transport.switchSession(existing.id);
         const { messages: history, hasMore } = await transport.loadHistory(existing.id);
         transport.setMessages(history);
@@ -602,23 +617,22 @@ function ChatApp() {
         return;
       }
 
-      transport.createSession(agentId);
-      // Summon feedback: preset a one-line opener from the expert so the new
-      // session reads as "summoned" immediately (web-side; a reload replays
-      // the real history).
-      const opener: ChatMessage = {
-        id: `summon-${Date.now()}`,
-        role: "assistant",
-        content: `👋 我是 ${agentId}，已就绪。请告诉我你的任务。`,
-        timestamp: Date.now(),
-      };
-      transport.setMessages([opener]);
-      useChatStore.getState().setMessages([opener]);
+      // No session yet: navigate to the New Session welcome page with the
+      // agent attached. The session is created lazily on the first message
+      // (same deferred flow as the New Session button) — clicking an agent
+      // and never typing no longer leaves an empty session behind.
+      transport.armNewSession(agentId);
+      const agent = agents.find((a) => a.id === agentId);
+      // Set after armNewSession: its empty-messages listener clears any
+      // previous pending agent.
+      useChatStore.getState().setPendingAgent(
+        agent
+          ? { id: agent.id, display_name: agent.display_name, emoji: agent.emoji }
+          : { id: agentId, display_name: agentId, emoji: "🤖" }
+      );
       setSessionKey((k) => k + 1);
-      await refreshSessions();
-      await refreshAgents();
     },
-    [transport, refreshSessions, refreshAgents, sessions]
+    [transport, refreshSessions, sessions, agents]
   );
 
   const handleSwitchSession = useCallback(
@@ -626,6 +640,8 @@ function ChatApp() {
       setSettingsOpen(false);
       setMarketplaceOpen(false);
       setKbOpen(false);
+      // Navigating away from the welcome page consumes any pending summon.
+      useChatStore.getState().setPendingAgent(null);
       const currentId = transport.getSessionId();
       if (currentId !== id) {
         // Save current session's in-memory messages before switching
@@ -697,6 +713,13 @@ function ChatApp() {
     const currentId = transport.getSessionId();
     const current = sessionItems.find((s) => s.id === currentId);
     useChatStore.getState().setCurrentAgent(current?.agent);
+    // A pending summon lives only while the welcome page is armed; the
+    // summon itself doesn't change sessionId, so a matching "current" here
+    // is just the stale previous session — clear only once the flag has
+    // been consumed (first send created the real session).
+    if (!transport.isPendingNewSession()) {
+      useChatStore.getState().setPendingAgent(null);
+    }
   }, [sessionItems, transport]);
 
   // Gate: until we have confirmed whether an LLM is configured, show a
