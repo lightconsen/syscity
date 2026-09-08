@@ -42,6 +42,13 @@ impl ModelRouter {
 
     // ==================== MODEL MANAGEMENT ====================
 
+    /// Get a registered provider instance by config name (`None` when the
+    /// name is not registered). Deterministic counterpart to
+    /// [`create_default_provider`] for callers that must pin a provider.
+    pub async fn get_provider(&self, name: &str) -> Option<Arc<dyn Provider + Send + Sync>> {
+        self.providers.read().await.get(name).cloned()
+    }
+
     /// List all `(provider, model_id)` pairs from provider configs and
     /// catalog-discovered models. Catalog entries are only included for
     /// providers that still exist in config, so removed providers do not

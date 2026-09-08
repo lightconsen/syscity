@@ -25,6 +25,12 @@ impl ModelRouter {
             ProviderOverrides {
                 // protocol: auto-detect from preset default
                 base_url: config.base_url.clone(),
+                // Honor the config's default_model: without this the concrete
+                // provider instance falls back to the *preset* default model
+                // (e.g. the openai preset's `gpt-5.4-mini`), so any
+                // `model: None` request (query expansion, utility calls) would
+                // send the wrong model to the configured endpoint.
+                model: (!config.default_model.is_empty()).then(|| config.default_model.clone()),
                 ..ProviderOverrides::default()
             },
         )
@@ -137,6 +143,35 @@ impl ModelRouter {
                     h.failures, class
                 );
                 h.state = CircuitState::Open;
+            }
+        }
+    }
+
+    /// Record a failed *health probe*. Unlike [`record_failure`], this does
+    /// NOT refresh `last_failure` while the breaker is already Open: the
+    /// Open→HalfOpen cooldown must keep running so real traffic can trial the
+    /// provider after `circuit_breaker_reset_secs` even while probes keep
+    /// failing. (Probe failures used to pin `last_failure`, making the
+    /// HalfOpen transition unreachable and locking the provider out until a
+    /// probe itself succeeded — a permanent lockout for any provider whose
+    /// probe endpoint is broken but whose real endpoint works.)
+    pub(super) async fn record_probe_failure(&self, provider: &str) {
+        let config = self.config.read().await;
+        let threshold = config.circuit_breaker_threshold;
+        drop(config);
+
+        let mut health = self.health.write().await;
+        if let Some(h) = health.get_mut(provider) {
+            h.failures += 1;
+            if h.state != CircuitState::Open {
+                h.last_failure = Some(chrono::Utc::now());
+                if h.failures >= threshold {
+                    warn!(
+                        "Circuit breaker opened for provider: {provider} ({} probe failures)",
+                        h.failures
+                    );
+                    h.state = CircuitState::Open;
+                }
             }
         }
     }

@@ -78,11 +78,11 @@ impl ModelRouter {
                     Ok(true) => self.record_success(&name, start.elapsed()).await,
                     Ok(false) => {
                         debug!("Health probe reported unhealthy for {}", name);
-                        self.record_failure(&name, None).await;
+                        self.record_probe_failure(&name).await;
                     }
                     Err(e) => {
                         debug!("Health probe failed for {}: {}", name, e);
-                        self.record_failure(&name, None).await;
+                        self.record_probe_failure(&name).await;
                     }
                 }
             }

@@ -159,19 +159,41 @@ pub async fn init_memory_services(
             // ── Multi-Query expansion ───────────────────────────────────────
             let mqc = &config.vector_memory.multi_query;
             if mqc.enabled && mqc.num_variations > 0 {
-                match state.infra.model_router.create_default_provider().await {
-                    Ok(provider) => {
-                        let rag_mq_config = RagMultiQueryConfig {
-                            enabled: true,
-                            num_variations: mqc.num_variations,
-                            ..Default::default()
-                        };
-                        service = service.with_multi_query(provider, rag_mq_config);
-                        info!("Multi-Query enabled with {} variations", mqc.num_variations);
-                    }
-                    Err(e) => {
-                        warn!("Failed to create LLM provider for Multi-Query: {}", e);
-                    }
+                // Pin the expansion LLM deterministically when configured.
+                // The unconfigured fallback (`create_default_provider`) grabs
+                // an arbitrary registered provider — possibly a metered one.
+                let mq_provider = match &mqc.provider {
+                    Some(name) => match state.infra.model_router.get_provider(name).await {
+                        Some(p) => Some(p),
+                        None => {
+                            warn!(
+                                "Multi-Query provider '{}' not found under [providers.*] — \
+                                     Multi-Query disabled",
+                                name
+                            );
+                            None
+                        }
+                    },
+                    None => state
+                        .infra
+                        .model_router
+                        .create_default_provider()
+                        .await
+                        .ok(),
+                };
+                if let Some(provider) = mq_provider {
+                    let rag_mq_config = RagMultiQueryConfig {
+                        enabled: true,
+                        num_variations: mqc.num_variations,
+                        ..Default::default()
+                    };
+                    service = service.with_multi_query(provider, mqc.model.clone(), rag_mq_config);
+                    info!(
+                        "Multi-Query enabled with {} variations (provider={}, model={})",
+                        mqc.num_variations,
+                        mqc.provider.as_deref().unwrap_or("<default>"),
+                        mqc.model.as_deref().unwrap_or("<provider default>")
+                    );
                 }
             }
 

@@ -17,6 +17,7 @@ use crate::rag::query::{NoopTransformer, QueryTransformer};
 use crate::rag::reranker::{NoopReranker, Reranker};
 use crate::rag::vector_store::{VectorStore, VectorStoreStats};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// High-level vector memory service
 pub struct VectorMemoryService {
@@ -31,8 +32,9 @@ pub struct VectorMemoryService {
     query_transformer: Arc<dyn QueryTransformer>,
     /// Optional reranker for cross-encoder re-scoring.
     reranker: Arc<dyn Reranker>,
-    /// Optional Multi-Query expansion provider and config.
+    /// Optional Multi-Query expansion provider, model override and config.
     multi_query_provider: Option<Arc<dyn Provider>>,
+    multi_query_model: Option<String>,
     multi_query_config: Option<MultiQueryConfig>,
 }
 
@@ -62,6 +64,7 @@ impl VectorMemoryService {
             query_transformer: Arc::new(NoopTransformer),
             reranker: Arc::new(NoopReranker),
             multi_query_provider: None,
+            multi_query_model: None,
             multi_query_config: None,
         }
     }
@@ -78,13 +81,16 @@ impl VectorMemoryService {
         self
     }
 
-    /// Attach a Multi-Query expansion provider.
+    /// Attach a Multi-Query expansion provider. `model` overrides the
+    /// provider's default model for the expansion call (`None` = default).
     pub fn with_multi_query(
         mut self,
         provider: Arc<dyn Provider>,
+        model: Option<String>,
         config: MultiQueryConfig,
     ) -> Self {
         self.multi_query_provider = Some(provider);
+        self.multi_query_model = model;
         self.multi_query_config = Some(config);
         self
     }
@@ -216,9 +222,23 @@ impl VectorMemoryService {
             crate::error::SyscityError::Internal("Multi-Query provider not set".into())
         })?;
 
-        // 1. Expand query into sub-queries (includes original query first)
-        let sub_queries =
-            expand_query_with_llm(query, mq_config.num_variations, provider.as_ref()).await?;
+        // 1. Expand query into sub-queries (includes original query first).
+        //    Expansion is an enhancement — when the LLM call fails, degrade
+        //    to the original query only instead of failing the whole search.
+        let sub_queries = match expand_query_with_llm(
+            query,
+            mq_config.num_variations,
+            provider.as_ref(),
+            self.multi_query_model.as_deref(),
+        )
+        .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("Multi-Query expansion failed, falling back to the original query: {}", e);
+                vec![query.to_string()]
+            }
+        };
 
         // 2. Search each sub-query in parallel
         //    Each sub-query goes through QueryTransformer (HyDE) → Embed → Search

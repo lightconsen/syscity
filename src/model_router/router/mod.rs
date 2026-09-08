@@ -956,4 +956,80 @@ mod tests {
         assert_eq!(openai.quota.as_ref().unwrap().remaining, 42.0);
         assert_eq!(anthropic.quota.as_ref().unwrap().remaining, 7.0);
     }
+
+    #[tokio::test]
+    async fn record_probe_failure_does_not_reset_half_open_cooldown_while_open() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        router
+            .add_provider("p", test_provider_config(&["m"]))
+            .await
+            .unwrap();
+
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(290);
+        {
+            let mut health = router.health.write().await;
+            let h = health.get_mut("p").unwrap();
+            h.state = CircuitState::Open;
+            h.failures = 5;
+            h.last_failure = Some(stale);
+        }
+
+        // While Open, a failed probe must NOT refresh last_failure — the
+        // Open→HalfOpen cooldown keeps running so real traffic can trial.
+        router.record_probe_failure("p").await;
+
+        let health = router.health.read().await;
+        let h = health.get("p").unwrap();
+        assert_eq!(h.state, CircuitState::Open);
+        assert_eq!(h.last_failure, Some(stale));
+    }
+
+    #[tokio::test]
+    async fn record_probe_failure_opens_breaker_from_closed() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        router
+            .add_provider("p", test_provider_config(&["m"]))
+            .await
+            .unwrap();
+
+        // Below the default threshold (5): counts but stays Closed.
+        router.record_probe_failure("p").await;
+        {
+            let health = router.health.read().await;
+            let h = health.get("p").unwrap();
+            assert_eq!(h.state, CircuitState::Closed);
+            assert!(h.last_failure.is_some());
+        }
+
+        for _ in 0..4 {
+            router.record_probe_failure("p").await;
+        }
+        let health = router.health.read().await;
+        assert_eq!(health.get("p").unwrap().state, CircuitState::Open);
+    }
+
+    #[tokio::test]
+    async fn record_probe_failure_reopens_breaker_from_half_open() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        router
+            .add_provider("p", test_provider_config(&["m"]))
+            .await
+            .unwrap();
+
+        {
+            let mut health = router.health.write().await;
+            let h = health.get_mut("p").unwrap();
+            h.state = CircuitState::HalfOpen;
+            h.failures = 5;
+            h.last_failure = Some(chrono::Utc::now() - chrono::Duration::seconds(290));
+        }
+
+        // HalfOpen + failed probe → re-open and restart the cooldown.
+        router.record_probe_failure("p").await;
+
+        let health = router.health.read().await;
+        let h = health.get("p").unwrap();
+        assert_eq!(h.state, CircuitState::Open);
+        assert!(h.last_failure.unwrap() > chrono::Utc::now() - chrono::Duration::seconds(10));
+    }
 }

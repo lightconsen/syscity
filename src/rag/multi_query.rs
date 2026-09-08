@@ -92,6 +92,7 @@ pub async fn expand_query_with_llm(
     query: &str,
     num_variations: usize,
     provider: &dyn Provider,
+    model: Option<&str>,
 ) -> crate::Result<Vec<String>> {
     if num_variations == 0 {
         return Ok(vec![query.to_string()]);
@@ -109,7 +110,9 @@ pub async fn expand_query_with_llm(
             ),
             Message::user(prompt),
         ],
-        model: None,
+        // `None` falls back to the provider instance's default model — make
+        // sure that default is the configured one (see `create_provider`).
+        model: model.map(String::from),
         temperature: Some(0.7),
         max_tokens: Some(512),
         stream: false,
@@ -298,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_expand_zero_variations() {
         let mock = Arc::new(MockProvider::new().with_callback(|_| Message::assistant("unused")));
-        let queries = expand_query_with_llm("test query", 0, mock.as_ref())
+        let queries = expand_query_with_llm("test query", 0, mock.as_ref(), None)
             .await
             .unwrap();
         assert_eq!(queries.len(), 1);
@@ -310,7 +313,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new().with_callback(|_| {
             Message::assistant("deployment steps\nmonitoring setup\nalert rules")
         }));
-        let queries = expand_query_with_llm("how to deploy", 3, mock.as_ref())
+        let queries = expand_query_with_llm("how to deploy", 3, mock.as_ref(), None)
             .await
             .unwrap();
         assert_eq!(queries.len(), 4);
@@ -323,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn test_expand_pads_on_insufficient_output() {
         let mock = Arc::new(MockProvider::new().with_callback(|_| Message::assistant("only one")));
-        let queries = expand_query_with_llm("test", 3, mock.as_ref())
+        let queries = expand_query_with_llm("test", 3, mock.as_ref(), None)
             .await
             .unwrap();
         assert_eq!(queries.len(), 4);
@@ -340,7 +343,7 @@ mod tests {
             MockProvider::new()
                 .with_callback(|_| Message::assistant("\n\nvariant a\n\nvariant b\n\n")),
         );
-        let queries = expand_query_with_llm("test", 2, mock.as_ref())
+        let queries = expand_query_with_llm("test", 2, mock.as_ref(), None)
             .await
             .unwrap();
         assert_eq!(queries.len(), 3);

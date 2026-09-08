@@ -861,6 +861,16 @@ pub struct MultiQueryConfig {
     /// Number of LLM-generated sub-queries (not counting the original query).
     #[serde(default = "default_multi_query_variations")]
     pub num_variations: usize,
+    /// Provider name for the expansion LLM (a key under `[providers.*]`).
+    /// Pin an explicit direct/cheap provider here: unset falls back to the
+    /// router's *first registered* provider, which is nondeterministic and
+    /// may be a metered one (e.g. cloud), silently billing credits per turn.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model override for the expansion LLM. Unset → the provider's
+    /// configured default model.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_multi_query_variations() -> usize {
@@ -872,6 +882,8 @@ impl Default for MultiQueryConfig {
         Self {
             enabled: false,
             num_variations: 3,
+            provider: None,
+            model: None,
         }
     }
 }
