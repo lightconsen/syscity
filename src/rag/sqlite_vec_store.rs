@@ -224,19 +224,29 @@ impl VectorStore for SqliteVecStore {
         let max_distance = 1.0f64 - threshold as f64;
 
         let rows = if let Some(collection) = collection {
+            // The KNN scan must live in its own subquery: sqlite-vec cannot
+            // extract the `k` constraint from a `LIMIT ?` that belongs to a
+            // query joining another table, and fails with "A LIMIT or 'k = ?'
+            // constraint is required on vec0 knn queries". The subquery keeps
+            // the plain (supported) KNN shape; the collection filter is
+            // applied by the outer join.
             sqlx::query(
                 "SELECT v.rowid, v.id, v.source_id, v.text, v.embedding, v.position,
                         v.total_chunks, v.metadata, v.distance
-                 FROM vec_chunks v
+                 FROM (SELECT rowid, id, source_id, text, embedding, position,
+                              total_chunks, metadata, distance
+                       FROM vec_chunks
+                       WHERE embedding MATCH ? AND distance <= ?
+                       ORDER BY distance
+                       LIMIT ?) v
                  JOIN vec_chunk_collections c ON v.id = c.chunk_id
-                 WHERE v.embedding MATCH ? AND v.distance <= ? AND c.collection = ?
-                 ORDER BY v.distance
-                 LIMIT ?",
+                 WHERE c.collection = ?
+                 ORDER BY v.distance",
             )
             .bind(&query_bytes)
             .bind(max_distance)
-            .bind(collection)
             .bind(limit as i64)
+            .bind(collection)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| crate::error::SyscityError::Storage {
@@ -498,6 +508,47 @@ mod tests {
 
         let results = store.search_similar(&[0.0, 1.0, 0.0], 5, 0.5, None).await?;
         assert!(results.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_vec_store_collection_search() -> crate::Result<()> {
+        // Regression: the collection-filtered search joins
+        // `vec_chunk_collections`; a direct KNN + JOIN query fails on
+        // sqlite-vec ("A LIMIT or 'k = ?' constraint is required on vec0 knn
+        // queries"). The query must use the subquery form.
+        let store = SqliteVecStore::new_in_memory(2).await?;
+        for (id, source, collection, embedding) in [
+            ("c1", "doc-a", Some("col-a"), vec![1.0, 0.0]),
+            ("c2", "doc-b", Some("col-b"), vec![0.9, 0.1]),
+            ("c3", "doc-c", None, vec![1.0, 0.0]),
+        ] {
+            store
+                .store_chunk(EmbeddedChunk {
+                    id: id.to_string(),
+                    source_id: source.to_string(),
+                    text: id.to_string(),
+                    embedding,
+                    position: 0,
+                    total_chunks: 1,
+                    collection: collection.map(String::from),
+                    metadata: None,
+                })
+                .await?;
+        }
+
+        let results = store
+            .search_similar(&[1.0, 0.0], 10, 0.5, Some("col-a"))
+            .await?;
+        assert_eq!(results.len(), 1, "only col-a chunks must match");
+        assert_eq!(results[0].0.id, "c1");
+
+        // The other collection must not leak its chunks.
+        let results_b = store
+            .search_similar(&[1.0, 0.0], 10, 0.5, Some("col-b"))
+            .await?;
+        assert_eq!(results_b.len(), 1);
+        assert_eq!(results_b[0].0.id, "c2");
         Ok(())
     }
 
