@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, Coins } from "lucide-react";
+import { AlertTriangle, Coins, ExternalLink } from "lucide-react";
 import { Section } from "@/components/ui/Section";
 import {
   cloudLogin,
@@ -97,6 +97,14 @@ export function CloudSection() {
                   : t("CloudSection.lowCredits")}
               </p>
             )}
+            {/* B2: monthly quota period hint */}
+            {sub?.period_end && (
+              <p className="mt-1 text-xs text-tertiary">
+                {t("CloudSection.periodEnd", {
+                  date: new Date(sub.period_end).toLocaleDateString(),
+                })}
+              </p>
+            )}
           </div>
 
           {/* Usage summary */}
@@ -125,6 +133,19 @@ export function CloudSection() {
           <p className="px-3 text-xs text-tertiary">
             {t("CloudSection.modelPickerHint")}
           </p>
+
+          {/* B1: console deep link (billing / earn credits). */}
+          {status.console_url && (
+            <a
+              href={status.console_url.replace(/\/$/, "")}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs text-secondary hover:text-primary transition"
+            >
+              <ExternalLink size={12} />
+              {t("CloudSection.manageConsole")}
+            </a>
+          )}
         </div>
       )}
     </Section>

@@ -1559,6 +1559,18 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
             const durationMs = Date.now() - startTime;
             const toolCount = toolCalls.size;
             const turnId = (evt.payload?.turn_id as string) || undefined;
+            // Cloud relay credit metering (A1): `usage` rides the final event.
+            const usage = evt.payload?.usage as
+              | { credits_used?: number; credit_balance?: number }
+              | undefined;
+            if (usage) {
+              if (usage.credits_used !== null && usage.credits_used !== undefined) {
+                aiMsg.credits = usage.credits_used;
+              }
+              if (usage.credit_balance !== null && usage.credit_balance !== undefined) {
+                aiMsg.balanceAfter = usage.credit_balance;
+              }
+            }
             // Save final AI message to history with full parts and metadata
             this.saveMessage({ ...aiMsg, durationMs, toolCount, turnId });
             aiMsg.content = currentText;
@@ -1572,6 +1584,10 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
             return;
           }
           case "chat.error": {
+            // Machine-readable code (e.g. `insufficient_credits`) drives a
+            // dedicated error card in the UI.
+            const code = evt.payload?.code as string | undefined;
+            if (code) aiMsg.errorCode = code;
             throw new Error(
               (evt.payload?.message as string) || "Chat error"
             );
@@ -1743,6 +1759,19 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
             finalParts.push(...extraParts);
             if (currentText) finalParts.push({ type: "text", text: currentText });
 
+            // Cloud relay credit metering (A1): `usage` rides the final event.
+            const usage = evt.payload?.usage as
+              | { credits_used?: number; credit_balance?: number }
+              | undefined;
+            if (usage) {
+              if (usage.credits_used !== null && usage.credits_used !== undefined) {
+                aiMsg.credits = usage.credits_used;
+              }
+              if (usage.credit_balance !== null && usage.credit_balance !== undefined) {
+                aiMsg.balanceAfter = usage.credit_balance;
+              }
+            }
+
             aiMsg.content = currentText;
             aiMsg.parts = finalParts;
             aiMsg.durationMs = Date.now();
@@ -1762,6 +1791,8 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
           }
           case "chat.error": {
             aiMsg.content = currentText || ((evt.payload?.message as string) || "Chat error");
+            const code = evt.payload?.code as string | undefined;
+            if (code) aiMsg.errorCode = code;
             aiMsg.liveStatus = undefined;
             this.messagesMap.set(sessionId, [...sessionMessages]);
             return;
@@ -1860,6 +1891,13 @@ export interface SyscityWebSocketTransport {
   getCloudUsage(days?: number): Promise<unknown>;
   submitCloudToken(token: string): Promise<unknown>;
   cloudLogout(): Promise<void>;
+  getCloudClaims(): Promise<unknown>;
+  cloudDailyClaim(): Promise<unknown>;
+  cloudSignupClaim(): Promise<unknown>;
+  getCloudPacks(): Promise<unknown>;
+  getCloudLedger(limit?: number): Promise<unknown>;
+  getCloudInvite(): Promise<unknown>;
+  redeemCloudInvite(code: string): Promise<unknown>;
   cloudKbList(): Promise<unknown>;
   cloudKbCreate(name: string): Promise<unknown>;
   cloudKbDelete(kbId: string): Promise<{ ok: boolean }>;

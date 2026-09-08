@@ -43,6 +43,14 @@ export interface ChatMessage {
   };
   /** Stable per-turn id from the `chat.final` event; the key for feedback.vote. */
   turnId?: string;
+  /** Credits billed by the cloud relay for this turn (from `chat.final`
+   * `usage.credits_used`). */
+  credits?: number;
+  /** Cloud credit balance after this turn (`usage.credit_balance`). */
+  balanceAfter?: number;
+  /** Machine-readable error code from `chat.error` (e.g.
+   * `insufficient_credits`). */
+  errorCode?: string;
 }
 
 export type MessagesCallback = (messages: ChatMessage[]) => void;

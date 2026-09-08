@@ -306,5 +306,7 @@
   "CloudSection.usedThisMonth": "本月已使用 {{n}} 积分",
   "CloudSection.usageSummary": "{{calls}} 次调用 · 近 {{days}} 天",
   "CloudSection.noUsage": "暂无用量。",
-  "CloudSection.modelPickerHint": "云端模型和搜索可在模型选择器中使用。"
+  "CloudSection.modelPickerHint": "云端模型和搜索可在模型选择器中使用。",
+  "CloudSection.periodEnd": "积分按月发放，{{date}} 重置",
+  "CloudSection.manageConsole": "在控制台管理"
 }

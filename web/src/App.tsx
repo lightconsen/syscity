@@ -24,6 +24,7 @@ import { DocumentPreviewPanel } from "@/components/shared/DocumentPreviewPanel";
 import { WorkspacePanel } from "@/components/workspace/WorkspacePanel";
 import { UpdateBanner } from "@/components/update/UpdateBanner";
 import { CloudEnabledBanner } from "@/components/update/CloudEnabledBanner";
+import { LowBalanceBanner } from "@/components/update/LowBalanceBanner";
 import { ExtensionsView } from "@/components/marketplace/ExtensionsView";
 import { KnowledgeBaseView } from "@/components/kb/KnowledgeBaseView";
 import { AskModal, type AskPrompt } from "@/components/ask/AskModal";
@@ -889,6 +890,8 @@ function ChatApp() {
         {!settingsOpen && !marketplaceOpen && !kbOpen && <UpdateBanner />}
         {/* First-login cloud guidance (shown once after a successful login). */}
         {!settingsOpen && !marketplaceOpen && !kbOpen && <CloudEnabledBanner />}
+        {/* Low credit balance / overdraft warning. */}
+        {!settingsOpen && !marketplaceOpen && !kbOpen && <LowBalanceBanner />}
         {kbOpen ? (
           <KnowledgeBaseView agents={agents} />
         ) : marketplaceOpen ? (

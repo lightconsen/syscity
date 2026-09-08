@@ -1,6 +1,10 @@
 {
   "CloudEnabledBanner.body": "云功能已启用 — 云端模型和网络搜索自动可用。在 设置 → 扩展 中浏览完整目录（含云端采购连接器）；积分/用量可在 Cloud 区查看。知识库文档可从云端控制台上传，或在对话中通过",
   "CloudEnabledBanner.dismiss": "关闭",
+  "LowBalanceBanner.overdrawn": "积分已透支 — 充值前计费调用将被拒绝。",
+  "LowBalanceBanner.low": "积分余额不足 — 请及时充值以免影响使用。",
+  "LowBalanceBanner.recharge": "充值",
+  "LowBalanceBanner.dismiss": "关闭",
   "UpdateBanner.idle": "空闲",
   "UpdateBanner.checking": "检查中…",
   "UpdateBanner.downloading": "下载中…",

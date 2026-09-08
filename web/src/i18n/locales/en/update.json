@@ -1,6 +1,10 @@
 {
   "CloudEnabledBanner.body": "Cloud enabled — cloud models and web search are available automatically. Browse the full catalog in Settings → Extensions (incl. cloud procurement connectors); view credits/usage under Cloud. Knowledge-base documents can be uploaded from the cloud console or in chat via",
   "CloudEnabledBanner.dismiss": "Dismiss",
+  "LowBalanceBanner.overdrawn": "Credit balance overdrawn — metered calls are blocked until you top up.",
+  "LowBalanceBanner.low": "Credit balance is running low — top up to avoid interruptions.",
+  "LowBalanceBanner.recharge": "Recharge",
+  "LowBalanceBanner.dismiss": "Dismiss",
   "UpdateBanner.idle": "Idle",
   "UpdateBanner.checking": "Checking…",
   "UpdateBanner.downloading": "Downloading…",

@@ -66,4 +66,37 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
       errors: string[];
     };
   };
+  // Credits / marketing — thin passthroughs to the cloud server (15s timeout,
+  // WAN round trip).
+  proto.getCloudClaims = async function (this: SyscityWebSocketTransport): Promise<unknown> {
+    return this.sendRequestAndWait("cloud.credits.claims", {}, 15_000);
+  };
+  proto.cloudDailyClaim = async function (this: SyscityWebSocketTransport): Promise<unknown> {
+    return this.sendRequestAndWait("cloud.credits.daily_claim", {}, 15_000);
+  };
+  proto.cloudSignupClaim = async function (this: SyscityWebSocketTransport): Promise<unknown> {
+    return this.sendRequestAndWait("cloud.credits.signup_claim", {}, 15_000);
+  };
+  proto.getCloudPacks = async function (this: SyscityWebSocketTransport): Promise<unknown> {
+    return this.sendRequestAndWait("cloud.credits.packs", {}, 15_000);
+  };
+  proto.getCloudLedger = async function (
+    this: SyscityWebSocketTransport,
+    limit?: number
+  ): Promise<unknown> {
+    return this.sendRequestAndWait(
+      "cloud.credits.ledger",
+      limit ? { limit } : {},
+      15_000
+    );
+  };
+  proto.getCloudInvite = async function (this: SyscityWebSocketTransport): Promise<unknown> {
+    return this.sendRequestAndWait("cloud.credits.invite", {}, 15_000);
+  };
+  proto.redeemCloudInvite = async function (
+    this: SyscityWebSocketTransport,
+    code: string
+  ): Promise<unknown> {
+    return this.sendRequestAndWait("cloud.credits.invite_redeem", { code }, 15_000);
+  };
 }

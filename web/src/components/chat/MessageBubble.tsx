@@ -5,6 +5,7 @@ import { DocumentRefPart } from "@/components/shared/DocumentRefPart";
 import { Avatar } from "./Avatar";
 import { LiveStatusBar } from "./LiveStatusBar";
 import {
+  AlertTriangle,
   Clock,
   Wrench,
   Copy,
@@ -16,10 +17,12 @@ import {
   BrainCircuit,
   ThumbsUp,
   ThumbsDown,
+  Coins,
 } from "lucide-react";
 import { formatDuration } from "@/lib/utils";
+import { cloudStatus } from "@/lib/cloud";
 import type { ChatMessage, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useChatStore } from "@/stores/chatStore";
 
@@ -33,6 +36,53 @@ const centerStyle: Record<string, string> = {
   paddingLeft: "calc((100% - var(--message-list-max-width)) / 2)",
   paddingRight: "calc((100% - var(--message-list-max-width)) / 2)",
 };
+
+// Console deep link for the insufficient-credits recharge button (cached —
+// it never changes for the lifetime of the page).
+let cachedConsoleUrl: string | null | undefined;
+function fetchConsoleUrl(): Promise<string | null> {
+  if (cachedConsoleUrl !== undefined) return Promise.resolve(cachedConsoleUrl);
+  return cloudStatus()
+    .then((s) => (cachedConsoleUrl = s.console_url?.replace(/\/$/, "") ?? null))
+    .catch(() => (cachedConsoleUrl = null));
+}
+
+/** A3: dedicated card when the cloud relay rejected the turn for overdraft. */
+function InsufficientCreditsCard() {
+  const { t } = useTranslation("chat");
+  const [consoleUrl, setConsoleUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetchConsoleUrl().then((u) => {
+      if (alive) setConsoleUrl(u);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return (
+    <div className="mt-1 rounded-lg border border-red-300/60 dark:border-red-500/30 bg-red-50 dark:bg-red-900/20 px-3 py-2.5 max-w-xl">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-red-600 dark:text-red-400">
+        <AlertTriangle className="w-3.5 h-3.5" />
+        {t("MessageBubble.insufficientCredits")}
+      </div>
+      <p className="mt-1 text-xs text-secondary">
+        {t("MessageBubble.insufficientCreditsHint")}
+      </p>
+      {consoleUrl && (
+        <a
+          href={consoleUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-primary-500 hover:bg-primary-600 text-white text-xs font-medium transition"
+        >
+          <Coins className="w-3 h-3" />
+          {t("MessageBubble.recharge")}
+        </a>
+      )}
+    </div>
+  );
+}
 
 function useCopied() {
   const [copied, setCopied] = useState(false);
@@ -299,7 +349,11 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
 
   const hasParts = message.parts && message.parts.length > 0;
   const isAssistant = message.role === "assistant";
-  const hasMetadata = isAssistant && (message.durationMs !== undefined || message.toolCount !== undefined);
+  const hasMetadata =
+    isAssistant &&
+    (message.durationMs !== undefined ||
+      message.toolCount !== undefined ||
+      message.credits !== undefined);
   const replyText = assistantReplyText(message);
   const internalCounts = countInternalParts(message);
   const hasInternals = internalCounts.reasoning > 0 || internalCounts.toolCalls > 0;
@@ -359,7 +413,9 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
               onToggle={toggleInternals}
             />
           )}
-          {hasParts ? (
+          {message.errorCode === "insufficient_credits" ? (
+            <InsufficientCreditsCard />
+          ) : hasParts ? (
             <div className="space-y-1">
               {/* Internals panel: reasoning + tool-calls with Collapse button */}
               {hasInternals && (
@@ -433,6 +489,15 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
                 <span className="flex items-center gap-1">
                   <Wrench className="w-3 h-3" />
                   {t("MessageBubble.toolCount", { count: message.toolCount })}
+                </span>
+              )}
+              {/* A1: cloud credit metering for this turn */}
+              {message.credits !== undefined && (
+                <span className="flex items-center gap-1">
+                  <Coins className="w-3 h-3" />
+                  {t("MessageBubble.creditsUsed", { n: message.credits })}
+                  {message.balanceAfter !== undefined &&
+                    " " + t("MessageBubble.creditsBalance", { balance: message.balanceAfter })}
                 </span>
               )}
             </div>

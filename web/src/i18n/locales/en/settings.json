@@ -306,5 +306,7 @@
   "CloudSection.usedThisMonth": "{{n}} credits used this month",
   "CloudSection.usageSummary": "{{calls}} calls · last {{days}} days",
   "CloudSection.noUsage": "No usage yet.",
-  "CloudSection.modelPickerHint": "Cloud models and search are available in the model picker."
+  "CloudSection.modelPickerHint": "Cloud models and search are available in the model picker.",
+  "CloudSection.periodEnd": "Credits renew monthly, resets {{date}}",
+  "CloudSection.manageConsole": "Manage in console"
 }
