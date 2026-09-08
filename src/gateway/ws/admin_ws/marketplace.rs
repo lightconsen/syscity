@@ -13,9 +13,10 @@ use crate::gateway::GatewayState;
 /// entry's installed state.
 ///
 /// Optional params: `{ lang }` — forwarded as `Accept-Language` when a sync
-/// happens (`catalog.json` is bilingual: `zh*` → Chinese, else English; the
-/// cloud ETag is per-language, so a language change naturally triggers a full
-/// 200 refresh and the single-slot disk cache self-heals).
+/// happens (`catalog.json` is bilingual: `zh*` → Chinese, else English). The
+/// single-slot cache tracks its language bucket in `meta.json`; a request for
+/// a different bucket triggers a re-sync (which skips `If-None-Match`, so the
+/// cloud answers 200 with the new language).
 ///
 /// On a first visit with an empty cache the handler one-shot syncs from the
 /// cloud catalog URL when cloud mode is active (feature + `cloud.enabled` +
@@ -43,14 +44,19 @@ pub(crate) async fn handle_connectors_catalog(
             Ok(None) => None,
             Err(e) => return WsResponse::err(&req.id, "INTERNAL", e.to_string()),
         };
-        // A cached-but-empty catalog (e.g. first sync raced an empty cloud
-        // catalog) must not pin the empty view forever: treat it as missing
-        // so the one-shot sync below can heal it.
+        // Sync when the cache is missing, empty, or holds a different
+        // language than the one requested now (a cached-but-empty catalog,
+        // e.g. first sync raced an empty cloud catalog, must not pin the
+        // empty view forever).
         #[cfg(feature = "cloud")]
-        let needs_sync = cached
-            .as_ref()
-            .map(|d| d.connectors.is_empty())
-            .unwrap_or(true);
+        let wants_lang = crate::mcp::connectors::catalog::catalog_lang_bucket(p.lang.as_deref());
+        #[cfg(feature = "cloud")]
+        let cached_lang = manager.cached_catalog_lang().await;
+        #[cfg(feature = "cloud")]
+        let needs_sync = match &cached {
+            Some(d) => d.connectors.is_empty() || cached_lang.as_deref() != Some(wants_lang),
+            None => true,
+        };
         #[cfg(feature = "cloud")]
         let synced = if needs_sync {
             let cfg = state.config.read().await.cloud.clone();
@@ -69,7 +75,10 @@ pub(crate) async fn handle_connectors_catalog(
         };
         #[cfg(not(feature = "cloud"))]
         let synced: Option<crate::mcp::connectors::catalog::CatalogDocument> = None;
-        cached.or(synced)
+        // A fresh sync wins (e.g. language change: the cache still holds the
+        // previous language); fall back to the cache when no sync ran or it
+        // failed (degraded offline mode keeps serving the stale catalog).
+        synced.or(cached)
     };
 
     let installed = manager.list().await.unwrap_or_default();

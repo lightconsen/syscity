@@ -139,6 +139,21 @@ pub struct CatalogMeta {
     /// Last successful sync time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<DateTime<Utc>>,
+    /// Language bucket (`"en"` | `"zh"`) of the last accepted body. The
+    /// single-slot cache holds one language at a time; a request for a
+    /// different bucket forces a full refresh instead of a 304.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+}
+
+/// Normalize a request language to the catalog's translation buckets —
+/// mirrors the cloud's `resolveLang`: `zh*` → `"zh"`, everything else
+/// (including no preference) → `"en"`.
+pub(crate) fn catalog_lang_bucket(lang: Option<&str>) -> &'static str {
+    match lang {
+        Some(l) if l.to_lowercase().starts_with("zh") => "zh",
+        _ => "en",
+    }
 }
 
 /// Outcome of a conditional GET against the catalog URL.
@@ -261,6 +276,12 @@ impl CatalogCache {
         }
     }
 
+    async fn write_meta(&self, meta: &CatalogMeta) -> crate::Result<()> {
+        let bytes = serde_json::to_vec_pretty(meta).unwrap_or_else(|_| Vec::new());
+        tokio::fs::write(self.meta_path(), bytes).await?;
+        Ok(())
+    }
+
     /// Load the last synced catalog, if any.
     pub async fn cached(&self) -> crate::Result<Option<CatalogDocument>> {
         let raw = match tokio::fs::read_to_string(self.body_path()).await {
@@ -278,6 +299,12 @@ impl CatalogCache {
             .map_err(|e| crate::error::SyscityError::Validation(format!("cached catalog: {e}")))
     }
 
+    /// Language bucket (`"en"` | `"zh"`) of the last synced catalog, if known.
+    /// Older meta files (pre-lang) read as `None`.
+    pub async fn cached_lang(&self) -> Option<String> {
+        self.load_meta().await.lang
+    }
+
     /// Fetch the remote catalog with conditional-request semantics.
     ///
     /// When `token` is present it is sent as `Authorization: Bearer` so the
@@ -286,9 +313,10 @@ impl CatalogCache {
     /// anonymous and authed views naturally refreshes the cache.
     ///
     /// `lang` (when set) is sent as `Accept-Language` — `catalog.json` is
-    /// bilingual and ETags are per-language, so the header must be stable
-    /// across requests; changing it yields an ETag mismatch → full 200
-    /// refresh in the new language (the single-slot cache self-heals).
+    /// bilingual and the cache is single-slot, so the last body's language
+    /// bucket is tracked in `meta.json`: a request for a different bucket
+    /// skips `If-None-Match` to force a full 200 refresh in the new language
+    /// instead of a 304 against the old language's ETag.
     ///
     /// Returns the (possibly cached) document plus whether the cache was
     /// refreshed during this call.
@@ -300,10 +328,18 @@ impl CatalogCache {
     ) -> crate::Result<(CatalogDocument, bool)> {
         tokio::fs::create_dir_all(&self.dir).await?;
         let meta = self.load_meta().await;
+        // The cache is single-slot and the response is per-language: when the
+        // requested bucket differs from the cached one, skip If-None-Match so
+        // the server answers 200 with the new language instead of 304-ing
+        // against the old language's ETag.
+        let want = catalog_lang_bucket(lang);
+        let lang_changed = meta.lang.as_deref() != Some(want);
 
         let mut request = self.client.get(url);
-        if let Some(etag) = &meta.etag {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        if !lang_changed {
+            if let Some(etag) = &meta.etag {
+                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
         }
         if let Some(token) = token {
             request = request.bearer_auth(token);
@@ -330,7 +366,19 @@ impl CatalogCache {
                 })?;
                 let body_hash = sha256_hex(&body);
                 match should_replace(&meta, status, &body_hash) {
-                    FetchDecision::KeepCached => FetchDecision::KeepCached,
+                    FetchDecision::KeepCached => {
+                        // Body unchanged but the language tracking moved
+                        // (identical zh/en content): persist the new bucket so
+                        // later syncs conditional-request again.
+                        if lang_changed {
+                            self.write_meta(&CatalogMeta {
+                                lang: Some(want.to_string()),
+                                ..meta.clone()
+                            })
+                            .await?;
+                        }
+                        FetchDecision::KeepCached
+                    }
                     FetchDecision::Replace => {
                         let text = String::from_utf8_lossy(&body).into_owned();
                         let doc: CatalogDocument = serde_json::from_str(&text).map_err(|e| {
@@ -340,13 +388,10 @@ impl CatalogCache {
                             etag: fresh_etag.or(meta.etag.clone()),
                             sha256: Some(body_hash),
                             synced_at: Some(Utc::now()),
+                            lang: Some(want.to_string()),
                         };
                         tokio::fs::write(self.body_path(), text.as_bytes()).await?;
-                        tokio::fs::write(
-                            self.meta_path(),
-                            serde_json::to_vec_pretty(&new_meta).unwrap_or_else(|_| Vec::new()),
-                        )
-                        .await?;
+                        self.write_meta(&new_meta).await?;
                         info!(
                             "Connector catalog refreshed ({} entries) from {url}",
                             doc.connectors.len()
@@ -529,6 +574,106 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(sha256_hex(b"syscity").len(), 64);
+    }
+
+    #[test]
+    fn lang_bucket_mirrors_cloud_resolution() {
+        assert_eq!(catalog_lang_bucket(None), "en");
+        assert_eq!(catalog_lang_bucket(Some("en")), "en");
+        assert_eq!(catalog_lang_bucket(Some("en-US")), "en");
+        assert_eq!(catalog_lang_bucket(Some("zh")), "zh");
+        assert_eq!(catalog_lang_bucket(Some("zh-CN")), "zh");
+        assert_eq!(catalog_lang_bucket(Some("ZH-tw")), "zh");
+        assert_eq!(catalog_lang_bucket(Some("fr")), "en");
+    }
+
+    #[test]
+    fn meta_lang_round_trips() {
+        let meta = CatalogMeta {
+            lang: Some("zh".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: CatalogMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lang.as_deref(), Some("zh"));
+        // Pre-lang meta files (no `lang` key) read as None, not an error.
+        let legacy: CatalogMeta = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.lang, None);
+    }
+
+    #[tokio::test]
+    async fn sync_re_syncs_when_language_changes() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let en_body = r#"{"version":1,"connectors":[{"id":"a","version":"1.0.0",
+            "display_name":"Alpha","description":"English description",
+            "source":{"type":"tar.gz","url":"https://example.com/a.tgz"}}]}"#;
+        let zh_body = r#"{"version":1,"connectors":[{"id":"a","version":"1.0.0",
+            "display_name":"阿尔法","description":"中文描述",
+            "source":{"type":"tar.gz","url":"https://example.com/a.tgz"}}]}"#;
+
+        let server = MockServer::start().await;
+        let url = format!("{}/catalog.json", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/catalog.json"))
+            .and(header("accept-language", "en"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(en_body)
+                    .append_header("ETag", "\"e-en\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalog.json"))
+            .and(header("accept-language", "en"))
+            .and(header("if-none-match", "\"e-en\""))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalog.json"))
+            .and(header("accept-language", "zh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(zh_body)
+                    .append_header("ETag", "\"e-zh\""),
+            )
+            .mount(&server)
+            .await;
+        // A stale (English) ETag must never leak into a zh request — the
+        // language change skips If-None-Match entirely.
+        Mock::given(method("GET"))
+            .and(path("/catalog.json"))
+            .and(header("accept-language", "zh"))
+            .and(header("if-none-match", "\"e-en\""))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = CatalogCache::new(tmp.path().to_path_buf());
+
+        // First sync resolves English and records the bucket.
+        let (doc, refreshed) = cache.sync(&url, None, Some("en")).await.unwrap();
+        assert!(refreshed);
+        assert_eq!(doc.connectors[0].display_name, "Alpha");
+        assert_eq!(cache.cached_lang().await.as_deref(), Some("en"));
+
+        // Same language → conditional request → 304 keeps the cache.
+        let (_, refreshed) = cache.sync(&url, None, Some("en")).await.unwrap();
+        assert!(!refreshed);
+
+        // Language change → full refresh in Chinese (no stale If-None-Match).
+        let (doc, refreshed) = cache.sync(&url, None, Some("zh")).await.unwrap();
+        assert!(refreshed);
+        assert_eq!(doc.connectors[0].display_name, "阿尔法");
+        assert_eq!(cache.cached_lang().await.as_deref(), Some("zh"));
+
+        // Same language again → 304 keeps the cache.
+        let (_, refreshed) = cache.sync(&url, None, Some("zh")).await.unwrap();
+        assert!(!refreshed);
     }
 
     #[test]

@@ -571,6 +571,12 @@ impl ConnectorManager {
         self.catalog_cache().cached().await
     }
 
+    /// Language bucket (`"en"` | `"zh"`) of the locally cached catalog, if
+    /// known (`meta.json`; `None` for pre-lang caches or no cache).
+    pub async fn cached_catalog_lang(&self) -> Option<String> {
+        self.catalog_cache().cached_lang().await
+    }
+
     /// Updates available according to the locally cached catalog.
     pub async fn check_updates(&self) -> crate::Result<Vec<PendingUpdate>> {
         let Some(doc) = self.cached_catalog().await? else {
