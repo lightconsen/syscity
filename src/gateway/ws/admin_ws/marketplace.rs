@@ -27,11 +27,14 @@ pub(crate) async fn handle_connectors_catalog(
     state: &Arc<GatewayState>,
 ) -> WsResponse {
     // Params are optional (the UI may send none): `{}` or absent = no
-    // language preference.
+    // language preference. `lang` is only consumed under the cloud feature
+    // (it becomes the catalog sync's Accept-Language).
     #[derive(Deserialize, Default)]
+    #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
     struct Params {
         lang: Option<String>,
     }
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     let p: Params = req
         .params
         .as_ref()

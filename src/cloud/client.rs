@@ -99,6 +99,50 @@ impl CloudClient {
         self.get_json(&path).await
     }
 
+    // --- Credits / marketing (cloud.credits.*) ---
+
+    /// GET /api/v1/credits/claims — marketing state for the account (check-in
+    /// streak, signup bonus, `marketing_enabled` master switch).
+    pub async fn credits_claims(&self) -> Result<Value> {
+        self.get_json("/api/v1/credits/claims").await
+    }
+
+    /// POST /api/v1/credits/daily-claim — the daily check-in
+    /// (`claimed:false` when already claimed today or marketing is off).
+    pub async fn credits_daily_claim(&self) -> Result<Value> {
+        self.post_json("/api/v1/credits/daily-claim", json!({}))
+            .await
+    }
+
+    /// POST /api/v1/credits/signup-claim — the one-time signup bonus.
+    pub async fn credits_signup_claim(&self) -> Result<Value> {
+        self.post_json("/api/v1/credits/signup-claim", json!({}))
+            .await
+    }
+
+    /// GET /api/v1/credits/packs — purchasable credit packs.
+    pub async fn credits_packs(&self) -> Result<Value> {
+        self.get_json("/api/v1/credits/packs").await
+    }
+
+    /// GET /api/v1/credits/ledger?limit= — recent ledger entries (newest
+    /// first; limit clamped to 1..=200).
+    pub async fn credits_ledger(&self, limit: u32) -> Result<Value> {
+        let path = format!("/api/v1/credits/ledger?limit={}", limit.clamp(1, 200));
+        self.get_json(&path).await
+    }
+
+    /// GET /api/v1/invite — the account's invite code + reward progress.
+    pub async fn invite(&self) -> Result<Value> {
+        self.get_json("/api/v1/invite").await
+    }
+
+    /// POST /api/v1/invite/redeem — redeem someone else's invite code.
+    pub async fn invite_redeem(&self, code: &str) -> Result<Value> {
+        self.post_json("/api/v1/invite/redeem", json!({ "code": code }))
+            .await
+    }
+
     /// POST /api/v1/devices — bind this device to the account, returning the
     /// `device_token` (P2-9). Re-binds are idempotent; already-bound devices
     /// return the existing device with a null token.

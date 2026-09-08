@@ -436,6 +436,7 @@ impl Agent {
             (progress_cb)(ProgressEvent::Completed {
                 response: rejection.clone(),
                 turn_id: String::new(),
+                usage: None,
             })
             .await;
             return Ok(OutgoingMessage::new(
@@ -509,6 +510,7 @@ impl Agent {
                 (progress_cb)(ProgressEvent::Completed {
                     response: cached.response.clone(),
                     turn_id: cache_turn_id.clone(),
+                    usage: None,
                 })
                 .await;
                 cache_collector.mark_cache_hit();
@@ -796,6 +798,7 @@ impl Agent {
         (progress_cb)(ProgressEvent::Completed {
             response: response_content.clone(),
             turn_id: turn_id.clone(),
+            usage: response.usage,
         })
         .await;
 

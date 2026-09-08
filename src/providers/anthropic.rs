@@ -126,6 +126,8 @@ impl AnthropicUsage {
             total_tokens: self.input_tokens + self.output_tokens,
             cache_read_tokens: self.cache_read_input_tokens.unwrap_or(0),
             cache_creation_tokens: self.cache_creation_input_tokens.unwrap_or(0),
+            x_credits_used: None,
+            x_credit_balance: None,
         }
     }
 }
@@ -235,6 +237,8 @@ impl UsageAccum {
             total_tokens: input + self.output_tokens.unwrap_or(0),
             cache_read_tokens: self.cache_read_input_tokens.unwrap_or(0),
             cache_creation_tokens: self.cache_creation_input_tokens.unwrap_or(0),
+            x_credits_used: None,
+            x_credit_balance: None,
         })
     }
 }

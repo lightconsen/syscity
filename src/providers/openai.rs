@@ -232,9 +232,13 @@ impl OpenAiProvider {
             metadata: None,
         };
 
+        let x_credits_used = resp.x_credits_used;
+        let x_credit_balance = resp.x_credit_balance;
         Ok(CompletionResponse {
             message,
-            usage: resp.usage.map(|u| u.to_usage()),
+            usage: resp
+                .usage
+                .map(|u| u.to_usage_with_credits(x_credits_used, x_credit_balance)),
             model: resp.model,
             finish_reason: choice.finish_reason,
         })
@@ -338,6 +342,11 @@ impl Provider for OpenAiProvider {
 
         debug!("Starting streaming completion from OpenAI");
 
+        // Keep a copy for the non-streaming fallback replay (cloud relays
+        // that reject `stream: true` with 501).
+        #[cfg(feature = "cloud")]
+        let fallback_request = request.clone();
+
         let model = request.model.unwrap_or_else(|| self.default_model.clone());
 
         let tools: Option<Vec<OpenAiTool>> = request.tools.map(|tools| {
@@ -375,10 +384,31 @@ impl Provider for OpenAiProvider {
 
         let request_url = self.url("/chat/completions");
 
-        let response = self
+        let response = match self
             .gateway_client
             .post_json_streaming(&request_url, &body_value)
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            // Cloud relays may not implement streaming (501). Replay the
+            // request non-streaming and surface the single response as a
+            // one-chunk stream so chat works on such providers.
+            #[cfg(feature = "cloud")]
+            Err(e) if is_streaming_unsupported(&e) => {
+                warn!("Provider rejected streaming ({}); replaying non-streaming", e);
+                let resp = self.complete(fallback_request).await?;
+                return Ok(Box::pin(futures::stream::once(async move {
+                    CompletionChunk {
+                        content: Some(resp.message.content),
+                        reasoning_content: resp.message.reasoning_content,
+                        tool_calls: resp.message.tool_calls,
+                        is_done: true,
+                        usage: resp.usage,
+                    }
+                })));
+            }
+            Err(e) => return Err(e),
+        };
 
         let stream = response.bytes_stream();
         let openai_stream = OpenAiStream::new(stream);
@@ -398,6 +428,18 @@ impl Provider for OpenAiProvider {
     ) -> crate::Result<()> {
         self.gateway_client.set_credential(credential).await;
         Ok(())
+    }
+}
+
+/// Whether the error indicates the provider does not support streaming
+/// (HTTP 501 from relays that only implement non-streaming completion).
+#[cfg(feature = "cloud")]
+fn is_streaming_unsupported(e: &crate::error::SyscityError) -> bool {
+    match e {
+        crate::error::SyscityError::ExternalService { source, .. } => {
+            source.contains("HTTP 501") || source.contains("streaming not supported")
+        }
+        _ => false,
     }
 }
 
@@ -467,6 +509,11 @@ struct OpenAiResponse {
     model: String,
     choices: Vec<OpenAiChoice>,
     usage: Option<OpenAiUsage>,
+    /// Cloud relay metering extension (top-level on the response body).
+    #[serde(default)]
+    x_credits_used: Option<i64>,
+    #[serde(default)]
+    x_credit_balance: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -505,13 +552,18 @@ impl OpenAiUsage {
             .unwrap_or(0)
     }
 
-    fn to_usage(&self) -> Usage {
+    /// Map to `Usage`, carrying the cloud relay's top-level credit fields
+    /// (`x_credits_used` / `x_credit_balance` sit on the response body, not
+    /// inside `usage`).
+    fn to_usage_with_credits(&self, used: Option<i64>, balance: Option<i64>) -> Usage {
         Usage {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
             cache_read_tokens: self.cache_read_tokens(),
             cache_creation_tokens: 0,
+            x_credits_used: used,
+            x_credit_balance: balance,
         }
     }
 }
@@ -528,6 +580,11 @@ struct OpenAiStreamResponse {
     choices: Vec<OpenAiStreamChoice>,
     /// Present in the final chunk when `stream_options.include_usage` is set
     usage: Option<OpenAiUsage>,
+    /// Cloud relay metering extension (top-level on the final chunk body).
+    #[serde(default)]
+    x_credits_used: Option<i64>,
+    #[serde(default)]
+    x_credit_balance: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,7 +696,12 @@ impl OpenAiStream {
                         reasoning_content,
                         tool_calls,
                         is_done,
-                        usage: response.usage.as_ref().map(|u| u.to_usage()),
+                        usage: response.usage.as_ref().map(|u| {
+                            u.to_usage_with_credits(
+                                response.x_credits_used,
+                                response.x_credit_balance,
+                            )
+                        }),
                     });
                 }
                 // Usage-only final chunk (choices empty when include_usage set)
@@ -649,7 +711,10 @@ impl OpenAiStream {
                         reasoning_content: None,
                         tool_calls: None,
                         is_done: true,
-                        usage: Some(usage.to_usage()),
+                        usage: Some(usage.to_usage_with_credits(
+                            response.x_credits_used,
+                            response.x_credit_balance,
+                        )),
                     });
                 }
             }
@@ -939,6 +1004,8 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            x_credits_used: None,
+            x_credit_balance: None,
         };
         let result = provider.from_openai_response(resp).unwrap();
         assert_eq!(result.message.role, Role::User);
@@ -968,6 +1035,8 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
             }],
             usage: None,
+            x_credits_used: None,
+            x_credit_balance: None,
         };
         let result = provider.from_openai_response(resp).unwrap();
         assert_eq!(result.message.role, Role::Tool);
@@ -1004,6 +1073,8 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            x_credits_used: None,
+            x_credit_balance: None,
         };
         let result = provider.from_openai_response(resp).unwrap();
         assert!(result.message.tool_calls.is_some());
@@ -1039,12 +1110,43 @@ mod tests {
                 total_tokens: 15,
                 ..Default::default()
             }),
+            x_credits_used: Some(3),
+            x_credit_balance: Some(1234),
         };
         let result = provider.from_openai_response(resp).unwrap();
         let usage = result.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        // Cloud relay metering extension is carried onto `Usage`.
+        assert_eq!(usage.x_credits_used, Some(3));
+        assert_eq!(usage.x_credit_balance, Some(1234));
+    }
+
+    #[test]
+    fn test_openai_response_parses_credit_extension() {
+        // Cloud relay metering fields sit at the top level of the response
+        // body; they must be captured (and omitted when absent).
+        let json = r#"{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"x_credits_used":2,"x_credit_balance":-3}"#;
+        let resp: OpenAiResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.x_credits_used, Some(2));
+        assert_eq!(resp.x_credit_balance, Some(-3));
+        let usage = resp
+            .usage
+            .unwrap()
+            .to_usage_with_credits(resp.x_credits_used, resp.x_credit_balance);
+        assert_eq!(usage.x_credits_used, Some(2));
+        assert_eq!(usage.x_credit_balance, Some(-3));
+
+        // Without the extension the fields stay `None` and do not serialize.
+        let plain: OpenAiResponse = serde_json::from_str(
+            r#"{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.x_credits_used, None);
+        let usage = crate::providers::Usage::default();
+        let ser = serde_json::to_string(&usage).unwrap();
+        assert!(!ser.contains("x_credits_used"));
     }
 
     #[test]
@@ -1057,6 +1159,8 @@ mod tests {
             model: "gpt-4".to_string(),
             choices: vec![],
             usage: None,
+            x_credits_used: None,
+            x_credit_balance: None,
         };
         let result = provider.from_openai_response(resp);
         assert!(result.is_err());
@@ -1083,6 +1187,8 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            x_credits_used: None,
+            x_credit_balance: None,
         };
         let result = provider.from_openai_response(resp).unwrap();
         assert_eq!(result.message.content, "");
@@ -1204,7 +1310,7 @@ mod tests {
         });
         let usage: OpenAiUsage = serde_json::from_value(json).unwrap();
         assert_eq!(usage.cache_read_tokens(), 80);
-        assert_eq!(usage.to_usage().cache_read_tokens, 80);
+        assert_eq!(usage.to_usage_with_credits(None, None).cache_read_tokens, 80);
     }
 
     #[test]
@@ -1229,7 +1335,12 @@ mod tests {
         });
         let usage: OpenAiUsage = serde_json::from_value(json).unwrap();
         assert_eq!(usage.cache_read_tokens(), 0);
-        assert_eq!(usage.to_usage().cache_creation_tokens, 0);
+        assert_eq!(
+            usage
+                .to_usage_with_credits(None, None)
+                .cache_creation_tokens,
+            0
+        );
     }
 
     #[test]
@@ -1240,7 +1351,12 @@ mod tests {
         let response: OpenAiStreamResponse = serde_json::from_str(data).unwrap();
         assert!(response.choices.is_empty());
         let usage = response.usage.unwrap();
-        assert_eq!(usage.to_usage().cache_read_tokens, 30);
+        assert_eq!(
+            usage
+                .to_usage_with_credits(response.x_credits_used, response.x_credit_balance)
+                .cache_read_tokens,
+            30
+        );
     }
 
     #[tokio::test]

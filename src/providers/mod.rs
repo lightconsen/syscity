@@ -323,6 +323,14 @@ pub struct Usage {
     /// Tokens written to the provider-side prompt cache
     #[serde(default)]
     pub cache_creation_tokens: u32,
+    /// Credits billed by the cloud relay for this call (top-level
+    /// `x_credits_used` extension on OpenAI-compatible bodies; `None` when
+    /// the provider does not report it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_credits_used: Option<i64>,
+    /// Credit balance reported by the cloud relay after this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_credit_balance: Option<i64>,
 }
 
 /// A request for text completion

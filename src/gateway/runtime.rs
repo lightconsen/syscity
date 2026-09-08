@@ -252,12 +252,18 @@ pub enum GatewayEvent {
         response: String,
         /// Stable per-turn identifier, surfaced to clients for feedback.vote.
         turn_id: String,
+        /// Token/credit usage reported by the provider for this turn
+        /// (`None` for guard rejections and cache hits).
+        usage: Option<crate::providers::Usage>,
     },
     /// Agent encountered a processing error during message handling
     ProcessingError {
         session_id: String,
         agent_id: String,
         message: String,
+        /// Machine-readable error code when known (e.g.
+        /// `insufficient_credits` from the cloud relay); `None` otherwise.
+        code: Option<String>,
     },
     /// Cron job announcement scheduled for delivery
     CronAnnounce {

@@ -290,6 +290,10 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "cloud.status"
         | "cloud.subscription"
         | "cloud.usage"
+        | "cloud.credits.claims"
+        | "cloud.credits.packs"
+        | "cloud.credits.ledger"
+        | "cloud.credits.invite"
         | "update.status"
         | "update.progress"
         | "plugins.list"
@@ -411,7 +415,10 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "cloud.kb.delete"
         | "cloud.kb.upload"
         | "cloud.kb.push"
-        | "cloud.kb.pull" => Some(SCOPE_WRITE),
+        | "cloud.kb.pull"
+        | "cloud.credits.daily_claim"
+        | "cloud.credits.signup_claim"
+        | "cloud.credits.invite_redeem" => Some(SCOPE_WRITE),
         "acp.spawn"
         | "acp.terminate"
         | "acp.message"
@@ -577,23 +584,40 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
             agent_id,
             response,
             turn_id,
-        } => Some((
-            "chat.final".to_string(),
-            serde_json::json!({
+            usage,
+        } => {
+            let mut payload = serde_json::json!({
                 "session_id": session_id,
                 "agent_id": agent_id,
                 "response": response,
                 "turn_id": turn_id,
-            }),
-        )),
-        GatewayEvent::ProcessingError { session_id, agent_id, message } => Some((
-            "chat.error".to_string(),
-            serde_json::json!({
+            });
+            if let Some(u) = usage {
+                // Cloud relay credit metering + token totals for the turn.
+                payload["usage"] = serde_json::json!({
+                    "credits_used": u.x_credits_used,
+                    "credit_balance": u.x_credit_balance,
+                    "total_tokens": u.total_tokens,
+                });
+            }
+            Some(("chat.final".to_string(), payload))
+        }
+        GatewayEvent::ProcessingError {
+            session_id,
+            agent_id,
+            message,
+            code,
+        } => {
+            let mut payload = serde_json::json!({
                 "session_id": session_id,
                 "agent_id": agent_id,
                 "message": message,
-            }),
-        )),
+            });
+            if let Some(code) = code {
+                payload["code"] = serde_json::json!(code);
+            }
+            Some(("chat.error".to_string(), payload))
+        }
         GatewayEvent::MessageReceived {
             channel,
             user_id,
@@ -1094,5 +1118,59 @@ mod tests {
         assert_eq!(name, "ask.resolved");
         assert_eq!(payload["ask_id"], "ask-1");
         assert_eq!(payload["cancelled"], true);
+    }
+
+    #[test]
+    fn test_chat_final_usage_payload() {
+        let with_usage = crate::gateway::GatewayEvent::Completed {
+            session_id: "s1".to_string(),
+            agent_id: "a1".to_string(),
+            response: "done".to_string(),
+            turn_id: "t1".to_string(),
+            usage: Some(crate::providers::Usage {
+                total_tokens: 60,
+                x_credits_used: Some(2),
+                x_credit_balance: Some(98),
+                ..Default::default()
+            }),
+        };
+        let (name, payload) = gateway_event_to_ws(&with_usage).expect("mapped event");
+        assert_eq!(name, "chat.final");
+        assert_eq!(payload["usage"]["credits_used"], 2);
+        assert_eq!(payload["usage"]["credit_balance"], 98);
+        assert_eq!(payload["usage"]["total_tokens"], 60);
+
+        // No usage → no `usage` key at all (unchanged wire shape).
+        let no_usage = crate::gateway::GatewayEvent::Completed {
+            session_id: "s1".to_string(),
+            agent_id: "a1".to_string(),
+            response: "done".to_string(),
+            turn_id: "t1".to_string(),
+            usage: None,
+        };
+        let (_, payload) = gateway_event_to_ws(&no_usage).expect("mapped event");
+        assert!(payload.get("usage").is_none());
+    }
+
+    #[test]
+    fn test_chat_error_code_payload() {
+        let coded = crate::gateway::GatewayEvent::ProcessingError {
+            session_id: "s1".to_string(),
+            agent_id: "a1".to_string(),
+            message: "insufficient credits".to_string(),
+            code: Some("insufficient_credits".to_string()),
+        };
+        let (name, payload) = gateway_event_to_ws(&coded).expect("mapped event");
+        assert_eq!(name, "chat.error");
+        assert_eq!(payload["code"], "insufficient_credits");
+
+        let plain = crate::gateway::GatewayEvent::ProcessingError {
+            session_id: "s1".to_string(),
+            agent_id: "a1".to_string(),
+            message: "boom".to_string(),
+            code: None,
+        };
+        let (_, payload) = gateway_event_to_ws(&plain).expect("mapped event");
+        assert!(payload.get("code").is_none());
     }
 }

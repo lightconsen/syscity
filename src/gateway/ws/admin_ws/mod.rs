@@ -80,7 +80,12 @@ async fn cloud_status_json(state: &GatewayState) -> serde_json::Value {
                 }
             }
         }
-        serde_json::json!({ "enabled": true, "logged_in": logged_in, "user": user })
+        serde_json::json!({
+            "enabled": true,
+            "logged_in": logged_in,
+            "user": user,
+            "console_url": cfg.console_url,
+        })
     }
     #[cfg(not(feature = "cloud"))]
     {

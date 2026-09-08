@@ -20,6 +20,11 @@ pub enum FailureClass {
     RateLimit,
     /// Billing/quota exceeded — disable key/provider
     Billing,
+    /// Cloud relay credit balance below the overdraft floor (403
+    /// `insufficient_credits`) — fail fast, do NOT disable the session key
+    /// (the credential stays valid; only the balance is exhausted)
+    #[cfg(feature = "cloud")]
+    InsufficientCredits,
     /// Service overloaded (502, 503) — retry with backoff
     Overloaded,
     /// Request timeout — retry
@@ -99,6 +104,8 @@ impl FailureClass {
             Self::AuthPermanent => "permanent authentication failure",
             Self::RateLimit => "rate limit exceeded",
             Self::Billing => "billing or quota exceeded",
+            #[cfg(feature = "cloud")]
+            Self::InsufficientCredits => "insufficient credit balance",
             Self::Overloaded => "service overloaded",
             Self::Timeout => "request timeout",
             Self::ConnectionError => "connection error",
@@ -138,6 +145,14 @@ impl FailureClass {
             401 => Self::AuthTemporary,
             403 => {
                 let msg = error.to_string().to_lowercase();
+                // Cloud relay credit gate (balance below the overdraft
+                // floor) is checked before the generic billing keywords so
+                // it is never classified as `Billing` (which would disable
+                // the otherwise-valid session key).
+                #[cfg(feature = "cloud")]
+                if msg.contains("insufficient_credits") {
+                    return Self::InsufficientCredits;
+                }
                 if msg.contains("billing")
                     || msg.contains("payment")
                     || msg.contains("quota")
@@ -274,6 +289,29 @@ mod tests {
         let class = FailureClass::from_error(&err, Some(403));
         assert_eq!(class, FailureClass::Billing);
         assert!(class.should_disable_key());
+    }
+
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn test_403_insufficient_credits_classified_and_key_kept() {
+        // Cloud relay credit gate: HTTP 403 with an `insufficient_credits`
+        // body. Must classify as InsufficientCredits — the session key
+        // stays valid (no disable, no rotation), the request is not
+        // retried.
+        let err = SyscityError::ExternalService {
+            source: "HTTP 403: {\"error\":\"insufficient_credits\"}".into(),
+            cause: None,
+        };
+        let class = FailureClass::from_error(&err, Some(403));
+        assert_eq!(class, FailureClass::InsufficientCredits);
+        assert!(!class.should_disable_key());
+        assert!(!class.should_rotate_key());
+        assert!(!class.is_retryable());
+        assert!(!class.should_cooldown_provider());
+
+        // Status code lost in rewrapping must still classify correctly.
+        let class = FailureClass::from_error(&err, None);
+        assert_eq!(class, FailureClass::InsufficientCredits);
     }
 
     #[test]

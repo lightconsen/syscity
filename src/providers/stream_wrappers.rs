@@ -122,6 +122,8 @@ pub fn usage_extractor_wrapper() -> StreamWrapper {
         let wrapped = UsageExtractor {
             inner: stream,
             seen_usage: false,
+            held_done: None,
+            queued: None,
         };
         Box::pin(wrapped)
     })
@@ -209,25 +211,78 @@ impl Stream for ToolCallAccumulator {
 struct UsageExtractor {
     inner: CompletionStream,
     seen_usage: bool,
+    /// A held-back `is_done` chunk whose usage is still `None`: the provider
+    /// may follow it with a trailing usage-only frame (OpenAI
+    /// `stream_options.include_usage`), which must be merged into it before
+    /// it is emitted — consumers stop at the first `is_done` chunk, so a
+    /// separate trailing frame would never be seen.
+    held_done: Option<CompletionChunk>,
+    /// One-slot outbox preserving chunk order when a held chunk is flushed
+    /// while another chunk was just dequeued.
+    queued: Option<CompletionChunk>,
+}
+
+impl UsageExtractor {
+    /// Flush a held chunk at end-of-stream, synthesizing zero usage when the
+    /// provider never reported any.
+    fn flush_held(&mut self) -> Poll<Option<CompletionChunk>> {
+        match self.held_done.take() {
+            Some(mut held) => {
+                if held.usage.is_none() && !self.seen_usage {
+                    held.usage = Some(crate::providers::Usage::default());
+                }
+                Poll::Ready(Some(held))
+            }
+            None => Poll::Ready(None),
+        }
+    }
 }
 
 impl Stream for UsageExtractor {
     type Item = CompletionChunk;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(mut chunk)) => {
-                if chunk.usage.is_some() {
-                    self.seen_usage = true;
+        // Flush the outbox first to keep chunk order.
+        if let Some(chunk) = self.queued.take() {
+            return Poll::Ready(Some(chunk));
+        }
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    if chunk.usage.is_some() {
+                        self.seen_usage = true;
+                        // A trailing usage frame: merge it into the held
+                        // final chunk (if any) so it is not lost.
+                        if let Some(mut held) = self.held_done.take() {
+                            held.usage = chunk.usage;
+                            return Poll::Ready(Some(held));
+                        }
+                        return Poll::Ready(Some(chunk));
+                    }
+                    if chunk.is_done {
+                        // Hold back; displace any previously held chunk
+                        // (pathological double-done) into the outbox.
+                        if let Some(mut held) = self.held_done.take() {
+                            if held.usage.is_none() && !self.seen_usage {
+                                held.usage = Some(crate::providers::Usage::default());
+                                self.seen_usage = true;
+                            }
+                            self.queued = Some(held);
+                        }
+                        self.held_done = Some(chunk);
+                        continue;
+                    }
+                    // Regular content chunk while a done chunk is held
+                    // (out of protocol, but preserve order).
+                    if let Some(held) = self.held_done.take() {
+                        self.queued = Some(chunk);
+                        return Poll::Ready(Some(held));
+                    }
+                    return Poll::Ready(Some(chunk));
                 }
-                if chunk.is_done && !self.seen_usage {
-                    // Emit a synthetic usage of zeros when provider doesn't report usage
-                    chunk.usage = Some(crate::providers::Usage::default());
-                    self.seen_usage = true;
-                }
-                Poll::Ready(Some(chunk))
+                Poll::Ready(None) => return self.flush_held(),
+                Poll::Pending => return Poll::Pending,
             }
-            other => other,
         }
     }
 }
@@ -500,6 +555,51 @@ mod tests {
         let result: Vec<_> = wrapped.collect().await;
         assert_eq!(result.len(), 1);
         assert!(result[0].usage.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_usage_extractor_merges_trailing_usage_frame() {
+        // OpenAI include_usage: the finish_reason frame (usage=None) is
+        // followed by a usage-only frame. Consumers stop at the first
+        // is_done chunk, so the trailing usage must be merged into it.
+        let chunks = vec![
+            CompletionChunk {
+                content: Some("answer".to_string()),
+                reasoning_content: None,
+                tool_calls: None,
+                is_done: false,
+                usage: None,
+            },
+            CompletionChunk {
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+                is_done: true,
+                usage: None,
+            },
+            CompletionChunk {
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+                is_done: true,
+                usage: Some(crate::providers::Usage {
+                    prompt_tokens: 50,
+                    completion_tokens: 10,
+                    total_tokens: 60,
+                    ..Default::default()
+                }),
+            },
+        ];
+        let stream = Box::pin(futures::stream::iter(chunks));
+        let wrapped = usage_extractor_wrapper()(stream);
+
+        let result: Vec<_> = wrapped.collect().await;
+        // The usage-only frame is folded into the held final chunk.
+        assert_eq!(result.len(), 2);
+        assert!(result[1].is_done);
+        let usage = result[1].usage.expect("merged usage");
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.total_tokens, 60);
     }
 
     #[tokio::test]

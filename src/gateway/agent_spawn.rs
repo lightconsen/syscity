@@ -552,7 +552,7 @@ async fn process_message_acp(
                         },
                     );
                 }
-                crate::agent::ProgressEvent::Completed { response, turn_id } => {
+                crate::agent::ProgressEvent::Completed { response, turn_id, usage } => {
                     emit_event(
                         &state.events.tx,
                         super::GatewayEvent::Completed {
@@ -560,6 +560,7 @@ async fn process_message_acp(
                             agent_id: agent_id.clone(),
                             response,
                             turn_id,
+                            usage,
                         },
                     );
                 }
@@ -570,6 +571,7 @@ async fn process_message_acp(
                             session_id: session_id.clone(),
                             agent_id: agent_id.clone(),
                             message,
+                            code: None,
                         },
                     );
                 }
@@ -791,7 +793,7 @@ async fn process_message_direct(
                     );
                 }
                 crate::agent::ProgressEvent::ToolResultDelta { .. } => {}
-                crate::agent::ProgressEvent::Completed { response, turn_id } => {
+                crate::agent::ProgressEvent::Completed { response, turn_id, usage } => {
                     emit_event(
                         &tx,
                         super::GatewayEvent::Completed {
@@ -799,6 +801,7 @@ async fn process_message_direct(
                             agent_id: aid.clone(),
                             response,
                             turn_id,
+                            usage,
                         },
                     );
                 }
@@ -809,6 +812,7 @@ async fn process_message_direct(
                             session_id: sid.clone(),
                             agent_id: aid.clone(),
                             message,
+                            code: None,
                         },
                     );
                 }

@@ -42,8 +42,14 @@ pub enum ProgressEvent {
     ///
     /// `turn_id` is the stable per-turn identifier (from the observability
     /// collector). It is empty for turns that never produced a collector
-    /// (e.g. prompt-injection-guard rejections).
-    Completed { response: String, turn_id: String },
+    /// (e.g. prompt-injection-guard rejections). `usage` carries the
+    /// provider-reported token/credit usage (`None` for guard rejections
+    /// and cache hits).
+    Completed {
+        response: String,
+        turn_id: String,
+        usage: Option<crate::providers::Usage>,
+    },
     /// Error occurred
     Error { message: String },
 }
@@ -699,6 +705,7 @@ mod tests {
         let event = ProgressEvent::Completed {
             response: "hi".to_string(),
             turn_id: "t1".to_string(),
+            usage: None,
         };
         let debug = format!("{:?}", event);
         assert!(debug.contains("Completed"));

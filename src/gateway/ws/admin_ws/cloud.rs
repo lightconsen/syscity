@@ -152,7 +152,7 @@ pub(crate) async fn handle_cloud_logout(req: &WsRequest, _state: &Arc<GatewaySta
 
 /// Shared gate: enabled + token, else `cloud_unavailable`.
 #[cfg(feature = "cloud")]
-pub(crate) async fn cloud_kb_client(
+pub(crate) async fn cloud_api_client(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> Result<crate::cloud::client::CloudClient, WsResponse> {
@@ -164,6 +164,15 @@ pub(crate) async fn cloud_kb_client(
         return Err(cloud_unavailable(req));
     };
     Ok(crate::cloud::client::CloudClient::new(&cfg, token))
+}
+
+/// KB-specific alias of [`cloud_api_client`].
+#[cfg(feature = "cloud")]
+pub(crate) async fn cloud_kb_client(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> Result<crate::cloud::client::CloudClient, WsResponse> {
+    cloud_api_client(req, state).await
 }
 
 /// `cloud.kb.list` — list the account's knowledge bases.
@@ -348,6 +357,182 @@ pub(crate) async fn handle_cloud_kb_query(
     }
 }
 
+// --- cloud.credits.* — credits marketing (thin WS passthroughs) ---
+//
+// Check-in / signup bonus / invite / packs / ledger. All gated by
+// `cloud_api_client` (enabled + token) and forwarded to the cloud server,
+// which owns the marketing rules and credit math.
+
+/// `cloud.credits.claims` — marketing state (check-in streak, signup bonus).
+pub(crate) async fn handle_cloud_credits_claims(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    match cloud_api_client(req, state).await {
+        Err(res) => res,
+        Ok(client) => match client.credits_claims().await {
+            Ok(v) => WsResponse::ok(&req.id, v),
+            Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+        },
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
+/// `cloud.credits.daily_claim` — the daily check-in.
+pub(crate) async fn handle_cloud_credits_daily_claim(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    match cloud_api_client(req, state).await {
+        Err(res) => res,
+        Ok(client) => match client.credits_daily_claim().await {
+            Ok(v) => WsResponse::ok(&req.id, v),
+            Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+        },
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
+/// `cloud.credits.signup_claim` — the one-time signup bonus.
+pub(crate) async fn handle_cloud_credits_signup_claim(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    match cloud_api_client(req, state).await {
+        Err(res) => res,
+        Ok(client) => match client.credits_signup_claim().await {
+            Ok(v) => WsResponse::ok(&req.id, v),
+            Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+        },
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
+/// `cloud.credits.packs` — purchasable credit packs.
+pub(crate) async fn handle_cloud_credits_packs(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    match cloud_api_client(req, state).await {
+        Err(res) => res,
+        Ok(client) => match client.credits_packs().await {
+            Ok(v) => WsResponse::ok(&req.id, v),
+            Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+        },
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
+/// `cloud.credits.ledger` — recent credit ledger entries (`{ limit? }`,
+/// default 50, clamped 1..=200).
+pub(crate) async fn handle_cloud_credits_ledger(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    #[derive(Deserialize, Default)]
+    struct LedgerParams {
+        limit: Option<u32>,
+    }
+    #[cfg(feature = "cloud")]
+    {
+        // Params are optional (the UI may send none).
+        let p: LedgerParams = req
+            .params
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        match cloud_api_client(req, state).await {
+            Err(res) => res,
+            Ok(client) => match client.credits_ledger(p.limit.unwrap_or(50)).await {
+                Ok(v) => WsResponse::ok(&req.id, v),
+                Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+            },
+        }
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
+/// `cloud.credits.invite` — the account's invite code + reward progress.
+pub(crate) async fn handle_cloud_credits_invite(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    match cloud_api_client(req, state).await {
+        Err(res) => res,
+        Ok(client) => match client.invite().await {
+            Ok(v) => WsResponse::ok(&req.id, v),
+            Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+        },
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
+/// `cloud.credits.invite_redeem` — redeem someone else's invite code
+/// (`{ code }`).
+pub(crate) async fn handle_cloud_credits_invite_redeem(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[cfg(feature = "cloud")]
+    #[derive(Deserialize)]
+    struct RedeemParams {
+        code: String,
+    }
+    #[cfg(feature = "cloud")]
+    {
+        let p: RedeemParams = match parse_params(req) {
+            Ok(p) => p,
+            Err(res) => return res,
+        };
+        let code = p.code.trim().to_string();
+        if code.is_empty() {
+            return WsResponse::err(&req.id, "INVALID_PARAMS", "code is required");
+        }
+        match cloud_api_client(req, state).await {
+            Err(res) => res,
+            Ok(client) => match client.invite_redeem(&code).await {
+                Ok(v) => WsResponse::ok(&req.id, v),
+                Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+            },
+        }
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = (state, req);
+        cloud_unavailable(req)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +575,47 @@ mod tests {
                 "cloud.kb.delete" => handle_cloud_kb_delete(&req, &state).await,
                 "cloud.kb.upload" => handle_cloud_kb_upload(&req, &state).await,
                 _ => handle_cloud_kb_query(&req, &state).await,
+            };
+            assert!(!resp.ok, "{method} unexpectedly succeeded");
+            assert_eq!(
+                resp.error.as_ref().unwrap().code,
+                "UNAUTHORIZED",
+                "{method} wrong error code"
+            );
+        }
+    }
+
+    /// Default config has cloud disabled → every cloud.credits.* method must
+    /// report UNAUTHORIZED (not panic / not reach the network).
+    #[tokio::test]
+    async fn cloud_credits_methods_unauthorized_when_cloud_disabled() {
+        let state = state().await;
+        let cases: Vec<(&str, Option<serde_json::Value>)> = vec![
+            ("cloud.credits.claims", None),
+            ("cloud.credits.daily_claim", None),
+            ("cloud.credits.signup_claim", None),
+            ("cloud.credits.packs", None),
+            ("cloud.credits.ledger", Some(serde_json::json!({ "limit": 10 }))),
+            ("cloud.credits.invite", None),
+            ("cloud.credits.invite_redeem", Some(serde_json::json!({ "code": "ABC123" }))),
+        ];
+        for (method, params) in cases {
+            let req = WsRequest {
+                frame_type: "req".into(),
+                id: "r1".into(),
+                method: method.into(),
+                params,
+            };
+            let resp = match method {
+                "cloud.credits.claims" => handle_cloud_credits_claims(&req, &state).await,
+                "cloud.credits.daily_claim" => handle_cloud_credits_daily_claim(&req, &state).await,
+                "cloud.credits.signup_claim" => {
+                    handle_cloud_credits_signup_claim(&req, &state).await
+                }
+                "cloud.credits.packs" => handle_cloud_credits_packs(&req, &state).await,
+                "cloud.credits.ledger" => handle_cloud_credits_ledger(&req, &state).await,
+                "cloud.credits.invite" => handle_cloud_credits_invite(&req, &state).await,
+                _ => handle_cloud_credits_invite_redeem(&req, &state).await,
             };
             assert!(!resp.ok, "{method} unexpectedly succeeded");
             assert_eq!(

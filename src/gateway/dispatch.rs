@@ -495,6 +495,7 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
             session_id: session_id.to_string(),
             agent_id: agent_id.to_string(),
             message: reason,
+            code: None,
         }) {
             debug!("No receivers for ProcessingError event: {}", e);
         }
@@ -726,12 +727,13 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
                     // as a final ToolResult event; no per-chunk gateway event
                     // yet.
                 }
-                crate::agent::ProgressEvent::Completed { response, turn_id } => {
+                crate::agent::ProgressEvent::Completed { response, turn_id, usage } => {
                     if let Err(e) = tx.send(GatewayEvent::Completed {
                         session_id: sid.clone(),
                         agent_id: aid.clone(),
                         response,
                         turn_id,
+                        usage,
                     }) {
                         debug!("No receivers for Completed event: {}", e);
                     }
@@ -741,6 +743,7 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
                         session_id: sid.clone(),
                         agent_id: aid.clone(),
                         message,
+                        code: None,
                     }) {
                         debug!("No receivers for ProcessingError event: {}", e);
                     }
@@ -858,6 +861,7 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
                 session_id: session_id.to_string(),
                 agent_id: agent_id.to_string(),
                 message: format!("Execution failed: {}", e),
+                code: extract_error_code(&e),
             }) {
                 debug!("No receivers for ProcessingError event: {}", e);
             }
@@ -876,6 +880,31 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
         .infra
         .shell_hooks
         .fire_stop(session_id, agent_id, channel);
+}
+
+/// Extract a machine-readable error code from a provider failure when one
+/// is recognizable. The cloud relay returns HTTP 403 with an
+/// `insufficient_credits` body when the credit balance falls below the
+/// overdraft floor; surfacing the code lets clients render a recharge
+/// prompt instead of a generic error. Always `None` without the cloud
+/// feature.
+#[cfg(feature = "cloud")]
+fn extract_error_code(e: &crate::error::SyscityError) -> Option<String> {
+    match e {
+        crate::error::SyscityError::ExternalService { source, .. } => {
+            if source.contains("insufficient_credits") {
+                Some("insufficient_credits".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "cloud"))]
+fn extract_error_code(_e: &crate::error::SyscityError) -> Option<String> {
+    None
 }
 
 #[cfg(test)]

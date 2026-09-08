@@ -226,8 +226,13 @@ impl HttpGatewayClient {
                         cause: None,
                     };
 
-                    // 4xx client errors are not retried.
-                    if status.is_client_error() || attempt == self.max_retries {
+                    // 4xx client errors are not retried. 501 (Not
+                    // Implemented) is also permanent — a capability gap, not
+                    // a transient server fault.
+                    if status.is_client_error()
+                        || status.as_u16() == 501
+                        || attempt == self.max_retries
+                    {
                         return Err(err);
                     }
 
@@ -563,6 +568,43 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn not_implemented_is_not_retried() {
+        // 501 is a permanent capability gap (e.g. a cloud relay without
+        // streaming support) — retrying just adds latency before the same
+        // answer.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat"))
+            .respond_with(
+                ResponseTemplate::new(501)
+                    .set_body_string("{\"error\":\"streaming not supported\"}"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = HttpGatewayClient::new(
+            server.uri(),
+            Credential::api_key("test"),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_max_retries(3)
+        .with_retry_delay(Duration::from_millis(10));
+
+        let result = client
+            .post_json::<TestBody, serde_json::Value>("/chat", &TestBody { msg: "hi".to_string() })
+            .await;
+
+        match result {
+            Err(crate::error::SyscityError::ExternalService { source, .. }) => {
+                assert!(source.starts_with("HTTP 501"), "source: {source}");
+            }
+            other => panic!("expected ExternalService 501 error, got {:?}", other),
+        }
     }
 
     #[tokio::test]

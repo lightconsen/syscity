@@ -580,6 +580,17 @@ async fn dispatch_method(
         "cloud.kb.docs" => admin_ws::handle_cloud_kb_docs(req, state).await,
         "cloud.kb.push" => admin_ws::handle_cloud_kb_push(req, state).await,
         "cloud.kb.pull" => admin_ws::handle_cloud_kb_pull(req, state).await,
+        "cloud.credits.claims" => admin_ws::handle_cloud_credits_claims(req, state).await,
+        "cloud.credits.daily_claim" => admin_ws::handle_cloud_credits_daily_claim(req, state).await,
+        "cloud.credits.signup_claim" => {
+            admin_ws::handle_cloud_credits_signup_claim(req, state).await
+        }
+        "cloud.credits.packs" => admin_ws::handle_cloud_credits_packs(req, state).await,
+        "cloud.credits.ledger" => admin_ws::handle_cloud_credits_ledger(req, state).await,
+        "cloud.credits.invite" => admin_ws::handle_cloud_credits_invite(req, state).await,
+        "cloud.credits.invite_redeem" => {
+            admin_ws::handle_cloud_credits_invite_redeem(req, state).await
+        }
         "kb.collections" => kb_ws::handle_kb_collections(req, state).await,
         "kb.docs" => kb_ws::handle_kb_docs(req, state).await,
         "kb.doc_content" => kb_ws::handle_kb_doc_content(req, state).await,
