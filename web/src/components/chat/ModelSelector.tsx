@@ -2,10 +2,45 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Check, ChevronDown } from "lucide-react";
 import type { ModelInfo, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
+import { modelLogoKey } from "@/lib/providerLogos";
 import { ProviderLogo } from "@/components/ui/ProviderLogo";
 
 interface ModelSelectorProps {
   transport: SyscityWebSocketTransport;
+}
+
+// One model row in the dropdown: vendor logo + bare model name. Cloud models
+// (proxy provider) resolve their logo from the model id via modelLogoKey.
+function ModelRow({
+  m,
+  selected,
+  onSelect,
+}: {
+  m: ModelInfo;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="option"
+      aria-selected={selected}
+      onClick={onSelect}
+      className={`w-full flex items-center gap-2 px-3 py-2 text-left transition ${
+        selected
+          ? "bg-primary-50 dark:bg-primary-900/20"
+          : "hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+      }`}
+    >
+      <ProviderLogo
+        provider={modelLogoKey(m.provider, m.name)}
+        name={m.provider_name}
+        className="w-4 h-4"
+      />
+      <span className="flex-1 min-w-0 text-sm text-primary">{m.name}</span>
+      {selected && <Check className="w-4 h-4 text-primary shrink-0" />}
+    </button>
+  );
 }
 
 // Compact model picker for the chat composer. Shows the effective model for
@@ -107,12 +142,16 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
   const fallback = agentModels[sessionAgentId] ?? defaultModel;
   const effectiveModel = models.find((m) => m.id === effective) ?? null;
 
-  // Group models by provider for the option list.
-  const byProvider = new Map<string, ModelInfo[]>();
+  // Option list: cloud (proxied) models first — flat, vendor logo per model,
+  // no section title — then a dashed divider, then local models grouped by
+  // provider.
+  const cloudModels = models.filter((m) => m.provider === "cloud");
+  const localByProvider = new Map<string, ModelInfo[]>();
   for (const m of models) {
-    const list = byProvider.get(m.provider) || [];
+    if (m.provider === "cloud") continue;
+    const list = localByProvider.get(m.provider) || [];
     list.push(m);
-    byProvider.set(m.provider, list);
+    localByProvider.set(m.provider, list);
   }
 
   const handleChange = (value: string) => {
@@ -141,7 +180,11 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
         className="flex items-center gap-1.5 max-w-[10rem] rounded-lg px-2 py-1.5 text-xs text-secondary hover:text-primary hover:bg-black/[0.04] dark:hover:bg-white/[0.06] focus:outline-none transition"
       >
         {effectiveModel ? (
-          <ProviderLogo provider={effectiveModel.provider} name={effectiveModel.provider_name} className="w-4 h-4" />
+          <ProviderLogo
+            provider={modelLogoKey(effectiveModel.provider, effectiveModel.name)}
+            name={effectiveModel.provider_name}
+            className="w-4 h-4"
+          />
         ) : (
           <span className="w-4 h-4 shrink-0 rounded bg-sidebar flex items-center justify-center text-[9px] font-semibold text-secondary">
             {(effective || "D").charAt(0).toUpperCase()}
@@ -149,7 +192,7 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
         )}
         <span className="truncate">
           {effectiveModel
-            ? `${effectiveModel.provider_name} - ${effectiveModel.name}`
+            ? effectiveModel.name
             : effective || t("ModelSelector.defaultModel")}
         </span>
         <ChevronDown
@@ -160,7 +203,7 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
       {open && (
         <div
           role="listbox"
-          className="absolute bottom-full left-0 mb-1.5 w-64 bg-card rounded-xl shadow-xl border border-subtle overflow-hidden z-50"
+          className="absolute bottom-full left-0 mb-1.5 w-max min-w-64 max-w-[min(26rem,calc(100vw-4rem))] bg-card rounded-xl shadow-xl border border-subtle overflow-hidden z-50"
         >
           <div className="max-h-72 overflow-y-auto py-1">
             {/* Clear-pin option */}
@@ -189,30 +232,33 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
               {sessionModel === null && <Check className="w-4 h-4 text-primary shrink-0" />}
             </button>
 
-            {Array.from(byProvider.entries()).map(([provider, ms]) => (
+            {/* Cloud (proxied) models: vendor logo + model name, no title */}
+            {cloudModels.map((m) => (
+              <ModelRow
+                key={m.id}
+                m={m}
+                selected={sessionModel === m.id}
+                onSelect={() => handleChange(m.id)}
+              />
+            ))}
+
+            {/* Dashed divider between cloud and local models */}
+            {cloudModels.length > 0 && (
+              <div className="my-1 border-t border-dashed border-subtle" />
+            )}
+
+            {Array.from(localByProvider.entries()).map(([provider, ms]) => (
               <div key={provider}>
                 <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wide text-secondary/70">
                   {ms[0]?.provider_name || provider}
                 </div>
                 {ms.map((m) => (
-                  <button
+                  <ModelRow
                     key={m.id}
-                    type="button"
-                    role="option"
-                    aria-selected={sessionModel === m.id}
-                    onClick={() => handleChange(m.id)}
-                    className={`w-full flex items-center gap-2 px-3 py-2 text-left transition ${
-                      sessionModel === m.id
-                        ? "bg-primary-50 dark:bg-primary-900/20"
-                        : "hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
-                    }`}
-                  >
-                    <ProviderLogo provider={m.provider} name={m.provider_name} className="w-4 h-4" />
-                    <span className="flex-1 min-w-0 truncate text-sm text-primary">
-                      {m.provider_name} - {m.name}
-                    </span>
-                    {sessionModel === m.id && <Check className="w-4 h-4 text-primary shrink-0" />}
-                  </button>
+                    m={m}
+                    selected={sessionModel === m.id}
+                    onSelect={() => handleChange(m.id)}
+                  />
                 ))}
               </div>
             ))}

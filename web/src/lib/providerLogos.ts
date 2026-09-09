@@ -55,3 +55,18 @@ export function getProviderLogoSrc(
   }
   return base;
 }
+
+/**
+ * Logo key for a model under a provider. Proxy providers (e.g. "cloud") have
+ * no logo of their own but serve third-party models whose ids carry the
+ * upstream vendor prefix ("deepseek-v4-flash" → deepseek), so the logo is
+ * inferred from the model id. The provider key is returned as-is when it
+ * already maps to a logo or no vendor prefix matches.
+ */
+export function modelLogoKey(providerKey: string, modelId: string): string {
+  const key = providerKey.toLowerCase();
+  if (PROVIDER_LOGOS[key]) return key;
+  const id = modelId.toLowerCase();
+  const match = Object.keys(PROVIDER_LOGOS).find((p) => id.startsWith(p));
+  return match ?? key;
+}
