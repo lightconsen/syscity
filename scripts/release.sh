@@ -15,10 +15,12 @@
 #   1. Preconditions: clean tree, on main, in sync with origin/main, target tag free
 #   2. cargo test --all-features --lib (unless --skip-tests)
 #   3. Promote the CHANGELOG `## [Unreleased]` section to `## [X.Y.Z] - <date>`;
-#      if that section is empty, draft one from commit subjects since the
-#      previous tag — via the LLM configured in scripts/.env (SYSCITY_* vars,
-#      gitignored; OpenAI- or Anthropic-compatible), falling back to mechanical
-#      ✨→Added / 🐛→Fixed / rest→Changed grouping when it's absent or fails.
+#      if that section is empty, draft one from the changes since the previous
+#      tag (full commit messages + diffstat + code diff, lockfiles excluded)
+#      via the LLM configured in scripts/.env (SYSCITY_* vars, gitignored;
+#      OpenAI- or Anthropic-compatible), falling back to mechanical
+#      ✨→Added / 🐛→Fixed / rest→Changed grouping of commit subjects when it's
+#      absent or fails.
 #      Opens $EDITOR unless --no-edit or non-interactive.
 #   4. Bump the version in Cargo.toml, desktop/Cargo.toml, web/package.json
 #      and refresh Cargo.lock
@@ -58,7 +60,8 @@ while [ $# -gt 0 ]; do
       echo "  --no-edit     skip opening an editor on CHANGELOG.md"
       echo "  --skip-tests  skip the pre-release test run"
       echo ""
-      echo "  Draft release notes use the LLM configured in scripts/.env"
+      echo "  Draft release notes summarize the changes since the last tag"
+      echo "  (commit messages + diff) via the LLM configured in scripts/.env"
       echo "  (SYSCITY_* vars) when present; falls back to mechanical grouping."
       exit 0
       ;;
@@ -167,6 +170,37 @@ if git rev-parse -q --verify "refs/tags/v$current" >/dev/null 2>&1; then
   fi
 fi
 
+# Concrete change material for the LLM draft: full commit messages plus the
+# diffstat and patch since the previous tag (lockfiles excluded). The patch is
+# truncated to a conservative context budget when needed.
+changes_file="$(mktemp)"
+if git rev-parse -q --verify "refs/tags/v$current" >/dev/null 2>&1; then
+  diff_paths=(. ':(exclude)Cargo.lock' ':(exclude)desktop/Cargo.lock' ':(exclude)web/pnpm-lock.yaml')
+  {
+    echo "=== commit messages v$current..HEAD ==="
+    git log "v$current..HEAD" --pretty='--- %h %s%n%b'
+    echo
+    echo "=== diffstat v$current..HEAD ==="
+    git diff --stat "v$current..HEAD" -- "${diff_paths[@]}"
+  } > "$changes_file"
+  patch_file="$(mktemp)"
+  git diff "v$current..HEAD" -- "${diff_paths[@]}" > "$patch_file"
+  max_chars=120000
+  base_len="$(wc -c < "$changes_file")"
+  if [ "$base_len" -lt "$max_chars" ]; then
+    room=$((max_chars - base_len))
+    if [ "$(wc -c < "$patch_file")" -le "$room" ]; then
+      echo "=== patch v$current..HEAD ===" >> "$changes_file"
+      cat "$patch_file" >> "$changes_file"
+    else
+      echo "=== patch v$current..HEAD (truncated) ===" >> "$changes_file"
+      head -c "$room" "$patch_file" >> "$changes_file"
+      printf '\n[... patch truncated ...]\n' >> "$changes_file"
+    fi
+  fi
+  rm -f "$patch_file"
+fi
+
 # Local LLM config for drafting release notes (gitignored, optional).
 # Exported so the python step below reads SYSCITY_* via os.environ.
 if [ -f scripts/.env ]; then
@@ -180,14 +214,14 @@ fi
 # substitution: /bin/bash 3.2 (macOS shebang) mis-parses backticks inside
 # $(...) heredocs, and the LLM fence-stripping below uses them.
 notes_file="$(mktemp)"
-if python3 - "$next" "$release_date" "$current" "$added" "$fixed" "$changed" "$subjects" > "$notes_file" <<'PY'
+if python3 - "$next" "$release_date" "$current" "$added" "$fixed" "$changed" "$changes_file" > "$notes_file" <<'PY'
 import json
 import os
 import re
 import sys
 import urllib.request
 
-next_ver, date, current, added, fixed, changed, subjects = sys.argv[1:8]
+next_ver, date, current, added, fixed, changed, changes_path = sys.argv[1:8]
 path = "CHANGELOG.md"
 text = open(path, encoding="utf-8").read()
 
@@ -205,29 +239,32 @@ body = body.strip("\n")
 def llm_release_notes():
     """Draft release notes via the SYSCITY_* provider config (scripts/.env).
 
-    Returns (model, text) on success; None when unconfigured, the request
-    fails, or the output is unusable (a warning goes to stderr on failure).
-    URL shapes mirror src/providers: OpenAI-compatible `{base}/chat/completions`
-    (base includes /v1), Anthropic-compatible `{base}/v1/messages`.
+    The material is the changes file written by the shell above: full commit
+    messages plus the diffstat and patch since the previous tag. Returns
+    (model, text) on success; None when unconfigured, the request fails, or
+    the output is unusable (a warning goes to stderr on failure).
     """
     base = os.environ.get("SYSCITY_BASE_URL", "").strip().rstrip("/")
     key = os.environ.get("SYSCITY_API_KEY", "").strip()
     model = os.environ.get("SYSCITY_MODEL", "").strip()
-    if not (base and key and model and subjects.strip()):
+    changes = ""
+    if os.path.exists(changes_path):
+        changes = open(changes_path, encoding="utf-8").read().strip()
+    if not (base and key and model and changes.strip()):
         return None
     is_anthropic = os.environ.get("SYSCITY_IS_ANTHROPIC", "").strip().lower() in ("true", "1")
     prompt = f"""You are drafting user-facing release notes for Syscity, version {next_ver} (previous release v{current}).
 
-Git commit subjects since v{current}:
+Changes since v{current} — full commit messages, then the diffstat and code diff (lockfiles excluded; the patch may be truncated):
 
-{subjects}
+{changes}
 
 Rewrite them as Keep-a-Changelog release notes:
-- Output ONLY the body: "### Added", "### Changed", "### Fixed" subsections in this order (omit empty ones), each followed by markdown bullets.
+- Base each bullet on the concrete changes visible in the messages and diff (what a user can now do, what behaves differently, what was fixed) — never copy commit titles verbatim.
 - Group related commits into one bullet when they form a single user-visible change; phrase bullets as user-visible behavior, not commit-speak.
-- Drop release chores (🔖 version bumps) and CI-only churn unless it matters to users.
+- Drop release chores (🔖 version bumps), lockfile churn, and CI-only changes unless they matter to users.
 - Write in the same language as the commit subjects.
-- Do not invent changes that are not implied by the subjects.
+- Do not invent changes that are not supported by the material.
 - No preamble, no top-level "##" version header, no dates.
 """
     if is_anthropic:
@@ -238,12 +275,14 @@ Rewrite them as Keep-a-Changelog release notes:
         url = base + "/chat/completions"
         headers = {"Authorization": "Bearer " + key,
                    "content-type": "application/json"}
-    payload = {"model": model, "max_tokens": 2000, "temperature": 0.2,
+    payload = {"model": model, "max_tokens": 8000, "temperature": 0.2,
                "messages": [{"role": "user", "content": prompt}]}
+    # Generous budget + timeout: reasoning models spend their completion
+    # tokens on invisible CoT before writing any content.
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                  headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.load(resp)
     except Exception as exc:
         print(f"⚠️  LLM draft failed ({exc}) — falling back to mechanical grouping",
@@ -297,7 +336,7 @@ then
 else
   source_note=""
 fi
-rm -f "$notes_file"
+rm -f "$notes_file" "$changes_file"
 if [ -z "$source_note" ]; then
   exit 1
 fi
