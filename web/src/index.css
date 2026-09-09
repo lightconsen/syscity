@@ -3,25 +3,26 @@
 @variant dark (&:where(.dark, .dark *));
 
 @theme {
-  /* Accent palette: clean analytics blue */
-  --color-primary-50: #EFF6FF;
-  --color-primary-100: #DBEAFE;
-  --color-primary-200: #BFDBFE;
-  --color-primary-300: #93C5FD;
-  --color-primary-400: #60A5FA;
-  --color-primary-500: #3B82F6;
-  --color-primary-600: #2563EB;
-  --color-primary-700: #1D4ED8;
-  --color-primary-800: #1E40AF;
-  --color-primary-900: #1E3A8A;
+  /* Accent palette: Syscity app indigo (matches site/ brand system —
+   * "Brand: Syscity magenta (#B22AC2) -> app indigo (#6366F1)") */
+  --color-primary-50: #EEF2FF;
+  --color-primary-100: #E0E7FF;
+  --color-primary-200: #C7D2FE;
+  --color-primary-300: #A5B4FC;
+  --color-primary-400: #818CF8;
+  --color-primary-500: #6366F1;
+  --color-primary-600: #4F46E5;
+  --color-primary-700: #4338CA;
+  --color-primary-800: #3730A3;
+  --color-primary-900: #312E81;
   /* Cards and form controls share a 12px radius in both themes. */
   --radius-lg: 0.75rem;
 }
 
 :root {
-  --color-primary: #2563EB;
-  --color-primary-dark: #1E40AF;
-  --color-primary-light: #3B82F6;
+  --color-primary: #4F46E5;
+  --color-primary-dark: #3730A3;
+  --color-primary-light: #6366F1;
   --message-list-max-width: 56rem;
   /* Light: clean SaaS dashboard — light gray page, soft white surfaces.
      The left rail sits a step below the page so the chat canvas reads
