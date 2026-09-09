@@ -754,11 +754,25 @@ impl Default for ModelRouterConfig {
 
 impl ModelRouterConfig {
     /// Find the provider name that owns the given concrete model ID.
+    ///
+    /// Deterministic when several providers serve the same model (a direct
+    /// vendor config and the cloud proxy both carry e.g.
+    /// "deepseek-v4-flash"): the non-cloud provider wins so routing is
+    /// stable across restarts and direct-capable calls are not metered
+    /// through the proxy by accident.
     pub fn provider_for_model(&self, model_id: &str) -> Option<&str> {
-        self.providers
+        let direct = self
+            .providers
             .iter()
+            .filter(|(name, _)| name.as_str() != "cloud")
             .find(|(_, cfg)| cfg.supports_model(model_id))
-            .map(|(name, _)| name.as_str())
+            .map(|(name, _)| name.as_str());
+        direct.or_else(|| {
+            self.providers
+                .iter()
+                .find(|(name, cfg)| name.as_str() == "cloud" && cfg.supports_model(model_id))
+                .map(|(name, _)| name.as_str())
+        })
     }
 }
 
@@ -980,5 +994,48 @@ mod tests {
         assert_eq!(provider_display_name("deepseek"), "DeepSeek");
         assert_eq!(provider_display_name("DeepSeek"), "DeepSeek");
         assert_eq!(provider_display_name("my-custom"), "my-custom");
+    }
+
+    #[test]
+    fn provider_for_model_prefers_non_cloud_when_duplicated() {
+        let direct = ProviderConfig {
+            provider_type: ProviderType::OpenAi,
+            models: vec!["deepseek-v4-flash".into(), "deepseek-v4-pro".into()],
+            default_model: "deepseek-v4-flash".into(),
+            api_key: "sk-test".to_string().into(),
+            api_keys: vec![],
+            auth_profile: None,
+            oauth: None,
+            base_url: None,
+            timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        let proxy = ProviderConfig {
+            provider_type: ProviderType::OpenAi,
+            models: vec![
+                "deepseek-v4-flash".into(),
+                "deepseek-v4-flash-vision-exp".into(),
+            ],
+            default_model: "deepseek-v4-flash".into(),
+            api_key: "sk-test".to_string().into(),
+            api_keys: vec![],
+            auth_profile: None,
+            oauth: None,
+            base_url: None,
+            timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        let mut config = ModelRouterConfig::default();
+        config.providers.insert("deepseek".to_string(), direct);
+        config.providers.insert("cloud".to_string(), proxy);
+
+        // Duplicated ids resolve to the direct provider; cloud-unique ids
+        // still resolve to the proxy.
+        assert_eq!(config.provider_for_model("deepseek-v4-flash"), Some("deepseek"));
+        assert_eq!(config.provider_for_model("deepseek-v4-pro"), Some("deepseek"));
+        assert_eq!(config.provider_for_model("deepseek-v4-flash-vision-exp"), Some("cloud"));
+        assert_eq!(config.provider_for_model("gpt-4o"), None);
     }
 }

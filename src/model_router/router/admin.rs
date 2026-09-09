@@ -7,13 +7,24 @@ use super::*;
 impl ModelRouter {
     // ==================== DEFAULT PROVIDER ====================
 
-    /// Create a default provider (first available)
+    /// Create a default provider. Deterministic pick: the alphabetically
+    /// first non-cloud registered provider. The registry is a HashMap, so
+    /// `.iter().next()` flapped the default between restarts — potentially
+    /// landing on the metered cloud proxy for unconfigured LLM calls.
     pub async fn create_default_provider(&self) -> crate::Result<Arc<dyn Provider + Send + Sync>> {
         let providers = self.providers.read().await;
 
-        if let Some((name, provider)) = providers.iter().next() {
+        let picked: Option<(String, Arc<dyn Provider + Send + Sync>)> = {
+            let mut names: Vec<&str> = providers.keys().map(String::as_str).collect();
+            names.sort_by_key(|n| (*n == "cloud", *n));
+            names
+                .first()
+                .and_then(|n| providers.get(*n).map(|p| ((*n).to_string(), p.clone())))
+        };
+
+        if let Some((name, provider)) = picked {
             info!("Using default provider: {name}");
-            Ok(provider.clone())
+            Ok(provider)
         } else {
             drop(providers);
 
@@ -59,7 +70,16 @@ impl ModelRouter {
 
         {
             let config = self.config.read().await;
-            for (provider, pcfg) in &config.providers {
+            // HashMap iteration order is randomized per process, and two
+            // providers can serve the same model id (a direct vendor config
+            // and the cloud proxy both carry e.g. "deepseek-v4-flash").
+            // Scan providers in a deterministic order — sorted, with the
+            // cloud proxy last — so a duplicated id is attributed to its
+            // direct provider and the cloud section only lists models
+            // unique to it.
+            let mut entries: Vec<_> = config.providers.iter().collect();
+            entries.sort_by_key(|(name, _)| (name.as_str() == "cloud", name.as_str()));
+            for (provider, pcfg) in entries {
                 for model in &pcfg.models {
                     if seen.insert(model.clone()) {
                         result.push((provider.clone(), model.clone()));

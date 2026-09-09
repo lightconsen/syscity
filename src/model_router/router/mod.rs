@@ -172,6 +172,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_with_providers_attributes_duplicated_ids_deterministically() {
+        // A direct vendor config and the cloud proxy can serve the same
+        // model ids. Attribution must not depend on HashMap iteration
+        // order: the direct provider claims duplicated ids and cloud only
+        // contributes models unique to it.
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        router
+            .add_provider(
+                "cloud",
+                test_provider_config(&["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]),
+            )
+            .await
+            .unwrap();
+        router
+            .add_provider(
+                "deepseek",
+                test_provider_config(&["deepseek-v4-flash", "deepseek-v4-pro"]),
+            )
+            .await
+            .unwrap();
+
+        let models = router.models_with_providers().await;
+        assert!(models.contains(&("deepseek".to_string(), "deepseek-v4-flash".to_string())));
+        assert!(models.contains(&("deepseek".to_string(), "deepseek-v4-pro".to_string())));
+        assert!(models.contains(&("cloud".to_string(), "deepseek-v4-flash-vision-exp".to_string())));
+        assert!(!models.contains(&("cloud".to_string(), "deepseek-v4-flash".to_string())));
+
+        // Routing resolution follows the same convention.
+        assert_eq!(
+            router
+                .provider_for_model("deepseek-v4-flash")
+                .await
+                .as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            router
+                .provider_for_model("deepseek-v4-flash-vision-exp")
+                .await
+                .as_deref(),
+            Some("cloud")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_default_provider_prefers_non_cloud() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        router
+            .add_provider("cloud", test_provider_config(&["cloud-only"]))
+            .await
+            .unwrap();
+        router
+            .add_provider("deepseek", test_provider_config(&["deepseek-only"]))
+            .await
+            .unwrap();
+
+        let default_provider = router.create_default_provider().await.unwrap();
+        let deepseek_provider = router.get_provider("deepseek").await.unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&default_provider, &deepseek_provider),
+            "default provider must deterministically be the non-cloud one"
+        );
+    }
+
+    #[tokio::test]
     async fn add_provider_rejects_duplicate_name() {
         let router = ModelRouter::new(ModelRouterConfig::default());
         router
