@@ -358,42 +358,21 @@ impl CompressedJsonlStore {
     /// into individual member byte slices.
     ///
     /// This is needed to compute per-member byte offsets when rebuilding the
-    /// index. The scan uses the gzip magic header (0x1F 0x8B) as the start of
-    /// each member.
+    /// index. Each member's extent is found exactly: parse the RFC 1952
+    /// header, raw-inflate the deflate stream with `mem::Decompress` until
+    /// `StreamEnd` (`total_in()` is then the stream's exact length), and skip
+    /// the fixed 8-byte trailer. Scanning for the gzip magic (0x1F 0x8B)
+    /// instead would false-positive on that byte sequence inside deflate
+    /// payloads — the "member" from such a start is truncated garbage and
+    /// fails to decompress with "unexpected end of file", which made index
+    /// rebuilds (and therefore the first `store()` on a legacy dir) flaky
+    /// depending on the compressed bytes' content.
     async fn split_gzip_members(data: Vec<u8>) -> crate::Result<Vec<Vec<u8>>> {
-        spawn_blocking(move || {
-            let mut members = Vec::new();
-            if data.is_empty() {
-                return Ok(members);
-            }
-            // Locate all offsets where a gzip magic header starts.
-            let mut starts = Vec::new();
-            let mut i = 0;
-            while i + 1 < data.len() {
-                if data[i] == 0x1F && data[i + 1] == 0x8B {
-                    starts.push(i);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            if starts.is_empty() {
-                return Ok(members);
-            }
-            starts.push(data.len());
-            for pair in starts.windows(2) {
-                let start = pair[0];
-                let end = pair[1];
-                if end > start {
-                    members.push(data[start..end].to_vec());
-                }
-            }
-            Ok(members)
-        })
-        .await
-        .map_err(|e| {
-            crate::error::SyscityError::Validation(format!("split_gzip task panicked: {}", e))
-        })?
+        spawn_blocking(move || split_gzip_members_sync(&data))
+            .await
+            .map_err(|e| {
+                crate::error::SyscityError::Validation(format!("split_gzip task panicked: {}", e))
+            })?
     }
 
     /// Compress a single JSON line into its own gzip member.
@@ -979,6 +958,129 @@ impl MemoryStore for CompressedJsonlStore {
     }
 }
 
+/// Length of a gzip member's trailer: CRC32 + ISIZE (RFC 1952 §2.3.1).
+const GZIP_TRAILER_LEN: usize = 8;
+
+/// Return the length of the RFC 1952 member header starting at `start`, or
+/// `None` when the bytes do not begin a plausible gzip member (magic, deflate
+/// method, and the optional fields FEXTRA/FNAME/FCOMMENT/FHCRC accounted for).
+fn gzip_header_len(data: &[u8], start: usize) -> Option<usize> {
+    if start + 10 > data.len() || data[start] != 0x1F || data[start + 1] != 0x8B {
+        return None;
+    }
+    // CM must be 8 ("deflate"); we only ever write members that satisfy this.
+    if data[start + 2] != 8 {
+        return None;
+    }
+    let flg = data[start + 3];
+    let mut p = start + 10;
+    if flg & 0x04 != 0 {
+        // FEXTRA: 2-byte LE length followed by that many bytes.
+        if p + 2 > data.len() {
+            return None;
+        }
+        let len = u16::from_le_bytes([data[p], data[p + 1]]) as usize;
+        p += 2 + len;
+    }
+    if flg & 0x08 != 0 {
+        // FNAME: zero-terminated string.
+        if p >= data.len() {
+            return None;
+        }
+        p += data[p..].iter().position(|&b| b == 0)? + 1;
+    }
+    if flg & 0x10 != 0 {
+        // FCOMMENT: zero-terminated string.
+        if p >= data.len() {
+            return None;
+        }
+        p += data[p..].iter().position(|&b| b == 0)? + 1;
+    }
+    if flg & 0x02 != 0 {
+        p += 2; // FHCRC
+    }
+    if p > data.len() {
+        return None;
+    }
+    Some(p - start)
+}
+
+/// Split concatenated gzip members into exact member byte slices (see
+/// `CompressedJsonlStore::split_gzip_members`).
+fn split_gzip_members_sync(data: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let mut members = Vec::new();
+    let mut pos = 0usize;
+
+    while pos + 2 <= data.len() {
+        let Some(hdr_len) = gzip_header_len(data, pos) else {
+            // Sequentially decoded members always resume at a real header, so
+            // a miss here means corrupt or foreign bytes; skip one and keep
+            // looking (same tolerance as the old magic scan).
+            pos += 1;
+            continue;
+        };
+
+        // Raw-inflate the deflate stream: `StreamEnd` marks the exact end of
+        // the member's deflate body regardless of what bytes follow.
+        let deflate_start = pos + hdr_len;
+        let mut de = Decompress::new(false);
+        let mut out: Vec<u8> = Vec::new();
+        let mut consumed = 0usize;
+        let mut done = false;
+        loop {
+            let input = &data[deflate_start + consumed..];
+            if input.is_empty() {
+                break; // truncated member: deflate stream never ended
+            }
+            if out.len() == out.capacity() {
+                out.reserve(4096);
+            }
+            match de.decompress_vec(input, &mut out, FlushDecompress::None) {
+                Ok(Status::StreamEnd) => {
+                    consumed = de.total_in() as usize;
+                    done = true;
+                    break;
+                }
+                Ok(_) => {
+                    let new_consumed = de.total_in() as usize;
+                    if new_consumed == consumed && out.len() == out.capacity() {
+                        out.reserve(out.len().max(4096));
+                    }
+                    consumed = new_consumed;
+                }
+                Err(e) => {
+                    if deflate_start + consumed >= data.len() {
+                        break; // truncated tail, handled below
+                    }
+                    return Err(crate::error::SyscityError::Storage {
+                        context: format!("Corrupt gzip member at offset {} in archival shard", pos),
+                        details: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        let member_end = deflate_start + consumed + GZIP_TRAILER_LEN;
+        if !done || member_end > data.len() {
+            // Truncated final member (e.g. a crash mid-append): ignore the
+            // tail instead of failing the whole scan.
+            warn!(
+                "Ignoring truncated final gzip member in archival shard \
+                 ({} trailing bytes)",
+                data.len() - pos
+            );
+            break;
+        }
+
+        members.push(data[pos..member_end].to_vec());
+        pos = member_end;
+    }
+
+    Ok(members)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -1089,5 +1191,96 @@ mod tests {
         let m2 = store.get(&id2).await.unwrap();
         assert!(m2.is_some(), "rebuild failed for id2");
         assert!(idx.exists(), "rebuild should recreate the index file");
+    }
+
+    #[tokio::test]
+    async fn split_gzip_members_tolerates_inner_magic_bytes() {
+        // The gzip magic (1F 8B) can occur inside a member's deflate payload.
+        // The old magic-scan split treated such an occurrence as the next
+        // member boundary, producing a truncated "member" that failed to
+        // decompress ("unexpected end of file") and broke index rebuilds.
+        // Find a payload whose compressed output exhibits the pattern, then
+        // assert the decode-driven split still yields exactly the members.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut inner_member = None;
+        for i in 0..20000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let line =
+                format!("entry #{i} {:016x} {:016x} {:016x} {:016x}", state, state, state, state);
+            let member = CompressedJsonlStore::compress_line(line).await.unwrap();
+            let has_inner = (2..member.len().saturating_sub(1))
+                .any(|i| member[i] == 0x1F && member[i + 1] == 0x8B);
+            if has_inner {
+                inner_member = Some(member);
+                break;
+            }
+        }
+        let Some(inner_member) = inner_member else {
+            // No compressed payload exhibited the pattern; nothing to prove.
+            return;
+        };
+
+        let head = CompressedJsonlStore::compress_line("first".into())
+            .await
+            .unwrap();
+        let tail = CompressedJsonlStore::compress_line("last".into())
+            .await
+            .unwrap();
+        let mut data = head;
+        data.extend_from_slice(&inner_member);
+        data.extend_from_slice(&tail);
+
+        let members = CompressedJsonlStore::split_gzip_members(data.clone())
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 3, "inner magic must not split a member");
+        assert_eq!(members.concat(), data, "slices must tile the input");
+
+        let first = CompressedJsonlStore::decompress_bytes(members[0].clone())
+            .await
+            .unwrap();
+        assert_eq!(first, vec!["first"]);
+        let last = CompressedJsonlStore::decompress_bytes(members[2].clone())
+            .await
+            .unwrap();
+        assert_eq!(last, vec!["last"]);
+    }
+
+    #[tokio::test]
+    async fn split_gzip_members_is_exact_across_varied_payloads() {
+        // Decode-driven splitting must tile the input exactly and decompress
+        // to the original lines for arbitrary payloads.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let lines: Vec<String> = (0..40)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                format!("entry #{i} {:016x}", state)
+            })
+            .collect();
+
+        let mut data = Vec::new();
+        for line in &lines {
+            data.extend(
+                CompressedJsonlStore::compress_line(line.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let members = CompressedJsonlStore::split_gzip_members(data.clone())
+            .await
+            .unwrap();
+        assert_eq!(members.len(), lines.len());
+        assert_eq!(members.concat(), data);
+        for (member, line) in members.iter().zip(&lines) {
+            let out = CompressedJsonlStore::decompress_bytes(member.clone())
+                .await
+                .unwrap();
+            assert_eq!(out, vec![line.as_str()]);
+        }
     }
 }
