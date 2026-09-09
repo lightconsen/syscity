@@ -9,5 +9,6 @@
 pub mod client;
 pub mod config;
 pub mod device;
+pub mod multipliers;
 pub mod provider;
 pub mod session;

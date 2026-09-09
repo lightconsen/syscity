@@ -70,6 +70,12 @@ impl CloudClient {
         self.post_json("/v1/chat/completions", body).await
     }
 
+    /// GET /v1/models — OpenAI-compatible model list. Each entry carries the
+    /// `credit_multiplier` extension field (billing multiplier per 1K tokens).
+    pub async fn models(&self) -> Result<Value> {
+        self.get_json("/v1/models").await
+    }
+
     /// POST /v1/embeddings.
     pub async fn embeddings(&self, body: Value) -> Result<Value> {
         self.post_json("/v1/embeddings", body).await

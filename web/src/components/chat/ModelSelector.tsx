@@ -20,6 +20,7 @@ function ModelRow({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useTranslation("chat");
   return (
     <button
       type="button"
@@ -38,6 +39,11 @@ function ModelRow({
         className="w-4 h-4"
       />
       <span className="flex-1 min-w-0 text-sm text-primary">{m.name}</span>
+      {m.provider === "cloud" && m.credit_multiplier != null && (
+        <span className="text-[10px] text-secondary/70 shrink-0" title={t("ModelSelector.creditMultiplier")}>
+          {m.credit_multiplier}x
+        </span>
+      )}
       {selected && <Check className="w-4 h-4 text-primary shrink-0" />}
     </button>
   );

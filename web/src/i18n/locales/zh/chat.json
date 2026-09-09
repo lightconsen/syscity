@@ -16,6 +16,7 @@
   "ModelSelector.selectModel": "选择模型",
   "ModelSelector.defaultModel": "默认模型",
   "ModelSelector.uses": "使用 {{model}}",
+  "ModelSelector.creditMultiplier": "云端积分计费倍率(每 1K tokens)",
   "MessageBubble.copy": "复制",
   "MessageBubble.copied": "已复制",
   "MessageBubble.edit": "编辑",

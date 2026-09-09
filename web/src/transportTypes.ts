@@ -68,6 +68,8 @@ export interface ModelInfo {
   api_key_masked?: string;
   /** Provider base URL, when configured. */
   base_url?: string;
+  /** Cloud billing multiplier (credits per 1K tokens); cloud models only. */
+  credit_multiplier?: number;
 }
 
 /** First-launch identity form payload (WS `onboarding.apply`). */

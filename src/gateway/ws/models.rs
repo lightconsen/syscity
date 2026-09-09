@@ -52,6 +52,17 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
             .collect()
     };
 
+    // Cloud models carry a server-configured billing multiplier (credits per
+    // 1K tokens). Fetched with a TTL cache; failures keep the previous table
+    // and never fail the listing.
+    #[cfg(feature = "cloud")]
+    let cloud_multipliers = if pairs.iter().any(|(p, _)| p == "cloud") && logged_in {
+        let cloud_cfg = { state.config.read().await.cloud.clone() };
+        crate::cloud::multipliers::credit_multipliers(&cloud_cfg).await
+    } else {
+        None
+    };
+
     let entries: Vec<serde_json::Value> = pairs
         .iter()
         .filter(|(provider, _model)| provider_visible(provider, logged_in))
@@ -60,7 +71,7 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
                 .get(provider)
                 .cloned()
                 .unwrap_or((false, None, None));
-            serde_json::json!({
+            let entry = serde_json::json!({
                 "id": model,
                 "name": model,
                 "provider": provider,
@@ -68,7 +79,22 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
                 "has_api_key": has_api_key,
                 "api_key_masked": api_key_masked,
                 "base_url": base_url,
-            })
+            });
+            // Cloud entries carry the server-configured billing multiplier
+            // (cache above); local models never do.
+            #[cfg(feature = "cloud")]
+            let entry = {
+                let mut entry = entry;
+                if provider == "cloud" {
+                    if let Some(table) = &cloud_multipliers {
+                        if let Some(mult) = table.get(model.as_str()) {
+                            entry["credit_multiplier"] = serde_json::json!(mult);
+                        }
+                    }
+                }
+                entry
+            };
+            entry
         })
         .collect();
     let default_model = {
