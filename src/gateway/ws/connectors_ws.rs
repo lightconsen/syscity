@@ -192,7 +192,7 @@ fn connector_id_param(req: &WsRequest) -> std::result::Result<String, WsResponse
 }
 
 /// Lowercase lifecycle state ("installed"/"enabled"/"disabled"/"error").
-fn lifecycle_state(summary: &ConnectorSummary) -> &'static str {
+pub(crate) fn lifecycle_state(summary: &ConnectorSummary) -> &'static str {
     match summary.state {
         crate::mcp::connectors::state::StateKind::Installed => "installed",
         crate::mcp::connectors::state::StateKind::Enabled => "enabled",
@@ -337,6 +337,8 @@ mod tests {
         let summary = resp.payload.as_ref().unwrap();
         assert_eq!(summary["id"], "test-connector");
         assert_eq!(summary["state"], "installed");
+        // MCP-capable connector probed live: installed-but-not-enabled → false.
+        assert_eq!(summary["connected"], false);
 
         let resp = handle_connectors_list(&req("r2", "connectors.list", None), &state).await;
         assert!(resp.ok);
@@ -346,6 +348,9 @@ mod tests {
             .clone();
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0]["id"], "test-connector");
+        // auto_connect: false → still `installed`, live connection false.
+        assert_eq!(connectors[0]["state"], "installed");
+        assert_eq!(connectors[0]["connected"], false);
 
         let _ = std::fs::remove_dir_all(&pkg);
     }

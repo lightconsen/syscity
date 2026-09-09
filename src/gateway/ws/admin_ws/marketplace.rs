@@ -12,11 +12,14 @@ use crate::gateway::GatewayState;
 /// `connectors.catalog` — the marketplace catalog (cached) joined with each
 /// entry's installed state.
 ///
-/// Optional params: `{ lang }` — forwarded as `Accept-Language` when a sync
-/// happens (`catalog.json` is bilingual: `zh*` → Chinese, else English). The
-/// single-slot cache tracks its language bucket in `meta.json`; a request for
-/// a different bucket triggers a re-sync (which skips `If-None-Match`, so the
-/// cloud answers 200 with the new language).
+/// Optional params: `{ lang, refresh }` — `lang` is forwarded as
+/// `Accept-Language` when a sync happens (`catalog.json` is bilingual: `zh*` →
+/// Chinese, else English). The single-slot cache tracks its language bucket in
+/// `meta.json`; a request for a different bucket triggers a re-sync (which
+/// skips `If-None-Match`, so the cloud answers 200 with the new language).
+/// `refresh: true` (the UI's Refresh button) forces a sync even when a fresh
+/// same-language cache exists — the ETag/sha256 conditional request still
+/// short-circuits when the remote body is unchanged.
 ///
 /// On a first visit with an empty cache the handler one-shot syncs from the
 /// cloud catalog URL when cloud mode is active (feature + `cloud.enabled` +
@@ -33,6 +36,8 @@ pub(crate) async fn handle_connectors_catalog(
     #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
     struct Params {
         lang: Option<String>,
+        #[serde(default)]
+        refresh: bool,
     }
     #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     let p: Params = req
@@ -47,19 +52,20 @@ pub(crate) async fn handle_connectors_catalog(
             Ok(None) => None,
             Err(e) => return WsResponse::err(&req.id, "INTERNAL", e.to_string()),
         };
-        // Sync when the cache is missing, empty, or holds a different
-        // language than the one requested now (a cached-but-empty catalog,
-        // e.g. first sync raced an empty cloud catalog, must not pin the
-        // empty view forever).
+        // Sync when explicitly asked (Refresh), when the cache is missing,
+        // empty, or holds a different language than the one requested now
+        // (a cached-but-empty catalog, e.g. first sync raced an empty cloud
+        // catalog, must not pin the empty view forever).
         #[cfg(feature = "cloud")]
         let wants_lang = crate::mcp::connectors::catalog::catalog_lang_bucket(p.lang.as_deref());
         #[cfg(feature = "cloud")]
         let cached_lang = manager.cached_catalog_lang().await;
         #[cfg(feature = "cloud")]
-        let needs_sync = match &cached {
-            Some(d) => d.connectors.is_empty() || cached_lang.as_deref() != Some(wants_lang),
-            None => true,
-        };
+        let needs_sync = p.refresh
+            || match &cached {
+                Some(d) => d.connectors.is_empty() || cached_lang.as_deref() != Some(wants_lang),
+                None => true,
+            };
         #[cfg(feature = "cloud")]
         let synced = if needs_sync {
             let cfg = state.config.read().await.cloud.clone();
@@ -107,9 +113,13 @@ pub(crate) async fn handle_connectors_catalog(
                 "visibility": e.visibility,
                 "credits_per_use": e.credits_per_use,
                 "category": e.category,
+                "starter_prompt": e.starter_prompt,
                 "installed": inst.is_some() || expert_installed,
                 "installed_version": inst.map(|s| s.version.clone()),
                 "state": inst.map(|s| serde_json::to_value(s.state).unwrap_or_default()),
+                "error": inst.and_then(|s| s.error.clone()),
+                "provides_mcp": inst.is_some_and(|s| s.provides_mcp),
+                "connected": inst.and_then(|s| s.connected),
             })
         })
         .collect();
@@ -169,6 +179,15 @@ pub(crate) async fn handle_connectors_catalog_install(
     } else {
         match manager.upgrade(&entry).await {
             Ok(summary) => {
+                // Broadcast the install so open Extensions views update
+                // without a manual refresh (same event as enable/disable).
+                super::super::connectors_ws::emit_connector_event(
+                    state,
+                    &summary.id,
+                    super::super::connectors_ws::lifecycle_state(&summary),
+                    Some(&summary),
+                )
+                .await;
                 WsResponse::ok(&req.id, serde_json::to_value(&summary).unwrap_or_default())
             }
             Err(e) => WsResponse::err(&req.id, "INTERNAL", e.to_string()),

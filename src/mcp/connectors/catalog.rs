@@ -89,6 +89,10 @@ pub struct CatalogEntry {
     /// Single-value capability category for marketplace browse/filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Optional starter prompt for experts/skills: pre-filled into the chat
+    /// composer when the entry is summoned / "tried".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter_prompt: Option<String>,
     /// Where the package archive lives.
     pub source: CatalogSource,
     /// Expected sha256 (lowercase hex) of the downloaded archive. When set,
@@ -429,9 +433,22 @@ impl CatalogCache {
         entry: &CatalogEntry,
         cache_root: &Path,
     ) -> crate::Result<PathBuf> {
+        // Only connectors ship a connector.json manifest: skills are bare
+        // SKILL.md folders and experts are SOUL.md role packages, so the
+        // marker selects what counts as the package root for each type.
+        let marker = match entry.entry_type.as_str() {
+            "skill" => "SKILL.md",
+            "expert" => "SOUL.md",
+            _ => "connector.json",
+        };
         let dest = cache_root.join(&entry.id).join(&entry.version);
-        if dest.join("connector.json").exists() {
-            return Ok(locate_package_root(&dest, "connector.json"));
+        let already_cached = match entry.entry_type.as_str() {
+            "skill" => dest.join("SKILL.md").exists(),
+            "expert" => dest.join("SOUL.md").exists() || dest.join("agents").is_dir(),
+            _ => dest.join("connector.json").exists(),
+        };
+        if already_cached {
+            return Ok(locate_package_root(&dest, marker));
         }
 
         let response = self
@@ -488,8 +505,15 @@ impl CatalogCache {
             PluginInstaller::extract_archive(&archive_path, &unpacked).await?;
             tokio::fs::remove_file(&archive_path).await.ok();
 
-            let root = locate_package_root(&unpacked, "connector.json");
-            if !root.join("connector.json").exists() {
+            // Connectors need their manifest; skill/expert packages are
+            // free-form (SKILL.md folders / SOUL.md role layouts, possibly
+            // multi-agent) — their installers validate the shape and error
+            // with a precise message, so hand the whole unpacked tree over.
+            let root = locate_package_root(&unpacked, marker);
+            if entry.entry_type != "skill"
+                && entry.entry_type != "expert"
+                && !root.join(marker).exists()
+            {
                 return Err(crate::error::SyscityError::Validation(format!(
                     "Archive for connector {} contains no connector.json",
                     entry.id
@@ -539,6 +563,7 @@ mod tests {
             visibility: "public".to_string(),
             credits_per_use: 0,
             category: None,
+            starter_prompt: None,
             source: CatalogSource {
                 kind: "tar.gz".to_string(),
                 url: format!("https://example.com/{id}-{version}.tar.gz"),
@@ -574,6 +599,35 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(sha256_hex(b"syscity").len(), 64);
+    }
+
+    #[test]
+    fn starter_prompt_parses_and_serializes_optionally() {
+        // Present → parsed.
+        let with: CatalogEntry = serde_json::from_str(
+            r#"{
+            "id": "e1", "version": "1.0.0", "type": "expert",
+            "starter_prompt": "帮我规划今天的工作",
+            "source": {"type": "tar.gz", "url": "https://example.com/e1.tgz"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(with.starter_prompt.as_deref(), Some("帮我规划今天的工作"));
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("starter_prompt"));
+
+        // Absent → None (older catalogs keep parsing); round-trips without
+        // the key (skip_serializing_if keeps the wire shape stable).
+        let without: CatalogEntry = serde_json::from_str(
+            r#"{
+            "id": "e2", "version": "1.0.0",
+            "source": {"type": "tar.gz", "url": "https://example.com/e2.tgz"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(without.starter_prompt, None);
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("starter_prompt"));
     }
 
     #[test]

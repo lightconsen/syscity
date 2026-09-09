@@ -70,6 +70,10 @@ pub struct ConnectorSummary {
     pub error: Option<String>,
     /// Whether enabling opens an MCP connection.
     pub provides_mcp: bool,
+    /// Live MCP connection state for `provides_mcp` connectors; `None` for
+    /// skills/experts and for callers that didn't probe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected: Option<bool>,
     /// Bundled skill names installed on this connector's behalf.
     pub skills: Vec<String>,
 }
@@ -224,7 +228,12 @@ impl ConnectorManager {
 
         let _guard = self.write_lock.lock().await;
         let dest = self.package_dir(&id, &version);
-        copy_dir_recursive(source_dir, &dest).await?;
+        // `upgrade()` hands us the package already living at `dest` (the
+        // catalog cache rename targeted it); copying onto itself would wipe
+        // it, so only copy genuinely external source dirs.
+        if source_dir != dest {
+            copy_dir_recursive(source_dir, &dest).await?;
+        }
 
         // Bundled-skills bridge: install every discovered SKILL.md directory
         // under a connector-prefixed flat name into the user skills directory.
@@ -291,7 +300,86 @@ impl ConnectorManager {
                 return self.enable(&id).await;
             }
         }
-        Ok(self.summary_from_parts(record, Some(&manifest)))
+        Ok(self
+            .with_live_connection(self.summary_from_parts(record, Some(&manifest)))
+            .await)
+    }
+
+    /// Install a skill-type catalog package (`type=skill`): the archive is a
+    /// bare `SKILL.md` folder (no connector.json manifest), so the folder is
+    /// copied into the package cache and every discovered skill is installed
+    /// into the user skills directory under `skill-<id>` (or
+    /// `skill-<id>-<leaf>` for multi-skill packages).
+    ///
+    /// A state record is written so catalog "installed" detection and the
+    /// update pipeline see the package; the returned summary reports
+    /// `provides_mcp: false` (no MCP server, nothing to enable).
+    async fn install_skill_package(
+        &self,
+        entry: &catalog::CatalogEntry,
+        source_dir: &Path,
+    ) -> crate::Result<ConnectorSummary> {
+        let _guard = self.write_lock.lock().await;
+        let dest = self.package_dir(&entry.id, &entry.version);
+        // Same in-place rule as `install_from_dir`: `upgrade()` passes the
+        // package root already living at `dest`.
+        if source_dir != dest {
+            copy_dir_recursive(source_dir, &dest).await?;
+        }
+
+        let discovered = discover_skill_dirs(&dest).unwrap_or_default();
+        if discovered.is_empty() {
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+            return Err(SyscityError::Validation(format!(
+                "skill package {}: no SKILL.md found",
+                entry.id
+            )));
+        }
+
+        let single = discovered.len() == 1;
+        let mut installed_skills = Vec::new();
+        for (leaf, skill_dir) in &discovered {
+            let name = if single {
+                format!("skill-{}", entry.id)
+            } else {
+                format!("skill-{}-{leaf}", entry.id)
+            };
+            match self.skill_storage.install_to_user(skill_dir, &name).await {
+                Ok(_) => installed_skills.push(name),
+                Err(e) => {
+                    rollback_skills(&self.skill_storage, &installed_skills).await;
+                    let _ = tokio::fs::remove_dir_all(&dest).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        let store = self.state_store();
+        let mut record = new_record(&entry.id, &entry.version);
+        record.skills = installed_skills.clone();
+        store
+            .update(|f| {
+                put_record(f, record);
+                Ok(())
+            })
+            .await?;
+        info!("Installed skill package {} v{}", entry.id, entry.version);
+
+        Ok(ConnectorSummary {
+            id: entry.id.clone(),
+            version: entry.version.clone(),
+            display_name: if entry.display_name.is_empty() {
+                entry.id.clone()
+            } else {
+                entry.display_name.clone()
+            },
+            description: entry.description.clone(),
+            state: StateKind::Installed,
+            error: None,
+            provides_mcp: false,
+            connected: None,
+            skills: installed_skills,
+        })
     }
 
     /// Install an expert role package (`type=expert`, §3.6): extract the
@@ -400,7 +488,9 @@ impl ConnectorManager {
                 Ok(())
             })
             .await?;
-        Ok(self.summary_from_parts(next, Some(&manifest)))
+        Ok(self
+            .with_live_connection(self.summary_from_parts(next, Some(&manifest)))
+            .await)
     }
 
     /// Disable a connector: drop its MCP connection and park it as `Disabled`.
@@ -423,7 +513,9 @@ impl ConnectorManager {
             })
             .await?;
         let manifest = self.load_manifest_for(&record).await.ok();
-        Ok(self.summary_from_parts(record, manifest.as_ref()))
+        Ok(self
+            .with_live_connection(self.summary_from_parts(record, manifest.as_ref()))
+            .await)
     }
 
     /// Remove a connector entirely: bundled skills, cached package, record.
@@ -509,7 +601,7 @@ impl ConnectorManager {
             let Some(summary) = self.summary_from_parts_opt(record, manifest.as_ref(), &id) else {
                 continue;
             };
-            out.push(summary);
+            out.push(self.with_live_connection(summary).await);
         }
         Ok(out)
     }
@@ -608,7 +700,14 @@ impl ConnectorManager {
             self.disable(&entry.id).await?;
         }
 
-        let summary = self.install_from_dir(&dest).await?;
+        // Pure skill packages (SKILL.md folder, no connector.json manifest)
+        // install straight into the user skills dir; everything else is a
+        // manifest-driven connector install.
+        let summary = if entry.entry_type == "skill" && !dest.join("connector.json").exists() {
+            self.install_skill_package(entry, &dest).await?
+        } else {
+            self.install_from_dir(&dest).await?
+        };
 
         if let Some(prev) = &previous {
             if prev.version != entry.version && prev.skills != summary.skills {
@@ -742,8 +841,18 @@ impl ConnectorManager {
             state: record.state,
             error: record.error,
             provides_mcp: manifest.as_ref().is_some_and(|m| m.provides_mcp()),
+            connected: None,
             skills: record.skills,
         }
+    }
+
+    /// Patch live MCP connection state into a summary (probes [`McpManager`]).
+    async fn with_live_connection(&self, mut s: ConnectorSummary) -> ConnectorSummary {
+        if s.provides_mcp {
+            let servers = self.mcp_manager.list_servers().await;
+            s.connected = Some(servers.contains(&s.id));
+        }
+        s
     }
 
     /// Build a summary from whichever pieces exist. Returns `None` only when
@@ -779,6 +888,7 @@ impl ConnectorManager {
             state: record.state,
             error: record.error,
             provides_mcp: manifest.as_ref().is_some_and(|m| m.provides_mcp()),
+            connected: None,
             skills: record.skills.clone(),
         })
     }
@@ -1108,6 +1218,106 @@ mod tests {
             fx.manager.auth_status("ghost").await.unwrap_err(),
             SyscityError::NotFound { .. }
         ));
+    }
+
+    /// A skill-type catalog entry (bare SKILL.md package, no connector.json)
+    /// upgrades into the user skills dir and records an installed state.
+    #[tokio::test]
+    async fn upgrade_installs_skill_package() {
+        let fx = fixture().await;
+        // Pre-place the package where `install_entry`'s fast path finds it:
+        // cache/<id>/<version>/SKILL.md (no download happens in this test).
+        let dest = fx.root.join("cache/brand-skill/1.0.0");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(
+            dest.join("SKILL.md"),
+            "---\nname: brand\ndescription: brand guidelines\n---\n# brand\n",
+        )
+        .unwrap();
+
+        let entry = catalog::CatalogEntry {
+            id: "brand-skill".to_string(),
+            version: "1.0.0".to_string(),
+            display_name: "Brand Skill".to_string(),
+            description: "fixture".to_string(),
+            icon: None,
+            entry_type: "skill".to_string(),
+            kind: "byoa".to_string(),
+            visibility: "public".to_string(),
+            credits_per_use: 0,
+            category: None,
+            starter_prompt: None,
+            source: catalog::CatalogSource {
+                kind: "tar.gz".to_string(),
+                url: "https://example.com/brand-skill.tgz".to_string(),
+            },
+            sha256: None,
+            auto_update: false,
+        };
+
+        let summary = fx.manager.upgrade(&entry).await.unwrap();
+        assert_eq!(summary.id, "brand-skill");
+        assert_eq!(summary.state, StateKind::Installed);
+        assert!(!summary.provides_mcp);
+        assert_eq!(summary.skills, vec!["skill-brand-skill".to_string()]);
+
+        // The skill landed in the user skills dir, and the package cache copy
+        // survived the in-place install (no copy-onto-self wipe).
+        assert!(fx.user_skills.join("skill-brand-skill/SKILL.md").exists());
+        assert!(dest.join("SKILL.md").exists());
+
+        // The state record makes catalog "installed" detection work.
+        let listed = fx.manager.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "brand-skill");
+        assert_eq!(listed[0].state, StateKind::Installed);
+    }
+
+    /// A connector-type upgrade whose package already lives in the cache dir
+    /// must not wipe it (regression: copy-onto-self emptied the package).
+    #[tokio::test]
+    async fn upgrade_connector_keeps_in_place_package() {
+        let fx = fixture().await;
+        let dest = fx.root.join("cache/test-mcp/1.0.0");
+        std::fs::create_dir_all(dest.join("skills/my-usage")).unwrap();
+        std::fs::write(dest.join("connector.json"), MCP_PACKAGE_JSON.replace("{url}", &fx.mcp_url))
+            .unwrap();
+        std::fs::write(
+            dest.join("skills/my-usage/SKILL.md"),
+            "---\nname: my-usage\ndescription: usage\n---\n# usage\n",
+        )
+        .unwrap();
+
+        let entry = catalog::CatalogEntry {
+            id: "test-mcp".to_string(),
+            version: "1.0.0".to_string(),
+            display_name: "Test MCP".to_string(),
+            description: "fixture".to_string(),
+            icon: None,
+            entry_type: "connector".to_string(),
+            kind: "byoa".to_string(),
+            visibility: "public".to_string(),
+            credits_per_use: 0,
+            category: None,
+            starter_prompt: None,
+            source: catalog::CatalogSource {
+                kind: "tar.gz".to_string(),
+                url: "https://example.com/test-mcp.tgz".to_string(),
+            },
+            sha256: None,
+            auto_update: false,
+        };
+
+        let summary = fx.manager.upgrade(&entry).await.unwrap();
+        assert_eq!(summary.id, "test-mcp");
+        assert_eq!(summary.state, StateKind::Installed);
+        assert!(summary.provides_mcp);
+        // Package contents survived; bundled skill installed.
+        assert!(dest.join("connector.json").exists());
+        assert!(fx
+            .user_skills
+            .join("connector-test-mcp-my-usage/SKILL.md")
+            .exists());
     }
 
     #[tokio::test]
