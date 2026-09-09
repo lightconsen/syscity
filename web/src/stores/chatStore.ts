@@ -77,6 +77,9 @@ interface ChatState {
   /** Agent summoned from the sidebar while the New Session welcome page is
    *  showing — the session itself is created lazily on the first message. */
   pendingAgent: { id: string; display_name: string; emoji: string } | null;
+  /** One-shot composer prefill (expert starter prompt / skill "try it"):
+   *  consumed by the composer on the next render, then cleared. */
+  pendingDraft: string | null;
 
   setMessages: (messages: ChatMessage[]) => void;
   prependMessages: (messages: ChatMessage[]) => void;
@@ -106,6 +109,7 @@ interface ChatState {
   setWorkspacePanelOpen: (open: boolean) => void;
   setKbPanelOpen: (open: boolean) => void;
   setPendingAgent: (agent: { id: string; display_name: string; emoji: string } | null) => void;
+  setPendingDraft: (draft: string | null) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -124,6 +128,7 @@ export const useChatStore = create<ChatState>((set) => ({
   workspacePanelOpen: false,
   kbPanelOpen: false,
   pendingAgent: null,
+  pendingDraft: null,
 
   setMessages: (messages) => set({ messages }),
   prependMessages: (messages) => set((s) => ({ messages: [...messages, ...s.messages] })),
@@ -169,4 +174,5 @@ export const useChatStore = create<ChatState>((set) => ({
     set(open ? { workspacePanelOpen: true, previewDocument: null } : { workspacePanelOpen: false }),
   setKbPanelOpen: (open) => set({ kbPanelOpen: open }),
   setPendingAgent: (pendingAgent) => set({ pendingAgent }),
+  setPendingDraft: (pendingDraft) => set({ pendingDraft }),
 }));

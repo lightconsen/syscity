@@ -1946,7 +1946,7 @@ export interface SyscityWebSocketTransport {
   emptyEvalDashboard(): EvalDashboardPayload;
   getFeedbackOps(): Promise<FeedbackOpsPayload>;
   emptyFeedbackOps(): FeedbackOpsPayload;
-  getConnectorsCatalog(lang?: string): Promise<unknown>;
+  getConnectorsCatalog(lang?: string, refresh?: boolean): Promise<unknown>;
   listMcpPresets(): Promise< Array<{ name: string; display_name: string; description: string; logo_url?: string; command?: string; args: string[]; url?: string; transport: string; enabled: boolean; auth_type?: string; client_id?: string; auth_url?: string; token_url?: string; scopes?: string; env: Array<{ name: string; required: boolean; description?: string }>; }> >;
   listMcpServers(): Promise<{ servers: Array<{ id: string; transport: string; command?: string; args: string[]; url?: string; auto_connect: boolean; connected: boolean; env_configured?: boolean; }>; }>;
   addMcpServer(payload: { id: string; transport: string; command?: string; args?: string[]; url?: string; auth_type?: string; client_id?: string; auth_url?: string; token_url?: string; scopes?: string; auto_connect?: boolean; env?: Record<string, string>; }): Promise<{ ok: boolean; error?: string }>;

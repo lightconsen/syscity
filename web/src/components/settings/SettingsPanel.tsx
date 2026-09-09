@@ -23,9 +23,21 @@ interface SettingsPanelProps {
   onClose: () => void;
   /** Tab to open on (e.g. "marketplace" when launched from the sidebar). */
   initialTab?: string;
+  /** Marketplace expert summon: open a session bound to the agent
+   *  (with an optional starter prompt). */
+  onSummonExpert?: (agentId: string, starterPrompt?: string) => void;
+  /** Marketplace skill follow-up: open a fresh welcome page with a
+   *  pre-filled composer. */
+  onNewSessionWithDraft?: (draft: string) => void;
 }
 
-export function SettingsPanel({ transport, onClose, initialTab = "general" }: SettingsPanelProps) {
+export function SettingsPanel({
+  transport,
+  onClose,
+  initialTab = "general",
+  onSummonExpert,
+  onNewSessionWithDraft,
+}: SettingsPanelProps) {
   const { t } = useTranslation("settings");
   const d = useSettingsData(transport, initialTab);
 
@@ -122,7 +134,12 @@ export function SettingsPanel({ transport, onClose, initialTab = "general" }: Se
                 onRefreshMcp={d.refreshMcp}
               />
             )}
-            {d.activeTab === "marketplace" && <MarketplaceSettings />}
+            {d.activeTab === "marketplace" && (
+              <MarketplaceSettings
+                onSummonExpert={onSummonExpert}
+                onNewSessionWithDraft={onNewSessionWithDraft}
+              />
+            )}
             {d.activeTab === "skills" && (
               <SkillsSettings transport={transport} skills={d.skills} onRefresh={d.refreshSkills} />
             )}

@@ -27,6 +27,7 @@ import { CloudEnabledBanner } from "@/components/update/CloudEnabledBanner";
 import { LowBalanceBanner } from "@/components/update/LowBalanceBanner";
 import { ExtensionsView } from "@/components/marketplace/ExtensionsView";
 import { KnowledgeBaseView } from "@/components/kb/KnowledgeBaseView";
+import { Toaster } from "@/components/ui/Toast";
 import { AskModal, type AskPrompt } from "@/components/ask/AskModal";
 import { ApprovalModal } from "@/components/approval/ApprovalModal";
 import type { ApprovalPrompt } from "@/components/approval/ApprovalModal";
@@ -112,6 +113,7 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
       // the summon that was just set.
       if (msgs.length === 0 && prev.length > 0) {
         useChatStore.getState().setPendingAgent(null);
+        useChatStore.getState().setPendingDraft(null);
       }
     });
     return () => {
@@ -597,11 +599,12 @@ function ChatApp() {
     // anything. The real session is created lazily on the first message sent
     // from the welcome page (transport.run() consumes the pending flag).
     useChatStore.getState().setPendingAgent(null);
+    useChatStore.getState().setPendingDraft(null);
     transport.armNewSession();
   }, [transport]);
 
   const handleCreateSessionWithAgent = useCallback(
-    async (agentId: string) => {
+    async (agentId: string, starterPrompt?: string) => {
       setSettingsOpen(false);
       setMarketplaceOpen(false);
       setKbOpen(false);
@@ -611,6 +614,7 @@ function ChatApp() {
       const existing = sessions.find((s) => s.agent_id === agentId);
       if (existing) {
         useChatStore.getState().setPendingAgent(null);
+        useChatStore.getState().setPendingDraft(null);
         transport.switchSession(existing.id);
         const { messages: history, hasMore } = await transport.loadHistory(existing.id);
         transport.setMessages(history);
@@ -633,9 +637,27 @@ function ChatApp() {
           ? { id: agent.id, display_name: agent.display_name, emoji: agent.emoji }
           : { id: agentId, display_name: agentId, emoji: "🤖" }
       );
+      // Starter prompt pre-fills the welcome page's composer (consumed
+      // once by ChatContent). Set after armNewSession for the same reason.
+      useChatStore.getState().setPendingDraft(starterPrompt ?? null);
       setSessionKey((k) => k + 1);
     },
     [transport, refreshSessions, sessions, agents]
+  );
+
+  /** Navigate to a fresh welcome page with a pre-filled composer (skill
+   *  "去试试" follow-up from the marketplace toasts). */
+  const handleNewSessionWithDraft = useCallback(
+    (draft: string) => {
+      setSettingsOpen(false);
+      setMarketplaceOpen(false);
+      setKbOpen(false);
+      useChatStore.getState().setPendingAgent(null);
+      transport.armNewSession();
+      useChatStore.getState().setPendingDraft(draft);
+      setSessionKey((k) => k + 1);
+    },
+    [transport]
   );
 
   const handleSwitchSession = useCallback(
@@ -645,6 +667,7 @@ function ChatApp() {
       setKbOpen(false);
       // Navigating away from the welcome page consumes any pending summon.
       useChatStore.getState().setPendingAgent(null);
+      useChatStore.getState().setPendingDraft(null);
       const currentId = transport.getSessionId();
       if (currentId !== id) {
         // Save current session's in-memory messages before switching
@@ -722,6 +745,7 @@ function ChatApp() {
     // been consumed (first send created the real session).
     if (!transport.isPendingNewSession()) {
       useChatStore.getState().setPendingAgent(null);
+      useChatStore.getState().setPendingDraft(null);
     }
   }, [sessionItems, transport]);
 
@@ -898,6 +922,7 @@ function ChatApp() {
           <ExtensionsView
             initialType={marketplaceType}
             onSummonExpert={handleCreateSessionWithAgent}
+            onNewSessionWithDraft={handleNewSessionWithDraft}
           />
         ) : settingsOpen ? (
           <SettingsPanel
@@ -905,6 +930,8 @@ function ChatApp() {
             transport={transport}
             initialTab={settingsTab}
             onClose={() => setSettingsOpen(false)}
+            onSummonExpert={handleCreateSessionWithAgent}
+            onNewSessionWithDraft={handleNewSessionWithDraft}
           />
         ) : (previewDocument || workspacePanelOpen) && !isMobile ? (
           <div
@@ -1016,6 +1043,9 @@ function ChatApp() {
           onDismiss={handleApprovalDismiss}
         />
       )}
+
+      {/* App-global toasts (marketplace install actions, connector events). */}
+      <Toaster />
     </div>
   );
 }

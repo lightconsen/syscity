@@ -57,6 +57,7 @@
   "MarketplaceSettings.refresh": "刷新",
   "MarketplaceSettings.noConnection": "未连接到网关",
   "MarketplaceSettings.filterAll": "全部",
+  "MarketplaceSettings.searchPlaceholder": "搜索扩展…",
   "MarketplaceSettings.typeConnector": "连接器",
   "MarketplaceSettings.typeSkill": "技能",
   "MarketplaceSettings.typeExpert": "专家",
@@ -72,6 +73,18 @@
   "MarketplaceSettings.installed": "已安装",
   "MarketplaceSettings.update": "更新",
   "MarketplaceSettings.install": "安装",
+  "MarketplaceSettings.add": "添加",
+  "MarketplaceSettings.close": "关闭",
   "MarketplaceSettings.enable": "启用",
-  "MarketplaceSettings.disable": "停用"
+  "MarketplaceSettings.disable": "停用",
+  "MarketplaceSettings.skillInstalled": "技能「{{name}}」已安装",
+  "MarketplaceSettings.tryIt": "去试试",
+  "MarketplaceSettings.trySkillPrompt": "我刚安装了「{{name}}」技能，请介绍它能做什么，并带我跑一个示例。",
+  "MarketplaceSettings.connecting": "连接中…",
+  "MarketplaceSettings.stateConnected": "已连接",
+  "MarketplaceSettings.stateDisconnected": "未连接",
+  "MarketplaceSettings.stateDisabled": "已停用",
+  "MarketplaceSettings.stateError": "错误",
+  "MarketplaceSettings.connectedToast": "{{name}} 已连接",
+  "MarketplaceSettings.connectFailedToast": "{{name}} 连接失败"
 }

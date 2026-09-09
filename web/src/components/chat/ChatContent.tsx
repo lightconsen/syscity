@@ -28,6 +28,17 @@ export function ChatContent({ transport }: ChatContentProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composer = useComposerRuntime();
+  const pendingDraft = useChatStore((s) => s.pendingDraft);
+  const setPendingDraft = useChatStore((s) => s.setPendingDraft);
+
+  /* ── One-shot composer prefill (expert starter prompt / skill "try it") ── */
+  useEffect(() => {
+    if (pendingDraft === null) return;
+    composer.setText(pendingDraft);
+    setPendingDraft(null);
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }, [pendingDraft, composer, setPendingDraft]);
+
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [paletteCommands, setPaletteCommands] = useState<CommandDef[]>([]);

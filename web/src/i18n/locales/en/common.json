@@ -57,6 +57,7 @@
   "MarketplaceSettings.refresh": "Refresh",
   "MarketplaceSettings.noConnection": "No gateway connection",
   "MarketplaceSettings.filterAll": "All",
+  "MarketplaceSettings.searchPlaceholder": "Search extensions...",
   "MarketplaceSettings.typeConnector": "Connectors",
   "MarketplaceSettings.typeSkill": "Skills",
   "MarketplaceSettings.typeExpert": "Experts",
@@ -72,6 +73,18 @@
   "MarketplaceSettings.installed": "Installed",
   "MarketplaceSettings.update": "Update",
   "MarketplaceSettings.install": "Install",
+  "MarketplaceSettings.add": "Add",
+  "MarketplaceSettings.close": "Close",
   "MarketplaceSettings.enable": "Enable",
-  "MarketplaceSettings.disable": "Disable"
+  "MarketplaceSettings.disable": "Disable",
+  "MarketplaceSettings.skillInstalled": "Skill \"{{name}}\" installed",
+  "MarketplaceSettings.tryIt": "Try it",
+  "MarketplaceSettings.trySkillPrompt": "I just installed the \"{{name}}\" skill. Show me what it can do and walk me through a first example.",
+  "MarketplaceSettings.connecting": "Connecting…",
+  "MarketplaceSettings.stateConnected": "Connected",
+  "MarketplaceSettings.stateDisconnected": "Not connected",
+  "MarketplaceSettings.stateDisabled": "Disabled",
+  "MarketplaceSettings.stateError": "Error",
+  "MarketplaceSettings.connectedToast": "{{name}} connected",
+  "MarketplaceSettings.connectFailedToast": "Failed to connect {{name}}"
 }
