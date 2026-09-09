@@ -11,6 +11,31 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-09
+
+### Added
+- Added full English/Chinese localization across the web UI — chat, settings, Knowledge Base, Workspace, onboarding, ask/approval, updates, and Extensions — plus a settings language switcher.
+- Added cloud credit controls: account popover with balance badge, daily check-in, one-time signup bonus, invite code redemption, purchasable packs, and recent ledger. A low-balance banner now appears when credit is running out.
+- Added usage and credit reporting to completed chat turns when the provider supplies it, and cloud credit exhaustion now surfaces as an `insufficient_credits` error.
+- Added per-model credit multiplier labels in the model picker and a cloud-first model selector with vendor logos.
+- Added skill and expert package installation from the marketplace, with toast feedback, starter prompt prefill, and live installed/connected/error state.
+- Added in-memory SWR caches for the Extensions catalog and Knowledge Base pages.
+
+### Changed
+- The web accent palette switched to Syscity indigo.
+- Marketplace catalog language now follows the active UI language; switching languages re-syncs instead of serving stale mixed translations.
+- Model router provider selection is deterministic across restarts and prefers direct non-cloud providers for duplicated model IDs.
+- The model router now honors each provider's configured default model for calls that do not specify a model.
+- Multi-query retrieval can be pinned to a specific provider/model and now falls back to the original query when expansion fails.
+
+### Fixed
+- Fixed `/sw.js` returning HTTP 500.
+- Fixed cached-but-empty marketplace catalogs being served indefinitely; they now self-heal on the next fetch.
+- Fixed in-place marketplace upgrades wiping already-cached package contents.
+- Fixed failed health probes from extending circuit breaker cooldown and locking providers out after the cooldown expired.
+- Fixed collection-filtered sqlite-vec KNN search by using a subquery.
+- Fixed cloud provider requests being sent without the `/v1` prefix, which caused 404s and circuit breaker trips.
+
 ## [0.3.2] - 2026-09-07
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "syscity-desktop"
-version = "0.3.2"
+version = "0.3.3"
 description = "Syscity Desktop App"
 authors = ["Syscity Contributors"]
 license = "Apache-2.0"
