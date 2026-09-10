@@ -146,12 +146,26 @@ export function ChatContent({ transport }: ChatContentProps) {
     }
   }, [messages]);
 
+  // While > 0 (a timestamp deadline), a programmatic bottom navigation is
+  // still settling: re-align on every virtualizer change so late item
+  // measurements can't leave the view short of the true bottom.
+  const stickUntilRef = useRef(0);
+
   const virtualizer = useVirtualizer({
     count: messages.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 120,
     measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 5,
+    onChange: (instance) => {
+      if (
+        stickUntilRef.current > 0 &&
+        performance.now() < stickUntilRef.current &&
+        instance.options.count > 0
+      ) {
+        instance.scrollToIndex(instance.options.count - 1, { align: "end" });
+      }
+    },
   });
 
   // Sync run state into store
@@ -161,17 +175,28 @@ export function ChatContent({ transport }: ChatContentProps) {
     });
   }, [transport]);
 
-  // Auto-scroll to bottom when new messages arrive (but not when prepending history)
+  const scrollToBottom = useCallback(() => {
+    if (messages.length === 0) return;
+    // Arm the settle window: late item measurements right after the jump are
+    // re-aligned by the virtualizer's onChange loop (stickUntilRef above).
+    stickUntilRef.current = performance.now() + 500;
+    virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
+  }, [messages.length, virtualizer]);
+
+  // Auto-scroll to bottom when new messages arrive (but not when prepending
+  // history — a prepend leaves the last message unchanged).
   const prevMessagesLengthRef = useRef(messages.length);
+  const prevLastIdRef = useRef(messages[messages.length - 1]?.id ?? null);
   useEffect(() => {
     const prevLength = prevMessagesLengthRef.current;
+    const prevLastId = prevLastIdRef.current;
     prevMessagesLengthRef.current = messages.length;
-    if (messages.length > prevLength) {
-      requestAnimationFrame(() => {
-        virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
-      });
+    const lastId = messages[messages.length - 1]?.id ?? null;
+    prevLastIdRef.current = lastId;
+    if (messages.length > prevLength && lastId !== prevLastId) {
+      requestAnimationFrame(() => scrollToBottom());
     }
-  }, [messages.length, virtualizer]);
+  }, [messages.length, messages, scrollToBottom]);
 
   const [showScrollButton, setShowScrollButton] = useState(false);
 
@@ -190,11 +215,6 @@ export function ChatContent({ transport }: ChatContentProps) {
     return () => el.removeEventListener("scroll", checkScroll);
   }, [messages]);
 
-  const scrollToBottom = useCallback(() => {
-    if (messages.length > 0) {
-      virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
-    }
-  }, [messages.length, virtualizer]);
   const isLoadingHistoryRef = useRef(isLoadingHistory);
   useEffect(() => {
     isLoadingHistoryRef.current = isLoadingHistory;
