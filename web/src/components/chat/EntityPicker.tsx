@@ -80,15 +80,19 @@ function PickerRow({
 
 type TabId = Extract<ChipKind, "agent" | "skill" | "connector">;
 
-/** Composer "+" picker: attach expert / skill / connector chips to the next
- *  message. Chips are UI references only — consumed by the transport at send
- *  time (skills/agents become `mentions`; connectors are enabled pre-send).
+/** Composer "+" picker: attach skill / connector chips (and, on the default
+ *  agent, expert chips) to the next message. Chips are UI references only —
+ *  consumed by the transport at send time (skills/agents become `mentions`;
+ *  connectors are enabled pre-send). Sessions already bound to a specific
+ *  agent hide the Experts tab: that agent answers directly, and delegating
+ *  to another expert from inside its session is not offered.
  *  Tabbed layout: Experts is single-select with a search box (attaching one
  *  expert replaces the previous); Skills/Connectors are multi-select.
  *  Clicking an attached row toggles it off; the panel closes on Escape /
  *  outside pointerdown. */
 export function EntityPicker({ transport }: EntityPickerProps) {
   const { t } = useTranslation("chat");
+  const boundAgentId = useChatStore((s) => s.currentAgent?.id);
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<TabId>("agent");
   const [query, setQuery] = useState("");
@@ -184,6 +188,15 @@ export function EntityPicker({ transport }: EntityPickerProps) {
     }
   }, [open]);
 
+  // Sessions bound to a specific agent don't offer expert delegation.
+  const expertsEnabled = !boundAgentId;
+
+  // Keep the active tab valid when the Experts tab disappears (session with
+  // a bound agent) — fall back to Skills.
+  useEffect(() => {
+    if (tab === "agent" && !expertsEnabled) setTab("skill");
+  }, [tab, expertsEnabled]);
+
   const isAttached = (kind: ChipKind, id: string) =>
     chips.some((c) => c.kind === kind && c.id === id);
 
@@ -250,11 +263,13 @@ export function EntityPicker({ transport }: EntityPickerProps) {
           {/* Tab bar */}
           <div className="flex border-b border-subtle">
             {(
-              [
-                ["agent", t("EntityPicker.experts")],
-                ["skill", t("EntityPicker.skills")],
-                ["connector", t("EntityPicker.connectors")],
-              ] as Array<[TabId, string]>
+              (
+                [
+                  ["agent", t("EntityPicker.experts")],
+                  ["skill", t("EntityPicker.skills")],
+                  ["connector", t("EntityPicker.connectors")],
+                ] as Array<[TabId, string]>
+              ).filter(([id]) => id !== "agent" || expertsEnabled)
             ).map(([id, label]) => (
               <button
                 key={id}
@@ -308,8 +323,8 @@ export function EntityPicker({ transport }: EntityPickerProps) {
           )}
 
           <div className="max-h-72 overflow-y-auto py-1">
-            {/* Experts: single-select + search filter */}
-            {tab === "agent" && (
+            {/* Experts: single-select + search filter (default-agent sessions only) */}
+            {tab === "agent" && expertsEnabled && (
               <>
                 {agentsOk && agents.length === 0 && (
                   <div className="px-3 py-1.5 text-xs text-secondary/70">
