@@ -479,11 +479,9 @@ export function MarketplaceSettings({
                       <button
                         onClick={() => summon(e)}
                         disabled={busy}
-                        className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition ${
-                          e.installed
-                            ? "bg-sidebar text-secondary hover:bg-black/5 dark:hover:bg-white/5"
-                            : "bg-primary-500 hover:bg-primary-600 text-white"
-                        } ${busy ? "opacity-50" : ""}`}
+                        className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition bg-primary-500 hover:bg-primary-600 text-white ${
+                          busy ? "opacity-50" : ""
+                        }`}
                       >
                         {busy ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />}
                         {t("MarketplaceSettings.summon")}
