@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 use crate::cloud::config::CloudConfig;
 use crate::error::{Result, SyscityError};
+use crate::secrets::SecretStoreHandle;
 
 /// Thin HTTP client for the cloud API. Built per-operation with a session
 /// token; callers are gated by `cloud.enabled` + logged-in before use.
@@ -12,6 +13,8 @@ pub struct CloudClient {
     http: reqwest::Client,
     api_base: String,
     token: String,
+    /// Secret-store handle, used to forget an expired/revoked session token.
+    secrets: std::sync::Arc<SecretStoreHandle>,
 }
 
 /// One document in a cloud KB backup (metadata only — bytes come via
@@ -34,7 +37,11 @@ pub struct KbDownload {
 }
 
 impl CloudClient {
-    pub fn new(cfg: &CloudConfig, token: String) -> Self {
+    pub fn new(
+        cfg: &CloudConfig,
+        token: String,
+        secrets: std::sync::Arc<SecretStoreHandle>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -42,6 +49,7 @@ impl CloudClient {
             http,
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             token,
+            secrets,
         }
     }
 
@@ -56,7 +64,7 @@ impl CloudClient {
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             // Expired or revoked session — forget the token so the UI flips
             // back to "Sign in" instead of reporting a dead signed-in state.
-            let _ = crate::cloud::session::clear_token().await;
+            let _ = crate::cloud::session::clear_token(&self.secrets).await;
             return Ok(None);
         }
         if !resp.status().is_success() {
@@ -190,7 +198,7 @@ impl CloudClient {
         let status = resp.status();
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                let _ = crate::cloud::session::clear_token().await;
+                let _ = crate::cloud::session::clear_token(&self.secrets).await;
             }
             let text = resp.text().await?;
             return Err(SyscityError::Internal(format!(
@@ -258,7 +266,7 @@ impl CloudClient {
         let status = resp.status();
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                let _ = crate::cloud::session::clear_token().await;
+                let _ = crate::cloud::session::clear_token(&self.secrets).await;
             }
             let text = resp.text().await.unwrap_or_default();
             return Err(SyscityError::Internal(format!(
@@ -287,7 +295,7 @@ impl CloudClient {
         let status = resp.status();
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                let _ = crate::cloud::session::clear_token().await;
+                let _ = crate::cloud::session::clear_token(&self.secrets).await;
             }
             let text = resp.text().await.unwrap_or_default();
             return Err(SyscityError::Internal(format!(
@@ -307,7 +315,7 @@ impl CloudClient {
         let text = resp.text().await?;
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                let _ = crate::cloud::session::clear_token().await;
+                let _ = crate::cloud::session::clear_token(&self.secrets).await;
             }
             return Err(SyscityError::Internal(format!("cloud {what} status {status}: {text}")));
         }

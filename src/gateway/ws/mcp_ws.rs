@@ -7,7 +7,7 @@ pub(super) async fn handle_mcp_list(req: &WsRequest, state: &Arc<GatewayState>) 
     let mut servers: Vec<serde_json::Value> = Vec::new();
     for (id, cfg) in config_guard.mcp.servers.iter() {
         // Only a boolean — never the stored token values.
-        let env_configured = crate::secrets::route_store("mcp-env").has_entity(id).await;
+        let env_configured = state.secrets.route("mcp-env").has_entity(id).await;
         servers.push(serde_json::json!({
             "id": id,
             "transport": match cfg.transport {
@@ -231,7 +231,9 @@ pub(super) async fn handle_mcp_add(req: &WsRequest, state: &Arc<GatewayState>) -
             .await
         {
             Ok(tools) => {
-                if let Err(e) = crate::secrets::route_store("mcp-env")
+                if let Err(e) = state
+                    .secrets
+                    .route("mcp-env")
                     .set_all(&payload.id, &env_literals)
                     .await
                 {
@@ -282,7 +284,9 @@ pub(super) async fn handle_mcp_add(req: &WsRequest, state: &Arc<GatewayState>) -
     if has_env {
         // No synchronous connect to validate against (auto_connect off or
         // oauth) — persist the tokens so they are not dropped.
-        if let Err(e) = crate::secrets::route_store("mcp-env")
+        if let Err(e) = state
+            .secrets
+            .route("mcp-env")
             .set_all(&payload.id, &env_literals)
             .await
         {
@@ -384,7 +388,9 @@ pub(super) async fn handle_mcp_remove(req: &WsRequest, state: &Arc<GatewayState>
     state.tools.mcp_manager.clear_oauth_token(&payload.id).await;
 
     // Drop any stored env tokens too.
-    if let Err(e) = crate::secrets::route_store("mcp-env")
+    if let Err(e) = state
+        .secrets
+        .route("mcp-env")
         .delete_entity(&payload.id)
         .await
     {

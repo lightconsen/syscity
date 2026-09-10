@@ -11,7 +11,7 @@ use crate::mcp::{
     token_path_for, McpClient, McpEvent, McpHealth, McpHealthStatus, McpNotification,
     McpServerConfig, McpToolDefinition, OAuthCommand, OAuthManager, OAuthManagerActor, OAuthTokens,
 };
-use crate::secrets::{route_store, SecretId};
+use crate::secrets::{SecretId, SecretStoreHandle};
 
 // ─────────────────────────────────────────────
 // McpConnectionMeta
@@ -49,6 +49,9 @@ pub struct McpManager {
     oauth: Option<OAuthManager>,
     /// Receiver half consumed when the actor is spawned in `with_event_tx`.
     oauth_cmd_rx: Option<mpsc::UnboundedReceiver<OAuthCommand>>,
+    /// Secret-store instance handle (persisted MCP env vars + OAuth refresh
+    /// tokens), shared with the gateway that owns this manager.
+    secrets: Arc<SecretStoreHandle>,
 }
 
 impl std::fmt::Debug for McpManager {
@@ -64,18 +67,21 @@ impl std::fmt::Debug for McpManager {
 
 impl Default for McpManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(SecretStoreHandle::default()))
     }
 }
 
 impl McpManager {
-    pub fn new() -> Self {
+    /// Create a manager bound to the given secret-store handle (used for
+    /// persisted MCP env vars and OAuth refresh tokens).
+    pub fn new(secrets: Arc<SecretStoreHandle>) -> Self {
         let (oauth_handle, oauth_cmd_rx) = OAuthManager::new();
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             event_tx: Arc::new(RwLock::new(None)),
             oauth: Some(oauth_handle),
             oauth_cmd_rx: Some(oauth_cmd_rx),
+            secrets,
         }
     }
 
@@ -87,8 +93,12 @@ impl McpManager {
         // Spawn the OAuth manager actor if we have the receiver.
         if let Some(cmd_rx) = self.oauth_cmd_rx.take() {
             if let Some(ref oauth) = self.oauth {
-                let actor =
-                    OAuthManagerActor::new(cmd_rx, oauth.cmd_tx.clone(), self.event_tx.clone());
+                let actor = OAuthManagerActor::new(
+                    cmd_rx,
+                    oauth.cmd_tx.clone(),
+                    self.event_tx.clone(),
+                    self.secrets.clone(),
+                );
                 actor.spawn();
             }
         }
@@ -201,12 +211,14 @@ impl McpManager {
         // Reconnect-after-restart: pull persisted tokens from the secret store
         // so the server spawns with them without the user re-entering them.
         // Inline (submitted) env wins over stored via entry().or_insert().
-        if let Ok(stored) = route_store("mcp-env").get_all(server_id).await {
+        if let Ok(stored) = self.secrets.route("mcp-env").get_all(server_id).await {
             for (k, v) in stored {
                 config.resolved_env.entry(k).or_insert(v);
             }
         }
-        let mut client = McpClient::new().with_timeout(config.timeout_secs);
+        let mut client = McpClient::new()
+            .with_timeout(config.timeout_secs)
+            .with_secrets(self.secrets.clone());
         client.connect(config.clone()).await?;
 
         let tools = client.get_tools().to_vec();
@@ -381,6 +393,7 @@ impl McpManager {
         let server_id = server_id.to_string();
         let clients = self.clients.clone();
         let event_tx = self.event_tx.clone();
+        let secrets = self.secrets.clone();
 
         tokio::spawn(async move {
             loop {
@@ -455,6 +468,7 @@ impl McpManager {
                         event_tx: event_tx.clone(),
                         oauth: None,
                         oauth_cmd_rx: None,
+                        secrets: secrets.clone(),
                     };
                     if let Err(e) = manager.reconnect_with_backoff(&server_id, config).await {
                         error!("MCP server '{}' recovery failed: {}", server_id, e);
@@ -577,7 +591,9 @@ impl McpManager {
             oauth.clear_token(server_id.to_string()).await;
         } else if let Ok(path) = token_path_for(server_id) {
             let _ = tokio::fs::remove_file(path).await;
-            let _ = route_store("mcp-oauth")
+            let _ = self
+                .secrets
+                .route("mcp-oauth")
                 .delete(&SecretId::new("mcp-oauth", server_id, "refresh_token"))
                 .await;
         }

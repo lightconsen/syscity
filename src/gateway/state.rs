@@ -46,6 +46,7 @@ use crate::outbound::{OutboundPipeline, ReplyDispatcher, SideEffectExecutor, Sse
 use crate::planner::TaskScheduler;
 use crate::plugins::PluginManager;
 use crate::providers::ProviderSdk;
+use crate::secrets::SecretStoreHandle;
 use crate::security::device_pairing::DevicePairingStore;
 use crate::security::{
     mention_gate::MentionGate, pairing::PairingStore, persistent_audit::PersistentAuditLog,
@@ -301,6 +302,13 @@ pub struct GatewayState {
     pub config_path: Option<PathBuf>,
     /// Path to the MCP presets file (~/.syscity/mcp.toml)
     pub mcps_path: Option<PathBuf>,
+
+    /// Secret-store instance handle (file backend + master key + memory cache).
+    ///
+    /// Constructed exactly once at gateway startup and threaded through the
+    /// runtime so a process can host more than one gateway (or test) without
+    /// sharing secret state. Replaces the former process-global singletons.
+    pub secrets: Arc<SecretStoreHandle>,
 
     /// Centralized registry for all gateway background tasks.
     pub task_registry: Arc<TaskRegistry>,

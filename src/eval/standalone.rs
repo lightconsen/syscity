@@ -196,7 +196,8 @@ pub async fn run_suite(
                 .and_then(|g| g.providers.get(&provider_type))
             {
                 Some(p) => {
-                    let key = p.effective_key().await;
+                    let secrets = crate::secrets::SecretStoreHandle::new();
+                    let key = p.effective_key(Some(&secrets)).await;
                     if key.is_empty() {
                         None
                     } else {

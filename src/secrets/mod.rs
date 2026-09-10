@@ -45,9 +45,8 @@ pub use mask::{
     mask_secret_container_payload,
 };
 pub use store::{
-    choose_store, persist_channel_secrets, resolve_channel_credential, resolve_oauth_client_secret,
-    resolve_secret_or_ref, resolve_store_ref, route_store, SecretId, SecretOrigin, SecretStore,
-    SecretStoreTier, SecretValue, StoreRef, SENSITIVE_CHANNEL_CREDENTIALS,
+    SecretId, SecretOrigin, SecretStore, SecretStoreHandle, SecretStoreTier, SecretValue, StoreRef,
+    SENSITIVE_CHANNEL_CREDENTIALS,
 };
 
 use std::collections::HashMap;

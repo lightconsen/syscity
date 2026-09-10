@@ -32,7 +32,7 @@ async fn test_mcp_manager_connects_to_mock_server_and_lists_tools() {
         ..Default::default()
     };
 
-    let manager = McpManager::new();
+    let manager = McpManager::default();
     let tools = timeout(Duration::from_secs(10), manager.connect("mock", config))
         .await
         .expect("timed out waiting for MCP connection")
@@ -63,7 +63,7 @@ async fn test_mcp_manager_reconnects_after_disconnect() {
         ..Default::default()
     };
 
-    let manager = McpManager::new();
+    let manager = McpManager::default();
 
     // First connect
     let tools1 = timeout(Duration::from_secs(10), manager.connect("mock", config.clone()))

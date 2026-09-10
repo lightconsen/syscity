@@ -1170,7 +1170,7 @@ async fn run_quality_gate_check(
     let provider_type = config.model_provider.clone();
     let api_key = match config.providers.get(&provider_type) {
         Some(p) => {
-            let key = p.effective_key().await;
+            let key = p.effective_key(Some(&state.secrets)).await;
             if key.is_empty() {
                 None
             } else {

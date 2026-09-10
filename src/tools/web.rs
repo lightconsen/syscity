@@ -492,6 +492,9 @@ pub struct WebSearchTool {
     /// Wrapped in Arc<RwLock<>> so hot-reload can update providers without
     /// rebuilding the entire tool registry.
     providers: std::sync::Arc<tokio::sync::RwLock<Vec<SearchProvider>>>,
+    /// Secret-store handle for the cloud search provider's session token.
+    /// `None` until wired by the gateway (`with_secrets`).
+    secrets: Option<std::sync::Arc<crate::secrets::SecretStoreHandle>>,
 }
 
 /// Search provider configuration
@@ -572,6 +575,7 @@ impl Default for WebSearchTool {
             providers: std::sync::Arc::new(tokio::sync::RwLock::new(vec![
                 SearchProvider::DuckDuckGo,
             ])),
+            secrets: None,
         }
     }
 }
@@ -607,6 +611,15 @@ impl WebSearchTool {
         providers: std::sync::Arc<tokio::sync::RwLock<Vec<SearchProvider>>>,
     ) -> Self {
         self.providers = providers;
+        self
+    }
+
+    /// Attach the secret-store handle used by the cloud search provider.
+    pub fn with_secrets(
+        mut self,
+        secrets: std::sync::Arc<crate::secrets::SecretStoreHandle>,
+    ) -> Self {
+        self.secrets = Some(secrets);
         self
     }
 }
@@ -1233,18 +1246,25 @@ impl WebSearchTool {
         query: &str,
         limit: usize,
     ) -> crate::Result<Vec<SearchResult>> {
-        let token = crate::cloud::session::get_token().await.ok_or_else(|| {
+        let secrets = self.secrets.as_ref().ok_or_else(|| {
             crate::error::SyscityError::Internal(
-                "not signed in to Syscity Cloud — web search needs a cloud session".to_string(),
+                "cloud web search is not wired to the secret store".to_string(),
             )
         })?;
+        let token = crate::cloud::session::get_token(secrets)
+            .await
+            .ok_or_else(|| {
+                crate::error::SyscityError::Internal(
+                    "not signed in to Syscity Cloud — web search needs a cloud session".to_string(),
+                )
+            })?;
         let cfg = crate::cloud::config::CloudConfig {
             enabled: true,
             api_base: api_base.to_string(),
             redirect_base: String::new(),
             console_url: String::new(),
         };
-        let resp = crate::cloud::client::CloudClient::new(&cfg, token)
+        let resp = crate::cloud::client::CloudClient::new(&cfg, token, secrets.clone())
             .search(query, limit as u32)
             .await?;
         let results = resp

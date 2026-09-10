@@ -9,12 +9,13 @@
 #[cfg(test)]
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
 use crate::cloud::client::CloudClient;
 use crate::cloud::config::CloudConfig;
-use crate::secrets::{choose_store, SecretId, SecretOrigin};
+use crate::secrets::{SecretId, SecretOrigin, SecretStoreHandle};
 
 /// Secret-store entity for the device token.
 pub const ENTITY_DEVICE_TOKEN: &str = "device_token";
@@ -55,8 +56,9 @@ pub fn local_device_id() -> String {
 }
 
 /// The stored device token, if this device was bound to the account.
-pub async fn device_token() -> Option<String> {
-    choose_store(&token_id())
+pub async fn device_token(secrets: &SecretStoreHandle) -> Option<String> {
+    secrets
+        .choose(&token_id())
         .get(&token_id())
         .await
         .ok()
@@ -64,25 +66,28 @@ pub async fn device_token() -> Option<String> {
 }
 
 /// Whether this device has been bound to the account.
-pub async fn bound() -> bool {
-    device_token().await.is_some()
+pub async fn bound(secrets: &SecretStoreHandle) -> bool {
+    device_token(secrets).await.is_some()
 }
 
 /// Register this device with the cloud account (idempotent). Requires a
 /// logged-in session; on success the returned `device_token` is persisted.
 /// Best-effort: callers log failures but do not fail the surrounding flow.
-pub async fn bind(cfg: &CloudConfig) -> crate::Result<()> {
-    let token = crate::cloud::session::get_token().await.ok_or_else(|| {
-        crate::error::SyscityError::Internal(
-            "not signed in to Syscity Cloud — cannot bind device".to_string(),
-        )
-    })?;
-    let client = CloudClient::new(cfg, token);
+pub async fn bind(cfg: &CloudConfig, secrets: Arc<SecretStoreHandle>) -> crate::Result<()> {
+    let token = crate::cloud::session::get_token(&secrets)
+        .await
+        .ok_or_else(|| {
+            crate::error::SyscityError::Internal(
+                "not signed in to Syscity Cloud — cannot bind device".to_string(),
+            )
+        })?;
+    let client = CloudClient::new(cfg, token, secrets.clone());
     let resp = client
         .bind_device(&local_device_id(), &default_display_name(), None)
         .await?;
     if let Some(device_token) = resp.get("device_token").and_then(|v| v.as_str()) {
-        choose_store(&token_id())
+        secrets
+            .choose(&token_id())
             .set(&token_id(), device_token, SecretOrigin::SystemGenerated)
             .await?;
     }

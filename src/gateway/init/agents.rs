@@ -56,6 +56,7 @@ pub async fn init_model_router(
     config: &GatewayConfig,
     task_registry: Arc<TaskRegistry>,
     shutdown_token: CancellationToken,
+    secrets: Arc<crate::secrets::SecretStoreHandle>,
 ) -> Arc<ModelRouter> {
     // The default model is a concrete model ID owned by a provider.
     let model_router_config = ModelRouterConfig {
@@ -66,7 +67,8 @@ pub async fn init_model_router(
     let model_router = Arc::new(
         ModelRouter::new(model_router_config)
             .with_task_registry(task_registry)
-            .with_shutdown_token(shutdown_token),
+            .with_shutdown_token(shutdown_token)
+            .with_secrets(secrets),
     );
     for (name, provider_config) in &config.providers {
         info!("Configuring provider: {}", name);
@@ -276,9 +278,10 @@ pub async fn init_agents(
     tool_registry: Arc<ToolRegistry>,
     task_registry: Arc<crate::gateway::task_registry::TaskRegistry>,
     shutdown_token: CancellationToken,
+    secrets: Arc<crate::secrets::SecretStoreHandle>,
 ) -> crate::Result<AgentsInit> {
     let acp = init_acp(config, session_store).await;
-    let model_router = init_model_router(config, task_registry, shutdown_token).await;
+    let model_router = init_model_router(config, task_registry, shutdown_token, secrets).await;
     let (skills_manager, agent_registry, session_manager) = init_agent_state().await?;
 
     configure_acp_agent_builder(

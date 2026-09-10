@@ -294,14 +294,19 @@ impl Gateway {
         let (routed_tx, routed_rx) = mpsc::channel(1000);
         let shutdown_token = CancellationToken::new();
 
+        // Secret-store instance handle — owns the master key, file-store root,
+        // and shared memory backend for this gateway instance. Constructed once
+        // here and threaded through the runtime (state, MCP, cloud, router).
+        let secrets = Arc::new(crate::secrets::SecretStoreHandle::new());
+
         // One-time migration of the legacy ~/.syscity/mcp_env store into
         // ~/.syscity/secrets/mcp-env (idempotent; no-op when absent), plus a
         // sweep of any old mcp_tokens sidecars still carrying plaintext token
         // fields (design §8.6).
-        if let Err(e) = crate::secrets::migrate_legacy_mcp_env().await {
+        if let Err(e) = crate::secrets::migrate_legacy_mcp_env(&secrets).await {
             warn!("Legacy mcp_env migration failed: {}", e);
         }
-        if let Err(e) = crate::mcp::migrate_legacy_mcp_tokens().await {
+        if let Err(e) = crate::mcp::migrate_legacy_mcp_tokens(&secrets).await {
             warn!("Legacy mcp_tokens migration failed: {}", e);
         }
 
@@ -345,9 +350,13 @@ impl Gateway {
         let acp = init::agents::init_acp(&config, session_store.clone()).await;
 
         let task_registry = Arc::new(crate::gateway::task_registry::TaskRegistry::new());
-        let model_router =
-            init::agents::init_model_router(&config, task_registry.clone(), shutdown_token.clone())
-                .await;
+        let model_router = init::agents::init_model_router(
+            &config,
+            task_registry.clone(),
+            shutdown_token.clone(),
+            secrets.clone(),
+        )
+        .await;
 
         let (skills_manager, agent_registry, session_manager) =
             init::agents::init_agent_state().await?;
@@ -363,6 +372,7 @@ impl Gateway {
                 device_bridge: device_bridge.clone(),
                 skills_manager: skills_manager.clone(),
                 shell_hooks: shell_hooks.clone(),
+                secrets: secrets.clone(),
             },
         )
         .await?;
@@ -402,6 +412,7 @@ impl Gateway {
             start_time: Instant::now(),
             config_path: config_path.clone(),
             mcps_path: Some(crate::dirs::config_dir().join("mcp.toml")),
+            secrets: secrets.clone(),
             task_registry: task_registry.clone(),
             shutdown_token: shutdown_token.clone(),
             auth: AuthState {

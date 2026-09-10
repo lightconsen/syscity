@@ -359,8 +359,10 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // copy always exists (the plaintext credentials map stays for backward
     // compatibility until `secrets migrate` strips it).
     for (id, channel_config) in config.channels.iter() {
-        if let Err(e) =
-            crate::secrets::persist_channel_secrets(id, &channel_config.credentials).await
+        if let Err(e) = state
+            .secrets
+            .persist_channel_secrets(id, &channel_config.credentials)
+            .await
         {
             tracing::warn!("Failed to persist channel secrets for '{}': {}", id, e);
         }

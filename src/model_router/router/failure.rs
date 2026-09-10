@@ -8,7 +8,7 @@ impl ModelRouter {
         &self,
         config: &ProviderConfig,
     ) -> crate::Result<Arc<dyn Provider + Send + Sync>> {
-        let api_key = config.effective_key().await;
+        let api_key = config.effective_key(self.secrets.as_deref()).await;
         let provider_type = config.provider_type.to_string();
 
         // Map legacy provider_type names to preset names

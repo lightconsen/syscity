@@ -108,12 +108,14 @@ pub async fn make_test_state_parts(
             .expect("skill manager"),
     ));
     let task_registry = Arc::new(crate::gateway::task_registry::TaskRegistry::new());
+    let secrets = Arc::new(crate::secrets::SecretStoreHandle::new());
 
     let state = GatewayState {
         config: Arc::new(RwLock::new(Arc::new(config))),
         start_time: std::time::Instant::now(),
         config_path: None,
         mcps_path: None,
+        secrets: secrets.clone(),
         task_registry: task_registry.clone(),
         shutdown_token: CancellationToken::new(),
         auth: AuthState {
@@ -172,16 +174,17 @@ pub async fn make_test_state_parts(
         },
         tools: ToolState {
             registry: Arc::new(ToolRegistry::new()),
-            mcp_manager: Arc::new(McpManager::new()),
+            mcp_manager: Arc::new(McpManager::new(secrets.clone())),
             connector_manager: Arc::new(crate::mcp::ConnectorManager::new(
                 std::env::temp_dir().join(format!("syscity_state_test_{}", uuid::Uuid::new_v4())),
-                Arc::new(McpManager::new()),
+                Arc::new(McpManager::new(secrets.clone())),
                 Arc::new(crate::skills::SkillStorage::with_user_dir(
                     std::env::temp_dir()
                         .join(format!("syscity_state_test_sk_{}", uuid::Uuid::new_v4())),
                 )),
                 #[cfg(feature = "cloud")]
                 None,
+                secrets.clone(),
             )),
             approval_queue: Arc::new(ApprovalQueue::new()),
             ask_queue: Arc::new(crate::tools::ask_user::AskQueue::new()),

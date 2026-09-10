@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use crate::cloud::client::CloudClient;
 use crate::cloud::config::CloudConfig;
 use crate::cloud::session::get_token;
+use crate::secrets::SecretStoreHandle;
 
 /// How long a fetched multiplier table stays fresh. Server-side changes go
 /// live when this expires, no engine restart needed.
@@ -32,7 +33,10 @@ static CACHE: LazyLock<RwLock<Option<(Instant, Multipliers)>>> =
 ///
 /// Failures never error out: a stale table keeps serving past its TTL so a
 /// transient cloud outage doesn't blank the UI.
-pub async fn credit_multipliers(cfg: &CloudConfig) -> Option<Multipliers> {
+pub async fn credit_multipliers(
+    cfg: &CloudConfig,
+    secrets: &Arc<SecretStoreHandle>,
+) -> Option<Multipliers> {
     {
         let cache = CACHE.read().await;
         if let Some((fetched_at, table)) = &*cache {
@@ -42,9 +46,9 @@ pub async fn credit_multipliers(cfg: &CloudConfig) -> Option<Multipliers> {
         }
     }
 
-    let fetched = match get_token().await {
+    let fetched = match get_token(secrets).await {
         Some(token) => {
-            let client = CloudClient::new(cfg, token);
+            let client = CloudClient::new(cfg, token, secrets.clone());
             match client.models().await {
                 Ok(v) => Some(multipliers_from_models_json(&v)),
                 Err(e) => {

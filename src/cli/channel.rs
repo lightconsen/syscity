@@ -104,9 +104,11 @@ async fn load_gateway_config() -> Option<crate::gateway::GatewayConfig> {
 /// `credentials` entries remain for backward compatibility until `secrets
 /// migrate` strips them.
 async fn save_gateway_config(config: &crate::gateway::GatewayConfig) -> Result<()> {
+    let secrets = crate::secrets::SecretStoreHandle::new();
     for (id, channel_config) in &config.channels {
-        if let Err(e) =
-            crate::secrets::persist_channel_secrets(id, &channel_config.credentials).await
+        if let Err(e) = secrets
+            .persist_channel_secrets(id, &channel_config.credentials)
+            .await
         {
             warn!("Failed to persist channel secrets for '{}': {}", id, e);
         }

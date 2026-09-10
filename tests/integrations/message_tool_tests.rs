@@ -102,6 +102,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
         start_time: std::time::Instant::now(),
         config_path: None,
         mcps_path: None,
+        secrets: Arc::new(syscity::secrets::SecretStoreHandle::new()),
         auth: syscity::gateway::state::AuthState {
             manager: Arc::new(syscity::security::AuthManager::new()),
             pairing_store: Arc::new(syscity::security::pairing::PairingStore::new()),
@@ -160,17 +161,18 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
         },
         tools: syscity::gateway::state::ToolState {
             registry: Arc::new(syscity::tools::ToolRegistry::new()),
-            mcp_manager: Arc::new(McpManager::new()),
+            mcp_manager: Arc::new(McpManager::default()),
             connector_manager: Arc::new(syscity::mcp::ConnectorManager::new(
                 std::env::temp_dir()
                     .join(format!("syscity_msg_tool_test_{}", uuid::Uuid::new_v4())),
-                Arc::new(McpManager::new()),
+                Arc::new(McpManager::default()),
                 Arc::new(syscity::skills::SkillStorage::with_user_dir(
                     std::env::temp_dir()
                         .join(format!("syscity_msg_tool_test_sk_{}", uuid::Uuid::new_v4())),
                 )),
                 #[cfg(feature = "cloud")]
                 None,
+                Arc::new(syscity::secrets::SecretStoreHandle::new()),
             )),
             approval_queue: Arc::new(syscity::tools::approval::ApprovalQueue::new()),
             ask_queue: Arc::new(syscity::tools::ask_user::AskQueue::new()),

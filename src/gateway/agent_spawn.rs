@@ -958,6 +958,8 @@ pub(crate) struct ToolRegistryArgs {
     pub skills_manager: Arc<RwLock<crate::skills::SkillManager>>,
     /// Shell-hook `ToolHooks` bundle (empty when no hooks.json configured).
     pub tool_hooks: crate::tools::hooks::ToolHooks,
+    /// Secret-store instance handle shared with the gateway (cloud tools).
+    pub secrets: Arc<crate::secrets::SecretStoreHandle>,
 }
 
 /// Create default tool registry with all built-in tools
@@ -982,6 +984,7 @@ pub(crate) async fn create_default_tool_registry(
         device_bridge,
         skills_manager,
         tool_hooks,
+        secrets,
     } = args;
 
     let mut registry = ToolRegistry::new()
@@ -1040,13 +1043,20 @@ pub(crate) async fn create_default_tool_registry(
     }
     let shared_providers = std::sync::Arc::new(tokio::sync::RwLock::new(search_providers));
     registry = registry.with_web_search_providers(shared_providers.clone());
-    registry.register(Box::new(WebSearchTool::new().with_providers_arc(shared_providers)));
+    registry.register(Box::new(
+        WebSearchTool::new()
+            .with_providers_arc(shared_providers)
+            .with_secrets(secrets.clone()),
+    ));
     registry.register(Box::new(WebFetchTool::new()));
 
     // Cloud knowledge base tool (feature `cloud`): list/query/upload cloud KBs.
     #[cfg(feature = "cloud")]
     if cloud_config.enabled {
-        registry.register(Box::new(crate::tools::cloud_kb::CloudKbTool::new(cloud_config.clone())));
+        registry.register(Box::new(crate::tools::cloud_kb::CloudKbTool::new(
+            cloud_config.clone(),
+            secrets.clone(),
+        )));
     }
 
     // Register todo tool. The tool and the registry share one TodoState so

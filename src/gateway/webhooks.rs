@@ -444,7 +444,9 @@ async fn feishu_webhook_handler(
                 .and_then(|c| c.credentials.get("webhook_secret"))
                 .cloned()
         };
-        crate::secrets::resolve_channel_credential("feishu", "webhook_secret", legacy.as_deref())
+        state
+            .secrets
+            .resolve_channel_credential("feishu", "webhook_secret", legacy.as_deref())
             .await
             .ok()
             .flatten()
@@ -567,7 +569,9 @@ async fn wechatmp_cred(state: &Arc<GatewayState>, key: &str) -> Option<String> {
             .and_then(|c| c.credentials.get(key))
             .cloned()
     };
-    crate::secrets::resolve_channel_credential("wechatmp", key, legacy.as_deref())
+    state
+        .secrets
+        .resolve_channel_credential("wechatmp", key, legacy.as_deref())
         .await
         .ok()
         .flatten()
@@ -947,12 +951,10 @@ async fn generic_webhook_handler(
 
     // Resolve webhook secret from the secret store (falling back to legacy
     // plaintext) - required for all generic webhook channels.
-    let secret = match crate::secrets::resolve_channel_credential(
-        &channel,
-        "webhook_secret",
-        legacy_secret.as_deref(),
-    )
-    .await
+    let secret = match state
+        .secrets
+        .resolve_channel_credential(&channel, "webhook_secret", legacy_secret.as_deref())
+        .await
     {
         Ok(Some(s)) if !s.is_empty() => s.into_inner(),
         _ => {
