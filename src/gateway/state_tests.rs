@@ -60,9 +60,18 @@ impl crate::outbound::OutboundPipeline for DummyOutboundPipeline {
 // ──────────────────────────────
 
 pub async fn make_test_state(config: GatewayConfig) -> GatewayState {
+    let (state, _entry_rx) = make_test_state_parts(config).await;
+    state
+}
+
+/// [`make_test_state`] variant that also returns the inbound-entry receiver,
+/// so tests can assert on the `IncomingMessage` a handler enqueued.
+pub async fn make_test_state_parts(
+    config: GatewayConfig,
+) -> (GatewayState, mpsc::Receiver<crate::channels::IncomingMessage>) {
     let (event_tx, _) = broadcast::channel(1);
     let (log_tx, _) = broadcast::channel(1);
-    let (inbound_entry_tx, _inbound_entry_rx) = mpsc::channel(1);
+    let (inbound_entry_tx, inbound_entry_rx) = mpsc::channel(1);
     let (routed_tx, _routed_rx) = mpsc::channel(1);
 
     let tmp = tempdir().expect("create temp dir");
@@ -100,7 +109,7 @@ pub async fn make_test_state(config: GatewayConfig) -> GatewayState {
     ));
     let task_registry = Arc::new(crate::gateway::task_registry::TaskRegistry::new());
 
-    GatewayState {
+    let state = GatewayState {
         config: Arc::new(RwLock::new(Arc::new(config))),
         start_time: std::time::Instant::now(),
         config_path: None,
@@ -237,7 +246,8 @@ pub async fn make_test_state(config: GatewayConfig) -> GatewayState {
         update: UpdateState::new(),
         // Tests control `embedded` explicitly; production captures the env.
         embedded: false,
-    }
+    };
+    (state, inbound_entry_rx)
 }
 
 /// Construct a test state with in-memory stores wired in.

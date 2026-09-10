@@ -178,6 +178,7 @@ pub(crate) async fn dispatch_routed_message(
                     think_level: think_level.clone(),
                     queue_mode: queue_mode.clone(),
                     channel_obs: channel_obs.clone(),
+                    mentions: routed.incoming.metadata.extra.get("mentions").cloned(),
                 },
             )
             .await;
@@ -207,6 +208,7 @@ pub(crate) async fn dispatch_routed_message(
                     think_level: think_level.clone(),
                     queue_mode: queue_mode.clone(),
                     channel_obs: channel_obs.clone(),
+                    mentions: routed.incoming.metadata.extra.get("mentions").cloned(),
                 },
             )
             .await;
@@ -293,6 +295,7 @@ pub(crate) async fn dispatch_routed_message(
                         think_level: think_level.clone(),
                         queue_mode: queue_mode.clone(),
                         channel_obs: channel_obs.clone(),
+                        mentions: routed.incoming.metadata.extra.get("mentions").cloned(),
                     },
                 )
                 .await;
@@ -311,6 +314,7 @@ pub(crate) async fn dispatch_routed_message(
                     think_level: think_level.clone(),
                     queue_mode: queue_mode.clone(),
                     channel_obs: channel_obs.clone(),
+                    mentions: routed.incoming.metadata.extra.get("mentions").cloned(),
                 },
             )
             .await;
@@ -382,6 +386,9 @@ pub(crate) async fn flush_session_buffer(
                 enriched: false,
                 route: Some(agent_id.to_string()),
             }),
+            // A debounce batch coalesces several user turns; per-turn chip
+            // attribution is meaningless here, so mentions are dropped.
+            mentions: None,
         },
     )
     .await;
@@ -437,6 +444,10 @@ pub(crate) struct AgentDispatch {
     /// Inbound channel-layer observation (debounce/enrich/route) carried into
     /// the turn for observability. `None` for non-dispatch paths.
     pub channel_obs: Option<ChannelObservation>,
+    /// Entity chips attached by the web composer (`metadata.extra["mentions"]`
+    /// of the routed message), forwarded so the engine can inject the hidden
+    /// per-turn mentions block. `None` for paths without chips.
+    pub mentions: Option<serde_json::Value>,
 }
 
 /// Resolve the effective concrete model ID for a session: the session's
@@ -479,6 +490,7 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
         think_level,
         queue_mode,
         channel_obs,
+        mentions,
     } = dispatch;
 
     // UserPromptSubmit gate: a configured shell hook can block a message
@@ -622,6 +634,16 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
             "channel_observation".to_string(),
             serde_json::to_value(obs).unwrap_or(serde_json::Value::Null),
         );
+    }
+
+    // Re-attach composer chips: this function rebuilds the IncomingMessage
+    // from bare dispatch fields, so the routed message's extra metadata would
+    // otherwise be lost here (same mechanism as channel_observation above).
+    if let Some(m) = mentions {
+        incoming_msg
+            .metadata
+            .extra
+            .insert("mentions".to_string(), m);
     }
 
     // Broadcast processing status

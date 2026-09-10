@@ -60,6 +60,19 @@ impl Agent {
         let user_id = message.user_id.0.clone();
         let content = message.content.clone();
 
+        // Composer chips (skills/agents) ride the message metadata; they are
+        // appended to the model-facing user message only (never persisted).
+        let mentions = crate::channels::mentions_from_extra(&message.metadata.extra);
+        let mentions_block = mentions
+            .as_ref()
+            .and_then(crate::channels::format_mentions_block);
+        // Mentions participate in the cache key so identical texts with
+        // different chips don't share a cached response.
+        let cache_key_content = match &mentions_block {
+            Some(block) => format!("{}\u{0}{}", content, block),
+            None => content.clone(),
+        };
+
         // ── Prompt-injection guard ────────────────────────────────────────────
         let input_scan = crate::skills::guard::scan_input(&content);
         if !input_scan.passed {
@@ -100,7 +113,7 @@ impl Agent {
         if should_cache {
             if let Some(cached) = self
                 .response_cache
-                .get(&user_id, &conversation_id, &content)
+                .get(&user_id, &conversation_id, &cache_key_content)
                 .await
             {
                 info!("Cache hit for user {} - returning cached response", user_id);
@@ -267,9 +280,13 @@ impl Agent {
 
         // Reset tool tracking and add user message for this turn.
         thread.context.clear_tools_used();
+        let model_content = match &mentions_block {
+            Some(block) => format!("{}\n\n{}", content, block),
+            None => content.clone(),
+        };
         thread
             .context
-            .add_message(Message::user_named(&user_id, &content));
+            .add_message(Message::user_named(&user_id, &model_content));
 
         // Track this turn in the turn log.
         let turn_idx = thread.push_turn(&content);
@@ -352,7 +369,7 @@ impl Agent {
                     .set(
                         &user_id,
                         &conversation_id,
-                        &content,
+                        &cache_key_content,
                         response.message.content.clone(),
                         tools_used_this_turn,
                     )
@@ -420,6 +437,19 @@ impl Agent {
         let user_id = message.user_id.0.clone();
         let content = message.content.clone();
 
+        // Composer chips (skills/agents) ride the message metadata; they are
+        // appended to the model-facing user message only (never persisted).
+        let mentions = crate::channels::mentions_from_extra(&message.metadata.extra);
+        let mentions_block = mentions
+            .as_ref()
+            .and_then(crate::channels::format_mentions_block);
+        // Mentions participate in the cache key so identical texts with
+        // different chips don't share a cached response.
+        let cache_key_content = match &mentions_block {
+            Some(block) => format!("{}\u{0}{}", content, block),
+            None => content.clone(),
+        };
+
         // Notify started
         (progress_cb)(ProgressEvent::Started).await;
 
@@ -455,7 +485,7 @@ impl Agent {
         if should_cache {
             if let Some(cached) = self
                 .response_cache
-                .get(&user_id, &conversation_id, &content)
+                .get(&user_id, &conversation_id, &cache_key_content)
                 .await
             {
                 info!("Cache hit for user {} - returning cached response", user_id);
@@ -624,9 +654,13 @@ impl Agent {
 
         // Reset tool tracking and add user message for this turn.
         thread.context.clear_tools_used();
+        let model_content = match &mentions_block {
+            Some(block) => format!("{}\n\n{}", content, block),
+            None => content.clone(),
+        };
         thread
             .context
-            .add_message(Message::user_named(&user_id, &content));
+            .add_message(Message::user_named(&user_id, &model_content));
 
         // Track this turn.
         let turn_idx = thread.push_turn(&content);
@@ -786,7 +820,7 @@ impl Agent {
                 .set(
                     &user_id,
                     &conversation_id,
-                    &content,
+                    &cache_key_content,
                     response.message.content.clone(),
                     tools_used_this_turn,
                 )

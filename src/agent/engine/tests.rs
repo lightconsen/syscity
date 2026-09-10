@@ -836,3 +836,101 @@ async fn test_flagged_turn_records_risk_signals() {
     assert!(!row.risk_signals.is_empty(), "flagged turn must carry risk signals");
     assert!(row.cache_hit, "cache_hit must round-trip");
 }
+
+/// Composer chips (mentions) must reach the model as a hidden context block
+/// appended to the user message — while the persisted transcript/turn content
+/// stays clean.
+#[tokio::test]
+async fn test_mentions_block_reaches_llm_only() {
+    use std::sync::Mutex;
+
+    use crate::channels::IncomingMessage;
+    use crate::providers::Role;
+
+    /// AlwaysOk variant that captures the user messages of every request
+    /// (a request may also carry the transient state-snapshot user message).
+    struct CaptureOk {
+        per_request_user_content: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CaptureOk {
+        fn name(&self) -> &str {
+            "capture-ok-test"
+        }
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+        fn max_context(&self) -> usize {
+            128_000
+        }
+        async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+            let users: Vec<String> = request
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .map(|m| m.content.clone())
+                .collect();
+            self.per_request_user_content.lock().unwrap().push(users);
+            Ok(CompletionResponse {
+                message: Message::assistant("ok"),
+                model: self.default_model().to_string(),
+                usage: Some(Usage::default()),
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+        async fn stream(&self, _request: CompletionRequest) -> crate::Result<CompletionStream> {
+            unimplemented!("non-streaming test");
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn set_credential(
+            &self,
+            _credential: crate::model_router::Credential,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = crate::agent::Agent::new(
+        crate::agent::AgentConfig::default(),
+        Arc::new(CaptureOk {
+            per_request_user_content: captured.clone(),
+        }),
+        Arc::new(crate::tools::ToolRegistry::new()),
+    );
+
+    // With chips: the model-facing user message carries the hidden block.
+    let mut msg = IncomingMessage::new("user", "conv-mentions", "hello");
+    msg.metadata
+        .extra
+        .insert("mentions".to_string(), serde_json::json!({"skills": ["canvas-design"]}));
+    let _ = agent.process_message(msg).await.unwrap();
+
+    let seen = captured.lock().unwrap();
+    assert_eq!(seen.len(), 1, "single LLM round expected");
+    let content = seen[0]
+        .iter()
+        .find(|c| c.contains("hello") || c.contains("attached-mentions"))
+        .expect("user message present in request");
+    assert!(content.starts_with("hello"), "original text preserved, got: {content}");
+    assert!(content.contains("<attached-mentions>"), "block appended");
+    assert!(content.contains("<skill name=\"canvas-design\" />"));
+    drop(seen);
+
+    // Without chips: content unchanged.
+    let msg = IncomingMessage::new("user", "conv-mentions-plain", "plain text");
+    let _ = agent.process_message(msg).await.unwrap();
+    let seen = captured.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[1].iter().any(|c| c == "plain text"),
+        "no block without mentions, got: {:?}",
+        seen[1]
+    );
+}

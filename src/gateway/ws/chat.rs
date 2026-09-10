@@ -15,6 +15,18 @@ pub(super) async fn handle_chat_send(
         session_id: Option<String>,
         #[serde(default)]
         agent_id: Option<String>,
+        /// Entity chips attached by the web composer: skills / agents the user
+        /// explicitly referenced on this message. Optional; old clients omit it.
+        #[serde(default)]
+        mentions: Option<MentionsParams>,
+    }
+
+    #[derive(Debug, Deserialize, serde::Serialize)]
+    struct MentionsParams {
+        #[serde(default)]
+        skills: Vec<String>,
+        #[serde(default)]
+        agents: Vec<String>,
     }
 
     let params: ChatSendParams = match parse_params(req) {
@@ -155,12 +167,23 @@ pub(super) async fn handle_chat_send(
         }
     }
 
-    let incoming =
+    let mut incoming =
         crate::channels::IncomingMessage::new(user_id.clone(), session_id.clone(), final_message)
             .with_provenance(crate::channels::InputProvenance::ExternalUser {
                 channel: "web".to_string(),
                 is_direct: true,
             });
+
+    // Attach composer chips after the smart-routing block: mentions describe
+    // the user's intent regardless of any greeting prefix stripped above.
+    if let Some(m) = params
+        .mentions
+        .filter(|m| !m.skills.is_empty() || !m.agents.is_empty())
+    {
+        if let Ok(v) = serde_json::to_value(&m) {
+            incoming.metadata.extra.insert("mentions".to_string(), v);
+        }
+    }
 
     // Submit to the unified inbound entry channel instead of calling the
     // pipeline directly. The worker drives the message through the pipeline
@@ -326,7 +349,7 @@ pub(super) async fn handle_chat_abort(
 mod tests {
     use super::*;
     use crate::gateway::state_tests::{
-        make_test_conn, make_test_state, make_test_state_with_store,
+        make_test_conn, make_test_state, make_test_state_parts, make_test_state_with_store,
     };
     use crate::gateway::GatewayConfig;
 
@@ -362,6 +385,48 @@ mod tests {
         let resp = handle_chat_send(&req("r1", params), &conn, &state).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "enqueue_failed");
+    }
+
+    #[tokio::test]
+    async fn chat_send_with_mentions_attaches_metadata() {
+        let (state, mut entry_rx) = make_test_state_parts(GatewayConfig::default()).await;
+        let state = Arc::new(state);
+        let conn = make_test_conn(&[]);
+        let params = Some(serde_json::json!({
+            "message": "hello",
+            "session_id": "s1",
+            "mentions": { "skills": ["canvas-design"], "agents": ["secretary-xiaowang"] }
+        }));
+        let resp = handle_chat_send(&req("r1", params), &conn, &state).await;
+        assert!(resp.ok, "expected ok, got {:?}", resp.error);
+
+        let incoming = entry_rx.recv().await.expect("enqueued message");
+        assert_eq!(incoming.content, "hello");
+        let mentions = incoming
+            .metadata
+            .extra
+            .get("mentions")
+            .expect("mentions key");
+        assert_eq!(mentions["skills"][0], "canvas-design");
+        assert_eq!(mentions["agents"][0], "secretary-xiaowang");
+    }
+
+    #[tokio::test]
+    async fn chat_send_without_mentions_has_no_key() {
+        let (state, mut entry_rx) = make_test_state_parts(GatewayConfig::default()).await;
+        let state = Arc::new(state);
+        let conn = make_test_conn(&[]);
+        let params = Some(serde_json::json!({ "message": "plain", "session_id": "s1" }));
+        let resp = handle_chat_send(&req("r1", params), &conn, &state).await;
+        assert!(resp.ok, "expected ok, got {:?}", resp.error);
+
+        let incoming = entry_rx.recv().await.expect("enqueued message");
+        assert_eq!(incoming.content, "plain");
+        assert!(
+            !incoming.metadata.extra.contains_key("mentions"),
+            "no mentions key expected, got {:?}",
+            incoming.metadata.extra
+        );
     }
 
     #[tokio::test]

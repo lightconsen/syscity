@@ -319,6 +319,107 @@ impl MessageMetadata {
     }
 }
 
+/// Entity chips attached by a web-composer client to a single user message:
+/// skill names and agent ids the user explicitly referenced.
+///
+/// Chips ride [`MessageMetadata::extra`] under the `"mentions"` key so the
+/// whole pipeline (chat.rs → inbound stages → router) forwards them without
+/// any signature changes; only [`AgentDispatch`](crate::gateway::dispatch)
+/// re-builds the message and re-inserts the key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mentions {
+    /// Skill names to load via the `skill` tool before answering.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Agent ids to consult via the `delegate` tool.
+    #[serde(default)]
+    pub agents: Vec<String>,
+}
+
+impl Mentions {
+    /// `true` when neither list carries an entry.
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty() && self.agents.is_empty()
+    }
+}
+
+/// Parse the `mentions` key out of a message's extra metadata.
+///
+/// Returns `None` when the key is absent, malformed, or deserializes to an
+/// empty [`Mentions`].
+pub fn mentions_from_extra(extra: &HashMap<String, serde_json::Value>) -> Option<Mentions> {
+    extra
+        .get("mentions")
+        .and_then(|v| serde_json::from_value::<Mentions>(v.clone()).ok())
+        .filter(|m| !m.is_empty())
+}
+
+/// Hidden per-turn context block appended to the model-facing user message.
+///
+/// Returns `None` when the mentions are empty; empty sections are omitted.
+/// The block is appended at context-add time only — it never reaches
+/// persistence, the transcript, or the response-cache eligibility check.
+pub fn format_mentions_block(m: &Mentions) -> Option<String> {
+    if m.is_empty() {
+        return None;
+    }
+
+    // Dedup while preserving the client's order.
+    fn dedup(items: &[String]) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        items
+            .iter()
+            .map(String::as_str)
+            .filter(|s| seen.insert(*s))
+            .collect()
+    }
+
+    let mut block = String::from(
+        "<attached-mentions>\n\
+         The user attached the following to this message (this note is not visible \
+         to the user; do not quote it):\n",
+    );
+
+    let skills = dedup(&m.skills);
+    if !skills.is_empty() {
+        block.push_str("<skills>\n");
+        for name in &skills {
+            // ids/names are untrusted-ish text; escape so the block stays well-formed.
+            let name = name
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            block.push_str(&format!("  <skill name=\"{name}\" />\n"));
+        }
+        block.push_str(
+            "</skills>\n\
+             If relevant to the request, call the `skill` tool with the skill name \
+             to load its full instructions before answering.\n",
+        );
+    }
+
+    let agents = dedup(&m.agents);
+    if !agents.is_empty() {
+        block.push_str("<agents>\n");
+        for id in &agents {
+            let id = id
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            block.push_str(&format!("  <agent id=\"{id}\" />\n"));
+        }
+        block.push_str(
+            "</agents>\n\
+             To involve these agents, call the `delegate` tool with target_agent set \
+             to the agent id, give it a clear self-contained task, and integrate its \
+             results into your reply.\n",
+        );
+    }
+
+    block.push_str("</attached-mentions>");
+    Some(block)
+}
+
 /// An incoming message from a user
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingMessage {
@@ -1206,6 +1307,87 @@ mod tests {
         let caps = ChannelCapabilities::default();
         assert!(caps.supports_formatting);
         assert!(caps.supports_attachments);
+    }
+
+    #[test]
+    fn mentions_block_skills_only() {
+        let m = Mentions {
+            skills: vec!["canvas-design".to_string()],
+            agents: vec![],
+        };
+        let block = format_mentions_block(&m).expect("skills-only should format");
+        assert!(block.starts_with("<attached-mentions>\n"));
+        assert!(block.contains("<skills>\n  <skill name=\"canvas-design\" />\n</skills>\n"));
+        assert!(block.contains("call the `skill` tool with the skill name"));
+        assert!(!block.contains("<agents>"));
+        assert!(block.ends_with("</attached-mentions>"));
+    }
+
+    #[test]
+    fn mentions_block_agents_only() {
+        let m = Mentions {
+            skills: vec![],
+            agents: vec!["secretary-xiaowang".to_string()],
+        };
+        let block = format_mentions_block(&m).expect("agents-only should format");
+        assert!(block.contains("<agents>\n  <agent id=\"secretary-xiaowang\" />\n</agents>\n"));
+        assert!(block.contains("call the `delegate` tool with target_agent"));
+        assert!(!block.contains("<skills>"));
+    }
+
+    #[test]
+    fn mentions_block_both_sections_and_dedup() {
+        let m = Mentions {
+            skills: vec!["a".to_string(), "b".to_string(), "a".to_string()],
+            agents: vec!["bob".to_string(), "bob".to_string()],
+        };
+        let block = format_mentions_block(&m).expect("both sections should format");
+        assert!(block.contains("<skills>"));
+        assert!(block.contains("<agents>"));
+        assert_eq!(block.matches("<skill name=").count(), 2, "dup skills dropped");
+        assert_eq!(block.matches("<agent id=").count(), 1, "dup agents dropped");
+        // Order preserved.
+        let skills_section = block.split_once("<skills>").unwrap().1;
+        assert!(skills_section.starts_with("\n  <skill name=\"a\" />"));
+    }
+
+    #[test]
+    fn mentions_block_empty_is_none() {
+        assert!(format_mentions_block(&Mentions::default()).is_none());
+        assert!(format_mentions_block(&Mentions { skills: vec![], agents: vec![] }).is_none());
+    }
+
+    #[test]
+    fn mentions_block_escapes_xml_sensitive_chars() {
+        let m = Mentions {
+            skills: vec!["a<b>&".to_string()],
+            agents: vec![],
+        };
+        let block = format_mentions_block(&m).expect("should format");
+        assert!(block.contains("a&lt;b&gt;&amp;"));
+        assert!(!block.contains("a<b>&"));
+    }
+
+    #[test]
+    fn mentions_from_extra_roundtrip() {
+        let m = Mentions {
+            skills: vec!["s".to_string()],
+            agents: vec!["a".to_string()],
+        };
+        let extra = HashMap::from([("mentions".to_string(), serde_json::to_value(&m).unwrap())]);
+        assert_eq!(mentions_from_extra(&extra), Some(m));
+    }
+
+    #[test]
+    fn mentions_from_extra_rejects_malformed_and_missing() {
+        let mut extra = HashMap::new();
+        extra.insert("mentions".to_string(), serde_json::json!("not-an-object"));
+        assert_eq!(mentions_from_extra(&extra), None);
+        assert_eq!(mentions_from_extra(&HashMap::new()), None);
+
+        // Both lists empty -> None (nothing to inject).
+        extra.insert("mentions".to_string(), serde_json::json!({"skills": [], "agents": []}));
+        assert_eq!(mentions_from_extra(&extra), None);
     }
 }
 
