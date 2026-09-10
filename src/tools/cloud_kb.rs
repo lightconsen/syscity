@@ -15,20 +15,24 @@ use crate::tools::types::{Tool, ToolContext, ToolExecutionResult};
 /// Tool that talks to the Syscity Cloud knowledge base API.
 pub struct CloudKbTool {
     cfg: CloudConfig,
+    secrets: std::sync::Arc<crate::secrets::SecretStoreHandle>,
 }
 
 impl CloudKbTool {
-    pub fn new(cfg: CloudConfig) -> Self {
-        Self { cfg }
+    pub fn new(
+        cfg: CloudConfig,
+        secrets: std::sync::Arc<crate::secrets::SecretStoreHandle>,
+    ) -> Self {
+        Self { cfg, secrets }
     }
 
     async fn client(&self) -> crate::Result<CloudClient> {
-        let token = session::get_token().await.ok_or_else(|| {
+        let token = session::get_token(&self.secrets).await.ok_or_else(|| {
             SyscityError::Internal(
                 "not signed in to Syscity Cloud — knowledge base needs a cloud session".to_string(),
             )
         })?;
-        Ok(CloudClient::new(&self.cfg, token))
+        Ok(CloudClient::new(&self.cfg, token, self.secrets.clone()))
     }
 }
 

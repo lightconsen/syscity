@@ -65,13 +65,14 @@ async fn cloud_status_json(state: &GatewayState) -> serde_json::Value {
         if !cfg.enabled {
             return serde_json::json!({ "enabled": false, "logged_in": false, "user": null });
         }
-        let logged_in = crate::cloud::session::logged_in().await;
+        let logged_in = crate::cloud::session::logged_in(&state.secrets).await;
         let mut user = None;
         if logged_in {
-            if let Some(token) = crate::cloud::session::get_token().await {
-                if let Ok(Some(v)) = crate::cloud::client::CloudClient::new(&cfg, token)
-                    .me()
-                    .await
+            if let Some(token) = crate::cloud::session::get_token(&state.secrets).await {
+                if let Ok(Some(v)) =
+                    crate::cloud::client::CloudClient::new(&cfg, token, state.secrets.clone())
+                        .me()
+                        .await
                 {
                     // /auth/me wraps the identity ({ "user": { id, name, ... } });
                     // unwrap it so the WS payload is flat — clients read

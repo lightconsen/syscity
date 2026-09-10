@@ -7,13 +7,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use zeroize::Zeroize;
 
 use crate::error::SyscityError;
-use crate::secrets::file_store::FileStore;
+use crate::secrets::file_store::{load_or_create_master_key, FileStore};
 use crate::secrets::in_memory::MemoryStore;
 #[cfg(feature = "keyring")]
 use crate::secrets::keyring_store::{probe_keyring, KeyringStore};
@@ -53,7 +55,7 @@ impl fmt::Display for SecretId {
     }
 }
 
-/// Secret origin — influences backend routing (see `choose_store`).
+/// Secret origin — influences backend routing (see [`SecretStoreHandle::choose`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretOrigin {
     /// Entered by the user (UI / config) → high-value, persistent → keyring
@@ -221,52 +223,6 @@ impl SecretStore for FallbackStore {
     }
 }
 
-/// Backend routing — picks a backend based on the secret id.
-pub fn choose_store(id: &SecretId) -> Arc<dyn SecretStore> {
-    choose_store_with(id, keyring_available())
-}
-
-/// Like `choose_store` but with an explicit keyring preference (test hook).
-pub fn choose_store_with(id: &SecretId, prefer_keyring: bool) -> Arc<dyn SecretStore> {
-    // MCP OAuth access tokens are short-lived → memory only. This is scoped to
-    // the `mcp-oauth` namespace: channel credentials may also use the
-    // `access_token` kind but are long-lived and must persist.
-    if id.namespace == "mcp-oauth" && id.kind == "access_token" {
-        return memory_store();
-    }
-    route_store_with(&id.namespace, prefer_keyring)
-}
-
-/// Namespace-level routing — every secret in a namespace shares a backend.
-pub fn route_store(namespace: &str) -> Arc<dyn SecretStore> {
-    route_store_with(namespace, keyring_available())
-}
-
-/// Like `route_store` but with an explicit keyring preference (test hook).
-///
-/// Without the `keyring` feature `prefer_keyring` is ignored and routing is
-/// always file-backed.
-#[cfg(feature = "keyring")]
-pub fn route_store_with(namespace: &str, prefer_keyring: bool) -> Arc<dyn SecretStore> {
-    if prefer_keyring {
-        Arc::new(FallbackStore {
-            primary: Arc::new(KeyringStore::new(namespace)),
-            secondary: Arc::new(FileStore::new(namespace)),
-        })
-    } else {
-        Arc::new(FileStore::new(namespace))
-    }
-}
-
-/// Like `route_store` but with an explicit keyring preference (test hook).
-///
-/// Without the `keyring` feature routing is always file-backed and the
-/// keychain is never touched.
-#[cfg(not(feature = "keyring"))]
-pub fn route_store_with(namespace: &str, _prefer_keyring: bool) -> Arc<dyn SecretStore> {
-    Arc::new(FileStore::new(namespace))
-}
-
 /// Whether the OS keyring backend is enabled and probed available.
 #[cfg(feature = "keyring")]
 fn keyring_available() -> bool {
@@ -279,17 +235,219 @@ fn keyring_available() -> bool {
     false
 }
 
-/// Shared memory-only backend for short-lived secrets (e.g. `access_token`).
-fn memory_store() -> Arc<dyn SecretStore> {
-    static STORE: OnceLock<Arc<dyn SecretStore>> = OnceLock::new();
-    STORE.get_or_init(|| Arc::new(MemoryStore::new())).clone()
+/// Instance handle owning the secret-store backends for one gateway instance.
+///
+/// Replaces the former process-global `OnceLock`s for the shared memory backend
+/// and the master key: a process may construct more than one handle (with
+/// distinct roots) and each holds isolated secrets, which also makes tests
+/// hermetic. Behaviour for the default single-instance case is unchanged — the
+/// same `~/.syscity/secrets` root, the same 0600 encrypted file store, and the
+/// same master-key source priority.
+///
+/// Construct exactly once at gateway startup and thread through
+/// [`crate::gateway::GatewayState`].
+pub struct SecretStoreHandle {
+    root: PathBuf,
+    master_key: Option<Arc<crate::secrets::file_store::MasterKey>>,
+    memory: Arc<dyn SecretStore>,
+    prefer_keyring: bool,
 }
 
-/// Resolve a store reference to its current value via backend routing.
-pub async fn resolve_store_ref(r: &StoreRef) -> crate::Result<Option<String>> {
-    let id = r.to_secret_id();
-    let store = choose_store(&id);
-    store.get(&id).await
+impl fmt::Debug for SecretStoreHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretStoreHandle")
+            .field("root", &self.root)
+            .field("master_key", &self.master_key.as_ref().map(|_| "MasterKey([REDACTED])"))
+            .field("prefer_keyring", &self.prefer_keyring)
+            .finish()
+    }
+}
+
+impl SecretStoreHandle {
+    /// Production handle at the default root (`~/.syscity/secrets`), loading (or
+    /// creating) the master key once from the OS keyring or the 0600 file.
+    ///
+    /// Under `cfg(test)` the key is left unset so the unit-test binary never
+    /// touches the real home directory or keychain; use [`Self::with_root`] for
+    /// hermetic tests that need encryption.
+    pub fn new() -> Self {
+        let root = crate::secrets::secrets_root_dir();
+        #[cfg(not(test))]
+        let prefer_keyring = keyring_available();
+        #[cfg(test)]
+        let prefer_keyring = false;
+
+        #[cfg(not(test))]
+        let master_key = match load_or_create_master_key(&root, prefer_keyring) {
+            Ok(key) => key.map(Arc::new),
+            Err(e) => {
+                warn!("Cannot load master key; secrets stored unencrypted: {e}");
+                None
+            }
+        };
+        #[cfg(test)]
+        let master_key: Option<Arc<crate::secrets::file_store::MasterKey>> = None;
+
+        Self {
+            root,
+            master_key,
+            memory: Arc::new(MemoryStore::new()),
+            prefer_keyring,
+        }
+    }
+
+    /// Handle rooted at an explicit directory, with its own master key file.
+    ///
+    /// Used for tests and for embedding more than one instance in a process.
+    /// The OS keyring is never consulted, so two handles rooted at different
+    /// directories never share a key.
+    pub fn with_root(root: PathBuf) -> crate::Result<Self> {
+        let master_key = load_or_create_master_key(&root, false)?.map(Arc::new);
+        Ok(Self {
+            root,
+            master_key,
+            memory: Arc::new(MemoryStore::new()),
+            prefer_keyring: false,
+        })
+    }
+
+    /// The storage root this handle owns.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// A file backend for `namespace` bound to this handle's root and key.
+    pub fn file_store(&self, namespace: &str) -> FileStore {
+        FileStore::with_root_and_key(namespace, self.root.clone(), self.master_key.clone())
+    }
+
+    /// The handle's shared memory-only backend (short-lived secrets).
+    pub fn memory_store(&self) -> Arc<dyn SecretStore> {
+        self.memory.clone()
+    }
+
+    /// Backend routing — picks a backend based on the secret id.
+    pub fn choose(&self, id: &SecretId) -> Arc<dyn SecretStore> {
+        self.choose_with(id, self.prefer_keyring)
+    }
+
+    /// Like `choose` but with an explicit keyring preference (test hook).
+    pub fn choose_with(&self, id: &SecretId, prefer_keyring: bool) -> Arc<dyn SecretStore> {
+        // MCP OAuth access tokens are short-lived → memory only. This is scoped
+        // to the `mcp-oauth` namespace: channel credentials may also use the
+        // `access_token` kind but are long-lived and must persist.
+        if id.namespace == "mcp-oauth" && id.kind == "access_token" {
+            return self.memory_store();
+        }
+        self.route_with(&id.namespace, prefer_keyring)
+    }
+
+    /// Namespace-level routing — every secret in a namespace shares a backend.
+    pub fn route(&self, namespace: &str) -> Arc<dyn SecretStore> {
+        self.route_with(namespace, self.prefer_keyring)
+    }
+
+    /// Like `route` but with an explicit keyring preference (test hook).
+    ///
+    /// Without the `keyring` feature `prefer_keyring` is ignored and routing is
+    /// always file-backed.
+    pub fn route_with(&self, namespace: &str, prefer_keyring: bool) -> Arc<dyn SecretStore> {
+        #[cfg(feature = "keyring")]
+        {
+            if prefer_keyring {
+                return Arc::new(FallbackStore {
+                    primary: Arc::new(KeyringStore::new(namespace)),
+                    secondary: Arc::new(self.file_store(namespace)),
+                });
+            }
+        }
+        let _ = prefer_keyring;
+        Arc::new(self.file_store(namespace))
+    }
+
+    /// Resolve a store reference to its current value via backend routing.
+    pub async fn resolve_store_ref(&self, r: &StoreRef) -> crate::Result<Option<String>> {
+        let id = r.to_secret_id();
+        self.choose(&id).get(&id).await
+    }
+
+    /// Resolve a store reference into a zeroized secret value.
+    ///
+    /// Returns `Ok(None)` when the referenced secret is absent or unreadable.
+    pub async fn resolve_secret_or_ref(&self, r: &StoreRef) -> crate::Result<Option<SecretValue>> {
+        Ok(self.resolve_store_ref(r).await?.map(SecretValue::new))
+    }
+
+    /// Mirror sensitive channel credentials into the secret store (namespace
+    /// `channel`, entity = channel id, kind = credential key).
+    ///
+    /// The plaintext `credentials` entries are kept for backward compatibility;
+    /// `secrets migrate` removes them from config once the store copy exists.
+    pub async fn persist_channel_secrets(
+        &self,
+        channel: &str,
+        credentials: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let store = self.route("channel");
+        for kind in SENSITIVE_CHANNEL_CREDENTIALS {
+            if let Some(value) = credentials.get(*kind) {
+                if !value.is_empty() {
+                    store
+                        .set(
+                            &SecretId::new("channel", channel, kind),
+                            value,
+                            SecretOrigin::UserEntered,
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a channel credential: the secret store (namespace `channel`) is
+    /// authoritative; the legacy plaintext `credentials` map is the fallback for
+    /// pre-migration configs.
+    pub async fn resolve_channel_credential(
+        &self,
+        channel: &str,
+        kind: &str,
+        legacy: Option<&str>,
+    ) -> crate::Result<Option<SecretValue>> {
+        let id = SecretId::new("channel", channel, kind);
+        match self.route("channel").get(&id).await {
+            Ok(Some(value)) if !value.is_empty() => Ok(Some(SecretValue::new(value))),
+            _ => Ok(legacy
+                .filter(|value| !value.is_empty())
+                .map(SecretValue::new)),
+        }
+    }
+
+    /// Resolve an OAuth client secret: the secret store (namespace `security`,
+    /// entity = `oauth-{provider}`, kind = `client_secret`) is authoritative;
+    /// the legacy plaintext `client_secret` config field is the fallback.
+    ///
+    /// Provider must be a stable slug (e.g. `"github"` / `"google"`) so each
+    /// provider's credential is stored under its own entity.
+    pub async fn resolve_oauth_client_secret(
+        &self,
+        provider: &str,
+        legacy: Option<&str>,
+    ) -> crate::Result<Option<SecretValue>> {
+        let id = SecretId::new("security", &format!("oauth-{provider}"), "client_secret");
+        match self.route("security").get(&id).await {
+            Ok(Some(value)) if !value.is_empty() => Ok(Some(SecretValue::new(value))),
+            _ => Ok(legacy
+                .filter(|value| !value.is_empty())
+                .map(SecretValue::new)),
+        }
+    }
+}
+
+impl Default for SecretStoreHandle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Zeroized secret value — the underlying string is wiped on drop so transient
@@ -344,13 +502,6 @@ impl Drop for SecretValue {
     }
 }
 
-/// Resolve a store reference into a zeroized secret value.
-///
-/// Returns `Ok(None)` when the referenced secret is absent or unreadable.
-pub async fn resolve_secret_or_ref(r: &StoreRef) -> crate::Result<Option<SecretValue>> {
-    Ok(resolve_store_ref(r).await?.map(SecretValue::new))
-}
-
 /// Credential keys that hold sensitive values and are mirrored into the secret
 /// store when a channel is written. Identifiers (`app_id`, `phone_number_id`,
 /// `bot_qq`, ...) are intentionally excluded — they are not secrets.
@@ -370,64 +521,6 @@ pub const SENSITIVE_CHANNEL_CREDENTIALS: &[&str] = &[
     "secret",
 ];
 
-/// Mirror sensitive channel credentials into the secret store (namespace
-/// `channel`, entity = channel id, kind = credential key).
-///
-/// The plaintext `credentials` entries are kept for backward compatibility;
-/// `secrets migrate` removes them from config once the store copy exists.
-pub async fn persist_channel_secrets(
-    channel: &str,
-    credentials: &HashMap<String, String>,
-) -> crate::Result<()> {
-    let store = route_store("channel");
-    for kind in SENSITIVE_CHANNEL_CREDENTIALS {
-        if let Some(value) = credentials.get(*kind) {
-            if !value.is_empty() {
-                store
-                    .set(&SecretId::new("channel", channel, kind), value, SecretOrigin::UserEntered)
-                    .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a channel credential: the secret store (namespace `channel`) is
-/// authoritative; the legacy plaintext `credentials` map is the fallback for
-/// pre-migration configs.
-pub async fn resolve_channel_credential(
-    channel: &str,
-    kind: &str,
-    legacy: Option<&str>,
-) -> crate::Result<Option<SecretValue>> {
-    let id = SecretId::new("channel", channel, kind);
-    match route_store("channel").get(&id).await {
-        Ok(Some(value)) if !value.is_empty() => Ok(Some(SecretValue::new(value))),
-        _ => Ok(legacy
-            .filter(|value| !value.is_empty())
-            .map(SecretValue::new)),
-    }
-}
-
-/// Resolve an OAuth client secret: the secret store (namespace `security`,
-/// entity = `oauth-{provider}`, kind = `client_secret`) is authoritative; the
-/// legacy plaintext `client_secret` config field is the fallback.
-///
-/// Provider must be a stable slug (e.g. `"github"` / `"google"`) so each
-/// provider's credential is stored under its own entity.
-pub async fn resolve_oauth_client_secret(
-    provider: &str,
-    legacy: Option<&str>,
-) -> crate::Result<Option<SecretValue>> {
-    let id = SecretId::new("security", &format!("oauth-{provider}"), "client_secret");
-    match route_store("security").get(&id).await {
-        Ok(Some(value)) if !value.is_empty() => Ok(Some(SecretValue::new(value))),
-        _ => Ok(legacy
-            .filter(|value| !value.is_empty())
-            .map(SecretValue::new)),
-    }
-}
-
 // ─────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────
@@ -435,6 +528,16 @@ pub async fn resolve_oauth_client_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hermetic handle rooted at a unique temp directory, with its own master
+    /// key file so encryption is exercised without touching the real home dir.
+    fn temp_handle(name: &str) -> (SecretStoreHandle, PathBuf) {
+        let root = std::env::temp_dir()
+            .join(format!("syscity_secret_handle_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let handle = SecretStoreHandle::with_root(root.clone()).expect("isolated handle");
+        (handle, root)
+    }
 
     /// In-memory `CredentialBackend` used to exercise the layered store without
     /// a live OS keychain — GitHub Actions runners have no secret-service
@@ -477,12 +580,13 @@ mod tests {
         // exercise it through the trait to prove the chain works end to end.
         // The primary is backed by an in-memory credential backend so the
         // layering logic is covered without a real keychain.
+        let (_, root) = temp_handle("keyring_layered");
         let store = Arc::new(FallbackStore {
             primary: Arc::new(KeyringStore::with_backend(
                 "mcp-env",
                 Arc::new(MemoryCredentialBackend::default()),
             )),
-            secondary: Arc::new(FileStore::new("mcp-env")),
+            secondary: Arc::new(FileStore::with_root_and_key("mcp-env", root.clone(), None)),
         });
         let id = SecretId::new("mcp-env", "probe", "secret");
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -496,11 +600,13 @@ mod tests {
             store.delete(&id).await.unwrap();
             assert!(!store.has(&id).await);
         });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_route_without_keyring_is_file() {
-        let store = route_store_with("mcp-env", false);
+        let (handle, root) = temp_handle("route_file");
+        let store = handle.route_with("mcp-env", false);
         // File-backed: entity-level ops are supported.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -512,12 +618,14 @@ mod tests {
             store.delete_entity("e").await.unwrap();
             assert!(!store.has_entity("e").await);
         });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_access_token_routes_to_memory() {
         let id = SecretId::new("mcp-oauth", "s", "access_token");
-        let store = choose_store_with(&id, false);
+        let (handle, root) = temp_handle("access_token_mem");
+        let store = handle.choose_with(&id, false);
         // Memory store has no per-entity map support.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -530,6 +638,7 @@ mod tests {
             store.delete(&id).await.unwrap();
             assert!(!store.has(&id).await);
         });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -537,7 +646,8 @@ mod tests {
         // Channel access tokens are long-lived → they must NOT route to the
         // memory store (reserved for MCP OAuth short-lived access tokens).
         let id = SecretId::new("channel", "whatsapp", "access_token");
-        let store = choose_store_with(&id, false);
+        let (handle, root) = temp_handle("channel_access_token");
+        let store = handle.choose_with(&id, false);
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut map = HashMap::new();
@@ -548,12 +658,15 @@ mod tests {
             store.delete_entity("whatsapp").await.unwrap();
             assert!(!store.has_entity("whatsapp").await);
         });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn test_channel_credential_store_first_then_legacy() {
+        let (handle, root) = temp_handle("channel_credential");
         // No store entry → legacy plaintext is the fallback.
-        let legacy = resolve_channel_credential("probe-channel", "token", Some("legacy"))
+        let legacy = handle
+            .resolve_channel_credential("probe-channel", "token", Some("legacy"))
             .await
             .unwrap();
         assert_eq!(legacy.as_ref().map(|v| v.as_str()), Some("legacy"));
@@ -561,35 +674,43 @@ mod tests {
         // Store entry takes precedence over legacy plaintext.
         let mut creds = HashMap::new();
         creds.insert("token".to_string(), "stored".to_string());
-        persist_channel_secrets("probe-channel", &creds)
+        handle
+            .persist_channel_secrets("probe-channel", &creds)
             .await
             .unwrap();
-        let stored = resolve_channel_credential("probe-channel", "token", Some("legacy"))
+        let stored = handle
+            .resolve_channel_credential("probe-channel", "token", Some("legacy"))
             .await
             .unwrap();
         assert_eq!(stored.as_ref().map(|v| v.as_str()), Some("stored"));
 
         // After deletion the legacy fallback is used again.
-        route_store("channel")
+        handle
+            .route("channel")
             .delete(&SecretId::new("channel", "probe-channel", "token"))
             .await
             .unwrap();
-        let back_to_legacy = resolve_channel_credential("probe-channel", "token", Some("legacy"))
+        let back_to_legacy = handle
+            .resolve_channel_credential("probe-channel", "token", Some("legacy"))
             .await
             .unwrap();
         assert_eq!(back_to_legacy.as_ref().map(|v| v.as_str()), Some("legacy"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn test_oauth_client_secret_store_first_then_legacy() {
+        let (handle, root) = temp_handle("oauth_client_secret");
         // No store entry → legacy plaintext config is the fallback.
-        let legacy = resolve_oauth_client_secret("github", Some("legacy-secret"))
+        let legacy = handle
+            .resolve_oauth_client_secret("github", Some("legacy-secret"))
             .await
             .unwrap();
         assert_eq!(legacy.as_ref().map(|v| v.as_str()), Some("legacy-secret"));
 
         // Store entry takes precedence over legacy plaintext.
-        route_store("security")
+        handle
+            .route("security")
             .set(
                 &SecretId::new("security", "oauth-github", "client_secret"),
                 "stored-secret",
@@ -597,20 +718,96 @@ mod tests {
             )
             .await
             .unwrap();
-        let stored = resolve_oauth_client_secret("github", Some("legacy-secret"))
+        let stored = handle
+            .resolve_oauth_client_secret("github", Some("legacy-secret"))
             .await
             .unwrap();
         assert_eq!(stored.as_ref().map(|v| v.as_str()), Some("stored-secret"));
 
         // After deletion the legacy fallback is used again.
-        route_store("security")
+        handle
+            .route("security")
             .delete(&SecretId::new("security", "oauth-github", "client_secret"))
             .await
             .unwrap();
-        let back_to_legacy = resolve_oauth_client_secret("github", Some("legacy-secret"))
+        let back_to_legacy = handle
+            .resolve_oauth_client_secret("github", Some("legacy-secret"))
             .await
             .unwrap();
         assert_eq!(back_to_legacy.as_ref().map(|v| v.as_str()), Some("legacy-secret"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_handles_are_isolated() {
+        // Two handles rooted at distinct directories must not observe each
+        // other's secrets — proving the per-instance design (no process-global
+        // store).
+        let (handle_a, root_a) = temp_handle("isolated_a");
+        let (handle_b, root_b) = temp_handle("isolated_b");
+
+        let id = SecretId::new("llm", "anthropic", "api_key");
+        handle_a
+            .route("llm")
+            .set(&id, "secret-a", SecretOrigin::UserEntered)
+            .await
+            .unwrap();
+
+        assert_eq!(handle_a.route("llm").get(&id).await.unwrap(), Some("secret-a".to_string()));
+        // B lives in a different root (and has a different key): nothing there.
+        assert_eq!(handle_b.route("llm").get(&id).await.unwrap(), None);
+
+        // B's write does not leak back into A.
+        handle_b
+            .route("llm")
+            .set(&id, "secret-b", SecretOrigin::UserEntered)
+            .await
+            .unwrap();
+        assert_eq!(handle_a.route("llm").get(&id).await.unwrap(), Some("secret-a".to_string()));
+        assert_eq!(handle_b.route("llm").get(&id).await.unwrap(), Some("secret-b".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root_a);
+        let _ = std::fs::remove_dir_all(&root_b);
+    }
+
+    #[tokio::test]
+    async fn test_handle_roundtrip_preserves_key_semantics() {
+        // A rooted handle round-trips a secret, encrypts it at rest, and a fresh
+        // handle at the same root (same key file) reads it back. This pins the
+        // default single-instance behaviour: 0600 encrypted file storage.
+        let (handle, root) = temp_handle("roundtrip");
+        let id = SecretId::new("llm", "openai", "api_key");
+        handle
+            .route("llm")
+            .set(&id, "sk-roundtrip", SecretOrigin::UserEntered)
+            .await
+            .unwrap();
+        assert_eq!(handle.route("llm").get(&id).await.unwrap(), Some("sk-roundtrip".to_string()));
+
+        // On-disk value is encrypted (plaintext must not appear).
+        let path = handle.file_store("llm").path_for("openai").unwrap();
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!on_disk.contains("sk-roundtrip"));
+        assert!(on_disk.contains("encrypted"));
+
+        // The file store keeps owner-only (0600) permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "secret files must be owner-only");
+        }
+
+        // A second handle at the same root uses the same persisted key.
+        let reopened = SecretStoreHandle::with_root(root.clone()).unwrap();
+        assert_eq!(reopened.route("llm").get(&id).await.unwrap(), Some("sk-roundtrip".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -99,6 +99,11 @@ pub struct ModelRouter {
     shutdown_token: CancellationToken,
     /// Pluggable task classifier for cost-aware routing.
     classifier: Box<dyn TaskClassifierImpl>,
+    /// Optional secret-store handle for resolving `StoreRef` provider keys.
+    ///
+    /// `None` on a bare router (tests, standalone tools); the gateway wires
+    /// its instance handle in via [`Self::with_secrets`].
+    secrets: Option<Arc<crate::secrets::SecretStoreHandle>>,
 }
 
 impl Default for ModelRouter {

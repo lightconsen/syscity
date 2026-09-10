@@ -107,7 +107,7 @@ async fn delegate_tool_spawn_without_agent() {
 
 #[tokio::test]
 async fn mcp_connection_tool_lists_empty() {
-    let manager = Arc::new(McpManager::new());
+    let manager = Arc::new(McpManager::default());
     let tool = McpConnectionTool::with_manager(manager);
     let result = tool
         .execute(json!({"action": "list"}), &test_context())

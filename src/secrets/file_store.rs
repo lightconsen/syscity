@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, AeadCore, OsRng};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
@@ -30,7 +30,7 @@ use zeroize::Zeroize;
 use crate::error::SyscityError;
 #[cfg(all(not(test), feature = "keyring"))]
 use crate::secrets::keyring_store::{probe_keyring, with_timeout};
-use crate::secrets::store::{SecretId, SecretOrigin, SecretStore};
+use crate::secrets::store::{SecretId, SecretOrigin, SecretStore, SecretStoreHandle};
 
 /// Top-level secrets directory (`~/.syscity/secrets`).
 pub fn secrets_root_dir() -> PathBuf {
@@ -90,19 +90,22 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    /// Create a file backend bound to a namespace.
-    pub fn new(namespace: &str) -> Self {
+    /// Create a file backend bound to a namespace, an explicit root, and a
+    /// master key.
+    ///
+    /// The root and key are normally supplied by a [`SecretStoreHandle`], which
+    /// owns them for the lifetime of a gateway instance. A `None` key means
+    /// values are written plaintext with `0600` permissions (no key backend was
+    /// available).
+    pub(crate) fn with_root_and_key(
+        namespace: &str,
+        root: PathBuf,
+        master_key: Option<Arc<MasterKey>>,
+    ) -> Self {
         Self {
             namespace: namespace.to_string(),
-            root: secrets_root_dir(),
-            master_key: match master_key() {
-                Ok(Some(key)) => Some(key),
-                Ok(None) => None,
-                Err(e) => {
-                    warn!("Cannot load master key; secrets stored unencrypted: {e}");
-                    None
-                }
-            },
+            root,
+            master_key,
         }
     }
 
@@ -273,7 +276,7 @@ pub struct MasterKey([u8; 32]);
 
 impl MasterKey {
     /// Generate a fresh random 256-bit key.
-    fn random() -> Self {
+    pub(crate) fn random() -> Self {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         Self(bytes)
@@ -338,42 +341,27 @@ impl Drop for MasterKey {
 /// AES-GCM nonce length in bytes.
 const NONCE_LEN: usize = 12;
 
-/// The file-store master key, loaded once and cached for the process.
+/// The file-store master key for a given storage root.
 ///
-/// Source priority: OS keyring (feature `keyring`) → 0600
-/// `~/.syscity/secrets/.master_key`. Returns `Ok(None)` when no backend is
-/// available (plaintext fallback); under `cfg(test)` it always returns `None`
-/// so tests stay hermetic.
-fn master_key() -> crate::Result<Option<Arc<MasterKey>>> {
-    static KEY: OnceLock<Arc<MasterKey>> = OnceLock::new();
-    if let Some(key) = KEY.get() {
-        return Ok(Some(key.clone()));
-    }
-    #[cfg(not(test))]
-    let loaded = load_or_create_master_key();
-    #[cfg(test)]
-    let loaded: crate::Result<Option<MasterKey>> = Ok(None);
-    match loaded {
-        Ok(Some(key)) => {
-            let key = Arc::new(key);
-            let _ = KEY.set(key.clone());
-            Ok(Some(key))
-        }
-        Ok(None) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
+/// Source priority: OS keyring (feature `keyring`, only when `use_keyring` is
+/// set) → 0600 `.master_key` file under `root`. Returns `Ok(None)` when no
+/// backend is available (plaintext fallback).
+///
+/// This is called exactly once per [`SecretStoreHandle`] at construction; the
+/// handle owns the result so no process-global cache is required.
+pub(crate) fn load_or_create_master_key(
+    root: &Path,
+    use_keyring: bool,
+) -> crate::Result<Option<MasterKey>> {
+    let _ = use_keyring;
 
-/// Load the existing master key or create and persist a fresh one.
-#[cfg(not(test))]
-fn load_or_create_master_key() -> crate::Result<Option<MasterKey>> {
     // 1. OS keyring (preferred, feature `keyring` only). The probe is
     // cooldown-throttled and never hangs; the keyring read/write below are
     // additionally time-bounded so a dark-wake hang falls back to the 0600
     // file instead of blocking startup.
-    #[cfg(feature = "keyring")]
+    #[cfg(all(feature = "keyring", not(test)))]
     {
-        if probe_keyring() {
+        if use_keyring && probe_keyring() {
             if let Some(key) = read_master_key_keyring_bounded()? {
                 return Ok(Some(key));
             }
@@ -386,11 +374,11 @@ fn load_or_create_master_key() -> crate::Result<Option<MasterKey>> {
     }
 
     // 2. 0600 `.master_key` file (headless hosts / default file storage).
-    if let Some(key) = read_master_key_file()? {
+    if let Some(key) = read_master_key_file(root)? {
         return Ok(Some(key));
     }
     let key = MasterKey::random();
-    match write_master_key_file(&key) {
+    match write_master_key_file(root, &key) {
         Ok(()) => Ok(Some(key)),
         Err(e) => {
             warn!("Cannot persist master key; secrets stored unencrypted: {e}");
@@ -446,15 +434,13 @@ fn write_master_key_keyring_bounded(key: &MasterKey) -> crate::Result<bool> {
     }
 }
 
-/// Path of the headless master-key fallback file.
-#[cfg(not(test))]
-fn master_key_path() -> PathBuf {
-    secrets_root_dir().join(".master_key")
+/// Path of the headless master-key fallback file under an explicit root.
+fn master_key_path(root: &Path) -> PathBuf {
+    root.join(".master_key")
 }
 
-#[cfg(not(test))]
-fn read_master_key_file() -> crate::Result<Option<MasterKey>> {
-    let path = master_key_path();
+fn read_master_key_file(root: &Path) -> crate::Result<Option<MasterKey>> {
+    let path = master_key_path(root);
     match std::fs::read_to_string(&path) {
         Ok(content) => match decode_master_key(content.trim()) {
             Ok(key) => Ok(Some(key)),
@@ -468,9 +454,8 @@ fn read_master_key_file() -> crate::Result<Option<MasterKey>> {
     }
 }
 
-#[cfg(not(test))]
-fn write_master_key_file(key: &MasterKey) -> crate::Result<()> {
-    let path = master_key_path();
+fn write_master_key_file(root: &Path, key: &MasterKey) -> crate::Result<()> {
+    let path = master_key_path(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -482,7 +467,6 @@ fn write_master_key_file(key: &MasterKey) -> crate::Result<()> {
     Ok(())
 }
 
-#[cfg(not(test))]
 fn encode_master_key(key: &MasterKey) -> String {
     base64::engine::general_purpose::STANDARD.encode(key.0)
 }
@@ -554,8 +538,8 @@ async fn set_file_perms(_path: &Path) -> crate::Result<()> {
 /// new location before the old file is removed; on any failure the current
 /// state is kept and a warning is logged. The old directory is removed once
 /// empty.
-pub async fn migrate_legacy_mcp_env() -> crate::Result<()> {
-    let store = FileStore::new("mcp-env");
+pub async fn migrate_legacy_mcp_env(secrets: &SecretStoreHandle) -> crate::Result<()> {
+    let store = secrets.file_store("mcp-env");
     migrate_legacy_mcp_env_with_store(crate::dirs::syscity_dir().join("mcp_env"), &store).await
 }
 

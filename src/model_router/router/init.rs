@@ -18,7 +18,14 @@ impl ModelRouter {
             task_registry: None,
             shutdown_token: CancellationToken::new(),
             classifier: Box::new(KeywordTaskClassifier),
+            secrets: None,
         }
+    }
+
+    /// Attach the secret-store handle used to resolve `StoreRef` provider keys.
+    pub fn with_secrets(mut self, secrets: Arc<crate::secrets::SecretStoreHandle>) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     /// Attach a SQLite connection pool for persisting auth profile state.
@@ -82,7 +89,7 @@ impl ModelRouter {
             health.insert(name.clone(), ProviderHealth::default());
 
             if matches!(provider_config.provider_type, ProviderType::OpenAi) {
-                let api_key = provider_config.effective_key().await;
+                let api_key = provider_config.effective_key(self.secrets.as_deref()).await;
                 if !api_key.is_empty() {
                     let fetcher = OpenAiUsageFetcher::new(api_key);
                     let mut fetchers = self.usage_fetchers.write().await;

@@ -21,9 +21,7 @@
 
 use serial_test::serial;
 
-use syscity::secrets::{
-    probe_keyring, resolve_store_ref, route_store, SecretId, SecretOrigin, StoreRef,
-};
+use syscity::secrets::{probe_keyring, SecretId, SecretOrigin, SecretStoreHandle, StoreRef};
 
 /// One row per design-doc storage namespace: `(namespace, entity, kind)`.
 const NAMESPACES: &[(&str, &str, &str)] = &[
@@ -47,10 +45,11 @@ async fn keyring_roundtrip_per_namespace() {
         return;
     }
 
+    let secrets = SecretStoreHandle::new();
     for &(namespace, entity, kind) in NAMESPACES {
         let id = SecretId::new(namespace, entity, kind);
         let value = format!("rt-{namespace}");
-        let store = route_store(namespace);
+        let store = secrets.route(namespace);
 
         // Clean slate for a repeatable run.
         let _ = store.delete(&id).await;
@@ -86,7 +85,8 @@ async fn llm_provider_keys_route_independently() {
     }
 
     const PROVIDERS: &[(&str, &str)] = &[("rt-provider-a", "sk-a"), ("rt-provider-b", "sk-b")];
-    let store = route_store("llm");
+    let secrets = SecretStoreHandle::new();
+    let store = secrets.route("llm");
 
     for (entity, key) in PROVIDERS {
         let id = SecretId::new("llm", entity, "api_key");
@@ -99,7 +99,7 @@ async fn llm_provider_keys_route_independently() {
 
     for (entity, key) in PROVIDERS {
         let r = StoreRef::new("llm", entity, "api_key");
-        let resolved = resolve_store_ref(&r).await.unwrap();
+        let resolved = secrets.resolve_store_ref(&r).await.unwrap();
         assert_eq!(
             resolved.as_deref(),
             Some(*key),

@@ -44,9 +44,11 @@ pub struct ToolsInit {
 }
 
 /// Initialize MCP manager with its internal event channel.
-pub async fn init_mcp_manager() -> (Arc<McpManager>, mpsc::UnboundedReceiver<McpEvent>) {
+pub async fn init_mcp_manager(
+    secrets: Arc<crate::secrets::SecretStoreHandle>,
+) -> (Arc<McpManager>, mpsc::UnboundedReceiver<McpEvent>) {
     let (mcp_event_tx, mcp_event_rx) = mpsc::unbounded_channel::<McpEvent>();
-    let mcp_manager = Arc::new(McpManager::new().with_event_tx(mcp_event_tx).await);
+    let mcp_manager = Arc::new(McpManager::new(secrets).with_event_tx(mcp_event_tx).await);
     (mcp_manager, mcp_event_rx)
 }
 
@@ -238,6 +240,8 @@ pub struct ToolSystemDeps {
     pub device_bridge: Option<Arc<dyn crate::device::DeviceBridge>>,
     pub skills_manager: Arc<RwLock<crate::skills::SkillManager>>,
     pub shell_hooks: Arc<ShellHookBridge>,
+    /// Secret-store instance handle shared with the gateway.
+    pub secrets: Arc<crate::secrets::SecretStoreHandle>,
 }
 
 /// Initialize the full tool subsystem.
@@ -251,8 +255,9 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         device_bridge,
         skills_manager,
         shell_hooks,
+        secrets,
     } = deps;
-    let (mcp_manager, mcp_event_rx) = init_mcp_manager().await;
+    let (mcp_manager, mcp_event_rx) = init_mcp_manager(secrets.clone()).await;
     let connector_manager = Arc::new(crate::mcp::ConnectorManager::new(
         crate::dirs::connectors_dir(),
         mcp_manager.clone(),
@@ -261,6 +266,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         // cloud mode is enabled (§2.7 double gate: feature + cloud.enabled).
         #[cfg(feature = "cloud")]
         config.cloud.enabled.then(|| config.cloud.api_base.clone()),
+        secrets.clone(),
     ));
     let approval_queue = Arc::new(ApprovalQueue::new());
     let ask_queue = Arc::new(AskQueue::new());
@@ -285,6 +291,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 device_bridge,
                 skills_manager,
                 tool_hooks: shell_hooks.tool_hooks(),
+                secrets: secrets.clone(),
             },
         )
         .await?,

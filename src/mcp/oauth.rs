@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{info, warn};
 
 use crate::mcp::{McpEvent, McpManager, McpServerConfig};
-use crate::secrets::{route_store, SecretId, SecretOrigin, SecretStore};
+use crate::secrets::{SecretId, SecretOrigin, SecretStore, SecretStoreHandle};
 
 // ─────────────────────────────────────────────
 // Token data
@@ -189,6 +189,8 @@ pub(crate) struct OAuthManagerActor {
     event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<McpEvent>>>>,
     token_cache: HashMap<String, CachedToken>,
     pending_flows: HashMap<String, PendingFlowState>,
+    /// Secret-store instance handle for refresh-token persistence.
+    secrets: Arc<SecretStoreHandle>,
 }
 
 impl OAuthManagerActor {
@@ -196,6 +198,7 @@ impl OAuthManagerActor {
         cmd_rx: mpsc::UnboundedReceiver<OAuthCommand>,
         cmd_tx: mpsc::UnboundedSender<OAuthCommand>,
         event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<McpEvent>>>>,
+        secrets: Arc<SecretStoreHandle>,
     ) -> Self {
         Self {
             cmd_rx,
@@ -203,6 +206,7 @@ impl OAuthManagerActor {
             event_tx,
             token_cache: HashMap::new(),
             pending_flows: HashMap::new(),
+            secrets,
         }
     }
 
@@ -377,7 +381,7 @@ impl OAuthManagerActor {
             self.token_cache.remove(server_id);
         }
 
-        let refresh_token = load_refresh_token(server_id).await?;
+        let refresh_token = load_refresh_token(&self.secrets, server_id).await?;
         let meta = load_metadata(server_id).await?;
 
         let tokens = match self
@@ -404,12 +408,13 @@ impl OAuthManagerActor {
                 return true;
             }
         }
-        load_refresh_token(server_id).await.is_some() && load_metadata(server_id).await.is_some()
+        load_refresh_token(&self.secrets, server_id).await.is_some()
+            && load_metadata(server_id).await.is_some()
     }
 
     async fn handle_clear_token(&mut self, server_id: &str) {
         self.token_cache.remove(server_id);
-        if let Err(e) = delete_refresh_token(server_id).await {
+        if let Err(e) = delete_refresh_token(&self.secrets, server_id).await {
             warn!("Failed to delete refresh token for '{server_id}': {e}");
         }
         let path = match token_path_for(server_id) {
@@ -453,7 +458,7 @@ impl OAuthManagerActor {
                 })
                 .ok();
                 if let Some(refresh) = &tokens.refresh_token {
-                    persist_refresh_token(server_id, refresh)
+                    persist_refresh_token(&self.secrets, server_id, refresh)
                         .await
                         .map_err(|e| {
                             warn!("Failed to persist refresh token for '{server_id}': {e}");
@@ -521,7 +526,7 @@ impl OAuthManagerActor {
                     })
                     .ok();
                     if let Some(r) = &updated.refresh_token {
-                        persist_refresh_token(server_id, r).await.map_err(|e| {
+                        persist_refresh_token(&self.secrets, server_id, r).await.map_err(|e| {
                             warn!("Failed to persist refreshed refresh token for '{server_id}': {e}");
                         }).ok();
                     }
@@ -637,9 +642,10 @@ fn tokens_fresh(tokens: &OAuthTokens) -> bool {
     }
 }
 
-/// The refresh-token backend — routed (keyring → `~/.syscity/secrets/mcp-oauth`).
-fn refresh_token_store() -> Arc<dyn SecretStore> {
-    route_store("mcp-oauth")
+/// The refresh-token backend — routed by the gateway's secret-store handle
+/// (keyring → `~/.syscity/secrets/mcp-oauth`).
+fn refresh_token_store(secrets: &SecretStoreHandle) -> Arc<dyn SecretStore> {
+    secrets.route("mcp-oauth")
 }
 
 fn refresh_token_id(server_id: &str) -> SecretId {
@@ -647,15 +653,19 @@ fn refresh_token_id(server_id: &str) -> SecretId {
 }
 
 /// Persist a refresh token for a server.
-async fn persist_refresh_token(server_id: &str, refresh: &str) -> crate::Result<()> {
-    refresh_token_store()
+async fn persist_refresh_token(
+    secrets: &SecretStoreHandle,
+    server_id: &str,
+    refresh: &str,
+) -> crate::Result<()> {
+    refresh_token_store(secrets)
         .set(&refresh_token_id(server_id), refresh, SecretOrigin::SystemGenerated)
         .await
 }
 
 /// Load a persisted refresh token for a server.
-async fn load_refresh_token(server_id: &str) -> Option<String> {
-    refresh_token_store()
+async fn load_refresh_token(secrets: &SecretStoreHandle, server_id: &str) -> Option<String> {
+    refresh_token_store(secrets)
         .get(&refresh_token_id(server_id))
         .await
         .ok()
@@ -663,8 +673,8 @@ async fn load_refresh_token(server_id: &str) -> Option<String> {
 }
 
 /// Delete a persisted refresh token for a server (missing is not an error).
-async fn delete_refresh_token(server_id: &str) -> crate::Result<()> {
-    refresh_token_store()
+async fn delete_refresh_token(secrets: &SecretStoreHandle, server_id: &str) -> crate::Result<()> {
+    refresh_token_store(secrets)
         .delete(&refresh_token_id(server_id))
         .await
 }
@@ -710,8 +720,8 @@ async fn load_metadata(server_id: &str) -> Option<OAuthMetadata> {
 /// Atomic and rollback-safe: the refresh token is persisted to the store
 /// *before* the sidecar is rewritten, so a failure at any step leaves the
 /// plaintext file intact and the refresh path is never lost.
-pub async fn migrate_legacy_mcp_tokens() -> crate::Result<()> {
-    let store = refresh_token_store();
+pub async fn migrate_legacy_mcp_tokens(secrets: &SecretStoreHandle) -> crate::Result<()> {
+    let store = refresh_token_store(secrets);
     migrate_legacy_mcp_tokens_with_store(mcp_tokens_dir(), store).await
 }
 

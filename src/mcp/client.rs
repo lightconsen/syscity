@@ -78,6 +78,9 @@ pub struct McpClient {
     /// In-process server handler, when the connection uses the in-process
     /// channel transport (mobile §4.6).
     in_process_handler: Option<Arc<dyn McpInProcessHandler>>,
+    /// Secret-store handle used by the cloud relay path to read the session
+    /// token. Set by [`Self::with_secrets`] when owned by a gateway.
+    secrets: Option<Arc<crate::secrets::SecretStoreHandle>>,
     /// Syscity Cloud relay target (feature `cloud`): set when connected with
     /// `McpTransport::Cloud`. When present, `tools/list` + `tools/call` go to
     /// the cloud relay REST endpoints instead of an MCP protocol channel.
@@ -111,9 +114,16 @@ impl McpClient {
             server_config: None,
             access_token: None,
             in_process_handler: None,
+            secrets: None,
             #[cfg(feature = "cloud")]
             cloud: None,
         }
+    }
+
+    /// Attach the secret-store handle used by the cloud relay path.
+    pub fn with_secrets(mut self, secrets: Arc<crate::secrets::SecretStoreHandle>) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     /// Register the in-process server handler used by the `InProcess`
@@ -833,7 +843,7 @@ impl McpClient {
     pub async fn list_tools(&mut self) -> crate::Result<()> {
         #[cfg(feature = "cloud")]
         if let Some(relay) = &self.cloud {
-            let token = cloud_session_token().await?;
+            let token = cloud_session_token(self.secrets.as_deref()).await?;
             self.tools = cloud_list_tools(relay, &token).await?;
             return Ok(());
         }
@@ -868,7 +878,7 @@ impl McpClient {
     ) -> crate::Result<serde_json::Value> {
         #[cfg(feature = "cloud")]
         if let Some(relay) = &self.cloud {
-            let token = cloud_session_token().await?;
+            let token = cloud_session_token(self.secrets.as_deref()).await?;
             return cloud_call_tool(relay, &token, name, &params).await;
         }
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
@@ -1162,12 +1172,22 @@ impl Default for McpClient {
 /// The stored cloud session token, erroring when absent (double gate: a cloud
 /// relay call requires a logged-in session).
 #[cfg(feature = "cloud")]
-async fn cloud_session_token() -> crate::Result<String> {
-    crate::cloud::session::get_token().await.ok_or_else(|| {
+async fn cloud_session_token(
+    secrets: Option<&crate::secrets::SecretStoreHandle>,
+) -> crate::Result<String> {
+    let secrets = secrets.ok_or_else(|| {
         crate::error::SyscityError::Internal(
-            "not signed in to Syscity Cloud — cloud connectors need a cloud session".to_string(),
+            "cloud relay not wired to the secret store".to_string(),
         )
-    })
+    })?;
+    crate::cloud::session::get_token(secrets)
+        .await
+        .ok_or_else(|| {
+            crate::error::SyscityError::Internal(
+                "not signed in to Syscity Cloud — cloud connectors need a cloud session"
+                    .to_string(),
+            )
+        })
 }
 
 /// List tools from a cloud-provisioned connector via `/api/v1/mcp/tools`.

@@ -19,7 +19,7 @@ pub(crate) async fn handle_plugins_reload_all(
 }
 
 /// `plugins.sign` — sign a plugin manifest with an ed25519 key.
-pub(crate) async fn handle_plugins_sign(req: &WsRequest, _state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_plugins_sign(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
     #[derive(Deserialize)]
     struct Params {
         name: String,
@@ -31,7 +31,9 @@ pub(crate) async fn handle_plugins_sign(req: &WsRequest, _state: &Arc<GatewaySta
     };
 
     let signing_key = if p.secret_key.is_empty() {
-        match crate::secrets::route_store("plugin")
+        match state
+            .secrets
+            .route("plugin")
             .get(&crate::secrets::SecretId::new("plugin", &p.name, "secret_key"))
             .await
         {
@@ -48,7 +50,9 @@ pub(crate) async fn handle_plugins_sign(req: &WsRequest, _state: &Arc<GatewaySta
             }
         }
     } else {
-        if let Err(e) = crate::secrets::route_store("plugin")
+        if let Err(e) = state
+            .secrets
+            .route("plugin")
             .set(
                 &crate::secrets::SecretId::new("plugin", &p.name, "secret_key"),
                 &p.secret_key,

@@ -28,7 +28,7 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
     // session token its models are unusable. Hide them for anonymous users
     // ("登录后云模型自动进入模型列表" — docs/cloud-integration.md).
     #[cfg(feature = "cloud")]
-    let logged_in = crate::cloud::session::logged_in().await;
+    let logged_in = crate::cloud::session::logged_in(&state.secrets).await;
     #[cfg(not(feature = "cloud"))]
     let logged_in = false;
 
@@ -58,7 +58,7 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
     #[cfg(feature = "cloud")]
     let cloud_multipliers = if pairs.iter().any(|(p, _)| p == "cloud") && logged_in {
         let cloud_cfg = { state.config.read().await.cloud.clone() };
-        crate::cloud::multipliers::credit_multipliers(&cloud_cfg).await
+        crate::cloud::multipliers::credit_multipliers(&cloud_cfg, &state.secrets).await
     } else {
         None
     };

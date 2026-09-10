@@ -51,13 +51,14 @@ async fn chrome_devtools_connector_full_cycle() {
     std::fs::write(pkg.join("connector.json"), CONNECTOR_JSON).unwrap();
     std::fs::write(skill_dir.join("SKILL.md"), SKILL_MD).unwrap();
 
-    let mcp_manager = Arc::new(McpManager::new());
+    let mcp_manager = Arc::new(McpManager::default());
     let manager = ConnectorManager::new(
         root.clone(),
         mcp_manager.clone(),
         Arc::new(SkillStorage::with_user_dir(user_skills.clone())),
         #[cfg(feature = "cloud")]
         None,
+        Arc::new(syscity::secrets::SecretStoreHandle::default()),
     );
 
     // ── 1. Install: cache copy + bundled-skill bridge ──────────────────────

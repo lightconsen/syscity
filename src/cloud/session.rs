@@ -1,7 +1,7 @@
 //! Cloud session: OAuth login URL building + session token storage.
 
 use crate::cloud::config::CloudConfig;
-use crate::secrets::{choose_store, SecretId, SecretOrigin};
+use crate::secrets::{SecretId, SecretOrigin, SecretStoreHandle};
 
 pub const CLOUD_NS: &str = "cloud";
 pub const ENTITY_SESSION: &str = "session";
@@ -11,8 +11,9 @@ fn token_id() -> SecretId {
 }
 
 /// The stored cloud session token, if any.
-pub async fn get_token() -> Option<String> {
-    let value: Option<String> = choose_store(&token_id())
+pub async fn get_token(secrets: &SecretStoreHandle) -> Option<String> {
+    let value: Option<String> = secrets
+        .choose(&token_id())
         .get(&token_id())
         .await
         .ok()
@@ -21,20 +22,21 @@ pub async fn get_token() -> Option<String> {
 }
 
 /// Persist a session token (keyring-preferred for user-entered secrets).
-pub async fn set_token(token: &str) -> crate::Result<()> {
-    choose_store(&token_id())
+pub async fn set_token(secrets: &SecretStoreHandle, token: &str) -> crate::Result<()> {
+    secrets
+        .choose(&token_id())
         .set(&token_id(), token, SecretOrigin::UserEntered)
         .await
 }
 
 /// Forget the session token (revoked / signed out).
-pub async fn clear_token() -> crate::Result<()> {
-    choose_store(&token_id()).delete(&token_id()).await
+pub async fn clear_token(secrets: &SecretStoreHandle) -> crate::Result<()> {
+    secrets.choose(&token_id()).delete(&token_id()).await
 }
 
 /// Whether a session token is stored.
-pub async fn logged_in() -> bool {
-    get_token().await.is_some()
+pub async fn logged_in(secrets: &SecretStoreHandle) -> bool {
+    get_token(secrets).await.is_some()
 }
 
 /// Cloud login URL: the console's provider-chooser page. The user picks

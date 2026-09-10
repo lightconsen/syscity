@@ -99,6 +99,9 @@ pub struct ConnectorManager {
     /// through the cloud MCP relay instead of a local MCP server.
     #[cfg(feature = "cloud")]
     cloud_api_base: Option<String>,
+    /// Secret-store handle for reading the cloud session token during catalog
+    /// sync (attached to the request as a Bearer token).
+    secrets: Arc<crate::secrets::SecretStoreHandle>,
 }
 
 impl std::fmt::Debug for ConnectorManager {
@@ -119,6 +122,7 @@ impl ConnectorManager {
         mcp_manager: Arc<McpManager>,
         skill_storage: Arc<SkillStorage>,
         #[cfg(feature = "cloud")] cloud_api_base: Option<String>,
+        secrets: Arc<crate::secrets::SecretStoreHandle>,
     ) -> Self {
         Self {
             root,
@@ -128,6 +132,7 @@ impl ConnectorManager {
             write_lock: AsyncMutex::new(()),
             #[cfg(feature = "cloud")]
             cloud_api_base,
+            secrets,
         }
     }
 
@@ -652,7 +657,7 @@ impl ConnectorManager {
         lang: Option<&str>,
     ) -> crate::Result<(CatalogDocument, bool)> {
         #[cfg(feature = "cloud")]
-        let token = crate::cloud::session::get_token().await;
+        let token = crate::cloud::session::get_token(&self.secrets).await;
         #[cfg(not(feature = "cloud"))]
         let token: Option<String> = None;
         self.catalog_cache().sync(url, token.as_deref(), lang).await
@@ -1083,10 +1088,11 @@ mod tests {
         let mcp_url = spawn_fake_mcp_server().await;
         let manager = ConnectorManager::new(
             root.clone(),
-            Arc::new(McpManager::new()),
+            Arc::new(McpManager::default()),
             Arc::new(SkillStorage::with_user_dir(user_skills.clone())),
             #[cfg(feature = "cloud")]
             None,
+            Arc::new(crate::secrets::SecretStoreHandle::default()),
         );
         Fixture {
             root,
@@ -1418,9 +1424,10 @@ mod tests {
         std::fs::create_dir_all(&user_skills).unwrap();
         let manager = ConnectorManager::new(
             root.clone(),
-            Arc::new(McpManager::new()),
+            Arc::new(McpManager::default()),
             Arc::new(SkillStorage::with_user_dir(user_skills)),
             Some("https://api.syscity.net".to_string()),
+            Arc::new(crate::secrets::SecretStoreHandle::default()),
         );
 
         let m = ConnectorManifest::parse(

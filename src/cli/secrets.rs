@@ -12,7 +12,7 @@ use crate::error::{Result, SyscityError};
 use crate::gateway::GatewayConfig;
 #[cfg(feature = "keyring")]
 use crate::secrets::{probe_keyring, KeyringStore, SecretStore};
-use crate::secrets::{route_store, FileStore, SENSITIVE_CHANNEL_CREDENTIALS};
+use crate::secrets::{SecretStoreHandle, SENSITIVE_CHANNEL_CREDENTIALS};
 
 /// Namespaces handled by the secret store and their human-readable label.
 const NAMESPACES: &[(&str, &str)] = &[
@@ -118,6 +118,7 @@ async fn keyring_has_entity(_namespace: &str, _entity: &str) -> bool {
 
 /// `syscity secrets list` — show names and locations, never values.
 async fn run_secrets_list() -> Result<()> {
+    let secrets = SecretStoreHandle::new();
     let keyring = keyring_available();
     println!(
         "Secret store backend: {}",
@@ -138,7 +139,7 @@ async fn run_secrets_list() -> Result<()> {
     println!("{:<10} {:<22} {:<20} {:<5}", "Namespace", "Entity", "Location", "Stored");
     for (namespace, entity) in pairs {
         let in_keyring = keyring_has_entity(&namespace, &entity).await;
-        let in_file = FileStore::new(&namespace).has_entity(&entity).await;
+        let in_file = secrets.file_store(&namespace).has_entity(&entity).await;
         let location = match (in_keyring, in_file) {
             (true, true) => "keyring + file",
             (true, false) => "keyring",
@@ -157,13 +158,15 @@ async fn run_secrets_list() -> Result<()> {
 /// `syscity secrets migrate` — mirror plaintext config secrets into the store
 /// and strip the plaintext copies from `config.toml`.
 async fn run_secrets_migrate() -> Result<()> {
+    let secrets = SecretStoreHandle::new();
+
     // 1. Move legacy `~/.syscity/mcp_env/` files into the store (idempotent).
-    crate::secrets::migrate_legacy_mcp_env().await?;
+    crate::secrets::migrate_legacy_mcp_env(&secrets).await?;
     info!("Migrated legacy mcp_env files");
 
     // 2. Sweep legacy `mcp_tokens` sidecars that still carry plaintext token
     //    fields into the store and rewrite them metadata-only (idempotent).
-    crate::mcp::migrate_legacy_mcp_tokens().await?;
+    crate::mcp::migrate_legacy_mcp_tokens(&secrets).await?;
     info!("Migrated legacy mcp_tokens files");
 
     let config_path = crate::dirs::default_config_file();
@@ -188,7 +191,9 @@ async fn run_secrets_migrate() -> Result<()> {
                 stored += 1;
             }
         }
-        crate::secrets::persist_channel_secrets(id, &channel.credentials).await?;
+        secrets
+            .persist_channel_secrets(id, &channel.credentials)
+            .await?;
     }
 
     // 4. Advisory for shared_token (kept in config; env reference preferred).
@@ -239,7 +244,8 @@ async fn run_secrets_purge(namespace: &str) -> Result<()> {
         )));
     }
 
-    let store = route_store(namespace);
+    let secrets = SecretStoreHandle::new();
+    let store = secrets.route(namespace);
 
     // Keyring entries cannot be enumerated, so include config-derived entities
     // that may live there in addition to the on-disk file entities.

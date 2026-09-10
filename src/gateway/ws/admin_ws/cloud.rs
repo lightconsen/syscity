@@ -31,10 +31,10 @@ pub(crate) async fn handle_cloud_subscription(
         if !cfg.enabled {
             return cloud_unavailable(req);
         }
-        let Some(token) = crate::cloud::session::get_token().await else {
+        let Some(token) = crate::cloud::session::get_token(&state.secrets).await else {
             return cloud_unavailable(req);
         };
-        match crate::cloud::client::CloudClient::new(&cfg, token)
+        match crate::cloud::client::CloudClient::new(&cfg, token, state.secrets.clone())
             .subscription()
             .await
         {
@@ -67,13 +67,13 @@ pub(crate) async fn handle_cloud_usage(req: &WsRequest, state: &Arc<GatewayState
         if !cfg.enabled {
             return cloud_unavailable(req);
         }
-        let Some(token) = crate::cloud::session::get_token().await else {
+        let Some(token) = crate::cloud::session::get_token(&state.secrets).await else {
             return cloud_unavailable(req);
         };
         let days = parse_params::<UsageParams>(req)
             .map(|p| p.days)
             .unwrap_or(30);
-        match crate::cloud::client::CloudClient::new(&cfg, token)
+        match crate::cloud::client::CloudClient::new(&cfg, token, state.secrets.clone())
             .usage(days)
             .await
         {
@@ -105,12 +105,16 @@ pub(crate) async fn handle_cloud_token(req: &WsRequest, state: &Arc<GatewayState
             Ok(p) => p,
             Err(res) => return res,
         };
-        if let Err(e) = crate::cloud::session::set_token(&params.token).await {
+        if let Err(e) = crate::cloud::session::set_token(&state.secrets, &params.token).await {
             return WsResponse::err(&req.id, "INTERNAL", e.to_string());
         }
-        match crate::cloud::client::CloudClient::new(&cfg, params.token.clone())
-            .me()
-            .await
+        match crate::cloud::client::CloudClient::new(
+            &cfg,
+            params.token.clone(),
+            state.secrets.clone(),
+        )
+        .me()
+        .await
         {
             Ok(Some(v)) => {
                 // Same unwrap as `cloud_status_json`: /auth/me wraps the
@@ -119,7 +123,7 @@ pub(crate) async fn handle_cloud_token(req: &WsRequest, state: &Arc<GatewayState
                 // Best-effort device registration (P2-9): a stable device
                 // identity for future cloud sync. Never fails the login on
                 // bind errors (mirrors the removed REST token handler).
-                if let Err(e) = crate::cloud::device::bind(&cfg).await {
+                if let Err(e) = crate::cloud::device::bind(&cfg, state.secrets.clone()).await {
                     tracing::warn!("Cloud device bind failed: {e}");
                 }
                 WsResponse::ok(&req.id, serde_json::json!({ "ok": true, "user": user }))
@@ -136,10 +140,14 @@ pub(crate) async fn handle_cloud_token(req: &WsRequest, state: &Arc<GatewayState
 }
 
 /// `cloud.logout` — forget the stored session token.
-pub(crate) async fn handle_cloud_logout(req: &WsRequest, _state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_cloud_logout(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
     #[cfg(feature = "cloud")]
     {
-        let _ = crate::cloud::session::clear_token().await;
+        let _ = crate::cloud::session::clear_token(&state.secrets).await;
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let _ = state;
     }
     WsResponse::ok(&req.id, serde_json::json!({ "ok": true }))
 }
@@ -160,10 +168,10 @@ pub(crate) async fn cloud_api_client(
     if !cfg.enabled {
         return Err(cloud_unavailable(req));
     }
-    let Some(token) = crate::cloud::session::get_token().await else {
+    let Some(token) = crate::cloud::session::get_token(&state.secrets).await else {
         return Err(cloud_unavailable(req));
     };
-    Ok(crate::cloud::client::CloudClient::new(&cfg, token))
+    Ok(crate::cloud::client::CloudClient::new(&cfg, token, state.secrets.clone()))
 }
 
 /// KB-specific alias of [`cloud_api_client`].

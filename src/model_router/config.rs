@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model_router::auth_profile::{AuthKeyConfig, AuthProfileConfig};
-use crate::secrets::StoreRef;
+use crate::secrets::{SecretStoreHandle, StoreRef};
 
 // ------------------------------------------------------------------
 // OAuthConfig
@@ -185,8 +185,12 @@ impl ProviderConfig {
 
     /// Get the effective API key to use for provider creation.
     /// Prefers auth_profile keys, then api_keys, then single api_key (inline
-    /// value, or a store ref resolved via the secret store).
-    pub async fn effective_key(&self) -> String {
+    /// value, or a store ref resolved via the secret-store handle).
+    ///
+    /// A `StoreRef` needs a [`SecretStoreHandle`] to resolve; callers without
+    /// one (e.g. a bare config inspection that knows the key is inline) may
+    /// pass `None`, in which case a ref resolves to an empty key.
+    pub async fn effective_key(&self, secrets: Option<&SecretStoreHandle>) -> String {
         if let Some(ref profile) = self.auth_profile {
             if let Some(first) = profile.keys.first() {
                 return first.key.clone();
@@ -197,9 +201,12 @@ impl ProviderConfig {
         }
         match &self.api_key {
             ProviderKey::Inline(s) => s.clone(),
-            ProviderKey::Ref(r) => match crate::secrets::resolve_store_ref(r).await {
-                Ok(Some(v)) if !v.is_empty() => v,
-                _ => String::new(),
+            ProviderKey::Ref(r) => match secrets {
+                Some(secrets) => match secrets.resolve_store_ref(r).await {
+                    Ok(Some(v)) if !v.is_empty() => v,
+                    _ => String::new(),
+                },
+                None => String::new(),
             },
         }
     }
@@ -891,7 +898,7 @@ mod tests {
         };
 
         // api_keys takes precedence over api_key
-        assert_eq!(config.effective_key().await, "multi-key");
+        assert_eq!(config.effective_key(None).await, "multi-key");
 
         // auth_profile takes precedence over both
         config.auth_profile = Some(AuthProfileConfig {
@@ -902,14 +909,14 @@ mod tests {
             cooldown_secs: 60,
             max_failures: 3,
         });
-        assert_eq!(config.effective_key().await, "profile-key");
+        assert_eq!(config.effective_key(None).await, "profile-key");
     }
 
     #[tokio::test]
     async fn provider_config_effective_key_resolves_store_ref() {
-        // A store ref is resolved through the secret store routing; with no
-        // keyring (test build) this falls back to the file backend, which has
-        // no entry for the synthetic id → empty key.
+        // With no secret-store handle the ref cannot be resolved → empty key.
+        // With a handle rooted at a temp dir, the ref still resolves to empty
+        // because no entry exists for the synthetic id.
         let config = ProviderConfig {
             provider_type: ProviderType::OpenAi,
             models: vec!["gpt-4o".to_string()],
@@ -923,7 +930,12 @@ mod tests {
             max_retries: 3,
             retry_delay_ms: 1000,
         };
-        assert_eq!(config.effective_key().await, "");
+        assert_eq!(config.effective_key(None).await, "");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let handle =
+            crate::secrets::SecretStoreHandle::with_root(tmp.path().to_path_buf()).expect("handle");
+        assert_eq!(config.effective_key(Some(&handle)).await, "");
     }
 
     #[test]

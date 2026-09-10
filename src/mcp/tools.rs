@@ -299,7 +299,7 @@ pub struct McpConnectionTool {
 impl McpConnectionTool {
     pub fn new() -> Self {
         Self {
-            manager: Arc::new(McpManager::new()),
+            manager: Arc::new(McpManager::default()),
             connectors: None,
         }
     }
