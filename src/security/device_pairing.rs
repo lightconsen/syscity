@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use super::auth_store::{self, AuthStore, StoredDevice};
+
 /// A pending device pairing request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingDeviceRequest {
@@ -47,7 +49,16 @@ pub struct AuthorizedDevice {
     pub display_name: Option<String>,
     pub public_key: Option<String>,
     /// Device token used for re-authentication.
+    ///
+    /// Populated with the plaintext token only for a device approved in this
+    /// process; devices restored from persistence leave this empty (the
+    /// plaintext is unrecoverable by design) and authenticate via
+    /// [`DevicePairingStore::validate_token`] against `token_hash`.
     pub token: String,
+    /// SHA-256 digest of `token` — the only form written to disk and the
+    /// value matched during validation. Never serialized over the wire.
+    #[serde(skip)]
+    pub token_hash: String,
     pub authorized_at: SystemTime,
     pub approved_by: Option<String>,
 }
@@ -75,6 +86,10 @@ pub struct DevicePairingStore {
     default_ttl: Duration,
     /// Max total pending requests allowed (across all devices).
     max_pending: usize,
+    /// Optional SQLite persistence for authorized devices. `None` keeps the
+    /// store purely in-memory (unchanged behavior for tests / non-sqlite
+    /// deployments).
+    store: Option<Arc<AuthStore>>,
 }
 
 impl Default for DevicePairingStore {
@@ -85,6 +100,7 @@ impl Default for DevicePairingStore {
             authorized: Arc::new(RwLock::new(HashMap::new())),
             default_ttl: Duration::from_secs(3600),
             max_pending: 100,
+            store: None,
         }
     }
 }
@@ -102,7 +118,29 @@ impl DevicePairingStore {
             authorized: Arc::new(RwLock::new(HashMap::new())),
             default_ttl,
             max_pending,
+            store: None,
         }
+    }
+
+    /// Attach a persistent store and restore previously authorized devices.
+    ///
+    /// Only hashed tokens are read back; restored devices expose an empty
+    /// `token` field but still authenticate through [`Self::validate_token`]
+    /// against their stored digest. Revoked devices leave no row behind, so
+    /// they are rejected after a restart.
+    pub async fn with_persistence(mut self, store: Arc<AuthStore>) -> crate::Result<Self> {
+        store.init_schema().await?;
+        let loaded = store.load_devices().await?;
+        let restored = loaded.len();
+        {
+            let mut auth = self.authorized.write().await;
+            for device in loaded {
+                auth.insert(device.device_id.clone(), device.into_authorized());
+            }
+        }
+        self.store = Some(store);
+        info!("Restored {} authorized device(s) from persistence", restored);
+        Ok(self)
     }
 
     /// Request device pairing access.
@@ -192,17 +230,28 @@ impl DevicePairingStore {
             display_name: req.display_name.clone(),
             public_key: req.public_key.clone(),
             token: token.clone(),
+            token_hash: auth_store::hash_device_token(&token),
             authorized_at: SystemTime::now(),
             approved_by: approved_by.map(|s| s.to_string()),
         };
 
         {
             let mut auth = self.authorized.write().await;
-            auth.insert(req.device_id.clone(), dev);
+            auth.insert(req.device_id.clone(), dev.clone());
         }
         {
             let mut index = self.pending_index.write().await;
             index.remove(&req.device_id);
+        }
+
+        // Write through to the store; only the token digest is persisted.
+        if let Some(ref store) = self.store {
+            if let Err(e) = store
+                .upsert_device(&StoredDevice::from_authorized(&dev))
+                .await
+            {
+                warn!("Failed to persist authorized device {}: {}", dev.device_id, e);
+            }
         }
 
         info!(
@@ -228,16 +277,34 @@ impl DevicePairingStore {
     }
 
     /// Revoke an authorized device.
+    ///
+    /// Removes the in-memory entry and deletes the persisted row, so a
+    /// revoked device stays revoked across a restart.
     pub async fn revoke(&self, device_id: &str) -> bool {
-        let mut auth = self.authorized.write().await;
-        auth.remove(device_id).is_some()
+        let removed = {
+            let mut auth = self.authorized.write().await;
+            auth.remove(device_id).is_some()
+        };
+        if removed {
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.delete_device(device_id).await {
+                    warn!("Failed to delete revoked device {} from store: {}", device_id, e);
+                }
+            }
+        }
+        removed
     }
 
     /// Check if a device token is valid.
+    ///
+    /// The presented plaintext token is hashed and compared (in constant
+    /// time) against each device's stored digest, so validation works for
+    /// devices restored from persistence where the plaintext is unavailable.
     pub async fn validate_token(&self, token: &str) -> Option<String> {
+        let presented = auth_store::hash_device_token(token);
         let auth = self.authorized.read().await;
         for (device_id, dev) in auth.iter() {
-            if dev.token == token {
+            if auth_store::token_hash_eq(&dev.token_hash, &presented) {
                 return Some(device_id.clone());
             }
         }

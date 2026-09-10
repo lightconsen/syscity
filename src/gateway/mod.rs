@@ -310,6 +310,7 @@ impl Gateway {
         let unified_vector_store = storage_init.unified_vector_store;
         let sqlite_pool = storage_init.sqlite_pool;
         let session_store = storage_init.session_store;
+        let auth_store = storage_init.auth_store;
         let feedback_store = storage_init.feedback_store;
         let pending_badcase_store = storage_init.pending_badcase_store;
         let decision_trace_store = storage_init.decision_trace_store;
@@ -375,7 +376,9 @@ impl Gateway {
         )
         .await;
 
-        let security_init = init::security::init_security(&config, audit_log_dyn.clone()).await?;
+        let security_init =
+            init::security::init_security(&config, audit_log_dyn.clone(), auth_store.clone())
+                .await?;
 
         let pipelines_init = init::pipelines::init_pipelines(
             &config,
@@ -384,6 +387,15 @@ impl Gateway {
             routed_tx.clone(),
         )
         .await?;
+
+        // Restore previously paired devices and keep new pairings durable.
+        let device_pairing_store = {
+            let store = crate::security::device_pairing::DevicePairingStore::new();
+            match auth_store.as_ref() {
+                Some(auth) => store.with_persistence(auth.clone()).await?,
+                None => store,
+            }
+        };
 
         let state = Arc::new(GatewayState {
             config: Arc::new(RwLock::new(Arc::new(config.clone()))),
@@ -395,9 +407,7 @@ impl Gateway {
             auth: AuthState {
                 manager: security_init.auth_manager.clone(),
                 pairing_store: Arc::new(crate::security::pairing::PairingStore::new()),
-                device_pairing_store: Arc::new(
-                    crate::security::device_pairing::DevicePairingStore::new(),
-                ),
+                device_pairing_store: Arc::new(device_pairing_store),
                 tailscale_authenticator: {
                     let ttl = config.security.tailscale_auth_ttl_secs;
                     Some(Arc::new(crate::security::tailscale::TailscaleAuthenticator::new(

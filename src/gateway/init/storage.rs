@@ -17,6 +17,7 @@ use crate::gateway::GatewayConfig;
 #[cfg(feature = "sqlite-vec")]
 use crate::rag::sqlite_vec_store::SqliteVecStore;
 use crate::rag::VectorStore;
+use crate::security::auth_store::AuthStore;
 use crate::security::persistent_audit::PersistentAuditLog;
 use crate::security::runtime_audit::AuditLogger;
 
@@ -26,6 +27,9 @@ pub struct StorageInit {
     pub unified_vector_store: Option<Arc<dyn VectorStore>>,
     pub sqlite_pool: Option<sqlx::SqlitePool>,
     pub session_store: Option<Arc<SessionStore>>,
+    /// SQLite persistence handle for auth sessions / device pairings. `None`
+    /// when the deployment is non-sqlite (auth stays in-memory).
+    pub auth_store: Option<Arc<AuthStore>>,
     pub feedback_store: Option<Arc<FeedbackStore>>,
     pub pending_badcase_store: Option<Arc<PendingBadcaseStore>>,
     pub decision_trace_store: Option<Arc<DecisionTraceStore>>,
@@ -119,6 +123,13 @@ pub async fn init_storage(config: &GatewayConfig) -> crate::Result<StorageInit> 
         None
     };
 
+    // Auth sessions / device pairings share the same database as the rest of
+    // the harness. Schema is created when the store is attached to the auth
+    // manager / device pairing store at gateway startup.
+    let auth_store: Option<Arc<AuthStore>> = sqlite_pool
+        .as_ref()
+        .map(|pool| Arc::new(AuthStore::new(pool.clone())));
+
     let audit_log: Arc<PersistentAuditLog> = if let Some(ref pool) = sqlite_pool {
         Arc::new(PersistentAuditLog::with_pool(pool.clone()))
     } else {
@@ -174,6 +185,7 @@ pub async fn init_storage(config: &GatewayConfig) -> crate::Result<StorageInit> 
         unified_vector_store,
         sqlite_pool,
         session_store,
+        auth_store,
         feedback_store,
         pending_badcase_store,
         decision_trace_store,

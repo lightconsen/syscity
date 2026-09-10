@@ -11,8 +11,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::security::auth_store::{AuthStore, StoredSession};
 use crate::security::runtime_audit::AuditEventType;
 
 /// Unique identifier for a user
@@ -81,6 +82,10 @@ pub struct AuthManager {
     pairing_required: bool,
     /// Optional audit logger for auth events
     audit_log: Option<Arc<dyn AuditLogger>>,
+    /// Optional SQLite persistence. When present the DB is the source of
+    /// truth and the maps above are a write-through fast path; when absent
+    /// the manager is purely in-memory (unchanged behavior).
+    store: Option<Arc<AuthStore>>,
 }
 
 /// Session information
@@ -116,6 +121,45 @@ impl AuthManager {
     pub fn with_audit_log(mut self, audit_log: Arc<dyn AuditLogger>) -> Self {
         self.audit_log = Some(audit_log);
         self
+    }
+
+    /// Attach a persistent store and restore surviving sessions into the
+    /// in-memory fast path.
+    ///
+    /// Expired rows are pruned before loading. Only hashed token material is
+    /// read back, so a restored session's `token` field carries its digest;
+    /// validation still works because callers present the plaintext, which is
+    /// hashed before lookup.
+    pub async fn with_persistence(mut self, store: Arc<AuthStore>) -> crate::Result<Self> {
+        store.init_schema().await?;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match store.delete_expired_sessions(now_ms).await {
+            Ok(0) => {}
+            Ok(n) => debug!("Pruned {} expired session(s) on startup", n),
+            Err(e) => warn!("Failed to prune expired sessions on startup: {}", e),
+        }
+
+        let loaded = store.load_sessions().await?;
+        let mut restored = 0usize;
+        {
+            let mut sessions = self.sessions.write().await;
+            for (token_hash, stored) in loaded {
+                match stored.into_session(&token_hash) {
+                    Some(session) if session.expires_at.timestamp_millis() > now_ms => {
+                        sessions.insert(token_hash, session);
+                        restored += 1;
+                    }
+                    // Expired or unrepresentable: skip; the row was either
+                    // just pruned or is dropped on next access.
+                    _ => {}
+                }
+            }
+        }
+
+        self.store = Some(store);
+        info!("Auth manager restored {} persisted session(s)", restored);
+        Ok(self)
     }
 
     /// Register a new user
@@ -184,8 +228,19 @@ impl AuthManager {
             scopes: resolved_scopes,
         };
 
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(token, session.clone());
+        // Key the fast path by the token digest (never the plaintext) so the
+        // in-memory map and the persisted map share one addressing scheme.
+        let token_hash = auth_store::hash_session_token(&token);
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(token_hash.clone(), session.clone());
+        }
+        if let Some(ref store) = self.store {
+            let stored = StoredSession::from_session(&session);
+            if let Err(e) = store.upsert_session(&token_hash, &stored).await {
+                warn!("Failed to persist session for user {}: {}", user_id, e);
+            }
+        }
 
         if let Some(ref audit) = self.audit_log {
             audit
@@ -209,8 +264,9 @@ impl AuthManager {
 
     /// Validate that a session has all required scopes
     pub async fn validate_scopes(&self, token: &str, required: &[&str]) -> bool {
+        let token_hash = auth_store::hash_session_token(token);
         let sessions = self.sessions.read().await;
-        let Some(session) = sessions.get(token) else {
+        let Some(session) = sessions.get(&token_hash) else {
             return false;
         };
         if session.expires_at <= chrono::Utc::now() {
@@ -226,12 +282,28 @@ impl AuthManager {
     }
 
     /// Validate a session token
+    ///
+    /// Reads the in-memory fast path first; on a cache miss (or a stale
+    /// in-memory entry) it consults the store, which is the source of truth.
+    /// Expired sessions are rejected and their rows cleaned up opportunistically.
     pub async fn validate_session(&self, token: &str) -> Option<Session> {
-        let sessions = self.sessions.read().await;
-        let result = sessions
-            .get(token)
-            .cloned()
-            .filter(|s| s.expires_at > chrono::Utc::now());
+        let token_hash = auth_store::hash_session_token(token);
+        let now = chrono::Utc::now();
+
+        let cached = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&token_hash).cloned()
+        };
+
+        let result = match cached {
+            Some(session) if session.expires_at > now => Some(session),
+            Some(_) => {
+                // Stale in-memory entry: evict, then fall back to the store.
+                self.sessions.write().await.remove(&token_hash);
+                self.load_session_from_store(&token_hash, now).await
+            }
+            None => self.load_session_from_store(&token_hash, now).await,
+        };
 
         if let Some(ref audit) = self.audit_log {
             if let Some(ref session) = result {
@@ -264,12 +336,56 @@ impl AuthManager {
         result
     }
 
+    /// Load a session from the store, warming the in-memory fast path.
+    ///
+    /// Returns `None` when there is no store, no row, an expired row (which is
+    /// deleted), or an unrepresentable timestamp.
+    async fn load_session_from_store(
+        &self,
+        token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<Session> {
+        let store = self.store.as_ref()?;
+        let stored = match store.load_session(token_hash).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!("Failed to load session from store: {}", e);
+                return None;
+            }
+        };
+
+        if stored.expires_at_ms <= now.timestamp_millis() {
+            if let Err(e) = store.delete_session(token_hash).await {
+                warn!("Failed to delete expired session row: {}", e);
+            }
+            return None;
+        }
+
+        let session = stored.into_session(token_hash)?;
+        self.sessions
+            .write()
+            .await
+            .insert(token_hash.to_string(), session.clone());
+        Some(session)
+    }
+
     /// Revoke a session
+    ///
+    /// Removes it from the fast path and deletes the persisted row, so a
+    /// revoked session stays revoked across a restart.
     pub async fn revoke_session(&self, token: &str) -> bool {
+        let token_hash = auth_store::hash_session_token(token);
         let session = {
             let mut sessions = self.sessions.write().await;
-            sessions.remove(token)
+            sessions.remove(&token_hash)
         };
+
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.delete_session(&token_hash).await {
+                warn!("Failed to delete revoked session row: {}", e);
+            }
+        }
 
         if let Some(ref session) = session {
             if let Some(ref audit) = self.audit_log {
@@ -956,6 +1072,278 @@ mod tests {
         assert!(validations[1].allowed);
         assert_eq!(validations[1].actor, "token_user");
     }
+
+    // ── Persistence (T1: sessions + device pairings survive restart) ────────
+
+    use crate::security::device_pairing::{DeviceAccessResult, DevicePairingStore};
+
+    /// Open a file-backed SQLite pool so writes are visible across "restart"
+    /// (a fresh `AuthManager` / `DevicePairingStore` over the same database).
+    async fn persistence_pool(dir: &std::path::Path) -> sqlx::SqlitePool {
+        let db_path = dir.join("auth-persistence-test.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("open file-backed sqlite pool")
+    }
+
+    /// Request + approve a pairing, returning the plaintext device token.
+    async fn pair_device(store: &DevicePairingStore, device_id: &str) -> String {
+        let code = match store
+            .request_access(device_id, Some("Test Device"), None)
+            .await
+        {
+            DeviceAccessResult::PairingRequired { code } => code,
+            other => panic!("expected PairingRequired, got {:?}", other),
+        };
+        store
+            .approve(&code, Some("admin"))
+            .await
+            .expect("approve returns a device token")
+    }
+
+    #[tokio::test]
+    async fn session_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+
+        let user = User::new("persist_user", "Persist User");
+        let token = {
+            let auth = AuthManager::new()
+                .with_persistence(store.clone())
+                .await
+                .unwrap();
+            auth.register_user(user.clone()).await.unwrap();
+            auth.create_session(user.id.clone(), 24, Some(vec!["chat".to_string()]))
+                .await
+                .unwrap()
+                .token
+        };
+
+        // Fresh manager over the same database — as if the process restarted.
+        let auth = AuthManager::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        let restored = auth.validate_session(&token).await;
+        assert!(restored.is_some(), "session should survive restart");
+        assert_eq!(restored.unwrap().user_id, user.id);
+        assert!(auth.validate_scopes(&token, &["chat"]).await);
+    }
+
+    #[tokio::test]
+    async fn expired_session_rejected_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+        let user = User::new("expired_user", "Expired User");
+
+        let token = {
+            let auth = AuthManager::new()
+                .with_persistence(store.clone())
+                .await
+                .unwrap();
+            auth.register_user(user.clone()).await.unwrap();
+            // TTL of 0 hours → already expired at persistence time.
+            auth.create_session(user.id.clone(), 0, None)
+                .await
+                .unwrap()
+                .token
+        };
+
+        let auth = AuthManager::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        assert!(
+            auth.validate_session(&token).await.is_none(),
+            "expired session must not validate after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_row_is_rejected_even_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+        // A manager that never loaded the store: the row must still be
+        // rejected on the store fallback path.
+        let auth = AuthManager::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+
+        let token = "manually-planted-token";
+        store
+            .upsert_session(
+                &auth_store::hash_session_token(token),
+                &StoredSession {
+                    user_id: "planted".to_string(),
+                    created_at_ms: 0,
+                    expires_at_ms: 1, // long past
+                    device_fingerprint: None,
+                    scopes: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            auth.validate_session(token).await.is_none(),
+            "a present-but-expired row must be rejected"
+        );
+        // The rejected row is cleaned up opportunistically.
+        assert_eq!(store.load_sessions().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn revoked_session_rejected_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+        let user = User::new("revoked_user", "Revoked User");
+
+        let token = {
+            let auth = AuthManager::new()
+                .with_persistence(store.clone())
+                .await
+                .unwrap();
+            auth.register_user(user.clone()).await.unwrap();
+            let token = auth
+                .create_session(user.id.clone(), 24, None)
+                .await
+                .unwrap()
+                .token;
+            assert!(auth.revoke_session(&token).await);
+            token
+        };
+
+        let auth = AuthManager::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        assert!(
+            auth.validate_session(&token).await.is_none(),
+            "revoked session must not validate after reload"
+        );
+        assert_eq!(store.load_sessions().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn device_pairing_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+
+        let token = {
+            let devices = DevicePairingStore::new()
+                .with_persistence(store.clone())
+                .await
+                .unwrap();
+            pair_device(&devices, "dev-persist").await
+        };
+
+        let devices = DevicePairingStore::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            devices.validate_token(&token).await,
+            Some("dev-persist".to_string()),
+            "device pairing should survive restart"
+        );
+        assert!(devices
+            .list_authorized()
+            .await
+            .iter()
+            .any(|d| d.device_id == "dev-persist"));
+    }
+
+    #[tokio::test]
+    async fn revoked_device_rejected_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+
+        let token = {
+            let devices = DevicePairingStore::new()
+                .with_persistence(store.clone())
+                .await
+                .unwrap();
+            let token = pair_device(&devices, "dev-revoke").await;
+            assert!(devices.revoke("dev-revoke").await);
+            token
+        };
+
+        let devices = DevicePairingStore::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        assert!(devices.validate_token(&token).await.is_none());
+        assert!(devices.list_authorized().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_plaintext_token_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = persistence_pool(dir.path()).await;
+        let store = Arc::new(AuthStore::new(pool.clone()));
+        let user = User::new("noplain_user", "NoPlain User");
+
+        let auth = AuthManager::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        auth.register_user(user.clone()).await.unwrap();
+        let session_token = auth
+            .create_session(user.id.clone(), 24, None)
+            .await
+            .unwrap()
+            .token;
+
+        let devices = DevicePairingStore::new()
+            .with_persistence(store.clone())
+            .await
+            .unwrap();
+        let device_token = pair_device(&devices, "dev-noplain").await;
+
+        // Raw read-back: the plaintext must not appear in any stored column.
+        let session_rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT token_hash, user_id, device_fingerprint, scopes_json FROM auth_sessions",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(session_rows.len(), 1);
+        for (hash, user_id, fp, scopes) in &session_rows {
+            assert_ne!(hash, &session_token);
+            assert!(!hash.contains(&session_token));
+            assert_ne!(user_id, &session_token);
+            assert_ne!(fp.as_deref(), Some(session_token.as_str()));
+            assert!(!scopes.contains(&session_token));
+            // The stored digest is exactly the expected hash.
+            assert_eq!(hash, &auth_store::hash_session_token(&session_token));
+        }
+
+        let device_rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT device_id, token_hash, display_name, approved_by FROM auth_devices",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(device_rows.len(), 1);
+        for (device_id, hash, display_name, approved_by) in &device_rows {
+            assert_ne!(device_id, &device_token);
+            assert_ne!(hash, &device_token);
+            assert!(!hash.contains(&device_token));
+            assert_ne!(display_name.as_deref(), Some(device_token.as_str()));
+            assert_ne!(approved_by.as_deref(), Some(device_token.as_str()));
+            assert_eq!(hash, &auth_store::hash_device_token(&device_token));
+        }
+    }
 }
 
 // Device fingerprinting for security tracking
@@ -1318,6 +1706,9 @@ mod secret_tests {
         assert!(!redacted.contains("abcdefghijklmnop"));
     }
 }
+
+/// SQLite persistence for authenticated sessions and device pairings
+pub mod auth_store;
 
 /// Security audit module
 pub mod audit;

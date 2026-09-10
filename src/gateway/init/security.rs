@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::gateway::rate_limit::{MultiTierRateLimitConfig, MultiTierRateLimiter, TierConfig};
 use crate::gateway::GatewayConfig;
+use crate::security::auth_store::AuthStore;
 use crate::security::mention_gate::MentionGate;
 use crate::security::runtime_audit::AuditLogger;
 use crate::security::AuthManager;
@@ -24,15 +25,21 @@ pub struct SecurityInit {
 }
 
 /// Initialize authentication, rate limiting, and command/mention gates.
+///
+/// When `auth_store` is present the auth manager loads surviving sessions from
+/// SQLite at startup so login state survives a restart.
 pub async fn init_security(
     config: &GatewayConfig,
     audit_log_dyn: Arc<dyn AuditLogger>,
+    auth_store: Option<Arc<AuthStore>>,
 ) -> crate::Result<SecurityInit> {
-    let auth_manager = Arc::new(
-        AuthManager::new()
-            .with_pairing_required(config.security.pairing_required)
-            .with_audit_log(audit_log_dyn),
-    );
+    let mut auth_manager = AuthManager::new()
+        .with_pairing_required(config.security.pairing_required)
+        .with_audit_log(audit_log_dyn);
+    if let Some(store) = auth_store {
+        auth_manager = auth_manager.with_persistence(store).await?;
+    }
+    let auth_manager = Arc::new(auth_manager);
 
     let rate_limiter = Arc::new(RateLimiter::new(
         config.security.rate_limit.capacity,
