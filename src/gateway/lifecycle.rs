@@ -104,13 +104,21 @@ pub(crate) async fn start_gateway(
 
     // Register the cloud model provider when cloud is enabled (§2.7). The
     // provider's credential is a store ref to the session token, so it
-    // resolves dynamically once the user logs in — no rebuild needed.
+    // resolves dynamically once the user logs in — no rebuild needed. The
+    // model list here is only the seed; it is refreshed from cloud
+    // `/v1/models` (see models.list). Update-or-add so a stale persisted
+    // "cloud" entry cannot make startup fail.
     #[cfg(feature = "cloud")]
     {
         let cloud_cfg = state.config.read().await.cloud.clone();
         if cloud_cfg.enabled {
-            let cfg = crate::cloud::provider::provider_config(&cloud_cfg);
-            match state.infra.model_router.add_provider("cloud", cfg).await {
+            let cfg = crate::cloud::provider::provider_config(&cloud_cfg, &[]);
+            let res = if state.infra.model_router.provider_exists("cloud").await {
+                state.infra.model_router.update_provider("cloud", cfg).await
+            } else {
+                state.infra.model_router.add_provider("cloud", cfg).await
+            };
+            match res {
                 Ok(()) => info!("Registered cloud model provider (login to use)"),
                 Err(e) => warn!("Failed to register cloud model provider: {e}"),
             }
