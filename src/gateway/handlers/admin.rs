@@ -202,8 +202,13 @@ pub(crate) async fn run_reload(state: &Arc<GatewayState>, scope_in: &str) -> ser
         let mut added = 0usize;
         let mut removed = 0usize;
 
-        // Remove providers that no longer exist in config
+        // Remove providers that no longer exist in config. The runtime-only
+        // cloud provider is never in the on-disk config, so skip it to avoid
+        // dropping it on every reload.
         for name in &current_names {
+            if name == "cloud" {
+                continue;
+            }
             if !new_providers.contains(name) {
                 if let Err(e) = state.infra.model_router.remove_provider(name).await {
                     warn!("Failed to remove provider '{}': {}", name, e);
