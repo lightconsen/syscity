@@ -303,7 +303,7 @@ pub async fn init_cron(config: &GatewayConfig, state: &Arc<GatewayState>) -> cra
         use crate::cron::cron::{AnnounceDelivery, CronScheduler};
         let (cron_scheduler, command_rx) = CronScheduler::new();
         let cron_scheduler =
-            cron_scheduler.with_store_path(crate::dirs::cron_dir().join("jobs.json"));
+            cron_scheduler.with_store_path(state.paths.cron_dir().join("jobs.json"));
         let cron_scheduler = Arc::new(Mutex::new(cron_scheduler));
 
         let (announce_tx, mut announce_rx) = mpsc::channel::<AnnounceDelivery>(64);
@@ -439,6 +439,7 @@ pub async fn init_side_effect_context(state: &Arc<GatewayState>) {
 async fn build_kb_manager(
     config: &GatewayConfig,
     sqlite_pool: Option<&sqlx::SqlitePool>,
+    paths: &crate::dirs::SyscityPaths,
 ) -> crate::Result<Arc<crate::rag::ingestion::KnowledgeBaseManager>> {
     let dimension = config.vector_memory.embedding_dimension;
 
@@ -524,7 +525,7 @@ async fn build_kb_manager(
     let pool = match sqlite_pool {
         Some(p) => p.clone(),
         None => {
-            let db_path = crate::dirs::default_memory_db();
+            let db_path = paths.default_memory_db();
             sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(2)
                 .connect(&format!("sqlite://{}", db_path.display()))
@@ -537,7 +538,7 @@ async fn build_kb_manager(
     };
 
     let vec_store: Arc<dyn crate::rag::VectorStore> = {
-        let db_path = crate::dirs::default_memory_db();
+        let db_path = paths.default_memory_db();
         Arc::new(
             crate::rag::SqliteVecStore::new(&format!("sqlite://{}", db_path.display()), dimension)
                 .await?,
@@ -572,7 +573,7 @@ pub(crate) async fn ensure_kb_manager(
     if let Some(m) = state.memory.kb_manager.read().await.clone() {
         return Ok(m);
     }
-    let manager = build_kb_manager(config, None)
+    let manager = build_kb_manager(config, None, &state.paths)
         .await
         .map_err(|e| e.to_string())?;
     *state.memory.kb_manager.write().await = Some(manager.clone());
@@ -593,13 +594,13 @@ pub async fn init_kb_manager(
 
     info!("Initializing Knowledge Base manager...");
 
-    let manager = build_kb_manager(config, sqlite_pool).await?;
+    let manager = build_kb_manager(config, sqlite_pool, &state.paths).await?;
 
     *state.memory.kb_manager.write().await = Some(manager.clone());
 
     // Auto-ingest stale/new documents on startup
     info!("KB: auto-ingesting stale/new documents...");
-    let agents_dir = crate::dirs::agents_dir();
+    let agents_dir = state.paths.agents_dir();
     if agents_dir.exists() {
         let mut read_dir = tokio::fs::read_dir(&agents_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {

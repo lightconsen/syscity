@@ -103,6 +103,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
         config_path: None,
         mcps_path: None,
         secrets: Arc::new(syscity::secrets::SecretStoreHandle::new()),
+        paths: Arc::new(syscity::dirs::SyscityPaths::from_root(tmp.path())),
         auth: syscity::gateway::state::AuthState {
             manager: Arc::new(syscity::security::AuthManager::new()),
             pairing_store: Arc::new(syscity::security::pairing::PairingStore::new()),

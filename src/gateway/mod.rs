@@ -272,6 +272,13 @@ pub struct GatewayOptions {
     /// When `None`, the bridge falls back to a `hooks.json` sibling of the
     /// config file, then to `~/.syscity/hooks.json`.
     pub hooks_file: Option<PathBuf>,
+    /// Explicit on-disk layout root for this gateway instance.
+    ///
+    /// When `None`, the gateway derives it from `SYSCITY_HOME` (or
+    /// `<home>/.syscity`), exactly as before. Tests and multi-instance hosts
+    /// can supply an arbitrary root so no code path touches the real
+    /// `~/.syscity`.
+    pub paths: Option<Arc<crate::dirs::SyscityPaths>>,
 }
 
 impl Gateway {
@@ -294,10 +301,33 @@ impl Gateway {
         let (routed_tx, routed_rx) = mpsc::channel(1000);
         let shutdown_token = CancellationToken::new();
 
+        // Explicit layout root for this instance. Supplied via options (tests /
+        // multi-instance hosts) or derived from `SYSCITY_HOME` / the default
+        // home — the latter is byte-for-byte the historical behaviour.
+        let paths = options
+            .paths
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::dirs::SyscityPaths::from_env()));
+        // Publish it as the process default so legacy free-function call sites
+        // (outside the gateway) observe the same root. Installing twice is
+        // harmless as long as the roots agree; a divergent second install keeps
+        // the first and is only logged.
+        if let Err(existing) = crate::dirs::set_default_paths(paths.clone()) {
+            if existing.root() != paths.root() {
+                debug!(
+                    existing = ?existing.root(),
+                    requested = ?paths.root(),
+                    "process-default Syscity root already set to a different path; \
+                     keeping the first"
+                );
+            }
+        }
+
         // Secret-store instance handle — owns the master key, file-store root,
         // and shared memory backend for this gateway instance. Constructed once
         // here and threaded through the runtime (state, MCP, cloud, router).
-        let secrets = Arc::new(crate::secrets::SecretStoreHandle::new());
+        // Its root follows the injected layout root so the two never diverge.
+        let secrets = Arc::new(crate::secrets::SecretStoreHandle::new_at_root(paths.secrets_dir()));
 
         // One-time migration of the legacy ~/.syscity/mcp_env store into
         // ~/.syscity/secrets/mcp-env (idempotent; no-op when absent), plus a
@@ -310,7 +340,7 @@ impl Gateway {
             warn!("Legacy mcp_tokens migration failed: {}", e);
         }
 
-        let storage_init = init::storage::init_storage(&config).await?;
+        let storage_init = init::storage::init_storage(&config, &paths).await?;
         let storage = storage_init.storage;
         let unified_vector_store = storage_init.unified_vector_store;
         let sqlite_pool = storage_init.sqlite_pool;
@@ -331,7 +361,7 @@ impl Gateway {
             .hooks_file
             .clone()
             .or_else(|| config_path.clone().map(|p| p.with_file_name("hooks.json")))
-            .unwrap_or_else(|| crate::dirs::config_dir().join("hooks.json"));
+            .unwrap_or_else(|| paths.config_dir().join("hooks.json"));
         let shell_hooks = ShellHookBridge::load(&hooks_path, Some(audit_log_dyn.clone()));
 
         // Migrate legacy (alias-era) provider/model config in place before the
@@ -411,8 +441,9 @@ impl Gateway {
             config: Arc::new(RwLock::new(Arc::new(config.clone()))),
             start_time: Instant::now(),
             config_path: config_path.clone(),
-            mcps_path: Some(crate::dirs::config_dir().join("mcp.toml")),
+            mcps_path: Some(paths.config_dir().join("mcp.toml")),
             secrets: secrets.clone(),
+            paths: paths.clone(),
             task_registry: task_registry.clone(),
             shutdown_token: shutdown_token.clone(),
             auth: AuthState {
@@ -512,23 +543,22 @@ impl Gateway {
                 storage: storage.clone(),
                 runtime_settings: Arc::new(RwLock::new(HashMap::new())),
                 transcript_store: {
-                    let store = crate::agent::TranscriptStore::new(crate::dirs::transcripts_dir());
+                    let store = crate::agent::TranscriptStore::new(paths.transcripts_dir());
                     Arc::new(store)
                 },
                 artifact_store: {
-                    let store = crate::agent::ArtifactStore::new(crate::dirs::artifacts_dir());
+                    let store = crate::agent::ArtifactStore::new(paths.artifacts_dir());
                     Arc::new(store)
                 },
                 disk_budget: {
-                    let manager = crate::agent::DiskBudgetManager::new(crate::dirs::budget_dir());
+                    let manager = crate::agent::DiskBudgetManager::new(paths.budget_dir());
                     if let Err(e) = manager.init() {
                         warn!("Failed to initialize disk budget manager: {}", e);
                     }
                     Arc::new(manager)
                 },
                 session_file_manager: {
-                    let manager =
-                        crate::agent::SessionFileManager::new(crate::dirs::session_files_dir());
+                    let manager = crate::agent::SessionFileManager::new(paths.session_files_dir());
                     if let Err(e) = manager.init().await {
                         warn!("Failed to initialize session file manager: {}", e);
                     }
@@ -629,10 +659,10 @@ impl Gateway {
             let store = session_store.clone();
             let days = config.observe.retention_days;
             let shutdown_token = shutdown_token.clone();
+            let turns_dir = paths.turns_dir();
             let retention_handle = tokio::spawn(async move {
                 let cutoff = crate::observe::prune::cutoff_date(days);
-                let (dirs, files) =
-                    crate::observe::prune::prune_turn_dirs(&crate::dirs::turns_dir(), &cutoff);
+                let (dirs, files) = crate::observe::prune::prune_turn_dirs(&turns_dir, &cutoff);
                 let db_rows = match store.as_ref() {
                     Some(s) => match s
                         .delete_metrics_before(crate::observe::prune::cutoff_ms(days))
