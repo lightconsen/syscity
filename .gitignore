@@ -84,3 +84,5 @@ lcov.info
 
 *.secret
 .e2e-tmp/
+
+*.local.md
