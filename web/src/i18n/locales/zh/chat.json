@@ -11,6 +11,8 @@
   "EntityPicker.emptyExperts": "暂无专家",
   "EntityPicker.emptySkills": "未安装技能",
   "EntityPicker.emptyConnectors": "未安装连接器",
+  "EntityPicker.searchExperts": "搜索专家…",
+  "EntityPicker.noMatches": "没有匹配的专家",
   "GoalPanel.statusRunning": "运行中",
   "GoalPanel.statusDone": "已完成",
   "GoalPanel.statusAborted": "已中止",

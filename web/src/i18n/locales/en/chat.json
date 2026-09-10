@@ -11,6 +11,8 @@
   "EntityPicker.emptyExperts": "No agents found",
   "EntityPicker.emptySkills": "No skills installed",
   "EntityPicker.emptyConnectors": "No connectors installed",
+  "EntityPicker.searchExperts": "Search experts…",
+  "EntityPicker.noMatches": "No matching experts",
   "GoalPanel.statusRunning": "Running",
   "GoalPanel.statusDone": "Completed",
   "GoalPanel.statusAborted": "Aborted",

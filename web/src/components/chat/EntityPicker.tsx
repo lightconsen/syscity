@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Plus, Check } from "lucide-react";
+import { Plus, Check, Search } from "lucide-react";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
-import { useChatStore, type ComposerChip } from "@/stores/chatStore";
+import { useChatStore, type ComposerChip, type ChipKind } from "@/stores/chatStore";
 
 interface EntityPickerProps {
   transport: SyscityWebSocketTransport;
@@ -78,14 +78,20 @@ function PickerRow({
   );
 }
 
+type TabId = Extract<ChipKind, "agent" | "skill" | "connector">;
+
 /** Composer "+" picker: attach expert / skill / connector chips to the next
  *  message. Chips are UI references only — consumed by the transport at send
  *  time (skills/agents become `mentions`; connectors are enabled pre-send).
- *  Clicking an attached row toggles it off; the panel stays open for
- *  multi-select and closes on Escape / outside pointerdown. */
+ *  Tabbed layout: Experts is single-select with a search box (attaching one
+ *  expert replaces the previous); Skills/Connectors are multi-select.
+ *  Clicking an attached row toggles it off; the panel closes on Escape /
+ *  outside pointerdown. */
 export function EntityPicker({ transport }: EntityPickerProps) {
   const { t } = useTranslation("chat");
   const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<TabId>("agent");
+  const [query, setQuery] = useState("");
   const [agents, setAgents] = useState<AgentRow[]>([]);
   const [skills, setSkills] = useState<SkillRow[]>([]);
   const [connectors, setConnectors] = useState<ConnectorRow[]>([]);
@@ -94,6 +100,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
   const [connectorsOk, setConnectorsOk] = useState(true);
   const chips = useChatStore((s) => s.pendingChips);
   const rootRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   // Fetch all three lists in parallel each time the panel opens (lists are
   // small; freshness matters more than caching). A failed fetch hides its
@@ -151,7 +158,8 @@ export function EntityPicker({ transport }: EntityPickerProps) {
     };
   }, [open, transport]);
 
-  // Close on outside pointerdown or Escape.
+  // Close on outside pointerdown or Escape. Reopen resets to the Experts tab
+  // with a cleared search.
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (e: PointerEvent) => {
@@ -170,10 +178,27 @@ export function EntityPicker({ transport }: EntityPickerProps) {
     };
   }, [open]);
 
-  const isAttached = (kind: ComposerChip["kind"], id: string) =>
+  useEffect(() => {
+    if (!open) {
+      setQuery("");
+    }
+  }, [open]);
+
+  const isAttached = (kind: ChipKind, id: string) =>
     chips.some((c) => c.kind === kind && c.id === id);
-  const toggle = (chip: ComposerChip) => {
+
+  const toggleMulti = (chip: ComposerChip) => {
     useChatStore.getState().addComposerChip(chip);
+  };
+  // Experts are single-select: attaching one replaces any previously attached.
+  const selectExpert = (chip: ComposerChip) => {
+    const store = useChatStore.getState();
+    const already = chips.some((c) => c.kind === "agent" && c.id === chip.id);
+    store.setPendingChips(
+      already
+        ? chips.filter((c) => c.kind !== "agent")
+        : [...chips.filter((c) => c.kind !== "agent"), chip]
+    );
   };
 
   const connectorStateDot = (c: ConnectorRow) => {
@@ -220,52 +245,131 @@ export function EntityPicker({ transport }: EntityPickerProps) {
       {open && (
         <div
           role="listbox"
-          className="absolute bottom-full left-0 mb-1.5 w-max min-w-72 max-w-[min(26rem,calc(100vw-4rem))] bg-card rounded-xl shadow-xl border border-subtle overflow-hidden z-50"
+          className="absolute bottom-full left-0 mb-1.5 w-80 max-w-[min(26rem,calc(100vw-4rem))] bg-card rounded-xl shadow-xl border border-subtle overflow-hidden z-50"
         >
-          <div className="max-h-80 overflow-y-auto py-1">
-            {/* Experts */}
-            {agentsOk && (
+          {/* Tab bar */}
+          <div className="flex border-b border-subtle">
+            {(
+              [
+                ["agent", t("EntityPicker.experts")],
+                ["skill", t("EntityPicker.skills")],
+                ["connector", t("EntityPicker.connectors")],
+              ] as Array<[TabId, string]>
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={tab === id}
+                onClick={() => setTab(id)}
+                className={`flex-1 px-3 py-2 text-xs font-medium transition ${
+                  tab === id
+                    ? "text-primary border-b-2 border-primary-500"
+                    : "text-secondary hover:text-primary"
+                }`}
+              >
+                {id === "agent" && chips.some((c) => c.kind === "agent") && (
+                  <Check className="inline w-3 h-3 mr-1 text-primary" />
+                )}
+                {id === "skill" && chips.some((c) => c.kind === "skill") && (
+                  <Check className="inline w-3 h-3 mr-1 text-primary" />
+                )}
+                {id === "connector" && chips.some((c) => c.kind === "connector") && (
+                  <Check className="inline w-3 h-3 mr-1 text-primary" />
+                )}
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Search box (Experts tab only) */}
+          {tab === "agent" && (
+            <div className="px-3 pt-2">
+              <div className="flex items-center gap-1.5 rounded-lg bg-black/[0.04] dark:bg-white/[0.06] px-2 py-1.5">
+                <Search className="w-3.5 h-3.5 text-secondary/70 shrink-0" />
+                <input
+                  ref={searchRef}
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    // Don't let the composer's keydown handlers steal Escape.
+                    if (e.key === "Escape") {
+                      e.stopPropagation();
+                      setQuery("");
+                    }
+                    e.stopPropagation();
+                  }}
+                  placeholder={t("EntityPicker.searchExperts")}
+                  className="flex-1 min-w-0 bg-transparent text-xs text-primary placeholder:text-secondary/60 focus:outline-none"
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="max-h-72 overflow-y-auto py-1">
+            {/* Experts: single-select + search filter */}
+            {tab === "agent" && (
               <>
-                <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wide text-secondary/70">
-                  {t("EntityPicker.experts")}
-                </div>
-                {agents.length === 0 ? (
+                {agentsOk && agents.length === 0 && (
                   <div className="px-3 py-1.5 text-xs text-secondary/70">
                     {t("EntityPicker.emptyExperts")}
                   </div>
-                ) : (
-                  agents.map((a) => (
-                    <PickerRow
-                      key={`agent-${a.id}`}
-                      emoji={a.emoji || "🤖"}
-                      label={a.display_name}
-                      description=""
-                      attached={isAttached("agent", a.id)}
-                      onClick={() =>
-                        toggle({
-                          kind: "agent",
-                          id: a.id,
-                          label: a.display_name,
-                          emoji: a.emoji || "🤖",
-                        })
-                      }
-                    />
-                  ))
                 )}
+                {!agentsOk && (
+                  <div className="px-3 py-1.5 text-xs text-secondary/70">
+                    {t("EntityPicker.emptyExperts")}
+                  </div>
+                )}
+                {agentsOk &&
+                  agents
+                    .filter(
+                      (a) =>
+                        query.trim() === "" ||
+                        a.display_name.toLowerCase().includes(query.trim().toLowerCase()) ||
+                        a.id.toLowerCase().includes(query.trim().toLowerCase())
+                    )
+                    .map((a) => (
+                      <PickerRow
+                        key={`agent-${a.id}`}
+                        emoji={a.emoji || "🤖"}
+                        label={a.display_name}
+                        description=""
+                        attached={isAttached("agent", a.id)}
+                        onClick={() =>
+                          selectExpert({
+                            kind: "agent",
+                            id: a.id,
+                            label: a.display_name,
+                            emoji: a.emoji || "🤖",
+                          })
+                        }
+                      />
+                    ))}
+                {agentsOk &&
+                  agents.length > 0 &&
+                  agents.every(
+                    (a) =>
+                      query.trim() !== "" &&
+                      !a.display_name.toLowerCase().includes(query.trim().toLowerCase()) &&
+                      !a.id.toLowerCase().includes(query.trim().toLowerCase())
+                  ) && (
+                    <div className="px-3 py-1.5 text-xs text-secondary/70">
+                      {t("EntityPicker.noMatches")}
+                    </div>
+                  )}
               </>
             )}
 
-            {/* Skills */}
-            {skillsOk && (
+            {/* Skills: multi-select */}
+            {tab === "skill" && (
               <>
-                <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wide text-secondary/70">
-                  {t("EntityPicker.skills")}
-                </div>
-                {skills.length === 0 ? (
+                {(!skillsOk || skills.length === 0) && (
                   <div className="px-3 py-1.5 text-xs text-secondary/70">
                     {t("EntityPicker.emptySkills")}
                   </div>
-                ) : (
+                )}
+                {skillsOk &&
                   skills.map((s) => (
                     <PickerRow
                       key={`skill-${s.name}`}
@@ -274,7 +378,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                       description={s.description || ""}
                       attached={isAttached("skill", s.name)}
                       onClick={() =>
-                        toggle({
+                        toggleMulti({
                           kind: "skill",
                           id: s.name,
                           label: s.name,
@@ -282,22 +386,19 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                         })
                       }
                     />
-                  ))
-                )}
+                  ))}
               </>
             )}
 
-            {/* Connectors */}
-            {connectorsOk && (
+            {/* Connectors: multi-select */}
+            {tab === "connector" && (
               <>
-                <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wide text-secondary/70">
-                  {t("EntityPicker.connectors")}
-                </div>
-                {connectors.length === 0 ? (
+                {(!connectorsOk || connectors.length === 0) && (
                   <div className="px-3 py-1.5 text-xs text-secondary/70">
                     {t("EntityPicker.emptyConnectors")}
                   </div>
-                ) : (
+                )}
+                {connectorsOk &&
                   connectors.map((c) => (
                     <PickerRow
                       key={`connector-${c.id}`}
@@ -308,7 +409,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                       stateDot={connectorStateDot(c)}
                       attached={isAttached("connector", c.id)}
                       onClick={() =>
-                        toggle({
+                        toggleMulti({
                           kind: "connector",
                           id: c.id,
                           label: c.display_name || c.id,
@@ -317,8 +418,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                         })
                       }
                     />
-                  ))
-                )}
+                  ))}
               </>
             )}
           </div>
