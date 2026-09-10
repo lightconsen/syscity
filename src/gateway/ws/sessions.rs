@@ -256,10 +256,16 @@ pub(super) async fn handle_sessions_set_model(
     // Treat an empty string the same as clearing the pin.
     let model = params.model.filter(|m| !m.is_empty());
 
-    // Validate the concrete model ID against the model router when pinning.
+    // Validate the model reference against the model router when pinning.
+    // Accepts bare ids and provider-qualified cloud refs (`cloud/<id>`).
     if let Some(ref m) = model {
-        let models = state.infra.model_router.models_with_providers().await;
-        if !models.iter().any(|(_, model_id)| model_id == m) {
+        if state
+            .infra
+            .model_router
+            .provider_for_model(m)
+            .await
+            .is_none()
+        {
             return WsResponse::err(&req.id, "MODEL_NOT_FOUND", format!("Unknown model: {}", m));
         }
     }
@@ -474,6 +480,58 @@ mod tests {
                 "r1",
                 "sessions.set_model",
                 serde_json::json!({ "session_id": "s1", "model": "no-such-model" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("MODEL_NOT_FOUND"));
+    }
+
+    /// A provider-qualified cloud ref (`cloud/<id>`) is accepted when the cloud
+    /// proxy serves the bare id; an unserved ref is still rejected.
+    #[tokio::test]
+    async fn set_model_accepts_qualified_cloud_ref() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let cloud = ProviderConfig {
+            provider_type: ProviderType::OpenAi,
+            models: vec!["deepseek-v4-pro".to_string()],
+            default_model: "deepseek-v4-pro".to_string(),
+            api_key: "test-key".to_string().into(),
+            api_keys: vec![],
+            auth_profile: None,
+            oauth: None,
+            base_url: None,
+            timeout: std::time::Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        };
+        state
+            .infra
+            .model_router
+            .add_provider("cloud", cloud)
+            .await
+            .expect("register cloud");
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_set_model(
+            &req(
+                "r1",
+                "sessions.set_model",
+                serde_json::json!({ "session_id": "s1", "model": "cloud/deepseek-v4-pro" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(res.ok, "qualified cloud ref should be accepted: {:?}", res.error);
+
+        let res = handle_sessions_set_model(
+            &req(
+                "r2",
+                "sessions.set_model",
+                serde_json::json!({ "session_id": "s1", "model": "cloud/ghost" }),
             ),
             &conn,
             &state,

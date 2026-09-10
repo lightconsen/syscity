@@ -19,10 +19,23 @@ fn provider_visible(provider: &str, logged_in: bool) -> bool {
     }
 }
 
-pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    // List (provider, model_id) pairs from provider configs + catalog.
-    let pairs = state.infra.model_router.models_with_providers().await;
+/// The id a picker row is addressed by. Cloud entries are qualified as
+/// `cloud/<id>` so a model id served by both a local provider and the proxy
+/// stays independently selectable (routing strips the qualifier upstream).
+pub(super) fn model_list_id(provider: &str, model: &str) -> String {
+    if provider == "cloud" {
+        format!("cloud/{model}")
+    } else {
+        model.to_string()
+    }
+}
 
+/// The display name of a picker row — always the bare model id.
+pub(super) fn model_list_name(_provider: &str, model: &str) -> String {
+    model.to_string()
+}
+
+pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
     // Cloud models only make sense to a signed-in session — the cloud provider
     // is registered on cloud.enabled (independent of login), so without a
     // session token its models are unusable. Hide them for anonymous users
@@ -31,6 +44,38 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
     let logged_in = crate::cloud::session::logged_in(&state.secrets).await;
     #[cfg(not(feature = "cloud"))]
     let logged_in = false;
+
+    // Refresh the cloud provider's model list from cloud `/v1/models` (TTL
+    // cached) before listing, so the picker reflects the proxy's live catalog
+    // instead of the static seed. The same fetch yields the billing
+    // multipliers; failures keep the previous list and never fail the listing.
+    #[cfg(feature = "cloud")]
+    let cloud_table = if logged_in {
+        let cloud_cfg = { state.config.read().await.cloud.clone() };
+        if cloud_cfg.enabled {
+            let table =
+                crate::cloud::multipliers::fetch_cloud_models(&cloud_cfg, &state.secrets).await;
+            if let Some(ref t) = table {
+                if let Err(e) = crate::cloud::provider::apply_discovered_models(
+                    &state.infra.model_router,
+                    &cloud_cfg,
+                    &t.ids,
+                )
+                .await
+                {
+                    warn!("Failed to apply cloud model list: {e}");
+                }
+            }
+            table
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // List (provider, model_id) pairs from provider configs + catalog.
+    let pairs = state.infra.model_router.models_with_providers().await;
 
     // Per-provider credential metadata so the UI can render the add/update form
     // (e.g. show that a key is already saved) without exposing the raw key.
@@ -52,17 +97,6 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
             .collect()
     };
 
-    // Cloud models carry a server-configured billing multiplier (credits per
-    // 1K tokens). Fetched with a TTL cache; failures keep the previous table
-    // and never fail the listing.
-    #[cfg(feature = "cloud")]
-    let cloud_multipliers = if pairs.iter().any(|(p, _)| p == "cloud") && logged_in {
-        let cloud_cfg = { state.config.read().await.cloud.clone() };
-        crate::cloud::multipliers::credit_multipliers(&cloud_cfg, &state.secrets).await
-    } else {
-        None
-    };
-
     let entries: Vec<serde_json::Value> = pairs
         .iter()
         .filter(|(provider, _model)| provider_visible(provider, logged_in))
@@ -72,8 +106,8 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
                 .cloned()
                 .unwrap_or((false, None, None));
             let entry = serde_json::json!({
-                "id": model,
-                "name": model,
+                "id": model_list_id(provider, model),
+                "name": model_list_name(provider, model),
                 "provider": provider,
                 "provider_name": crate::model_router::provider_display_name(provider),
                 "has_api_key": has_api_key,
@@ -81,13 +115,14 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
                 "base_url": base_url,
             });
             // Cloud entries carry the server-configured billing multiplier
-            // (cache above); local models never do.
+            // (same cached fetch as above); local models never do. The lookup
+            // key is the bare model id.
             #[cfg(feature = "cloud")]
             let entry = {
                 let mut entry = entry;
                 if provider == "cloud" {
-                    if let Some(table) = &cloud_multipliers {
-                        if let Some(mult) = table.get(model.as_str()) {
+                    if let Some(table) = &cloud_table {
+                        if let Some(mult) = table.multipliers.get(model.as_str()) {
                             entry["credit_multiplier"] = serde_json::json!(mult);
                         }
                     }
@@ -520,11 +555,20 @@ pub(super) async fn handle_models_add(req: &WsRequest, state: &Arc<GatewayState>
 
 /// Copy the router's live provider/default state back into `GatewayConfig` so
 /// the persisted `config.toml` matches what routing actually uses.
+///
+/// The runtime-only cloud provider is excluded: it is registered from
+/// `cloud.enabled` at startup, and persisting it would bake a stale model list
+/// (and a secret-store credential ref) into the user's config.
 pub(super) async fn sync_config_from_router(state: &GatewayState) {
     let router_config = state.infra.model_router.router_config().await;
     let mut config_guard = state.config.write().await;
     let config = Arc::make_mut(&mut config_guard);
-    config.providers = router_config.providers.clone();
+    config.providers = router_config
+        .providers
+        .iter()
+        .filter(|(name, _)| name.as_str() != "cloud")
+        .map(|(name, pcfg)| (name.clone(), pcfg.clone()))
+        .collect();
     config.model = router_config.default_model.clone();
     if let Some(provider) = router_config.provider_for_model(&config.model) {
         config.model_provider = provider.to_string();
@@ -907,6 +951,97 @@ mod tests {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
         let res = handle_models_set_default(
             &req("s", "models.set_default", serde_json::json!({ "model_id": "nope" })),
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("MODEL_NOT_FOUND"));
+    }
+
+    /// Cloud entries carry a `cloud/` qualifier so a name shared with a local
+    /// provider stays independently selectable; locals stay bare. The display
+    /// name is always the bare id.
+    #[test]
+    fn model_list_id_qualifies_cloud_and_name_is_bare() {
+        assert_eq!(model_list_id("cloud", "deepseek-v4-pro"), "cloud/deepseek-v4-pro");
+        assert_eq!(model_list_name("cloud", "deepseek-v4-pro"), "deepseek-v4-pro");
+        assert_eq!(model_list_id("deepseek", "deepseek-v4-pro"), "deepseek-v4-pro");
+        assert_eq!(model_list_name("deepseek", "deepseek-v4-pro"), "deepseek-v4-pro");
+        assert_eq!(model_list_id("openai", "gpt-4o"), "gpt-4o");
+    }
+
+    /// The runtime cloud provider is backed by a secret-store ref and a
+    /// discovered model list — persisting it would bake both into config.toml.
+    #[tokio::test]
+    async fn sync_config_from_router_excludes_cloud() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        register_provider(&state, "openai", &["gpt-4o"]).await;
+        register_provider(&state, "cloud", &["deepseek-flash"]).await;
+        sync_config_from_router(&state).await;
+        let config = state.config.read().await;
+        assert!(!config.providers.contains_key("cloud"));
+        assert!(config.providers.contains_key("openai"));
+    }
+
+    /// `cloud/<bare>` selects the cloud copy; the bare id keeps resolving to
+    /// the local provider of the same name.
+    #[tokio::test]
+    async fn models_set_default_and_remove_accept_qualified_cloud_ref() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        register_provider(&state, "deepseek", &["deepseek-v4-pro"]).await;
+        register_provider(&state, "cloud", &["deepseek-v4-pro"]).await;
+
+        let res = handle_models_set_default(
+            &req(
+                "s",
+                "models.set_default",
+                serde_json::json!({ "model_id": "cloud/deepseek-v4-pro" }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(res.ok, "qualified cloud ref accepted: {:?}", res.error);
+        assert_eq!(state.infra.model_router.get_default_model().await, "cloud/deepseek-v4-pro");
+        assert_eq!(
+            state
+                .infra
+                .model_router
+                .provider_for_model("cloud/deepseek-v4-pro")
+                .await
+                .as_deref(),
+            Some("cloud")
+        );
+
+        // The local copy is untouched and still routes locally.
+        assert_eq!(
+            state
+                .infra
+                .model_router
+                .provider_for_model("deepseek-v4-pro")
+                .await
+                .as_deref(),
+            Some("deepseek")
+        );
+
+        // Removing via the qualified ref only drops the cloud copy.
+        let res = handle_models_remove(
+            &req("r", "models.remove", serde_json::json!({ "model_id": "cloud/deepseek-v4-pro" })),
+            &state,
+        )
+        .await;
+        assert!(res.ok, "qualified cloud ref removable: {:?}", res.error);
+        let pairs = state.infra.model_router.models_with_providers().await;
+        assert!(pairs.contains(&("deepseek".to_string(), "deepseek-v4-pro".to_string())));
+        assert!(!pairs.contains(&("cloud".to_string(), "deepseek-v4-pro".to_string())));
+    }
+
+    /// A `cloud/` ref for a model cloud does not serve is still rejected.
+    #[tokio::test]
+    async fn models_set_default_rejects_cloud_ghost() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        register_provider(&state, "cloud", &["deepseek-flash"]).await;
+        let res = handle_models_set_default(
+            &req("s", "models.set_default", serde_json::json!({ "model_id": "cloud/ghost" })),
             &state,
         )
         .await;

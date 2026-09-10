@@ -177,11 +177,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn models_with_providers_attributes_duplicated_ids_deterministically() {
+    async fn models_with_providers_lists_duplicated_ids_per_provider() {
         // A direct vendor config and the cloud proxy can serve the same
-        // model ids. Attribution must not depend on HashMap iteration
-        // order: the direct provider claims duplicated ids and cloud only
-        // contributes models unique to it.
+        // model ids. The picker lists cloud and local sections independently,
+        // so each provider contributes its own copy of a duplicated id.
         let router = ModelRouter::new(ModelRouterConfig::default());
         router
             .add_provider(
@@ -201,10 +200,14 @@ mod tests {
         let models = router.models_with_providers().await;
         assert!(models.contains(&("deepseek".to_string(), "deepseek-v4-flash".to_string())));
         assert!(models.contains(&("deepseek".to_string(), "deepseek-v4-pro".to_string())));
+        assert!(models.contains(&("cloud".to_string(), "deepseek-v4-flash".to_string())));
         assert!(models.contains(&("cloud".to_string(), "deepseek-v4-flash-vision-exp".to_string())));
-        assert!(!models.contains(&("cloud".to_string(), "deepseek-v4-flash".to_string())));
+        // Every pair is unique (no per-provider duplication).
+        let unique: std::collections::HashSet<_> = models.iter().cloned().collect();
+        assert_eq!(unique.len(), models.len());
 
-        // Routing resolution follows the same convention.
+        // A duplicated bare id still routes to the direct provider; the
+        // qualified `cloud/<id>` reference selects the proxy.
         assert_eq!(
             router
                 .provider_for_model("deepseek-v4-flash")
@@ -214,11 +217,31 @@ mod tests {
         );
         assert_eq!(
             router
+                .provider_for_model("cloud/deepseek-v4-flash")
+                .await
+                .as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            router
                 .provider_for_model("deepseek-v4-flash-vision-exp")
                 .await
                 .as_deref(),
             Some("cloud")
         );
+    }
+
+    #[tokio::test]
+    async fn remove_model_strips_cloud_qualifier() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        router
+            .add_provider("cloud", test_provider_config(&["deepseek-v4-pro", "deepseek-flash"]))
+            .await
+            .unwrap();
+
+        router.remove_model("cloud/deepseek-v4-pro").await.unwrap();
+        let config = router.router_config().await;
+        assert_eq!(config.providers["cloud"].models, vec!["deepseek-flash"]);
     }
 
     #[tokio::test]

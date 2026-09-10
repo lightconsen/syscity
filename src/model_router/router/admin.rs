@@ -64,24 +64,24 @@ impl ModelRouter {
     /// catalog-discovered models. Catalog entries are only included for
     /// providers that still exist in config, so removed providers do not
     /// resurrect their models.
+    ///
+    /// A model id served by several providers is listed once **per provider**
+    /// (e.g. the local "deepseek" config and the cloud proxy both carry
+    /// "deepseek-v4-pro"): the picker shows cloud and local sections
+    /// independently, and the cloud copy is addressed as `cloud/<id>`.
     pub async fn models_with_providers(&self) -> Vec<(String, String)> {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
 
         {
             let config = self.config.read().await;
-            // HashMap iteration order is randomized per process, and two
-            // providers can serve the same model id (a direct vendor config
-            // and the cloud proxy both carry e.g. "deepseek-v4-flash").
-            // Scan providers in a deterministic order — sorted, with the
-            // cloud proxy last — so a duplicated id is attributed to its
-            // direct provider and the cloud section only lists models
-            // unique to it.
+            // HashMap iteration order is randomized per process, so scan in a
+            // deterministic order (sorted, with the cloud proxy last).
             let mut entries: Vec<_> = config.providers.iter().collect();
             entries.sort_by_key(|(name, _)| (name.as_str() == "cloud", name.as_str()));
             for (provider, pcfg) in entries {
                 for model in &pcfg.models {
-                    if seen.insert(model.clone()) {
+                    if seen.insert((provider.clone(), model.clone())) {
                         result.push((provider.clone(), model.clone()));
                     }
                 }
@@ -94,7 +94,9 @@ impl ModelRouter {
         };
 
         for entry in self.model_catalog.list().await {
-            if provider_names.contains(&entry.provider) && seen.insert(entry.id.clone()) {
+            if provider_names.contains(&entry.provider)
+                && seen.insert((entry.provider.clone(), entry.id.clone()))
+            {
                 result.push((entry.provider, entry.id));
             }
         }
@@ -111,12 +113,26 @@ impl ModelRouter {
                 return Some(provider.to_string());
             }
         }
-        self.model_catalog
-            .list()
-            .await
+        let entries = self.model_catalog.list().await;
+        // A qualified `cloud/<id>` reference must resolve to the proxy even
+        // when the bare id also appears in the catalog under another provider.
+        if let (Some("cloud"), bare) = crate::model_router::parse_model_ref(model_id) {
+            if let Some(e) = entries
+                .iter()
+                .find(|e| e.provider == "cloud" && e.id == bare)
+            {
+                return Some(e.provider.clone());
+            }
+        }
+        entries
             .into_iter()
             .find(|e| e.id == model_id)
             .map(|e| e.provider)
+    }
+
+    /// Whether the cloud proxy serves the given bare model id.
+    pub async fn cloud_serves_model(&self, bare: &str) -> bool {
+        self.config.read().await.cloud_serves(bare)
     }
 
     /// Switch the default model to a concrete model ID.
@@ -425,6 +441,10 @@ impl ModelRouter {
             }
         })?;
 
+        // The provider stores bare ids, while the caller may pass a
+        // provider-qualified reference (`cloud/<id>`).
+        let bare_id = crate::model_router::parse_model_ref(model_id).1;
+
         let provider_emptied = {
             let mut config = self.config.write().await;
             let Some(pcfg) = config.providers.get_mut(&provider_name) else {
@@ -434,7 +454,7 @@ impl ModelRouter {
                 }
                 .into());
             };
-            pcfg.models.retain(|m| m != model_id);
+            pcfg.models.retain(|m| m != bare_id);
             pcfg.models.is_empty()
         };
 

@@ -35,10 +35,10 @@ pub use auth_profile::{
 pub use auth_profile_store::AuthProfileStore;
 pub use classifier::{KeywordTaskClassifier, TaskClassifierImpl};
 pub use config::{
-    provider_display_name, provider_preset_for_name, provider_presets, CircuitState,
-    CostAwareConfig, FallbackEntry, ModelCost, ModelRouterConfig, OAuthConfig, ProviderConfig,
-    ProviderHealth, ProviderHealthInfo, ProviderInfo, ProviderKey, ProviderPreset, ProviderType,
-    TaskRoutingRule, TaskType,
+    parse_model_ref, provider_display_name, provider_preset_for_name, provider_presets,
+    CircuitState, CostAwareConfig, FallbackEntry, ModelCost, ModelRouterConfig, OAuthConfig,
+    ProviderConfig, ProviderHealth, ProviderHealthInfo, ProviderInfo, ProviderKey, ProviderPreset,
+    ProviderType, TaskRoutingRule, TaskType,
 };
 pub use failure_class::FailureClass;
 pub use gateway_client::{GatewayClient, HttpGatewayClient};

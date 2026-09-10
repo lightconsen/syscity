@@ -116,8 +116,14 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
         let agent_id = params.path["agent_models.".len()..].to_string();
         match params.value.as_str().filter(|s| !s.is_empty()) {
             Some(v) => {
-                let models = state.infra.model_router.models_with_providers().await;
-                if !models.iter().any(|(_, id)| id == v) {
+                // Accepts bare ids and provider-qualified cloud refs.
+                if state
+                    .infra
+                    .model_router
+                    .provider_for_model(v)
+                    .await
+                    .is_none()
+                {
                     return WsResponse::err(
                         &req.id,
                         "MODEL_NOT_FOUND",
@@ -576,6 +582,27 @@ mod tests {
         assert!(!res.ok);
         assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("MODEL_NOT_FOUND"));
         assert!(!state.config.read().await.agent_models.contains_key("main"));
+    }
+
+    /// A provider-qualified cloud ref is a valid agent binding; a `cloud/` ref
+    /// for an unserved id is not.
+    #[tokio::test]
+    async fn config_set_agent_models_accepts_qualified_cloud_ref() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        register_provider(&state, "cloud", &["deepseek-v4-pro"]).await;
+
+        let res =
+            set_and_ok(&state, "agent_models.main", serde_json::json!("cloud/deepseek-v4-pro"))
+                .await;
+        assert!(res.ok, "qualified cloud ref should bind: {:?}", res.error);
+        assert_eq!(
+            state.config.read().await.agent_models.get("main").cloned(),
+            Some("cloud/deepseek-v4-pro".into())
+        );
+
+        let res = set_and_ok(&state, "agent_models.other", serde_json::json!("cloud/ghost")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("MODEL_NOT_FOUND"));
     }
 
     #[tokio::test]

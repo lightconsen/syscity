@@ -110,7 +110,18 @@ impl ModelRouter {
     ) -> crate::Result<(String, String, CompletionRequest)> {
         let (provider, resolved_model) = {
             if let Some(provider) = self.provider_for_model(model_id).await {
-                (provider, model_id.to_string())
+                // A genuine `cloud/<id>` reference keeps the cloud proxy but
+                // must reach the upstream (and observability, cost, cache) as
+                // the bare model id.
+                let bare = match crate::model_router::parse_model_ref(model_id) {
+                    (Some("cloud"), rest)
+                        if provider == "cloud" && self.cloud_serves_model(rest).await =>
+                    {
+                        rest.to_string()
+                    }
+                    _ => model_id.to_string(),
+                };
+                (provider, bare)
             } else {
                 let default_model = self.get_default_model().await;
                 let provider = self
@@ -422,5 +433,93 @@ mod tests {
             .await
             .expect("complete should succeed");
         assert_eq!(response.message.content, "ok");
+    }
+
+    /// Minimal OpenAI-compatible provider config for routing tests.
+    fn pcfg(models: &[&str]) -> crate::model_router::ProviderConfig {
+        use crate::model_router::{ProviderConfig, ProviderType};
+        ProviderConfig {
+            provider_type: ProviderType::OpenAi,
+            models: models.iter().map(|s| s.to_string()).collect(),
+            default_model: models.first().map(|s| s.to_string()).unwrap_or_default(),
+            api_key: "test-key".to_string().into(),
+            api_keys: vec![],
+            auth_profile: None,
+            oauth: None,
+            base_url: None,
+            timeout: std::time::Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        }
+    }
+
+    /// `cloud/<bare>` selects the cloud proxy, and the model that reaches the
+    /// upstream is the bare id (no `cloud/` leak into requests/observability).
+    #[tokio::test]
+    async fn build_request_routes_qualified_cloud_ref_to_cloud_with_bare_model() {
+        let router = ModelRouter::new(crate::model_router::config::ModelRouterConfig::default());
+        router
+            .add_provider("deepseek", pcfg(&["deepseek-v4-pro"]))
+            .await
+            .unwrap();
+        router
+            .add_provider("cloud", pcfg(&["deepseek-v4-pro", "deepseek-flash"]))
+            .await
+            .unwrap();
+
+        let (provider, model, request) = router
+            .build_request("cloud/deepseek-v4-pro", vec![Message::user("hi")], None, false)
+            .await
+            .expect("qualified ref should route");
+        assert_eq!(provider, "cloud");
+        assert_eq!(model, "deepseek-v4-pro");
+        assert_eq!(request.model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    /// A bare duplicate id keeps resolving to the non-cloud provider (the
+    /// pre-existing default), so current sessions are unaffected.
+    #[tokio::test]
+    async fn build_request_bare_duplicate_resolves_local() {
+        let router = ModelRouter::new(crate::model_router::config::ModelRouterConfig::default());
+        router
+            .add_provider("deepseek", pcfg(&["deepseek-v4-pro"]))
+            .await
+            .unwrap();
+        router
+            .add_provider("cloud", pcfg(&["deepseek-v4-pro"]))
+            .await
+            .unwrap();
+
+        let (provider, model, request) = router
+            .build_request("deepseek-v4-pro", vec![Message::user("hi")], None, false)
+            .await
+            .expect("bare ref should route");
+        assert_eq!(provider, "deepseek");
+        assert_eq!(model, "deepseek-v4-pro");
+        assert_eq!(request.model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    /// A `cloud/` ref for a model the proxy does not serve is unknown and falls
+    /// back to the global default model.
+    #[tokio::test]
+    async fn build_request_cloud_ghost_falls_back_to_default() {
+        let mut config = crate::model_router::config::ModelRouterConfig::default();
+        config.default_model = "local-default".to_string();
+        let router = ModelRouter::new(config);
+        router
+            .add_provider("local", pcfg(&["local-default"]))
+            .await
+            .unwrap();
+        router
+            .add_provider("cloud", pcfg(&["deepseek-flash"]))
+            .await
+            .unwrap();
+
+        let (provider, model, _) = router
+            .build_request("cloud/ghost", vec![Message::user("hi")], None, false)
+            .await
+            .expect("unknown ref falls back to default");
+        assert_eq!(provider, "local");
+        assert_eq!(model, "local-default");
     }
 }

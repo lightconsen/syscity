@@ -188,9 +188,11 @@ impl Agent {
             }
         }
 
-        // Snapshot what is about to be sent (one row per LLM request).
+        // Snapshot what is about to be sent (one row per LLM request). The
+        // routing ref may carry a `cloud/` qualifier; store the bare model id.
         let model_id = self.resolve_model_id(context.id()).await;
-        self.persist_request_snapshot(context, &model_id, &tools);
+        let snapshot_model = crate::model_router::parse_model_ref(&model_id).1;
+        self.persist_request_snapshot(context, snapshot_model, &tools);
 
         // Get completion — use model router when available for key rotation /
         // fallback. If the provider rejects the request as over its context
@@ -503,9 +505,13 @@ impl Agent {
         // Notify generating (starting)
         (progress_cb)(ProgressEvent::Generating { content: None }).await;
 
-        // Snapshot what is about to be sent (one row per LLM request).
+        // Snapshot what is about to be sent (one row per LLM request). The
+        // routing ref may carry a `cloud/` qualifier; store/emit the bare id.
         let model_id = self.resolve_model_id(context.id()).await;
-        self.persist_request_snapshot(context, &model_id, &tools);
+        let bare_model = crate::model_router::parse_model_ref(&model_id)
+            .1
+            .to_string();
+        self.persist_request_snapshot(context, &bare_model, &tools);
 
         // Snapshot the full request messages (untruncated) for the observability
         // full-trace input. Captured before the stream-setup loop below because
@@ -538,7 +544,7 @@ impl Agent {
                 (
                     stream,
                     crate::providers::stream_wrappers::ProviderStreamFamily::Generic,
-                    model_id.clone(),
+                    bare_model.clone(),
                     provider,
                     route_record,
                 )

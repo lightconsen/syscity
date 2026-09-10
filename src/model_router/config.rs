@@ -759,15 +759,48 @@ impl Default for ModelRouterConfig {
     }
 }
 
+/// Prefix that qualifies a model reference as belonging to the cloud proxy.
+const CLOUD_REF_PREFIX: &str = "cloud/";
+
+/// Split a provider-qualified model reference into `(provider_hint, bare_id)`.
+///
+/// Only the cloud proxy may be qualified (`cloud/<bare-id>`), because that is
+/// the one provider whose model ids can collide with a directly-configured
+/// provider. Bare ids return `(None, id)` unchanged. The split is purely
+/// syntactic — whether the cloud provider actually serves the bare id is
+/// decided by the caller via [`ModelRouterConfig::cloud_serves`].
+///
+/// An empty remainder (`"cloud/"`) is not a qualification and is returned
+/// verbatim as a bare id.
+pub fn parse_model_ref(model_ref: &str) -> (Option<&str>, &str) {
+    match model_ref.strip_prefix(CLOUD_REF_PREFIX) {
+        Some(rest) if !rest.is_empty() => (Some("cloud"), rest),
+        _ => (None, model_ref),
+    }
+}
+
 impl ModelRouterConfig {
+    /// Whether the cloud proxy serves the given bare model id.
+    pub fn cloud_serves(&self, bare: &str) -> bool {
+        self.providers
+            .get("cloud")
+            .is_some_and(|p| p.supports_model(bare))
+    }
+
     /// Find the provider name that owns the given concrete model ID.
     ///
     /// Deterministic when several providers serve the same model (a direct
     /// vendor config and the cloud proxy both carry e.g.
-    /// "deepseek-v4-flash"): the non-cloud provider wins so routing is
+    /// "deepseek-v4-flash"): an explicit `cloud/<id>` reference selects the
+    /// cloud proxy; otherwise the non-cloud provider wins so routing is
     /// stable across restarts and direct-capable calls are not metered
     /// through the proxy by accident.
     pub fn provider_for_model(&self, model_id: &str) -> Option<&str> {
+        if let (Some(_), bare) = parse_model_ref(model_id) {
+            if self.cloud_serves(bare) {
+                return Some("cloud");
+            }
+        }
         let direct = self
             .providers
             .iter()
@@ -1049,5 +1082,67 @@ mod tests {
         assert_eq!(config.provider_for_model("deepseek-v4-pro"), Some("deepseek"));
         assert_eq!(config.provider_for_model("deepseek-v4-flash-vision-exp"), Some("cloud"));
         assert_eq!(config.provider_for_model("gpt-4o"), None);
+
+        // A `cloud/<id>` reference selects the proxy even when the bare id
+        // also exists on a direct provider; unserved cloud ids resolve to None.
+        assert_eq!(config.provider_for_model("cloud/deepseek-v4-flash"), Some("cloud"));
+        assert_eq!(config.provider_for_model("cloud/deepseek-v4-flash-vision-exp"), Some("cloud"));
+        // The proxy does not serve this id, so the qualification is not real.
+        assert_eq!(config.provider_for_model("cloud/deepseek-v4-pro"), None);
+        assert_eq!(config.provider_for_model("cloud/ghost"), None);
+    }
+
+    #[test]
+    fn parse_model_ref_splits_only_cloud_prefix() {
+        assert_eq!(parse_model_ref("deepseek-v4-pro"), (None, "deepseek-v4-pro"));
+        assert_eq!(parse_model_ref("cloud/deepseek-v4-pro"), (Some("cloud"), "deepseek-v4-pro"));
+        // Prefix is stripped exactly once, even when the id contains '/'.
+        assert_eq!(parse_model_ref("cloud/a/b"), (Some("cloud"), "a/b"));
+        // Empty remainder and non-lowercase prefixes are not qualifications.
+        assert_eq!(parse_model_ref("cloud/"), (None, "cloud/"));
+        assert_eq!(parse_model_ref("Cloud/x"), (None, "Cloud/x"));
+    }
+
+    #[test]
+    fn literal_cloud_prefixed_id_falls_back_to_bare_scan() {
+        // A direct provider may legitimately own an id that starts with
+        // "cloud/"; it must still resolve when the proxy does not serve it.
+        let config = ModelRouterConfig {
+            providers: [
+                ("local".to_string(), test_config(&["cloud/foo"])),
+                ("cloud".to_string(), test_config(&["bar"])),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(config.provider_for_model("cloud/foo"), Some("local"));
+        // But when the proxy does serve the bare id, the qualification wins.
+        let config = ModelRouterConfig {
+            providers: [
+                ("local".to_string(), test_config(&["cloud/foo"])),
+                ("cloud".to_string(), test_config(&["foo"])),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(config.provider_for_model("cloud/foo"), Some("cloud"));
+    }
+
+    fn test_config(models: &[&str]) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: ProviderType::OpenAi,
+            models: models.iter().map(|s| s.to_string()).collect(),
+            default_model: models.first().map(|s| s.to_string()).unwrap_or_default(),
+            api_key: "sk-test".to_string().into(),
+            api_keys: vec![],
+            auth_profile: None,
+            oauth: None,
+            base_url: None,
+            timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        }
     }
 }
