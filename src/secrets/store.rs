@@ -271,7 +271,21 @@ impl SecretStoreHandle {
     /// touches the real home directory or keychain; use [`Self::with_root`] for
     /// hermetic tests that need encryption.
     pub fn new() -> Self {
-        let root = crate::secrets::secrets_root_dir();
+        Self::new_at_root(crate::secrets::secrets_root_dir())
+    }
+
+    /// Production handle rooted at an explicit directory.
+    ///
+    /// Identical to [`Self::new`] in backend selection (OS keyring preference
+    /// is preserved), but the storage root is supplied by the caller. This is
+    /// how the gateway keeps secrets aligned with its injected
+    /// [`crate::dirs::SyscityPaths`] root: `new_at_root(paths.secrets_dir())`.
+    /// Passing the default root produces exactly the same handle as
+    /// [`Self::new`].
+    ///
+    /// For hermetic tests that must not touch the OS keyring, use
+    /// [`Self::with_root`] instead.
+    pub fn new_at_root(root: PathBuf) -> Self {
         #[cfg(not(test))]
         let prefer_keyring = keyring_available();
         #[cfg(test)]

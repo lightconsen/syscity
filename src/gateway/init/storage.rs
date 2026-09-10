@@ -40,7 +40,14 @@ pub struct StorageInit {
 
 /// Initialize the storage adapter, shared SQLite pool, session store, and audit
 /// log.
-pub async fn init_storage(config: &GatewayConfig) -> crate::Result<StorageInit> {
+///
+/// `paths` supplies the layout root used when the config does not pin an
+/// explicit `database_url`; the default resolves to `<root>/data/syscity.db`
+/// (`~/.syscity/data/syscity.db` for the default root).
+pub async fn init_storage(
+    config: &GatewayConfig,
+    paths: &crate::dirs::SyscityPaths,
+) -> crate::Result<StorageInit> {
     #[allow(clippy::type_complexity)]
     let (storage, unified_vector_store, sqlite_pool): (
         Arc<RwLock<dyn Storage>>,
@@ -54,7 +61,7 @@ pub async fn init_storage(config: &GatewayConfig) -> crate::Result<StorageInit> 
                     .database_url
                     .as_ref()
                     .map(|s| std::path::PathBuf::from(s.strip_prefix("sqlite:").unwrap_or(s)))
-                    .unwrap_or_else(|| crate::dirs::syscity_dir().join("data").join("syscity.db"));
+                    .unwrap_or_else(|| paths.default_memory_db());
                 if let Some(parent) = db_path.parent() {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
                         warn!("Failed to create SQLite directory {:?}: {}", parent, e);

@@ -30,6 +30,7 @@ use crate::channels::{
 };
 use crate::config::hot_reload::HotReloadManager;
 use crate::cron::cron::CronScheduler;
+use crate::dirs::SyscityPaths;
 use crate::gateway::hooks::EventHookRegistry;
 use crate::gateway::rate_limit::MultiTierRateLimiter;
 use crate::gateway::task_registry::TaskRegistry;
@@ -309,6 +310,15 @@ pub struct GatewayState {
     /// runtime so a process can host more than one gateway (or test) without
     /// sharing secret state. Replaces the former process-global singletons.
     pub secrets: Arc<SecretStoreHandle>,
+
+    /// Explicit on-disk layout root for this gateway instance.
+    ///
+    /// Owns the base directory every layout entry (data, agents, sessions DB,
+    /// secrets, logs, ...) is derived from. Constructed once at startup from
+    /// `SYSCITY_HOME`/the default home, or supplied explicitly for tests and
+    /// multi-instance embedding. Default behaviour is unchanged: with no
+    /// override it resolves to `~/.syscity`.
+    pub paths: Arc<SyscityPaths>,
 
     /// Centralized registry for all gateway background tasks.
     pub task_registry: Arc<TaskRegistry>,

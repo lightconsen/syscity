@@ -10,9 +10,9 @@ use crate::gateway::GatewayState;
 /// `onboarding.status` — `{ "status": "pending" | "done" }`.
 pub(crate) async fn handle_onboarding_status(
     req: &WsRequest,
-    _state: &Arc<GatewayState>,
+    state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let dir = crate::dirs::workspace_data_dir();
+    let dir = state.paths.workspace_data_dir();
     match crate::memory::onboarding::status(&dir).await {
         Ok(crate::memory::onboarding::OnboardingStatus::Done) => {
             WsResponse::ok(&req.id, serde_json::json!({ "status": "done" }))
@@ -27,13 +27,13 @@ pub(crate) async fn handle_onboarding_status(
 /// `onboarding.apply` — `{ ok: true }` on success.
 pub(crate) async fn handle_onboarding_apply(
     req: &WsRequest,
-    _state: &Arc<GatewayState>,
+    state: &Arc<GatewayState>,
 ) -> WsResponse {
     let payload: crate::memory::onboarding::OnboardingPayload = match parse_params(req) {
         Ok(p) => p,
         Err(res) => return res,
     };
-    let dir = crate::dirs::workspace_data_dir();
+    let dir = state.paths.workspace_data_dir();
     match crate::memory::onboarding::apply(&dir, &payload).await {
         Ok(()) => WsResponse::ok(&req.id, serde_json::json!({ "ok": true })),
         Err(e) => WsResponse::err(&req.id, "INTERNAL", e.to_string()),

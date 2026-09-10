@@ -11,7 +11,7 @@ use crate::gateway::GatewayState;
 
 /// `traces.get` — replay a recorded agent turn (`{ turn_id }`). Returns the
 /// turn summary + full event list. Formerly `GET /api/traces/:turn_id`.
-pub(crate) async fn handle_traces_get(req: &WsRequest, _state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_traces_get(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
     #[derive(Deserialize)]
     struct Params {
         turn_id: String,
@@ -30,7 +30,7 @@ pub(crate) async fn handle_traces_get(req: &WsRequest, _state: &Arc<GatewayState
 
     // Turn dirs are `turns/YYYY-MM-DD/<turn_id>/`; the date isn't in the id, so
     // scan the date partitions (bounded — a local personal-assistant store).
-    let base = crate::dirs::turns_dir();
+    let base = state.paths.turns_dir();
     let mut turn_dir = None;
     if let Ok(rd) = std::fs::read_dir(&base) {
         for entry in rd.flatten() {

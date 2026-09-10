@@ -116,6 +116,9 @@ pub async fn make_test_state_parts(
         config_path: None,
         mcps_path: None,
         secrets: secrets.clone(),
+        // Hermetic layout root: every derived path lives under the temp dir,
+        // never the real `~/.syscity`.
+        paths: Arc::new(crate::dirs::SyscityPaths::from_root(tmp.path())),
         task_registry: task_registry.clone(),
         shutdown_token: CancellationToken::new(),
         auth: AuthState {
