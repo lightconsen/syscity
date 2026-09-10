@@ -58,7 +58,11 @@ export type SessionCallback = () => void;
 
 /** A concrete model owned by a provider, as returned by `models.list`. */
 export interface ModelInfo {
+  /** Selectable reference. Bare for local providers; `cloud/<bare>` for the
+   * cloud proxy so a model id shared with a local provider stays
+   * independently selectable. Persist this value when pinning. */
   id: string;
+  /** Human-readable model name — always the bare id (no `cloud/` prefix). */
   name: string;
   provider: string;
   provider_name: string;

@@ -151,6 +151,11 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
   // Option list: cloud (proxied) models first — flat, vendor logo per model,
   // no section title — then a dashed divider, then local models grouped by
   // provider.
+  //
+  // A model id can appear in both sections (the cloud proxy and a local
+  // provider both serve e.g. deepseek-v4-pro). The cloud entry carries a
+  // `cloud/` qualifier in `id`, so `key`, `selected`, and `models.find` all
+  // stay unambiguous; `name` is the bare id for display in both.
   const cloudModels = models.filter((m) => m.provider === "cloud");
   const localByProvider = new Map<string, ModelInfo[]>();
   for (const m of models) {

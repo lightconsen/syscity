@@ -33,6 +33,9 @@ export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
   // re-reading it on status change picks up the fresh version.
   const version = networkStatus === "connected" ? transport.getServerInfo().version : undefined;
   const model = useEffectiveModel(transport);
+  // A pinned cloud copy is stored as a qualified `cloud/<id>` ref; show the
+  // bare model name to the user.
+  const modelLabel = model?.replace(/^cloud\//, "");
 
   return (
     <div
@@ -77,7 +80,7 @@ export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
             {t("Statusbar.running")}
           </span>
         )}
-        {model && <span className="truncate max-w-[16rem]">{model}</span>}
+        {modelLabel && <span className="truncate max-w-[16rem]">{modelLabel}</span>}
         {version && (
           <span className="truncate" title={t("Statusbar.gatewayVersion", { v: version })}>
             v{version}
