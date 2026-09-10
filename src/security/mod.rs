@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::security::auth_store::{AuthStore, StoredSession};
+use crate::security::request_context::RequestContext;
 use crate::security::runtime_audit::AuditEventType;
 
 /// Unique identifier for a user
@@ -753,6 +754,33 @@ impl RateLimiter {
                 retry_after_secs: ((cost - bucket.remaining()) / self.refill_rate) as u64,
             }
         }
+    }
+
+    /// Check if the request is allowed, keyed by the identity carried in
+    /// `ctx` (the context's user id). Consumes 1 token.
+    pub async fn check_context(&self, ctx: &RequestContext) -> RateLimitResult {
+        self.check(&ctx.to_user_id()).await
+    }
+
+    /// Check with custom cost, keyed by the context's user id.
+    pub async fn check_with_cost_context(
+        &self,
+        ctx: &RequestContext,
+        cost: f64,
+    ) -> RateLimitResult {
+        self.check_with_cost(&ctx.to_user_id(), cost).await
+    }
+
+    /// Check with custom cost, keyed by a scope-qualified user id of the form
+    /// `"{scope}:{user_id}"`. Reproduces the historical ad-hoc key format now
+    /// derived from the context.
+    pub async fn check_scoped_context(
+        &self,
+        ctx: &RequestContext,
+        scope: &str,
+        cost: f64,
+    ) -> RateLimitResult {
+        self.check_with_cost(&ctx.scoped_user_id(scope), cost).await
     }
 
     /// Get current bucket state for a user
@@ -1718,6 +1746,9 @@ pub mod runtime_audit;
 
 /// Persistent SQLite-backed audit log
 pub mod persistent_audit;
+
+/// Per-request identity context threaded through the request lifecycle
+pub mod request_context;
 
 /// DM pairing and access control
 pub mod pairing;

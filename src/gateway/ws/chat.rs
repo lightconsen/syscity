@@ -5,6 +5,7 @@ pub(super) async fn handle_chat_send(
     req: &WsRequest,
     conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     #[allow(dead_code)]
@@ -47,13 +48,9 @@ pub(super) async fn handle_chat_send(
         (format!("{}:{}", channel, user), true)
     };
 
-    let user_id = {
-        let cg = conn.read().await;
-        cg.user_id
-            .as_ref()
-            .map(|u| u.0.clone())
-            .unwrap_or_else(|| "anonymous".to_string())
-    };
+    // Identity comes from the per-request context threaded in by the
+    // dispatcher (same value as the handshake-resolved user id).
+    let user_id = ctx.user_id().to_string();
 
     let mut should_name = false;
     if let Some(ref store) = state.agents.store {
@@ -366,11 +363,15 @@ mod tests {
         Arc::new(make_test_state(GatewayConfig::default()).await)
     }
 
+    fn ctx() -> RequestContext {
+        RequestContext::anonymous()
+    }
+
     #[tokio::test]
     async fn chat_send_missing_params_errors() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        let resp = handle_chat_send(&req("r1", None), &conn, &state).await;
+        let resp = handle_chat_send(&req("r1", None), &conn, &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
     }
@@ -382,7 +383,7 @@ mod tests {
         let state = state().await;
         let conn = make_test_conn(&[]);
         let params = Some(serde_json::json!({ "message": "hello", "session_id": "s1" }));
-        let resp = handle_chat_send(&req("r1", params), &conn, &state).await;
+        let resp = handle_chat_send(&req("r1", params), &conn, &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "enqueue_failed");
     }
@@ -397,7 +398,7 @@ mod tests {
             "session_id": "s1",
             "mentions": { "skills": ["canvas-design"], "agents": ["secretary-xiaowang"] }
         }));
-        let resp = handle_chat_send(&req("r1", params), &conn, &state).await;
+        let resp = handle_chat_send(&req("r1", params), &conn, &state, &ctx()).await;
         assert!(resp.ok, "expected ok, got {:?}", resp.error);
 
         let incoming = entry_rx.recv().await.expect("enqueued message");
@@ -417,7 +418,7 @@ mod tests {
         let state = Arc::new(state);
         let conn = make_test_conn(&[]);
         let params = Some(serde_json::json!({ "message": "plain", "session_id": "s1" }));
-        let resp = handle_chat_send(&req("r1", params), &conn, &state).await;
+        let resp = handle_chat_send(&req("r1", params), &conn, &state, &ctx()).await;
         assert!(resp.ok, "expected ok, got {:?}", resp.error);
 
         let incoming = entry_rx.recv().await.expect("enqueued message");

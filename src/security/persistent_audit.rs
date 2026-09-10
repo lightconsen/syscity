@@ -14,6 +14,7 @@ use sqlx::Row;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::security::request_context::RequestContext;
 use crate::security::runtime_audit::{AuditEntry, AuditEventType, AuditLogger};
 
 /// Persistent audit log backed by SQLite
@@ -136,6 +137,25 @@ impl PersistentAuditLog {
                 warn!("Failed to persist audit entry: {}", e);
             }
         }
+    }
+
+    /// Log a new audit entry using the actor carried by `ctx`.
+    ///
+    /// Convenience wrapper over [`PersistentAuditLog::log`] so per-request
+    /// call sites thread one [`RequestContext`] instead of re-deriving the
+    /// actor string (and so the actor can no longer silently fall back to a
+    /// hardcoded literal).
+    pub async fn log_with_context(
+        &self,
+        event_type: AuditEventType,
+        ctx: &RequestContext,
+        target: impl Into<String>,
+        allowed: bool,
+        description: impl Into<String>,
+        details: Option<serde_json::Value>,
+    ) {
+        self.log(event_type, ctx.actor(), target, allowed, description, details)
+            .await;
     }
 
     /// Retrieve recent entries from memory (fast)

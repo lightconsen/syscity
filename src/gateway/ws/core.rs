@@ -323,7 +323,8 @@ async fn handle_websocket(
 
                     match serde_json::from_str::<WsRequest>(&text) {
                         Ok(req) => {
-                            let res = dispatch_method(&req, &conn, &state, &cmd_tx).await;
+                            let res =
+                                dispatch_method(&req, &conn, &state, &cmd_tx, &auth_mode).await;
                             let res_text = serde_json::to_string(&res).unwrap_or_default();
                             if cmd_tx
                                 .send(WsCommand::SendResponse(res_text))
@@ -386,8 +387,25 @@ async fn dispatch_method(
     conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
     cmd_tx: &mpsc::Sender<WsCommand>,
+    auth_mode: &crate::gateway::protocol::AuthMode,
 ) -> WsResponse {
     let scopes = conn.read().await.scopes.clone();
+
+    // Build the per-request identity context once, from the identity resolved
+    // at the handshake plus the transport auth mode, and thread it into the
+    // handlers that audit or rate-limit. This is pure plumbing: for the
+    // single-user/default case the user id is unchanged (`"anonymous"`,
+    // `"shared"`, `"tailscale"`, or the device id).
+    let ctx = {
+        let cg = conn.read().await;
+        let source = match auth_mode {
+            crate::gateway::protocol::AuthMode::None => AuthSource::None,
+            crate::gateway::protocol::AuthMode::Token => AuthSource::SharedToken,
+            crate::gateway::protocol::AuthMode::Device => AuthSource::Device,
+            crate::gateway::protocol::AuthMode::Tailscale => AuthSource::Tailscale,
+        };
+        RequestContext::from_identity(cg.user_id.as_ref(), source)
+    };
     if let Some(required) = method_scope(&req.method) {
         if !scopes_allow(&scopes, &req.method) {
             if req.method == "commands.execute" {
@@ -441,7 +459,7 @@ async fn dispatch_method(
         "connect" => {
             WsResponse::err(&req.id, "INVALID_REQUEST", "connect can only be sent as first message")
         }
-        "chat.send" => chat::handle_chat_send(req, conn, state).await,
+        "chat.send" => chat::handle_chat_send(req, conn, state, &ctx).await,
         "chat.history" => chat::handle_chat_history(req, conn, state).await,
         "chat.abort" => chat::handle_chat_abort(req, conn, state).await,
         "feedback.vote" => feedback::handle_feedback_vote(req, state).await,
@@ -539,9 +557,9 @@ async fn dispatch_method(
         "workspace.list" => workspace::handle_workspace_list(req, state).await,
         "workspace.read" => workspace::handle_workspace_read(req, state).await,
         "acp.list" => acp::handle_acp_list(req, state).await,
-        "acp.spawn" => acp::handle_acp_spawn(req, conn, state).await,
-        "acp.terminate" => acp::handle_acp_terminate(req, state).await,
-        "acp.message" => acp::handle_acp_message(req, state).await,
+        "acp.spawn" => acp::handle_acp_spawn(req, state, &ctx).await,
+        "acp.terminate" => acp::handle_acp_terminate(req, state, &ctx).await,
+        "acp.message" => acp::handle_acp_message(req, state, &ctx).await,
         "acp.status" => acp::handle_acp_status(req, state).await,
         "acp.pause" => acp::handle_acp_pause(req, state).await,
         "acp.resume" => acp::handle_acp_resume(req, state).await,
@@ -718,7 +736,7 @@ mod tests {
     ) -> WsResponse {
         let state = state().await;
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCommand>(1);
-        dispatch_method(r, conn, &state, &cmd_tx).await
+        dispatch_method(r, conn, &state, &cmd_tx, &crate::gateway::protocol::AuthMode::None).await
     }
 
     // ── dispatch_method ──────────────────────────────────────────────────────

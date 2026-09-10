@@ -28,8 +28,8 @@ pub(super) async fn handle_acp_list(req: &WsRequest, state: &Arc<GatewayState>) 
 
 pub(super) async fn handle_acp_spawn(
     req: &WsRequest,
-    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     use crate::acp::{AcpSessionId, SpawnMode, SubagentConfig, ThreadBinding};
     use crate::channels::IncomingMessage;
@@ -54,18 +54,14 @@ pub(super) async fn handle_acp_spawn(
         Err(res) => return res,
     };
 
-    let actor = {
-        let cg = conn.read().await;
-        cg.user_id
-            .as_ref()
-            .map(|u| u.0.clone())
-            .unwrap_or_else(|| "anonymous".to_string())
-    };
+    // Identity comes from the per-request context (same value the handshake
+    // resolved for this connection).
+    let actor = ctx.user_id().to_string();
 
     let rate_result = state
         .auth
         .rate_limiter
-        .check_with_cost(&crate::security::UserId::new(format!("acp:spawn:{}", actor)), 1.0)
+        .check_scoped_context(ctx, "acp:spawn", 1.0)
         .await;
     if !rate_result.is_allowed() {
         let retry = match rate_result {
@@ -172,7 +168,11 @@ pub(super) async fn handle_acp_spawn(
     }
 }
 
-pub(super) async fn handle_acp_terminate(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(super) async fn handle_acp_terminate(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     use crate::acp::AcpSessionId;
     use crate::security::runtime_audit::AuditEventType;
 
@@ -194,7 +194,7 @@ pub(super) async fn handle_acp_terminate(req: &WsRequest, state: &Arc<GatewaySta
                 .audit_log
                 .log(
                     AuditEventType::AcpTerminate,
-                    "ws-user",
+                    ctx.actor(),
                     &params.session_id,
                     true,
                     format!("Terminated {} subagents in session {}", count, params.session_id),
@@ -215,7 +215,7 @@ pub(super) async fn handle_acp_terminate(req: &WsRequest, state: &Arc<GatewaySta
                 .audit_log
                 .log(
                     AuditEventType::AcpTerminate,
-                    "ws-user",
+                    ctx.actor(),
                     &params.session_id,
                     false,
                     format!("Failed to terminate session: {}", e),
@@ -231,7 +231,11 @@ pub(super) async fn handle_acp_terminate(req: &WsRequest, state: &Arc<GatewaySta
     }
 }
 
-pub(super) async fn handle_acp_message(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(super) async fn handle_acp_message(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     use crate::acp::AcpSessionId;
     use crate::channels::IncomingMessage;
     use crate::security::runtime_audit::AuditEventType;
@@ -256,7 +260,7 @@ pub(super) async fn handle_acp_message(req: &WsRequest, state: &Arc<GatewayState
 
     let subagent = &subagents[0];
     let message =
-        IncomingMessage::new("ws-user".to_string(), session_id.to_string(), params.message);
+        IncomingMessage::new(ctx.user_id().to_string(), session_id.to_string(), params.message);
 
     match state.agents.acp.send_message(&subagent.id, message).await {
         Ok(response) => {
@@ -265,7 +269,7 @@ pub(super) async fn handle_acp_message(req: &WsRequest, state: &Arc<GatewayState
                 .audit_log
                 .log(
                     AuditEventType::AcpMessage,
-                    "ws-user",
+                    ctx.actor(),
                     &params.session_id,
                     true,
                     format!(
@@ -293,7 +297,7 @@ pub(super) async fn handle_acp_message(req: &WsRequest, state: &Arc<GatewayState
                 .audit_log
                 .log(
                     AuditEventType::AcpMessage,
-                    "ws-user",
+                    ctx.actor(),
                     &params.session_id,
                     false,
                     format!("Failed to send message: {}", e),
@@ -506,7 +510,7 @@ pub(super) async fn handle_acp_execute_session(
 
     // Attach structured tracing context for this request.
     // The _guard is explicitly dropped before .await because Entered is !Send.
-    let ctx = RequestContext::new(Some(session_id.clone()), Some(params.user_id.clone()));
+    let ctx = TracingContext::new(Some(session_id.clone()), Some(params.user_id.clone()));
     let span = ctx.attach_to_span();
     let _guard = span.clone().entered();
 
@@ -574,7 +578,7 @@ pub(super) async fn handle_acp_execute_run(
 
     // Attach structured tracing context for this request.
     // The _guard is explicitly dropped before .await because Entered is !Send.
-    let ctx = RequestContext::new(Some(session_id.clone()), Some(params.user_id.clone()));
+    let ctx = TracingContext::new(Some(session_id.clone()), Some(params.user_id.clone()));
     let span = ctx.attach_to_span();
     let _guard = span.clone().entered();
 
@@ -608,7 +612,7 @@ pub(super) async fn handle_acp_execute_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::state_tests::{make_test_conn, make_test_state};
+    use crate::gateway::state_tests::make_test_state;
     use crate::gateway::GatewayConfig;
 
     fn req(id: &str, params: Option<serde_json::Value>) -> WsRequest {
@@ -628,6 +632,10 @@ mod tests {
         Some(serde_json::json!({ "session_id": session_id }))
     }
 
+    fn ctx() -> RequestContext {
+        RequestContext::anonymous()
+    }
+
     #[tokio::test]
     async fn acp_list_empty_ok() {
         let state = state().await;
@@ -641,8 +649,7 @@ mod tests {
     #[tokio::test]
     async fn acp_spawn_missing_params_errors() {
         let state = state().await;
-        let conn = make_test_conn(&[]);
-        let resp = handle_acp_spawn(&req("r1", None), &conn, &state).await;
+        let resp = handle_acp_spawn(&req("r1", None), &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
     }
@@ -650,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn acp_terminate_unknown_session_fails() {
         let state = state().await;
-        let resp = handle_acp_terminate(&req("r1", session_params("ghost")), &state).await;
+        let resp = handle_acp_terminate(&req("r1", session_params("ghost")), &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "TERMINATE_FAILED");
     }
@@ -658,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn acp_message_missing_params_errors() {
         let state = state().await;
-        let resp = handle_acp_message(&req("r1", None), &state).await;
+        let resp = handle_acp_message(&req("r1", None), &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
     }
@@ -667,7 +674,7 @@ mod tests {
     async fn acp_message_no_active_subagents() {
         let state = state().await;
         let params = Some(serde_json::json!({ "session_id": "ghost", "message": "hi" }));
-        let resp = handle_acp_message(&req("r1", params), &state).await;
+        let resp = handle_acp_message(&req("r1", params), &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "NO_ACTIVE_SUBAGENTS");
     }

@@ -53,11 +53,15 @@ use tracing::{debug, info, warn, Instrument};
 use uuid::Uuid;
 
 use crate::agent::session_store::AppendMessageParams;
-use crate::core::context::RequestContext;
+// The core tracing context is aliased: the name `RequestContext` in this module
+// (and, via the glob `use super::*`, in its submodules) refers to the security
+// request identity context.
+use crate::core::context::RequestContext as TracingContext;
 use crate::gateway::handlers::config::persist_config_atomic;
 use crate::gateway::protocol::*;
 use crate::gateway::{GatewayEvent, GatewayState};
 use crate::providers::Message as ProviderMessage;
+use crate::security::request_context::{AuthSource, RequestContext};
 use crate::security::UserId;
 
 /// Query parameters for WebSocket upgrade
