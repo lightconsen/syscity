@@ -39,9 +39,9 @@ function ModelRow({
         className="w-4 h-4"
       />
       <span className="flex-1 min-w-0 text-sm text-primary">{m.name}</span>
-      {m.provider === "cloud" && m.credit_multiplier != null && (
+      {m.provider === "cloud" && (
         <span className="text-[10px] text-secondary/70 shrink-0" title={t("ModelSelector.creditMultiplier")}>
-          {m.credit_multiplier}x
+          {m.credit_multiplier ?? 1}x
         </span>
       )}
       {selected && <Check className="w-4 h-4 text-primary shrink-0" />}
@@ -248,9 +248,15 @@ export function ModelSelector({ transport }: ModelSelectorProps) {
               />
             ))}
 
-            {/* Dashed divider between cloud and local models */}
+            {/* Labeled divider marking the start of the local-model section */}
             {cloudModels.length > 0 && (
-              <div className="my-1 border-t border-dashed border-subtle" />
+              <div className="my-1 flex items-center gap-2 px-3">
+                <span className="flex-1 border-t border-dashed border-subtle" />
+                <span className="text-[10px] text-secondary/70">
+                  {t("ModelSelector.localModels")}
+                </span>
+                <span className="flex-1 border-t border-dashed border-subtle" />
+              </div>
             )}
 
             {Array.from(localByProvider.entries()).map(([provider, ms]) => (

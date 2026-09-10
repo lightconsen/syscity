@@ -35,6 +35,7 @@
   "ModelSelector.defaultModel": "Default model",
   "ModelSelector.uses": "uses {{model}}",
   "ModelSelector.creditMultiplier": "Cloud billing multiplier (credits per 1K tokens)",
+  "ModelSelector.localModels": "Local",
   "MessageBubble.copy": "Copy",
   "MessageBubble.copied": "Copied",
   "MessageBubble.edit": "Edit",
