@@ -11,6 +11,22 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-10
+
+### Added
+- Composer **+** picker with Experts, Skills, and Connectors tabs. Experts is searchable and single-select; Skills and Connectors are multi-select. In sessions already bound to a specific agent, the Experts tab is hidden and the active tab falls back to Skills.
+- Attached expert and skill chips are sent with the next message as hidden per-turn context that guides skill loading and expert delegation without being saved in the transcript. Responses are cached separately for different chip selections.
+- Skills and Connectors tabs now show a search box once their list exceeds 10 items. Search matches names and descriptions, and each tab has its own no-match row. Switching tabs clears the search.
+- Connector chips are enabled automatically on send when they are not already enabled. If enabling fails, the message still sends and a toast shows the failure.
+
+### Changed
+- In Marketplace, an expert’s Summon button now keeps its primary style after the expert is installed.
+
+### Fixed
+- The chat view now stays pinned to the bottom while message scrolling settles, so late message measurements don’t leave it short of the newest message.
+- Markdown messages no longer rebuild from scratch on unrelated re-renders, reducing flicker and scroll jumps.
+- Gzip archive member splitting is now exact instead of scanning for magic byte sequences, fixing flaky archive index rebuilds when compressed data contained gzip-header-like bytes.
+
 ## [0.3.3] - 2026-09-09
 
 ### Added
