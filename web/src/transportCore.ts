@@ -20,6 +20,10 @@ import {
 
 import { getGatewayBase, setGatewayBase } from "./lib/gatewayBase";
 
+import { useChatStore } from "./stores/chatStore";
+import { pushToast } from "./components/ui/Toast";
+import i18n from "./i18n";
+
 import type {
   WsEvent,
   EventCallback,
@@ -1014,6 +1018,8 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
 
     // Send via chat.send like a normal user turn. The assistant-ui runtime
     // drives the streaming response via run() when messages change.
+    // Note: this bypasses run(), so composer chips/mentions are not re-attached
+    // on edit/resend — the resent message carries the clean text only.
     this.sendRequest("chat.send", {
       session_id: this.sessionId,
       message: last.content,
@@ -1223,6 +1229,11 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       return;
     }
 
+    // Entity chips attached via the composer "+" picker are consumed here —
+    // the single choke point for every send — so slash-command interception
+    // also clears them (no stale chips leaking into a later message).
+    const chips = useChatStore.getState().consumePendingChips();
+
     const text = last.content
       .map((c) => (c.type === "text" ? c.text : ""))
       .join("");
@@ -1357,9 +1368,34 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     this.abortControllers.set(sessionId, new AbortController());
     this.notifyRunningSessionsChanged();
 
+    // Connector chips that aren't currently enabled are enabled pre-send; a
+    // failure surfaces as a toast but doesn't block the message (the gateway's
+    // connectors.enable is idempotent for already-enabled connectors).
+    for (const chip of chips) {
+      if (chip.kind === "connector" && chip.state !== "enabled") {
+        try {
+          await this.waitForConnected(5000);
+          await this.sendRequestAndWait("connectors.enable", { id: chip.id }, 5000);
+        } catch {
+          pushToast(
+            "error",
+            i18n.t("chat:EntityPicker.connectFailed", { name: chip.label }),
+          );
+        }
+      }
+    }
+
     this.sendRequest("chat.send", {
       session_id: sessionId,
       message: text,
+      ...(chips.length
+        ? {
+            mentions: {
+              skills: chips.filter((c) => c.kind === "skill").map((c) => c.id),
+              agents: chips.filter((c) => c.kind === "agent").map((c) => c.id),
+            },
+          }
+        : {}),
     });
 
     const parts: (
@@ -1971,6 +2007,8 @@ export interface SyscityWebSocketTransport {
   shortcutInbox(): Promise<Array<{ prompt?: string; at_ms?: number; file?: string }> | null>;
   listSkills(): Promise<{ skills: Array<Record<string, unknown>>; count: number }>;
   installSkill(name: string, zipBase64: string): Promise<boolean>;
+  listConnectors(): Promise<Array<Record<string, unknown>>>;
+  enableConnector(id: string): Promise<boolean>;
   listKbCollections(): Promise<{ configured: boolean; reason: string | null; collections: Array<Record<string, unknown>> }>;
   listKbDocs(collection: string): Promise<{ collection: string; docs: Array<Record<string, unknown>> }>;
   kbDocContent(collection: string, docId: string): Promise<{ doc_id: string; size: number; truncated: boolean; binary: boolean; content?: string }>;

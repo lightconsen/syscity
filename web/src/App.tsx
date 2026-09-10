@@ -114,6 +114,7 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
       if (msgs.length === 0 && prev.length > 0) {
         useChatStore.getState().setPendingAgent(null);
         useChatStore.getState().setPendingDraft(null);
+        useChatStore.getState().setPendingChips([]);
       }
     });
     return () => {
@@ -600,6 +601,7 @@ function ChatApp() {
     // from the welcome page (transport.run() consumes the pending flag).
     useChatStore.getState().setPendingAgent(null);
     useChatStore.getState().setPendingDraft(null);
+    useChatStore.getState().setPendingChips([]);
     transport.armNewSession();
   }, [transport]);
 
@@ -615,6 +617,7 @@ function ChatApp() {
       if (existing) {
         useChatStore.getState().setPendingAgent(null);
         useChatStore.getState().setPendingDraft(null);
+        useChatStore.getState().setPendingChips([]);
         transport.switchSession(existing.id);
         const { messages: history, hasMore } = await transport.loadHistory(existing.id);
         transport.setMessages(history);
@@ -628,6 +631,7 @@ function ChatApp() {
       // agent attached. The session is created lazily on the first message
       // (same deferred flow as the New Session button) — clicking an agent
       // and never typing no longer leaves an empty session behind.
+      useChatStore.getState().setPendingChips([]);
       transport.armNewSession(agentId);
       const agent = agents.find((a) => a.id === agentId);
       // Set after armNewSession: its empty-messages listener clears any
@@ -653,6 +657,7 @@ function ChatApp() {
       setMarketplaceOpen(false);
       setKbOpen(false);
       useChatStore.getState().setPendingAgent(null);
+      useChatStore.getState().setPendingChips([]);
       transport.armNewSession();
       useChatStore.getState().setPendingDraft(draft);
       setSessionKey((k) => k + 1);
@@ -668,6 +673,7 @@ function ChatApp() {
       // Navigating away from the welcome page consumes any pending summon.
       useChatStore.getState().setPendingAgent(null);
       useChatStore.getState().setPendingDraft(null);
+      useChatStore.getState().setPendingChips([]);
       const currentId = transport.getSessionId();
       if (currentId !== id) {
         // Save current session's in-memory messages before switching
@@ -746,6 +752,8 @@ function ChatApp() {
     if (!transport.isPendingNewSession()) {
       useChatStore.getState().setPendingAgent(null);
       useChatStore.getState().setPendingDraft(null);
+      // Note: pendingChips deliberately survive here — chips can be attached
+      // in any session (not just the welcome page) and are consumed at send.
     }
   }, [sessionItems, transport]);
 

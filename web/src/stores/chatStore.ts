@@ -43,6 +43,22 @@ interface PreviewDocument {
   exportUrl?: string;
 }
 
+export type ChipKind = "skill" | "agent" | "connector";
+
+/** Entity chip attached to the composer via the "+" picker. In-memory only;
+ *  consumed (and cleared) by the transport when the message is sent. */
+export interface ComposerChip {
+  kind: ChipKind;
+  /** skill name / agent id / connector id */
+  id: string;
+  /** display label */
+  label: string;
+  emoji?: string;
+  /** connectors only: last known lifecycle state (drives the state dot and
+   *  whether a pre-send `connectors.enable` call is needed) */
+  state?: "installed" | "enabled" | "disabled" | "error";
+}
+
 interface ChatState {
   messages: ChatMessage[];
   sessions: Array<{
@@ -80,6 +96,8 @@ interface ChatState {
   /** One-shot composer prefill (expert starter prompt / skill "try it"):
    *  consumed by the composer on the next render, then cleared. */
   pendingDraft: string | null;
+  /** Entity chips attached via the composer "+" picker; consumed at send. */
+  pendingChips: ComposerChip[];
 
   setMessages: (messages: ChatMessage[]) => void;
   prependMessages: (messages: ChatMessage[]) => void;
@@ -110,9 +128,14 @@ interface ChatState {
   setKbPanelOpen: (open: boolean) => void;
   setPendingAgent: (agent: { id: string; display_name: string; emoji: string } | null) => void;
   setPendingDraft: (draft: string | null) => void;
+  addComposerChip: (chip: ComposerChip) => void;
+  removeComposerChip: (kind: ChipKind, id: string) => void;
+  setPendingChips: (chips: ComposerChip[]) => void;
+  /** Take the current chips and clear them (send-time consumption). */
+  consumePendingChips: () => ComposerChip[];
 }
 
-export const useChatStore = create<ChatState>((set) => ({
+export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   sessions: [],
   currentSessionId: "",
@@ -129,6 +152,7 @@ export const useChatStore = create<ChatState>((set) => ({
   kbPanelOpen: false,
   pendingAgent: null,
   pendingDraft: null,
+  pendingChips: [],
 
   setMessages: (messages) => set({ messages }),
   prependMessages: (messages) => set((s) => ({ messages: [...messages, ...s.messages] })),
@@ -175,4 +199,24 @@ export const useChatStore = create<ChatState>((set) => ({
   setKbPanelOpen: (open) => set({ kbPanelOpen: open }),
   setPendingAgent: (pendingAgent) => set({ pendingAgent }),
   setPendingDraft: (pendingDraft) => set({ pendingDraft }),
+  addComposerChip: (chip) =>
+    set((s) => {
+      // Toggle-off when already attached; otherwise dedup by kind+id.
+      const exists = s.pendingChips.some((c) => c.kind === chip.kind && c.id === chip.id);
+      return {
+        pendingChips: exists
+          ? s.pendingChips.filter((c) => !(c.kind === chip.kind && c.id === chip.id))
+          : [...s.pendingChips, chip],
+      };
+    }),
+  removeComposerChip: (kind, id) =>
+    set((s) => ({
+      pendingChips: s.pendingChips.filter((c) => !(c.kind === kind && c.id === id)),
+    })),
+  setPendingChips: (pendingChips) => set({ pendingChips }),
+  consumePendingChips: () => {
+    const chips = get().pendingChips;
+    if (chips.length > 0) set({ pendingChips: [] });
+    return chips;
+  },
 }));

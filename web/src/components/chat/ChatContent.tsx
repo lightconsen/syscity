@@ -8,6 +8,8 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { MessageBubble } from "./MessageBubble";
 import { CommandPalette } from "./CommandPalette";
 import { ModelSelector } from "./ModelSelector";
+import { EntityPicker } from "./EntityPicker";
+import { ComposerChips } from "./ComposerChips";
 import { getCommandCompletions, type CommandDef } from "@/slash-commands";
 import { useChatStore } from "@/stores/chatStore";
 import { Mic, Paperclip, Square, Send, ChevronDown } from "lucide-react";
@@ -360,6 +362,9 @@ export function ChatContent({ transport }: ChatContentProps) {
           aria-label={t("ChatContent.messageInput")}
         />
 
+        {/* Entity chips attached via the "+" picker (cleared on send) */}
+        <ComposerChips />
+
         {/* Bottom toolbar */}
         <div className="flex items-center justify-between px-2 pb-2 pt-1">
           <div className="flex items-center gap-1">
@@ -382,6 +387,7 @@ export function ChatContent({ transport }: ChatContentProps) {
             >
               <Paperclip className="w-5 h-5" />
             </button>
+            <EntityPicker transport={transport} />
           </div>
           <div className="flex items-center gap-1">
             <ModelSelector transport={transport} />
