@@ -80,6 +80,9 @@ function PickerRow({
 
 type TabId = Extract<ChipKind, "agent" | "skill" | "connector">;
 
+/** Skills/Connectors tabs show their search box only past this many rows. */
+const SEARCH_THRESHOLD = 10;
+
 /** Composer "+" picker: attach skill / connector chips (and, on the default
  *  agent, expert chips) to the next message. Chips are UI references only —
  *  consumed by the transport at send time (skills/agents become `mentions`;
@@ -87,7 +90,8 @@ type TabId = Extract<ChipKind, "agent" | "skill" | "connector">;
  *  agent hide the Experts tab: that agent answers directly, and delegating
  *  to another expert from inside its session is not offered.
  *  Tabbed layout: Experts is single-select with a search box (attaching one
- *  expert replaces the previous); Skills/Connectors are multi-select.
+ *  expert replaces the previous); Skills/Connectors are multi-select and
+ *  gain a search box once their list exceeds SEARCH_THRESHOLD rows.
  *  Clicking an attached row toggles it off; the panel closes on Escape /
  *  outside pointerdown. */
 export function EntityPicker({ transport }: EntityPickerProps) {
@@ -163,7 +167,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
   }, [open, transport]);
 
   // Close on outside pointerdown or Escape. Reopen resets to the Experts tab
-  // with a cleared search.
+  // with a cleared search; switching tabs clears the search too.
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (e: PointerEvent) => {
@@ -239,6 +243,37 @@ export function EntityPicker({ transport }: EntityPickerProps) {
     );
   };
 
+  // Search filtering. Experts is always searchable; Skills/Connectors expose
+  // the search box only once their list exceeds SEARCH_THRESHOLD rows.
+  const q = query.trim().toLowerCase();
+  const filteredAgents = agents.filter(
+    (a) =>
+      q === "" ||
+      a.display_name.toLowerCase().includes(q) ||
+      a.id.toLowerCase().includes(q)
+  );
+  const filteredSkills = skills.filter(
+    (s) =>
+      q === "" ||
+      s.name.toLowerCase().includes(q) ||
+      (s.description ?? "").toLowerCase().includes(q)
+  );
+  const filteredConnectors = connectors.filter((c) => {
+    if (q === "") return true;
+    const label = (c.display_name || c.id).toLowerCase();
+    return (
+      label.includes(q) ||
+      c.id.toLowerCase().includes(q) ||
+      (c.description ?? "").toLowerCase().includes(q)
+    );
+  });
+  const showSearch =
+    tab === "agent"
+      ? expertsEnabled
+      : tab === "skill"
+        ? skills.length > SEARCH_THRESHOLD
+        : connectors.length > SEARCH_THRESHOLD;
+
   return (
     <div ref={rootRef} className="relative">
       <button
@@ -276,7 +311,10 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                 type="button"
                 role="tab"
                 aria-selected={tab === id}
-                onClick={() => setTab(id)}
+                onClick={() => {
+                  setTab(id);
+                  setQuery("");
+                }}
                 className={`flex-1 px-3 py-2 text-xs font-medium transition ${
                   tab === id
                     ? "text-primary border-b-2 border-primary-500"
@@ -297,8 +335,8 @@ export function EntityPicker({ transport }: EntityPickerProps) {
             ))}
           </div>
 
-          {/* Search box (Experts tab only) */}
-          {tab === "agent" && (
+          {/* Search box (Experts always; Skills/Connectors past the threshold) */}
+          {showSearch && (
             <div className="px-3 pt-2">
               <div className="flex items-center gap-1.5 rounded-lg bg-black/[0.04] dark:bg-white/[0.06] px-2 py-1.5">
                 <Search className="w-3.5 h-3.5 text-secondary/70 shrink-0" />
@@ -315,7 +353,13 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                     }
                     e.stopPropagation();
                   }}
-                  placeholder={t("EntityPicker.searchExperts")}
+                  placeholder={t(
+                    tab === "agent"
+                      ? "EntityPicker.searchExperts"
+                      : tab === "skill"
+                        ? "EntityPicker.searchSkills"
+                        : "EntityPicker.searchConnectors"
+                  )}
                   className="flex-1 min-w-0 bg-transparent text-xs text-primary placeholder:text-secondary/60 focus:outline-none"
                 />
               </div>
@@ -337,14 +381,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                   </div>
                 )}
                 {agentsOk &&
-                  agents
-                    .filter(
-                      (a) =>
-                        query.trim() === "" ||
-                        a.display_name.toLowerCase().includes(query.trim().toLowerCase()) ||
-                        a.id.toLowerCase().includes(query.trim().toLowerCase())
-                    )
-                    .map((a) => (
+                  filteredAgents.map((a) => (
                       <PickerRow
                         key={`agent-${a.id}`}
                         emoji={a.emoji || "🤖"}
@@ -363,12 +400,7 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                     ))}
                 {agentsOk &&
                   agents.length > 0 &&
-                  agents.every(
-                    (a) =>
-                      query.trim() !== "" &&
-                      !a.display_name.toLowerCase().includes(query.trim().toLowerCase()) &&
-                      !a.id.toLowerCase().includes(query.trim().toLowerCase())
-                  ) && (
+                  filteredAgents.length === 0 && (
                     <div className="px-3 py-1.5 text-xs text-secondary/70">
                       {t("EntityPicker.noMatches")}
                     </div>
@@ -385,7 +417,14 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                   </div>
                 )}
                 {skillsOk &&
-                  skills.map((s) => (
+                  skills.length > 0 &&
+                  filteredSkills.length === 0 && (
+                    <div className="px-3 py-1.5 text-xs text-secondary/70">
+                      {t("EntityPicker.noMatchingSkills")}
+                    </div>
+                  )}
+                {skillsOk &&
+                  filteredSkills.map((s) => (
                     <PickerRow
                       key={`skill-${s.name}`}
                       emoji="🧩"
@@ -414,7 +453,14 @@ export function EntityPicker({ transport }: EntityPickerProps) {
                   </div>
                 )}
                 {connectorsOk &&
-                  connectors.map((c) => (
+                  connectors.length > 0 &&
+                  filteredConnectors.length === 0 && (
+                    <div className="px-3 py-1.5 text-xs text-secondary/70">
+                      {t("EntityPicker.noMatchingConnectors")}
+                    </div>
+                  )}
+                {connectorsOk &&
+                  filteredConnectors.map((c) => (
                     <PickerRow
                       key={`connector-${c.id}`}
                       emoji="🔌"
