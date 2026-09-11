@@ -103,7 +103,7 @@ pub async fn make_test_state_parts(
     let _ = session_file_manager.init().await;
 
     let skills_manager = Arc::new(RwLock::new(
-        crate::skills::SkillManager::new()
+        crate::skills::SkillManager::new(crate::dirs::paths())
             .await
             .expect("skill manager"),
     ));
@@ -188,6 +188,10 @@ pub async fn make_test_state_parts(
                 #[cfg(feature = "cloud")]
                 None,
                 secrets.clone(),
+                Arc::new(crate::dirs::SyscityPaths::from_root(
+                    std::env::temp_dir()
+                        .join(format!("syscity_state_test_cm_{}", uuid::Uuid::new_v4())),
+                )),
             )),
             approval_queue: Arc::new(ApprovalQueue::new()),
             ask_queue: Arc::new(crate::tools::ask_user::AskQueue::new()),

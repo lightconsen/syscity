@@ -12,12 +12,15 @@ use crate::tools::sdk::ToolCapabilities;
 
 /// Tool that writes a user-viewable report (markdown or HTML) to the
 /// artifacts directory and returns metadata for frontend preview.
-#[derive(Debug, Default)]
-pub struct WriteReportTool;
+#[derive(Debug)]
+pub struct WriteReportTool {
+    /// Layout root the artifact directories resolve against.
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+}
 
 impl WriteReportTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(paths: std::sync::Arc<crate::dirs::SyscityPaths>) -> Self {
+        Self { paths }
     }
 }
 
@@ -27,8 +30,11 @@ impl WriteReportTool {
 ///
 /// - `~/.syscity/workspace` → `default`
 /// - `~/.syscity/agents/<id>/workspace` → `<id>`
-fn artifact_url_owner(agent_ws: &std::path::Path) -> Option<String> {
-    let base = crate::dirs::syscity_dir();
+fn artifact_url_owner(
+    paths: &crate::dirs::SyscityPaths,
+    agent_ws: &std::path::Path,
+) -> Option<String> {
+    let base = paths.root().to_path_buf();
     if agent_ws == base.join("workspace") {
         return Some("default".to_string());
     }
@@ -57,6 +63,7 @@ fn artifact_url_owner(agent_ws: &std::path::Path) -> Option<String> {
 /// all document/image artifacts land in the same owner-addressed workspace
 /// convention.
 pub fn resolve_artifact_target(
+    paths: &crate::dirs::SyscityPaths,
     context: &ToolContext,
     filename: &str,
 ) -> (std::path::PathBuf, String) {
@@ -66,7 +73,7 @@ pub fn resolve_artifact_target(
         .agent_workspace
         .clone()
         .unwrap_or_else(|| context.workspace_root().clone());
-    let owner = artifact_url_owner(&agent_ws);
+    let owner = artifact_url_owner(paths, &agent_ws);
     let tree_path = match delegation_scope {
         Some(scope) => format!("{}/{}", scope.root_id, scope.task_id),
         None => String::new(),
@@ -80,7 +87,7 @@ pub fn resolve_artifact_target(
             d
         }
         None => {
-            let mut d = crate::dirs::artifacts_dir();
+            let mut d = paths.artifacts_dir();
             if !tree_path.is_empty() {
                 d = d.join(&tree_path);
             }
@@ -233,7 +240,7 @@ impl Tool for WriteReportTool {
         // `~/.syscity/workspace` is addressed as `@default`). A workspace
         // outside the standard layout cannot be addressed safely, so those
         // reports keep the legacy global directory + flat URL.
-        let (artifacts_dir, url) = resolve_artifact_target(context, filename);
+        let (artifacts_dir, url) = resolve_artifact_target(&self.paths, context, filename);
         tokio::fs::create_dir_all(&artifacts_dir)
             .await
             .map_err(|e| crate::error::SyscityError::IoContext {
@@ -306,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_report_basic() {
-        let tool = WriteReportTool::new();
+        let tool = WriteReportTool::new(crate::dirs::paths());
         assert_eq!(tool.name(), "write_report");
 
         let args = serde_json::json!({
@@ -339,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_report_slides_validates_canvas_and_exports() {
-        let tool = WriteReportTool::new();
+        let tool = WriteReportTool::new(crate::dirs::paths());
         let ctx = ToolContext::new("test", "test-conv");
 
         // A valid canvas gets an export_url for on-demand pptx conversion.
@@ -383,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_report_docx_and_xlsx_export_urls() {
-        let tool = WriteReportTool::new();
+        let tool = WriteReportTool::new(crate::dirs::paths());
         let ctx = ToolContext::new("test", "test-conv");
 
         // docx: any flowing HTML converts; no structural gate.
@@ -442,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_report_in_delegation_is_tree_bound() {
-        let tool = WriteReportTool::new();
+        let tool = WriteReportTool::new(crate::dirs::paths());
 
         let scope = DelegationScope::new("root-9", "task-9", 1, 3);
         let ctx = ToolContext::new("test", "test-conv").with_delegation(Some(scope));
@@ -482,20 +489,22 @@ mod tests {
 
     #[test]
     fn test_artifact_url_owner_standard_layouts() {
-        let base = crate::dirs::syscity_dir();
-        assert_eq!(artifact_url_owner(&base.join("workspace")).as_deref(), Some("default"));
+        let paths = crate::dirs::paths();
+        let base = paths.root();
+        assert_eq!(artifact_url_owner(&paths, &base.join("workspace")).as_deref(), Some("default"));
         assert_eq!(
-            artifact_url_owner(&base.join("agents/worker/workspace")).as_deref(),
+            artifact_url_owner(&paths, &base.join("agents/worker/workspace")).as_deref(),
             Some("worker")
         );
     }
 
     #[test]
     fn test_artifact_url_owner_rejects_nonstandard_or_unsafe() {
-        let base = crate::dirs::syscity_dir();
+        let paths = crate::dirs::paths();
+        let base = paths.root();
         // Custom workspace outside the standard layout.
-        assert!(artifact_url_owner(std::path::Path::new("/tmp/custom-ws")).is_none());
+        assert!(artifact_url_owner(&paths, std::path::Path::new("/tmp/custom-ws")).is_none());
         // Agent id with URL-hostile characters.
-        assert!(artifact_url_owner(&base.join("agents/a.b/workspace")).is_none());
+        assert!(artifact_url_owner(&paths, &base.join("agents/a.b/workspace")).is_none());
     }
 }

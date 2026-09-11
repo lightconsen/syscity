@@ -67,6 +67,8 @@ pub struct SkillManager {
     /// Reload channel
     reload_tx: mpsc::Sender<String>,
     reload_rx: Arc<RwLock<mpsc::Receiver<String>>>,
+    /// Layout root the user skills directory resolves against.
+    paths: Arc<crate::dirs::SyscityPaths>,
 }
 
 #[cfg(test)]

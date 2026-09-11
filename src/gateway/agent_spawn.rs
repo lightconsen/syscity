@@ -960,6 +960,8 @@ pub(crate) struct ToolRegistryArgs {
     pub tool_hooks: crate::tools::hooks::ToolHooks,
     /// Secret-store instance handle shared with the gateway (cloud tools).
     pub secrets: Arc<crate::secrets::SecretStoreHandle>,
+    /// Layout root shared with the gateway.
+    pub paths: Arc<crate::dirs::SyscityPaths>,
 }
 
 /// Create default tool registry with all built-in tools
@@ -985,6 +987,7 @@ pub(crate) async fn create_default_tool_registry(
         skills_manager,
         tool_hooks,
         secrets,
+        paths,
     } = args;
 
     let mut registry = ToolRegistry::new()
@@ -1002,8 +1005,8 @@ pub(crate) async fn create_default_tool_registry(
     registry.register(Box::new(FileReadTool::new().with_write_guard(write_guard.clone())));
     registry.register(Box::new(FileWriteTool::new().with_write_guard(write_guard.clone())));
     registry.register(Box::new(FileEditTool::new().with_write_guard(write_guard)));
-    registry.register(Box::new(crate::tools::WriteReportTool::new()));
-    registry.register(Box::new(crate::tools::SvgToPngTool::new()));
+    registry.register(Box::new(crate::tools::WriteReportTool::new(paths.clone())));
+    registry.register(Box::new(crate::tools::SvgToPngTool::new(paths.clone())));
     registry.register(Box::new(GlobTool::new()));
     registry.register(Box::new(GrepTool::new()));
 

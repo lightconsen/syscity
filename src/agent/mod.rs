@@ -797,7 +797,9 @@ mod tests {
     #[tokio::test]
     async fn test_skill_manager_injection_into_build_fresh_context() {
         // Create skill manager and load built-in skills
-        let mut skill_manager = crate::skills::SkillManager::new().await.unwrap();
+        let mut skill_manager = crate::skills::SkillManager::new(crate::dirs::paths())
+            .await
+            .unwrap();
         let loaded = skill_manager.load_all().await.unwrap();
         assert!(loaded > 0, "Expected built-in skills to be loaded");
 
@@ -836,7 +838,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_catalog_stable_regardless_of_message() {
-        let mut skill_manager = crate::skills::SkillManager::new().await.unwrap();
+        let mut skill_manager = crate::skills::SkillManager::new(crate::dirs::paths())
+            .await
+            .unwrap();
         skill_manager.load_all().await.unwrap();
         let skill_manager = Arc::new(RwLock::new(skill_manager));
 

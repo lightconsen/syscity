@@ -102,6 +102,8 @@ pub struct ConnectorManager {
     /// Secret-store handle for reading the cloud session token during catalog
     /// sync (attached to the request as a Bearer token).
     secrets: Arc<crate::secrets::SecretStoreHandle>,
+    /// Layout root the connector's sibling directories resolve against.
+    paths: Arc<crate::dirs::SyscityPaths>,
 }
 
 impl std::fmt::Debug for ConnectorManager {
@@ -123,6 +125,7 @@ impl ConnectorManager {
         skill_storage: Arc<SkillStorage>,
         #[cfg(feature = "cloud")] cloud_api_base: Option<String>,
         secrets: Arc<crate::secrets::SecretStoreHandle>,
+        paths: Arc<crate::dirs::SyscityPaths>,
     ) -> Self {
         Self {
             root,
@@ -133,6 +136,7 @@ impl ConnectorManager {
             #[cfg(feature = "cloud")]
             cloud_api_base,
             secrets,
+            paths,
         }
     }
 
@@ -409,7 +413,7 @@ impl ConnectorManager {
             .catalog_cache()
             .install_entry(entry, &cache_root)
             .await?;
-        let agents_dir = crate::dirs::agents_dir();
+        let agents_dir = self.paths.agents_dir();
         let mut installed = Vec::new();
 
         install_agent_roles(&dest, &agents_dir, &entry.id, &mut installed).await?;
@@ -1093,6 +1097,7 @@ mod tests {
             #[cfg(feature = "cloud")]
             None,
             Arc::new(crate::secrets::SecretStoreHandle::default()),
+            Arc::new(crate::dirs::SyscityPaths::from_root(root.clone())),
         );
         Fixture {
             root,
@@ -1428,6 +1433,7 @@ mod tests {
             Arc::new(SkillStorage::with_user_dir(user_skills)),
             Some("https://api.syscity.net".to_string()),
             Arc::new(crate::secrets::SecretStoreHandle::default()),
+            Arc::new(crate::dirs::SyscityPaths::from_root(root.clone())),
         );
 
         let m = ConnectorManifest::parse(

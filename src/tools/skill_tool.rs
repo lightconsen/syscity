@@ -110,7 +110,7 @@ mod tests {
     use crate::skills::Skill;
 
     async fn manager_with_skills() -> Arc<RwLock<SkillManager>> {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
         let mut base = Skill::new("base", "Base skill", "BASE_BODY");
         base.version = "1.0.0".to_string();
         manager.insert_for_test(base).await;

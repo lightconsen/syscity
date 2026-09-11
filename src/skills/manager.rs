@@ -14,9 +14,9 @@ use tracing::{error, info, warn};
 use super::*;
 
 impl SkillManager {
-    /// Create a new skill manager
-    pub async fn new() -> crate::Result<Self> {
-        let storage = SkillStorage::new()?;
+    /// Create a new skill manager rooted at `paths`.
+    pub async fn new(paths: std::sync::Arc<crate::dirs::SyscityPaths>) -> crate::Result<Self> {
+        let storage = SkillStorage::new(paths.clone())?;
         let config = match SkillConfig::load().await {
             Ok(c) => c,
             Err(e) => {
@@ -33,6 +33,7 @@ impl SkillManager {
             watcher: None,
             reload_tx,
             reload_rx: Arc::new(RwLock::new(reload_rx)),
+            paths,
         };
 
         Ok(manager)
@@ -489,8 +490,8 @@ impl SkillManager {
         registry_url: Option<&str>,
     ) -> crate::Result<()> {
         let registry = match registry_url {
-            Some(url) => registry::SkillRegistry::new(url)?,
-            None => registry::SkillRegistry::default_registry()?,
+            Some(url) => registry::SkillRegistry::new(url, self.paths.clone())?,
+            None => registry::SkillRegistry::default_registry(self.paths.clone())?,
         };
 
         info!("Installing skill '{}' from registry", name);
@@ -802,14 +803,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_manager_dependency_graph_empty() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
         let graph = manager.build_dependency_graph().await;
         assert!(graph.names().is_empty());
     }
 
     #[tokio::test]
     async fn test_skill_manager_dependency_graph_with_skills() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
 
         // Insert a skill with dependencies directly
         {
@@ -832,7 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_manager_resolve_dependencies() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
 
         {
             let mut skills = manager.skills.write().await;
@@ -853,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_catalog_format_and_stability() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
         {
             let mut skills = manager.skills.write().await;
             skills.insert(
@@ -880,13 +881,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_catalog_empty() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
         assert_eq!(manager.build_catalog().await, "");
     }
 
     #[tokio::test]
     async fn test_skill_manager_check_dependencies_satisfied() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
 
         {
             let mut skills = manager.skills.write().await;
@@ -908,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_manager_check_dependencies_missing() {
-        let manager = SkillManager::new().await.unwrap();
+        let manager = SkillManager::new(crate::dirs::paths()).await.unwrap();
 
         {
             let mut skills = manager.skills.write().await;

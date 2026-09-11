@@ -47,12 +47,15 @@ pub fn rasterize_svg(svg: &str) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 /// `svg_to_png` tool.
-#[derive(Debug, Default)]
-pub struct SvgToPngTool;
+#[derive(Debug)]
+pub struct SvgToPngTool {
+    /// Layout root the artifact directories resolve against.
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+}
 
 impl SvgToPngTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(paths: std::sync::Arc<crate::dirs::SyscityPaths>) -> Self {
+        Self { paths }
     }
 }
 
@@ -143,7 +146,7 @@ impl Tool for SvgToPngTool {
         let svg_filename = format!("{base}.svg");
         let png_filename = format!("{base}.png");
 
-        let (artifacts_dir, _) = resolve_artifact_target(context, &png_filename);
+        let (artifacts_dir, _) = resolve_artifact_target(&self.paths, context, &png_filename);
         tokio::fs::create_dir_all(&artifacts_dir)
             .await
             .map_err(|e| crate::error::SyscityError::IoContext {
@@ -164,8 +167,8 @@ impl Tool for SvgToPngTool {
                 source: e,
             })?;
 
-        let (_, svg_url) = resolve_artifact_target(context, &svg_filename);
-        let (_, png_url) = resolve_artifact_target(context, &png_filename);
+        let (_, svg_url) = resolve_artifact_target(&self.paths, context, &svg_filename);
+        let (_, png_url) = resolve_artifact_target(&self.paths, context, &png_filename);
 
         Ok(ToolExecutionResult::success(format!(
             "Rendered SVG to {png_filename} ({width}x{height})"

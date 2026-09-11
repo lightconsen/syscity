@@ -389,11 +389,12 @@ impl Gateway {
         .await;
 
         let (skills_manager, agent_registry, session_manager) =
-            init::agents::init_agent_state().await?;
+            init::agents::init_agent_state(paths.clone()).await?;
 
         let tools_init = init::tools::init_tools(
             &config,
             init::tools::ToolSystemDeps {
+                paths: paths.clone(),
                 acp: acp.clone(),
                 session_store: session_store.clone(),
                 audit_log_dyn: audit_log_dyn.clone(),

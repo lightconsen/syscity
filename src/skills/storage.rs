@@ -79,9 +79,9 @@ pub struct SkillStorage {
 }
 
 impl SkillStorage {
-    /// Create a new skill storage instance
-    pub fn new() -> crate::Result<Self> {
-        let user_dir = Self::user_skills_dir()?;
+    /// Create a new skill storage instance rooted at `paths`.
+    pub fn new(paths: std::sync::Arc<crate::dirs::SyscityPaths>) -> crate::Result<Self> {
+        let user_dir = paths.skills_dir();
 
         Ok(Self {
             bundled_dir: Self::bundled_skills_dir(),
@@ -102,12 +102,6 @@ impl SkillStorage {
                 Some(PathBuf::from("./skills"))
             })
             .filter(|p| p.exists())
-    }
-
-    /// Get the user skills directory (~/.syscity/skills/)
-    fn user_skills_dir() -> crate::Result<PathBuf> {
-        // Use centralized ~/.syscity/skills directory
-        Ok(crate::dirs::skills_dir())
     }
 
     /// Get the project skills directory (./.syscity/skills/)
@@ -405,15 +399,6 @@ impl SkillStorage {
     }
 }
 
-impl Default for SkillStorage {
-    fn default() -> Self {
-        // Default trait cannot return Result; user_skills_dir only fails if
-        // no home directory is set, which is unrecoverable in this context.
-        #[allow(clippy::expect_used)]
-        Self::new().expect("Failed to create skill storage")
-    }
-}
-
 /// Copy directory recursively
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> crate::Result<()> {
     tokio::fs::create_dir_all(dst)
@@ -498,9 +483,7 @@ mod tests {
 
     #[test]
     fn test_user_skills_dir() {
-        let dir = SkillStorage::user_skills_dir();
-        assert!(dir.is_ok());
-        let dir = dir.unwrap();
+        let dir = crate::dirs::paths().skills_dir();
         assert!(dir.to_string_lossy().contains("syscity"));
         assert!(dir.to_string_lossy().contains("skills"));
     }
@@ -535,13 +518,13 @@ mod tests {
 
     #[test]
     fn test_skill_storage_new() {
-        let storage = SkillStorage::new();
+        let storage = SkillStorage::new(crate::dirs::paths());
         assert!(storage.is_ok());
     }
 
     #[test]
     fn test_skill_storage_default() {
-        let storage = SkillStorage::default();
+        let storage = SkillStorage::new(crate::dirs::paths()).expect("skill storage");
         assert!(!storage.user_dir().as_os_str().is_empty());
     }
 

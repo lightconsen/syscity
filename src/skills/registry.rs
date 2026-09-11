@@ -62,28 +62,33 @@ pub struct SkillRegistry {
     url: String,
     /// HTTP client
     client: reqwest::Client,
+    /// Layout root installed skills are written under.
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
 }
 
 impl SkillRegistry {
     /// Create a new skill registry client
-    pub fn new(url: impl Into<String>) -> Result<Self> {
+    pub fn new(
+        url: impl Into<String>,
+        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent(format!("syscity/{} (SkillRegistry)", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| SyscityError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
-        Ok(Self { url: url.into(), client })
+        Ok(Self { url: url.into(), client, paths })
     }
 
     /// Create registry with default URL
-    pub fn default_registry() -> Result<Self> {
-        Self::new("https://skills.syscity.dev")
+    pub fn default_registry(paths: std::sync::Arc<crate::dirs::SyscityPaths>) -> Result<Self> {
+        Self::new("https://skills.syscity.dev", paths)
     }
 
     /// Get the ClawHub registry
-    pub fn clawhub() -> Result<Self> {
-        Self::new("https://clawhub.syscity.dev")
+    pub fn clawhub(paths: std::sync::Arc<crate::dirs::SyscityPaths>) -> Result<Self> {
+        Self::new("https://clawhub.syscity.dev", paths)
     }
 
     /// Search for skills in the registry
@@ -177,7 +182,7 @@ impl SkillRegistry {
         info!("Installing skill '{}' from registry", name);
 
         // Check if already installed
-        let skill_dir = dirs::skills_dir().join(name);
+        let skill_dir = self.paths.skills_dir().join(name);
 
         if skill_dir.exists() {
             warn!("Skill '{}' already installed at {:?}", name, skill_dir);
@@ -268,7 +273,7 @@ impl SkillRegistry {
 
         let content = response.bytes().await.map_err(SyscityError::Http)?;
 
-        let skill_dir = dirs::skills_dir().join(name);
+        let skill_dir = self.paths.skills_dir().join(name);
 
         fs::create_dir_all(&skill_dir)
             .await
@@ -289,7 +294,7 @@ impl SkillRegistry {
         info!("Updating skill '{}'", name);
 
         // Get current version
-        let skill_dir = dirs::skills_dir().join(name);
+        let skill_dir = self.paths.skills_dir().join(name);
 
         if !skill_dir.exists() {
             return Err(SyscityError::NotFound {
@@ -339,7 +344,7 @@ impl SkillRegistry {
     pub async fn check_updates(&self) -> Result<Vec<SkillUpdate>> {
         debug!("Checking for skill updates");
 
-        let skill_dir = dirs::skills_dir();
+        let skill_dir = self.paths.skills_dir();
 
         let mut updates = Vec::new();
 
@@ -429,7 +434,7 @@ impl SkillRegistry {
     pub async fn uninstall(&self, name: &str) -> Result<()> {
         info!("Uninstalling skill '{}'", name);
 
-        let skill_dir = dirs::skills_dir().join(name);
+        let skill_dir = self.paths.skills_dir().join(name);
 
         if !skill_dir.exists() {
             return Err(SyscityError::NotFound {
@@ -452,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_skill_registry_creation() {
-        let registry = SkillRegistry::new("https://skills.example.com");
+        let registry = SkillRegistry::new("https://skills.example.com", crate::dirs::paths());
         assert!(registry.is_ok());
 
         let reg = registry.unwrap();
@@ -461,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_default_registry() {
-        let registry = SkillRegistry::default_registry();
+        let registry = SkillRegistry::default_registry(crate::dirs::paths());
         assert!(registry.is_ok());
         let reg = registry.unwrap();
         assert_eq!(reg.url, "https://skills.syscity.dev");
@@ -469,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_clawhub_registry() {
-        let registry = SkillRegistry::clawhub();
+        let registry = SkillRegistry::clawhub(crate::dirs::paths());
         assert!(registry.is_ok());
         let reg = registry.unwrap();
         assert_eq!(reg.url, "https://clawhub.syscity.dev");

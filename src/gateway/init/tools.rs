@@ -242,6 +242,8 @@ pub struct ToolSystemDeps {
     pub shell_hooks: Arc<ShellHookBridge>,
     /// Secret-store instance handle shared with the gateway.
     pub secrets: Arc<crate::secrets::SecretStoreHandle>,
+    /// Layout root shared with the gateway.
+    pub paths: Arc<crate::dirs::SyscityPaths>,
 }
 
 /// Initialize the full tool subsystem.
@@ -256,17 +258,19 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         skills_manager,
         shell_hooks,
         secrets,
+        paths,
     } = deps;
     let (mcp_manager, mcp_event_rx) = init_mcp_manager(secrets.clone()).await;
     let connector_manager = Arc::new(crate::mcp::ConnectorManager::new(
-        crate::dirs::connectors_dir(),
+        paths.connectors_dir(),
         mcp_manager.clone(),
-        Arc::new(crate::skills::SkillStorage::new()?),
+        Arc::new(crate::skills::SkillStorage::new(paths.clone())?),
         // kind=cloud connectors route through the cloud MCP relay only when
         // cloud mode is enabled (§2.7 double gate: feature + cloud.enabled).
         #[cfg(feature = "cloud")]
         config.cloud.enabled.then(|| config.cloud.api_base.clone()),
         secrets.clone(),
+        paths.clone(),
     ));
     let approval_queue = Arc::new(ApprovalQueue::new());
     let ask_queue = Arc::new(AskQueue::new());
@@ -292,6 +296,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 skills_manager,
                 tool_hooks: shell_hooks.tool_hooks(),
                 secrets: secrets.clone(),
+                paths: paths.clone(),
             },
         )
         .await?,

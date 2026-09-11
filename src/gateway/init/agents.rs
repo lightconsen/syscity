@@ -259,12 +259,14 @@ pub async fn configure_acp_agent_builder(
 }
 
 /// Initialize skill manager, agent registry, and session manager.
-pub async fn init_agent_state() -> crate::Result<(
+pub async fn init_agent_state(
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+) -> crate::Result<(
     Arc<RwLock<SkillManager>>,
     Arc<RwLock<AgentRegistry>>,
     Arc<RwLock<SessionManager>>,
 )> {
-    let skills_manager = Arc::new(RwLock::new(SkillManager::new().await?));
+    let skills_manager = Arc::new(RwLock::new(SkillManager::new(paths).await?));
     let agent_registry = Arc::new(RwLock::new(AgentRegistry::new()));
     let session_manager = Arc::new(RwLock::new(SessionManager::new()));
     Ok((skills_manager, agent_registry, session_manager))
@@ -279,10 +281,11 @@ pub async fn init_agents(
     task_registry: Arc<crate::gateway::task_registry::TaskRegistry>,
     shutdown_token: CancellationToken,
     secrets: Arc<crate::secrets::SecretStoreHandle>,
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
 ) -> crate::Result<AgentsInit> {
     let acp = init_acp(config, session_store).await;
     let model_router = init_model_router(config, task_registry, shutdown_token, secrets).await;
-    let (skills_manager, agent_registry, session_manager) = init_agent_state().await?;
+    let (skills_manager, agent_registry, session_manager) = init_agent_state(paths).await?;
 
     configure_acp_agent_builder(
         &acp,
