@@ -89,6 +89,93 @@ jobs:
           # default the deployment target lower, so pin it on macOS builds.
           MACOSX_DEPLOYMENT_TARGET: ${{ runner.os == 'macOS' && '10.15' || '' }}
 
+      # Developer ID signing + notarization. The CLI is a bare Mach-O, so
+      # notarytool needs it zipped and Apple cannot staple a ticket to it —
+      # Gatekeeper validates the notarization online on first run.
+      - name: Prepare Apple signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          # Developer ID cert + key into a throwaway keychain the ephemeral
+          # runner discards with the job.
+          printf '%s' "$APPLE_CERTIFICATE" \
+            | openssl base64 -d -A -out "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security -f pkcs12
+          # codesign runs headless, so the imported key must be pre-authorized
+          # or it blocks on a keychain prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user \
+            -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          # App Store Connect API key for notarytool. Tauri reads APPLE_API_KEY
+          # as the Key ID and APPLE_API_KEY_PATH as the .p8 path; notarytool is
+          # told both explicitly.
+          P8="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" \
+            | openssl base64 -d -A -out "$P8"
+          chmod 600 "$P8"
+          echo "APPLE_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
+
+      - name: Sign release binary
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/syscity"
+          codesign --force --options runtime --timestamp \
+            --entitlements scripts/entitlements/cli.entitlements \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      - name: Notarize release binary
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/syscity"
+          ZIP="$RUNNER_TEMP/${{ matrix.asset_name }}.zip"
+          ditto -c -k --keepParent "$BIN" "$ZIP"
+
+          RESULT="$RUNNER_TEMP/notarytool.json"
+          if ! xcrun notarytool submit "$ZIP" \
+              --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" --wait --output-format json > "$RESULT"; then
+            cat "$RESULT" || true
+            echo "::error::notarytool submission failed"
+            exit 1
+          fi
+          cat "$RESULT"
+
+          STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RESULT")"
+          if [ "$STATUS" != "Accepted" ]; then
+            ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$RESULT")"
+            xcrun notarytool log "$ID" \
+              --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" || true
+            echo "::error::notarization status: $STATUS"
+            exit 1
+          fi
+
       - name: Package
         shell: bash
         run: |
@@ -187,6 +274,22 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0.0"
 
+      # The App Store Connect API key is the only piece Tauri cannot read from
+      # a secret directly: APPLE_API_KEY_PATH must point at a real .p8 file.
+      - name: Prepare Apple notary key
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          P8="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" \
+            | openssl base64 -d -A -out "$P8"
+          chmod 600 "$P8"
+          echo "APPLE_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
+
       - name: Build Tauri App
         working-directory: desktop
         run: cargo tauri build --target ${{ matrix.target }}
@@ -197,6 +300,42 @@ jobs:
           # llama.cpp requires std::filesystem (macOS 10.15+). cargo tauri build
           # defaults the deployment target lower, so pin it on macOS builds.
           MACOSX_DEPLOYMENT_TARGET: ${{ runner.os == 'macOS' && '10.15' || '' }}
+          # Apple Developer ID. Tauri creates its own keychain from the .p12,
+          # signs the bundle with the hardened runtime, then notarizes and
+          # staples it — no manual keychain step needed here. Apple-account
+          # auth is deliberately the API-key form (not APPLE_ID/APPLE_PASSWORD),
+          # which is the one that survives unattended CI. Ignored on non-macOS
+          # targets.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+
+      # Fail the release rather than publish a bundle Gatekeeper will reject.
+      - name: Verify macOS signature and notarization
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # desktop/ is a workspace member, so the bundle lands in one of two
+          # places depending on how cargo resolves the target dir.
+          BUNDLE_DIR="desktop/target/${{ matrix.target }}/release/bundle"
+          [ -d "$BUNDLE_DIR" ] || BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+
+          APP="$BUNDLE_DIR/macos/Syscity.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          spctl -a -vvv -t exec "$APP"
+
+          for DMG in "$BUNDLE_DIR"/dmg/*.dmg; do
+            [ -f "$DMG" ] || continue
+            codesign --verify --strict --verbose=2 "$DMG"
+            # Gatekeeper evaluates the .app inside (verified above); the dmg's
+            # own ticket is best-effort, so don't block the release on it.
+            xcrun stapler validate "$DMG" \
+              || echo "::warning::$DMG has no stapled ticket (inner .app is stapled)"
+          done
 
       - name: Collect artifacts
         shell: bash

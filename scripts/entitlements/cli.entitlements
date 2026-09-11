@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened runtime (required for notarization) blocks JIT by default.
+	     The CLI ships the `plugins` feature, so wasmtime's Cranelift backend
+	     needs MAP_JIT executable memory when a wasm plugin runs. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+</dict>
+</plist>

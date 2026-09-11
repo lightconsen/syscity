@@ -4,5 +4,10 @@
 <dict>
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
+	<!-- Hardened runtime (applied when the bundle is Developer ID signed)
+	     blocks JIT by default. The `plugins` feature runs wasmtime, whose
+	     Cranelift backend needs MAP_JIT executable memory. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
 </dict>
 </plist>

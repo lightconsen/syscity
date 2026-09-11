@@ -111,6 +111,8 @@ Release CI (`.github/workflows/release.yml`) publishes:
 - Each CLI tarball ships a `.sha256`; desktop updater artifacts are
   minisign-signed with per-platform `latest.json` manifests (see
   [self-upgrade.md](self-upgrade.md)).
+- Every macOS artifact (CLI binaries, `.app`, `.dmg`) is Developer ID signed
+  and notarized (see [release.md](release.md#macos-signing)).
 
 macOS builds pin `MACOSX_DEPLOYMENT_TARGET=10.15` because llama.cpp requires
 `std::filesystem`.
