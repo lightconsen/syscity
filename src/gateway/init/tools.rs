@@ -56,6 +56,7 @@ pub async fn init_mcp_manager(
 pub async fn init_computer_adapter(
     config: &GatewayConfig,
     tool_registry: Arc<ToolRegistry>,
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
 ) -> Option<Arc<dyn ComputerAdapter>> {
     if !config.computer.enabled {
         return None;
@@ -80,7 +81,7 @@ pub async fn init_computer_adapter(
                 config.computer.remote_control.timeout_secs,
             ),
         };
-        match crate::computer::RemoteControlAdapter::new(rc_config).await {
+        match crate::computer::RemoteControlAdapter::new(rc_config, paths.clone()).await {
             Ok(adapter) => {
                 info!("Remote control adapter connected to {} for desktop automation", host);
                 return Some(Arc::new(adapter));
@@ -302,7 +303,8 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         .await?,
     );
 
-    let computer_adapter = init_computer_adapter(config, tool_registry.clone()).await;
+    let computer_adapter =
+        init_computer_adapter(config, tool_registry.clone(), paths.clone()).await;
 
     // Register ComputerTool with the adapter (or None if unavailable).
     if let Some(ref adapter) = computer_adapter {

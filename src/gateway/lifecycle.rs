@@ -1246,6 +1246,7 @@ async fn run_quality_gate_check(
         &config.quality_gate,
         harness,
         evals_dir,
+        state.paths.clone(),
     ) {
         Some(g) => g,
         None => {

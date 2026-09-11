@@ -165,9 +165,8 @@ pub struct BaselineStore {
 
 impl BaselineStore {
     /// Load baselines from the default path (`~/.syscity/baselines.json`).
-    pub fn load() -> Self {
-        let path = crate::dirs::data_dir().join("baselines.json");
-        Self::load_from(path)
+    pub fn load(paths: &crate::dirs::SyscityPaths) -> Self {
+        Self::load_from(paths.data_dir().join("baselines.json"))
     }
 
     /// Load baselines from a specific path.
@@ -272,6 +271,8 @@ pub struct QualityGate {
     pub harness: EvalHarness,
     pub evals_dir: PathBuf,
     pub baseline_store: BaselineStore,
+    /// Layout root the gate's persisted state resolves against.
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
     /// Governance rules applied to the auto-included badcase regression suite
     /// (expiry / dedup / downgrade, §十二 回归集治理). `None` falls back to the
     /// raw `load_badcase_suite` auto-include.
@@ -294,6 +295,7 @@ impl QualityGate {
         suites: Vec<String>,
         harness: EvalHarness,
         evals_dir: PathBuf,
+        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
     ) -> Self {
         Self {
             name,
@@ -302,7 +304,8 @@ impl QualityGate {
             suites,
             harness,
             evals_dir,
-            baseline_store: BaselineStore::load(),
+            baseline_store: BaselineStore::load(&paths),
+            paths,
             badcase_governance: None,
             pending_badcase_store: None,
             turn_sample_store: None,
@@ -349,6 +352,7 @@ impl QualityGate {
         config: &QualityGateConfig,
         harness: EvalHarness,
         evals_dir: PathBuf,
+        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
     ) -> Option<Self> {
         if !config.enabled {
             return None;
@@ -385,7 +389,8 @@ impl QualityGate {
             suites: config.suites.clone(),
             harness,
             evals_dir,
-            baseline_store: BaselineStore::load(),
+            baseline_store: BaselineStore::load(&paths),
+            paths,
             badcase_governance: None,
             pending_badcase_store: None,
             turn_sample_store: None,
@@ -679,7 +684,7 @@ impl QualityGate {
 
     /// Phased rollout: run the offline gate and advance phase if signals pass.
     pub async fn run_phased(&self) -> (GateResult, PhaseStore) {
-        let mut phase = PhaseStore::load(&self.name);
+        let mut phase = PhaseStore::load(&self.name, &self.paths.data_dir());
         let (result, _decision) = self.check().await;
 
         if result.passed {
@@ -1027,18 +1032,23 @@ pub struct PhaseStore {
     pub gate_name: String,
     pub current_phase: f64, // 0.01, 0.10, 0.50, or 1.00
     pub phases: Vec<f64>,
+    /// Where this state persists. Not part of the serialized payload.
+    #[serde(skip)]
+    path: PathBuf,
 }
 
 impl PhaseStore {
-    /// Load phase state from `~/.syscity/phase.json`.
-    pub fn load(gate_name: &str) -> Self {
-        let path = crate::dirs::data_dir().join("phase.json");
+    /// Load phase state from `<data_dir>/phase.json`.
+    pub fn load(gate_name: &str, data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("phase.json");
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let store: Self = serde_json::from_str(&content).unwrap_or_else(|_| Self {
+        let mut store: Self = serde_json::from_str(&content).unwrap_or_else(|_| Self {
             gate_name: gate_name.to_string(),
             current_phase: 0.01,
             phases: vec![0.01, 0.10, 0.50, 1.00],
+            path: PathBuf::new(),
         });
+        store.path = path;
         store
     }
 
@@ -1060,7 +1070,7 @@ impl PhaseStore {
 
     /// Persist phase state to disk.
     fn save(&self) {
-        let path = crate::dirs::data_dir().join("phase.json");
+        let path = &self.path;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

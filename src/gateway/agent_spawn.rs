@@ -1094,7 +1094,7 @@ pub(crate) async fn create_default_tool_registry(
     registry.register(Box::new(ApplyPatchTool::new()));
 
     // Register memory tool for persistent memory storage
-    match MemoryTool::new().await {
+    match MemoryTool::new(&paths).await {
         Ok(memory_tool) => {
             registry.register(Box::new(memory_tool));
             info!("MemoryTool registered successfully");
@@ -1108,7 +1108,7 @@ pub(crate) async fn create_default_tool_registry(
     }
 
     // Register semantic/hybrid memory search tool
-    match MemorySearchTool::new().await {
+    match MemorySearchTool::new(&paths).await {
         Ok(tool) => {
             let tool = tool.with_manager_holder(memory_manager);
             registry.register(Box::new(tool));
@@ -1120,7 +1120,7 @@ pub(crate) async fn create_default_tool_registry(
     }
 
     // Register memory get/CRUD tool
-    match MemoryGetTool::new().await {
+    match MemoryGetTool::new(&paths).await {
         Ok(tool) => {
             registry.register(Box::new(tool));
             info!("MemoryGetTool registered successfully");

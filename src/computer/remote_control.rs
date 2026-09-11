@@ -129,6 +129,8 @@ impl RemoteOs {
 pub struct RemoteControlAdapter {
     config: RemoteControlConfig,
     remote_os: RemoteOs,
+    /// Layout root the workspace staging directory resolves against.
+    paths: std::sync::Arc<crate::dirs::SyscityPaths>,
 }
 
 impl std::fmt::Debug for RemoteControlAdapter {
@@ -145,10 +147,14 @@ impl RemoteControlAdapter {
     ///
     /// Probes the remote host to detect its OS.  Fails if the host is
     /// unreachable or SSH authentication fails.
-    pub async fn new(config: RemoteControlConfig) -> Result<Self> {
+    pub async fn new(
+        config: RemoteControlConfig,
+        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+    ) -> Result<Self> {
         let mut adapter = Self {
             config,
             remote_os: RemoteOs::Unknown,
+            paths,
         };
 
         adapter.detect_os().await?;
@@ -160,10 +166,14 @@ impl RemoteControlAdapter {
     }
 
     /// Create without probing (useful in tests).
-    pub fn new_unchecked(config: RemoteControlConfig) -> Self {
+    pub fn new_unchecked(
+        config: RemoteControlConfig,
+        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+    ) -> Self {
         Self {
             config,
             remote_os: RemoteOs::Linux,
+            paths,
         }
     }
 
@@ -288,7 +298,7 @@ impl RemoteControlAdapter {
             if output.status.success() && !output.stdout.is_empty() {
                 let raw_bytes = output.stdout;
                 // Apply ScreenshotEncoder to reduce payload size over SSH.
-                let files_dir = crate::dirs::workspace_data_dir().join("files");
+                let files_dir = self.paths.workspace_data_dir().join("files");
                 let _ = std::fs::create_dir_all(&files_dir);
                 let temp_path =
                     files_dir.join(format!("remote_{}.png", crate::utils::ms_timestamp()));
@@ -354,7 +364,9 @@ impl RemoteControlAdapter {
 
         let raw_bytes = output.stdout;
         // Apply ScreenshotEncoder to reduce payload size over SSH.
-        let temp_path = crate::dirs::workspace_data_dir()
+        let temp_path = self
+            .paths
+            .workspace_data_dir()
             .join("files")
             .join(format!("remote_{}.png", crate::utils::ms_timestamp()));
         if let Err(e) = tokio::fs::write(&temp_path, &raw_bytes).await {
@@ -424,7 +436,9 @@ $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
         let final_b64 = if let Ok(decoded) =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
         {
-            let temp_path = crate::dirs::workspace_data_dir()
+            let temp_path = self
+                .paths
+                .workspace_data_dir()
                 .join("files")
                 .join(format!("remote_{}.png", crate::utils::ms_timestamp()));
             if let Err(e) = tokio::fs::write(&temp_path, &decoded).await {
@@ -1062,24 +1076,30 @@ mod tests {
 
     #[test]
     fn test_remote_control_adapter_debug() {
-        let adapter = RemoteControlAdapter::new_unchecked(RemoteControlConfig::default());
+        let adapter = RemoteControlAdapter::new_unchecked(
+            RemoteControlConfig::default(),
+            crate::dirs::paths(),
+        );
         let debug = format!("{:?}", adapter);
         assert!(debug.contains("RemoteControlAdapter"));
     }
 
     #[test]
     fn test_ssh_cmd_builds() {
-        let adapter = RemoteControlAdapter::new_unchecked(RemoteControlConfig {
-            host: "test.example.com".to_string(),
-            user: "admin".to_string(),
-            port: 2222,
-            protocol: RemoteProtocol::Ssh {
-                key_path: Some("/key".to_string()),
+        let adapter = RemoteControlAdapter::new_unchecked(
+            RemoteControlConfig {
+                host: "test.example.com".to_string(),
+                user: "admin".to_string(),
+                port: 2222,
+                protocol: RemoteProtocol::Ssh {
+                    key_path: Some("/key".to_string()),
+                },
+                display: Some(":1".to_string()),
+                ssh_extra_args: vec!["-o".to_string(), "Compression=yes".to_string()],
+                connect_timeout: Duration::from_secs(5),
             },
-            display: Some(":1".to_string()),
-            ssh_extra_args: vec!["-o".to_string(), "Compression=yes".to_string()],
-            connect_timeout: Duration::from_secs(5),
-        });
+            crate::dirs::paths(),
+        );
 
         let cmd = adapter.ssh_cmd();
         // We can't inspect the Command easily, but at least we verified it doesn't
