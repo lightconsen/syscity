@@ -201,6 +201,7 @@ pub(crate) async fn spawn_goal_runner_with_store(
         state.tools.registry.clone(),
         state.infra.model_router.clone(),
         goal_tx,
+        state.paths.clone(),
     )
     .with_progress(persisted.round, condition_history)
     // Fresh-context goals resume with the same carried handoff they had

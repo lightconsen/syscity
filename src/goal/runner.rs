@@ -109,6 +109,8 @@ pub struct GoalRunner {
     pub plan: GoalPlan,
     /// Current round number (1-indexed).
     pub round: usize,
+    /// Layout root the goal workspace resolves against.
+    paths: Arc<crate::dirs::SyscityPaths>,
     /// Tool registry for tool execution.
     tools: Arc<ToolRegistry>,
     /// Model router for LLM completions.
@@ -148,10 +150,12 @@ impl GoalRunner {
         tools: Arc<ToolRegistry>,
         model_router: Arc<ModelRouter>,
         event_tx: tokio::sync::mpsc::UnboundedSender<GoalEvent>,
+        paths: Arc<crate::dirs::SyscityPaths>,
     ) -> Self {
         let model_override = plan.model_override.clone();
         Self {
             id: id.into(),
+            paths,
             parent_session_id: parent_session_id.into(),
             plan,
             round: 0,
@@ -292,7 +296,7 @@ impl GoalRunner {
                         // Best-effort: also leave a human-readable note in the
                         // workspace so users can watch long-goal progress.
                         if let Err(e) = write_round_note(
-                            &crate::dirs::workspace_data_dir(),
+                            &self.paths.workspace_data_dir(),
                             &self.id,
                             &self.plan.description,
                             self.round,
@@ -573,7 +577,7 @@ impl GoalRunner {
 
         // Create a tool context for tool execution.
         let tool_ctx = ToolContext::new("system", &self.id)
-            .with_workspace_root(crate::dirs::workspace_data_dir())
+            .with_workspace_root(self.paths.workspace_data_dir())
             .with_model_name(model.clone())
             .with_provider_name("model_router");
 
@@ -690,7 +694,7 @@ impl GoalRunner {
 7. When done, reply with a brief completion message."#,
             self.plan.description,
             conditions.join("\n"),
-            crate::dirs::workspace_data_dir().display(),
+            self.paths.workspace_data_dir().display(),
         )
     }
 
@@ -742,7 +746,7 @@ impl GoalRunner {
             .unwrap_or_else(|| "default".to_string());
 
         let tool_ctx = ToolContext::new("system", &self.id)
-            .with_workspace_root(crate::dirs::workspace_data_dir())
+            .with_workspace_root(self.paths.workspace_data_dir())
             .with_model_name(model.clone())
             .with_provider_name("model_router");
 
@@ -875,7 +879,7 @@ Schema rules (strictly enforced; violations fail the whole round):
   blocks are rejected outright, never truncated."#,
             goal = self.plan.description,
             conditions = conditions.join("\n"),
-            workdir = crate::dirs::workspace_data_dir().display(),
+            workdir = self.paths.workspace_data_dir().display(),
             tag = crate::goal::handoff::HANDOFF_FENCE_TAG,
             limit = crate::goal::handoff::MAX_HANDOFF_CHARS,
         )
@@ -1195,7 +1199,15 @@ mod tests {
 
     fn make_runner(plan: GoalPlan) -> GoalRunner {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        GoalRunner::new("test_goal", "test_session", plan, make_tools(), make_router(), tx)
+        GoalRunner::new(
+            "test_goal",
+            "test_session",
+            plan,
+            make_tools(),
+            make_router(),
+            tx,
+            crate::dirs::paths(),
+        )
     }
 
     fn make_plan(description: &str) -> GoalPlan {
@@ -1235,7 +1247,9 @@ mod tests {
             expected: Some(0),
         });
 
-        let runner = GoalRunner::new("g", "s", plan, make_tools(), router, tx).with_store(store);
+        let runner =
+            GoalRunner::new("g", "s", plan, make_tools(), router, tx, crate::dirs::paths())
+                .with_store(store);
         runner.run().await;
 
         let events = drain_events(&mut rx);
@@ -1304,9 +1318,17 @@ mod tests {
                 .with_responses(vec![tool_call_request("call_1"), Message::assistant("done")]),
         );
         let router = make_mock_router(mock).await;
-        let mut runner = GoalRunner::new("g", "s", plan.clone(), make_tools(), router, tx.clone())
-            .with_store(store.clone())
-            .with_progress(1, vec![]);
+        let mut runner = GoalRunner::new(
+            "g",
+            "s",
+            plan.clone(),
+            make_tools(),
+            router,
+            tx.clone(),
+            crate::dirs::paths(),
+        )
+        .with_store(store.clone())
+        .with_progress(1, vec![]);
 
         // Round in flight: the mid-round checkpoint must carry the message
         // history ending with a complete assistant→tool group.
@@ -1334,11 +1356,12 @@ mod tests {
         let mock2 =
             Arc::new(MockProvider::new().with_responses(vec![Message::assistant("resumed final")]));
         let router2 = make_mock_router(mock2.clone()).await;
-        let runner2 = GoalRunner::new("g", "s", plan, make_tools(), router2, tx)
-            .with_store(store.clone())
-            .with_progress(states[0].round, vec![])
-            .with_round_messages(saved_messages)
-            .with_token_usage(states[0].token_usage);
+        let runner2 =
+            GoalRunner::new("g", "s", plan, make_tools(), router2, tx, crate::dirs::paths())
+                .with_store(store.clone())
+                .with_progress(states[0].round, vec![])
+                .with_round_messages(saved_messages)
+                .with_token_usage(states[0].token_usage);
         runner2.run().await;
 
         let history = mock2.history();
@@ -1379,9 +1402,17 @@ mod tests {
             Message::assistant(handoff_reply("continue", "partial work", &["keep going"], &[])),
         ]));
         let router = make_mock_router(mock).await;
-        let mut runner = GoalRunner::new("g", "s", plan.clone(), make_tools(), router, tx.clone())
-            .with_store(store.clone())
-            .with_progress(1, vec![]);
+        let mut runner = GoalRunner::new(
+            "g",
+            "s",
+            plan.clone(),
+            make_tools(),
+            router,
+            tx.clone(),
+            crate::dirs::paths(),
+        )
+        .with_store(store.clone())
+        .with_progress(1, vec![]);
 
         let handoff = runner.run_fresh_round().await.unwrap().expect("handoff");
         assert_eq!(handoff.status, crate::goal::handoff::HandoffStatus::Continue);
@@ -1400,10 +1431,11 @@ mod tests {
             handoff_reply("continue", "resumed work", &["next"], &[]),
         )]));
         let router2 = make_mock_router(mock2.clone()).await;
-        let mut runner2 = GoalRunner::new("g", "s", plan, make_tools(), router2, tx)
-            .with_store(store)
-            .with_progress(states[0].round, vec![])
-            .with_round_messages(states[0].round_messages.clone());
+        let mut runner2 =
+            GoalRunner::new("g", "s", plan, make_tools(), router2, tx, crate::dirs::paths())
+                .with_store(store)
+                .with_progress(states[0].round, vec![])
+                .with_round_messages(states[0].round_messages.clone());
         let resumed_handoff = runner2.run_fresh_round().await.unwrap().expect("handoff");
         assert_eq!(resumed_handoff.summary, "resumed work");
 
@@ -1714,7 +1746,8 @@ mod tests {
             .with_fresh_context(true);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let runner = GoalRunner::new("g", "s", plan, make_tools(), router, tx);
+        let runner =
+            GoalRunner::new("g", "s", plan, make_tools(), router, tx, crate::dirs::paths());
         runner.run().await;
 
         let events = drain_events(&mut rx);
@@ -1776,7 +1809,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let store_dir = temp_dir("fatal_config");
         let store = Arc::new(tokio::sync::RwLock::new(GoalStore::with_dir(store_dir.clone())));
-        let runner = GoalRunner::new("g", "s", plan, make_tools(), router, tx).with_store(store);
+        let runner =
+            GoalRunner::new("g", "s", plan, make_tools(), router, tx, crate::dirs::paths())
+                .with_store(store);
         runner.run().await;
 
         let events = drain_events(&mut rx);
@@ -1826,7 +1861,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let store_dir = temp_dir("invalid_handoff");
         let store = Arc::new(tokio::sync::RwLock::new(GoalStore::with_dir(store_dir.clone())));
-        let runner = GoalRunner::new("g", "s", plan, make_tools(), router, tx).with_store(store);
+        let runner =
+            GoalRunner::new("g", "s", plan, make_tools(), router, tx, crate::dirs::paths())
+                .with_store(store);
         runner.run().await;
 
         let events = drain_events(&mut rx);
@@ -1874,7 +1911,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let store_dir = temp_dir("failed_status");
         let store = Arc::new(tokio::sync::RwLock::new(GoalStore::with_dir(store_dir.clone())));
-        let runner = GoalRunner::new("g", "s", plan, make_tools(), router, tx).with_store(store);
+        let runner =
+            GoalRunner::new("g", "s", plan, make_tools(), router, tx, crate::dirs::paths())
+                .with_store(store);
         runner.run().await;
 
         let events = drain_events(&mut rx);

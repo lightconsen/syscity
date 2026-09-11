@@ -252,6 +252,7 @@ pub(super) async fn handle_goal(
         state.tools.registry.clone(),
         state.infra.model_router.clone(),
         goal_tx,
+        state.paths.clone(),
     )
     .with_store(goal_store.clone());
     let cancel_token = runner.cancel_token();
