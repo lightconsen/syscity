@@ -49,6 +49,7 @@ pub(super) async fn handle_sessions_create(
     req: &WsRequest,
     conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     let cg = conn.read().await;
     let channel = cg
@@ -57,12 +58,12 @@ pub(super) async fn handle_sessions_create(
         .map(|c| c.id.as_str())
         .unwrap_or("ws")
         .to_string();
-    let user = cg
-        .user_id
-        .as_ref()
-        .map(|u| u.0.clone())
-        .unwrap_or_else(|| "anonymous".to_string());
     drop(cg);
+
+    // Identity comes from the request context rather than being re-derived off
+    // the connection: the context already resolves to the handshake identity
+    // (`"anonymous"` when unauthenticated), so the two cannot drift apart.
+    let user = ctx.user_id().to_string();
 
     #[derive(Debug, Deserialize)]
     struct CreateParams {
@@ -435,7 +436,7 @@ pub(super) async fn handle_legacy_unsubscribe(
 mod tests {
     use super::*;
     use crate::gateway::state_tests::{
-        make_test_conn, make_test_state, make_test_state_with_store,
+        make_test_conn, make_test_ctx, make_test_state, make_test_state_with_store,
     };
     use crate::gateway::GatewayConfig;
     use crate::model_router::{ProviderConfig, ProviderType};
@@ -648,6 +649,7 @@ mod tests {
             ),
             &conn,
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(res.ok);
@@ -667,6 +669,7 @@ mod tests {
             &req("c", "sessions.create", serde_json::json!({})),
             &conn,
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(res.ok);
@@ -682,6 +685,7 @@ mod tests {
             &req("c", "sessions.create", serde_json::json!({ "session_id": "s1" })),
             &conn,
             &state,
+            &make_test_ctx(),
         )
         .await;
 
@@ -723,6 +727,7 @@ mod tests {
             &req("c", "sessions.create", serde_json::json!({ "session_id": "s1" })),
             &conn,
             &state,
+            &make_test_ctx(),
         )
         .await;
 
@@ -768,6 +773,7 @@ mod tests {
                 &req("c", "sessions.create", serde_json::json!({ "session_id": sid })),
                 &conn,
                 &state,
+                &make_test_ctx(),
             )
             .await;
         }

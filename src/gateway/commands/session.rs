@@ -91,13 +91,10 @@ pub(super) async fn handle_status(req: &WsRequest, state: &Arc<GatewayState>) ->
 pub(super) async fn handle_whoami(
     req: &WsRequest,
     conn: &Arc<RwLock<ProtocolConnection>>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     let guard = conn.read().await;
-    let user = guard
-        .user_id
-        .as_ref()
-        .map(|u| u.to_string())
-        .unwrap_or_else(|| "anonymous".to_string());
+    let user = ctx.user_id();
     let scopes = &guard.scopes;
 
     let text = format!("👤 **Whoami**\n\nUser: `{}`\nScopes: `{}`", user, scopes.join(", "));
@@ -471,7 +468,7 @@ pub(super) async fn handle_export_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::state_tests::{make_test_conn, make_test_state};
+    use crate::gateway::state_tests::{make_test_conn, make_test_ctx, make_test_state};
     use crate::gateway::GatewayConfig;
 
     fn req(id: &str) -> WsRequest {
@@ -517,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn whoami_anonymous_default() {
         let conn = make_test_conn(&[]);
-        let resp = handle_whoami(&req("r1"), &conn).await;
+        let resp = handle_whoami(&req("r1"), &conn, &make_test_ctx()).await;
         assert!(resp.ok);
         let text = resp.payload.as_ref().unwrap()["text"].as_str().unwrap();
         assert!(text.contains("anonymous"), "no user_id means anonymous");
@@ -526,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn whoami_lists_scopes() {
         let conn = make_test_conn(&["chat", "admin"]);
-        let resp = handle_whoami(&req("r1"), &conn).await;
+        let resp = handle_whoami(&req("r1"), &conn, &make_test_ctx()).await;
         assert!(resp.ok);
         let text = resp.payload.as_ref().unwrap()["text"].as_str().unwrap();
         assert!(text.contains("chat"), "scopes should be listed");

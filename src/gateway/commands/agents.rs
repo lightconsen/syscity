@@ -283,6 +283,7 @@ pub(super) async fn handle_subagents(
     req: &WsRequest,
     conn: &Arc<RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
     args: &str,
 ) -> WsResponse {
     let trimmed = args.trim();
@@ -443,11 +444,7 @@ pub(super) async fn handle_subagents(
             }
 
             let guard = conn.read().await;
-            let sender = guard
-                .user_id
-                .as_ref()
-                .map(|u| u.0.clone())
-                .unwrap_or_else(|| "user".to_string());
+            let sender = ctx.user_id().to_string();
             let conversation_id = guard.subscriptions.first().cloned().unwrap_or_default();
             drop(guard);
 
@@ -787,6 +784,7 @@ pub(super) async fn handle_steer(
     req: &WsRequest,
     conn: &Arc<RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
     args: &str,
 ) -> WsResponse {
     let trimmed = args.trim();
@@ -803,12 +801,7 @@ pub(super) async fn handle_steer(
     }
 
     let incoming = crate::channels::IncomingMessage::new(
-        conn.read()
-            .await
-            .user_id
-            .as_ref()
-            .map(|u| u.0.clone())
-            .unwrap_or_else(|| "user".to_string()),
+        ctx.user_id().to_string(),
         conn.read()
             .await
             .subscriptions
@@ -921,7 +914,7 @@ pub(super) async fn handle_unfocus(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::state_tests::{make_test_conn, make_test_state};
+    use crate::gateway::state_tests::{make_test_conn, make_test_ctx, make_test_state};
     use crate::gateway::GatewayConfig;
 
     fn req(id: &str) -> WsRequest {
@@ -982,7 +975,7 @@ mod tests {
     async fn subagents_empty_lists_none() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        let resp = handle_subagents(&req("r1"), &conn, &state, "").await;
+        let resp = handle_subagents(&req("r1"), &conn, &state, &make_test_ctx(), "").await;
         assert!(resp.ok);
         let text = resp.payload.as_ref().unwrap()["text"].as_str().unwrap();
         assert!(text.contains("No subagents found"));
@@ -992,7 +985,7 @@ mod tests {
     async fn subagents_kill_no_session() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        let resp = handle_subagents(&req("r1"), &conn, &state, "kill").await;
+        let resp = handle_subagents(&req("r1"), &conn, &state, &make_test_ctx(), "kill").await;
         assert!(resp.ok);
         let text = resp.payload.as_ref().unwrap()["text"].as_str().unwrap();
         assert!(text.contains("No active session to kill"));
@@ -1002,7 +995,7 @@ mod tests {
     async fn subagents_log_empty_topics() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        let resp = handle_subagents(&req("r1"), &conn, &state, "log").await;
+        let resp = handle_subagents(&req("r1"), &conn, &state, &make_test_ctx(), "log").await;
         assert!(resp.ok);
         let text = resp.payload.as_ref().unwrap()["text"].as_str().unwrap();
         assert!(text.contains("No ACP bus topics"));
@@ -1046,7 +1039,7 @@ mod tests {
     async fn steer_empty_args_errors() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        let resp = handle_steer(&req("r1"), &conn, &state, "").await;
+        let resp = handle_steer(&req("r1"), &conn, &state, &make_test_ctx(), "").await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_ARGS");
     }
@@ -1055,7 +1048,7 @@ mod tests {
     async fn steer_missing_message_errors() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        let resp = handle_steer(&req("r1"), &conn, &state, "agent-1").await;
+        let resp = handle_steer(&req("r1"), &conn, &state, &make_test_ctx(), "agent-1").await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_ARGS");
     }

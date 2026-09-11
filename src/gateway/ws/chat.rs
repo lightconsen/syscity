@@ -38,14 +38,13 @@ pub(super) async fn handle_chat_send(
     let (session_id, _is_new_session) = if let Some(sid) = params.session_id {
         (sid, false)
     } else {
+        // The auto-created session id is `{channel}:{user}`. The user half comes
+        // from the request context, which resolves to the same string the
+        // handshake stored (including `"anonymous"` when unauthenticated), so
+        // there is no separate fallback to keep in sync.
         let cg = conn.read().await;
         let channel = cg.client.as_ref().map(|c| c.id.as_str()).unwrap_or("ws");
-        let user = cg
-            .user_id
-            .as_ref()
-            .map(|u| u.0.as_str())
-            .unwrap_or("anonymous");
-        (format!("{}:{}", channel, user), true)
+        (format!("{}:{}", channel, ctx.user_id()), true)
     };
 
     // Identity comes from the per-request context threaded in by the

@@ -22,6 +22,7 @@ use crate::gateway::command_provider::{CommandProviderHint, CommandProviderResol
 use crate::gateway::protocol::*;
 use crate::gateway::GatewayState;
 use crate::mcp::{McpServerConfig, McpToolWrapper};
+use crate::security::request_context::RequestContext;
 use crate::tools::approval::{ApprovalDecision, ApprovalFilter};
 use crate::tools::command_gate::UserLevel;
 
@@ -357,6 +358,7 @@ pub async fn handle_commands_execute(
     req: &WsRequest,
     conn: &Arc<RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     let params: ExecuteParams = match parse_params(req) {
         Ok(p) => p,
@@ -461,15 +463,10 @@ pub async fn handle_commands_execute(
             }
         }
 
-        // Tier check against the user's configured level.
-        let user_id = conn
-            .read()
-            .await
-            .user_id
-            .as_ref()
-            .map(|u| u.0.clone())
-            .unwrap_or_else(|| "anonymous".to_string());
-        let user_level = state.auth.command_gate.user_level(&user_id);
+        // Tier check against the user's configured level. The identity comes
+        // from the request context so this authorization decision cannot drift
+        // from the one the audit log records.
+        let user_level = state.auth.command_gate.user_level(ctx.user_id());
         let required_level = match def.tier {
             CommandTier::Essential | CommandTier::Standard => UserLevel::User,
             CommandTier::Power => UserLevel::Admin,
@@ -500,7 +497,7 @@ pub async fn handle_commands_execute(
         match def.key.as_str() {
             "help" | "commands" => session::handle_help(req, &params.args),
             "status" => session::handle_status(req, state).await,
-            "whoami" => session::handle_whoami(req, conn).await,
+            "whoami" => session::handle_whoami(req, conn, ctx).await,
             "stop" => session::handle_stop(req, conn, state).await,
             "reset" => session::handle_reset(req, conn, state).await,
             "model" => model::handle_model(req, conn, state, &params.args).await,
@@ -518,9 +515,9 @@ pub async fn handle_commands_execute(
             "export-session" => {
                 session::handle_export_session(req, conn, state, &params.args).await
             }
-            "subagents" => agents::handle_subagents(req, conn, state, &params.args).await,
+            "subagents" => agents::handle_subagents(req, conn, state, ctx, &params.args).await,
             "acp" => agents::handle_acp(req, conn, state, &params.args).await,
-            "steer" | "tell" => agents::handle_steer(req, conn, state, &params.args).await,
+            "steer" | "tell" => agents::handle_steer(req, conn, state, ctx, &params.args).await,
             "kill" => agents::handle_kill(req, conn, state, &params.args).await,
             "focus" => agents::handle_focus(req, conn, state, &params.args).await,
             "unfocus" => agents::handle_unfocus(req, conn, state).await,

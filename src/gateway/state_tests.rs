@@ -308,6 +308,16 @@ pub fn make_test_conn(
     Arc::new(tokio::sync::RwLock::new(conn))
 }
 
+/// Build the per-request identity context a handler would receive from the WS
+/// dispatcher.
+///
+/// Matches what [`make_test_conn`] resolves to: the fabricated connection has no
+/// user id, so the dispatcher's `RequestContext::from_identity(None, ..)` yields
+/// the anonymous context.
+pub fn make_test_ctx() -> crate::security::request_context::RequestContext {
+    crate::security::request_context::RequestContext::anonymous()
+}
+
 // ── Layer 1: Blocklist ───────────────────────────────────────────────────────
 
 #[tokio::test]

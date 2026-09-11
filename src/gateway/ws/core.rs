@@ -404,7 +404,17 @@ async fn dispatch_method(
             crate::gateway::protocol::AuthMode::Device => AuthSource::Device,
             crate::gateway::protocol::AuthMode::Tailscale => AuthSource::Tailscale,
         };
-        RequestContext::from_identity(cg.user_id.as_ref(), source)
+        let ctx = RequestContext::from_identity(cg.user_id.as_ref(), source);
+        // Under device auth the paired device id *is* the user id, so record it
+        // as such rather than making downstream code re-derive it off `conn`.
+        // (There is no session id at dispatch time: it lives in the per-method
+        // params, so callers that know it attach it via `with_session_id`.)
+        if source == AuthSource::Device {
+            let device_id = ctx.user_id().to_string();
+            ctx.with_device_id(device_id)
+        } else {
+            ctx
+        }
     };
     if let Some(required) = method_scope(&req.method) {
         if !scopes_allow(&scopes, &req.method) {
@@ -466,7 +476,7 @@ async fn dispatch_method(
         "feedback.ops" => feedback::handle_feedback_ops(req, state).await,
         "ask.respond" => ask::handle_ask_respond(req, state).await,
         "sessions.list" => sessions::handle_sessions_list(req, state).await,
-        "sessions.create" => sessions::handle_sessions_create(req, conn, state).await,
+        "sessions.create" => sessions::handle_sessions_create(req, conn, state, &ctx).await,
         "sessions.delete" => sessions::handle_sessions_delete(req, conn, state).await,
         "sessions.rename" => sessions::handle_sessions_rename(req, conn, state).await,
         "sessions.set_pinned" => sessions::handle_sessions_set_pinned(req, conn, state).await,
@@ -492,7 +502,7 @@ async fn dispatch_method(
             WsResponse::ok(&req.id, crate::gateway::commands::handle_commands_list())
         }
         "commands.execute" => {
-            crate::gateway::commands::handle_commands_execute(req, conn, state).await
+            crate::gateway::commands::handle_commands_execute(req, conn, state, &ctx).await
         }
         "config.get" => config_ws::handle_config_get(req, state).await,
         "config.set" => config_ws::handle_config_set(req, state).await,
