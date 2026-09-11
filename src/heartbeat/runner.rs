@@ -317,8 +317,11 @@ impl HeartbeatRunner {
             }
         }
 
-        // Try per-agent directory: ~/.syscity/agents/{id}/HEARTBEAT.md
-        let agent_path = crate::dirs::agents_dir()
+        // Try per-agent directory: <root>/agents/{id}/HEARTBEAT.md
+        let agent_path = self
+            .state
+            .paths
+            .agents_dir()
             .join(&handle.id)
             .join(HEARTBEAT_FILENAME);
         if let Ok(content) = tokio::fs::read_to_string(&agent_path).await {
@@ -326,7 +329,11 @@ impl HeartbeatRunner {
         }
 
         // Fallback: workspace-level HEARTBEAT.md
-        let workspace_path = crate::dirs::workspace_data_dir().join(HEARTBEAT_FILENAME);
+        let workspace_path = self
+            .state
+            .paths
+            .workspace_data_dir()
+            .join(HEARTBEAT_FILENAME);
         if let Ok(content) = tokio::fs::read_to_string(&workspace_path).await {
             return Some(content);
         }

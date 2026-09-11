@@ -119,7 +119,7 @@ pub(super) async fn handle_kb_ingest(req: &WsRequest, state: &Arc<GatewayState>)
         );
     }
 
-    let agent_dir = crate::dirs::agent_dir(agent_id);
+    let agent_dir = state.paths.agent_dir(agent_id);
     if !agent_dir.is_dir() {
         return WsResponse::err(&req.id, "INVALID_PARAMS", format!("Unknown agent '{agent_id}'"));
     }
@@ -349,7 +349,9 @@ pub(super) async fn handle_kb_delete_doc(req: &WsRequest, state: &Arc<GatewaySta
         if src_path.components().any(|c| c.as_os_str() == "kb-uploads") {
             if let Some(name) = src_path.file_name() {
                 let agent_id = p.collection.trim_start_matches("kb-");
-                let upload = crate::dirs::agent_dir(agent_id)
+                let upload = state
+                    .paths
+                    .agent_dir(agent_id)
                     .join("kb-uploads")
                     .join(name);
                 match tokio::fs::remove_file(&upload).await {

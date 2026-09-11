@@ -41,7 +41,7 @@ pub(crate) async fn register_hot_reload_handlers(
                 info!("Main config file changed - reloading configuration");
 
                 // Reload config from disk
-                let config_path = crate::dirs::default_config_file();
+                let config_path = state.paths.default_config_file();
                 if !config_path.exists() {
                     return Ok(());
                 }
@@ -519,7 +519,7 @@ pub(crate) async fn register_hot_reload_handlers(
                 let state = state.clone();
                 async move {
                     // Extract agent ID from path: agents/{agent_id}/kb.toml
-                    let agents_dir = crate::dirs::agents_dir();
+                    let agents_dir = state.paths.agents_dir();
                     let rel = match event.path.strip_prefix(&agents_dir) {
                         Ok(r) => r,
                         Err(_) => return Ok(()),
@@ -632,7 +632,7 @@ mod tests {
             ))
             .await;
 
-        let agents_dir = crate::dirs::agents_dir();
+        let agents_dir = state.paths.agents_dir();
         manager
             .dispatch_for_test(event(
                 agents_dir.join("kb-agent").join("kb.toml"),

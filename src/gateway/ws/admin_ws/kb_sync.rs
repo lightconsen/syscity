@@ -134,7 +134,7 @@ pub(crate) async fn handle_cloud_kb_push(req: &WsRequest, state: &Arc<GatewaySta
             );
         }
         let agent_id = collection.trim_start_matches("kb-").to_string();
-        let uploads_dir = crate::dirs::agent_dir(&agent_id).join("kb-uploads");
+        let uploads_dir = state.paths.agent_dir(&agent_id).join("kb-uploads");
 
         let client = match cloud_kb_client(req, state).await {
             Ok(c) => c,
@@ -269,7 +269,7 @@ pub(crate) async fn handle_cloud_kb_pull(req: &WsRequest, state: &Arc<GatewaySta
             Err(res) => return res,
         };
 
-        let agent_dir = crate::dirs::agent_dir(&agent_id);
+        let agent_dir = state.paths.agent_dir(&agent_id);
         if !agent_dir.is_dir() {
             return WsResponse::err(
                 &req.id,

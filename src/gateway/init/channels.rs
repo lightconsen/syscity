@@ -88,7 +88,7 @@ pub(crate) async fn init_plugin_channels(
     use crate::channels::plugin_host::PluginChannelRegistry;
     use crate::dirs;
 
-    let plugin_dir = dirs::extensions_dir().join("channels");
+    let plugin_dir = state.paths.extensions_dir().join("channels");
     if !plugin_dir.exists() {
         info!("Plugin channel directory does not exist, skipping: {:?}", plugin_dir);
         return Ok(());

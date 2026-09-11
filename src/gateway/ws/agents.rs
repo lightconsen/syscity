@@ -260,7 +260,7 @@ pub(crate) async fn handle_agents_default(
 /// `agents.memory.get` — the agent's `MEMORY.md` (`{ agent_id }`).
 pub(crate) async fn handle_agents_memory_get(
     req: &WsRequest,
-    _state: &Arc<GatewayState>,
+    state: &Arc<GatewayState>,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
@@ -270,7 +270,7 @@ pub(crate) async fn handle_agents_memory_get(
         Ok(p) => p,
         Err(res) => return res,
     };
-    let dir = crate::dirs::agents_dir().join(&params.agent_id);
+    let dir = state.paths.agents_dir().join(&params.agent_id);
     let path = dir.join("MEMORY.md");
     let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
     WsResponse::ok(&req.id, serde_json::json!({ "agent_id": params.agent_id, "memory": content }))
@@ -279,7 +279,7 @@ pub(crate) async fn handle_agents_memory_get(
 /// `agents.memory.clear` — clear the agent's `MEMORY.md` (`{ agent_id }`).
 pub(crate) async fn handle_agents_memory_clear(
     req: &WsRequest,
-    _state: &Arc<GatewayState>,
+    state: &Arc<GatewayState>,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
@@ -289,7 +289,7 @@ pub(crate) async fn handle_agents_memory_clear(
         Ok(p) => p,
         Err(res) => return res,
     };
-    let dir = crate::dirs::agents_dir().join(&params.agent_id);
+    let dir = state.paths.agents_dir().join(&params.agent_id);
     match tokio::fs::create_dir_all(&dir).await {
         Ok(()) => {}
         Err(e) => {
@@ -311,10 +311,7 @@ pub(crate) async fn handle_agents_memory_clear(
 
 /// `agents.export` — the agent's on-disk personality files as JSON
 /// (`{ agent_id }` → `{ agent_id, files: { "SOUL.md": ... } }`).
-pub(crate) async fn handle_agents_export(
-    req: &WsRequest,
-    _state: &Arc<GatewayState>,
-) -> WsResponse {
+pub(crate) async fn handle_agents_export(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
         agent_id: String,
@@ -323,7 +320,7 @@ pub(crate) async fn handle_agents_export(
         Ok(p) => p,
         Err(res) => return res,
     };
-    let dir = crate::dirs::agents_dir().join(&params.agent_id);
+    let dir = state.paths.agents_dir().join(&params.agent_id);
     const MD_FILES: &[&str] = &[
         "PERSONALITY.md",
         "SOUL.md",
@@ -359,7 +356,7 @@ pub(crate) async fn handle_agents_import(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
-    let dir = crate::dirs::agents_dir().join(&params.agent_id);
+    let dir = state.paths.agents_dir().join(&params.agent_id);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return WsResponse::err(&req.id, "INTERNAL", format!("Failed to create agent dir: {}", e));
     }

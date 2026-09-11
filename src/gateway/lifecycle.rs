@@ -38,7 +38,7 @@ pub(crate) async fn start_gateway(
 
     // ── MCP presets: auto-create mcp.toml with defaults if missing ──
     {
-        let mcps_path = crate::dirs::config_dir().join("mcp.toml");
+        let mcps_path = state.paths.config_dir().join("mcp.toml");
         if !mcps_path.exists() {
             if let Err(e) = tokio::fs::write(&mcps_path, crate::mcp::DEFAULT_PRESETS_TOML).await {
                 warn!("Failed to create default MCP presets file: {e}");
@@ -128,7 +128,7 @@ pub(crate) async fn start_gateway(
     // Initialize hot reload if enabled
     let hot_reload = state.infra.hot_reload.read().await.clone();
     if let Some(ref hot_reload) = hot_reload {
-        let config_path = crate::dirs::default_config_file();
+        let config_path = state.paths.default_config_file();
         if let Err(e) = hot_reload
             .watch_file(&config_path, ConfigFileType::Main)
             .await
@@ -188,7 +188,7 @@ pub(crate) async fn start_gateway(
     // Watch kb.toml files for hot-reload
     if let Some(ref hot_reload) = *state.infra.hot_reload.read().await {
         use crate::config::hot_reload::ConfigFileType;
-        let agents_dir = crate::dirs::agents_dir();
+        let agents_dir = state.paths.agents_dir();
         if agents_dir.exists() {
             let mut read_dir = match tokio::fs::read_dir(&agents_dir).await {
                 Ok(d) => d,
@@ -232,7 +232,7 @@ pub(crate) async fn start_gateway(
         use crate::tools::DelegateTool;
 
         let db_url =
-            format!("sqlite://{}", crate::dirs::data_dir().join("delegations.db").display());
+            format!("sqlite://{}", state.paths.data_dir().join("delegations.db").display());
         let delegation_store = Arc::new(DelegationTaskStore::new(&db_url).await?);
         // Sweep rows left in-flight by a previous process: they belong to
         // executions that died with it and would otherwise read as "running"
