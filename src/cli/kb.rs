@@ -319,7 +319,7 @@ async fn cmd_watch_foreground(agent: Option<&str>) -> Result<()> {
     let manager = create_kb_manager().await?;
     let manager = Arc::new(manager);
 
-    let mut watcher = crate::rag::ingestion::watch::KbWatcher::new()?;
+    let mut watcher = crate::rag::ingestion::watch::KbWatcher::new(crate::dirs::paths())?;
 
     let agents: Vec<String> = if let Some(a) = agent {
         watcher.add_agent(a)?;

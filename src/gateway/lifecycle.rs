@@ -245,7 +245,10 @@ pub(crate) async fn start_gateway(
         state
             .tools
             .registry
-            .register_dynamic(Arc::new(TaskStateTool::new(delegation_store.clone())));
+            .register_dynamic(Arc::new(TaskStateTool::new(
+                delegation_store.clone(),
+                state.paths.clone(),
+            )));
 
         let resolver: Arc<dyn crate::tools::delegate_tool::AgentResolver> =
             Arc::new(super::agent_spawn::GatewayAgentResolver {

@@ -14,6 +14,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::dirs::SyscityPaths;
 use crate::rag::ingestion::loader::{load_kb_config, KnowledgeSource, SourceType};
 
 /// An event emitted by the KB watcher.
@@ -55,6 +56,8 @@ pub struct KbWatcher {
     pub event_rx: mpsc::Receiver<KbWatchEvent>,
     /// Watched agents (for potential future re-scan).
     _agents: HashMap<String, WatchedAgent>,
+    /// Layout root the watched agent directories resolve against.
+    paths: Arc<SyscityPaths>,
 }
 
 impl KbWatcher {
@@ -62,14 +65,14 @@ impl KbWatcher {
     ///
     /// Opens the underlying `RecommendedWatcher` and sets up the event
     /// channel. Returns an error if the OS-level watcher cannot be created.
-    pub fn new() -> crate::Result<Self> {
+    pub fn new(paths: Arc<SyscityPaths>) -> crate::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(256);
         let inner_event_tx = event_tx.clone();
         let debounce_map: Arc<std::sync::Mutex<HashMap<PathBuf, Instant>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let debounce_map_clone = debounce_map.clone();
 
-        let agents_dir = crate::dirs::agents_dir();
+        let agents_dir = paths.agents_dir();
         let watcher: RecommendedWatcher = notify::recommended_watcher(
             move |res: notify::Result<notify::Event>| {
                 let debounce = debounce_map_clone.clone();
@@ -147,6 +150,7 @@ impl KbWatcher {
             event_tx,
             event_rx,
             _agents: HashMap::new(),
+            paths,
         })
     }
 
@@ -155,7 +159,7 @@ impl KbWatcher {
     /// Watches `kb.toml`, all source files referenced in `kb.toml`, and the
     /// agent directory itself (non-recursive) so new files are also caught.
     pub fn add_agent(&mut self, agent_id: &str) -> crate::Result<()> {
-        let agent_dir = crate::dirs::agent_dir(agent_id);
+        let agent_dir = self.paths.agent_dir(agent_id);
         if !agent_dir.exists() {
             return Err(crate::error::SyscityError::Validation(format!(
                 "Agent directory not found: {}",
@@ -220,7 +224,7 @@ impl KbWatcher {
     ///
     /// Returns the list of agent IDs that were successfully added.
     pub fn add_all_agents(&mut self) -> crate::Result<Vec<String>> {
-        let agents_dir = crate::dirs::agents_dir();
+        let agents_dir = self.paths.agents_dir();
         if !agents_dir.exists() {
             return Ok(Vec::new());
         }

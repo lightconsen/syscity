@@ -20,12 +20,14 @@ use crate::tools::{Tool, ToolContext, ToolExecutionResult};
 #[derive(Debug, Clone)]
 pub struct TaskStateTool {
     store: Arc<DelegationTaskStore>,
+    /// Layout root the delegation workspace paths resolve against.
+    paths: Arc<crate::dirs::SyscityPaths>,
 }
 
 impl TaskStateTool {
     /// Create a new tool backed by the given store.
-    pub fn new(store: Arc<DelegationTaskStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<DelegationTaskStore>, paths: Arc<crate::dirs::SyscityPaths>) -> Self {
+        Self { store, paths }
     }
 }
 
@@ -286,9 +288,11 @@ Only available inside an active delegation; errors otherwise."#
                     .await?
                     .ok_or_else(|| DelegationError::TaskNotFound(task_id.clone()))?;
                 let state_keys: Vec<String> = task.state().keys().cloned().collect();
-                let workspace = crate::dirs::delegation_task_dir(&scope.root_id, &scope.task_id);
-                let tree_root = crate::dirs::delegation_workspace_dir(&scope.root_id);
-                let shared_root = crate::dirs::delegation_shared_dir(&scope.root_id);
+                let workspace = self
+                    .paths
+                    .delegation_task_dir(&scope.root_id, &scope.task_id);
+                let tree_root = self.paths.delegation_workspace_dir(&scope.root_id);
+                let shared_root = self.paths.delegation_shared_dir(&scope.root_id);
                 Ok(ToolExecutionResult::success(format!(
                     "task {} ({}): status={}, workspace={}, shared_workspace={}, state_keys={:?}, artifacts={}, events={}",
                     task.id,
@@ -370,7 +374,7 @@ mod tests {
             })
             .await
             .unwrap();
-        TaskStateTool::new(store)
+        TaskStateTool::new(store, crate::dirs::paths())
     }
 
     fn context_with_scope(task_id: &str) -> ToolContext {
