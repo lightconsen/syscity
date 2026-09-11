@@ -36,6 +36,8 @@ type EventSubscribers =
 
 /// Plugin runtime - manages plugin lifecycle
 pub struct PluginRuntime {
+    /// Directory holding per-plugin persisted state (`<root>/plugins/data`).
+    state_root: std::path::PathBuf,
     plugins: Arc<RwLock<HashMap<String, PluginInstance>>>,
     #[cfg(feature = "plugins")]
     engine: wasmtime::Engine,
@@ -68,8 +70,8 @@ pub struct PluginRuntime {
 }
 
 impl PluginRuntime {
-    /// Create a new plugin runtime
-    pub fn new() -> crate::Result<Self> {
+    /// Create a new plugin runtime whose plugin state lives under `state_root`.
+    pub fn new(state_root: std::path::PathBuf) -> crate::Result<Self> {
         #[cfg(feature = "plugins")]
         {
             let mut config = wasmtime::Config::default();
@@ -108,6 +110,7 @@ impl PluginRuntime {
                 event_rx: Arc::new(Mutex::new(None)),
                 event_dispatch_handle,
                 metrics: Arc::new(PluginMetricsRegistry::new()),
+                state_root,
             })
         }
 
@@ -116,6 +119,7 @@ impl PluginRuntime {
             Ok(Self {
                 plugins: Arc::new(RwLock::new(HashMap::new())),
                 metrics: Arc::new(PluginMetricsRegistry::new()),
+                state_root,
             })
         }
     }
@@ -187,7 +191,7 @@ impl PluginRuntime {
         plugin_id: &str,
         memory: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
     ) {
-        let state_dir = dirs::plugins_data_dir().join(plugin_id);
+        let state_dir = self.state_root.join(plugin_id);
         let state_path = state_dir.join("state.json");
 
         let memory = memory.read().await.clone();
@@ -227,7 +231,7 @@ impl PluginRuntime {
         &self,
         plugin_id: &str,
     ) -> (Option<HashMap<String, Vec<u8>>>, Option<HashMap<String, String>>) {
-        let state_path = dirs::plugins_data_dir().join(plugin_id).join("state.json");
+        let state_path = self.state_root.join(plugin_id).join("state.json");
         if !state_path.exists() {
             return (None, None);
         }
@@ -1123,13 +1127,6 @@ impl Drop for PluginRuntime {
     }
 }
 
-impl Default for PluginRuntime {
-    fn default() -> Self {
-        #[allow(clippy::expect_used)] // Default trait cannot return Result
-        Self::new().expect("Failed to create plugin runtime")
-    }
-}
-
 impl PluginRuntime {
     /// Get the metrics registry for this runtime.
     pub fn metrics(&self) -> &Arc<PluginMetricsRegistry> {
@@ -1178,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_plugin_runtime_new() {
-        let runtime = PluginRuntime::new();
+        let runtime = PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests"));
         assert!(runtime.is_ok());
     }
 
@@ -1218,7 +1215,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         let plugin_id = runtime.load_plugin(temp_dir.path()).await.unwrap();
         assert_eq!(plugin_id, "com.test.loader");
 
@@ -1229,7 +1227,8 @@ mod tests {
     #[tokio::test]
     async fn test_load_plugin_missing_manifest() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
 
         let result = runtime.load_plugin(temp_dir.path()).await;
         assert!(result.is_err());
@@ -1239,14 +1238,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_plugin_not_found() {
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         let plugin = runtime.get_plugin("nonexistent").await;
         assert!(plugin.is_none());
     }
 
     #[tokio::test]
     async fn test_list_plugins_empty() {
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         let plugins = runtime.list_plugins().await;
         assert!(plugins.is_empty());
     }
@@ -1267,7 +1268,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         runtime.load_plugin(temp_dir.path()).await.unwrap();
 
         let plugins = runtime.list_plugins().await;
@@ -1291,7 +1293,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         runtime.load_plugin(temp_dir.path()).await.unwrap();
 
         // Disable
@@ -1307,7 +1310,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_enabled_not_found() {
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         let result = runtime.set_enabled("nonexistent", false).await;
         assert!(result.is_err());
     }
@@ -1328,7 +1332,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         runtime.load_plugin(temp_dir.path()).await.unwrap();
         assert!(runtime.get_plugin("com.test.unload").await.is_some());
 
@@ -1339,7 +1344,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_unload_plugin_not_found() {
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         let removed = runtime.unload_plugin("nonexistent").await.unwrap();
         assert!(!removed);
     }
@@ -1360,7 +1366,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runtime = PluginRuntime::new().unwrap();
+        let runtime =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
         runtime.load_plugin(temp_dir.path()).await.unwrap();
 
         let result = runtime.shutdown().await;

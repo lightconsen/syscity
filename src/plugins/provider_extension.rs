@@ -299,7 +299,12 @@ mod tests {
 
     /// Stub runtime for tests that do not actually invoke WASM.
     fn stub_runtime() -> Arc<crate::plugins::runtime::PluginRuntime> {
-        Arc::new(crate::plugins::runtime::PluginRuntime::new().unwrap())
+        Arc::new(
+            crate::plugins::runtime::PluginRuntime::new(
+                std::env::temp_dir().join("syscity-plugin-tests"),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
