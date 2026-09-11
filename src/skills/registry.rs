@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, info, instrument, warn};
 
-use crate::dirs;
 use crate::error::{Result, SyscityError};
 use crate::skills::frontmatter::SkillFile;
 

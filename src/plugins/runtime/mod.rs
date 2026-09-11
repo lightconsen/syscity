@@ -27,7 +27,6 @@ use tracing::{debug, info, warn};
 
 use super::manifest::{PluginManifest, PluginPermission};
 use super::metrics::PluginMetricsRegistry;
-use crate::dirs;
 
 /// Shared handle to the event subscriber map.
 #[cfg(feature = "plugins")]

@@ -115,8 +115,9 @@ pub async fn init_plugin_manager(
     model_router: Arc<ModelRouter>,
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
     task_registry: Arc<crate::gateway::task_registry::TaskRegistry>,
+    paths: &crate::dirs::SyscityPaths,
 ) -> crate::Result<Arc<PluginManager>> {
-    let plugins_dir = crate::dirs::config_dir().join("plugins");
+    let plugins_dir = paths.config_dir().join("plugins");
     let plugin_manager = {
         let pm = PluginManager::new(plugins_dir).await?;
         pm.set_tool_registry(tool_registry);
@@ -350,6 +351,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         model_router,
         channels.clone(),
         task_registry,
+        &paths,
     )
     .await?;
     let canvas_manager = Arc::new(CanvasManager::new());

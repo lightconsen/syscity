@@ -95,7 +95,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
     let _ = session_file_manager.init().await;
 
     let skills_manager = Arc::new(RwLock::new(
-        syscity::skills::SkillManager::new()
+        syscity::skills::SkillManager::new(syscity::dirs::paths())
             .await
             .expect("skill manager"),
     ));
@@ -177,6 +177,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
                 #[cfg(feature = "cloud")]
                 None,
                 Arc::new(syscity::secrets::SecretStoreHandle::new()),
+                syscity::dirs::paths(),
             )),
             approval_queue: Arc::new(syscity::tools::approval::ApprovalQueue::new()),
             ask_queue: Arc::new(syscity::tools::ask_user::AskQueue::new()),

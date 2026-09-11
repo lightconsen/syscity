@@ -65,7 +65,9 @@ pub(crate) async fn handle_plugins_sign(req: &WsRequest, state: &Arc<GatewayStat
         p.secret_key.clone()
     };
 
-    let manifest_path = crate::dirs::config_dir()
+    let manifest_path = state
+        .paths
+        .config_dir()
         .join("plugins")
         .join(&p.name)
         .join("plugin.json");

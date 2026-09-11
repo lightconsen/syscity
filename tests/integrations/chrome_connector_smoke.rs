@@ -59,6 +59,7 @@ async fn chrome_devtools_connector_full_cycle() {
         #[cfg(feature = "cloud")]
         None,
         Arc::new(syscity::secrets::SecretStoreHandle::default()),
+        syscity::dirs::paths(),
     );
 
     // ── 1. Install: cache copy + bundled-skill bridge ──────────────────────
