@@ -12,11 +12,16 @@
 //!   report inside that agent's workspace.
 //! - `/api/v1/artifacts/[<root>/<task>/]<file>` — legacy global artifacts dir.
 
+use std::sync::Arc;
+
 use axum::{
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
 };
+
+use crate::dirs::SyscityPaths;
+use crate::gateway::GatewayState;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ArtifactExportQuery {
@@ -135,7 +140,7 @@ async fn export_document(
 /// Resolve a request path to its on-disk location, honoring the `@owner`
 /// prefix for agent-workspace artifacts and falling back to the legacy global
 /// directory. Returns `None` for unsafe paths.
-fn resolve_artifact_path(path: &str) -> Option<std::path::PathBuf> {
+fn resolve_artifact_path(paths: &SyscityPaths, path: &str) -> Option<std::path::PathBuf> {
     // Path traversal protection: reject absolute paths, ".." / "." / empty
     // segments, backslashes, and percent-encoded variants, so the joined path
     // can never escape its root.
@@ -163,13 +168,13 @@ fn resolve_artifact_path(path: &str) -> Option<std::path::PathBuf> {
             return None;
         }
         let ws = if owner == "default" {
-            crate::dirs::workspace_data_dir()
+            paths.workspace_data_dir()
         } else {
-            crate::dirs::agent_workspace_dir(owner)
+            paths.agent_workspace_dir(owner)
         };
         (ws.join("artifacts"), rel)
     } else {
-        (crate::dirs::artifacts_dir(), path)
+        (paths.artifacts_dir(), path)
     };
 
     Some(root.join(std::path::Path::new(rel)))
@@ -182,10 +187,11 @@ fn resolve_artifact_path(path: &str) -> Option<std::path::PathBuf> {
 /// With `?to=pptx|docx|xlsx` the document must be authored HTML and the
 /// response is the converted Office file download instead of the source.
 pub async fn artifact_handler(
+    State(state): State<Arc<GatewayState>>,
     Path(path): Path<String>,
     Query(query): Query<ArtifactExportQuery>,
 ) -> impl IntoResponse {
-    let Some(file_path) = resolve_artifact_path(&path) else {
+    let Some(file_path) = resolve_artifact_path(&state.paths, &path) else {
         return (
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -237,9 +243,32 @@ pub async fn artifact_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::state_tests::make_test_state;
+    use crate::gateway::GatewayConfig;
+
+    /// A state whose `paths` root is a temp dir, so these tests never read or
+    /// write the real `~/.syscity`.
+    async fn state() -> Arc<GatewayState> {
+        Arc::new(make_test_state(GatewayConfig::default()).await)
+    }
+
+    fn query(to: Option<&str>) -> Query<ArtifactExportQuery> {
+        Query(ArtifactExportQuery { to: to.map(str::to_string) })
+    }
+
+    async fn get(
+        state: &Arc<GatewayState>,
+        path: &str,
+        to: Option<&str>,
+    ) -> axum::response::Response {
+        artifact_handler(State(state.clone()), Path(path.to_string()), query(to))
+            .await
+            .into_response()
+    }
 
     #[tokio::test]
     async fn test_traversal_paths_rejected() {
+        let state = state().await;
         for bad in [
             "..",
             "../etc/passwd",
@@ -251,10 +280,7 @@ mod tests {
             "a\\..\\b.md",
             "./a.md",
         ] {
-            let resp =
-                artifact_handler(Path(bad.to_string()), Query(ArtifactExportQuery { to: None }))
-                    .await
-                    .into_response();
+            let resp = get(&state, bad, None).await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "should reject {:?}", bad);
         }
     }
@@ -263,62 +289,49 @@ mod tests {
     async fn test_nested_tree_path_served() {
         // A tree-scoped artifact is stored under artifacts/<root>/<task>/<file>
         // and served from the matching URL.
-        let dir = crate::dirs::artifacts_dir().join("root-t").join("task-t");
+        let state = state().await;
+        let dir = state.paths.artifacts_dir().join("root-t").join("task-t");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("r.md"), "# hi from tree")
             .await
             .unwrap();
 
-        let resp = artifact_handler(
-            Path("root-t/task-t/r.md".to_string()),
-            Query(ArtifactExportQuery { to: None }),
-        )
-        .await
-        .into_response();
+        let resp = get(&state, "root-t/task-t/r.md", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("# hi from tree"));
-
-        let _ = tokio::fs::remove_dir_all(crate::dirs::artifacts_dir().join("root-t")).await;
     }
 
     #[tokio::test]
     async fn test_agent_workspace_path_served() {
         // Agent-workspace artifacts are addressed with an `@<owner>` prefix
         // and served from that workspace's artifacts dir.
-        let dir = crate::dirs::workspace_data_dir().join("artifacts");
+        let state = state().await;
+        let dir = state.paths.workspace_data_dir().join("artifacts");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("ws-test.md"), "# hi from workspace")
             .await
             .unwrap();
 
-        let resp = artifact_handler(
-            Path("@default/ws-test.md".to_string()),
-            Query(ArtifactExportQuery { to: None }),
-        )
-        .await
-        .into_response();
+        let resp = get(&state, "@default/ws-test.md", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("# hi from workspace"));
-
-        let _ = tokio::fs::remove_file(dir.join("ws-test.md")).await;
     }
 
     #[tokio::test]
     async fn test_owner_segment_validated() {
+        let state = state().await;
         for bad in ["@../x.md", "@a.b/x.md", "@default"] {
-            let resp =
-                artifact_handler(Path(bad.to_string()), Query(ArtifactExportQuery { to: None }))
-                    .await
-                    .into_response();
+            let resp = get(&state, bad, None).await;
             assert_ne!(resp.status(), StatusCode::OK, "should not serve {:?}", bad);
         }
     }
 
     #[tokio::test]
     async fn test_slides_export_returns_pptx() {
-        let dir = crate::dirs::artifacts_dir();
+        let state = state().await;
+        let dir = state.paths.artifacts_dir();
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(
             dir.join("export-deck.html"),
@@ -327,12 +340,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resp = artifact_handler(
-            Path("export-deck.html".to_string()),
-            Query(ArtifactExportQuery { to: Some("pptx".to_string()) }),
-        )
-        .await
-        .into_response();
+        let resp = get(&state, "export-deck.html", Some("pptx")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp
             .headers()
@@ -346,13 +354,12 @@ mod tests {
             .unwrap();
         // A pptx is a zip package.
         assert_eq!(&body[..2], b"PK");
-
-        let _ = tokio::fs::remove_file(dir.join("export-deck.html")).await;
     }
 
     #[tokio::test]
     async fn test_docx_and_xlsx_export() {
-        let dir = crate::dirs::artifacts_dir();
+        let state = state().await;
+        let dir = state.paths.artifacts_dir();
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("export-doc.html"), "<h1>标题</h1><p>正文</p>")
             .await
@@ -364,12 +371,7 @@ mod tests {
         .await
         .unwrap();
 
-        let docx = artifact_handler(
-            Path("export-doc.html".to_string()),
-            Query(ArtifactExportQuery { to: Some("docx".to_string()) }),
-        )
-        .await
-        .into_response();
+        let docx = get(&state, "export-doc.html", Some("docx")).await;
         assert_eq!(docx.status(), StatusCode::OK);
         let ct = docx
             .headers()
@@ -383,12 +385,7 @@ mod tests {
             .unwrap();
         assert_eq!(&body[..2], b"PK");
 
-        let xlsx = artifact_handler(
-            Path("export-sheet.html".to_string()),
-            Query(ArtifactExportQuery { to: Some("xlsx".to_string()) }),
-        )
-        .await
-        .into_response();
+        let xlsx = get(&state, "export-sheet.html", Some("xlsx")).await;
         assert_eq!(xlsx.status(), StatusCode::OK);
         let ct = xlsx
             .headers()
@@ -401,19 +398,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..2], b"PK");
-
-        let _ = tokio::fs::remove_file(dir.join("export-doc.html")).await;
-        let _ = tokio::fs::remove_file(dir.join("export-sheet.html")).await;
     }
 
     #[tokio::test]
     async fn test_export_rejects_unknown_target() {
-        let resp = artifact_handler(
-            Path("x.md".to_string()),
-            Query(ArtifactExportQuery { to: Some("pdf".to_string()) }),
-        )
-        .await
-        .into_response();
+        let state = state().await;
+        let resp = get(&state, "x.md", Some("pdf")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
