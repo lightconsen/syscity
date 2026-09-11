@@ -11,6 +11,22 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-09-11
+
+### Added
+- Cloud models are discovered from the cloud proxy's `GET /v1/models` instead of a hardcoded list, refreshed lazily (10-minute TTL) when the model picker opens. The picker shows the models the proxy actually serves and drops entries it no longer advertises.
+- The model picker lists **Cloud** and **Local** sections independently. A model id served by both (e.g. `deepseek-v4-pro` through the cloud proxy and from a directly-configured provider) now appears in both, and the cloud copy is independently selectable and routes through the proxy.
+
+### Changed
+- Authenticated sessions and device pairings are persisted to the shared SQLite store, so login state and paired devices survive a restart. Only domain-separated SHA-256 token digests are written — never plaintext.
+- Audit records attribute actions to the real user (and the rate limiter is keyed per user) instead of hardcoded placeholder actors.
+- The secret store and filesystem layout are per-instance handles threaded through the gateway rather than process globals. Single-instance behaviour is unchanged — same `~/.syscity` root, same 0600 encrypted store.
+
+### Fixed
+- macOS downloads no longer trigger Gatekeeper's "cannot verify the developer" warning: CLI tarballs and desktop builds are Developer ID signed and notarized.
+- `system.reload` no longer removes the runtime cloud provider.
+- The status bar shows the bare model name for cloud-pinned sessions instead of the internal `cloud/<id>` reference.
+
 ## [0.3.4] - 2026-09-10
 
 ### Added
