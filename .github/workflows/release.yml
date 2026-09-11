@@ -312,6 +312,36 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
 
+      # Tauri notarizes only the .app. A quarantined .dmg is assessed on its own
+      # ticket (`spctl -t open`: "rejected, source=Unnotarized Developer ID"), so
+      # it must be notarized and stapled separately — the .dmg is what the
+      # download page serves.
+      - name: Notarize and staple the dmg
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="desktop/target/${{ matrix.target }}/release/bundle"
+          [ -d "$BUNDLE_DIR" ] || BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+
+          for DMG in "$BUNDLE_DIR"/dmg/*.dmg; do
+            [ -f "$DMG" ] || continue
+            RESULT="$RUNNER_TEMP/notarytool-dmg.json"
+            xcrun notarytool submit "$DMG" \
+              --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" --wait --output-format json > "$RESULT"
+            cat "$RESULT"
+            STATUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RESULT")"
+            if [ "$STATUS" != "Accepted" ]; then
+              echo "::error::dmg notarization status: $STATUS"
+              exit 1
+            fi
+            xcrun stapler staple "$DMG"
+          done
+
       # Fail the release rather than publish a bundle Gatekeeper will reject.
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS'
@@ -331,10 +361,8 @@ jobs:
           for DMG in "$BUNDLE_DIR"/dmg/*.dmg; do
             [ -f "$DMG" ] || continue
             codesign --verify --strict --verbose=2 "$DMG"
-            # Gatekeeper evaluates the .app inside (verified above); the dmg's
-            # own ticket is best-effort, so don't block the release on it.
-            xcrun stapler validate "$DMG" \
-              || echo "::warning::$DMG has no stapled ticket (inner .app is stapled)"
+            xcrun stapler validate "$DMG"
+            spctl -a -vvv -t open --context context:primary-signature "$DMG"
           done
 
       - name: Collect artifacts

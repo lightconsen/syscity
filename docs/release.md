@@ -100,9 +100,15 @@ damaged"), so every macOS artifact is Developer ID signed and notarized.
   `.p12` into a throwaway keychain, runs `codesign --options runtime --timestamp
   --entitlements scripts/entitlements/cli.entitlements`, then notarizes with
   `notarytool`. The tarball ships the **signed** binary.
-- **Desktop** (`.dmg`, `.app`): the `build-desktop` job only supplies the
-  `APPLE_*` env vars — Tauri creates its own keychain, signs the bundle with the
-  hardened runtime, notarizes and **staples** it.
+- **Desktop** (`.app`): the `build-desktop` job only supplies the `APPLE_*` env
+  vars — Tauri creates its own keychain, signs the bundle with the hardened
+  runtime, notarizes it and **staples** it.
+- **`.dmg`**: Tauri does **not** notarize the disk image (only the `.app` it
+  wraps), and a quarantined `.dmg` is assessed on its own ticket — signed but
+  unnotarized reads as `spctl: rejected, source=Unnotarized Developer ID`. The
+  workflow therefore runs a separate `notarytool submit` + `stapler staple` on
+  the `.dmg`. The updater payload (`.app.tar.gz`) is fine: Tauri tar-gzips the
+  app *after* stapling it.
 - **Entitlements**: hardened runtime blocks JIT, and both builds ship the
   `plugins` feature (wasmtime/Cranelift), so both entitlement files carry
   `com.apple.security.cs.allow-jit`. The desktop app adds
@@ -165,6 +171,11 @@ so re-running after a fix **adds** missing assets rather than duplicating.
   uses the same name for the opposite thing.
 - **Notarization is a network call** to Apple on every release run, so a tag
   release needs the runner to reach `appstoreconnect.apple.com`.
+- **Tauri notarizes the `.app`, not the `.dmg`** — the dmg needs its own
+  `notarytool submit` + `stapler staple` (the workflow does this). Verified
+  locally: before the extra step, `spctl -t open` on the dmg reports
+  `rejected, source=Unnotarized Developer ID`; after, `accepted,
+  source=Notarized Developer ID`.
 - **Windows updater payload** is the NSIS `.exe`, not the `.msi`.
 
 ## Eval gates
