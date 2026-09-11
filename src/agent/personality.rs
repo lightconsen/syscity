@@ -15,7 +15,7 @@ use tokio::fs;
 use tracing::{debug, info, warn};
 
 use crate::agent::AgentConfig;
-use crate::dirs;
+use crate::dirs::SyscityPaths;
 
 /// Regex for matching placeholder headings that should not be used as display
 /// names.
@@ -93,6 +93,7 @@ impl Default for AgentTemplateParams {
 /// gets a consistent IDENTITY.md + SOUL.md structure, while still allowing
 /// per-agent customisation of name, description, and emoji.
 pub async fn seed_agent_personality(
+    paths: &SyscityPaths,
     agent_dir: &Path,
     params: &AgentTemplateParams,
 ) -> crate::Result<()> {
@@ -107,7 +108,7 @@ pub async fn seed_agent_personality(
 
     // Ensure workspace/ and data/ subdirectories exist
     let id = params.agent_id.clone();
-    for sub in [&dirs::agent_workspace_dir(&id), &dirs::agent_data_dir(&id)] {
+    for sub in [&paths.agent_workspace_dir(&id), &paths.agent_data_dir(&id)] {
         if !sub.exists() {
             tokio::fs::create_dir_all(sub).await.map_err(|e| {
                 crate::error::SyscityError::Storage {
@@ -149,6 +150,7 @@ pub async fn seed_agent_personality(
 
 /// Synchronous version of `seed_agent_personality`.
 pub fn seed_agent_personality_sync(
+    paths: &SyscityPaths,
     agent_dir: &Path,
     params: &AgentTemplateParams,
 ) -> crate::Result<()> {
@@ -160,7 +162,7 @@ pub fn seed_agent_personality_sync(
     }
 
     let id = params.agent_id.clone();
-    for sub in [&dirs::agent_workspace_dir(&id), &dirs::agent_data_dir(&id)] {
+    for sub in [&paths.agent_workspace_dir(&id), &paths.agent_data_dir(&id)] {
         if !sub.exists() {
             std::fs::create_dir_all(sub).map_err(|e| crate::error::SyscityError::Storage {
                 context: format!("Failed to create agent subdirectory: {:?}", sub),
@@ -644,12 +646,16 @@ impl AgentRegistry {
     }
 
     /// Discover agents from the configured agents/ directory.
-    pub async fn discover(&mut self) -> crate::Result<usize> {
-        self.discover_in_dir(&dirs::agents_dir()).await
+    pub async fn discover(&mut self, paths: &SyscityPaths) -> crate::Result<usize> {
+        self.discover_in_dir(paths, &paths.agents_dir()).await
     }
 
     /// Discover agents from a specific directory.
-    pub async fn discover_in_dir(&mut self, agents_dir: &Path) -> crate::Result<usize> {
+    pub async fn discover_in_dir(
+        &mut self,
+        paths: &SyscityPaths,
+        agents_dir: &Path,
+    ) -> crate::Result<usize> {
         if !agents_dir.exists() {
             info!("Agents directory does not exist: {:?}", agents_dir);
             return Ok(0);
@@ -674,8 +680,8 @@ impl AgentRegistry {
                     let agent_id = personality.id.clone();
                     if personality.is_valid {
                         // Ensure agent subdirectories exist (workspace/, data/)
-                        let workspace_dir = dirs::agent_workspace_dir(&agent_id);
-                        let data_dir = dirs::agent_data_dir(&agent_id);
+                        let workspace_dir = paths.agent_workspace_dir(&agent_id);
+                        let data_dir = paths.agent_data_dir(&agent_id);
                         for dir in [&workspace_dir, &data_dir] {
                             if let Err(e) = tokio::fs::create_dir_all(dir).await {
                                 warn!("Failed to create agent directory {:?}: {}", dir, e);
@@ -698,7 +704,7 @@ impl AgentRegistry {
                             ),
                             emoji: "🤖".to_string(),
                         };
-                        if let Err(e) = seed_agent_personality(&path, &params).await {
+                        if let Err(e) = seed_agent_personality(paths, &path, &params).await {
                             warn!("Failed to seed personality for '{}': {}", agent_id, e);
                         } else {
                             // Reload after seeding
@@ -1063,6 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn seed_creates_identity_with_correct_format() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let paths = SyscityPaths::from_root(temp_dir.path());
         let agent_id = unique_test_id("identity");
         let agent_dir = temp_dir.path().join(&agent_id);
         let params = AgentTemplateParams {
@@ -1072,7 +1079,9 @@ mod tests {
             emoji: "🆔".to_string(),
         };
 
-        seed_agent_personality(&agent_dir, &params).await.unwrap();
+        seed_agent_personality(&paths, &agent_dir, &params)
+            .await
+            .unwrap();
 
         let identity_path = agent_dir.join("IDENTITY.md");
         assert!(identity_path.exists());
@@ -1081,13 +1090,12 @@ mod tests {
         assert!(content.contains("## name\n"));
         assert!(content.contains("Identity Agent"));
         assert!(content.contains("Tests the identity template."));
-
-        cleanup_test_agent(&params.agent_id);
     }
 
     #[tokio::test]
     async fn seed_creates_soul_with_yaml_frontmatter() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let paths = SyscityPaths::from_root(temp_dir.path());
         let agent_id = unique_test_id("soul");
         let agent_dir = temp_dir.path().join(&agent_id);
         let params = AgentTemplateParams {
@@ -1097,7 +1105,9 @@ mod tests {
             emoji: "✨".to_string(),
         };
 
-        seed_agent_personality(&agent_dir, &params).await.unwrap();
+        seed_agent_personality(&paths, &agent_dir, &params)
+            .await
+            .unwrap();
 
         let soul_path = agent_dir.join("SOUL.md");
         assert!(soul_path.exists());
@@ -1114,13 +1124,12 @@ mod tests {
         assert!(content.contains("format: markdown\n"));
         assert!(content.contains("---\n\n# Core Principles\n"));
         assert!(content.contains("Be genuinely helpful"));
-
-        cleanup_test_agent(&params.agent_id);
     }
 
     #[tokio::test]
     async fn seeded_personality_loads_and_is_valid() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let paths = SyscityPaths::from_root(temp_dir.path());
         let agent_id = unique_test_id("load");
         let agent_dir = temp_dir.path().join(&agent_id);
         let params = AgentTemplateParams {
@@ -1130,7 +1139,9 @@ mod tests {
             emoji: "📦".to_string(),
         };
 
-        seed_agent_personality(&agent_dir, &params).await.unwrap();
+        seed_agent_personality(&paths, &agent_dir, &params)
+            .await
+            .unwrap();
 
         let personality = AgentPersonality::load(&agent_dir).await.unwrap();
         assert!(personality.is_valid, "Seeded personality should be valid");
@@ -1138,13 +1149,12 @@ mod tests {
         assert_eq!(personality.display_name(), "Loadable Agent");
         assert!(!personality.identity.is_empty());
         assert!(!personality.soul.is_empty());
-
-        cleanup_test_agent(&params.agent_id);
     }
 
     #[test]
     fn seed_sync_matches_async_output() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let paths = SyscityPaths::from_root(temp_dir.path());
         let agent_id = unique_test_id("sync");
         let agent_dir = temp_dir.path().join(&agent_id);
         let params = AgentTemplateParams {
@@ -1154,7 +1164,7 @@ mod tests {
             emoji: "⚡".to_string(),
         };
 
-        seed_agent_personality_sync(&agent_dir, &params).unwrap();
+        seed_agent_personality_sync(&paths, &agent_dir, &params).unwrap();
 
         let identity = std::fs::read_to_string(agent_dir.join("IDENTITY.md")).unwrap();
         let soul = std::fs::read_to_string(agent_dir.join("SOUL.md")).unwrap();
@@ -1165,13 +1175,12 @@ mod tests {
         assert!(soul.contains("persona: Tests sync seeding."));
         assert!(soul.contains("emoji: \"⚡\""));
         assert!(soul.starts_with("---\n"));
-
-        cleanup_test_agent(&params.agent_id);
     }
 
     #[tokio::test]
     async fn seed_does_not_overwrite_existing_files() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let paths = SyscityPaths::from_root(temp_dir.path());
         let agent_id = unique_test_id("no-clobber");
         let agent_dir = temp_dir.path().join(&agent_id);
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -1185,12 +1194,12 @@ mod tests {
             emoji: "🚫".to_string(),
         };
 
-        seed_agent_personality(&agent_dir, &params).await.unwrap();
+        seed_agent_personality(&paths, &agent_dir, &params)
+            .await
+            .unwrap();
 
         let content = std::fs::read_to_string(agent_dir.join("IDENTITY.md")).unwrap();
         assert_eq!(content, existing_identity);
-
-        cleanup_test_agent(&params.agent_id);
     }
 
     #[test]
@@ -1205,7 +1214,8 @@ mod tests {
     #[tokio::test]
     async fn test_registry_discovers_valid_skips_invalid_and_seeds_empty() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let agents_dir = temp_dir.path().join("agents");
+        let paths = SyscityPaths::from_root(temp_dir.path());
+        let agents_dir = paths.agents_dir();
 
         let valid_id = unique_test_id("valid");
         let valid_dir = agents_dir.join(&valid_id);
@@ -1228,25 +1238,25 @@ mod tests {
         std::fs::write(agents_dir.join("not-a-dir.txt"), "ignore").unwrap();
 
         let mut registry = AgentRegistry::new();
-        let count = registry.discover_in_dir(&agents_dir).await.unwrap();
+        let count = registry.discover_in_dir(&paths, &agents_dir).await.unwrap();
         assert_eq!(count, 2, "Should discover valid agent and seed empty dir");
         assert!(registry.has(&valid_id));
         assert!(registry.has(&empty_id));
 
-        cleanup_test_agent(&valid_id);
-        cleanup_test_agent(&empty_id);
-        let _ = std::fs::remove_dir_all(dirs::agent_workspace_dir(&valid_id));
-        let _ = std::fs::remove_dir_all(dirs::agent_data_dir(&valid_id));
-        let _ = std::fs::remove_dir_all(dirs::agent_workspace_dir(&empty_id));
-        let _ = std::fs::remove_dir_all(dirs::agent_data_dir(&empty_id));
+        // Everything this test touches — including the workspace/ and data/
+        // dirs discovery seeds — lives under `temp_dir`, so the TempDir drop
+        // cleans up. No remove_dir_all against the real ~/.syscity.
     }
 
     #[tokio::test]
     async fn test_primary_prompt_token_budget() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let paths = SyscityPaths::from_root(temp_dir.path());
         let agent_dir = temp_dir.path().join("default");
         let params = AgentTemplateParams::default();
-        seed_agent_personality(&agent_dir, &params).await.unwrap();
+        seed_agent_personality(&paths, &agent_dir, &params)
+            .await
+            .unwrap();
 
         let personality = AgentPersonality::load(&agent_dir).await.unwrap();
         let config = personality.to_agent_config_for(PersonalityContext::Primary);
@@ -1266,10 +1276,5 @@ mod tests {
             .unwrap()
             .as_millis();
         format!("test-{}-{}-{}", prefix, std::process::id(), ts)
-    }
-
-    fn cleanup_test_agent(agent_id: &str) {
-        let path = dirs::agents_dir().join(agent_id);
-        let _ = std::fs::remove_dir_all(path);
     }
 }

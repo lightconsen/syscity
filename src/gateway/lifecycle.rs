@@ -165,7 +165,7 @@ pub(crate) async fn start_gateway(
     // Discover agents from agents/ directory (auto-discovery)
     {
         let mut registry = state.agents.registry.write().await;
-        match registry.discover().await {
+        match registry.discover(&state.paths).await {
             Ok(count) => {
                 if count > 0 {
                     info!("🔍 Discovered {} agents from agents/ directory", count);

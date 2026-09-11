@@ -168,7 +168,13 @@ pub(crate) async fn handle_connectors_catalog_install(
     if entry.entry_type == "expert" {
         match manager.install_expert(&entry).await {
             Ok(agents) => {
-                let _ = state.agents.registry.write().await.discover().await;
+                let _ = state
+                    .agents
+                    .registry
+                    .write()
+                    .await
+                    .discover(&state.paths)
+                    .await;
                 WsResponse::ok(
                     &req.id,
                     serde_json::json!({ "id": entry.id, "type": "expert", "agents": agents, "installed": true }),

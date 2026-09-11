@@ -605,7 +605,12 @@ pub async fn init() -> crate::Result<PathBuf> {
 async fn seed_default_agent_personality(base: &Path) -> crate::Result<()> {
     let default_agent_dir = base.join("agents").join("default");
     let params = crate::agent::AgentTemplateParams::default();
-    crate::agent::seed_agent_personality(&default_agent_dir, &params).await
+    crate::agent::seed_agent_personality(
+        &SyscityPaths::from_root(base),
+        &default_agent_dir,
+        &params,
+    )
+    .await
 }
 
 /// Initialize directories synchronously (for non-async contexts)
@@ -653,7 +658,11 @@ pub fn init_sync() -> crate::Result<PathBuf> {
 fn seed_default_agent_personality_sync(base: &Path) -> crate::Result<()> {
     let default_agent_dir = base.join("agents").join("default");
     let params = crate::agent::AgentTemplateParams::default();
-    crate::agent::seed_agent_personality_sync(&default_agent_dir, &params)
+    crate::agent::seed_agent_personality_sync(
+        &SyscityPaths::from_root(base),
+        &default_agent_dir,
+        &params,
+    )
 }
 
 /// Check if Syscity directories are initialized

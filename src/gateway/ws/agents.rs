@@ -376,7 +376,13 @@ pub(crate) async fn handle_agents_import(req: &WsRequest, state: &Arc<GatewaySta
             );
         }
     }
-    let discovered = state.agents.registry.write().await.discover().await;
+    let discovered = state
+        .agents
+        .registry
+        .write()
+        .await
+        .discover(&state.paths)
+        .await;
     WsResponse::ok(
         &req.id,
         serde_json::json!({
