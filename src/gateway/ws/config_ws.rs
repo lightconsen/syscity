@@ -479,7 +479,8 @@ pub(crate) async fn push_default_agent_update(state: &Arc<GatewayState>) {
     };
     let effective = {
         let config = state.config.read().await;
-        let mut effective = crate::gateway::augment_default_agent_config(&config.default_agent);
+        let mut effective =
+            crate::gateway::augment_default_agent_config(&config.default_agent, &state.paths);
         effective.agent_id = Some("default".to_string());
         config.apply_agent_overrides("default", &mut effective);
         effective

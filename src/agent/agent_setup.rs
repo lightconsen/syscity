@@ -30,6 +30,7 @@ impl Agent {
         let agent_id = config.agent_id.clone().unwrap_or_default();
 
         Self {
+            paths: crate::dirs::paths(),
             config: config.into(),
             agent_id,
             provider,
@@ -75,6 +76,12 @@ impl Agent {
             sample_store: None,
             sampling: crate::gateway::config::OnlineSamplingConfig::default(),
         }
+    }
+
+    /// Root this agent's workspace/delegation directories resolve against.
+    pub fn with_paths(mut self, paths: Arc<crate::dirs::SyscityPaths>) -> Self {
+        self.paths = paths;
+        self
     }
 
     /// Set provider-specific extra parameters (e.g. thinking config) to inject
@@ -224,7 +231,7 @@ impl Agent {
             max_context_length: None,
         };
 
-        let agent_workspace = cfg.resolve_workspace_dir();
+        let agent_workspace = cfg.resolve_workspace_dir(&self.paths);
 
         let mut ctx = ToolContext::new(user_id.clone(), conversation_id)
             .with_timeout(Duration::from_secs(120))
@@ -243,11 +250,13 @@ impl Agent {
         // absolute path.  Other agents' workspaces are not granted, preserving
         // cross-agent isolation.
         if let Some(scope) = delegation.as_ref() {
-            let task_dir = crate::dirs::delegation_task_dir(&scope.root_id, &scope.task_id);
+            let task_dir = self
+                .paths
+                .delegation_task_dir(&scope.root_id, &scope.task_id);
             ctx = ctx
                 .with_workspace_root(task_dir)
                 .allow_path(agent_workspace)
-                .allow_path(crate::dirs::delegation_workspace_dir(&scope.root_id));
+                .allow_path(self.paths.delegation_workspace_dir(&scope.root_id));
         }
 
         // Carry the shared ask-user queue so `ask_user` can block for a human

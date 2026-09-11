@@ -101,7 +101,7 @@ pub(crate) async fn handle_connectors_catalog(
             let inst = installed_by_id.get(&e.id);
             // Experts are "installed" once their role dir exists in agents/.
             let expert_installed =
-                e.entry_type == "expert" && crate::dirs::agents_dir().join(&e.id).is_dir();
+                e.entry_type == "expert" && state.paths.agents_dir().join(&e.id).is_dir();
             serde_json::json!({
                 "id": e.id,
                 "version": e.version,

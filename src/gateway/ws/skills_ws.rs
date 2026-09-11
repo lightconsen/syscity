@@ -57,7 +57,7 @@ pub(super) async fn handle_skills_install(
         return WsResponse::err(&req.id, "INVALID_PARAMS", "Skill name is required");
     }
 
-    let skills_dir = crate::dirs::skills_dir();
+    let skills_dir = state.paths.skills_dir();
     let skill_dir = skills_dir.join(name);
     if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
         return WsResponse::err(

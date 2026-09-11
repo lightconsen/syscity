@@ -49,13 +49,13 @@ async fn resolve_workspace_root(
                     .as_ref()
                     .map(crate::dirs::resolve_tilde);
             }
-            Some(cfg.resolve_workspace_dir())
+            Some(cfg.resolve_workspace_dir(&state.paths))
         }
         Some(id) => {
             {
                 let agents = state.agents.agents.read().await;
                 if let Some(handle) = agents.get(id) {
-                    return Some(handle.config.resolve_workspace_dir());
+                    return Some(handle.config.resolve_workspace_dir(&state.paths));
                 }
             }
             let personality = {
@@ -73,7 +73,7 @@ async fn resolve_workspace_root(
                         let config = state.config.read().await;
                         config.apply_agent_overrides(id, &mut cfg);
                     }
-                    Some(cfg.resolve_workspace_dir())
+                    Some(cfg.resolve_workspace_dir(&state.paths))
                 }
                 None => None,
             }
@@ -350,13 +350,13 @@ mod tests {
     async fn resolve_root_default_agent_uses_shared_workspace() {
         let state = state().await;
         let root = resolve_workspace_root(&state, None).await.unwrap();
-        assert_eq!(root, crate::dirs::workspace_data_dir());
+        assert_eq!(root, state.paths.workspace_data_dir());
         let root = resolve_workspace_root(&state, Some("default"))
             .await
             .unwrap();
-        assert_eq!(root, crate::dirs::workspace_data_dir());
+        assert_eq!(root, state.paths.workspace_data_dir());
         let root = resolve_workspace_root(&state, Some("")).await.unwrap();
-        assert_eq!(root, crate::dirs::workspace_data_dir());
+        assert_eq!(root, state.paths.workspace_data_dir());
     }
 
     #[tokio::test]
@@ -376,7 +376,7 @@ mod tests {
             .insert_for_test(personality);
 
         let root = resolve_workspace_root(&state, Some("alice")).await.unwrap();
-        assert_eq!(root, crate::dirs::agent_workspace_dir("alice"));
+        assert_eq!(root, state.paths.agent_workspace_dir("alice"));
 
         let missing = resolve_workspace_root(&state, Some("ghost")).await;
         assert!(missing.is_none());

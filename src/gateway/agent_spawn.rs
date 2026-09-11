@@ -183,6 +183,7 @@ pub(crate) async fn spawn_agent_inner(
     let agent = if let Some(mm) = memory_manager {
         let chat_history = mm.chat_history();
         let mut builder = Agent::new(config.clone(), provider, tools)
+            .with_paths(state.paths.clone())
             .with_model(model.clone())
             .with_memory_manager(mm.clone())
             .with_chat_history(chat_history)
@@ -215,6 +216,7 @@ pub(crate) async fn spawn_agent_inner(
         Arc::new(builder)
     } else {
         let mut builder = Agent::new(config.clone(), provider, tools)
+            .with_paths(state.paths.clone())
             .with_model(model.clone())
             .with_cost_guard(cost_guard)
             .with_online_monitoring(online_monitoring.clone())

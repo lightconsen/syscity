@@ -74,9 +74,10 @@ use handlers::*;
 /// `default_agent.*` updates so the running agent keeps its identity context.
 pub(crate) fn augment_default_agent_config(
     base: &crate::agent::AgentConfig,
+    paths: &crate::dirs::SyscityPaths,
 ) -> crate::agent::AgentConfig {
     let mut config = base.clone();
-    let default_agent_dir = crate::dirs::agents_dir().join("default");
+    let default_agent_dir = paths.agents_dir().join("default");
     config.system_prompt = format!(
         "{}\n\n## Agent Identity\n\nYour agent ID is: `default`\nYour agent directory is: \
          `{}`\nYou may edit files in your agent directory (including HEARTBEAT.md) to manage your \

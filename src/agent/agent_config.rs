@@ -141,12 +141,12 @@ impl AgentConfig {
     /// 1. `workspace_dir` config value (with `~` expanded)
     /// 2. For the default agent: `~/.syscity/workspace`
     /// 3. For named agents: `~/.syscity/agents/{agent_id}/workspace`
-    pub fn resolve_workspace_dir(&self) -> std::path::PathBuf {
+    pub fn resolve_workspace_dir(&self, paths: &crate::dirs::SyscityPaths) -> std::path::PathBuf {
         match &self.workspace_dir {
             Some(dir) => crate::dirs::resolve_tilde(dir),
             None => match self.agent_id.as_deref() {
-                Some("default") | None => crate::dirs::workspace_data_dir(),
-                Some(id) => crate::dirs::agent_workspace_dir(id),
+                Some("default") | None => paths.workspace_data_dir(),
+                Some(id) => paths.agent_workspace_dir(id),
             },
         }
     }

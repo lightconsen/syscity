@@ -175,6 +175,10 @@ impl ConfigCell {
 
 #[derive(Clone)]
 pub struct Agent {
+    /// Layout root this agent's workspace and delegation directories resolve
+    /// against. Defaults to the process root at construction; the gateway
+    /// overrides it with the root it was started with (`with_paths`).
+    paths: Arc<crate::dirs::SyscityPaths>,
     /// Agent configuration (runtime-updatable, copy-on-clone).
     config: ConfigCell,
     /// Stable agent identifier set at spawn time.
@@ -751,14 +755,17 @@ mod tests {
     fn test_resolve_workspace_dir_explicit() {
         let mut config = AgentConfig::default();
         config.workspace_dir = Some(PathBuf::from("/tmp/workspace"));
-        assert_eq!(config.resolve_workspace_dir(), PathBuf::from("/tmp/workspace"));
+        assert_eq!(
+            config.resolve_workspace_dir(&crate::dirs::paths()),
+            PathBuf::from("/tmp/workspace")
+        );
     }
 
     #[test]
     fn test_resolve_workspace_dir_with_tilde() {
         let mut config = AgentConfig::default();
         config.workspace_dir = Some(PathBuf::from("~/projects"));
-        let resolved = config.resolve_workspace_dir();
+        let resolved = config.resolve_workspace_dir(&crate::dirs::paths());
         assert!(!resolved.to_string_lossy().contains("~"));
         assert!(resolved.to_string_lossy().contains("projects"));
     }
@@ -766,7 +773,7 @@ mod tests {
     #[test]
     fn test_resolve_workspace_dir_default_fallback() {
         let config = AgentConfig::default();
-        let resolved = config.resolve_workspace_dir();
+        let resolved = config.resolve_workspace_dir(&crate::dirs::paths());
         // The root itself is the process default (a temp dir under cfg(test));
         // what this pins is that it resolves to the workspace, not an agent dir.
         assert!(resolved.to_string_lossy().contains("workspace"));
@@ -776,7 +783,7 @@ mod tests {
     fn test_resolve_workspace_dir_default_agent_id() {
         let mut config = AgentConfig::default();
         config.agent_id = Some("default".to_string());
-        let resolved = config.resolve_workspace_dir();
+        let resolved = config.resolve_workspace_dir(&crate::dirs::paths());
         // Should use the global workspace dir, not agents/default/workspace
         assert!(resolved.to_string_lossy().contains("workspace"));
         assert!(!resolved.to_string_lossy().contains("agents"));
@@ -786,7 +793,7 @@ mod tests {
     fn test_resolve_workspace_dir_named_agent() {
         let mut config = AgentConfig::default();
         config.agent_id = Some("my-agent".to_string());
-        let resolved = config.resolve_workspace_dir();
+        let resolved = config.resolve_workspace_dir(&crate::dirs::paths());
         assert!(resolved.to_string_lossy().contains("agents"));
         assert!(resolved.to_string_lossy().contains("my-agent"));
         assert!(resolved.to_string_lossy().contains("workspace"));

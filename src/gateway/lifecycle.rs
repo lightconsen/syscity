@@ -153,7 +153,7 @@ pub(crate) async fn start_gateway(
     }
 
     // Initialize default agent (optional - requires provider configuration)
-    let default_config = super::augment_default_agent_config(&config.default_agent);
+    let default_config = super::augment_default_agent_config(&config.default_agent, &state.paths);
     match spawn_agent_in_lifecycle(state.clone(), "default".to_string(), default_config).await {
         Ok(()) => info!("Default agent spawned successfully"),
         Err(e) => {
@@ -1220,8 +1220,10 @@ async fn run_quality_gate_check(
 
     // 3. Create a temporary agent for eval
     let agent_config = config.default_agent.clone();
-    let agent =
-        Arc::new(crate::agent::Agent::new(agent_config, provider.clone(), tool_registry.clone()));
+    let agent = Arc::new(
+        crate::agent::Agent::new(agent_config, provider.clone(), tool_registry.clone())
+            .with_paths(state.paths.clone()),
+    );
 
     // 4. Create critic (if needed for criteria)
     let mut critic = crate::agent::reflection::critic::Critic::new(provider);
