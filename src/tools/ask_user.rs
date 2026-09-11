@@ -16,7 +16,9 @@
 //!
 //! Background/autonomous contexts (delegated sub-agents, goal runner, cron,
 //! heartbeat, standing orders) have no interactive human — `ask_user`
-//! refuses there with a clear message instead of silently blocking.
+//! refuses there with a clear message instead of silently blocking. They all
+//! run as the `"system"` actor and are told apart from an interactive session
+//! by their conversation-id prefix (see [`background_context_reason`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -208,14 +210,16 @@ pub fn background_context_reason(ctx: &ToolContext) -> Option<&'static str> {
     if ctx.delegation.is_some() {
         return Some("delegated sub-agent context has no interactive human");
     }
-    if ctx.user_id == "goal_runner" {
-        return Some("goal runner context has no interactive human");
-    }
     if ctx.user_id == "system" {
+        // Cron, heartbeat, standing orders and goal runs all execute with no
+        // human present; they are told apart from an interactive session by the
+        // conversation-id prefix they are launched under (goal ids are minted as
+        // `goal_<uuid>`).
         let cid = ctx.conversation_id.as_str();
         if cid.starts_with("cron:")
             || cid.starts_with("heartbeat:")
             || cid.starts_with("standing_order:")
+            || cid.starts_with("goal_")
         {
             return Some("background system context has no interactive human");
         }
@@ -485,8 +489,8 @@ mod tests {
         });
         assert!(background_context_reason(&ctx).is_some());
 
-        // Goal runner.
-        assert!(background_context_reason(&ToolContext::new("goal_runner", "goal-1")).is_some());
+        // Goal run (goal ids are minted as `goal_<uuid>`).
+        assert!(background_context_reason(&ToolContext::new("system", "goal_1a2b3c4d")).is_some());
 
         // Background system contexts.
         assert!(background_context_reason(&ToolContext::new("system", "cron:job-1")).is_some());
@@ -542,7 +546,7 @@ mod tests {
         let tool = AskUserTool::default();
 
         // Goal runner context (no queue anyway).
-        let goal_ctx = ToolContext::new("goal_runner", "goal-1");
+        let goal_ctx = ToolContext::new("system", "goal_1a2b3c4d");
         let result = tool
             .execute(serde_json::json!({ "question": "Q" }), &goal_ctx)
             .await

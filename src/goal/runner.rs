@@ -572,7 +572,7 @@ impl GoalRunner {
             .unwrap_or_else(|| "default".to_string());
 
         // Create a tool context for tool execution.
-        let tool_ctx = ToolContext::new("goal_runner", &self.id)
+        let tool_ctx = ToolContext::new("system", &self.id)
             .with_workspace_root(crate::dirs::workspace_data_dir())
             .with_model_name(model.clone())
             .with_provider_name("model_router");
@@ -741,7 +741,7 @@ impl GoalRunner {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        let tool_ctx = ToolContext::new("goal_runner", &self.id)
+        let tool_ctx = ToolContext::new("system", &self.id)
             .with_workspace_root(crate::dirs::workspace_data_dir())
             .with_model_name(model.clone())
             .with_provider_name("model_router");
