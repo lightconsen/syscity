@@ -767,7 +767,8 @@ mod tests {
     fn test_resolve_workspace_dir_default_fallback() {
         let config = AgentConfig::default();
         let resolved = config.resolve_workspace_dir();
-        assert!(resolved.to_string_lossy().contains(".syscity"));
+        // The root itself is the process default (a temp dir under cfg(test));
+        // what this pins is that it resolves to the workspace, not an agent dir.
         assert!(resolved.to_string_lossy().contains("workspace"));
     }
 
@@ -777,7 +778,6 @@ mod tests {
         config.agent_id = Some("default".to_string());
         let resolved = config.resolve_workspace_dir();
         // Should use the global workspace dir, not agents/default/workspace
-        assert!(resolved.to_string_lossy().contains(".syscity"));
         assert!(resolved.to_string_lossy().contains("workspace"));
         assert!(!resolved.to_string_lossy().contains("agents"));
     }
@@ -787,7 +787,6 @@ mod tests {
         let mut config = AgentConfig::default();
         config.agent_id = Some("my-agent".to_string());
         let resolved = config.resolve_workspace_dir();
-        assert!(resolved.to_string_lossy().contains(".syscity"));
         assert!(resolved.to_string_lossy().contains("agents"));
         assert!(resolved.to_string_lossy().contains("my-agent"));
         assert!(resolved.to_string_lossy().contains("workspace"));

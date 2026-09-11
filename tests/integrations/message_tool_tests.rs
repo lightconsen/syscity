@@ -58,6 +58,9 @@ impl syscity::outbound::OutboundPipeline for DummyOutboundPipeline {
 // ─────────────────────────────
 
 async fn make_test_state(config: GatewayConfig) -> GatewayState {
+    // Builds a bare `GatewayState`, bypassing gateway startup — so it must
+    // install a root itself (see `install_test_root` in the parent module).
+    install_test_root();
     let (event_tx, _) = broadcast::channel(1);
     let (inbound_entry_tx, _inbound_entry_rx) = mpsc::channel(1);
     let (routed_tx, _routed_rx) = mpsc::channel(1);

@@ -338,6 +338,15 @@ pub fn run() {
         std::process::exit(1);
     }
 
+    // Pin the process-wide path root before anything resolves a path: the
+    // desktop app is a single-root process, and `dirs::` free functions (used
+    // just below for the log file) panic if no root was installed.
+    if syscity::dirs::set_default_paths(Arc::new(syscity::dirs::SyscityPaths::from_env())).is_err()
+    {
+        // Already installed — harmless, both resolve to the same root.
+        eprintln!("path root already installed; keeping the existing one");
+    }
+
     // Set up a simple tracing subscriber so Gateway logs are visible.
     // In release builds stdout is disconnected (windows_subsystem), so we
     // also duplicate everything to a log file.

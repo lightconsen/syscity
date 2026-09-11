@@ -86,7 +86,6 @@ pub(crate) async fn init_plugin_channels(
     _config: &crate::gateway::config::GatewayConfig,
 ) -> crate::Result<()> {
     use crate::channels::plugin_host::PluginChannelRegistry;
-    use crate::dirs;
 
     let plugin_dir = state.paths.extensions_dir().join("channels");
     if !plugin_dir.exists() {

@@ -287,19 +287,47 @@ impl SyscityPaths {
     }
 }
 
-/// Process-default path handle, installed on first use.
+/// Process-default path handle, installed once at process entry.
 static DEFAULT_PATHS: OnceLock<Arc<SyscityPaths>> = OnceLock::new();
 
-/// The process-default path handle (constructed from `SYSCITY_HOME` or
-/// `<home>/.syscity` on first call).
+/// The process-default path handle.
 ///
-/// Gateway startup installs its explicitly-built instance here via
-/// [`set_default_paths`] so that legacy free-function call sites observe the
-/// same root as the injected `GatewayState::paths`.
+/// The root is resolved from `SYSCITY_HOME` (or `<home>/.syscity`) **exactly
+/// once per process, by the owner of the process entry point** — `main.rs` for
+/// the CLI, the desktop shell for the app, `Gateway::with_options` for an
+/// embedded gateway — via [`set_default_paths`]. Nothing resolves the
+/// environment implicitly any more.
+///
+/// This global exists only for the free functions below, which a single-root
+/// process can still resolve safely. New code should take an injected
+/// [`SyscityPaths`] instead (`GatewayState::paths`).
+///
+/// In `cfg(test)` builds an uninstalled process gets a throwaway temp-dir root
+/// rather than a panic, so a unit test that reaches a free function writes into
+/// a temp dir instead of the developer's real `~/.syscity`.
 pub fn paths() -> Arc<SyscityPaths> {
-    DEFAULT_PATHS
-        .get_or_init(|| Arc::new(SyscityPaths::from_env()))
-        .clone()
+    if let Some(installed) = DEFAULT_PATHS.get() {
+        return installed.clone();
+    }
+    DEFAULT_PATHS.get_or_init(default_paths_root).clone()
+}
+
+/// The root to install when nothing was installed explicitly.
+fn default_paths_root() -> Arc<SyscityPaths> {
+    #[cfg(test)]
+    {
+        Arc::new(SyscityPaths::from_root(
+            std::env::temp_dir().join(format!("syscity-test-{}", std::process::id())),
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        panic!(
+            "SyscityPaths was never installed. Call dirs::set_default_paths() at the process \
+             entry point (src/main.rs, the desktop shell, or Gateway::with_options) before \
+             using any dirs:: free function; or take an injected SyscityPaths instead."
+        )
+    }
 }
 
 /// Install the process-default path handle.
@@ -815,14 +843,15 @@ mod tests {
 
     #[test]
     fn test_syscity_dir_structure() {
-        // Just verify the paths are constructed correctly
-        let base = syscity_dir();
-        assert!(base.to_string_lossy().contains(".syscity"));
-
-        assert!(config_dir().to_string_lossy().contains(".syscity"));
+        // The free functions resolve against the process-default root. In a
+        // `cfg(test)` build an uninstalled process gets a throwaway temp root
+        // rather than `~/.syscity`, so this asserts the *structure* only — the
+        // `~/.syscity` naming is covered by the `resolve_base_dir`/`from_env`
+        // tests, which exercise the resolver directly.
         assert!(memory_dir().to_string_lossy().contains("memory"));
         assert!(logs_dir().to_string_lossy().contains("logs"));
         assert!(skills_dir().to_string_lossy().contains("skills"));
+        assert!(agents_dir().to_string_lossy().contains("agents"));
     }
 
     #[test]
