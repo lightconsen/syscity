@@ -107,9 +107,9 @@ pub(super) async fn handle_acp_spawn(
             state
                 .auth
                 .audit_log
-                .log(
+                .log_with_context(
                     AuditEventType::AcpSpawn,
-                    &actor,
+                    ctx,
                     &subagent_id,
                     true,
                     format!("Spawned subagent via WebSocket (mode: {:?})", handle.mode),
@@ -154,9 +154,9 @@ pub(super) async fn handle_acp_spawn(
             state
                 .auth
                 .audit_log
-                .log(
+                .log_with_context(
                     AuditEventType::AcpSpawn,
-                    &actor,
+                    ctx,
                     "",
                     false,
                     format!("Failed to spawn subagent: {}", e),
@@ -192,9 +192,9 @@ pub(super) async fn handle_acp_terminate(
             state
                 .auth
                 .audit_log
-                .log(
+                .log_with_context(
                     AuditEventType::AcpTerminate,
-                    ctx.actor(),
+                    ctx,
                     &params.session_id,
                     true,
                     format!("Terminated {} subagents in session {}", count, params.session_id),
@@ -213,9 +213,9 @@ pub(super) async fn handle_acp_terminate(
             state
                 .auth
                 .audit_log
-                .log(
+                .log_with_context(
                     AuditEventType::AcpTerminate,
-                    ctx.actor(),
+                    ctx,
                     &params.session_id,
                     false,
                     format!("Failed to terminate session: {}", e),
@@ -267,9 +267,9 @@ pub(super) async fn handle_acp_message(
             state
                 .auth
                 .audit_log
-                .log(
+                .log_with_context(
                     AuditEventType::AcpMessage,
-                    ctx.actor(),
+                    ctx,
                     &params.session_id,
                     true,
                     format!(
@@ -295,9 +295,9 @@ pub(super) async fn handle_acp_message(
             state
                 .auth
                 .audit_log
-                .log(
+                .log_with_context(
                     AuditEventType::AcpMessage,
-                    ctx.actor(),
+                    ctx,
                     &params.session_id,
                     false,
                     format!("Failed to send message: {}", e),
@@ -660,6 +660,22 @@ mod tests {
         let resp = handle_acp_terminate(&req("r1", session_params("ghost")), &state, &ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "TERMINATE_FAILED");
+    }
+
+    /// The audit entry a WS handler writes records the *request context's*
+    /// actor — not a re-derived or hardcoded literal (docs/scale.md §8, T2).
+    #[tokio::test]
+    async fn audit_actor_comes_from_request_context() {
+        let state = state().await;
+        let ctx = RequestContext::new("alice", AuthSource::SharedToken);
+
+        let resp = handle_acp_terminate(&req("r1", session_params("ghost")), &state, &ctx).await;
+        assert!(!resp.ok);
+
+        let entries = state.auth.audit_log.recent(1).await;
+        assert_eq!(entries.len(), 1, "the failure path must still audit");
+        assert_eq!(entries[0].actor, "alice");
+        assert_ne!(entries[0].actor, "anonymous");
     }
 
     #[tokio::test]
