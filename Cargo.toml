@@ -231,8 +231,8 @@ ndarray = { version = "0.17", optional = true }
 # QR code generation for device pairing
 qrcode = "0.14"
 
-# Terminal UI (optional)
-ratatui = { version = "0.29" }
+# Terminal UI (the `tui` client). Not optional: `src/tui` is always compiled.
+ratatui = { version = "0.30" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-util = { version = "0.7" }
 unicode-width = { version = "0.2" }
