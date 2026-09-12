@@ -174,7 +174,7 @@ async fn eval_validate_all_yaml() {
         if is_suite {
             // Validate suite manifest
             match std::fs::read_to_string(path) {
-                Ok(content) => match serde_yml::from_str::<serde_yml::Value>(&content) {
+                Ok(content) => match serde_norway::from_str::<serde_norway::Value>(&content) {
                     Ok(_) => validated += 1,
                     Err(e) => errors.push(format!("{:?}: {}", path, e)),
                 },

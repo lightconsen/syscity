@@ -92,7 +92,7 @@ struct YamlCondition {
     /// `must_contain` can be integer or string in YAML — we deserialise as
     /// raw `Value` and convert to `String` during conversion.
     #[serde(default)]
-    must_contain: Option<serde_yml::Value>,
+    must_contain: Option<serde_norway::Value>,
     #[serde(default)]
     expected: Option<i32>,
     #[serde(default)]
@@ -261,7 +261,7 @@ pub fn list_suites(evals_dir: &Path) -> Result<Vec<(String, String)>> {
             // Try to extract a display name from the YAML
             let name = match std::fs::read_to_string(&path) {
                 Ok(content) => {
-                    if let Ok(manifest) = serde_yml::from_str::<YamlManifest>(&content) {
+                    if let Ok(manifest) = serde_norway::from_str::<YamlManifest>(&content) {
                         manifest.name.clone().unwrap_or(stem.clone())
                     } else {
                         stem.clone()
@@ -279,7 +279,7 @@ pub fn list_suites(evals_dir: &Path) -> Result<Vec<(String, String)>> {
 /// that name.
 fn resolve_included_manifest(incl_path: &Path, sections: &[String]) -> Result<Vec<ResolvedEntry>> {
     let content = std::fs::read_to_string(incl_path).map_err(crate::error::SyscityError::Io)?;
-    let manifest: YamlManifest = serde_yml::from_str(&content).map_err(|e| {
+    let manifest: YamlManifest = serde_norway::from_str(&content).map_err(|e| {
         crate::error::SyscityError::Validation(format!(
             "Cannot parse included {}: {}",
             incl_path.display(),
@@ -320,7 +320,7 @@ pub struct LoadedTaskFile {
 /// one entry per task and an optional skill evaluation design.
 pub fn load_tasks(yaml_path: &Path) -> Result<LoadedTaskFile> {
     let content = std::fs::read_to_string(yaml_path).map_err(crate::error::SyscityError::Io)?;
-    let file: YamlTaskFile = serde_yml::from_str(&content).map_err(|e| {
+    let file: YamlTaskFile = serde_norway::from_str(&content).map_err(|e| {
         crate::error::SyscityError::Validation(format!(
             "Cannot parse {}: {}",
             yaml_path.display(),
@@ -344,7 +344,7 @@ pub fn load_tasks(yaml_path: &Path) -> Result<LoadedTaskFile> {
 /// (ci_smoke.yaml) it is ignored — the entire file is loaded.
 pub fn load_suite(manifest_path: &Path, suite_name: &str) -> Result<EvalSuite> {
     let content = std::fs::read_to_string(manifest_path).map_err(crate::error::SyscityError::Io)?;
-    let manifest: YamlManifest = serde_yml::from_str(&content).map_err(|e| {
+    let manifest: YamlManifest = serde_norway::from_str(&content).map_err(|e| {
         crate::error::SyscityError::Validation(format!(
             "Cannot parse {}: {}",
             manifest_path.display(),
@@ -633,11 +633,11 @@ fn convert_condition(yc: YamlCondition) -> Option<GoalCondition> {
 ///
 /// Handles both `must_contain: 1` (integer) and `must_contain: "text"`
 /// (string).
-fn yaml_value_to_string(v: &serde_yml::Value) -> String {
+fn yaml_value_to_string(v: &serde_norway::Value) -> String {
     match v {
-        serde_yml::Value::String(s) => s.clone(),
-        serde_yml::Value::Number(n) => n.to_string(),
-        serde_yml::Value::Bool(b) => b.to_string(),
+        serde_norway::Value::String(s) => s.clone(),
+        serde_norway::Value::Number(n) => n.to_string(),
+        serde_norway::Value::Bool(b) => b.to_string(),
         other => format!("{:?}", other),
     }
 }
@@ -717,7 +717,7 @@ mod tests {
               source: badcase
               failure_reason: crit
         "#;
-        let file: YamlTaskFile = serde_yml::from_str(yaml).unwrap();
+        let file: YamlTaskFile = serde_norway::from_str(yaml).unwrap();
         let tasks: Vec<EvalTask> = file
             .tasks
             .into_iter()
@@ -740,7 +740,7 @@ mod tests {
               difficulty: hard
               coverage: [tools, routing]
         "#;
-        let file: YamlTaskFile = serde_yml::from_str(yaml).unwrap();
+        let file: YamlTaskFile = serde_norway::from_str(yaml).unwrap();
         let tasks: Vec<EvalTask> = file
             .tasks
             .into_iter()
@@ -753,13 +753,13 @@ mod tests {
 
     #[test]
     fn test_convert_yaml_value_to_string() {
-        let yaml: serde_yml::Value = serde_yml::from_str("42").unwrap();
+        let yaml: serde_norway::Value = serde_norway::from_str("42").unwrap();
         assert_eq!(yaml_value_to_string(&yaml), "42");
 
-        let yaml: serde_yml::Value = serde_yml::from_str("\"hello\"").unwrap();
+        let yaml: serde_norway::Value = serde_norway::from_str("\"hello\"").unwrap();
         assert_eq!(yaml_value_to_string(&yaml), "hello");
 
-        let yaml: serde_yml::Value = serde_yml::from_str("true").unwrap();
+        let yaml: serde_norway::Value = serde_norway::from_str("true").unwrap();
         assert_eq!(yaml_value_to_string(&yaml), "true");
     }
 
@@ -768,7 +768,7 @@ mod tests {
         let yc = YamlCondition {
             cond_type: "pattern".into(),
             command: "grep -c 'web_search' /tmp/log".into(),
-            must_contain: Some(serde_yml::Value::Number(1.into())),
+            must_contain: Some(serde_norway::Value::Number(1.into())),
             expected: None,
             path: String::new(),
             operator: String::new(),

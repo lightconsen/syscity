@@ -110,7 +110,7 @@ pub struct SkillFrontmatter {
 
     /// Custom configuration values
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_yml::Value>,
+    pub extra: HashMap<String, serde_norway::Value>,
 }
 
 fn default_version() -> String {
@@ -317,12 +317,13 @@ impl SkillFile {
             let body = &after_first[end_pos + 4..]; // Skip \n---
 
             // Parse YAML frontmatter
-            let frontmatter: SkillFrontmatter = serde_yml::from_str(yaml_content).map_err(|e| {
-                crate::error::SyscityError::Config(crate::error::ConfigError::Parse(format!(
-                    "Failed to parse SKILL.md frontmatter: {}",
-                    e
-                )))
-            })?;
+            let frontmatter: SkillFrontmatter =
+                serde_norway::from_str(yaml_content).map_err(|e| {
+                    crate::error::SyscityError::Config(crate::error::ConfigError::Parse(format!(
+                        "Failed to parse SKILL.md frontmatter: {}",
+                        e
+                    )))
+                })?;
 
             Ok((frontmatter, body.trim_start()))
         } else {

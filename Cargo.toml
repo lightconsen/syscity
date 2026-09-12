@@ -111,7 +111,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 dirs = "6.0"
 
 # YAML support
-serde_yml = "0.0.13"
+serde_norway = "0.9"
 
 # Async trait support
 async-trait = "0.1"

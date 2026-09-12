@@ -13,7 +13,7 @@
 //! # Design
 //!
 //! - Collection happens **after** harness.run() — zero changes to EvalHarness.
-//! - YAML output uses `serde_yml::Value` tree to match the `YamlTask`
+//! - YAML output uses `serde_norway::Value` tree to match the `YamlTask`
 //!   intermediate schema, avoiding `GoalCondition` → `YamlCondition` round-trip
 //!   mismatch.
 //! - RCA integration is optional (`Option<Arc<RcaPipeline>>`).
@@ -552,10 +552,11 @@ pub fn write_badcase_yaml(
     let file_path = output_dir.join(format!("{}.yaml", sanitize_id(&record.task_id)));
 
     // Load existing tasks if file exists
-    let mut existing_tasks: Vec<serde_yml::Value> = if file_path.exists() {
+    let mut existing_tasks: Vec<serde_norway::Value> = if file_path.exists() {
         let content =
             std::fs::read_to_string(&file_path).map_err(crate::error::SyscityError::Io)?;
-        let doc: serde_yml::Value = serde_yml::from_str(&content).unwrap_or(serde_yml::Value::Null);
+        let doc: serde_norway::Value =
+            serde_norway::from_str(&content).unwrap_or(serde_norway::Value::Null);
         doc.get("tasks")
             .and_then(|v| v.as_sequence())
             .cloned()
@@ -569,13 +570,13 @@ pub fn write_badcase_yaml(
     existing_tasks.push(task_yaml);
 
     // Serialize to YAML
-    let root = serde_yml::Value::Mapping({
-        let mut m = serde_yml::Mapping::new();
-        m.insert("tasks".to_string(), serde_yml::Value::Sequence(existing_tasks));
+    let root = serde_norway::Value::Mapping({
+        let mut m = serde_norway::Mapping::new();
+        m.insert("tasks".to_string().into(), serde_norway::Value::Sequence(existing_tasks));
         m
     });
 
-    let yaml_str = serde_yml::to_string(&root)
+    let yaml_str = serde_norway::to_string(&root)
         .map_err(|e| crate::error::SyscityError::Validation(e.to_string()))?;
     std::fs::write(&file_path, yaml_str).map_err(crate::error::SyscityError::Io)?;
 
@@ -583,47 +584,50 @@ pub fn write_badcase_yaml(
     Ok(file_path)
 }
 
-/// Build a `serde_yml::Value` mapping matching the `YamlTask` schema.
-fn build_badcase_yaml_task(record: &BadcaseRecord, original: &EvalTask) -> serde_yml::Value {
-    use serde_yml::Value;
+/// Build a `serde_norway::Value` mapping matching the `YamlTask` schema.
+fn build_badcase_yaml_task(record: &BadcaseRecord, original: &EvalTask) -> serde_norway::Value {
+    use serde_norway::Value;
 
-    let mut task = serde_yml::Mapping::new();
+    let mut task = serde_norway::Mapping::new();
 
     // id: append suffix to avoid collision with original task id
     task.insert(
-        "id".to_string(),
+        "id".to_string().into(),
         format!("{}_bc", &record.task_id[..record.task_id.len().min(50)]).into(),
     );
 
     // input
-    task.insert("input".to_string(), record.input.clone().into());
+    task.insert("input".to_string().into(), record.input.clone().into());
 
     // description
     if !record.description.is_empty() {
-        task.insert("description".to_string(), record.description.clone().into());
+        task.insert("description".to_string().into(), record.description.clone().into());
     }
 
     // expected_behavior
     if !original.expected_behavior.is_empty() {
-        task.insert("expected_behavior".to_string(), original.expected_behavior.clone().into());
+        task.insert(
+            "expected_behavior".to_string().into(),
+            original.expected_behavior.clone().into(),
+        );
     }
 
     // source: always "badcase"
-    task.insert("source".to_string(), "badcase".into());
+    task.insert("source".to_string().into(), "badcase".into());
 
     // difficulty + coverage (§八) — round-trip the regression labels
-    task.insert("difficulty".to_string(), record.difficulty.clone().into());
+    task.insert("difficulty".to_string().into(), record.difficulty.clone().into());
     if !record.coverage.is_empty() {
-        task.insert("coverage".to_string(), record.coverage.clone().into());
+        task.insert("coverage".to_string().into(), record.coverage.clone().into());
     }
 
     // failure_reason
-    task.insert("failure_reason".to_string(), record.failure_reason.clone().into());
+    task.insert("failure_reason".to_string().into(), record.failure_reason.clone().into());
 
     // rca_result (if available)
     if let Some(ref rca) = record.rca_result {
-        if let Ok(val) = serde_yml::to_value(rca) {
-            task.insert("rca_result".to_string(), val);
+        if let Ok(val) = serde_norway::to_value(rca) {
+            task.insert("rca_result".to_string().into(), val);
         }
     }
 
@@ -634,69 +638,72 @@ fn build_badcase_yaml_task(record: &BadcaseRecord, original: &EvalTask) -> serde
             .iter()
             .map(goal_condition_to_yaml)
             .collect();
-        task.insert("conditions".to_string(), conds.into());
+        task.insert("conditions".to_string().into(), conds.into());
     }
 
     // criteria (if original has it)
     if let Some(ref criteria) = original.criteria {
-        let mut crit = serde_yml::Mapping::new();
+        let mut crit = serde_norway::Mapping::new();
         let dims: Vec<Value> = criteria
             .dimensions
             .iter()
             .map(|d| format!("{:?}", d).into())
             .collect();
-        crit.insert("dimensions".to_string(), dims.into());
+        crit.insert("dimensions".to_string().into(), dims.into());
 
         // thresholds: HashMap<String, f64> serializes cleanly
-        let thresh_map: serde_yml::Mapping = criteria
+        let thresh_map: serde_norway::Mapping = criteria
             .thresholds
             .iter()
-            .map(|(k, v)| (k.clone(), Value::Number(serde_yml::Number::from(*v))))
+            .map(|(k, v)| (Value::String(k.clone()), Value::Number(serde_norway::Number::from(*v))))
             .collect();
-        crit.insert("thresholds".to_string(), thresh_map.into());
+        crit.insert("thresholds".to_string().into(), thresh_map.into());
 
-        task.insert("criteria".to_string(), crit.into());
+        task.insert("criteria".to_string().into(), crit.into());
     }
 
     Value::Mapping(task)
 }
 
 /// Convert a `GoalCondition` to the `YamlCondition` intermediate format.
-fn goal_condition_to_yaml(cond: &GoalCondition) -> serde_yml::Value {
-    use serde_yml::Value;
+fn goal_condition_to_yaml(cond: &GoalCondition) -> serde_norway::Value {
+    use serde_norway::Value;
 
-    let mut m = serde_yml::Mapping::new();
+    let mut m = serde_norway::Mapping::new();
     match cond {
         GoalCondition::ExitCode { command, expected } => {
-            m.insert("type".to_string(), "exit_code".into());
-            m.insert("command".to_string(), command.clone().into());
+            m.insert("type".to_string().into(), "exit_code".into());
+            m.insert("command".to_string().into(), command.clone().into());
             if let Some(exp) = expected {
-                m.insert("expected".to_string(), Value::Number((*exp).into()));
+                m.insert("expected".to_string().into(), Value::Number((*exp).into()));
             }
         }
         GoalCondition::Pattern { command, must_contain } => {
-            m.insert("type".to_string(), "pattern".into());
-            m.insert("command".to_string(), command.clone().into());
-            m.insert("must_contain".to_string(), must_contain.clone().into());
+            m.insert("type".to_string().into(), "pattern".into());
+            m.insert("command".to_string().into(), command.clone().into());
+            m.insert("must_contain".to_string().into(), must_contain.clone().into());
         }
         GoalCondition::FileExists { path } => {
-            m.insert("type".to_string(), "file_exists".into());
-            m.insert("path".to_string(), path.clone().into());
+            m.insert("type".to_string().into(), "file_exists".into());
+            m.insert("path".to_string().into(), path.clone().into());
         }
         GoalCondition::Numeric { command, operator, threshold } => {
-            m.insert("type".to_string(), "numeric".into());
-            m.insert("command".to_string(), command.clone().into());
-            m.insert("operator".to_string(), format!("{:?}", operator).into());
-            m.insert("threshold".to_string(), Value::Number(serde_yml::Number::from(*threshold)));
+            m.insert("type".to_string().into(), "numeric".into());
+            m.insert("command".to_string().into(), command.clone().into());
+            m.insert("operator".to_string().into(), format!("{:?}", operator).into());
+            m.insert(
+                "threshold".to_string().into(),
+                Value::Number(serde_norway::Number::from(*threshold)),
+            );
         }
         GoalCondition::MustNotContain { command, must_not_contain } => {
-            m.insert("type".to_string(), "must_not_contain".into());
-            m.insert("command".to_string(), command.clone().into());
-            m.insert("must_not_contain".to_string(), must_not_contain.clone().into());
+            m.insert("type".to_string().into(), "must_not_contain".into());
+            m.insert("command".to_string().into(), command.clone().into());
+            m.insert("must_not_contain".to_string().into(), must_not_contain.clone().into());
         }
         GoalCondition::StaticAnalysis { command } => {
-            m.insert("type".to_string(), "static_analysis".into());
-            m.insert("command".to_string(), command.clone().into());
+            m.insert("type".to_string().into(), "static_analysis".into());
+            m.insert("command".to_string().into(), command.clone().into());
         }
     }
     Value::Mapping(m)
@@ -787,7 +794,7 @@ pub(crate) fn load_all_badcase_records(evals_dir: &Path) -> Vec<BadcaseRecord> {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let doc: serde_yml::Value = match serde_yml::from_str(&content) {
+            let doc: serde_norway::Value = match serde_norway::from_str(&content) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -796,7 +803,7 @@ pub(crate) fn load_all_badcase_records(evals_dir: &Path) -> Vec<BadcaseRecord> {
                 None => continue,
             };
             for task in tasks {
-                if let Ok(r) = serde_yml::from_value::<BadcaseRecord>(task.clone()) {
+                if let Ok(r) = serde_norway::from_value::<BadcaseRecord>(task.clone()) {
                     records.push(r);
                 }
             }
@@ -877,7 +884,7 @@ pub fn extract_rca_results_from_badcases(evals_dir: &Path) -> Result<Vec<RcaResu
                 }
             };
 
-            let doc: serde_yml::Value = match serde_yml::from_str(&content) {
+            let doc: serde_norway::Value = match serde_norway::from_str(&content) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Failed to parse badcase file {:?}: {}", path, e);
@@ -892,7 +899,7 @@ pub fn extract_rca_results_from_badcases(evals_dir: &Path) -> Result<Vec<RcaResu
 
             for task in tasks {
                 if let Some(rca_val) = task.get("rca_result") {
-                    match serde_yml::from_value::<RcaResult>(rca_val.clone()) {
+                    match serde_norway::from_value::<RcaResult>(rca_val.clone()) {
                         Ok(rca) => results.push(rca),
                         Err(e) => {
                             warn!("Failed to deserialize rca_result in {:?}: {}", path, e);
@@ -986,7 +993,7 @@ mod tests {
     fn test_goal_condition_to_yaml_roundtrip() {
         use crate::goal::condition::Comparison;
 
-        let v = |s: &str| serde_yml::Value::String(s.to_string());
+        let v = |s: &str| serde_norway::Value::String(s.to_string());
 
         let cond = GoalCondition::Pattern {
             command: "grep -c 'web_search' ${trial_dir}/trace.log".into(),
@@ -1264,9 +1271,9 @@ mod tests {
     #[test]
     fn test_weight_for_maps_difficulty() {
         let mut weights = HashMap::new();
-        weights.insert("hard".to_string(), 2.0);
-        weights.insert("medium".to_string(), 1.5);
-        weights.insert("easy".to_string(), 0.5);
+        weights.insert("hard".to_string().into(), 2.0);
+        weights.insert("medium".to_string().into(), 1.5);
+        weights.insert("easy".to_string().into(), 0.5);
         let g = BadcaseGovernance {
             difficulty_weights: weights,
             default_weight: 1.0,
@@ -1297,7 +1304,7 @@ mod tests {
     #[test]
     fn test_weighted_trials_scales() {
         let mut weights = HashMap::new();
-        weights.insert("hard".to_string(), 2.0);
+        weights.insert("hard".to_string().into(), 2.0);
         let g = BadcaseGovernance {
             difficulty_weights: weights,
             default_weight: 1.0,
@@ -1315,7 +1322,7 @@ mod tests {
     #[test]
     fn test_weighted_trials_floors_at_one() {
         let mut weights = HashMap::new();
-        weights.insert("easy".to_string(), 0.0);
+        weights.insert("easy".to_string().into(), 0.0);
         let g = BadcaseGovernance {
             difficulty_weights: weights,
             default_weight: 0.0,
@@ -1331,7 +1338,7 @@ mod tests {
         use crate::gateway::config::BadcaseGovernanceConfig;
 
         let mut weights = HashMap::new();
-        weights.insert("hard".to_string(), 3.0);
+        weights.insert("hard".to_string().into(), 3.0);
         let cfg = BadcaseGovernanceConfig {
             difficulty_weights: weights,
             default_weight: 1.5,
@@ -1369,7 +1376,7 @@ mod tests {
               secs_since_epoch: 1784000000
               nanos_since_epoch: 0
         "#;
-        let record: BadcaseRecord = serde_yml::from_str(yaml).unwrap();
+        let record: BadcaseRecord = serde_norway::from_str(yaml).unwrap();
         assert_eq!(record.difficulty, "medium");
         assert!(record.coverage.is_empty());
 
@@ -1380,7 +1387,7 @@ mod tests {
         labeled.coverage = vec!["tools".into(), "routing".into()];
         let value = build_badcase_yaml_task(&labeled, &crate::eval::EvalTask::default());
         let mapping = value.as_mapping().unwrap();
-        assert_eq!(mapping.get("difficulty"), Some(&serde_yml::Value::String("hard".into())));
+        assert_eq!(mapping.get("difficulty"), Some(&serde_norway::Value::String("hard".into())));
         let coverage = mapping.get("coverage").expect("coverage key");
         assert_eq!(
             coverage
@@ -1400,7 +1407,7 @@ mod tests {
             id: legacy
             input: hi
         "#;
-        let task: crate::eval::EvalTask = serde_yml::from_str(yaml).unwrap();
+        let task: crate::eval::EvalTask = serde_norway::from_str(yaml).unwrap();
         assert_eq!(task.difficulty, "medium");
         assert!(task.coverage.is_empty());
         assert!(task.trials.is_none());

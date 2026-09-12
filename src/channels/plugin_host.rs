@@ -866,7 +866,7 @@ impl PluginChannelRegistry {
         let manifest_path = self.plugin_dir.join(format!("{}.yaml", name));
         let (config, manifest) = if manifest_path.exists() {
             let manifest_yaml = tokio::fs::read_to_string(&manifest_path).await?;
-            let m: PluginManifest = serde_yml::from_str(&manifest_yaml)?;
+            let m: PluginManifest = serde_norway::from_str(&manifest_yaml)?;
             let manifest = Some(m);
             (config.unwrap_or_else(|| serde_json::json!({})), manifest)
         } else {

@@ -46,7 +46,7 @@ pub struct BehaviorConfig {
     pub group_chat_mode: Option<String>,
     /// Additional free-form behavior flags.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_yml::Value>,
+    pub extra: HashMap<String, serde_norway::Value>,
 }
 
 impl BehaviorConfig {
@@ -73,7 +73,7 @@ pub struct PreferenceConfig {
     pub format: Option<String>,
     /// Additional free-form preferences.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_yml::Value>,
+    pub extra: HashMap<String, serde_norway::Value>,
 }
 
 impl PreferenceConfig {
@@ -124,7 +124,7 @@ pub struct SoulConfig {
     pub preferences: PreferenceConfig,
     /// Extra top-level keys for forward compatibility.
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_yml::Value>,
+    pub extra: HashMap<String, serde_norway::Value>,
 }
 
 impl SoulConfig {
@@ -238,7 +238,7 @@ impl SoulConfig {
             if !self.preferences.extra.contains_key(key) {
                 self.preferences
                     .extra
-                    .insert(key.clone(), serde_yml::Value::String(value.clone()));
+                    .insert(key.clone(), serde_norway::Value::String(value.clone()));
                 changed = true;
             }
         }
@@ -247,12 +247,12 @@ impl SoulConfig {
     }
 }
 
-fn yaml_to_string(v: &serde_yml::Value) -> String {
+fn yaml_to_string(v: &serde_norway::Value) -> String {
     match v {
-        serde_yml::Value::String(s) => s.clone(),
-        serde_yml::Value::Number(n) => n.to_string(),
-        serde_yml::Value::Bool(b) => b.to_string(),
-        _ => serde_yml::to_string(v)
+        serde_norway::Value::String(s) => s.clone(),
+        serde_norway::Value::Number(n) => n.to_string(),
+        serde_norway::Value::Bool(b) => b.to_string(),
+        _ => serde_norway::to_string(v)
             .unwrap_or_default()
             .trim()
             .to_string(),
@@ -302,7 +302,7 @@ impl SoulFile {
             .trim_start()
             .to_string();
 
-        let config: SoulConfig = serde_yml::from_str(yaml_text).map_err(|e| {
+        let config: SoulConfig = serde_norway::from_str(yaml_text).map_err(|e| {
             crate::error::SyscityError::Validation(format!(
                 "Failed to parse SOUL.md frontmatter: {}",
                 e
@@ -326,7 +326,7 @@ impl SoulFile {
 
         let mut out = String::new();
         if include_frontmatter {
-            let yaml = serde_yml::to_string(&self.config).map_err(|e| {
+            let yaml = serde_norway::to_string(&self.config).map_err(|e| {
                 crate::error::SyscityError::Validation(format!(
                     "Failed to serialize SOUL.md frontmatter: {}",
                     e

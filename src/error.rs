@@ -162,8 +162,8 @@ impl From<toml::de::Error> for SyscityError {
     }
 }
 
-impl From<serde_yml::Error> for SyscityError {
-    fn from(err: serde_yml::Error) -> Self {
+impl From<serde_norway::Error> for SyscityError {
+    fn from(err: serde_norway::Error) -> Self {
         SyscityError::Internal(format!("YAML error: {}", err))
     }
 }

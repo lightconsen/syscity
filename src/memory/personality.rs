@@ -570,11 +570,11 @@ impl PersonalityMemory {
             return Ok(false);
         }
 
-        let yaml = serde_yml::to_string(&soul_file.config).map_err(|e| {
+        let yaml = serde_norway::to_string(&soul_file.config).map_err(|e| {
             SyscityError::Validation(format!("Failed to serialize SOUL.md config: {}", e))
         })?;
 
-        // serde_yml does not guarantee a trailing newline, so trim and add one
+        // serde_norway does not guarantee a trailing newline, so trim and add one
         // before the closing `---` delimiter — otherwise the terminator would be
         // glued onto the last YAML line and the frontmatter would not re-parse.
         let yaml = yaml.trim_end();

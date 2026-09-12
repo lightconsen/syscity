@@ -424,7 +424,7 @@ async fn cmd_validate(dir: Option<PathBuf>) -> Result<()> {
         if is_suite {
             // Validate suite manifest structure
             let content = std::fs::read_to_string(path).map_err(crate::error::SyscityError::Io)?;
-            match serde_yml::from_str::<serde_yml::Value>(&content) {
+            match serde_norway::from_str::<serde_norway::Value>(&content) {
                 Ok(_) => {
                     total_files += 1;
                     if let Some(name) = path.file_name() {

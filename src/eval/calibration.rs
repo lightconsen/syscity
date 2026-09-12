@@ -134,7 +134,7 @@ struct CalibrationCriteriaYaml {
 /// Load calibration cases from a YAML file.
 pub fn load_calibration_cases(path: &Path) -> Result<Vec<CalibrationCase>> {
     let content = std::fs::read_to_string(path)?;
-    let yaml: CalibrationYaml = serde_yml::from_str(&content).map_err(|e| {
+    let yaml: CalibrationYaml = serde_norway::from_str(&content).map_err(|e| {
         crate::error::SyscityError::Validation(format!(
             "Cannot parse calibration file {:?}: {}",
             path, e
