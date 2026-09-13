@@ -24,7 +24,9 @@
 //!     },
 //!     ..Default::default()
 //! };
-//! let adapter = RemoteControlAdapter::new(config).await?;
+//! // The adapter resolves its workspace staging dir against this root.
+//! let paths = Arc::new(syscity::dirs::SyscityPaths::from_env());
+//! let adapter = RemoteControlAdapter::new(config, paths).await?;
 //! let screenshot = adapter.screenshot(None).await?;
 //! # Ok(())
 //! # }

@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use syscity::mcp::{McpManager, McpServerConfig, McpTransport};
 use tokio::time::{timeout, Duration};
 
@@ -21,6 +23,7 @@ async fn ensure_python3() {
 #[tokio::test]
 async fn test_mcp_manager_connects_to_mock_server_and_lists_tools() {
     ensure_python3().await;
+    common::install_test_root();
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mock_server = manifest.join("tests/fixtures/mock_mcp_server.py");
@@ -52,6 +55,7 @@ async fn test_mcp_manager_connects_to_mock_server_and_lists_tools() {
 #[tokio::test]
 async fn test_mcp_manager_reconnects_after_disconnect() {
     ensure_python3().await;
+    common::install_test_root();
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mock_server = manifest.join("tests/fixtures/mock_mcp_server.py");

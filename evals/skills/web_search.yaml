@@ -31,12 +31,12 @@ skill_eval_design:
       must_contain: ["NBA"]
       min_length: 10
   resilience:
-    # Note: enum variants are written as plain values (not `!tag` shorthand);
-    # serde_yml 0.0.13 keeps YAML tags verbatim (`!empty_result`) instead of
-    # mapping them to externally-tagged enum variants like libyml did.
+    # Externally-tagged enums: unit variants (`empty_result`, `retry`) are
+    # written as plain scalars, while variants that carry data take the YAML
+    # tag shorthand (`!graceful "…"`, `!fallback "…"`). The libyaml-based
+    # deserializer rejects a bare mapping like `{graceful: "…"}`.
     - inject: empty_result
-      expect:
-        graceful: "抱歉"
+      expect: !graceful "抱歉"
     - inject: timeout
       expect: retry
 

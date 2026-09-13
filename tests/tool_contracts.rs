@@ -12,6 +12,8 @@ use syscity::providers::FunctionDefinition;
 use syscity::tools::*;
 
 /// Build a minimal tool context for contract verification.
+mod common;
+
 fn test_context() -> ToolContext {
     ToolContext::new("test_user", "test_conv")
         .with_working_dir("/tmp")
@@ -20,6 +22,8 @@ fn test_context() -> ToolContext {
 
 /// Build a registry with core tools for contract testing.
 fn build_test_registry() -> ToolRegistry {
+    // Embedder setup: some tools resolve paths at construction.
+    common::install_test_root();
     let mut registry = ToolRegistry::new();
 
     registry.register(Box::new(ShellTool::new()));

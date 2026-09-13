@@ -283,7 +283,11 @@ async fn apply_patch_applies_valid_patch() {
         .await;
     assert!(result.is_ok());
     let output = result.unwrap();
-    assert!(output.success, "Expected patch to apply successfully");
+    assert!(
+        output.success,
+        "Expected patch to apply successfully, got error: {:?}",
+        output.error
+    );
 
     let content = std::fs::read_to_string(&file_path).unwrap();
     assert!(content.contains("new line"), "Expected file to be patched");
