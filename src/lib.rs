@@ -130,6 +130,21 @@ pub fn environment() -> String {
 /// global initialization.
 pub fn init() -> Result<()> {
     utils::logging::setup_panic_handler();
+
+    // Pin the process-wide filesystem root here, at the library's documented
+    // entry point, so an embedder that calls `init()` cannot reach a `dirs::`
+    // free function before a root exists. `SYSCITY_HOME` / `~` is read exactly
+    // once — here — rather than lazily at whatever call site happens to run
+    // first.
+    //
+    // `Err` means a root was already installed (an embedder or test pinned its
+    // own first); that one wins, and the difference is harmless because both
+    // resolve to the same layout.
+    let root = std::sync::Arc::new(crate::dirs::SyscityPaths::from_env());
+    if crate::dirs::set_default_paths(root).is_err() {
+        tracing::debug!("path root already installed; keeping the existing one");
+    }
+
     Ok(())
 }
 

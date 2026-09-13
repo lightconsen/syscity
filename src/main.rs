@@ -3,23 +3,13 @@
 //! This is the main entry point for the Syscity application.
 //! It initializes the application and runs the CLI.
 
-use std::sync::Arc;
-
 use syscity::cli::Cli;
 
 #[tokio::main]
 async fn main() {
-    // Pin the process-wide path root explicitly, once, before anything reads it.
-    // Resolving `SYSCITY_HOME` / `~/.syscity` here is what lets the rest of the
-    // binary stop reaching for the environment: the CLI is a single-root
-    // process, so one install covers every `dirs::` free-function call.
-    if syscity::dirs::set_default_paths(Arc::new(syscity::dirs::SyscityPaths::from_env())).is_err()
-    {
-        // A root was already installed by an outer embedder — that one wins.
-        tracing::debug!("path root already installed; keeping the existing one");
-    }
-
-    // Initialize the application
+    // Initialize the application. This also pins the process-wide path root
+    // (`syscity::init`), so the CLI's single-root contract is established before
+    // any `dirs::` free function runs.
     if let Err(e) = syscity::init() {
         eprintln!("Failed to initialize: {}", e);
         std::process::exit(1);

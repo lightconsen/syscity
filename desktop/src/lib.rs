@@ -332,19 +332,12 @@ async fn run_update_check(app: tauri::AppHandle) -> Result<String, String> {
 /// Entry point used by `src/main.rs`.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize syscity global setup (panic handler, etc.)
+    // Initialize syscity global setup (panic handler, and the process-wide path
+    // root — see `syscity::init`). This must precede the log path below, which
+    // resolves through `dirs::`.
     if let Err(e) = syscity::init() {
         eprintln!("Failed to initialize syscity: {}", e);
         std::process::exit(1);
-    }
-
-    // Pin the process-wide path root before anything resolves a path: the
-    // desktop app is a single-root process, and `dirs::` free functions (used
-    // just below for the log file) panic if no root was installed.
-    if syscity::dirs::set_default_paths(Arc::new(syscity::dirs::SyscityPaths::from_env())).is_err()
-    {
-        // Already installed — harmless, both resolve to the same root.
-        eprintln!("path root already installed; keeping the existing one");
     }
 
     // Set up a simple tracing subscriber so Gateway logs are visible.
