@@ -35,8 +35,10 @@ use crate::tools::sdk::ToolCapabilities;
 pub struct TodoState {
     /// In-memory storage of todo lists per conversation
     stores: RwLock<HashMap<String, TodoStore>>,
-    /// Base directory for todo files
-    base_dir: PathBuf,
+    /// Base directory for todo files. `None` means the process-default todos
+    /// dir, resolved on first use: constructing a tool must not require an
+    /// installed path root.
+    base_dir: Option<PathBuf>,
 }
 
 impl Default for TodoState {
@@ -46,19 +48,27 @@ impl Default for TodoState {
 }
 
 impl TodoState {
-    /// Create state backed by the default todos directory
+    /// Create state backed by the default todos directory.
+    ///
+    /// The directory is resolved on first use, so building a tool never needs a
+    /// process path root to be installed.
     pub fn new() -> Self {
         Self {
             stores: RwLock::new(HashMap::new()),
-            base_dir: crate::dirs::todos_dir(),
+            base_dir: None,
         }
+    }
+
+    /// The directory to persist into, resolving the process default on demand.
+    fn base_dir(&self) -> PathBuf {
+        self.base_dir.clone().unwrap_or_else(crate::dirs::todos_dir)
     }
 
     /// Create with custom directory (for testing)
     pub fn with_dir(base_dir: PathBuf) -> Self {
         Self {
             stores: RwLock::new(HashMap::new()),
-            base_dir,
+            base_dir: Some(base_dir),
         }
     }
 
@@ -67,7 +77,7 @@ impl TodoState {
         // Sanitize conversation ID to be safe for filenames
         let safe_id =
             conversation_id.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
-        self.base_dir.join(format!("{}.json", safe_id))
+        self.base_dir().join(format!("{}.json", safe_id))
     }
 
     /// Load a todo store from disk
@@ -209,7 +219,7 @@ impl TodoState {
         let mut total_cleaned = 0;
 
         // Get list of all todo files
-        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+        let mut entries = match tokio::fs::read_dir(self.base_dir()).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to read todos directory: {}", e);
@@ -282,7 +292,7 @@ impl TodoState {
     pub async fn list_conversations(&self) -> Vec<String> {
         let mut conversations = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+        let mut entries = match tokio::fs::read_dir(self.base_dir()).await {
             Ok(entries) => entries,
             Err(_) => return conversations,
         };
