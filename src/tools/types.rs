@@ -77,8 +77,10 @@ pub struct ToolSandbox {
     pub fd_limit: Option<u64>,
     /// Maximum process count (for preventing fork bombs)
     pub process_limit: Option<u64>,
-    /// Root directory for file operations (workspace boundary).
-    pub workspace_root: std::path::PathBuf,
+    /// Root directory for file operations (workspace boundary). `None` means
+    /// the process-default workspace dir, resolved on first read — building a
+    /// sandbox must not require an installed path root.
+    pub(crate) workspace_root: Option<std::path::PathBuf>,
     /// The owning agent's own workspace, when known.
     ///
     /// Differs from `workspace_root` for delegated children, whose
@@ -108,7 +110,7 @@ impl Default for ToolSandbox {
             cpu_limit: None,
             fd_limit: None,
             process_limit: None,
-            workspace_root: crate::dirs::workspace_data_dir(),
+            workspace_root: None,
             agent_workspace: None,
             workspace_only: true,
             sandbox_policy: None,
@@ -212,8 +214,12 @@ impl ToolContext {
     pub fn allowed_commands(&self) -> &[String] {
         &self.sandbox.allowed_commands
     }
-    pub fn workspace_root(&self) -> &std::path::PathBuf {
-        &self.sandbox.workspace_root
+    /// The workspace boundary, resolving the process default on first read.
+    pub fn workspace_root(&self) -> std::path::PathBuf {
+        self.sandbox
+            .workspace_root
+            .clone()
+            .unwrap_or_else(crate::dirs::workspace_data_dir)
     }
     pub fn workspace_only(&self) -> bool {
         self.sandbox.workspace_only
@@ -252,7 +258,7 @@ impl ToolContext {
     /// Set the workspace root directory
     /// Set workspace root
     pub fn with_workspace_root(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.sandbox.workspace_root = path.into();
+        self.sandbox.workspace_root = Some(path.into());
         self
     }
 
@@ -540,12 +546,12 @@ impl ToolContext {
         if self.sandbox.workspace_only {
             let resolved = self.resolve_path(path);
             let resolved_canon = resolved.canonicalize().ok();
-            let root_canon = self.sandbox.workspace_root.canonicalize().ok();
+            let root_canon = self.workspace_root().canonicalize().ok();
 
             let within = if let (Some(ref rc), Some(ref wc)) = (resolved_canon, root_canon) {
                 rc.starts_with(wc)
             } else {
-                resolved.starts_with(&self.sandbox.workspace_root)
+                resolved.starts_with(self.workspace_root())
             };
 
             if !within {
@@ -582,7 +588,7 @@ impl ToolContext {
         if expanded.is_absolute() {
             expanded
         } else {
-            self.sandbox.workspace_root.join(expanded)
+            self.workspace_root().join(expanded)
         }
     }
 

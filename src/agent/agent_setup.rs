@@ -856,7 +856,7 @@ mod tests {
 
         // Relative paths resolve into the task's scratch dir inside the tree.
         let task_dir = crate::dirs::delegation_task_dir("root-1", "run-1");
-        assert_eq!(ctx.workspace_root(), &task_dir);
+        assert_eq!(ctx.workspace_root(), task_dir);
         assert_eq!(ctx.resolve_path(std::path::Path::new("draft.md")), task_dir.join("draft.md"));
 
         // The whole tree plus the agent's own workspace are reachable.
@@ -888,7 +888,7 @@ mod tests {
         let ctx = agent.build_tool_context("user", "conv-1", None);
 
         // No delegation → workspace stays the agent's own, no allowlist.
-        assert_eq!(ctx.workspace_root(), &crate::dirs::agent_workspace_dir("worker"));
+        assert_eq!(ctx.workspace_root(), crate::dirs::agent_workspace_dir("worker"));
         assert!(ctx.allowed_paths().is_empty());
     }
 

@@ -69,7 +69,9 @@ pub struct PersistedRoundResult {
 ///
 /// Each goal is stored as `~/.syscity/goals/{goal_id}.json`.
 pub struct GoalStore {
-    dir: PathBuf,
+    /// `None` means the process-default goals dir, resolved on first use:
+    /// constructing a store must not require an installed path root.
+    dir: Option<PathBuf>,
 }
 
 impl Default for GoalStore {
@@ -81,20 +83,25 @@ impl Default for GoalStore {
 impl GoalStore {
     /// Create a new goal store using the default goals directory.
     pub fn new() -> Self {
-        Self { dir: goals_dir() }
+        Self { dir: None }
+    }
+
+    /// The directory to persist into, resolving the process default on demand.
+    fn dir(&self) -> PathBuf {
+        self.dir.clone().unwrap_or_else(goals_dir)
     }
 
     /// Create a goal store with a custom directory (for testing).
     pub fn with_dir(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir: Some(dir) }
     }
 
     /// Ensure the goals directory exists.
     async fn ensure_dir(&self) -> crate::Result<()> {
-        if !self.dir.exists() {
-            tokio::fs::create_dir_all(&self.dir).await.map_err(|e| {
+        if !self.dir().exists() {
+            tokio::fs::create_dir_all(self.dir()).await.map_err(|e| {
                 crate::error::SyscityError::Storage {
-                    context: format!("Failed to create goals directory: {:?}", self.dir),
+                    context: format!("Failed to create goals directory: {:?}", self.dir()),
                     details: e.to_string(),
                 }
             })?;
@@ -104,7 +111,7 @@ impl GoalStore {
 
     /// Path to the state file for a given goal id.
     fn state_path(&self, goal_id: &str) -> PathBuf {
-        self.dir.join(format!("{}.json", goal_id))
+        self.dir().join(format!("{}.json", goal_id))
     }
 
     /// Save a goal's state to disk.
@@ -148,7 +155,7 @@ impl GoalStore {
     /// Load all persisted goal states.
     pub async fn load_all(&self) -> Vec<PersistedGoalState> {
         let mut states = Vec::new();
-        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+        let mut entries = match tokio::fs::read_dir(self.dir()).await {
             Ok(e) => e,
             Err(_) => return states,
         };

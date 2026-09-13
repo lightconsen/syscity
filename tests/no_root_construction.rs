@@ -96,18 +96,33 @@ fn public_constructors_do_not_require_an_installed_root() {
     // which is what the gateway does. The constructors above are different:
     // there the caller never opted into a process global, so the root is an
     // implementation detail they should not have to supply.
-    // `Default` impls are constructors too. Not checked here: `ToolSandbox`'s
-    // default sets `workspace_root` from `dirs::workspace_data_dir()`, so
-    // `ToolContext::default()` is a *known* offender — tracked, not blessed.
+    // ── `Default` impls are constructors too ────────────────────────────────
+    check(&mut offenders, "ToolContext::default", || {
+        let _ = ToolContext::default();
+    });
+    check(&mut offenders, "ToolSandbox::default", || {
+        let _ = syscity::tools::ToolSandbox::default();
+    });
+
+    // ── Other no-argument / cheap constructors ──────────────────────────────
+    check(&mut offenders, "GoalStore::new", || {
+        let _ = syscity::goal::persist::GoalStore::new();
+    });
+
+    // Deliberately *not* checked, because it is the opposite case:
     //
-    // The cheap-looking fix is deliberately **not** taken: defaulting the field
-    // to `current_dir()` (as the sibling `working_directory` field does) would
-    // silently move the default workspace fence from `<root>/workspace` to the
-    // process cwd. A default whose meaning changes in order to make a symptom
-    // go away is worse than the symptom, and nothing at the call site shows it.
-    // The real fix is to pass the root explicitly or resolve it lazily while
-    // keeping the same value — the field is a public `PathBuf` read in ~113
-    // places, so that is a real change, not a one-liner.
+    // The rule this test enforces is that a constructor handing back a
+    // particular instance ("a tool", "a goal store", "a context") must not
+    // require an installed root — the directory is an implementation detail the
+    // caller never opted into. A constructor that *means* "the process-default
+    // X" cannot do what its name says without a root, so the guard's panic is
+    // the correct answer there; those are `SecretStoreHandle::new` (which must
+    // read the master key from that root anyway) and
+    // `TurnMetricsWriter::default_dir` (named for the default). Embedders that
+    // own their root use the explicit form (`new_at_root`,
+    // `TurnMetricsWriter::new(path)`).
+
+    // ── Managers ────────────────────────────────────────────────────────────
     check(&mut offenders, "McpManager::new", || {
         let root = tempfile::tempdir().expect("temp secrets root");
         let Ok(secrets) = syscity::secrets::SecretStoreHandle::with_root(root.path().to_path_buf())

@@ -297,7 +297,7 @@ mod tests {
                 cpu_limit: None,
                 fd_limit: None,
                 process_limit: None,
-                workspace_root: PathBuf::from("/tmp"),
+                workspace_root: Some(PathBuf::from("/tmp")),
                 agent_workspace: None,
                 workspace_only: false,
                 sandbox_policy: None,
