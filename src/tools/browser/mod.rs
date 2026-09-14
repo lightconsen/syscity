@@ -228,7 +228,9 @@ impl Tool for BrowserTool {
          instead of confused — and a click outside the live viewport is refused rather than \
          dispatched somewhere unnamed. Clicks take a button and a click_count (double and triple \
          clicks are two and three press/release pairs, not one pair carrying a count), and Drag \
-         or DragAt moves the pointer between press and release rather than jumping. Requires \
+         or DragAt moves the pointer between press and release rather than jumping. Each action is \
+         either a bare name (for the ones that take no arguments, e.g. \"back\" or \"list_tabs\") \
+         or {\"name\": {...}}; snake_case and PascalCase names are both accepted. Requires \
          Chrome/Chromium to be installed."
     }
 
@@ -646,6 +648,111 @@ impl Tool for BrowserTool {
                                         "required": ["ref_id", "action"]
                                     }
                                 }
+                            },
+                            {
+                                "type": "string",
+                                "description": "A bare name, for the actions that take no arguments",
+                                "enum": [
+                                    "back",
+                                    "forward",
+                                    "reload",
+                                    "get_cookies",
+                                    "clear_cookies",
+                                    "clear_captures",
+                                    "list_tabs",
+                                    "screencast_stop",
+                                    "get_performance_metrics"
+                                ]
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "Press": {
+                                        "type": "object",
+                                        "properties": {
+                                            "key": { "type": "string", "description": "Key to press, e.g. Enter, Tab, Escape, ArrowDown" }
+                                        },
+                                        "required": ["key"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "Select": {
+                                        "type": "object",
+                                        "properties": {
+                                            "selector": { "type": "string", "description": "CSS selector of the input, textarea or element holding the text" },
+                                            "text": { "type": "string", "description": "Select this text. Omit to select by start/end indices instead." },
+                                            "start": { "type": "integer", "description": "Selection start index (input/textarea only)" },
+                                            "end": { "type": "integer", "description": "Selection end index (input/textarea only)" }
+                                        },
+                                        "required": ["selector"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "UploadFiles": {
+                                        "type": "object",
+                                        "properties": {
+                                            "selector": { "type": "string", "description": "CSS selector of the file input" },
+                                            "files": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths to attach" }
+                                        },
+                                        "required": ["selector", "files"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "HandleDialog": {
+                                        "type": "object",
+                                        "properties": {
+                                            "action": { "type": "string", "enum": ["accept", "dismiss"], "description": "Accept or dismiss the alert/confirm/prompt" },
+                                            "text": { "type": "string", "description": "Text to enter for a prompt" }
+                                        },
+                                        "required": ["action"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "SetDownloadBehavior": {
+                                        "type": "object",
+                                        "properties": {
+                                            "behavior": { "type": "string", "enum": ["allow", "deny", "default"], "description": "How downloads are handled" },
+                                            "download_path": { "type": "string", "description": "Directory to save downloads into (with behavior=allow)" }
+                                        },
+                                        "required": ["behavior"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "SwitchTab": {
+                                        "type": "object",
+                                        "properties": {
+                                            "index": { "type": "integer", "description": "Tab index from ListTabs" },
+                                            "title": { "type": "string", "description": "Substring of the tab title, instead of index" }
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "CloseTab": {
+                                        "type": "object",
+                                        "properties": {
+                                            "index": { "type": "integer", "description": "Tab index from ListTabs" },
+                                            "title": { "type": "string", "description": "Substring of the tab title, instead of index" }
+                                        }
+                                    }
+                                }
                             }
                         ]
                     }
@@ -753,6 +860,44 @@ mod tests {
         let tool = BrowserTool::new();
         let ctx = ToolContext::default();
         assert_eq!(tool.timeout(&ctx), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn every_action_is_discoverable_from_the_schema() {
+        // Eighteen variants were missing from this schema while being perfectly
+        // parseable, so a model could only reach them by guessing a name —
+        // including `press`, which is how a page is driven by keyboard at all.
+        // The list is explicit rather than derived: adding a variant means
+        // adding it here, which is the reminder this test exists to be.
+        let schema = BrowserTool::new().parameters_schema().to_string();
+        // The names as this schema writes them: actions that take arguments are
+        // object keys in PascalCase, the argument-less ones sit in a lowercase
+        // enum list. Either spelling parses.
+        for name in [
+            "back",
+            "forward",
+            "reload",
+            "get_cookies",
+            "clear_cookies",
+            "clear_captures",
+            "list_tabs",
+            "screencast_stop",
+            "get_performance_metrics",
+            "Press",
+            "Select",
+            "UploadFiles",
+            "HandleDialog",
+            "SetDownloadBehavior",
+            "SwitchTab",
+            "CloseTab",
+            "Drag",
+            "DragAt",
+        ] {
+            assert!(
+                schema.contains(&format!("\"{name}\"")),
+                "`{name}` cannot be discovered from the schema"
+            );
+        }
     }
 
     #[test]
