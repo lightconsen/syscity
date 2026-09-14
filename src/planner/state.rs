@@ -20,7 +20,7 @@ pub struct TaskStateStore {
 impl TaskStateStore {
     /// Create a new state store at the given database URL.
     ///
-    /// Example: `sqlite:///Users/lando/.syscity/planner.db`
+    /// Example: `sqlite://~/.syscity/planner.db`
     pub async fn new(database_url: &str) -> crate::Result<Self> {
         info!("Initializing planner state store");
 

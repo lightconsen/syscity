@@ -126,7 +126,7 @@ pub struct DelegationTaskStore {
 impl DelegationTaskStore {
     /// Create a new store at the given database URL.
     ///
-    /// Example: `sqlite:///Users/lando/.syscity/data/delegations.db`
+    /// Example: `sqlite://~/.syscity/data/delegations.db`
     pub async fn new(database_url: &str) -> crate::Result<Self> {
         info!("Initializing delegation task store");
 

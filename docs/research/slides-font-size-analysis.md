@@ -357,14 +357,14 @@ order.
 ## 4. Sources
 
 ### Local files analyzed
-- `/Users/lando/work/syscity/src/office/slides.rs` — the converter
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/shapes_xml.rs` — autofit XML generation (the problem)
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/shapes.rs` — Shape struct (no font-size field)
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/text/format.rs` — TextFormat (has font_size, unused by Shape)
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/text/run.rs` — Run (has .size(), unused by Shape)
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/text/paragraph.rs` — Paragraph (unused by Shape)
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/slide_content/content.rs` — SlideContent (shapes Vec, no format path)
-- `/Users/lando/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/slide_xml/content.rs` — shape rendering order (deterministic)
+- `~/work/syscity/src/office/slides.rs` — the converter
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/shapes_xml.rs` — autofit XML generation (the problem)
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/shapes.rs` — Shape struct (no font-size field)
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/text/format.rs` — TextFormat (has font_size, unused by Shape)
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/text/run.rs` — Run (has .size(), unused by Shape)
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/text/paragraph.rs` — Paragraph (unused by Shape)
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/slide_content/content.rs` — SlideContent (shapes Vec, no format path)
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ppt-rs-0.2.25/src/generator/slide_xml/content.rs` — shape rendering order (deterministic)
 
 ### External references
 - [crates.io: ppt-rs](https://crates.io/crates/ppt-rs) — 0.2.25 is latest (2026-08-19)

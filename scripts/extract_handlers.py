@@ -5,8 +5,11 @@ import re
 import os
 from pathlib import Path
 
-MOD_RS = Path("/Users/lando/work/syscity/src/gateway/mod.rs")
-HANDLERS_DIR = Path("/Users/lando/work/syscity/src/gateway/handlers")
+# Derived from the script's own location so it works from any checkout
+# (`~/...` would not help: `pathlib.Path` does not expand a leading `~`).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MOD_RS = REPO_ROOT / "src/gateway/mod.rs"
+HANDLERS_DIR = REPO_ROOT / "src/gateway/handlers"
 
 HANDLER_MAP = {
     "web_terminal_html_handler": "web_ui",

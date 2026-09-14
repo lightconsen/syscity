@@ -315,7 +315,7 @@ rewritten with absolute download URLs.
 
 ## Development Mode (Mode 1)
 
-When using external tools like Claude Code for development, you work in the original source tree (`/Users/lando/work/syscity/`) and deploy to `~/.syscity/bin/syscity`. The Shim's strategy B+C makes this seamless:
+When using external tools like Claude Code for development, you work in the original source tree (`~/work/syscity/`) and deploy to `~/.syscity/bin/syscity`. The Shim's strategy B+C makes this seamless:
 
 ```bash
 # In your dev directory
@@ -351,8 +351,8 @@ When using Mode 1 (external development), `~/.syscity/src/` can be managed in th
 
 | Strategy | How | Pros | Cons |
 |----------|-----|------|------|
-| **A: Independent copy** | `cp -r /Users/lando/work/syscity ~/.syscity/src` | Dev and runtime fully isolated | Manual sync needed |
-| **B: Symlink** | `ln -s /Users/lando/work/syscity ~/.syscity/src` | Single source of truth | `target/` pollutes dev tree |
+| **A: Independent copy** | `cp -r ~/work/syscity ~/.syscity/src` | Dev and runtime fully isolated | Manual sync needed |
+| **B: Symlink** | `ln -s ~/work/syscity ~/.syscity/src` | Single source of truth | `target/` pollutes dev tree |
 | **C: Git worktree** | `git worktree add ~/.syscity/src self-upgrade` | Shared git history, clean separation | Requires git setup |
 
 **Recommendation**: Use **Strategy A** for safety (Syscity self-upgrade only touches its own copy), or **Strategy C** if you want to track auto-commits in your main git history.
