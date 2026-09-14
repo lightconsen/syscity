@@ -5,6 +5,7 @@
 
 pub mod batch;
 pub mod logging;
+pub mod png;
 pub mod pool;
 pub mod profiling;
 pub mod time;

@@ -221,8 +221,11 @@ impl Tool for BrowserTool {
          exceptions (GetConsoleMessages), and can record screencasts as JPEG frame sequences \
          (ScreencastStart/ScreencastStop). Use this tool when the user asks to open a webpage, \
          browse the web, take a website screenshot, debug a page's network/console activity, or \
-         automate browser actions (打开网页/浏览/网页截图/网页调试). Requires Chrome/Chromium to be \
-         installed."
+         automate browser actions (打开网页/浏览/网页截图/网页调试). Coordinates are viewport CSS \
+         pixels: every screenshot reports its coordinate space, image size, viewport size, device \
+         pixel ratio and scroll offset, so image pixels and click coordinates can be reconciled \
+         instead of confused — and a click outside the live viewport is refused rather than \
+         dispatched somewhere unnamed. Requires Chrome/Chromium to be installed."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -299,7 +302,7 @@ impl Tool for BrowserTool {
                                     "Screenshot": {
                                         "type": "object",
                                         "properties": {
-                                            "full_page": { "type": "boolean", "description": "Capture full page (default: false)" },
+                                            "full_page": { "type": "boolean", "description": "Capture full page (default: false). A full-page image is document-sized, not viewport-sized — its points need converting before they can be clicked, and the result says so." },
                                             "selector": { "type": "string", "description": "Optional CSS selector for specific element" }
                                         }
                                     }
@@ -475,8 +478,8 @@ impl Tool for BrowserTool {
                                     "ClickAt": {
                                         "type": "object",
                                         "properties": {
-                                            "x": { "type": "number", "description": "Viewport x coordinate" },
-                                            "y": { "type": "number", "description": "Viewport y coordinate" }
+                                            "x": { "type": "number", "description": "Viewport x coordinate in CSS pixels. If it came from a screenshot, divide image pixels by the device_pixel_ratio the screenshot reported (and subtract its scroll offset for a full_page capture). A point outside the live viewport is refused." },
+                                            "y": { "type": "number", "description": "Viewport y coordinate in CSS pixels, same units as x." }
                                         },
                                         "required": ["x", "y"]
                                     }

@@ -7,6 +7,8 @@ use serde_json::json;
 
 use tracing::{info, warn};
 
+use crate::browser::coordinate_space;
+
 pub(super) async fn execute_navigation_actions(
     action: BrowserAction,
     page: &chromiumoxide::Page,
@@ -57,6 +59,24 @@ pub(super) async fn execute_navigation_actions(
             use chromiumoxide::cdp::browser_protocol::input::{
                 DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
             };
+
+            // The point is in the live viewport's units, so it is checked
+            // against the live viewport. This costs one read, which is the
+            // point: a coordinate lifted from a full-page screenshot would
+            // otherwise be dispatched at an off-screen position and reported as
+            // a successful click.
+            let metrics = match coordinate_space::read(page).await {
+                Some(metrics) => metrics,
+                None => {
+                    return Err(format!(
+                        "cannot click at ({x}, {y}): the page's viewport could not be read, so the \
+                         point's coordinate space cannot be checked. Take a fresh screenshot and \
+                         retry."
+                    ))
+                }
+            };
+            coordinate_space::check_click((x, y), &metrics)?;
+
             let mut press =
                 DispatchMouseEventParams::new(DispatchMouseEventType::MousePressed, x, y);
             press.button = Some(MouseButton::Left);
@@ -72,7 +92,12 @@ pub(super) async fn execute_navigation_actions(
                 return Err(format!("Failed to click at ({}, {}): {}", x, y, e));
             }
             crate::browser::instrument::auto_wait(page).await;
-            Ok(json!({ "success": true, "x": x, "y": y }))
+            Ok(json!({
+                "success": true,
+                "x": x,
+                "y": y,
+                "viewport": { "width": metrics.width, "height": metrics.height },
+            }))
         }
 
         BrowserAction::Back => {
