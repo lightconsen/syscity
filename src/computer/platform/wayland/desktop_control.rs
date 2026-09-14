@@ -66,7 +66,9 @@ impl Tool for DesktopControlTool {
     fn description(&self) -> &str {
         "Control the Linux Wayland desktop using ydotool or wtype. Supports mouse click, type \
          text, and key presses. Note: Wayland restricts window introspection; window management is \
-         limited compared to X11."
+         limited compared to X11. Input goes to the live session: it moves the real pointer and \
+         types into whatever holds focus, so on a desktop someone is using, say what you intend \
+         and ask before acting."
     }
 
     fn parameters_schema(&self) -> Value {

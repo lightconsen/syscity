@@ -230,8 +230,18 @@ impl Tool for BrowserTool {
          clicks are two and three press/release pairs, not one pair carrying a count), and Drag \
          or DragAt moves the pointer between press and release rather than jumping. Each action is \
          either a bare name (for the ones that take no arguments, e.g. \"back\" or \"list_tabs\") \
-         or {\"name\": {...}}; snake_case and PascalCase names are both accepted. Requires \
-         Chrome/Chromium to be installed."
+         or {\"name\": {...}}; snake_case and PascalCase names are both accepted. Most needs that \
+         look like they lie outside the page have an answer inside it, and that answer is the one \
+         to use: attach files with UploadFiles rather than clicking a file input (a styled upload \
+         button forwards its click to a hidden input, and the picker it opens is outside the \
+         page); answer an alert, confirm or prompt with HandleDialog, because an unanswered one \
+         blocks the page; choose where downloads land with SetDownloadBehavior; use ListTabs, \
+         SwitchTab and CloseTab for other tabs; print with PrintToPdf. What this tool genuinely \
+         cannot reach is the browser's own chrome (the address bar and its menus), native OS \
+         dialogs other than those above, and HTTP authentication prompts. If one of those is truly \
+         in the way, say so and ask the user rather than working around it: reaching them means \
+         foreground input on a desktop someone else may be using, so it is not a move to make on \
+         your own. Requires Chrome/Chromium to be installed."
     }
 
     fn parameters_schema(&self) -> Value {

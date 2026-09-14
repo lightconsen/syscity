@@ -46,6 +46,8 @@ impl Tool for ComputerTool {
 
 Use the `action` parameter to choose the operation. Each action uses its own set of parameters — see the action enum descriptions for details.
 
+Mouse and keyboard actions go to the live session: they move the real pointer and type into whatever holds focus. On a desktop someone is using, say what you intend and ask before acting.
+
 Common workflows:
 - "screenshot" — capture the screen (optionally a region)
 - "click" — click at coordinates or on a UI element

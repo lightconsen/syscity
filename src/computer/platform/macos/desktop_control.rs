@@ -177,7 +177,8 @@ impl Tool for DesktopControlTool {
         "Control macOS desktop applications using a hybrid model: query the accessibility UI tree \
          first, then screenshot if needed, and execute actions via AppleScript. Use for opening \
          apps, clicking buttons, filling forms, pressing shortcuts, or inspecting the current GUI \
-         state."
+         state. Input goes to the live session: it moves the real pointer and types into whatever \
+         holds focus, so on a desktop someone is using, say what you intend and ask before acting."
     }
 
     fn parameters_schema(&self) -> Value {

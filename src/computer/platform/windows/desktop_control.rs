@@ -61,7 +61,9 @@ impl Tool for DesktopControlTool {
 
     fn description(&self) -> &str {
         "Control the Windows desktop using PowerShell. Supports click, type, key presses, window \
-         inspection, and window activation."
+         inspection, and window activation. Input goes to the live session: it moves the real \
+         pointer and types into whatever holds focus, so on a desktop someone is using, say what \
+         you intend and ask before acting."
     }
 
     fn parameters_schema(&self) -> Value {
