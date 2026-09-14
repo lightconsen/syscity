@@ -1,10 +1,23 @@
 //! Browser integration tests
 //!
-//! These tests require the `browser` feature and may require Chrome/Chromium
-//! to be installed for some tests.
+//! These drive a real Chrome through the browser tool: a page is loaded from a
+//! `data:` URL, and the assertion is about what the page did rather than about
+//! what the tool returned.
 //!
-//! Note: chromiumoxide 0.7 may not be compatible with Chrome 128+ due to
-//! CDP protocol changes. Tests detect this and skip gracefully.
+//! Three things worth knowing before adding one:
+//!
+//! - **A `#` in a `data:` URL starts the fragment.** Everything after it — markup
+//!   and inline handlers alike — never reaches the document, and the failure
+//!   looks like a handler that never fired. Style by colour name, or encode it.
+//! - **An assertion about input has to be about an effect the browser produced,
+//!   not about a handler running.** `onkeydown` fires for a script-dispatched
+//!   `KeyboardEvent` too, which is how a `Press` that delivered nothing real
+//!   passed this suite for as long as it did. `test_browser_press_enter_submits`
+//!   and `..._tab_moves_focus` assert the default action instead, and
+//!   `..._drag_reaches_pointer_listeners` asserts the held-button mask.
+//! - **Without Chrome every test here returns early and reports success.** A
+//!   green run is not evidence that any of them ran; they need a lane with a
+//!   browser installed to mean anything.
 
 #![cfg(feature = "browser")]
 
@@ -365,4 +378,255 @@ async fn test_browser_press() {
     let ok_val = results[3].get("Ok").expect("expected Ok");
     let text = ok_val.get("text").and_then(|v| v.as_str()).unwrap_or("");
     assert!(text.contains("pressed:a"), "expected 'pressed:a' in result, got: {}", text);
+}
+
+/// Pressing Enter has to submit the form.
+///
+/// This is the assertion the rest of this file cannot make. A test that reads
+/// what an `onkeydown` handler wrote into the DOM passes just as happily when
+/// the key was a synthesized `KeyboardEvent` — those fire the handlers too. Only
+/// a key the browser itself acted on submits a form, moves focus, or closes an
+/// overlay, which is why `Press` sends CDP key events rather than dispatching
+/// events from a script.
+#[tokio::test]
+#[serial]
+async fn test_browser_press_enter_submits_the_form() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": "data:text/html,<html><body><form onsubmit=\"event.preventDefault();document.body.innerText='submitted'\"><input id='input' type='text'></form></body></html>" } },
+            { "click": { "selector": "#input" } },
+            { "press": { "key": "Enter" } },
+            { "get_text": {} }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "browser press failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    assert_eq!(results.len(), 4);
+    let text = results[3]
+        .get("Ok")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        text.contains("submitted"),
+        "Enter did not submit the form — the page text was {text:?}"
+    );
+}
+
+/// Pressing Tab has to move the focus.
+///
+/// Same reason as the test above, and the same blind spot in the others: focus
+/// moves because the browser handled the key, not because a handler ran.
+#[tokio::test]
+#[serial]
+async fn test_browser_press_tab_moves_focus() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": "data:text/html,<html><body><input id='first' type='text'><input id='second' type='text'></body></html>" } },
+            { "click": { "selector": "#first" } },
+            { "press": { "key": "Tab" } },
+            { "execute_script": { "script": "return (document.activeElement || {}).id || '(none)'" } }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "browser press failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    assert_eq!(results.len(), 4);
+    let focused = results[3]
+        .get("Ok")
+        .and_then(|v| v.get("result"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(focused, "second", "Tab did not move the focus — activeElement is {focused:?}");
+}
+
+/// A coordinate click lands where it was aimed.
+#[tokio::test]
+#[serial]
+async fn test_browser_click_at_coordinates() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": "data:text/html,<html><body><button id='b' style='position:absolute;left:100px;top:50px;width:200px;height:40px' onclick=\"document.body.innerText='clicked'\">Go</button></body></html>" } },
+            { "click_at": { "x": 200, "y": 70 } },
+            { "get_text": {} }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "click_at failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    let text = results[2]
+        .get("Ok")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(text.contains("clicked"), "coordinate click missed: {text:?}");
+}
+
+/// A double click is a real one.
+///
+/// Two press/release pairs carrying click counts 1 and 2 is what a browser needs
+/// in order to raise `dblclick`; one pair carrying `clickCount: 2` is not.
+#[tokio::test]
+#[serial]
+async fn test_browser_click_at_double_click() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": "data:text/html,<html><body><button id='b' style='position:absolute;left:100px;top:50px;width:200px;height:40px' ondblclick=\"document.body.innerText='double'\">Go</button></body></html>" } },
+            { "click_at": { "x": 200, "y": 70, "click_count": 2 } },
+            { "get_text": {} }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "double click failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    let text = results[2]
+        .get("Ok")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(text.contains("double"), "no dblclick was raised: {text:?}");
+}
+
+/// The right button raises the page's own context menu event.
+#[tokio::test]
+#[serial]
+async fn test_browser_click_at_right_button() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": "data:text/html,<html><body><div style='position:absolute;left:100px;top:50px;width:200px;height:40px' oncontextmenu=\"document.body.innerText='menu';return false\">right</div></body></html>" } },
+            { "click_at": { "x": 200, "y": 70, "button": "right" } },
+            { "get_text": {} }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "right click failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    let text = results[2]
+        .get("Ok")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(text.contains("menu"), "no contextmenu event: {text:?}");
+}
+
+/// A drag is pointer events with the button held.
+///
+/// Both halves of that sentence were wrong before: the old implementation
+/// dispatched JavaScript `MouseEvent`s, so a page listening for `pointermove`
+/// heard nothing at all — and it sent no movement between press and release, so
+/// there was nothing to hear anyway. This asserts the listener fires *and* that
+/// it sees `buttons === 1`, the field that separates a drag from a hover.
+#[tokio::test]
+#[serial]
+async fn test_browser_drag_reaches_pointer_listeners() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    // The listener is on the body and records the highest `buttons` it ever
+    // sees, so the answer does not depend on the pointer staying inside the
+    // element it started on — a drag is expected to leave it.
+    //
+    // No `#` anywhere in this page: in a data URL it starts the fragment, so
+    // everything after it — handlers included — never reaches the document. The
+    // div is styled by colour name for that reason.
+    let page = "data:text/html,<html><body id='body' \
+                onpointermove=\"window.__b=Math.max(window.__b||0,event.buttons);document.getElementById('log').textContent='buttons '+window.__b\">\
+                <div id='log'>none</div>\
+                <div id='src' style='position:absolute;left:100px;top:50px;width:120px;height:60px;background:gray'>drag</div>\
+                </body></html>";
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": page } },
+            { "drag_at": { "from_x": 150, "from_y": 75, "to_x": 400, "to_y": 300 } },
+            { "get_text": { "selector": "#log" } }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "drag failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    let text = results[2]
+        .get("Ok")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        text.contains("buttons 1"),
+        "no pointermove carried the held button: {text:?} | all results: {results:?}"
+    );
 }

@@ -36,21 +36,24 @@ impl KeySpec {
 /// The named keys, with the values the browser expects.
 ///
 /// Only the ones a caller has reason to name: navigation, editing, and the two
-/// keys that carry default behaviour everywhere.
-const NAMED: &[(&[&str], &str, &str, i64)] = &[
-    (&["enter", "return"], "Enter", "Enter", 13),
-    (&["tab"], "Tab", "Tab", 9),
-    (&["escape", "esc"], "Escape", "Escape", 27),
-    (&["backspace"], "Backspace", "Backspace", 8),
-    (&["delete", "del"], "Delete", "Delete", 46),
-    (&["arrowup", "up"], "ArrowUp", "ArrowUp", 38),
-    (&["arrowdown", "down"], "ArrowDown", "ArrowDown", 40),
-    (&["arrowleft", "left"], "ArrowLeft", "ArrowLeft", 37),
-    (&["arrowright", "right"], "ArrowRight", "ArrowRight", 39),
-    (&["home"], "Home", "Home", 36),
-    (&["end"], "End", "End", 35),
-    (&["pageup", "pgup"], "PageUp", "PageUp", 33),
-    (&["pagedown", "pgdn"], "PageDown", "PageDown", 34),
+/// keys that carry default behaviour everywhere. The last column is the
+/// character the key produces, where it produces one — Enter does, and that is
+/// not decoration: a real Enter arrives with its carriage return, and Chrome
+/// submits the form on the back of it.
+const NAMED: &[(&[&str], &str, &str, i64, Option<&str>)] = &[
+    (&["enter", "return"], "Enter", "Enter", 13, Some("\r")),
+    (&["tab"], "Tab", "Tab", 9, None),
+    (&["escape", "esc"], "Escape", "Escape", 27, None),
+    (&["backspace"], "Backspace", "Backspace", 8, None),
+    (&["delete", "del"], "Delete", "Delete", 46, None),
+    (&["arrowup", "up"], "ArrowUp", "ArrowUp", 38, None),
+    (&["arrowdown", "down"], "ArrowDown", "ArrowDown", 40, None),
+    (&["arrowleft", "left"], "ArrowLeft", "ArrowLeft", 37, None),
+    (&["arrowright", "right"], "ArrowRight", "ArrowRight", 39, None),
+    (&["home"], "Home", "Home", 36, None),
+    (&["end"], "End", "End", 35, None),
+    (&["pageup", "pgup"], "PageUp", "PageUp", 33, None),
+    (&["pagedown", "pgdn"], "PageDown", "PageDown", 34, None),
 ];
 
 /// Keys that are only meaningful held down while another key is pressed.
@@ -97,15 +100,15 @@ pub fn key_spec(name: &str) -> Result<KeySpec, String> {
         return Ok(space());
     }
 
-    if let Some((_, key, code, vk)) = NAMED
+    if let Some((_, key, code, vk, text)) = NAMED
         .iter()
-        .find(|(names, _, _, _)| names.contains(&lowered.as_str()))
+        .find(|(names, _, _, _, _)| names.contains(&lowered.as_str()))
     {
         return Ok(KeySpec {
             key: (*key).to_string(),
             code: (*code).to_string(),
             vk: *vk,
-            text: None,
+            text: text.map(str::to_string),
         });
     }
 
@@ -151,11 +154,16 @@ mod tests {
         // the form and to move focus.
         let enter = key_spec("Enter").unwrap();
         assert_eq!((enter.key.as_str(), enter.code.as_str(), enter.vk), ("Enter", "Enter", 13));
-        assert!(!enter.is_printable(), "Enter is handled, not typed");
+
+        // And the carriage return is not decoration either. Without it Chrome
+        // delivers the key but does not submit the form — which is what the
+        // integration test caught when this was sent as a bare rawKeyDown.
+        assert_eq!(enter.text.as_deref(), Some("\r"), "Enter must carry its CR");
 
         let tab = key_spec("tab").unwrap();
         assert_eq!(tab.vk, 9);
         assert_eq!(tab.code, "Tab");
+        assert_eq!(tab.text, None, "Tab is handled, never typed");
     }
 
     #[test]
