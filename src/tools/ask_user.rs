@@ -206,6 +206,17 @@ impl Default for AskQueue {
 
 /// Return a reason string when `ctx` has no interactive human to answer a
 /// question, or `None` for a foreground human session.
+/// Whether a question asked from this context could actually reach a human.
+///
+/// Two facts decide it: a queue that can deliver the question, and a context
+/// that is not one of the headless ones. The `ask_user` tool asks this of
+/// itself; the tool registry asks it too, before turning a tool's
+/// `requires_approval` into a prompt — a prompt nobody can answer would be
+/// submitted and then waited on for five minutes.
+pub fn can_ask_a_human(ctx: &ToolContext) -> bool {
+    background_context_reason(ctx).is_none() && ctx.ask_queue.is_some()
+}
+
 pub fn background_context_reason(ctx: &ToolContext) -> Option<&'static str> {
     if ctx.delegation.is_some() {
         return Some("delegated sub-agent context has no interactive human");
@@ -289,7 +300,7 @@ delegated sub-agents or background jobs (goals, cron, heartbeat)."#
     }
 
     fn is_available(&self, context: &ToolContext) -> bool {
-        background_context_reason(context).is_none() && context.ask_queue.is_some()
+        can_ask_a_human(context)
     }
 
     async fn execute(
