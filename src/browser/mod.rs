@@ -17,6 +17,8 @@ pub mod aria_snapshot;
 #[cfg(feature = "browser")]
 pub mod coordinate_space;
 #[cfg(feature = "browser")]
+pub mod escalation;
+#[cfg(feature = "browser")]
 pub mod instrument;
 #[cfg(feature = "browser")]
 pub mod network_log;

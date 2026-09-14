@@ -160,6 +160,7 @@ impl BrowserTool {
             | BrowserAction::GetConsoleMessages { .. }
             | BrowserAction::ExecuteScript { .. }
             | BrowserAction::Press { .. }
+            | BrowserAction::Escalate { .. }
             | BrowserAction::Act { .. } => {
                 execute_content_actions(action, page, browser, screenshot_data).await
             }
@@ -238,10 +239,11 @@ impl Tool for BrowserTool {
          blocks the page; choose where downloads land with SetDownloadBehavior; use ListTabs, \
          SwitchTab and CloseTab for other tabs; print with PrintToPdf. What this tool genuinely \
          cannot reach is the browser's own chrome (the address bar and its menus), native OS \
-         dialogs other than those above, and HTTP authentication prompts. If one of those is truly \
-         in the way, say so and ask the user rather than working around it: reaching them means \
-         foreground input on a desktop someone else may be using, so it is not a move to make on \
-         your own. Requires Chrome/Chromium to be installed."
+         dialogs other than those above, and HTTP authentication prompts. When one of those is \
+         truly in the way, use Escalate rather than working around it: it reports what cannot be \
+         reached, names the window that would have to be operated, and states the consent to ask \
+         for — reaching them means foreground input on a desktop someone else may be using, so it \
+         is not a move to make on your own. Requires Chrome/Chromium to be installed."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -763,6 +765,19 @@ impl Tool for BrowserTool {
                                         }
                                     }
                                 }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "Escalate": {
+                                        "type": "object",
+                                        "properties": {
+                                            "reason": { "type": "string", "enum": ["native_dialog", "browser_chrome", "http_auth", "other"], "description": "What the page cannot reach" },
+                                            "detail": { "type": "string", "description": "Optional specifics worth putting to the user" }
+                                        },
+                                        "required": ["reason"]
+                                    }
+                                }
                             }
                         ]
                     }
@@ -902,6 +917,7 @@ mod tests {
             "CloseTab",
             "Drag",
             "DragAt",
+            "Escalate",
         ] {
             assert!(
                 schema.contains(&format!("\"{name}\"")),

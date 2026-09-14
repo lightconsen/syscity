@@ -3,6 +3,8 @@
 use super::{BrowserAction, BrowserScreenshot};
 use serde_json::{json, Value};
 
+use crate::browser::escalation;
+
 pub(super) async fn execute_content_actions(
     action: BrowserAction,
     page: &chromiumoxide::Page,
@@ -177,6 +179,71 @@ pub(super) async fn execute_content_actions(
                 Err(e) => Err(format!("Failed to act on ref {}: {}", ref_id, e)),
             }
         }
+
+        BrowserAction::Escalate { reason, detail } => {
+            escalate(page, &reason, detail.as_deref()).await
+        }
+
         _ => Err("browser: action not handled by this group".to_string()),
     }
+}
+
+/// Report that the page cannot be finished from inside the page.
+///
+/// Deliberately does nothing else. The caller gets what it needs to escalate —
+/// which window would have to be operated, what this tool cannot reach, the
+/// in-page route worth trying first, and the fact that consent comes first
+/// because the desktop is shared.
+async fn escalate(
+    page: &chromiumoxide::Page,
+    reason: &str,
+    detail: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let reason = escalation::Reason::parse(reason)?;
+
+    // The identity comes from the driver rather than from the caller's
+    // recollection: it is the one fact here that has to be right, because it is
+    // what the desktop side would match a window against.
+    let title = page.get_title().await.ok().flatten().unwrap_or_default();
+    let url = page.url().await.ok().flatten().unwrap_or_default();
+
+    let subject = if title.is_empty() {
+        "this browser window".to_string()
+    } else {
+        format!("the window titled \"{title}\"")
+    };
+
+    let mut escalation = serde_json::Map::new();
+    escalation.insert("code".to_string(), json!("needs_os_injection"));
+    escalation.insert("reason".to_string(), json!(reason.name()));
+    escalation.insert("cannot_reach".to_string(), json!(reason.cannot_reach()));
+    escalation.insert("browser_window".to_string(), json!({ "title": title, "url": url }));
+    if let Some(detail) = detail {
+        escalation.insert("detail".to_string(), json!(detail));
+    }
+    if let Some(instead) = reason.instead_try() {
+        escalation.insert("instead_try_first".to_string(), json!(instead));
+    }
+    escalation.insert(
+        "consent_required".to_string(),
+        json!(format!(
+            "Reaching {subject} means input at the operating-system level: the pointer moves and \
+             keystrokes go to whatever holds focus on the desktop, which someone may be using. Put \
+             that to the user and wait for an answer before going further."
+        )),
+    );
+    escalation.insert(
+        "if_the_user_agrees".to_string(),
+        json!([
+            "Use the `computer` tool with `activate_window` and a distinctive substring of that \
+             title — window titles are matched as a pattern, so a plain substring is the safest \
+             choice.",
+            "Then screenshot, click, key or type against that window. The pointer and the focus \
+             move: this is not a background action.",
+            "Come back to this tool afterwards. The page can verify what happened (Snapshot, \
+             GetText), which a desktop action on its own cannot."
+        ]),
+    );
+
+    Ok(json!({ "success": true, "escalation": escalation }))
 }

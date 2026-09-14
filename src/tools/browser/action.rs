@@ -224,6 +224,14 @@ pub enum BrowserAction {
         index: Option<usize>,
         title: Option<String>,
     },
+    /// Say that the page cannot be finished from inside the page, and hand the
+    /// caller what it needs to escalate to the desktop
+    Escalate {
+        /// native_dialog | browser_chrome | http_auth | other
+        reason: String,
+        /// Optional specifics worth putting to the user
+        detail: Option<String>,
+    },
 }
 
 /// `ClickAt` -> `click_at`, which is the name serde accepts for the variant.
