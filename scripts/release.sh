@@ -18,7 +18,9 @@
 #      if that section is empty, draft one from the changes since the previous
 #      tag (full commit messages + diffstat + code diff, lockfiles excluded)
 #      via the LLM configured in scripts/.env (SYSCITY_* vars, gitignored;
-#      OpenAI- or Anthropic-compatible), falling back to mechanical
+#      OpenAI- or Anthropic-compatible; SYSCITY_PROXY opts that call into a
+#      proxy — ambient proxy variables are ignored so the proxy needed for
+#      `git push` cannot silently break the draft), falling back to mechanical
 #      ✨→Added / 🐛→Fixed / rest→Changed grouping of commit subjects when it's
 #      absent or fails.
 #      Opens $EDITOR unless --no-edit or non-interactive.
@@ -221,6 +223,17 @@ import re
 import sys
 import urllib.request
 
+# The ambient proxy environment is for git, not necessarily for this call: the
+# same https_proxy that pushes the tag can refuse or truncate the API host — it
+# did, and the truncated read became an empty draft that was then quietly
+# replaced by the mechanical fallback. So ambient proxy variables are ignored
+# here, and a proxy is used only when scripts/.env opts in with SYSCITY_PROXY.
+_proxy = os.environ.get("SYSCITY_PROXY", "").strip()
+OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"http": _proxy, "https": _proxy})
+    if _proxy else urllib.request.ProxyHandler({})
+)
+
 next_ver, date, current, added, fixed, changed, changes_path = sys.argv[1:8]
 path = "CHANGELOG.md"
 text = open(path, encoding="utf-8").read()
@@ -275,24 +288,39 @@ Rewrite them as Keep-a-Changelog release notes:
         url = base + "/chat/completions"
         headers = {"Authorization": "Bearer " + key,
                    "content-type": "application/json"}
-    payload = {"model": model, "max_tokens": 8000, "temperature": 0.2,
+    payload = {"model": model, "temperature": 0.2,
                "messages": [{"role": "user", "content": prompt}]}
-    # Generous budget + timeout: reasoning models spend their completion
-    # tokens on invisible CoT before writing any content.
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            data = json.load(resp)
-    except Exception as exc:
-        print(f"⚠️  LLM draft failed ({exc}) — falling back to mechanical grouping",
-              file=sys.stderr)
-        return None
-    if is_anthropic:
-        out = "".join(block.get("text", "") for block in data.get("content", []))
-    else:
-        out = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    out = out.strip()
+
+    # A reasoning model can spend the whole completion budget on invisible CoT
+    # and write nothing at all: the reply comes back truncated with an empty
+    # message. That is not a failure to report but a budget to raise — 8000 was
+    # not enough for a 34k-token prompt, and since the fallback below is quiet,
+    # a whole release shipped with notes that were just commit subjects.
+    out = ""
+    for budget in (32000, 96000):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({**payload, "max_tokens": budget}).encode("utf-8"),
+            headers=headers, method="POST")
+        try:
+            with OPENER.open(req, timeout=300) as resp:
+                data = json.load(resp)
+        except Exception as exc:
+            print(f"⚠️  LLM draft failed ({exc}) — falling back to mechanical grouping",
+                  file=sys.stderr)
+            return None
+        choice = (data.get("choices") or [{}])[0]
+        if is_anthropic:
+            out = "".join(block.get("text", "") for block in data.get("content", []))
+            truncated = data.get("stop_reason") == "max_tokens"
+        else:
+            out = choice.get("message", {}).get("content", "")
+            truncated = choice.get("finish_reason") == "length"
+        out = out.strip()
+        if out or not truncated:
+            break
+        print(f"⚠️  LLM spent all {budget} tokens on reasoning without writing "
+              f"anything — retrying with a larger budget", file=sys.stderr)
     if out.startswith("```"):  # strip a wrapping markdown fence, if any
         out = re.sub(r"^```[^\n]*\n", "", out)
         out = re.sub(r"\n?```\s*$", "", out).strip()
