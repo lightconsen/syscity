@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@assistant-ui/react": "0.14.5",
+    "@assistant-ui/react": "0.14.29",
     "@assistant-ui/react-markdown": "0.14.0",
     "@tanstack/react-virtual": "^3.14.2",
     "@tauri-apps/api": "^2",
