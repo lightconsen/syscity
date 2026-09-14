@@ -170,7 +170,7 @@ subtle = "2.5"
 # WeChat Official Account (wechatmp) encrypted-message protocol
 aes = { version = "0.8", optional = true }
 cbc = { version = "0.1", optional = true }
-roxmltree = { version = "0.21", optional = true }
+roxmltree = "0.21"
 
 # Secure secret handling
 zeroize = { version = "1.7", features = ["derive"] }
@@ -271,7 +271,7 @@ feishu = []
 signal = []
 imessage = []
 webchat = []
-wechatmp = ["dep:aes", "dep:cbc", "dep:sha1", "dep:roxmltree"]
+wechatmp = ["dep:aes", "dep:cbc", "dep:sha1"]
 all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp"]
 web = []
 # Syscity Cloud integration (login + cloud LLM/search/KB/connectors). Default

@@ -1,7 +1,14 @@
 //! Android device control via ADB.
 //!
 //! Provides screenshot, tap, swipe, text input, key events, app installation,
-//! launch, force-stop, and UI tree dump.
+//! launch, force-stop, and a structured UI element list.
+//!
+//! Observation returns an indexed element list parsed from the platform's
+//! `uiautomator dump`, not the raw XML: the dump is an order of magnitude
+//! larger, and the model would otherwise have to parse `bounds` to act on it.
+//! Text input escapes for the *device* shell (a plain `input text '<text>'`
+//! breaks on an embedded quote) and routes non-ASCII through ADBKeyboard, which
+//! `input text` cannot type.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -197,6 +204,74 @@ impl AdbInputTool {
         }
         args
     }
+
+    /// Whether the device's active input method is ADBKeyboard.
+    ///
+    /// ADBKeyboard accepts text over a broadcast, which is the only way to type
+    /// non-ASCII without a UI: `input text` goes through the device's key
+    /// character map and drops or mangles anything outside ASCII (CJK in
+    /// particular). Costs one extra `adb` round trip, so it is only consulted
+    /// for text that actually needs it.
+    async fn adbkeyboard_is_active(&self) -> bool {
+        let args = self.adb_args(&["shell", "settings", "get", "secure", "default_input_method"]);
+        match run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await {
+            Ok((status, stdout, _)) if status.success() => {
+                stdout.to_lowercase().contains("adbkeyboard")
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Quote a string as a single shell word for the *device* shell.
+///
+/// A single-quoted word may not contain a quote, so an embedded `'` has to close
+/// the word, emit an escaped quote and reopen it (`'\''`) — the only escape a
+/// single-quoted shell word supports. Without this a quote in the text ends the
+/// command early and everything after it is parsed as further commands.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Apply `input text`'s own escapes: `%s` means space and `%%` a literal `%`.
+///
+/// A literal `%` must be doubled *before* spaces become `%s`, otherwise the `%`
+/// introduced here would itself be doubled.
+fn input_encode(s: &str) -> String {
+    s.replace('%', "%%").replace(' ', "%s")
+}
+
+/// Build the device-shell command(s) that type `text`.
+///
+/// `input text` cannot produce a newline, so every line break becomes an
+/// `input keyevent 66` (Enter) *between* the lines, which also makes blank lines
+/// come out as paragraph breaks. A single-line text is one command.
+fn encode_input_text(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+
+    let mut commands: Vec<String> = Vec::with_capacity(lines.len() * 2);
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            commands.push("input keyevent 66".to_string());
+        }
+        if !line.is_empty() {
+            commands.push(format!("input text {}", sh_quote(&input_encode(line))));
+        }
+    }
+    commands.join("; ")
 }
 
 #[async_trait]
@@ -251,12 +326,35 @@ impl Tool for AdbInputTool {
                 format!("input swipe {} {} {} {}", x1, y1, x2, y2)
             }
             "text" => {
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .replace(' ', "%s");
-                format!("input text '{}'", text)
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if text.is_empty() {
+                    return Ok(ToolExecutionResult::error(
+                        "action 'text' requires a non-empty 'text' argument",
+                    ));
+                }
+                if text.is_ascii() {
+                    encode_input_text(text)
+                } else if self.adbkeyboard_is_active().await {
+                    // ADBKeyboard takes the text base64-encoded over a broadcast,
+                    // which carries any character the device can render.
+                    let payload = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        text.as_bytes(),
+                    );
+                    format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
+                } else {
+                    // `input text` types through the device's key character map,
+                    // so non-ASCII (CJK in particular) comes out dropped or
+                    // mangled. Fail loudly rather than silently typing the wrong
+                    // thing — the previous behaviour replaced only spaces and
+                    // then sent the text as-is.
+                    return Ok(ToolExecutionResult::error(
+                        "Cannot type non-ASCII text: `input text` only types ASCII reliably and \
+                         ADBKeyboard is not the active input method. Install/enable ADBKeyboard \
+                         (com.android.adbkeyboard) and select it as the input method, or keep the \
+                         text ASCII.",
+                    ));
+                }
             }
             "key" => {
                 let keycode = args
@@ -435,6 +533,121 @@ impl AdbUiTreeTool {
     }
 }
 
+/// One node of the Android accessibility tree, flattened for the model.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct UiElement {
+    /// 1-based index the model refers to this element by.
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_desc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    /// Fully-qualified class, shortened to the last segment.
+    pub class: String,
+    pub clickable: bool,
+    pub enabled: bool,
+    /// `(x1, y1, x2, y2)` in device pixels.
+    pub bounds: (i32, i32, i32, i32),
+    /// Centre of `bounds` — what a tap should target.
+    pub center: (i32, i32),
+}
+
+/// Parse a `bounds="[x1,y1][x2,y2]"` attribute.
+fn parse_bounds(raw: &str) -> Option<(i32, i32, i32, i32)> {
+    let rest = raw.strip_prefix('[')?;
+    let (first, rest) = rest.split_once("][")?;
+    let second = rest.strip_suffix(']')?;
+    let mut a = first.split(',');
+    let (x1, y1) = (a.next()?.trim().parse().ok()?, a.next()?.trim().parse().ok()?);
+    let mut b = second.split(',');
+    let (x2, y2) = (b.next()?.trim().parse().ok()?, b.next()?.trim().parse().ok()?);
+    Some((x1, y1, x2, y2))
+}
+
+/// Flatten a `uiautomator dump` document into an indexed element list.
+///
+/// Only nodes the model can act on or read are kept — those with text, a
+/// content description or a resource id, plus clickable ones. Bare layout
+/// containers carry nothing actionable and cost context, and the raw XML is
+/// ~10x the size of this list.
+///
+/// `index` is assigned here, and is what `android_input` should be pointed at
+/// via `center` rather than making the model read `bounds` itself.
+pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("invalid UI tree XML: {e}"))?;
+
+    let mut out = Vec::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("node")) {
+        let attr = |key: &str| {
+            node.attribute(key)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let text = attr("text");
+        let content_desc = attr("content-desc");
+        let resource_id = attr("resource-id");
+        let clickable = attr("clickable").as_deref() == Some("true");
+        let scrollable = attr("scrollable").as_deref() == Some("true");
+
+        let actionable = clickable || scrollable;
+        if text.is_none() && content_desc.is_none() && resource_id.is_none() && !actionable {
+            continue;
+        }
+        let Some(bounds) = attr("bounds").as_deref().and_then(parse_bounds) else {
+            continue;
+        };
+
+        let class = attr("class")
+            .map(|c| c.rsplit('.').next().unwrap_or(&c).to_string())
+            .unwrap_or_default();
+
+        out.push(UiElement {
+            index: out.len() + 1,
+            text,
+            content_desc,
+            resource_id,
+            class,
+            clickable,
+            enabled: attr("enabled").as_deref() != Some("false"),
+            center: ((bounds.0 + bounds.2) / 2, (bounds.1 + bounds.3) / 2),
+            bounds,
+        });
+    }
+    Ok(out)
+}
+
+/// One line per element, for the model to read directly.
+fn format_ui_summary(elements: &[UiElement]) -> String {
+    if elements.is_empty() {
+        return "UI tree has no actionable elements".to_string();
+    }
+    let mut lines = vec![format!("{} actionable element(s):", elements.len())];
+    for e in elements {
+        let label = e
+            .text
+            .as_deref()
+            .or(e.content_desc.as_deref())
+            .map(|s| format!("{s:?}"))
+            .or_else(|| e.resource_id.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let mut flags = String::new();
+        if e.clickable {
+            flags.push_str(" clickable");
+        }
+        if !e.enabled {
+            flags.push_str(" disabled");
+        }
+        lines.push(format!(
+            "[{}] {} {}{} center=({},{})",
+            e.index, e.class, label, flags, e.center.0, e.center.1
+        ));
+    }
+    lines.join("\n")
+}
+
 #[async_trait]
 impl Tool for AdbUiTreeTool {
     fn name(&self) -> &str {
@@ -442,7 +655,10 @@ impl Tool for AdbUiTreeTool {
     }
 
     fn description(&self) -> &str {
-        "Dump the Android device UI hierarchy as XML via uiautomator."
+        "Read the Android device's UI: a numbered list of the elements you can act on, each with \
+         its text or content description, whether it is clickable, and the screen coordinates of \
+         its centre. Tap an element with android_input by passing that centre as x/y. Bare layout \
+         containers are omitted."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -487,7 +703,18 @@ impl Tool for AdbUiTreeTool {
             return Ok(ToolExecutionResult::error(format!("adb pull failed: {}", stderr)));
         }
 
-        Ok(ToolExecutionResult::success(format!("UI tree dumped\n{}", stdout)))
+        // The raw dump is an order of magnitude larger than what the model can
+        // use, and the model would have to parse `bounds` itself to act on it.
+        // Hand back an indexed list instead; the XML stays out of the context.
+        let elements = match parse_uiautomator_xml(&stdout) {
+            Ok(e) => e,
+            Err(e) => return Ok(ToolExecutionResult::error(e)),
+        };
+        let summary = format_ui_summary(&elements);
+        Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
+            "count": elements.len(),
+            "elements": elements,
+        })))
     }
 }
 
@@ -632,6 +859,187 @@ impl Tool for AdbStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Text input encoding ─────────────────────────────────────────────
+    //
+    // `adb shell <cmd>` hands the string to the *device* shell, so the text has
+    // to survive two layers: the shell's word parsing, then `input`'s own `%s`
+    // convention. Getting either wrong used to send a malformed command.
+
+    #[test]
+    fn plain_text_is_a_single_quoted_word() {
+        assert_eq!(encode_input_text("hello"), "input text 'hello'");
+    }
+
+    #[test]
+    fn spaces_use_inputs_percent_s_convention() {
+        assert_eq!(encode_input_text("hello world"), "input text 'hello%sworld'");
+    }
+
+    #[test]
+    fn a_literal_percent_is_doubled() {
+        assert_eq!(encode_input_text("100%"), "input text '100%%'");
+        // Doubling happens before spaces are converted, so the `%` that
+        // introduces `%s` is not itself doubled.
+        assert_eq!(encode_input_text("50% off"), "input text '50%%%soff'");
+    }
+
+    #[test]
+    fn an_embedded_quote_cannot_end_the_command() {
+        // The old encoding produced `input text 'it's'`, which the device shell
+        // reads as the command `input text 'it'` followed by `s'` — the text
+        // after the quote was interpreted as shell, not typed.
+        assert_eq!(encode_input_text("it's"), r#"input text 'it'\''s'"#);
+    }
+
+    #[test]
+    fn shell_metacharacters_are_inert() {
+        let cmd = encode_input_text("a; rm -rf / && echo $(whoami) `id` | tee > /tmp/x");
+        // Exactly one command, wrapped as one quoted word: the metacharacters are
+        // data, not syntax.
+        assert_eq!(cmd.matches("input text").count(), 1);
+        assert!(cmd.starts_with("input text '"), "got {cmd}");
+        assert!(cmd.ends_with('\''), "got {cmd}");
+        assert!(cmd.contains("$(whoami)"), "got {cmd}");
+    }
+
+    #[test]
+    fn newlines_become_enter_keyevents() {
+        assert_eq!(
+            encode_input_text("line1\nline2"),
+            "input text 'line1'; input keyevent 66; input text 'line2'"
+        );
+    }
+
+    #[test]
+    fn blank_lines_survive_as_paragraph_breaks() {
+        assert_eq!(
+            encode_input_text("a\n\nb"),
+            "input text 'a'; input keyevent 66; input keyevent 66; input text 'b'"
+        );
+    }
+
+    #[test]
+    fn carriage_returns_from_crlf_are_stripped() {
+        assert_eq!(
+            encode_input_text("a\r\nb"),
+            "input text 'a'; input keyevent 66; input text 'b'"
+        );
+    }
+
+    #[test]
+    fn non_ascii_is_not_silently_mangled_here() {
+        // The helper passes non-ASCII through unchanged; deciding what to *do*
+        // with it (ADBKeyboard vs an explicit error) happens in `execute`, which
+        // needs a device. This pins that the helper itself does not corrupt it.
+        let cmd = encode_input_text("登录");
+        assert_eq!(cmd, "input text '登录'");
+    }
+
+    // ── UI tree parsing ─────────────────────────────────────────────────
+
+    /// A dump in the shape `uiautomator dump` actually produces: nested
+    /// containers, a text field, a labelled button, a node whose label lives in
+    /// `content-desc`, an escaped entity, and bare layout containers that carry
+    /// nothing actionable.
+    const DUMP: &str = r#"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" text="" resource-id="" bounds="[0,0][1080,2340]">
+    <node index="1" class="android.widget.TextView" text="登录 &amp; 注册" resource-id="com.app:id/title" bounds="[100,200][980,300]" enabled="true" clickable="false" />
+    <node index="2" class="android.widget.Button" text="登录" resource-id="com.app:id/login" bounds="[120,840][360,920]" enabled="true" clickable="true" />
+    <node index="3" class="android.widget.ImageButton" text="" content-desc="返回" resource-id="" bounds="[0,100][100,200]" enabled="true" clickable="true" />
+    <node index="4" class="android.widget.EditText" text="" resource-id="com.app:id/phone" bounds="[120,500][960,580]" enabled="false" clickable="true" />
+    <node index="5" class="android.view.View" text="" resource-id="" bounds="[0,300][1080,400]" enabled="true" clickable="false" scrollable="false" />
+  </node>
+</hierarchy>"#;
+
+    #[test]
+    fn parses_bounds_attribute() {
+        assert_eq!(parse_bounds("[0,0][1080,2340]"), Some((0, 0, 1080, 2340)));
+        assert_eq!(parse_bounds("[120,840][360,920]"), Some((120, 840, 360, 920)));
+        assert_eq!(parse_bounds("garbage"), None);
+        assert_eq!(parse_bounds("[1,2]"), None);
+    }
+
+    #[test]
+    fn keeps_only_actionable_or_labelled_nodes() {
+        let els = parse_uiautomator_xml(DUMP).expect("parses");
+        // The bare FrameLayout and the unlabelled non-clickable View are dropped.
+        let classes: Vec<&str> = els.iter().map(|e| e.class.as_str()).collect();
+        assert!(!classes.contains(&"FrameLayout"), "container kept: {classes:?}");
+        assert_eq!(els.len(), 4, "{classes:?}");
+    }
+
+    #[test]
+    fn indices_are_one_based_and_contiguous() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        for (i, e) in els.iter().enumerate() {
+            assert_eq!(e.index, i + 1);
+        }
+    }
+
+    #[test]
+    fn class_names_are_shortened() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        assert_eq!(els[0].class, "TextView");
+        assert_eq!(els[1].class, "Button");
+    }
+
+    #[test]
+    fn xml_entities_are_decoded() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        assert_eq!(els[0].text.as_deref(), Some("登录 & 注册"));
+    }
+
+    #[test]
+    fn empty_attributes_become_none() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        // The image button has text="" but a content-desc.
+        let back = els.iter().find(|e| e.class == "ImageButton").unwrap();
+        assert_eq!(back.text, None);
+        assert_eq!(back.content_desc.as_deref(), Some("返回"));
+    }
+
+    #[test]
+    fn center_is_derived_from_bounds() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        let login = els
+            .iter()
+            .find(|e| e.text.as_deref() == Some("登录"))
+            .unwrap();
+        assert_eq!(login.bounds, (120, 840, 360, 920));
+        assert_eq!(login.center, (240, 880));
+    }
+
+    #[test]
+    fn disabled_flag_is_carried() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        let phone = els.iter().find(|e| e.class == "EditText").unwrap();
+        assert!(!phone.enabled);
+        assert!(els[1].enabled);
+    }
+
+    #[test]
+    fn summary_lists_elements_with_their_index_and_center() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        let summary = format_ui_summary(&els);
+        assert!(summary.starts_with("4 actionable element(s):"), "{summary}");
+        assert!(summary.contains(r#"[2] Button "登录" clickable center=(240,880)"#), "{summary}");
+        assert!(summary.contains("disabled"), "{summary}");
+    }
+
+    #[test]
+    fn malformed_xml_is_an_error_not_a_panic() {
+        assert!(parse_uiautomator_xml("<hierarchy><node").is_err());
+        assert!(parse_uiautomator_xml("").is_err());
+    }
+
+    #[test]
+    fn empty_hierarchy_summarises_clearly() {
+        let els = parse_uiautomator_xml("<hierarchy rotation=\"0\"/>").unwrap();
+        assert!(els.is_empty());
+        assert_eq!(format_ui_summary(&els), "UI tree has no actionable elements");
+    }
 
     #[test]
     fn test_adb_screenshot_tool_name() {
