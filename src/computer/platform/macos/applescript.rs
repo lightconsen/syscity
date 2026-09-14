@@ -145,6 +145,11 @@ impl Tool for AppleScriptTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // One pointer and one focus: two conversations must not drive this
+        // display at once. See `tools::target_lock`.
+        let _target = crate::tools::target_lock::TargetLocks::global()
+            .lock(crate::tools::target_lock::DESKTOP)
+            .await;
         let script = args["script"].as_str().ok_or_else(|| {
             crate::error::SyscityError::Validation("Missing 'script' argument".to_string())
         })?;

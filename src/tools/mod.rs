@@ -9,6 +9,7 @@ pub mod ask_user;
 pub mod eval;
 pub mod metadata;
 pub mod rbac;
+pub mod target_lock;
 
 // Re-export approval types for convenience
 pub use approval::{

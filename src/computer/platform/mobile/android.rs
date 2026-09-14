@@ -533,6 +533,11 @@ impl Tool for AdbInputTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // One device: two conversations must not type into it at once. See
+        // `tools::target_lock`.
+        let _target = crate::tools::target_lock::TargetLocks::global()
+            .lock(crate::tools::target_lock::ANDROID)
+            .await;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("tap");
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
@@ -691,6 +696,11 @@ impl Tool for AdbAppManagerTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // One device: two conversations must not type into it at once. See
+        // `tools::target_lock`.
+        let _target = crate::tools::target_lock::TargetLocks::global()
+            .lock(crate::tools::target_lock::ANDROID)
+            .await;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,

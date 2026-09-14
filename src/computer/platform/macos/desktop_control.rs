@@ -231,6 +231,11 @@ impl Tool for DesktopControlTool {
         args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // One pointer and one focus: two conversations must not drive this
+        // display at once. See `tools::target_lock`.
+        let _target = crate::tools::target_lock::TargetLocks::global()
+            .lock(crate::tools::target_lock::DESKTOP)
+            .await;
         let action_str = args["action"].as_str().ok_or_else(|| {
             crate::error::SyscityError::Validation("Missing 'action' argument".to_string())
         })?;
