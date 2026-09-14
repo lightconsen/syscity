@@ -30,7 +30,7 @@ mod execution;
 #[cfg(feature = "browser")]
 mod screencast;
 
-use action::normalize_browser_actions;
+use action::parse_action;
 pub use action::{BrowserAction, FormField};
 
 /// How a captured browser screenshot is handed from the screenshot action to
@@ -625,20 +625,22 @@ impl Tool for BrowserTool {
 
     async fn execute(
         &self,
-        mut args: Value,
+        args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        // Normalize action names to handle LLM-generated PascalCase variant names
-        if let Some(actions_val) = args.get_mut("actions") {
-            normalize_browser_actions(actions_val);
-        }
-
-        let actions: Vec<BrowserAction> = serde_json::from_value(
-            args.get("actions").cloned().unwrap_or(json!([])),
-        )
-        .map_err(|e| {
-            crate::error::SyscityError::Validation(format!("Invalid browser actions: {}", e))
+        let actions_value = args.get("actions").cloned().unwrap_or(json!([]));
+        let actions_list = actions_value.as_array().ok_or_else(|| {
+            crate::error::SyscityError::Validation(
+                "Invalid browser actions: expected an array".to_string(),
+            )
         })?;
+        let actions: Vec<BrowserAction> = actions_list
+            .iter()
+            .map(parse_action)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                crate::error::SyscityError::Validation(format!("Invalid browser actions: {}", e))
+            })?;
 
         if actions.is_empty() {
             return Ok(ToolExecutionResult::error("No browser actions specified"));

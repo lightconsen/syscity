@@ -200,52 +200,124 @@ pub enum BrowserAction {
     },
 }
 
-/// Normalize action names in browser action JSON values.
-/// Converts PascalCase action names to snake_case for serde compatibility.
-/// This handles cases where the LLM sends the Rust enum variant name
-/// (e.g. "Navigate" or "GetHtml") instead of the serde-renamed snake_case
-/// form (e.g. "navigate" or "get_html").
-pub(super) fn normalize_browser_actions(value: &mut Value) {
-    let normalize_action = |name: &str| -> String {
-        let mut result = String::with_capacity(name.len() + 4);
-        for (i, c) in name.chars().enumerate() {
-            if c.is_uppercase() {
-                if i > 0 {
-                    result.push('_');
-                }
-                for lower in c.to_lowercase() {
-                    result.push(lower);
-                }
-            } else {
-                result.push(c);
+/// `ClickAt` -> `click_at`, which is the name serde accepts for the variant.
+fn snake_case_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
             }
+            for lower in c.to_lowercase() {
+                out.push(lower);
+            }
+        } else {
+            out.push(c);
         }
-        result
+    }
+    out
+}
+
+/// Parse one action, accepting the shapes callers actually send.
+///
+/// serde takes the canonical externally-tagged snake_case form,
+/// `{"click_at": {"x": 1}}`. Two other shapes are tolerated because they reach
+/// us anyway: the PascalCase variant names the JSON schema advertises
+/// (`{"ClickAt": {"x": 1}}`) and an `action` key naming the variant
+/// (`{"action": "ClickAt", "x": 1}`). The previous helper rewrote that `action`
+/// value and left serde to fail on the object, so neither tolerated shape
+/// actually worked — a model following the schema got "unknown variant
+/// `ClickAt`" back.
+pub(super) fn parse_action(value: &Value) -> Result<BrowserAction, serde_json::Error> {
+    // A unit variant arrives as a bare string.
+    if let Some(name) = value.as_str() {
+        return serde_json::from_value(Value::String(snake_case_name(name)));
+    }
+
+    let Some(object) = value.as_object() else {
+        return serde_json::from_value(value.clone());
     };
 
-    match value {
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                if let Value::Object(obj) = item {
-                    let orig = obj.get("action").and_then(|v| v.as_str()).map(String::from);
-                    if let Some(name) = orig {
-                        let normalized = normalize_action(&name);
-                        if normalized != name {
-                            obj.insert("action".to_string(), Value::String(normalized));
-                        }
-                    }
-                }
+    // `{"action": "ClickAt", ...rest}` -> `{"click_at": {...rest}}`.
+    if let Some(name) = object.get("action").and_then(Value::as_str) {
+        let mut rest = object.clone();
+        rest.remove("action");
+        let mut tagged = serde_json::Map::new();
+        tagged.insert(snake_case_name(name), Value::Object(rest));
+        return serde_json::from_value(Value::Object(tagged));
+    }
+
+    // `{"ClickAt": {...}}` -> `{"click_at": {...}}`.
+    if object.len() == 1 {
+        if let Some((name, body)) = object.iter().next() {
+            let canonical = snake_case_name(name);
+            if canonical != *name {
+                let mut tagged = serde_json::Map::new();
+                tagged.insert(canonical, body.clone());
+                return serde_json::from_value(Value::Object(tagged));
             }
         }
-        Value::Object(obj) => {
-            let orig = obj.get("action").and_then(|v| v.as_str()).map(String::from);
-            if let Some(name) = orig {
-                let normalized = normalize_action(&name);
-                if normalized != name {
-                    obj.insert("action".to_string(), Value::String(normalized));
-                }
-            }
-        }
-        _ => {}
+    }
+
+    serde_json::from_value(value.clone())
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_canonical_snake_case_shape_parses() {
+        let parsed = parse_action(&json!({ "click_at": { "x": 1.0, "y": 2.0 } })).unwrap();
+        assert!(matches!(parsed, BrowserAction::ClickAt { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn the_pascal_case_shape_the_schema_advertises_parses() {
+        // This is the shape the tool's JSON schema shows the model, and it used
+        // to come back as "unknown variant `ClickAt`".
+        let parsed = parse_action(&json!({ "ClickAt": { "x": 1.0, "y": 2.0 } })).unwrap();
+        assert!(matches!(parsed, BrowserAction::ClickAt { x: 1.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn an_action_key_naming_the_variant_parses() {
+        let parsed = parse_action(&json!({
+            "action": "Navigate",
+            "url": "https://example.com"
+        }))
+        .unwrap();
+        assert!(
+            matches!(parsed, BrowserAction::Navigate { ref url } if url == "https://example.com")
+        );
+    }
+
+    #[test]
+    fn unit_variants_parse_from_a_bare_string_in_either_case() {
+        assert!(matches!(parse_action(&json!("list_tabs")).unwrap(), BrowserAction::ListTabs));
+        assert!(matches!(parse_action(&json!("ListTabs")).unwrap(), BrowserAction::ListTabs));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_variant_is_still_an_error() {
+        // Tolerating other shapes must not turn a typo into a silent no-op.
+        assert!(parse_action(&json!({ "lick_at": { "x": 1.0 } })).is_err());
+        assert!(parse_action(&json!("NotAnAction")).is_err());
+        assert!(parse_action(&json!(42)).is_err());
+    }
+
+    #[test]
+    fn a_canonical_name_is_left_alone() {
+        // Round-tripping a serialized action must not depend on the rewrite.
+        let original = BrowserAction::Screenshot {
+            full_page: Some(true),
+            selector: None,
+        };
+        let value = serde_json::to_value(&original).unwrap();
+        assert!(matches!(
+            parse_action(&value).unwrap(),
+            BrowserAction::Screenshot { full_page: Some(true), .. }
+        ));
     }
 }
