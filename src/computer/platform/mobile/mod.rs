@@ -82,6 +82,37 @@ pub async fn run_cmd(
     Ok((status, stdout, stderr))
 }
 
+/// Like [`run_cmd`], but returns stdout as raw bytes.
+///
+/// Required for anything binary: the `String` variant goes through
+/// `from_utf8_lossy`, which replaces every non-UTF-8 byte with U+FFFD. That
+/// silently corrupts a binary payload — `adb exec-out screencap -p` returns a
+/// PNG, so base64-encoding the lossy string yields something that is not a
+/// decodable image at all.
+pub async fn run_cmd_bytes(
+    cmd: &str,
+    args: &[&str],
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>, String)> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(cmd.to_string());
+    argv.extend(args.iter().map(|s| s.to_string()));
+
+    let req = crate::tools::process_runner::ProcessRequest::argv(
+        &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    let out = crate::tools::process_runner::run(&req)
+        .await
+        .map_err(|e| match e {
+            crate::tools::process_runner::ProcessError::Spawn { source, .. } => source,
+            other => std::io::Error::other(format!("{other}")),
+        })?;
+    let status = out
+        .status
+        .ok_or_else(|| std::io::Error::other("process aborted without a status"))?;
+    let stderr = out.stderr_string();
+    Ok((status, out.stdout, stderr))
+}
+
 /// List devices as seen by the local adb client (§4.5).
 ///
 /// Each entry is `{serial, state}` where state is one of `device`,

@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{has_adb, run_cmd};
+use super::{has_adb, run_cmd, run_cmd_bytes};
 use crate::computer::platform::{OsControlScope, PlatformConstraints, PlatformToolSet};
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
 
@@ -63,6 +63,7 @@ impl PlatformToolSet for AndroidToolset {
 
     fn tools(&self) -> Vec<Box<dyn Tool>> {
         vec![
+            Box::new(AdbObserveTool::new()),
             Box::new(AdbScreenshotTool::new()),
             Box::new(AdbInputTool::new()),
             Box::new(AdbAppManagerTool::new()),
@@ -102,18 +103,6 @@ impl AdbScreenshotTool {
         self.device = Some(device);
         self
     }
-
-    fn adb_args(&self, base: &[&str]) -> Vec<String> {
-        let mut args = Vec::new();
-        if let Some(d) = &self.device {
-            args.push("-s".to_string());
-            args.push(d.clone());
-        }
-        for a in base {
-            args.push(a.to_string());
-        }
-        args
-    }
 }
 
 #[async_trait]
@@ -144,21 +133,11 @@ impl Tool for AdbScreenshotTool {
         _args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let adb_args = self.adb_args(&["exec-out", "screencap", "-p"]);
-        let (status, stdout, stderr) =
-            run_cmd("adb", &adb_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                .await
-                .map_err(|e| crate::error::SyscityError::ExternalService {
-                    source: "adb screencap failed".to_string(),
-                    cause: Some(Box::new(e)),
-                })?;
-
-        if !status.success() {
-            return Ok(ToolExecutionResult::error(format!("adb screencap failed: {}", stderr)));
-        }
-
-        let base64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, stdout.as_bytes());
+        let png = match capture_png(&self.device).await {
+            Ok(png) => png,
+            Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
+        };
+        let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
 
         Ok(
             ToolExecutionResult::success("Screenshot captured").with_data(serde_json::json!({
@@ -166,6 +145,108 @@ impl Tool for AdbScreenshotTool {
                 "format": "png",
             })),
         )
+    }
+}
+
+// ── ADB Observe Tool ───────────────────────────────────────────────────────
+
+/// Screenshot **and** UI tree from one call, with the coordinate space made
+/// explicit.
+///
+/// Two separate adb reads cannot be simultaneous, but doing them back to back in
+/// one call shrinks the window — and, more usefully, the result states what was
+/// actually captured. If the screenshot's real pixel size and the rectangle the
+/// element tree describes disagree (a rotation, a scaled capture), then every
+/// coordinate in the tree is wrong for the image the model is looking at, and it
+/// is told so instead of discovering it by tapping the wrong place.
+#[derive(Debug)]
+pub struct AdbObserveTool {
+    device: Option<String>,
+}
+
+impl Default for AdbObserveTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbObserveTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for AdbObserveTool {
+    fn name(&self) -> &str {
+        "android_observe"
+    }
+
+    fn description(&self) -> &str {
+        "Look at the Android device: returns the numbered actionable elements and a screenshot \
+         together, so the elements and the image describe the same moment. Preferred over \
+         calling android_ui_tree and android_screenshot separately. Says so when the two \
+         disagree about the screen size, which would make the element coordinates unusable."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Observe the Android device",
+            serde_json::json!({
+                "device": { "type": "string", "description": "Optional device serial" }
+            }),
+            Vec::<String>::new(),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let png = match capture_png(&self.device).await {
+            Ok(png) => png,
+            Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
+        };
+        let dump = match dump_ui(&self.device).await {
+            Ok(dump) => dump,
+            Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
+        };
+
+        let shot = png_dimensions(&png);
+        let consistent = coordinate_space_consistent(dump.screen, shot);
+
+        let mut summary = format_ui_summary(&dump.elements);
+        if !consistent {
+            let (sw, sh) = dump.screen.unwrap_or((0, 0));
+            let (iw, ih) = shot.unwrap_or((0, 0));
+            summary.push_str(&format!(
+                "\n\nWARNING: the screenshot ({iw}x{ih}) and the UI tree ({sw}x{sh}) do not describe \
+                 the same screen — it most likely rotated or was scaled between the two reads. \
+                 The element coordinates above may not match the image: observe again before \
+                 tapping."
+            ));
+        }
+
+        let as_size = |dims: Option<(u32, u32)>| {
+            dims.map(|(w, h)| serde_json::json!({ "width": w, "height": h }))
+        };
+        Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
+            "count": dump.elements.len(),
+            "elements": dump.elements,
+            "screenshot_base64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &png,
+            ),
+            "screenshot": as_size(shot),
+            "screen": dump.screen.map(|(w, h)| serde_json::json!({ "width": w, "height": h })),
+            "coordinates_consistent": consistent,
+        })))
     }
 }
 
@@ -705,6 +786,82 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
     Ok(out)
 }
 
+/// Capture the device screen as raw PNG bytes.
+///
+/// Uses the byte-safe runner: the PNG has to reach the encoder exactly as the
+/// device produced it, and the `String` variant of `run_cmd` would replace every
+/// non-UTF-8 byte with U+FFFD and corrupt the image.
+async fn capture_png(device: &Option<String>) -> crate::Result<Vec<u8>> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(serial) = device {
+        args.push("-s".to_string());
+        args.push(serial.clone());
+    }
+    args.extend(
+        ["exec-out", "screencap", "-p"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+
+    let (status, stdout, stderr) =
+        run_cmd_bytes("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .await
+            .map_err(|e| crate::error::SyscityError::ExternalService {
+                source: "adb screencap failed".to_string(),
+                cause: Some(Box::new(e)),
+            })?;
+    if !status.success() {
+        return Err(crate::error::SyscityError::ExternalService {
+            source: format!("adb screencap failed: {stderr}"),
+            cause: None,
+        });
+    }
+    Ok(stdout)
+}
+
+/// The screen rectangle a dump describes: the root `<node>`'s bounds.
+///
+/// `uiautomator dump` wraps everything in `<hierarchy>` with a single root node
+/// whose bounds are the full display. Comparing that against the screenshot's
+/// pixel size is how a coordinate-space mismatch is caught.
+pub fn parse_screen_bounds(xml: &str) -> Option<(i32, i32)> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let root = doc.descendants().find(|n| {
+        n.has_tag_name("node") && n.parent().is_some_and(|p| p.has_tag_name("hierarchy"))
+    })?;
+    parse_bounds(root.attribute("bounds")?).map(|(_, _, x2, y2)| (x2, y2))
+}
+
+/// Width and height from a PNG's IHDR chunk.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 || bytes[..8] != SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
+/// Whether the element coordinates and the screenshot describe the same space.
+///
+/// They come from two separate reads, so a rotation — or a scaled capture —
+/// between them makes every coordinate in the tree wrong for the image the model
+/// is looking at, and taps land somewhere else. Comparing the sizes is cheap and
+/// catches it; a rotation is expected to simply swap the axes.
+///
+/// When either side is unknown there is nothing to compare, and claiming a
+/// mismatch would be worse than staying quiet.
+fn coordinate_space_consistent(screen: Option<(i32, i32)>, shot: Option<(u32, u32)>) -> bool {
+    match (screen, shot) {
+        (Some((sw, sh)), Some((iw, ih))) => {
+            let (sw, sh) = (sw.max(0) as u32, sh.max(0) as u32);
+            (sw, sh) == (iw, ih) || (sh, sw) == (iw, ih)
+        }
+        _ => true,
+    }
+}
+
 /// One line per element, for the model to read directly.
 fn format_ui_summary(elements: &[UiElement]) -> String {
     if elements.is_empty() {
@@ -802,7 +959,31 @@ fn validate_target<'a>(
 ///
 /// Shared by `android_ui_tree` and the safety net in `android_input` so both see
 /// the same enumeration.
+/// A parsed `uiautomator dump`: the actionable elements plus the screen
+/// rectangle the dump describes.
+pub struct UiDump {
+    pub elements: Vec<UiElement>,
+    /// Full-display size as the dump reports it (`None` if it had no root bounds).
+    pub screen: Option<(i32, i32)>,
+}
+
 async fn dump_ui_elements(device: &Option<String>) -> crate::Result<Vec<UiElement>> {
+    Ok(dump_ui(device).await?.elements)
+}
+
+/// Dump, pull and parse the tree in one go.
+async fn dump_ui(device: &Option<String>) -> crate::Result<UiDump> {
+    let xml = pull_ui_xml(device).await?;
+    let elements = parse_uiautomator_xml(&xml)
+        .map_err(|source| crate::error::SyscityError::ExternalService { source, cause: None })?;
+    Ok(UiDump {
+        elements,
+        screen: parse_screen_bounds(&xml),
+    })
+}
+
+/// Run `uiautomator dump` on the device and pull the file back.
+async fn pull_ui_xml(device: &Option<String>) -> crate::Result<String> {
     let mut prefix: Vec<String> = Vec::new();
     if let Some(serial) = device {
         prefix.push("-s".to_string());
@@ -849,8 +1030,7 @@ async fn dump_ui_elements(device: &Option<String>) -> crate::Result<Vec<UiElemen
         });
     }
 
-    parse_uiautomator_xml(&stdout)
-        .map_err(|source| crate::error::SyscityError::ExternalService { source, cause: None })
+    Ok(stdout)
 }
 
 #[async_trait]
@@ -1331,6 +1511,55 @@ mod tests {
         assert!(parse_tap_steps(Some(&wrong_type)).is_err());
     }
 
+    /// A binary payload must survive as bytes.
+    ///
+    /// `screencap -p` returns a PNG, and the screenshot path used to base64 the
+    /// result of `run_cmd`, whose stdout is `String::from_utf8_lossy` — every
+    /// non-UTF-8 byte became U+FFFD, so the "screenshot" was not a decodable
+    /// image. This uses a local `printf` rather than adb, so the fix is verified
+    /// here rather than only on a device.
+    #[tokio::test]
+    async fn binary_stdout_survives_as_bytes() {
+        let (status, bytes, _) = run_cmd_bytes("printf", &["\\377\\376\\101"]).await.unwrap();
+        assert!(status.success());
+        assert_eq!(bytes, vec![0xFF, 0xFE, 0x41]);
+        // The lossy path would have replaced the invalid byte sequences.
+        assert_ne!(String::from_utf8_lossy(&bytes).as_bytes(), bytes.as_slice());
+    }
+
+    #[test]
+    fn png_dimensions_reads_the_ihdr_chunk() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes()); // IHDR length (unused)
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1080u32.to_be_bytes());
+        png.extend_from_slice(&2340u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((1080, 2340)));
+
+        assert_eq!(png_dimensions(b"not a png"), None);
+        assert_eq!(png_dimensions(&[0x89, b'P']), None);
+    }
+
+    #[test]
+    fn coordinate_space_check_catches_a_rotation_or_scale() {
+        // Matching, including the axes swapped by a rotation.
+        assert!(coordinate_space_consistent(Some((1080, 2340)), Some((1080, 2340))));
+        assert!(coordinate_space_consistent(Some((1080, 2340)), Some((2340, 1080))));
+        // A scaled capture, or a stale tree from before a rotation.
+        assert!(!coordinate_space_consistent(Some((1080, 2340)), Some((540, 1170))));
+        assert!(!coordinate_space_consistent(Some((1080, 2340)), Some((1080, 1080))));
+        // Nothing to compare is not a mismatch.
+        assert!(coordinate_space_consistent(None, Some((1080, 2340))));
+        assert!(coordinate_space_consistent(Some((1080, 2340)), None));
+    }
+
+    #[test]
+    fn screen_bounds_come_from_the_root_node() {
+        assert_eq!(parse_screen_bounds(DUMP), Some((1080, 2340)));
+        assert_eq!(parse_screen_bounds("<hierarchy rotation=\"0\"/>"), None);
+        assert_eq!(parse_screen_bounds("garbage"), None);
+    }
+
     #[test]
     fn test_adb_screenshot_tool_name() {
         let tool = AdbScreenshotTool::new();
@@ -1382,5 +1611,15 @@ mod tests {
             .collect();
         assert!(names.contains(&"device_adb_pair".to_string()));
         assert!(names.contains(&"device_adb_status".to_string()));
+    }
+
+    #[test]
+    fn test_android_toolset_exposes_the_combined_observe_tool() {
+        let names: Vec<String> = AndroidToolset::new()
+            .tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(names.contains(&"android_observe".to_string()), "{names:?}");
     }
 }
