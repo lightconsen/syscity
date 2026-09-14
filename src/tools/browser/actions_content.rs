@@ -217,13 +217,6 @@ pub(super) async fn execute_content_actions(
     }
 }
 
-/// Report that the page cannot be finished from inside the page.
-///
-/// Deliberately does nothing else. The caller gets what it needs to escalate —
-/// which window would have to be operated, what this tool cannot reach, the
-/// in-page route worth trying first, and the fact that consent comes first
-/// because the desktop is shared.
-
 /// Send a key sequence, one CDP event per step.
 ///
 /// The steps are built by `browser::keys`; this is only the mapping onto CDP,
@@ -270,6 +263,12 @@ async fn dispatch_key_steps(
     Ok(())
 }
 
+/// Report that the page cannot be finished from inside the page.
+///
+/// Deliberately does nothing else. The caller gets what it needs to escalate —
+/// which window would have to be operated, what this tool cannot reach, the
+/// in-page route worth trying first, and the fact that consent comes first
+/// because the desktop is shared.
 async fn escalate(
     page: &chromiumoxide::Page,
     reason: &str,
