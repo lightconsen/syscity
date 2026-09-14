@@ -286,7 +286,13 @@ impl Tool for AdbObserveTool {
         };
         let dump = match dump_ui(&device).await {
             Ok(dump) => dump,
-            Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
+            // The screenshot taken above is already in hand, but an error
+            // result's data does not reach the model, so the code travels for
+            // callers and the message carries what the model needs to know.
+            Err(e) => {
+                return Ok(ToolExecutionResult::error(e.message)
+                    .with_data(serde_json::json!({ "code": e.code })))
+            }
         };
 
         let shot = png_dimensions(&png);
@@ -374,7 +380,7 @@ impl AdbInputTool {
         index: usize,
         description: Option<&str>,
     ) -> Result<(i32, i32), String> {
-        let elements = dump_ui_elements(device).await.map_err(|e| e.to_string())?;
+        let elements = dump_ui_elements(device).await.map_err(|e| e.message)?;
         validate_target(&elements, index, description).map(|e| e.center)
     }
 }
@@ -926,43 +932,89 @@ fn coordinate_space_consistent(screen: Option<(i32, i32)>, shot: Option<(u32, u3
     }
 }
 
-/// Turn a `uiautomator dump` failure into something actionable.
+/// A UI dump that could not be read, with a stable code for the cause.
 ///
-/// Its stderr is cryptic and looks the same across causes that need completely
-/// different responses — a device that is gone, a screen that never settles, and
-/// a secure window all just "fail". The fallback is always available though: the
-/// screenshot still works when the element tree does not.
-fn classify_dump_failure(stderr: &str) -> String {
-    let lowered = stderr.to_lowercase();
-    // adb puts the serial in the middle: `device 'emulator-5554' not found`.
-    let device_gone = (lowered.contains("device") && lowered.contains("not found"))
-        || lowered.contains("device offline")
-        || lowered.contains("no devices/emulators found")
-        || lowered.contains("unauthorized");
-    let symptom = if device_gone {
-        "the device is not connected (or has gone offline) — reconnect it and try again"
-    } else if lowered.contains("could not get idle state") {
-        "the screen never settled (something on it keeps animating)"
-    } else if lowered.contains("null root node") || lowered.contains("could not get root node") {
-        "no accessibility root node was available — likely a secure window (a password or \
-         banking screen), or another app is holding the UiAutomation connection"
-    } else if lowered.contains("permission denial") {
-        "the accessibility service is not enabled"
-    } else {
-        "uiautomator reported an error"
-    };
+/// The code is the part a caller branches on; the message is what the model
+/// reads. `WebErrorCode` in `tools::web` is the same idea, and the wire values
+/// belong to the tool contract in the same way: they ride on the result as
+/// `data.code` so a caller does not have to parse the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpFailure {
+    /// One of the constants below.
+    pub code: &'static str,
+    /// What happened, and what to do instead.
+    pub message: String,
+}
 
-    let raw = stderr.trim();
-    if raw.is_empty() {
-        format!(
-            "Could not read the UI tree: {symptom}. Work from a screenshot instead — \
-             android_observe returns one alongside the tree."
-        )
-    } else {
-        format!(
-            "Could not read the UI tree: {symptom}. Raw output: {raw}. Work from a screenshot \
-             instead — android_observe returns one alongside the tree."
-        )
+/// The device is gone: unplugged, offline, or not authorised.
+pub const DEVICE_GONE: &str = "DEVICE_GONE";
+/// The screen never stopped changing, so uiautomator could not settle it.
+pub const SCREEN_NEVER_IDLE: &str = "SCREEN_NEVER_IDLE";
+/// No accessibility root: a secure window, or another holder of UiAutomation.
+pub const SECURE_WINDOW: &str = "SECURE_WINDOW";
+/// The accessibility service is not enabled.
+pub const ACCESSIBILITY_DISABLED: &str = "ACCESSIBILITY_DISABLED";
+/// The dump failed for a reason this code does not name.
+pub const DUMP_FAILED: &str = "DUMP_FAILED";
+
+impl DumpFailure {
+    fn new(code: &'static str, message: String) -> Self {
+        Self { code, message }
+    }
+
+    /// Classify what `uiautomator` said.
+    ///
+    /// Its stderr is cryptic and looks the same across causes that need
+    /// completely different responses — a device that is gone, a screen that
+    /// never settles, and a secure window all just "fail". The fallback is
+    /// always available though: the screenshot still works when the element
+    /// tree does not.
+    fn classify(stderr: &str) -> Self {
+        let lowered = stderr.to_lowercase();
+        // adb puts the serial in the middle: `device 'emulator-5554' not found`.
+        let device_gone = (lowered.contains("device") && lowered.contains("not found"))
+            || lowered.contains("device offline")
+            || lowered.contains("no devices/emulators found")
+            || lowered.contains("unauthorized");
+        let (code, symptom) = if device_gone {
+            (
+                DEVICE_GONE,
+                "the device is not connected (or has gone offline) — reconnect it and try again",
+            )
+        } else if lowered.contains("could not get idle state") {
+            (SCREEN_NEVER_IDLE, "the screen never settled (something on it keeps animating)")
+        } else if lowered.contains("null root node") || lowered.contains("could not get root node")
+        {
+            (
+                SECURE_WINDOW,
+                "no accessibility root node was available — likely a secure window (a password or \
+                 banking screen), or another app is holding the UiAutomation connection",
+            )
+        } else if lowered.contains("permission denial") {
+            (ACCESSIBILITY_DISABLED, "the accessibility service is not enabled")
+        } else {
+            (DUMP_FAILED, "uiautomator reported an error")
+        };
+
+        let raw = stderr.trim();
+        let message = if raw.is_empty() {
+            format!(
+                "Could not read the UI tree: {symptom}. Work from a screenshot instead — \
+                 android_observe returns one alongside the tree."
+            )
+        } else {
+            format!(
+                "Could not read the UI tree: {symptom}. Raw output: {raw}. Work from a screenshot \
+                 instead — android_observe returns one alongside the tree."
+            )
+        };
+        Self::new(code, message)
+    }
+}
+
+impl std::fmt::Display for DumpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -1079,15 +1131,19 @@ pub struct UiDump {
     pub screen: Option<(i32, i32)>,
 }
 
-async fn dump_ui_elements(device: &Option<String>) -> crate::Result<Vec<UiElement>> {
+async fn dump_ui_elements(device: &Option<String>) -> Result<Vec<UiElement>, DumpFailure> {
     Ok(dump_ui(device).await?.elements)
 }
 
 /// Dump, pull and parse the tree in one go.
-async fn dump_ui(device: &Option<String>) -> crate::Result<UiDump> {
+async fn dump_ui(device: &Option<String>) -> Result<UiDump, DumpFailure> {
     let xml = pull_ui_xml(device).await?;
-    let elements = parse_uiautomator_xml(&xml)
-        .map_err(|source| crate::error::SyscityError::ExternalService { source, cause: None })?;
+    let elements = parse_uiautomator_xml(&xml).map_err(|source| {
+        DumpFailure::new(
+            DUMP_FAILED,
+            format!("Could not read the UI tree: the dump did not parse ({source})"),
+        )
+    })?;
     Ok(UiDump {
         elements,
         screen: parse_screen_bounds(&xml),
@@ -1095,7 +1151,7 @@ async fn dump_ui(device: &Option<String>) -> crate::Result<UiDump> {
 }
 
 /// Run `uiautomator dump` on the device and pull the file back.
-async fn pull_ui_xml(device: &Option<String>) -> crate::Result<String> {
+async fn pull_ui_xml(device: &Option<String>) -> Result<String, DumpFailure> {
     let mut prefix: Vec<String> = Vec::new();
     if let Some(serial) = device {
         prefix.push("-s".to_string());
@@ -1113,33 +1169,22 @@ async fn pull_ui_xml(device: &Option<String>) -> crate::Result<String> {
 
     // `uiautomator dump` writes to a device file, which then has to be pulled.
     let dump = argv(&["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"]);
-    let (status, _, stderr) =
-        run(dump)
-            .await
-            .map_err(|e| crate::error::SyscityError::ExternalService {
-                source: "adb uiautomator dump failed".to_string(),
-                cause: Some(Box::new(e)),
-            })?;
+    let (status, _, stderr) = run(dump).await.map_err(|e| {
+        DumpFailure::new(DUMP_FAILED, format!("Could not run adb to read the UI tree: {e}"))
+    })?;
     if !status.success() {
-        return Err(crate::error::SyscityError::ExternalService {
-            source: classify_dump_failure(&stderr),
-            cause: None,
-        });
+        return Err(DumpFailure::classify(&stderr));
     }
 
     let pull = argv(&["pull", "/sdcard/window_dump.xml", "-"]);
-    let (status, stdout, stderr) =
-        run(pull)
-            .await
-            .map_err(|e| crate::error::SyscityError::ExternalService {
-                source: "adb pull failed".to_string(),
-                cause: Some(Box::new(e)),
-            })?;
+    let (status, stdout, stderr) = run(pull).await.map_err(|e| {
+        DumpFailure::new(DUMP_FAILED, format!("Could not read the UI tree: adb pull failed ({e})"))
+    })?;
     if !status.success() {
-        return Err(crate::error::SyscityError::ExternalService {
-            source: format!("adb pull failed: {stderr}"),
-            cause: None,
-        });
+        // A failed pull reports its own reason on stderr ("no such file", a
+        // device that went away between the two commands), so it goes through
+        // the same classifier rather than a second vocabulary.
+        return Err(DumpFailure::classify(&stderr));
     }
 
     Ok(stdout)
@@ -1182,7 +1227,10 @@ impl Tool for AdbUiTreeTool {
         // Hand back an indexed list instead; the XML stays out of the context.
         let elements = match dump_ui_elements(&device).await {
             Ok(e) => e,
-            Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
+            Err(e) => {
+                return Ok(ToolExecutionResult::error(e.message)
+                    .with_data(serde_json::json!({ "code": e.code })))
+            }
         };
         let summary = format_ui_summary(&elements);
         Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
@@ -1655,18 +1703,28 @@ mod tests {
 
     #[test]
     fn dump_failures_are_told_apart() {
-        let offline = classify_dump_failure("error: device 'emulator-5554' not found");
-        assert!(offline.contains("not connected"), "{offline}");
+        // The code is the half a caller branches on, so it has to be right as
+        // well as the sentence.
+        let offline = DumpFailure::classify("error: device 'emulator-5554' not found");
+        assert_eq!(offline.code, DEVICE_GONE);
+        assert!(offline.message.contains("not connected"), "{offline}");
 
-        let busy = classify_dump_failure("ERROR: could not get idle state.");
-        assert!(busy.contains("never settled"), "{busy}");
+        let busy = DumpFailure::classify("ERROR: could not get idle state.");
+        assert_eq!(busy.code, SCREEN_NEVER_IDLE);
+        assert!(busy.message.contains("never settled"), "{busy}");
 
         let secure =
-            classify_dump_failure("ERROR: null root node returned by UiTestAutomationBridge.");
-        assert!(secure.contains("secure window"), "{secure}");
+            DumpFailure::classify("ERROR: null root node returned by UiTestAutomationBridge.");
+        assert_eq!(secure.code, SECURE_WINDOW);
+        assert!(secure.message.contains("secure window"), "{secure}");
 
-        let disabled = classify_dump_failure("java.lang.SecurityException: Permission Denial");
-        assert!(disabled.contains("not enabled"), "{disabled}");
+        let disabled = DumpFailure::classify("java.lang.SecurityException: Permission Denial");
+        assert_eq!(disabled.code, ACCESSIBILITY_DISABLED);
+        assert!(disabled.message.contains("not enabled"), "{disabled}");
+
+        // Anything unrecognised still gets a code, so a caller never has to
+        // handle "no code at all".
+        assert_eq!(DumpFailure::classify("something nobody has seen before").code, DUMP_FAILED);
     }
 
     #[test]
@@ -1677,16 +1735,31 @@ mod tests {
             "something nobody has seen before",
             "",
         ] {
-            let msg = classify_dump_failure(stderr);
+            let failure = DumpFailure::classify(stderr);
+            let msg = &failure.message;
             assert!(msg.contains("screenshot"), "{msg}");
             assert!(msg.contains("android_observe"), "{msg}");
+            assert!(
+                [
+                    DEVICE_GONE,
+                    SCREEN_NEVER_IDLE,
+                    SECURE_WINDOW,
+                    ACCESSIBILITY_DISABLED,
+                    DUMP_FAILED
+                ]
+                .contains(&failure.code),
+                "unknown code {}",
+                failure.code
+            );
         }
     }
 
     #[test]
     fn raw_output_is_kept_when_there_is_any() {
-        assert!(classify_dump_failure("weird failure").contains("weird failure"));
-        assert!(!classify_dump_failure("   ").contains("Raw output"));
+        assert!(DumpFailure::classify("weird failure")
+            .message
+            .contains("weird failure"));
+        assert!(!DumpFailure::classify("   ").message.contains("Raw output"));
     }
 
     #[test]
