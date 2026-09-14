@@ -259,7 +259,10 @@ impl Tool for AdbObserveTool {
         "Look at the Android device: returns the numbered actionable elements and a screenshot \
          together, so the elements and the image describe the same moment. Preferred over \
          calling android_ui_tree and android_screenshot separately. Says so when the two \
-         disagree about the screen size, which would make the element coordinates unusable."
+         disagree about the screen size, which would make the element coordinates unusable. When \
+         the UI tree cannot be read at all it still returns the screenshot and says why: in that \
+         case the elements are absent from the result rather than empty, because an empty list \
+         means the tree was read and held nothing actionable."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -285,14 +288,50 @@ impl Tool for AdbObserveTool {
             Ok(png) => png,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
+        let as_size = |dims: Option<(u32, u32)>| {
+            dims.map(|(w, h)| serde_json::json!({ "width": w, "height": h }))
+        };
+
         let dump = match dump_ui(&device).await {
             Ok(dump) => dump,
-            // The screenshot taken above is already in hand, but an error
-            // result's data does not reach the model, so the code travels for
-            // callers and the message carries what the model needs to know.
-            Err(e) => {
-                return Ok(ToolExecutionResult::error(e.message)
-                    .with_data(serde_json::json!({ "code": e.code })))
+            // A tree that cannot be read does not fail this call. The screenshot
+            // is already in hand and is most of what the tool is for, and every
+            // message about a failed dump tells the model to work from the
+            // screenshot that android_observe returns — which an error result
+            // would throw away, since its payload does not reach the model. So
+            // the observation comes back with the image, no elements, and the
+            // failure's code for a caller to branch on.
+            Err(failure) => {
+                let shot = png_dimensions(&png);
+                let size = shot
+                    .map(|(w, h)| format!("{w}x{h}"))
+                    .unwrap_or_else(|| "unknown size".to_string());
+
+                let mut data = serde_json::Map::new();
+                data.insert("tree_available".to_string(), serde_json::json!(false));
+                data.insert("code".to_string(), serde_json::json!(failure.code));
+                data.insert(
+                    "screenshot".to_string(),
+                    as_size(shot).unwrap_or(serde_json::Value::Null),
+                );
+                data.insert(
+                    "screenshot_base64".to_string(),
+                    serde_json::json!(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &png,
+                    )),
+                );
+                data.insert(
+                    "device".to_string(),
+                    serde_json::json!(resolved_serial(&device).await),
+                );
+
+                return Ok(ToolExecutionResult::success(format!(
+                    "Screenshot captured ({size}), but the UI tree could not be read, so there are \
+                     no elements in this result — absent, not empty. {}",
+                    failure.message
+                ))
+                .with_data(serde_json::Value::Object(data)));
             }
         };
 
@@ -311,9 +350,6 @@ impl Tool for AdbObserveTool {
             ));
         }
 
-        let as_size = |dims: Option<(u32, u32)>| {
-            dims.map(|(w, h)| serde_json::json!({ "width": w, "height": h }))
-        };
         Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
             "count": dump.elements.len(),
             "elements": dump.elements,
