@@ -40,7 +40,7 @@
 
 截图后端：macOS ScreenCaptureKit（抓完**再校验一次窗口身份**，不符即失败，防 TOCTOU）→ `screencapture -l` 兜底；Windows `PrintWindow(PW_RENDERFULLCONTENT)` → WGC → BitBlt；Linux SHM `shm_get_image` → `XGetImage` → ImageMagick。
 
-**一处真实的自相矛盾**（值得学，见第十二节 D）：「遍历是否完整」的字段 `elements_complete` 存在，但被**硬编码为 false**（已核实：`platform-linux/.../tools/impl_.rs:893`；契约里是 `Option<bool>`，`cua-driver-contract/src/windows.rs:261`），而截断**只标在给模型看的 markdown 文本里**。也就是说：结构化字段不区分"完整树"和"被截断的树"，而下游 `verify_state` 恰恰因为"遍历不穷尽"拒绝 `element.exists: false`。
+**一处真实的自相矛盾**（对我们的含义见配套的 `cua-notes.local.md`）：「遍历是否完整」的字段 `elements_complete` 存在，但被**硬编码为 false**（已核实：`platform-linux/.../tools/impl_.rs:893`；契约里是 `Option<bool>`，`cua-driver-contract/src/windows.rs:261`），而截断**只标在给模型看的 markdown 文本里**。也就是说：结构化字段不区分"完整树"和"被截断的树"，而下游 `verify_state` 恰恰因为"遍历不穷尽"拒绝 `element.exists: false`。
 
 ## 四、动作：**不是**"阶梯"（这是最容易误读的一点）
 
@@ -138,10 +138,55 @@ else { SuspectedNoop }
 
 **教训**：这套代码的注释质量很高（很多"为什么这样"写得比文档好），但**博客和 README 不能当规格**。反过来也说明一件事：注释里那句 `active_lease_conflict: unproven` 是可信的——他们对自己没做到的事会直说。
 
-## 十二、本快照未能确定的
+## 十二、效果：行不行，以及凭什么这么说
+
+**一句话：没有任何第三方或实机采用数据；但它对自己效果的度量，是这份快照里最扎实的部分——而且边界画得很清楚。**
+
+文档层有两件东西，加上可执行的证据本身：
+
+- `docs/test-matrix.md`（223 行）：覆盖**策略**。维度的定义很讲究——OS × 窗口系统 × harness × 寻址方式（`ax`/`px`/`page`）× 投递（`background`/`foreground`）× 作用域（`window`/`desktop`）× oracle（应用状态/辅助功能状态/焦点状态/像素状态/协议状态）× 状态（`pass`/`fail`/`skip`/`environment_error`）× 观测量（`delivered`/`refused`/`no_effect`/`error`/`not_run`）。它明确区分"单元与确定性测试"和"harness E2E"，并要求后者跨过**驱动、OS、窗口系统、应用**四层边界 + 一个**外部 oracle**。
+- `docs/action-support.md`（109 行）：**实测台账**，逐行带 run ID。
+- 证据本身在树里：`rust/crates/cua-driver/tests/harness_{appkit,wpf,winui3,gtk3,gtk4,swiftui,web,libreoffice}_test.rs` + `cross_platform_behavior_test.rs`，配 `tests/fixtures/apps/{windows,macos,linux,cross-platform}`。
+
+**台账的口径是重点**（`action-support.md:3-15`）：*"derived from typed `CaseSpec` rows and accepted E2E evidence, **not from a successful driver response alone**."*
+
+- **Delivered** = 观察到 fixture 自己拥有的状态变化
+- **Refused** = 精确拒绝码 + 全部要求的三方 oracle（焦点 / z 序 / 光标 / 输入泄漏）通过
+- **Gap** = 未支持或未证明，且"**缺行永远不算这个动作做不到**"
+
+已接受的基线（都带 run ID）：
+
+| 环境 | 行数 | 结果 |
+|---|---|---|
+| Windows/Win32 | 122 | 122/122（99 delivered + 23 精确拒绝） |
+| macOS/Quartz | 145 | 145/145（138 delivery + 6 拒绝 + 1 个被光标干扰的行单独通过） |
+| Linux/X11 | 116 | 116/116（75 delivered + 41 精确拒绝） |
+| Linux/Sway | 116 | 36/36（native+capture）+ 80/80（shared） |
+| GNOME 46 Wayland | GTK3 31 | 31/31 |
+| 嵌套 `cua-compositor` | shared | **仍 10 项失败**，明确标 experimental，拒绝晋级 |
+
+博客说的"500+ 行为检查"就是这些数加起来——不是虚数。
+
+**这个口径最值得学的两点**：① **拒绝也被当成一等成果来验证**——不光要拒绝码正确，还要证明拒绝**没有副作用**（没抢焦点、没改 z 序、没动光标、没漏输入）；② lanes 的 preflight 会**注入故意的焦点与输入违规，要求哨兵能检出两者**，否则不采信任何结果——先证明 oracle 有效，再相信结论。
+
+维护规则（`action-support.md:105-109`）等于把一条原则写成了政策：
+
+> "When an OS API reports success but offers no effect read-back, retain a visible gap rather than inventing a fixture-specific refusal in production code."
+
+**边界，他们自己写明**：
+
+- 全部 E2E 用的是**仓库自带的 fixture 应用**（Electron / Tauri / WPF / WinUI3 / WebView2 / AppKit / SwiftUI / WKWebView / GTK3），不是真实第三方软件。设计如此，但这就是边界。
+- PX 行的明确限度（`:83-85`）：*"PX 后台左键行可能把屏幕点解析到一个可操作的 AT-SPI 节点。这样的通过只证明公开的 PX 寻址行为，**不证明**对画布或游戏的原始像素投递。"*
+- SwiftUI 那行是个真实应用级缺口的例子：fixture 能证明 `popover_open=true`，但**瞬态面板仍不出现在定向 AX 枚举里**。
+- gap 是公开列出的：WinUI3 后台右键/双击、WebView2 原生键盘、macOS AppKit 的原生 press key/hotkey、`background_uipi_blocked`（"今天没有可控的提权 fixture，**不得计为已覆盖**"）、Wayland 的光标保持未证明（issue #2194）。
+- KWin 那条不是"没做"而是**明知做出风险后拒绝**：portal/libei 投递是焦点绑定的，激活 + 读回也无法阻止焦点在 compositor 处理前改变，所以在有 target-bound 输入路径之前**故意关闭**。
+
+**benchmark 是另一回事，别混读**：他们的 KiCad 评测（25 题 / 7 个前沿模型 / 最好 6/25 / 空白画布 0/25）说明瓶颈在**任务难度**，不在驱动。前者衡量模型，后者才衡量驱动。
+
+## 十三、本快照未能确定的
 
 - **版本**：快照不是 git 仓库，无法确认对应哪个 release；契约常量 0.8.0 与 fixtures 0.12.6 的矛盾也因此无法定位。
 - **Swift 参考实现缺席**：Rust 注释反复说自己是 `Sources/CuaDriverCore/Input/*.swift` 的移植，但 `libs/cua-driver/` 下没有 `Sources/`，无法交叉验证移植的正确性。
-- **度量保真度**：`confirmed` / `unverifiable` / `suspected_noop` 的实机准确率，只能靠一份**人工维护的** `docs/action-support.md` 台账，仓库里没有可执行证据。
+- **`confirmed` / `unverifiable` / `suspected_noop` 分类自身的准确率**：跑 E2E 的代码和台账都在树里（见第十二节），但**分类器本身**准不准，只能靠那份台账间接反映——没有一项检查是"给定一次真实动作，问它判对了吗"。
 - **Hyprland 的 per-agent lane 模型在 GNOME/KWin 上是否有对应物**：插件只有 Hyprland 版，Rust 侧没有 Mutter 的等价仲裁。
 - **被引用但不在快照内的组件**：`docs/decisions/*.md`、pool-operator、claim reaper、`osgym_pool_claim_demand` 的 exporter —— 代码注释里反复出现，实体不在这份树里。
