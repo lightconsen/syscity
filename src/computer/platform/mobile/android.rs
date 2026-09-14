@@ -862,10 +862,58 @@ fn coordinate_space_consistent(screen: Option<(i32, i32)>, shot: Option<(u32, u3
     }
 }
 
+/// Turn a `uiautomator dump` failure into something actionable.
+///
+/// Its stderr is cryptic and looks the same across causes that need completely
+/// different responses — a device that is gone, a screen that never settles, and
+/// a secure window all just "fail". The fallback is always available though: the
+/// screenshot still works when the element tree does not.
+fn classify_dump_failure(stderr: &str) -> String {
+    let lowered = stderr.to_lowercase();
+    // adb puts the serial in the middle: `device 'emulator-5554' not found`.
+    let device_gone = (lowered.contains("device") && lowered.contains("not found"))
+        || lowered.contains("device offline")
+        || lowered.contains("no devices/emulators found")
+        || lowered.contains("unauthorized");
+    let symptom = if device_gone {
+        "the device is not connected (or has gone offline) — reconnect it and try again"
+    } else if lowered.contains("could not get idle state") {
+        "the screen never settled (something on it keeps animating)"
+    } else if lowered.contains("null root node") || lowered.contains("could not get root node") {
+        "no accessibility root node was available — likely a secure window (a password or \
+         banking screen), or another app is holding the UiAutomation connection"
+    } else if lowered.contains("permission denial") {
+        "the accessibility service is not enabled"
+    } else {
+        "uiautomator reported an error"
+    };
+
+    let raw = stderr.trim();
+    if raw.is_empty() {
+        format!(
+            "Could not read the UI tree: {symptom}. Work from a screenshot instead — \
+             android_observe returns one alongside the tree."
+        )
+    } else {
+        format!(
+            "Could not read the UI tree: {symptom}. Raw output: {raw}. Work from a screenshot \
+             instead — android_observe returns one alongside the tree."
+        )
+    }
+}
+
 /// One line per element, for the model to read directly.
 fn format_ui_summary(elements: &[UiElement]) -> String {
     if elements.is_empty() {
-        return "UI tree has no actionable elements".to_string();
+        // A dump that succeeds but yields nothing is not a failure to report —
+        // it is a screen the accessibility tree cannot describe (a game, a
+        // canvas, a secure surface). Saying so, and pointing at the screenshot,
+        // is the difference between the model retrying the tree forever and it
+        // switching approach.
+        return "The UI tree has no actionable elements — this screen is probably a game, a \
+                canvas, or a secure surface that exposes no accessibility nodes. Work from the \
+                screenshot instead (android_observe returns one alongside this list)."
+            .to_string();
     }
     let mut lines = vec![format!("{} actionable element(s):", elements.len())];
     for e in elements {
@@ -1010,7 +1058,7 @@ async fn pull_ui_xml(device: &Option<String>) -> crate::Result<String> {
             })?;
     if !status.success() {
         return Err(crate::error::SyscityError::ExternalService {
-            source: format!("uiautomator dump failed: {stderr}"),
+            source: classify_dump_failure(&stderr),
             cause: None,
         });
     }
@@ -1396,7 +1444,11 @@ mod tests {
     fn empty_hierarchy_summarises_clearly() {
         let els = parse_uiautomator_xml("<hierarchy rotation=\"0\"/>").unwrap();
         assert!(els.is_empty());
-        assert_eq!(format_ui_summary(&els), "UI tree has no actionable elements");
+        let msg = format_ui_summary(&els);
+        assert!(msg.contains("no actionable elements"), "{msg}");
+        // An empty tree is not a dead end: the screenshot still describes the
+        // screen, so the summary has to say so.
+        assert!(msg.contains("screenshot"), "{msg}");
     }
 
     // ── Tap safety net ──────────────────────────────────────────────────
@@ -1525,6 +1577,47 @@ mod tests {
         assert_eq!(bytes, vec![0xFF, 0xFE, 0x41]);
         // The lossy path would have replaced the invalid byte sequences.
         assert_ne!(String::from_utf8_lossy(&bytes).as_bytes(), bytes.as_slice());
+    }
+
+    // ── Failure classification (B4) ─────────────────────────────────────
+    //
+    // `uiautomator`'s stderr looks the same across causes that need different
+    // responses, and the fallback ("use the screenshot") applies to all of them.
+
+    #[test]
+    fn dump_failures_are_told_apart() {
+        let offline = classify_dump_failure("error: device 'emulator-5554' not found");
+        assert!(offline.contains("not connected"), "{offline}");
+
+        let busy = classify_dump_failure("ERROR: could not get idle state.");
+        assert!(busy.contains("never settled"), "{busy}");
+
+        let secure =
+            classify_dump_failure("ERROR: null root node returned by UiTestAutomationBridge.");
+        assert!(secure.contains("secure window"), "{secure}");
+
+        let disabled = classify_dump_failure("java.lang.SecurityException: Permission Denial");
+        assert!(disabled.contains("not enabled"), "{disabled}");
+    }
+
+    #[test]
+    fn every_dump_failure_points_at_the_screenshot() {
+        for stderr in [
+            "device offline",
+            "ERROR: could not get idle state.",
+            "something nobody has seen before",
+            "",
+        ] {
+            let msg = classify_dump_failure(stderr);
+            assert!(msg.contains("screenshot"), "{msg}");
+            assert!(msg.contains("android_observe"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn raw_output_is_kept_when_there_is_any() {
+        assert!(classify_dump_failure("weird failure").contains("weird failure"));
+        assert!(!classify_dump_failure("   ").contains("Raw output"));
     }
 
     #[test]
