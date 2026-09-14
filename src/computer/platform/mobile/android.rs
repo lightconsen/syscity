@@ -80,6 +80,71 @@ impl PlatformToolSet for AndroidToolset {
     }
 }
 
+// ── Device targeting ───────────────────────────────────────────────────────
+
+/// Schema text for the `device` argument the targeting tools share.
+const DEVICE_PARAM: &str =
+    "Device serial to act on. Omit it and the call uses the only attached device — the result \
+     reports which serial was actually used, since that is whatever is attached at the time.";
+
+/// `adb` argv prefix for the target device — no `-s` when none is pinned, in
+/// which case adb resolves the device itself.
+fn adb_args(device: &Option<String>, base: &[&str]) -> Vec<String> {
+    let mut args = Vec::with_capacity(base.len() + 2);
+    if let Some(serial) = device {
+        args.push("-s".to_string());
+        args.push(serial.clone());
+    }
+    args.extend(base.iter().map(|s| s.to_string()));
+    args
+}
+
+/// The device a call acts on: the caller's argument when given, else the serial
+/// the toolset was configured with.
+///
+/// Omitting `device` does not mean "any device" — adb resolves it to whichever
+/// single device is attached at that moment, so a call made after a swap lands
+/// on the new one without saying so. Passing it pins this call's target.
+fn resolve_device(args: &Value, configured: Option<&str>) -> Result<Option<String>, String> {
+    match args.get("device") {
+        // Absent, or explicitly null: fall back to the configured serial.
+        None | Some(Value::Null) => Ok(configured.map(str::to_string)),
+        Some(Value::String(serial)) if !serial.trim().is_empty() => {
+            Ok(Some(serial.trim().to_string()))
+        }
+        // An empty or non-string serial must not quietly become "no device":
+        // that sends the command to a target the caller did not ask for, which
+        // is the whole failure this argument exists to prevent.
+        Some(Value::String(_)) => {
+            Err("`device` was given but is empty — omit it to use the only attached device"
+                .to_string())
+        }
+        Some(other) => Err(format!("`device` must be a serial string, got {other}")),
+    }
+}
+
+/// The serial this call actually addressed, for the result to report.
+///
+/// A pinned serial is known for free; otherwise ask adb. Naming the device is
+/// what turns a silent swap into a visible line in the transcript. Best-effort
+/// by design — nothing about labelling the target is worth failing a call over —
+/// so a failure here surfaces as a null in the result rather than as silence.
+async fn resolved_serial(device: &Option<String>) -> Option<String> {
+    if let Some(serial) = device {
+        return Some(serial.clone());
+    }
+    let (status, stdout, _) = run_cmd("adb", &["get-serialno"]).await.ok()?;
+    if !status.success() {
+        return None;
+    }
+    let serial = stdout.trim();
+    if serial.is_empty() || serial == "unknown" {
+        None
+    } else {
+        Some(serial.to_string())
+    }
+}
+
 // ── ADB Screenshot Tool ────────────────────────────────────────────────────
 
 /// Capture device screen via `adb exec-out screencap -p`.
@@ -119,10 +184,7 @@ impl Tool for AdbScreenshotTool {
         create_schema(
             "Capture Android device screenshot",
             serde_json::json!({
-                "device": {
-                    "type": "string",
-                    "description": "Optional device serial number",
-                }
+                "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
         )
@@ -130,10 +192,14 @@ impl Tool for AdbScreenshotTool {
 
     async fn execute(
         &self,
-        _args: Value,
+        args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let png = match capture_png(&self.device).await {
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let png = match capture_png(&device).await {
             Ok(png) => png,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
@@ -143,6 +209,7 @@ impl Tool for AdbScreenshotTool {
             ToolExecutionResult::success("Screenshot captured").with_data(serde_json::json!({
                 "base64": base64,
                 "format": "png",
+                "device": resolved_serial(&device).await,
             })),
         )
     }
@@ -198,7 +265,7 @@ impl Tool for AdbObserveTool {
         create_schema(
             "Observe the Android device",
             serde_json::json!({
-                "device": { "type": "string", "description": "Optional device serial" }
+                "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
         )
@@ -206,14 +273,18 @@ impl Tool for AdbObserveTool {
 
     async fn execute(
         &self,
-        _args: Value,
+        args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let png = match capture_png(&self.device).await {
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let png = match capture_png(&device).await {
             Ok(png) => png,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
-        let dump = match dump_ui(&self.device).await {
+        let dump = match dump_ui(&device).await {
             Ok(dump) => dump,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
@@ -246,6 +317,7 @@ impl Tool for AdbObserveTool {
             "screenshot": as_size(shot),
             "screen": dump.screen.map(|(w, h)| serde_json::json!({ "width": w, "height": h })),
             "coordinates_consistent": consistent,
+            "device": resolved_serial(&device).await,
         })))
     }
 }
@@ -274,18 +346,6 @@ impl AdbInputTool {
         self
     }
 
-    fn adb_args(&self, base: &[&str]) -> Vec<String> {
-        let mut args = Vec::new();
-        if let Some(d) = &self.device {
-            args.push("-s".to_string());
-            args.push(d.clone());
-        }
-        for a in base {
-            args.push(a.to_string());
-        }
-        args
-    }
-
     /// Whether the device's active input method is ADBKeyboard.
     ///
     /// ADBKeyboard accepts text over a broadcast, which is the only way to type
@@ -293,8 +353,9 @@ impl AdbInputTool {
     /// character map and drops or mangles anything outside ASCII (CJK in
     /// particular). Costs one extra `adb` round trip, so it is only consulted
     /// for text that actually needs it.
-    async fn adbkeyboard_is_active(&self) -> bool {
-        let args = self.adb_args(&["shell", "settings", "get", "secure", "default_input_method"]);
+    async fn adbkeyboard_is_active(&self, device: &Option<String>) -> bool {
+        let args =
+            adb_args(device, &["shell", "settings", "get", "secure", "default_input_method"]);
         match run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await {
             Ok((status, stdout, _)) if status.success() => {
                 stdout.to_lowercase().contains("adbkeyboard")
@@ -309,12 +370,11 @@ impl AdbInputTool {
     /// earlier read silently hits whatever has moved into place since.
     async fn resolve_tap_target(
         &self,
+        device: &Option<String>,
         index: usize,
         description: Option<&str>,
     ) -> Result<(i32, i32), String> {
-        let elements = dump_ui_elements(&self.device)
-            .await
-            .map_err(|e| e.to_string())?;
+        let elements = dump_ui_elements(device).await.map_err(|e| e.to_string())?;
         validate_target(&elements, index, description).map(|e| e.center)
     }
 }
@@ -422,7 +482,9 @@ impl Tool for AdbInputTool {
          `target` (an element index from android_ui_tree): it is re-read from the live screen \
          before dispatch, so a screen that changed under you is reported instead of silently \
          tapping the wrong thing. Use action 'sequence' with several coordinate steps when you \
-         need to hit something that will disappear before your next turn."
+         need to hit something that will disappear before your next turn. Success means the \
+         input was dispatched, not that it took effect — observe afterwards to see what the \
+         screen actually did."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -460,7 +522,7 @@ impl Tool for AdbInputTool {
                 "y2": { "type": "integer", "description": "End Y (swipe)" },
                 "text": { "type": "string", "description": "Text to type" },
                 "keycode": { "type": "string", "description": "Android keycode name or number" },
-                "device": { "type": "string", "description": "Optional device serial" }
+                "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             vec!["action"],
         )
@@ -472,6 +534,10 @@ impl Tool for AdbInputTool {
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("tap");
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
 
         let shell_cmd = match action {
             "tap" => {
@@ -480,7 +546,10 @@ impl Tool for AdbInputTool {
                     // screen before anything is dispatched.
                     Some(index) => {
                         let description = args.get("target_description").and_then(|v| v.as_str());
-                        match self.resolve_tap_target(index as usize, description).await {
+                        match self
+                            .resolve_tap_target(&device, index as usize, description)
+                            .await
+                        {
                             Ok((x, y)) => format!("input tap {} {}", x, y),
                             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
                         }
@@ -509,7 +578,7 @@ impl Tool for AdbInputTool {
                 }
                 if text.is_ascii() {
                     encode_input_text(text)
-                } else if self.adbkeyboard_is_active().await {
+                } else if self.adbkeyboard_is_active(&device).await {
                     // ADBKeyboard takes the text base64-encoded over a broadcast,
                     // which carries any character the device can render.
                     let payload = base64::Engine::encode(
@@ -545,9 +614,9 @@ impl Tool for AdbInputTool {
             _ => return Ok(ToolExecutionResult::error(format!("Unknown action: {}", action))),
         };
 
-        let adb_args = self.adb_args(&["shell", &shell_cmd]);
+        let argv = adb_args(&device, &["shell", &shell_cmd]);
         let (status, _stdout, stderr) =
-            run_cmd("adb", &adb_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
                 .await
                 .map_err(|e| crate::error::SyscityError::ExternalService {
                     source: "adb input failed".to_string(),
@@ -558,7 +627,8 @@ impl Tool for AdbInputTool {
             return Ok(ToolExecutionResult::error(format!("adb input failed: {}", stderr)));
         }
 
-        Ok(ToolExecutionResult::success(format!("Input '{}' sent", action)))
+        Ok(ToolExecutionResult::success(format!("Input '{}' sent", action))
+            .with_data(serde_json::json!({ "device": resolved_serial(&device).await })))
     }
 }
 
@@ -585,18 +655,6 @@ impl AdbAppManagerTool {
         self.device = Some(device);
         self
     }
-
-    fn adb_args(&self, base: &[&str]) -> Vec<String> {
-        let mut args = Vec::new();
-        if let Some(d) = &self.device {
-            args.push("-s".to_string());
-            args.push(d.clone());
-        }
-        for a in base {
-            args.push(a.to_string());
-        }
-        args
-    }
 }
 
 #[async_trait]
@@ -606,7 +664,8 @@ impl Tool for AdbAppManagerTool {
     }
 
     fn description(&self) -> &str {
-        "Install, launch, force-stop, or list apps on an Android device."
+        "Install, launch, force-stop, or list apps on an Android device. 'completed' means the \
+         adb command was dispatched, not that the app started — observe afterwards to see."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -621,7 +680,7 @@ impl Tool for AdbAppManagerTool {
                 "package": { "type": "string", "description": "Package name (e.g. com.example.app)" },
                 "activity": { "type": "string", "description": "Activity class (launch)" },
                 "apk_path": { "type": "string", "description": "Local path to APK (install)" },
-                "device": { "type": "string", "description": "Optional device serial" }
+                "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             vec!["action"],
         )
@@ -633,11 +692,15 @@ impl Tool for AdbAppManagerTool {
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
 
-        let adb_args = match action {
+        let argv = match action {
             "install" => {
                 let path = args.get("apk_path").and_then(|v| v.as_str()).unwrap_or("");
-                self.adb_args(&["install", "-r", path])
+                adb_args(&device, &["install", "-r", path])
             }
             "launch" => {
                 let pkg = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
@@ -646,18 +709,18 @@ impl Tool for AdbAppManagerTool {
                     Some(a) => format!("{}/{}", pkg, a),
                     None => format!("{}/.MainActivity", pkg),
                 };
-                self.adb_args(&["shell", "am", "start", "-n", &component])
+                adb_args(&device, &["shell", "am", "start", "-n", &component])
             }
             "force_stop" => {
                 let pkg = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
-                self.adb_args(&["shell", "am", "force-stop", pkg])
+                adb_args(&device, &["shell", "am", "force-stop", pkg])
             }
-            "list_packages" => self.adb_args(&["shell", "pm", "list", "packages"]),
+            "list_packages" => adb_args(&device, &["shell", "pm", "list", "packages"]),
             _ => return Ok(ToolExecutionResult::error(format!("Unknown action: {}", action))),
         };
 
         let (status, stdout, stderr) =
-            run_cmd("adb", &adb_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
                 .await
                 .map_err(|e| crate::error::SyscityError::ExternalService {
                     source: "adb app manager failed".to_string(),
@@ -668,10 +731,10 @@ impl Tool for AdbAppManagerTool {
             return Ok(ToolExecutionResult::error(format!("adb app manager failed: {}", stderr)));
         }
 
-        Ok(ToolExecutionResult::success(format!(
-            "Action '{}' completed\n{}",
-            action, stdout
-        )))
+        Ok(
+            ToolExecutionResult::success(format!("Action '{}' completed\n{}", action, stdout))
+                .with_data(serde_json::json!({ "device": resolved_serial(&device).await })),
+        )
     }
 }
 
@@ -792,16 +855,7 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
 /// device produced it, and the `String` variant of `run_cmd` would replace every
 /// non-UTF-8 byte with U+FFFD and corrupt the image.
 async fn capture_png(device: &Option<String>) -> crate::Result<Vec<u8>> {
-    let mut args: Vec<String> = Vec::new();
-    if let Some(serial) = device {
-        args.push("-s".to_string());
-        args.push(serial.clone());
-    }
-    args.extend(
-        ["exec-out", "screencap", "-p"]
-            .iter()
-            .map(|s| s.to_string()),
-    );
+    let args = adb_args(device, &["exec-out", "screencap", "-p"]);
 
     let (status, stdout, stderr) =
         run_cmd_bytes("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
@@ -1098,7 +1152,7 @@ impl Tool for AdbUiTreeTool {
         create_schema(
             "Get Android UI tree",
             serde_json::json!({
-                "device": { "type": "string", "description": "Optional device serial" }
+                "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
         )
@@ -1106,13 +1160,17 @@ impl Tool for AdbUiTreeTool {
 
     async fn execute(
         &self,
-        _args: Value,
+        args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
         // The raw dump is an order of magnitude larger than what the model can
         // use, and the model would have to parse `bounds` itself to act on it.
         // Hand back an indexed list instead; the XML stays out of the context.
-        let elements = match dump_ui_elements(&self.device).await {
+        let elements = match dump_ui_elements(&device).await {
             Ok(e) => e,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
@@ -1120,6 +1178,7 @@ impl Tool for AdbUiTreeTool {
         Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
             "count": elements.len(),
             "elements": elements,
+            "device": resolved_serial(&device).await,
         })))
     }
 }
@@ -1714,5 +1773,68 @@ mod tests {
             .map(|t| t.name().to_string())
             .collect();
         assert!(names.contains(&"android_observe".to_string()), "{names:?}");
+    }
+
+    // ── Device targeting ────────────────────────────────────────────────
+    //
+    // A call with no `device` is not "any device": adb resolves it to whichever
+    // single device is attached at that moment, so a swap between two calls
+    // retargets silently. The argument therefore has to be honoured when given,
+    // refused when it cannot be a serial, and the result has to name what was
+    // actually addressed.
+
+    #[test]
+    fn the_callers_device_argument_beats_the_configured_serial() {
+        let args = serde_json::json!({ "device": "emulator-5554" });
+        assert_eq!(
+            resolve_device(&args, Some("R58M111")).unwrap(),
+            Some("emulator-5554".to_string())
+        );
+    }
+
+    #[test]
+    fn omitting_device_falls_back_to_the_configured_serial() {
+        assert_eq!(
+            resolve_device(&serde_json::json!({}), Some("R58M111")).unwrap(),
+            Some("R58M111".to_string())
+        );
+        assert_eq!(resolve_device(&serde_json::json!({}), None).unwrap(), None);
+        // JSON null is an omission, not a serial: that is what a serializer
+        // emits for a `None`, so it must fall back like an absent key.
+        assert_eq!(
+            resolve_device(&serde_json::json!({ "device": null }), Some("R58M111")).unwrap(),
+            Some("R58M111".to_string())
+        );
+    }
+
+    #[test]
+    fn a_device_that_is_not_a_serial_is_refused_not_ignored() {
+        // Falling back to the configured serial here would act on a device the
+        // caller did not name — the exact silent retarget this argument exists
+        // to prevent, so it has to fail instead of quietly doing something.
+        for args in [
+            serde_json::json!({ "device": "" }),
+            serde_json::json!({ "device": "   " }),
+            serde_json::json!({ "device": 7 }),
+            serde_json::json!({ "device": ["emulator-5554"] }),
+        ] {
+            assert!(resolve_device(&args, Some("R58M111")).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn a_serial_is_trimmed_before_use() {
+        let args = serde_json::json!({ "device": " emulator-5554 " });
+        assert_eq!(resolve_device(&args, None).unwrap(), Some("emulator-5554".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_serial_is_reported_without_asking_adb() {
+        // There is no adb in this test, and the pinned case must not need one:
+        // the serial is already known, so it is reported without a round trip.
+        assert_eq!(
+            resolved_serial(&Some("emulator-5554".to_string())).await,
+            Some("emulator-5554".to_string())
+        );
     }
 }
