@@ -1,9 +1,22 @@
 //! Form filling, text input, drag/select and download behavior.
 
 use super::{BrowserAction, BrowserScreenshot};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use tracing::warn;
+
+/// Turn a script's own result into the action's result, treating the `error`
+/// field these scripts use as a failure.
+///
+/// They report a missing element *inside* the value they return, so the action
+/// used to answer `success: true` with `{"result": {"error": ...}}` — a failure
+/// dressed as a success, which a caller reading `success` has no way to notice.
+fn js_result(value: Value) -> Result<Value, String> {
+    match value.get("error").and_then(Value::as_str) {
+        Some(message) => Err(message.to_string()),
+        None => Ok(json!({ "success": true, "result": value })),
+    }
+}
 
 pub(super) async fn execute_form_actions(
     action: BrowserAction,
@@ -129,7 +142,7 @@ pub(super) async fn execute_form_actions(
             match page.evaluate(script.as_str()).await {
                 Ok(result) => {
                     let value = result.value().cloned().unwrap_or(json!(null));
-                    Ok(json!({ "success": true, "result": value }))
+                    js_result(value).map_err(|e| format!("Failed to select: {e}"))
                 }
                 Err(e) => Err(format!("Failed to select: {}", e)),
             }
@@ -191,7 +204,7 @@ pub(super) async fn execute_form_actions(
             match page.evaluate(script.as_str()).await {
                 Ok(result) => {
                     let value = result.value().cloned().unwrap_or(json!(null));
-                    Ok(json!({ "success": true, "result": value }))
+                    js_result(value).map_err(|e| format!("Failed to drag: {e}"))
                 }
                 Err(e) => Err(format!("Failed to drag: {}", e)),
             }
@@ -253,5 +266,35 @@ pub(super) async fn execute_form_actions(
             }
         }
         _ => Err("browser: action not handled by this group".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_script_error_is_a_failure_not_a_success() {
+        // The scripts report a missing element *inside* the value they return.
+        // Answering `success: true` with that nested is a lie the caller cannot
+        // see, which is what this used to do.
+        let failed = js_result(json!({ "error": "Element not found" })).unwrap_err();
+        assert_eq!(failed, "Element not found");
+    }
+
+    #[test]
+    fn an_ordinary_result_keeps_its_shape() {
+        let ok = js_result(json!({ "start": 0, "selected": "abc" })).unwrap();
+        assert_eq!(ok["success"], json!(true));
+        assert_eq!(ok["result"]["selected"], json!("abc"));
+    }
+
+    #[test]
+    fn only_a_top_level_error_string_counts_as_a_failure() {
+        // A form fill returns `errors: []` as data; treating that as a failure
+        // would invert its meaning. And a non-string `error` field is not the
+        // convention these scripts use.
+        assert!(js_result(json!({ "errors": [] })).is_ok());
+        assert!(js_result(json!({ "error": 7 })).is_ok());
     }
 }
