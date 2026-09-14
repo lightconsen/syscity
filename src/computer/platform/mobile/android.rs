@@ -68,6 +68,7 @@ impl PlatformToolSet for AndroidToolset {
             Box::new(AdbInputTool::new()),
             Box::new(AdbAppManagerTool::new()),
             Box::new(AdbUiTreeTool::new()),
+            Box::new(AdbVerifyTool::new()),
             // Loopback self-pairing (§4.5): pair the phone with its own
             // wireless-debugging adbd and report pairing state.
             Box::new(AdbPairTool::new()),
@@ -1241,6 +1242,206 @@ impl Tool for AdbUiTreeTool {
     }
 }
 
+// ── ADB Verify Tool ────────────────────────────────────────────────────────
+
+/// The three answers a verification can give.
+///
+/// `unknown` never means success: it means the check could not be made, and the
+/// result says why.
+pub const VERDICT_SATISFIED: &str = "satisfied";
+pub const VERDICT_UNSATISFIED: &str = "unsatisfied";
+pub const VERDICT_UNKNOWN: &str = "unknown";
+
+/// What a verification is looking for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expectation {
+    /// Some element's text or content description contains this.
+    TextContains(String),
+    /// The element at this index is still there, still labelled this way.
+    ElementAt {
+        index: usize,
+        description: Option<String>,
+    },
+}
+
+impl Expectation {
+    /// What was checked, in the caller's terms, for the result to report.
+    fn describe(&self) -> String {
+        match self {
+            Expectation::TextContains(text) => format!("the screen shows text containing {text:?}"),
+            Expectation::ElementAt {
+                index,
+                description: Some(label),
+            } => format!("element {index} is still {label:?}"),
+            Expectation::ElementAt { index, description: None } => {
+                format!("element {index} is still there")
+            }
+        }
+    }
+
+    fn parse(args: &Value) -> Result<Self, String> {
+        if let Some(text) = args.get("text").and_then(Value::as_str) {
+            let text = text.trim();
+            if text.is_empty() {
+                return Err("`text` was given but is empty".to_string());
+            }
+            return Ok(Expectation::TextContains(text.to_string()));
+        }
+        if let Some(index) = args.get("target").and_then(Value::as_u64) {
+            return Ok(Expectation::ElementAt {
+                index: index as usize,
+                description: args
+                    .get("target_description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .map(str::to_string),
+            });
+        }
+        Err(
+            "give one of `text` (something the screen should now show) or `target` (an element \
+             index from android_ui_tree that should still be there)"
+                .to_string(),
+        )
+    }
+}
+
+/// Decide the verdict from the elements a dump produced.
+///
+/// The evidence is the accessibility tree and nothing else — not a screenshot
+/// comparison, and not the fact that an action was dispatched earlier. That is
+/// the whole reason to ask separately.
+fn evaluate(expectation: &Expectation, elements: &[UiElement]) -> &'static str {
+    let satisfied = match expectation {
+        Expectation::TextContains(text) => {
+            let needle = text.to_lowercase();
+            elements.iter().any(|element| {
+                [element.text.as_deref(), element.content_desc.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|label| label.to_lowercase().contains(&needle))
+            })
+        }
+        // Index 0 does not exist (indices are 1-based), and an index past the
+        // end is an element that is gone — both are "not satisfied", not
+        // "unverifiable": the tree was read and the element is not in it.
+        Expectation::ElementAt { index, description } if *index > 0 => {
+            match elements.get(index - 1) {
+                Some(element) => description.as_deref().is_none_or(|wanted| {
+                    let label = element
+                        .text
+                        .as_deref()
+                        .or(element.content_desc.as_deref())
+                        .unwrap_or_default();
+                    label_matches(label, wanted)
+                }),
+                None => false,
+            }
+        }
+        Expectation::ElementAt { .. } => false,
+    };
+
+    if satisfied {
+        VERDICT_SATISFIED
+    } else {
+        VERDICT_UNSATISFIED
+    }
+}
+
+/// Check that the screen shows what was expected.
+#[derive(Debug)]
+pub struct AdbVerifyTool {
+    device: Option<String>,
+}
+
+impl Default for AdbVerifyTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbVerifyTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for AdbVerifyTool {
+    fn name(&self) -> &str {
+        "android_verify"
+    }
+
+    fn description(&self) -> &str {
+        "Check that the device's screen now shows what you expect, after an action. Answers \
+         `satisfied`, `unsatisfied` or `unknown` — and `unknown` never means success: it means the \
+         check could not be made, and the result says why. The evidence is the accessibility tree, \
+         nothing else: not a screenshot comparison, and not the fact that an action was dispatched \
+         earlier. Ask this when the question is whether something worked; android_observe is for \
+         looking around."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Verify the Android screen",
+            serde_json::json!({
+                "text": { "type": "string", "description": "The screen should show this text, in some element's text or content description" },
+                "target": { "type": "integer", "description": "An element index from android_ui_tree that should still be there" },
+                "target_description": { "type": "string", "description": "Optional label you expect at `target`" },
+                "device": { "type": "string", "description": DEVICE_PARAM }
+            }),
+            Vec::<String>::new(),
+        )
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let expectation = match Expectation::parse(&args) {
+            Ok(expectation) => expectation,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let checked = expectation.describe();
+
+        match dump_ui_elements(&device).await {
+            Ok(elements) => {
+                let verdict = evaluate(&expectation, &elements);
+                Ok(ToolExecutionResult::success(format!(
+                    "{verdict}: checked that {checked} (read {} element(s) from the tree)",
+                    elements.len()
+                ))
+                .with_data(serde_json::json!({
+                    "verdict": verdict,
+                    "checked": checked,
+                    "elements_read": elements.len(),
+                    "device": resolved_serial(&device).await,
+                })))
+            }
+            Err(failure) => Ok(ToolExecutionResult::success(format!(
+                "{VERDICT_UNKNOWN}: could not check that {checked} — {}",
+                failure.message
+            ))
+            .with_data(serde_json::json!({
+                "verdict": VERDICT_UNKNOWN,
+                "checked": checked,
+                "code": failure.code,
+                "device": resolved_serial(&device).await,
+            }))),
+        }
+    }
+}
+
 // ── ADB Pairing Tools (§4.5) ───────────────────────────────────────────────
 
 /// Pair the phone with its own wireless-debugging adbd over loopback (§4.5).
@@ -1919,5 +2120,88 @@ mod tests {
             resolved_serial(&Some("emulator-5554".to_string())).await,
             Some("emulator-5554".to_string())
         );
+    }
+
+    // ── Verification verdicts ────────────────────────────────────────────
+    //
+    // The tree is the evidence, and there are three answers rather than two:
+    // "could not check" is neither a yes nor a no, and folding it into either
+    // one invents a fact.
+
+    #[test]
+    fn a_verification_answers_with_evidence_from_the_tree() {
+        let elements = vec![element(1, Some("Inbox"), "android.widget.TextView")];
+        assert_eq!(
+            evaluate(&Expectation::TextContains("inbox".into()), &elements),
+            VERDICT_SATISFIED,
+            "the match is case-insensitive, like the tap path's"
+        );
+        assert_eq!(
+            evaluate(&Expectation::TextContains("Sent".into()), &elements),
+            VERDICT_UNSATISFIED
+        );
+        // An empty screen is not a pass.
+        assert_eq!(
+            evaluate(&Expectation::TextContains("anything".into()), &[]),
+            VERDICT_UNSATISFIED
+        );
+    }
+
+    #[test]
+    fn an_element_that_is_not_there_is_unsatisfied_not_unknown() {
+        // The tree was read and the element is not in it: that is an answer.
+        let elements = vec![element(1, Some("Inbox"), "android.widget.TextView")];
+        assert_eq!(
+            evaluate(&Expectation::ElementAt { index: 1, description: None }, &elements),
+            VERDICT_SATISFIED
+        );
+        assert_eq!(
+            evaluate(&Expectation::ElementAt { index: 7, description: None }, &elements),
+            VERDICT_UNSATISFIED
+        );
+        // Indices are 1-based, so 0 does not exist.
+        assert_eq!(
+            evaluate(&Expectation::ElementAt { index: 0, description: None }, &elements),
+            VERDICT_UNSATISFIED
+        );
+    }
+
+    #[test]
+    fn a_relabelled_element_fails_the_label_check() {
+        let elements = vec![element(1, Some("Inbox"), "android.widget.TextView")];
+        assert_eq!(
+            evaluate(
+                &Expectation::ElementAt {
+                    index: 1,
+                    description: Some("Sent".into())
+                },
+                &elements
+            ),
+            VERDICT_UNSATISFIED
+        );
+        assert_eq!(
+            evaluate(
+                &Expectation::ElementAt {
+                    index: 1,
+                    description: Some("inbo".into())
+                },
+                &elements
+            ),
+            VERDICT_SATISFIED
+        );
+    }
+
+    #[test]
+    fn a_verification_must_name_something_to_check() {
+        assert!(Expectation::parse(&serde_json::json!({})).is_err());
+        assert!(Expectation::parse(&serde_json::json!({ "text": "   " })).is_err());
+        assert!(matches!(
+            Expectation::parse(&serde_json::json!({ "text": "Inbox" })).unwrap(),
+            Expectation::TextContains(_)
+        ));
+        assert!(matches!(
+            Expectation::parse(&serde_json::json!({ "target": 3 })).unwrap(),
+            Expectation::ElementAt { index: 3, .. }
+        ));
     }
 }
