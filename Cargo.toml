@@ -221,7 +221,7 @@ wasmtime = { version = "46.0", optional = true }
 wasmtime-wasi = { version = "46.0", optional = true }
 
 # Hot reload - file watching
-notify-debouncer-full = { version = "0.3", optional = true }
+notify-debouncer-full = { version = "0.7", optional = true }
 
 # Vision (OCR + UI element detection via ONNX)
 ort = { version = "2.0.0-rc.12", optional = true }
