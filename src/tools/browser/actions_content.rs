@@ -4,6 +4,7 @@ use super::{BrowserAction, BrowserScreenshot};
 use serde_json::{json, Value};
 
 use crate::browser::escalation;
+use crate::browser::keys;
 
 pub(super) async fn execute_content_actions(
     action: BrowserAction,
@@ -150,24 +151,49 @@ pub(super) async fn execute_content_actions(
         }
 
         BrowserAction::Press { key } => {
-            let script = format!(
-                r#"() => {{
-                        const el = document.activeElement || document.body;
-                        const evt = new KeyboardEvent('keydown', {{ key: '{}', bubbles: true }});
-                        el.dispatchEvent(evt);
-                        const evtUp = new KeyboardEvent('keyup', {{ key: '{}', bubbles: true }});
-                        el.dispatchEvent(evtUp);
-                        return true;
-                    }}"#,
-                key, key
-            );
-            match page.evaluate(script.as_str()).await {
-                Ok(_) => {
-                    crate::browser::instrument::auto_wait(page).await;
-                    Ok(json!({ "success": true, "key": key }))
+            use chromiumoxide::cdp::browser_protocol::input::{
+                DispatchKeyEventParams, DispatchKeyEventType,
+            };
+
+            let spec = keys::key_spec(&key)?;
+            let event = |kind: DispatchKeyEventType, with_text: bool| {
+                let mut params = DispatchKeyEventParams::new(kind);
+                params.key = Some(spec.key.clone());
+                params.code = Some(spec.code.clone());
+                params.windows_virtual_key_code = Some(spec.vk);
+                if with_text {
+                    params.text = spec.text.clone();
+                    params.unmodified_text = spec.text.clone();
                 }
-                Err(e) => Err(format!("Failed to press key: {}", e)),
-            }
+                params
+            };
+
+            // A key that types goes down as `keyDown` so the character is
+            // inserted; one that is handled rather than typed goes down as
+            // `rawKeyDown`, which stops the browser deriving a character from
+            // the virtual key code and lets the key's own behaviour run —
+            // submitting the form, moving focus, closing the overlay.
+            let printable = spec.is_printable();
+            let down = if printable {
+                DispatchKeyEventType::KeyDown
+            } else {
+                DispatchKeyEventType::RawKeyDown
+            };
+            page.execute(event(down, printable))
+                .await
+                .map_err(|e| format!("Failed to press {}: {}", spec.key, e))?;
+            page.execute(event(DispatchKeyEventType::KeyUp, false))
+                .await
+                .map_err(|e| format!("Failed to release {}: {}", spec.key, e))?;
+
+            crate::browser::instrument::auto_wait(page).await;
+            Ok(json!({
+                "success": true,
+                "delivered": "cdp_key_event",
+                "key": spec.key,
+                "code": spec.code,
+                "typed": spec.text,
+            }))
         }
 
         BrowserAction::Act { ref_id, action } => {

@@ -21,6 +21,8 @@ pub mod escalation;
 #[cfg(feature = "browser")]
 pub mod instrument;
 #[cfg(feature = "browser")]
+pub mod keys;
+#[cfg(feature = "browser")]
 pub mod network_log;
 #[cfg(feature = "browser")]
 pub mod pointer;

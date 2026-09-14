@@ -682,7 +682,7 @@ impl Tool for BrowserTool {
                                     "Press": {
                                         "type": "object",
                                         "properties": {
-                                            "key": { "type": "string", "description": "Key to press, e.g. Enter, Tab, Escape, ArrowDown" }
+                                            "key": { "type": "string", "description": "Key to press, by name (Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp/PageDown, Space) or a single character to type. A modifier on its own is refused: this sends one key at a time." }
                                         },
                                         "required": ["key"]
                                     }
