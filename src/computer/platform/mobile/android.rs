@@ -266,6 +266,47 @@ fn input_encode(s: &str) -> String {
     s.replace('%', "%%").replace(' ', "%s")
 }
 
+/// Build a tap sequence: several taps dispatched in a single shell command.
+///
+/// For a control that is about to auto-fade (a transient toolbar, a toast with a
+/// button), tapping it, waiting for a model turn and tapping the next thing is
+/// usually too slow — the control is gone. Chaining the taps into one dispatch
+/// closes that window.
+///
+/// Deliberately coordinate-based: the later taps usually target a control that
+/// only appears *because* an earlier one revealed it, so it cannot be validated
+/// against the current tree. Each `input` is its own process on the device,
+/// which spaces the taps by a few tens of milliseconds without needing `sleep`.
+fn encode_tap_sequence(steps: &[(i64, i64)]) -> String {
+    steps
+        .iter()
+        .map(|(x, y)| format!("input tap {} {}", x, y))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Read a `steps` argument as a list of `{ x, y }` taps.
+fn parse_tap_steps(value: Option<&Value>) -> Result<Vec<(i64, i64)>, String> {
+    let Some(Value::Array(items)) = value else {
+        return Err("action 'sequence' requires a 'steps' array of { x, y } taps".to_string());
+    };
+    if items.is_empty() {
+        return Err("action 'sequence' needs at least one step".to_string());
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let x = item.get("x").and_then(Value::as_i64);
+            let y = item.get("y").and_then(Value::as_i64);
+            match (x, y) {
+                (Some(x), Some(y)) => Ok((x, y)),
+                _ => Err(format!("step {i} needs integer 'x' and 'y'")),
+            }
+        })
+        .collect()
+}
+
 /// Build the device-shell command(s) that type `text`.
 ///
 /// `input text` cannot produce a newline, so every line break becomes an
@@ -299,7 +340,8 @@ impl Tool for AdbInputTool {
         "Send tap, swipe, text, or key events to an Android device via ADB. For taps prefer \
          `target` (an element index from android_ui_tree): it is re-read from the live screen \
          before dispatch, so a screen that changed under you is reported instead of silently \
-         tapping the wrong thing."
+         tapping the wrong thing. Use action 'sequence' with several coordinate steps when you \
+         need to hit something that will disappear before your next turn."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -308,8 +350,20 @@ impl Tool for AdbInputTool {
             serde_json::json!({
                 "action": {
                     "type": "string",
-                    "description": "tap | swipe | text | key",
-                    "enum": ["tap", "swipe", "text", "key"]
+                    "description": "tap | sequence | swipe | text | key",
+                    "enum": ["tap", "sequence", "swipe", "text", "key"]
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "For 'sequence': taps to dispatch back to back in one call, for a control that will auto-fade before your next turn. Each is { \"x\": int, \"y\": int }.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" }
+                        },
+                        "required": ["x", "y"]
+                    }
                 },
                 "target": {
                     "type": "integer",
@@ -396,6 +450,10 @@ impl Tool for AdbInputTool {
                     ));
                 }
             }
+            "sequence" => match parse_tap_steps(args.get("steps")) {
+                Ok(steps) => encode_tap_sequence(&steps),
+                Err(msg) => return Ok(ToolExecutionResult::error(msg)),
+            },
             "key" => {
                 let keycode = args
                     .get("keycode")
@@ -1239,6 +1297,38 @@ mod tests {
         disabled.enabled = false;
         let err = validate_target(&[disabled], 1, None).unwrap_err();
         assert!(err.contains("disabled"), "{err}");
+    }
+
+    // ── Tap sequences ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_sequence_becomes_one_shell_command() {
+        // One dispatch, not N: every extra round trip is a model turn during
+        // which the transient control has already faded.
+        assert_eq!(encode_tap_sequence(&[(10, 20), (30, 40)]), "input tap 10 20; input tap 30 40");
+        assert_eq!(encode_tap_sequence(&[(5, 6)]), "input tap 5 6");
+    }
+
+    #[test]
+    fn steps_parse_from_the_argument() {
+        let args = serde_json::json!([{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }]);
+        assert_eq!(parse_tap_steps(Some(&args)).unwrap(), vec![(1, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn malformed_steps_are_rejected_with_a_reason() {
+        assert!(parse_tap_steps(None)
+            .unwrap_err()
+            .contains("requires a 'steps' array"));
+        assert!(parse_tap_steps(Some(&serde_json::json!([])))
+            .unwrap_err()
+            .contains("at least one"));
+        let missing_y = serde_json::json!([{ "x": 1 }]);
+        assert!(parse_tap_steps(Some(&missing_y))
+            .unwrap_err()
+            .contains("step 0"));
+        let wrong_type = serde_json::json!([{ "x": "1", "y": 2 }]);
+        assert!(parse_tap_steps(Some(&wrong_type)).is_err());
     }
 
     #[test]
