@@ -160,6 +160,7 @@ impl BrowserTool {
             | BrowserAction::GetConsoleMessages { .. }
             | BrowserAction::ExecuteScript { .. }
             | BrowserAction::Press { .. }
+            | BrowserAction::Hotkey { .. }
             | BrowserAction::Escalate { .. }
             | BrowserAction::Act { .. } => {
                 execute_content_actions(action, page, browser, screenshot_data).await
@@ -229,7 +230,9 @@ impl Tool for BrowserTool {
          instead of confused — and a click outside the live viewport is refused rather than \
          dispatched somewhere unnamed. Clicks take a button and a click_count (double and triple \
          clicks are two and three press/release pairs, not one pair carrying a count), and Drag \
-         or DragAt moves the pointer between press and release rather than jumping. Each action is \
+         or DragAt moves the pointer between press and release rather than jumping. Hotkey holds \
+         its modifiers while one key goes down, which is not the same as pressing the keys in \
+         sequence: Control+A selects, where typing Control then A does not. Each action is \
          either a bare name (for the ones that take no arguments, e.g. \"back\" or \"list_tabs\") \
          or {\"name\": {...}}; snake_case and PascalCase names are both accepted. Most needs that \
          look like they lie outside the page have an answer inside it, and that answer is the one \
@@ -769,6 +772,18 @@ impl Tool for BrowserTool {
                             {
                                 "type": "object",
                                 "properties": {
+                                    "Hotkey": {
+                                        "type": "object",
+                                        "properties": {
+                                            "keys": { "type": "array", "items": { "type": "string" }, "description": "Modifiers then the one key they modify, e.g. [\"ctrl\", \"a\"] or [\"cmd\", \"shift\", \"p\"]. A second non-modifier key is refused: that is two combinations, not one." }
+                                        },
+                                        "required": ["keys"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
                                     "Escalate": {
                                         "type": "object",
                                         "properties": {
@@ -918,6 +933,7 @@ mod tests {
             "Drag",
             "DragAt",
             "Escalate",
+            "Hotkey",
         ] {
             assert!(
                 schema.contains(&format!("\"{name}\"")),

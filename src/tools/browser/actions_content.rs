@@ -151,48 +151,51 @@ pub(super) async fn execute_content_actions(
         }
 
         BrowserAction::Press { key } => {
-            use chromiumoxide::cdp::browser_protocol::input::{
-                DispatchKeyEventParams, DispatchKeyEventType,
+            let steps = match keys::press_steps(&key) {
+                Ok(steps) => steps,
+                Err(refusal) => return Err(refusal),
             };
-
-            let spec = keys::key_spec(&key)?;
-            let event = |kind: DispatchKeyEventType, with_text: bool| {
-                let mut params = DispatchKeyEventParams::new(kind);
-                params.key = Some(spec.key.clone());
-                params.code = Some(spec.code.clone());
-                params.windows_virtual_key_code = Some(spec.vk);
-                if with_text {
-                    params.text = spec.text.clone();
-                    params.unmodified_text = spec.text.clone();
-                }
-                params
-            };
-
-            // A key that types goes down as `keyDown` so the character is
-            // inserted; one that is handled rather than typed goes down as
-            // `rawKeyDown`, which stops the browser deriving a character from
-            // the virtual key code and lets the key's own behaviour run —
-            // submitting the form, moving focus, closing the overlay.
-            let printable = spec.is_printable();
-            let down = if printable {
-                DispatchKeyEventType::KeyDown
-            } else {
-                DispatchKeyEventType::RawKeyDown
-            };
-            page.execute(event(down, printable))
-                .await
-                .map_err(|e| format!("Failed to press {}: {}", spec.key, e))?;
-            page.execute(event(DispatchKeyEventType::KeyUp, false))
-                .await
-                .map_err(|e| format!("Failed to release {}: {}", spec.key, e))?;
-
+            dispatch_key_steps(page, &steps).await?;
             crate::browser::instrument::auto_wait(page).await;
+
+            let spec = &steps[0].spec;
             Ok(json!({
                 "success": true,
                 "delivered": "cdp_key_event",
                 "key": spec.key,
                 "code": spec.code,
                 "typed": spec.text,
+            }))
+        }
+
+        BrowserAction::Hotkey { keys: combination } => {
+            let steps = match keys::hotkey_steps(&combination) {
+                Ok(steps) => steps,
+                Err(refusal) => return Err(refusal),
+            };
+            dispatch_key_steps(page, &steps).await?;
+            crate::browser::instrument::auto_wait(page).await;
+
+            // The last press is the key being modified; everything before it is
+            // a modifier held down.
+            let main = steps
+                .iter()
+                .find(|step| step.kind != keys::KeyStepKind::Up)
+                .map(|step| step.spec.key.clone())
+                .unwrap_or_default();
+            let modifiers: Vec<&str> = steps
+                .iter()
+                .filter(|step| step.kind == keys::KeyStepKind::DownRaw)
+                .filter(|step| step.spec.key != main)
+                .map(|step| step.spec.key.as_str())
+                .collect();
+
+            Ok(json!({
+                "success": true,
+                "delivered": "cdp_key_event",
+                "key": main,
+                "modifiers": modifiers,
+                "typed": serde_json::Value::Null,
             }))
         }
 
@@ -220,6 +223,53 @@ pub(super) async fn execute_content_actions(
 /// which window would have to be operated, what this tool cannot reach, the
 /// in-page route worth trying first, and the fact that consent comes first
 /// because the desktop is shared.
+
+/// Send a key sequence, one CDP event per step.
+///
+/// The steps are built by `browser::keys`; this is only the mapping onto CDP,
+/// so that a single press and a combination differ in how their steps are
+/// computed rather than in how they are sent.
+async fn dispatch_key_steps(
+    page: &chromiumoxide::Page,
+    steps: &[keys::KeyStep],
+) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchKeyEventParams, DispatchKeyEventType,
+    };
+
+    for step in steps {
+        let kind = match step.kind {
+            keys::KeyStepKind::Down => DispatchKeyEventType::KeyDown,
+            keys::KeyStepKind::DownRaw => DispatchKeyEventType::RawKeyDown,
+            keys::KeyStepKind::Up => DispatchKeyEventType::KeyUp,
+        };
+        let mut params = DispatchKeyEventParams::new(kind);
+        params.key = Some(step.spec.key.clone());
+        params.code = Some(step.spec.code.clone());
+        params.windows_virtual_key_code = Some(step.spec.vk);
+        // Which modifiers are held during this event — the field that makes
+        // Control+A a combination rather than two keystrokes in a row.
+        params.modifiers = Some(step.modifiers);
+        // macOS runs its editing shortcuts in the browser process rather than
+        // from the DOM event, so the command has to travel with the key: without
+        // it Cmd+A arrives, matches nothing, and selects nothing. Not sent on a
+        // key-up, where the command has already run.
+        if cfg!(target_os = "macos") && step.kind != keys::KeyStepKind::Up {
+            if let Some(command) = keys::editing_command(step.modifiers, &step.spec.code) {
+                params.commands = Some(vec![command.to_string()]);
+            }
+        }
+        if step.kind == keys::KeyStepKind::Down {
+            params.text = step.spec.text.clone();
+            params.unmodified_text = step.spec.text.clone();
+        }
+        page.execute(params)
+            .await
+            .map_err(|e| format!("Failed to send {}: {}", step.spec.key, e))?;
+    }
+    Ok(())
+}
+
 async fn escalate(
     page: &chromiumoxide::Page,
     reason: &str,

@@ -229,6 +229,199 @@ pub fn key_spec(name: &str) -> Result<KeySpec, String> {
     ))
 }
 
+/// What a key step does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStepKind {
+    /// Press, letting a character through if the key has one.
+    Down,
+    /// Press without a character: for modifiers, whose whole meaning is being
+    /// held while another key goes down.
+    DownRaw,
+    Up,
+}
+
+/// One key event in a sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyStep {
+    pub kind: KeyStepKind,
+    pub spec: KeySpec,
+    /// CDP's modifier bitmask as held during this event — Alt 1, Control 2,
+    /// Meta 4, Shift 8.
+    pub modifiers: i64,
+}
+
+/// CDP's modifier bits, as the wire defines them.
+pub const ALT: i64 = 1;
+pub const CONTROL: i64 = 2;
+pub const META: i64 = 4;
+pub const SHIFT: i64 = 8;
+
+/// Cmd+Shift.
+///
+/// A named constant because `META | SHIFT` inside a match arm would be an
+/// *or-pattern* — matching either bit alone, not both — which silently matched
+/// nothing here until a test caught it. In a const expression `|` is the
+/// bitwise or that was meant.
+const META_SHIFT: i64 = META | SHIFT;
+
+/// The editing command a combination stands for, when it stands for one.
+///
+/// macOS runs its editing shortcuts in the browser process, not from the DOM
+/// event: a synthetic Cmd+A arrives at the page with `metaKey` true and the
+/// right `key`, and selects nothing, because nothing in the page ever handled
+/// it. CDP carries the command alongside the event for exactly this reason
+/// (`Input.dispatchKeyEvent.commands`), and without it a combination is
+/// delivered and ignored — which is how this was found.
+///
+/// The names are WebKit's editing commands, the same vocabulary
+/// `document.execCommand` uses; the bindings are macOS's. An unmatched
+/// combination has no command, which is the common case and not a failure:
+/// shift-click and arrow keys are handled by the page itself.
+pub fn editing_command(modifiers: i64, code: &str) -> Option<&'static str> {
+    let command = match (modifiers, code) {
+        (META, "KeyA") => "SelectAll",
+        (META, "KeyC") => "Copy",
+        (META, "KeyX") => "Cut",
+        (META, "KeyV") => "Paste",
+        (META, "KeyZ") => "Undo",
+        (META_SHIFT, "KeyZ") => "Redo",
+        // The macOS binding for Control+A is not select-all: it moves the
+        // caret, which is why sending it and seeing no selection is correct
+        // behaviour rather than a bug.
+        (CONTROL, "KeyA") => "MoveToBeginningOfParagraph",
+        (META, "ArrowUp") => "MoveToBeginningOfDocument",
+        (META, "ArrowDown") => "MoveToEndOfDocument",
+        (META, "ArrowLeft") => "MoveToLeftEndOfLine",
+        (META, "ArrowRight") => "MoveToRightEndOfLine",
+        (META_SHIFT, "ArrowUp") => "MoveToBeginningOfDocumentAndModifySelection",
+        (META_SHIFT, "ArrowDown") => "MoveToEndOfDocumentAndModifySelection",
+        (META_SHIFT, "ArrowLeft") => "MoveToLeftEndOfLineAndModifySelection",
+        (META_SHIFT, "ArrowRight") => "MoveToRightEndOfLineAndModifySelection",
+        _ => return None,
+    };
+    Some(command)
+}
+
+/// A modifier: the bit it holds down, and the key event that holds it.
+///
+/// These do not go through `key_spec`, which refuses a modifier on its own —
+/// correct for `Press`, which sends one key, and wrong here, where holding one
+/// while another goes down is the entire point.
+fn modifier_spec(name: &str) -> Option<(i64, KeySpec)> {
+    let (bit, key, code, vk) = match name {
+        "alt" | "option" => (ALT, "Alt", "AltLeft", 18),
+        "control" | "ctrl" => (CONTROL, "Control", "ControlLeft", 17),
+        "meta" | "cmd" | "command" | "win" | "super" => (META, "Meta", "MetaLeft", 91),
+        "shift" => (SHIFT, "Shift", "ShiftLeft", 16),
+        _ => return None,
+    };
+    Some((
+        bit,
+        KeySpec {
+            key: key.to_string(),
+            code: code.to_string(),
+            vk,
+            text: None,
+        },
+    ))
+}
+
+/// The steps that press and release one key.
+pub fn press_steps(name: &str) -> Result<Vec<KeyStep>, String> {
+    let spec = key_spec(name)?;
+    let kind = if spec.is_printable() {
+        KeyStepKind::Down
+    } else {
+        KeyStepKind::DownRaw
+    };
+    Ok(vec![
+        KeyStep {
+            kind,
+            spec: spec.clone(),
+            modifiers: 0,
+        },
+        KeyStep {
+            kind: KeyStepKind::Up,
+            spec,
+            modifiers: 0,
+        },
+    ])
+}
+
+/// The steps that hold modifiers, press one key, and let go.
+///
+/// The order matters and so do the masks: a modifier that is not yet held when
+/// the main key goes down is not a combination, and the key-up carries the
+/// modifiers that were still held. That is what the browser reads, and what
+/// makes Control+A select rather than type an "a".
+pub fn hotkey_steps(keys: &[String]) -> Result<Vec<KeyStep>, String> {
+    if keys.is_empty() {
+        return Err("a hotkey needs at least one key".to_string());
+    }
+
+    let mut held: Vec<(i64, KeySpec)> = Vec::new();
+    let mut main: Option<KeySpec> = None;
+    for key in keys {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err("a hotkey has an empty key name in it".to_string());
+        }
+        if let Some((bit, spec)) = modifier_spec(&trimmed.to_lowercase()) {
+            held.push((bit, spec));
+            continue;
+        }
+        if main.is_some() {
+            return Err(format!(
+                "`{trimmed}` is a second key to press: a hotkey modifies one key, so send the \
+                 others one at a time"
+            ));
+        }
+        main = Some(key_spec(trimmed)?);
+    }
+
+    let Some(spec) = main else {
+        return Err("a combination needs a key to modify (e.g. [\"ctrl\", \"a\"])".to_string());
+    };
+
+    let mut steps = Vec::with_capacity(held.len() * 2 + 2);
+    let mut mask = 0i64;
+    for (bit, modifier) in &held {
+        mask |= bit;
+        steps.push(KeyStep {
+            kind: KeyStepKind::DownRaw,
+            spec: modifier.clone(),
+            modifiers: mask,
+        });
+    }
+
+    let down = if spec.is_printable() {
+        KeyStepKind::Down
+    } else {
+        KeyStepKind::DownRaw
+    };
+    steps.push(KeyStep {
+        kind: down,
+        spec: spec.clone(),
+        modifiers: mask,
+    });
+    steps.push(KeyStep {
+        kind: KeyStepKind::Up,
+        spec,
+        modifiers: mask,
+    });
+
+    for (bit, modifier) in held.iter().rev() {
+        mask &= !bit;
+        steps.push(KeyStep {
+            kind: KeyStepKind::Up,
+            spec: modifier.clone(),
+            modifiers: mask,
+        });
+    }
+
+    Ok(steps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +502,110 @@ mod tests {
         assert!(refused.contains("Frobnicate"), "{refused}");
         assert!(refused.contains("Enter"), "{refused}");
         assert!(key_spec("").is_err());
+    }
+
+    #[test]
+    fn a_hotkey_holds_its_modifier_while_the_key_goes_down() {
+        let steps = hotkey_steps(&["ctrl".to_string(), "a".to_string()]).unwrap();
+        let shape: Vec<(KeyStepKind, String, i64)> = steps
+            .iter()
+            .map(|s| (s.kind, s.spec.key.clone(), s.modifiers))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (KeyStepKind::DownRaw, "Control".to_string(), 2),
+                (KeyStepKind::Down, "a".to_string(), 2),
+                (KeyStepKind::Up, "a".to_string(), 2),
+                (KeyStepKind::Up, "Control".to_string(), 0),
+            ]
+        );
+        // The character is carried on the main key, not the modifier.
+        assert_eq!(steps[1].spec.text.as_deref(), Some("a"));
+        assert_eq!(steps[0].spec.text, None, "a modifier types nothing");
+    }
+
+    #[test]
+    fn a_hotkey_with_a_key_that_types_nothing_stays_raw() {
+        let steps = hotkey_steps(&["shift".to_string(), "Enter".to_string()]).unwrap();
+        assert_eq!(steps[0].kind, KeyStepKind::DownRaw);
+        assert_eq!(steps[1].kind, KeyStepKind::Down, "Enter carries its CR");
+        assert_eq!(steps[1].modifiers, 8);
+    }
+
+    #[test]
+    fn several_modifiers_accumulate_and_release_in_reverse() {
+        let steps = hotkey_steps(&[
+            "ctrl".to_string(),
+            "shift".to_string(),
+            "Escape".to_string(),
+        ])
+        .unwrap();
+        let mask: Vec<i64> = steps.iter().map(|s| s.modifiers).collect();
+        // Ctrl down (2), Shift joins it (10), the main key and its release
+        // carry both, then Shift goes first (2 — Ctrl is still held) and Ctrl
+        // last (0).
+        assert_eq!(mask, vec![2, 10, 10, 10, 2, 0]);
+        assert_eq!(steps.iter().filter(|s| s.kind == KeyStepKind::Up).count(), 3);
+    }
+
+    #[test]
+    fn a_hotkey_needs_a_key_to_modify() {
+        let refused = hotkey_steps(&["ctrl".to_string()]).unwrap_err();
+        assert!(refused.contains("needs a key to modify"), "{refused}");
+        assert!(hotkey_steps(&[]).unwrap_err().contains("at least one"));
+    }
+
+    #[test]
+    fn a_hotkey_takes_one_key_at_a_time() {
+        // Two main keys is two combinations, and sending them as one would
+        // press the second while the first is still down.
+        let refused =
+            hotkey_steps(&["ctrl".to_string(), "a".to_string(), "b".to_string()]).unwrap_err();
+        assert!(refused.contains("second key"), "{refused}");
+        assert!(refused.contains("one at a time"), "{refused}");
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_hotkey_is_refused() {
+        assert!(hotkey_steps(&["ctrl".to_string(), "Frobnicate".to_string()]).is_err());
+        assert!(hotkey_steps(&["".to_string()]).is_err());
+    }
+
+    #[test]
+    fn a_single_press_is_a_down_and_an_up() {
+        let steps = press_steps("Tab").unwrap();
+        assert_eq!(steps[0].kind, KeyStepKind::DownRaw);
+        assert_eq!(steps[1].kind, KeyStepKind::Up);
+        assert!(press_steps("Frobnicate").is_err());
+    }
+
+    #[test]
+    fn a_mac_editing_shortcut_carries_its_command() {
+        // Cmd+A selects all; the event alone does not make that happen.
+        assert_eq!(editing_command(META, "KeyA"), Some("SelectAll"));
+        assert_eq!(editing_command(META, "KeyC"), Some("Copy"));
+        assert_eq!(editing_command(META, "KeyV"), Some("Paste"));
+        assert_eq!(editing_command(META, "KeyZ"), Some("Undo"));
+        assert_eq!(editing_command(META_SHIFT, "KeyZ"), Some("Redo"));
+    }
+
+    #[test]
+    fn control_a_on_mac_is_not_select_all() {
+        // It moves the caret, and saying so is better than leaving a caller to
+        // conclude the combination was delivered wrongly.
+        assert_eq!(editing_command(CONTROL, "KeyA"), Some("MoveToBeginningOfParagraph"));
+        assert_ne!(editing_command(CONTROL, "KeyA"), Some("SelectAll"));
+    }
+
+    #[test]
+    fn an_unbound_combination_has_no_command() {
+        assert_eq!(editing_command(META, "KeyB"), None);
+        assert_eq!(editing_command(0, "KeyA"), None, "a bare a types");
+        assert_eq!(
+            editing_command(META | CONTROL, "KeyA"),
+            None,
+            "extra modifiers make it a different shortcut"
+        );
     }
 }

@@ -170,6 +170,8 @@ pub enum BrowserAction {
     },
     /// Press a key on the page
     Press { key: String },
+    /// Press a combination: modifiers held while one key goes down
+    Hotkey { keys: Vec<String> },
     /// Drag an element to another element, or by an offset
     Drag {
         selector: String,

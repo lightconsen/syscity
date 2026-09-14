@@ -630,3 +630,57 @@ async fn test_browser_drag_reaches_pointer_listeners() {
         "no pointermove carried the held button: {text:?} | all results: {results:?}"
     );
 }
+
+/// A hotkey is a combination, not two keystrokes in a row.
+///
+/// Control+A with the modifier held selects the field's contents; pressing
+/// Control and then A does not. That difference lives entirely in the
+/// `modifiers` mask each event carries, so this is the assertion that tells the
+/// two implementations apart.
+#[tokio::test]
+#[serial]
+async fn test_browser_hotkey_selects_all() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    // Select-all is Cmd+A on macOS and Ctrl+A elsewhere. The mechanism under
+    // test is the same one; the combination has to be the one the platform
+    // actually binds, or the test would be asserting that a shortcut macOS does
+    // not have fails to work.
+    let modifier = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [
+            { "navigate": { "url": "data:text/html,<html><body><input id='field' type='text' value='selectme'><div id='log'>none</div></body></html>" } },
+            { "click": { "selector": "#field" } },
+            { "hotkey": { "keys": [modifier, "a"] } },
+            { "execute_script": { "script": "const el = document.activeElement; return String(el.selectionStart) + '-' + String(el.selectionEnd)" } }
+        ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "hotkey failed: {:?}", result.error);
+    let data = result.data.expect("expected data");
+    let results = data
+        .get("results")
+        .expect("results")
+        .as_array()
+        .expect("array");
+    let selection = results[3]
+        .get("Ok")
+        .and_then(|v| v.get("result"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        selection, "0-8",
+        "{modifier}+A did not select the field — selection was {selection:?}"
+    );
+}
