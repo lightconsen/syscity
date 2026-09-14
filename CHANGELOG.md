@@ -14,44 +14,20 @@ if no section matches, the release falls back to auto-generated notes.
 ## [0.3.6] - 2026-09-14
 
 ### Added
-
-- feat(android): observe the screen and the UI tree together
-- feat(android): chain taps into one dispatch for transient UI
-- feat(android): re-check a tap target against the live screen before dispatching
-- feat(security): thread RequestContext through the WS dispatch surface
+- Android observation via `android_observe`: returns the numbered actionable UI elements and a screenshot from one call, reports the pixel size of each, and warns when the screenshot and the UI tree describe different screens.
+- `android_input` can tap by element index using `target`; the target is re-read from the live screen and the tap is refused if the element moved, is no longer clickable, is disabled, or does not match `target_description`.
+- `android_input` supports `sequence` for dispatching multiple coordinate taps in a single adb command, useful for controls that auto-fade before the next turn.
+- Android text input now escapes device-shell metacharacters, turns newlines into Enter key events, and types non-ASCII via ADBKeyboard when active; otherwise it fails with actionable guidance instead of silently mangling the text.
+- `android_ui_tree` now returns a numbered list of actionable elements with class, labels, center, bounds, and clickability/enabled state, rather than raw XML.
 
 ### Fixed
-
-- fix(android): honour the `device` argument instead of ignoring it
-- fix(android): say why a UI dump failed, and what to do instead
-- fix(android): escape text input, and stop mangling non-ASCII
-- fix(test): use the setter instead of the now-private sandbox field
-- fix(ci): repair the serde_norway fallout
-- fix(test): stop gateway tests writing to the real ~/.syscity
-
-### Changed
-
-- chore: stop shipping machine-specific paths
-- docs(research): add Artemis Android-automation notes
-- refactor(tools): stop resolving workspace dirs at construction
-- refactor(dirs): let syscity::init install the process root
-- test: assert public constructors need no installed path root
-- refactor(tools): resolve the todos dir lazily, not at construction
-- chore(deps): replace serde_yml with serde_norway (RUSTSEC-2025-0068)
-- chore(deps): bump ratatui 0.29 → 0.30, dropping vulnerable lru
-- chore(deps): bump event-listener to 5.4.2 (RUSTSEC-2026-0221)
-- refactor(dirs): close out the paths injection (plugin manager, sign, fallout)
-- refactor(dirs): inject SyscityPaths into Agent and the remaining gateway sites
-- refactor(dirs): inject SyscityPaths into GoalRunner
-- refactor(dirs): inject the plugin state root into PluginRuntime
-- refactor(dirs): inject SyscityPaths into memory tools, quality gate and remote control
-- refactor(dirs): inject SyscityPaths into the tool registry, connectors and skills
-- refactor(dirs): inject SyscityPaths into the KB watcher and task-state tool
-- refactor(dirs): require an explicit root, install one at each entry point
-- refactor(dirs): thread SyscityPaths through agent discovery
-- refactor(dirs): resolve paths off state in gateway handlers
-- refactor: unify background actor on "system"
-- refactor(security): route WS audit through RequestContext
+- The `device` argument is now honored by `android_screenshot`, `android_observe`, `android_input`, `android_app_manager`, and `android_ui_tree`; each result reports the serial actually acted on, and invalid device values are refused rather than silently falling back.
+- Android screenshots are now returned as valid PNG bytes instead of being corrupted by text encoding.
+- Android UI dump failures now classify the likely cause (device offline, unsettled screen, secure window, disabled accessibility service) and point to the screenshot fallback for continued work.
+- Empty Android UI trees now explain that the screen is likely a game, canvas, or secure surface and recommend using the screenshot, rather than reporting an unexplained failure.
+- Fixed matching for the common adb error `device 'emulator-5554' not found`.
+- Tracked scripts and generated Android build files no longer leak machine-specific absolute paths.
+- Removed vulnerable dependencies by replacing `serde_yml` with `serde_norway`, upgrading `ratatui` to 0.30, and bumping `event-listener` to a patched release.
 
 ## [0.3.5] - 2026-09-11
 
