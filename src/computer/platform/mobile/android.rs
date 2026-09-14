@@ -221,6 +221,21 @@ impl AdbInputTool {
             _ => false,
         }
     }
+
+    /// Re-read the tree and turn an element index into a tap point.
+    ///
+    /// Costs one extra dump, which is the point: tapping the coordinates from an
+    /// earlier read silently hits whatever has moved into place since.
+    async fn resolve_tap_target(
+        &self,
+        index: usize,
+        description: Option<&str>,
+    ) -> Result<(i32, i32), String> {
+        let elements = dump_ui_elements(&self.device)
+            .await
+            .map_err(|e| e.to_string())?;
+        validate_target(&elements, index, description).map(|e| e.center)
+    }
 }
 
 /// Quote a string as a single shell word for the *device* shell.
@@ -281,7 +296,10 @@ impl Tool for AdbInputTool {
     }
 
     fn description(&self) -> &str {
-        "Send tap, swipe, text, or key events to an Android device via ADB."
+        "Send tap, swipe, text, or key events to an Android device via ADB. For taps prefer \
+         `target` (an element index from android_ui_tree): it is re-read from the live screen \
+         before dispatch, so a screen that changed under you is reported instead of silently \
+         tapping the wrong thing."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -293,8 +311,16 @@ impl Tool for AdbInputTool {
                     "description": "tap | swipe | text | key",
                     "enum": ["tap", "swipe", "text", "key"]
                 },
-                "x": { "type": "integer", "description": "X coordinate (tap/swipe)" },
-                "y": { "type": "integer", "description": "Y coordinate (tap/swipe)" },
+                "target": {
+                    "type": "integer",
+                    "description": "Element index from android_ui_tree. Preferred over x/y for taps: the element is re-read from the live screen and the tap is refused if it moved, changed, or is not clickable."
+                },
+                "target_description": {
+                    "type": "string",
+                    "description": "Optional label you expect at `target`. A mismatch refuses the tap and reports what is actually there."
+                },
+                "x": { "type": "integer", "description": "X coordinate (tap/swipe). No safety net — prefer `target`." },
+                "y": { "type": "integer", "description": "Y coordinate (tap/swipe). No safety net — prefer `target`." },
                 "x2": { "type": "integer", "description": "End X (swipe)" },
                 "y2": { "type": "integer", "description": "End Y (swipe)" },
                 "text": { "type": "string", "description": "Text to type" },
@@ -314,9 +340,23 @@ impl Tool for AdbInputTool {
 
         let shell_cmd = match action {
             "tap" => {
-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-                format!("input tap {} {}", x, y)
+                match args.get("target").and_then(|v| v.as_u64()) {
+                    // Preferred: an element index, re-checked against the live
+                    // screen before anything is dispatched.
+                    Some(index) => {
+                        let description = args.get("target_description").and_then(|v| v.as_str());
+                        match self.resolve_tap_target(index as usize, description).await {
+                            Ok((x, y)) => format!("input tap {} {}", x, y),
+                            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+                        }
+                    }
+                    // Raw coordinates: no safety net, the caller is on its own.
+                    None => {
+                        let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                        format!("input tap {} {}", x, y)
+                    }
+                }
             }
             "swipe" => {
                 let x1 = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -519,18 +559,6 @@ impl AdbUiTreeTool {
         self.device = Some(device);
         self
     }
-
-    fn adb_args(&self, base: &[&str]) -> Vec<String> {
-        let mut args = Vec::new();
-        if let Some(d) = &self.device {
-            args.push("-s".to_string());
-            args.push(d.clone());
-        }
-        for a in base {
-            args.push(a.to_string());
-        }
-        args
-    }
 }
 
 /// One node of the Android accessibility tree, flattened for the model.
@@ -648,6 +676,125 @@ fn format_ui_summary(elements: &[UiElement]) -> String {
     lines.join("\n")
 }
 
+/// Loose label comparison for the safety net.
+///
+/// The model's description is free text, so accept a case-insensitive substring
+/// match in either direction. An element with no label at all cannot be checked
+/// and passes — refusing there would block icon buttons the model identified
+/// from the screenshot.
+fn label_matches(label: &str, description: &str) -> bool {
+    let label = label.trim();
+    if label.is_empty() {
+        return true;
+    }
+    let description = description.trim();
+    if description.is_empty() {
+        return false;
+    }
+    let (l, d) = (label.to_lowercase(), description.to_lowercase());
+    l.contains(&d) || d.contains(&l)
+}
+
+/// Resolve an element index against a freshly-read tree, without any I/O.
+///
+/// This is the safety net: the index came from an earlier `android_ui_tree`
+/// result, and the screen may have changed since. Tapping the *coordinates* of a
+/// stale read silently hits whatever has since moved into place, so an indexed
+/// tap re-reads and validates first, and refuses with a reason the model can act
+/// on rather than clicking blind.
+fn validate_target<'a>(
+    elements: &'a [UiElement],
+    index: usize,
+    description: Option<&str>,
+) -> Result<&'a UiElement, String> {
+    if index == 0 {
+        return Err("Element indices are 1-based; 0 does not exist.".to_string());
+    }
+    let element = elements.get(index - 1).ok_or_else(|| {
+        format!(
+            "No element {index} on screen now — the UI has {} element(s). Re-read it with \
+             android_ui_tree.",
+            elements.len()
+        )
+    })?;
+
+    if let Some(description) = description {
+        let label = element
+            .text
+            .as_deref()
+            .or(element.content_desc.as_deref())
+            .unwrap_or("");
+        if !label_matches(label, description) {
+            return Err(format!(
+                "Refused: element {index} is {label:?}, not {description:?} — the screen changed. \
+                 Re-read it with android_ui_tree rather than tapping stale coordinates."
+            ));
+        }
+    }
+    if !element.clickable {
+        return Err(format!("Refused: element {index} ({}) is not clickable.", element.class));
+    }
+    if !element.enabled {
+        return Err(format!("Refused: element {index} is disabled."));
+    }
+    Ok(element)
+}
+
+/// Dump and parse the device's current UI tree.
+///
+/// Shared by `android_ui_tree` and the safety net in `android_input` so both see
+/// the same enumeration.
+async fn dump_ui_elements(device: &Option<String>) -> crate::Result<Vec<UiElement>> {
+    let mut prefix: Vec<String> = Vec::new();
+    if let Some(serial) = device {
+        prefix.push("-s".to_string());
+        prefix.push(serial.clone());
+    }
+    let argv = |base: &[&str]| -> Vec<String> {
+        let mut v = prefix.clone();
+        v.extend(base.iter().map(|s| s.to_string()));
+        v
+    };
+    let run = |args: Vec<String>| {
+        let args: Vec<String> = args;
+        async move { run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await }
+    };
+
+    // `uiautomator dump` writes to a device file, which then has to be pulled.
+    let dump = argv(&["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"]);
+    let (status, _, stderr) =
+        run(dump)
+            .await
+            .map_err(|e| crate::error::SyscityError::ExternalService {
+                source: "adb uiautomator dump failed".to_string(),
+                cause: Some(Box::new(e)),
+            })?;
+    if !status.success() {
+        return Err(crate::error::SyscityError::ExternalService {
+            source: format!("uiautomator dump failed: {stderr}"),
+            cause: None,
+        });
+    }
+
+    let pull = argv(&["pull", "/sdcard/window_dump.xml", "-"]);
+    let (status, stdout, stderr) =
+        run(pull)
+            .await
+            .map_err(|e| crate::error::SyscityError::ExternalService {
+                source: "adb pull failed".to_string(),
+                cause: Some(Box::new(e)),
+            })?;
+    if !status.success() {
+        return Err(crate::error::SyscityError::ExternalService {
+            source: format!("adb pull failed: {stderr}"),
+            cause: None,
+        });
+    }
+
+    parse_uiautomator_xml(&stdout)
+        .map_err(|source| crate::error::SyscityError::ExternalService { source, cause: None })
+}
+
 #[async_trait]
 impl Tool for AdbUiTreeTool {
     fn name(&self) -> &str {
@@ -676,39 +823,12 @@ impl Tool for AdbUiTreeTool {
         _args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        // Dump to device /sdcard/window_dump.xml, then pull it.
-        let dump_args = self.adb_args(&["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"]);
-        let (status, _, stderr) =
-            run_cmd("adb", &dump_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                .await
-                .map_err(|e| crate::error::SyscityError::ExternalService {
-                    source: "adb uiautomator dump failed".to_string(),
-                    cause: Some(Box::new(e)),
-                })?;
-
-        if !status.success() {
-            return Ok(ToolExecutionResult::error(format!("uiautomator dump failed: {}", stderr)));
-        }
-
-        let pull_args = self.adb_args(&["pull", "/sdcard/window_dump.xml", "-"]);
-        let (status, stdout, stderr) =
-            run_cmd("adb", &pull_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                .await
-                .map_err(|e| crate::error::SyscityError::ExternalService {
-                    source: "adb pull failed".to_string(),
-                    cause: Some(Box::new(e)),
-                })?;
-
-        if !status.success() {
-            return Ok(ToolExecutionResult::error(format!("adb pull failed: {}", stderr)));
-        }
-
         // The raw dump is an order of magnitude larger than what the model can
         // use, and the model would have to parse `bounds` itself to act on it.
         // Hand back an indexed list instead; the XML stays out of the context.
-        let elements = match parse_uiautomator_xml(&stdout) {
+        let elements = match dump_ui_elements(&self.device).await {
             Ok(e) => e,
-            Err(e) => return Ok(ToolExecutionResult::error(e)),
+            Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
         let summary = format_ui_summary(&elements);
         Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
@@ -1039,6 +1159,86 @@ mod tests {
         let els = parse_uiautomator_xml("<hierarchy rotation=\"0\"/>").unwrap();
         assert!(els.is_empty());
         assert_eq!(format_ui_summary(&els), "UI tree has no actionable elements");
+    }
+
+    // ── Tap safety net ──────────────────────────────────────────────────
+    //
+    // An indexed tap re-reads the tree and validates before dispatching. All of
+    // that decision-making is `validate_target`, which needs no device.
+
+    fn element(index: usize, text: Option<&str>, class: &str) -> UiElement {
+        UiElement {
+            index,
+            text: text.map(str::to_string),
+            content_desc: None,
+            resource_id: None,
+            class: class.to_string(),
+            clickable: true,
+            enabled: true,
+            bounds: (0, 0, 10, 10),
+            center: (5, 5),
+        }
+    }
+
+    #[test]
+    fn valid_index_resolves_to_its_center() {
+        let els = vec![element(1, Some("登录"), "Button")];
+        let target = validate_target(&els, 1, None).expect("valid");
+        assert_eq!(target.center, (5, 5));
+    }
+
+    #[test]
+    fn index_zero_is_rejected() {
+        let els = vec![element(1, Some("登录"), "Button")];
+        let err = validate_target(&els, 0, None).unwrap_err();
+        assert!(err.contains("1-based"), "{err}");
+    }
+
+    #[test]
+    fn an_index_past_the_end_says_how_many_there_are() {
+        let els = vec![element(1, Some("a"), "Button")];
+        let err = validate_target(&els, 7, None).unwrap_err();
+        assert!(err.contains("No element 7"), "{err}");
+        assert!(err.contains("1 element(s)"), "{err}");
+    }
+
+    #[test]
+    fn a_description_mismatch_refuses_and_names_both() {
+        // This is the case the safety net exists for: the model is aiming at
+        // something that is no longer at that index.
+        let els = vec![element(1, Some("注册"), "Button")];
+        let err = validate_target(&els, 1, Some("登录")).unwrap_err();
+        assert!(err.contains("Refused"), "{err}");
+        assert!(err.contains("\"注册\""), "{err}");
+        assert!(err.contains("\"登录\""), "{err}");
+    }
+
+    #[test]
+    fn a_matching_description_passes_loosely() {
+        let els = vec![element(1, Some("Login with phone"), "Button")];
+        assert!(validate_target(&els, 1, Some("login")).is_ok(), "case-insensitive substring");
+        assert!(validate_target(&els, 1, Some("Login with phone")).is_ok(), "exact");
+    }
+
+    #[test]
+    fn an_unlabelled_element_cannot_be_checked_but_passes() {
+        // An icon button identified from the screenshot has no text to match;
+        // refusing there would block a legitimate tap.
+        let els = vec![element(1, None, "ImageButton")];
+        assert!(validate_target(&els, 1, Some("back arrow")).is_ok());
+    }
+
+    #[test]
+    fn non_clickable_and_disabled_targets_are_refused() {
+        let mut no_click = element(1, Some("标题"), "TextView");
+        no_click.clickable = false;
+        let err = validate_target(&[no_click], 1, None).unwrap_err();
+        assert!(err.contains("not clickable"), "{err}");
+
+        let mut disabled = element(1, Some("提交"), "Button");
+        disabled.enabled = false;
+        let err = validate_target(&[disabled], 1, None).unwrap_err();
+        assert!(err.contains("disabled"), "{err}");
     }
 
     #[test]
