@@ -11,6 +11,48 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-09-14
+
+### Added
+
+- feat(android): observe the screen and the UI tree together
+- feat(android): chain taps into one dispatch for transient UI
+- feat(android): re-check a tap target against the live screen before dispatching
+- feat(security): thread RequestContext through the WS dispatch surface
+
+### Fixed
+
+- fix(android): honour the `device` argument instead of ignoring it
+- fix(android): say why a UI dump failed, and what to do instead
+- fix(android): escape text input, and stop mangling non-ASCII
+- fix(test): use the setter instead of the now-private sandbox field
+- fix(ci): repair the serde_norway fallout
+- fix(test): stop gateway tests writing to the real ~/.syscity
+
+### Changed
+
+- chore: stop shipping machine-specific paths
+- docs(research): add Artemis Android-automation notes
+- refactor(tools): stop resolving workspace dirs at construction
+- refactor(dirs): let syscity::init install the process root
+- test: assert public constructors need no installed path root
+- refactor(tools): resolve the todos dir lazily, not at construction
+- chore(deps): replace serde_yml with serde_norway (RUSTSEC-2025-0068)
+- chore(deps): bump ratatui 0.29 → 0.30, dropping vulnerable lru
+- chore(deps): bump event-listener to 5.4.2 (RUSTSEC-2026-0221)
+- refactor(dirs): close out the paths injection (plugin manager, sign, fallout)
+- refactor(dirs): inject SyscityPaths into Agent and the remaining gateway sites
+- refactor(dirs): inject SyscityPaths into GoalRunner
+- refactor(dirs): inject the plugin state root into PluginRuntime
+- refactor(dirs): inject SyscityPaths into memory tools, quality gate and remote control
+- refactor(dirs): inject SyscityPaths into the tool registry, connectors and skills
+- refactor(dirs): inject SyscityPaths into the KB watcher and task-state tool
+- refactor(dirs): require an explicit root, install one at each entry point
+- refactor(dirs): thread SyscityPaths through agent discovery
+- refactor(dirs): resolve paths off state in gateway handlers
+- refactor: unify background actor on "system"
+- refactor(security): route WS audit through RequestContext
+
 ## [0.3.5] - 2026-09-11
 
 ### Added

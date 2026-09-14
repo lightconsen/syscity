@@ -8271,7 +8271,7 @@ dependencies = [
 
 [[package]]
 name = "syscity"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -8381,7 +8381,7 @@ dependencies = [
 
 [[package]]
 name = "syscity-desktop"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "rand 0.8.6",
