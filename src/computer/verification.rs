@@ -21,9 +21,9 @@ pub enum VerificationCriteria {
     /// UI tree must contain an element with the given role (and optionally
     /// label).
     UiTreeContains { role: String, label: Option<String> },
-    /// Screenshot must differ from the baseline by no more than
-    /// `max_pixel_diff`. A baseline is captured automatically before the
-    /// action.
+    /// Screenshot must differ from the baseline by **more** than
+    /// `max_pixel_diff` — something visible has to have changed. A baseline is
+    /// captured automatically before the action.
     ScreenshotChanged { max_pixel_diff: u32 },
     /// Screenshot must be stable (two consecutive screenshots differ by no more
     /// than `max_pixel_diff`). Useful after waiting for animations to finish.
@@ -62,6 +62,14 @@ impl Default for VerificationConfig {
             baseline_delay_ms: 200,
         }
     }
+}
+
+/// Whether a screenshot difference satisfies `ScreenshotChanged`.
+///
+/// The direction is the whole content of the check: a criterion named for
+/// change is satisfied by a difference *larger* than the threshold.
+fn changed_beyond(diff: u32, max_pixel_diff: u32) -> bool {
+    diff > max_pixel_diff
 }
 
 /// Execute actions and verify their outcomes.
@@ -265,7 +273,7 @@ impl VerificationEngine {
                 })?;
                 let after = self.adapter.screenshot(None).await?;
                 let diff = compute_screenshot_diff(before, &after);
-                Ok(diff <= *max_pixel_diff)
+                Ok(changed_beyond(diff, *max_pixel_diff))
             }
             VerificationCriteria::ScreenshotStable { max_pixel_diff, poll_ms } => {
                 let first = self.adapter.screenshot(None).await?;
@@ -348,6 +356,25 @@ fn compute_screenshot_diff(a: &Screenshot, b: &Screenshot) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a screenshot difference satisfies `ScreenshotChanged`.
+    ///
+    /// Separate and named because the direction is the entire content of the
+    /// check — and it was the wrong way round. The criterion passed when the
+    /// difference was *at or below* the threshold, which is the question
+    /// `ScreenshotStable` asks, so a check named for change was satisfied by a
+    /// screen that had not moved.
+    #[test]
+    fn screenshot_changed_means_changed() {
+        assert!(changed_beyond(1, 0));
+        assert!(changed_beyond(4_000, 100));
+        assert!(changed_beyond(101, 100));
+
+        // Unchanged is the case that used to pass.
+        assert!(!changed_beyond(0, 0));
+        // At the threshold is not beyond it.
+        assert!(!changed_beyond(100, 100));
+    }
 
     #[test]
     fn test_verification_config_default() {

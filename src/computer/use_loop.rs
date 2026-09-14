@@ -67,7 +67,7 @@ pub struct StepRecord {
     pub step: usize,
     pub action: DesktopAction,
     pub result: ActionResult,
-    pub verified: bool,
+    pub verification: StepVerification,
     pub screenshot_before: Option<Screenshot>,
     pub screenshot_after: Option<Screenshot>,
     /// Number of snapshots taken before this step (for undo / rollback).
@@ -91,6 +91,45 @@ pub struct LoopState {
     pub last_error: Option<String>,
     /// Number of consecutive failed steps.
     pub consecutive_failures: usize,
+}
+
+/// What a verification established about an action.
+///
+/// Three states, because two cannot hold the truth: a check that could not run
+/// is neither a pass nor a failure, and folding it into either invents a fact.
+/// `verify_by_diff` used to fold it into a pass — it answered `true` when it had
+/// no screenshots to compare, so "could not tell" and "it worked" were the same
+/// answer downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepVerification {
+    /// The action's effect was observed.
+    Verified,
+    /// The action did not have the effect it should have had.
+    Failed,
+    /// Nothing was established: the check could not run, or no check exists for
+    /// this action.
+    Unverifiable,
+}
+
+impl StepVerification {
+    /// A `VerificationEngine` answer, whose false means the criterion was
+    /// checked and not met — never "unknown".
+    fn from_checked(verified: bool) -> Self {
+        if verified {
+            StepVerification::Verified
+        } else {
+            StepVerification::Failed
+        }
+    }
+
+    /// Whether this step was actually verified.
+    ///
+    /// Both `Failed` and `Unverifiable` answer false here, which is the right
+    /// answer to "was it verified?" — but they are not the same thing, and the
+    /// enum is what keeps them apart.
+    pub fn verified(self) -> bool {
+        matches!(self, StepVerification::Verified)
+    }
 }
 
 /// Outcome of running the loop.
@@ -372,7 +411,7 @@ impl ComputerUseLoop {
                                 .await
                                 .ok();
 
-                            let verified = if self.config.verify_after_each {
+                            let verification = if self.config.verify_after_each {
                                 self.verify_action(
                                     &action,
                                     &result,
@@ -381,33 +420,47 @@ impl ComputerUseLoop {
                                     screenshot_after.as_ref(),
                                 )
                                 .await
-                                .unwrap_or(false)
+                                // A check that errored established nothing. It
+                                // is not evidence that the action failed.
+                                .unwrap_or(StepVerification::Unverifiable)
                             } else {
-                                true
+                                StepVerification::Unverifiable
                             };
 
-                            if verified {
-                                // Success — reset failure counters and settle delay.
-                                consecutive_failures = 0;
-                                self.rollback_already_triggered
-                                    .store(false, Ordering::Relaxed);
-                                current_settle_delay_ms = self.config.settle_delay_ms;
-                            } else {
-                                consecutive_failures += 1;
+                            match verification {
+                                StepVerification::Verified => {
+                                    consecutive_failures = 0;
+                                    self.rollback_already_triggered
+                                        .store(false, Ordering::Relaxed);
+                                    current_settle_delay_ms = self.config.settle_delay_ms;
+                                    last_error = None;
+                                }
+                                StepVerification::Failed => {
+                                    consecutive_failures += 1;
+                                    last_error = Some("Verification failed".to_string());
+                                }
+                                // Neither counter moves: counting it as a
+                                // failure would roll back work that may be
+                                // fine, and counting it as a success would
+                                // reset the failures that were real. The
+                                // previous error, if any, stands.
+                                StepVerification::Unverifiable => {
+                                    tracing::info!(
+                                        "verification: nothing established for this step"
+                                    );
+                                }
                             }
-
-                            last_verified = Some(verified);
-                            last_error = if verified {
-                                None
-                            } else {
-                                Some("Verification failed".to_string())
+                            last_verified = match verification {
+                                StepVerification::Verified => Some(true),
+                                StepVerification::Failed => Some(false),
+                                StepVerification::Unverifiable => None,
                             };
 
                             history.push(StepRecord {
                                 step,
                                 action,
                                 result,
-                                verified,
+                                verification,
                                 screenshot_before,
                                 screenshot_after,
                                 snapshots_taken,
@@ -446,7 +499,9 @@ impl ComputerUseLoop {
                                 step,
                                 action,
                                 result: ActionResult::error(e.to_string()),
-                                verified: false,
+                                // The action itself errored: that is a failure, not
+                                // an absent check.
+                                verification: StepVerification::Failed,
                                 screenshot_before,
                                 screenshot_after: None,
                                 snapshots_taken,
@@ -474,8 +529,6 @@ impl ComputerUseLoop {
     /// use the [`VerificationEngine`]; other screen-mutating actions are
     /// verified by diffing the pre/post [`ScreenState`] — if nothing visible
     /// changed, the action likely did not land.
-    ///
-    /// Returns `true` if the action appears to have succeeded.
     async fn verify_action(
         &self,
         action: &DesktopAction,
@@ -483,11 +536,11 @@ impl ComputerUseLoop {
         tree_before: Option<&[UiElement]>,
         screenshot_before: Option<&Screenshot>,
         screenshot_after: Option<&Screenshot>,
-    ) -> Result<bool> {
+    ) -> Result<StepVerification> {
         match action {
             DesktopAction::Screenshot { .. } => {
-                // Screenshots are self-verifying.
-                Ok(true)
+                // A screenshot is the thing the action was for.
+                Ok(StepVerification::Verified)
             }
             DesktopAction::LaunchApp { name, wait_for_ready, .. } => {
                 if *wait_for_ready {
@@ -498,27 +551,31 @@ impl ComputerUseLoop {
                             None,
                         )
                         .await
+                        .map(StepVerification::from_checked)
                 } else {
-                    Ok(true)
+                    // The caller asked not to wait for it, so nothing was
+                    // checked.
+                    Ok(StepVerification::Unverifiable)
                 }
             }
-            DesktopAction::Wait { .. } => Ok(true),
-            DesktopAction::ActivateWindow { title_pattern } => {
-                self.verifier
-                    .verify(
-                        &VerificationCriteria::WindowTitleContains {
-                            pattern: title_pattern.clone(),
-                        },
-                        &ActionResult::success(""),
-                        None,
-                    )
-                    .await
-            }
+            DesktopAction::Wait { .. } => Ok(StepVerification::Verified),
+            DesktopAction::ActivateWindow { title_pattern } => self
+                .verifier
+                .verify(
+                    &VerificationCriteria::WindowTitleContains { pattern: title_pattern.clone() },
+                    &ActionResult::success(""),
+                    None,
+                )
+                .await
+                .map(StepVerification::from_checked),
             _ if crate::computer::vision::is_screen_mutating_action(action) => {
                 self.verify_by_diff(tree_before, screenshot_before, screenshot_after)
                     .await
             }
-            _ => Ok(true), // Other actions: assume success.
+            // No check exists for this action. Saying so is the only honest
+            // option: the previous `Ok(true)` here was a claim of success that
+            // nothing had established.
+            _ => Ok(StepVerification::Unverifiable),
         }
     }
 
@@ -530,13 +587,15 @@ impl ComputerUseLoop {
         tree_before: Option<&[UiElement]>,
         screenshot_before: Option<&Screenshot>,
         screenshot_after: Option<&Screenshot>,
-    ) -> Result<bool> {
+    ) -> Result<StepVerification> {
         let (Some(shot_before), Some(shot_after)) = (screenshot_before, screenshot_after) else {
-            // No screenshots available (e.g. headless) — cannot verify.
-            return Ok(true);
+            // No screenshots to compare (e.g. headless). That is not a pass:
+            // nothing was checked, and claiming otherwise is what this enum
+            // exists to stop.
+            return Ok(StepVerification::Unverifiable);
         };
         if shot_before.base64.is_empty() || shot_after.base64.is_empty() {
-            return Ok(true);
+            return Ok(StepVerification::Unverifiable);
         }
 
         let tree_after = self.adapter.read_ui_tree(None).await.unwrap_or_default();
@@ -551,7 +610,11 @@ impl ComputerUseLoop {
         if !changed {
             tracing::info!("verification: no visible change ({})", diff.summary());
         }
-        Ok(changed)
+        Ok(if changed {
+            StepVerification::Verified
+        } else {
+            StepVerification::Failed
+        })
     }
 
     /// Take a screenshot, falling back to an empty placeholder when the
@@ -566,6 +629,48 @@ impl ComputerUseLoop {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_check_that_cannot_run_establishes_nothing() {
+        // The bug this replaces: `verify_by_diff` answered `true` when it had no
+        // screenshots to compare, so "could not tell" and "it worked" were the
+        // same answer, and the loop reset its failure counter on both.
+        let loop_ = ComputerUseLoop::new(Arc::new(
+            crate::computer::headless::HeadlessComputerAdapter::new(),
+        ));
+
+        let outcome = loop_.verify_by_diff(None, None, None).await.unwrap();
+        assert_eq!(outcome, StepVerification::Unverifiable);
+        assert!(!outcome.verified(), "unverifiable is not verified");
+
+        // An empty screenshot is the same situation: nothing to compare.
+        let empty = Screenshot::new(String::new(), 0, 0);
+        let outcome = loop_
+            .verify_by_diff(None, Some(&empty), Some(&empty))
+            .await
+            .unwrap();
+        assert_eq!(outcome, StepVerification::Unverifiable);
+    }
+
+    #[tokio::test]
+    async fn an_action_with_no_check_is_unverifiable_not_successful() {
+        // `_ => Ok(true), // Other actions: assume success.` was a claim of
+        // success that nothing had established.
+        let loop_ = ComputerUseLoop::new(Arc::new(
+            crate::computer::headless::HeadlessComputerAdapter::new(),
+        ));
+        let outcome = loop_
+            .verify_action(
+                &crate::computer::types::DesktopAction::GetSystemStatus,
+                &crate::computer::types::ActionResult::success(""),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, StepVerification::Unverifiable);
+    }
+
     use super::*;
 
     #[test]

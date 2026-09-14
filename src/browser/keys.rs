@@ -33,27 +33,112 @@ impl KeySpec {
     }
 }
 
-/// The named keys, with the values the browser expects.
-///
-/// Only the ones a caller has reason to name: navigation, editing, and the two
-/// keys that carry default behaviour everywhere. The last column is the
-/// character the key produces, where it produces one — Enter does, and that is
-/// not decoration: a real Enter arrives with its carriage return, and Chrome
-/// submits the form on the back of it.
-const NAMED: &[(&[&str], &str, &str, i64, Option<&str>)] = &[
-    (&["enter", "return"], "Enter", "Enter", 13, Some("\r")),
-    (&["tab"], "Tab", "Tab", 9, None),
-    (&["escape", "esc"], "Escape", "Escape", 27, None),
-    (&["backspace"], "Backspace", "Backspace", 8, None),
-    (&["delete", "del"], "Delete", "Delete", 46, None),
-    (&["arrowup", "up"], "ArrowUp", "ArrowUp", 38, None),
-    (&["arrowdown", "down"], "ArrowDown", "ArrowDown", 40, None),
-    (&["arrowleft", "left"], "ArrowLeft", "ArrowLeft", 37, None),
-    (&["arrowright", "right"], "ArrowRight", "ArrowRight", 39, None),
-    (&["home"], "Home", "Home", 36, None),
-    (&["end"], "End", "End", 35, None),
-    (&["pageup", "pgup"], "PageUp", "PageUp", 33, None),
-    (&["pagedown", "pgdn"], "PageDown", "PageDown", 34, None),
+/// A named key: the words that name it, and the values the browser expects.
+struct NamedKey {
+    names: &'static [&'static str],
+    key: &'static str,
+    code: &'static str,
+    vk: i64,
+    /// The character the key produces, where it produces one. Enter does, and
+    /// that is not decoration: a real Enter arrives with its carriage return,
+    /// and Chrome submits the form on the back of it.
+    text: Option<&'static str>,
+}
+
+/// Only the keys a caller has reason to name: navigation, editing, and the two
+/// that carry default behaviour everywhere.
+const NAMED: &[NamedKey] = &[
+    NamedKey {
+        names: &["enter", "return"],
+        key: "Enter",
+        code: "Enter",
+        vk: 13,
+        text: Some("\r"),
+    },
+    NamedKey {
+        names: &["tab"],
+        key: "Tab",
+        code: "Tab",
+        vk: 9,
+        text: None,
+    },
+    NamedKey {
+        names: &["escape", "esc"],
+        key: "Escape",
+        code: "Escape",
+        vk: 27,
+        text: None,
+    },
+    NamedKey {
+        names: &["backspace"],
+        key: "Backspace",
+        code: "Backspace",
+        vk: 8,
+        text: None,
+    },
+    NamedKey {
+        names: &["delete", "del"],
+        key: "Delete",
+        code: "Delete",
+        vk: 46,
+        text: None,
+    },
+    NamedKey {
+        names: &["arrowup", "up"],
+        key: "ArrowUp",
+        code: "ArrowUp",
+        vk: 38,
+        text: None,
+    },
+    NamedKey {
+        names: &["arrowdown", "down"],
+        key: "ArrowDown",
+        code: "ArrowDown",
+        vk: 40,
+        text: None,
+    },
+    NamedKey {
+        names: &["arrowleft", "left"],
+        key: "ArrowLeft",
+        code: "ArrowLeft",
+        vk: 37,
+        text: None,
+    },
+    NamedKey {
+        names: &["arrowright", "right"],
+        key: "ArrowRight",
+        code: "ArrowRight",
+        vk: 39,
+        text: None,
+    },
+    NamedKey {
+        names: &["home"],
+        key: "Home",
+        code: "Home",
+        vk: 36,
+        text: None,
+    },
+    NamedKey {
+        names: &["end"],
+        key: "End",
+        code: "End",
+        vk: 35,
+        text: None,
+    },
+    NamedKey {
+        names: &["pageup", "pgup"],
+        key: "PageUp",
+        code: "PageUp",
+        vk: 33,
+        text: None,
+    },
+    NamedKey {
+        names: &["pagedown", "pgdn"],
+        key: "PageDown",
+        code: "PageDown",
+        vk: 34,
+        text: None,
+    },
 ];
 
 /// Keys that are only meaningful held down while another key is pressed.
@@ -100,15 +185,15 @@ pub fn key_spec(name: &str) -> Result<KeySpec, String> {
         return Ok(space());
     }
 
-    if let Some((_, key, code, vk, text)) = NAMED
+    if let Some(named) = NAMED
         .iter()
-        .find(|(names, _, _, _, _)| names.contains(&lowered.as_str()))
+        .find(|named| named.names.contains(&lowered.as_str()))
     {
         return Ok(KeySpec {
-            key: (*key).to_string(),
-            code: (*code).to_string(),
-            vk: *vk,
-            text: text.map(str::to_string),
+            key: named.key.to_string(),
+            code: named.code.to_string(),
+            vk: named.vk,
+            text: named.text.map(str::to_string),
         });
     }
 
