@@ -21,6 +21,8 @@ pub mod instrument;
 #[cfg(feature = "browser")]
 pub mod network_log;
 #[cfg(feature = "browser")]
+pub mod pointer;
+#[cfg(feature = "browser")]
 pub mod pool;
 #[cfg(feature = "browser")]
 pub mod profile;

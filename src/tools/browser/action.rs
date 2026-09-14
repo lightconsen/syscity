@@ -21,7 +21,13 @@ pub enum BrowserAction {
     /// Navigate to a URL
     Navigate { url: String },
     /// Click on an element
-    Click { selector: String },
+    Click {
+        selector: String,
+        /// left (default), middle or right
+        button: Option<String>,
+        /// 1 (default), 2 for a double click, 3 for a triple
+        click_count: Option<u32>,
+    },
     /// Type text into an input field
     Type {
         selector: String,
@@ -36,7 +42,14 @@ pub enum BrowserAction {
     /// Hover over an element
     Hover { selector: String },
     /// Click at viewport coordinates
-    ClickAt { x: f64, y: f64 },
+    ClickAt {
+        x: f64,
+        y: f64,
+        /// left (default), middle or right
+        button: Option<String>,
+        /// 1 (default), 2 for a double click, 3 for a triple
+        click_count: Option<u32>,
+    },
     /// Get the current page HTML
     GetHtml,
     /// Get text content of the page or specific element
@@ -157,12 +170,25 @@ pub enum BrowserAction {
     },
     /// Press a key on the page
     Press { key: String },
-    /// Drag an element from one point to another
+    /// Drag an element to another element, or by an offset
     Drag {
         selector: String,
         target_selector: Option<String>,
         delta_x: Option<i32>,
         delta_y: Option<i32>,
+        /// Intermediate moves between press and release (default 12)
+        steps: Option<u32>,
+    },
+    /// Drag between viewport coordinates
+    DragAt {
+        from_x: f64,
+        from_y: f64,
+        to_x: f64,
+        to_y: f64,
+        /// Intermediate moves between press and release (default 12)
+        steps: Option<u32>,
+        /// left (default), middle or right
+        button: Option<String>,
     },
     /// Select text in an input or textarea
     Select {
@@ -270,7 +296,7 @@ mod parse_tests {
     #[test]
     fn the_canonical_snake_case_shape_parses() {
         let parsed = parse_action(&json!({ "click_at": { "x": 1.0, "y": 2.0 } })).unwrap();
-        assert!(matches!(parsed, BrowserAction::ClickAt { x: 1.0, y: 2.0 }));
+        assert!(matches!(parsed, BrowserAction::ClickAt { x: 1.0, y: 2.0, .. }));
     }
 
     #[test]
@@ -278,7 +304,7 @@ mod parse_tests {
         // This is the shape the tool's JSON schema shows the model, and it used
         // to come back as "unknown variant `ClickAt`".
         let parsed = parse_action(&json!({ "ClickAt": { "x": 1.0, "y": 2.0 } })).unwrap();
-        assert!(matches!(parsed, BrowserAction::ClickAt { x: 1.0, y: 2.0 }));
+        assert!(matches!(parsed, BrowserAction::ClickAt { x: 1.0, y: 2.0, .. }));
     }
 
     #[test]

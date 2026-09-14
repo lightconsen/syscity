@@ -167,6 +167,7 @@ impl BrowserTool {
             | BrowserAction::FillForm { .. }
             | BrowserAction::Select { .. }
             | BrowserAction::Drag { .. }
+            | BrowserAction::DragAt { .. }
             | BrowserAction::UploadFiles { .. }
             | BrowserAction::HandleDialog { .. }
             | BrowserAction::SetDownloadBehavior { .. } => {
@@ -225,7 +226,10 @@ impl Tool for BrowserTool {
          pixels: every screenshot reports its coordinate space, image size, viewport size, device \
          pixel ratio and scroll offset, so image pixels and click coordinates can be reconciled \
          instead of confused — and a click outside the live viewport is refused rather than \
-         dispatched somewhere unnamed. Requires Chrome/Chromium to be installed."
+         dispatched somewhere unnamed. Clicks take a button and a click_count (double and triple \
+         clicks are two and three press/release pairs, not one pair carrying a count), and Drag \
+         or DragAt moves the pointer between press and release rather than jumping. Requires \
+         Chrome/Chromium to be installed."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -256,7 +260,9 @@ impl Tool for BrowserTool {
                                     "Click": {
                                         "type": "object",
                                         "properties": {
-                                            "selector": { "type": "string", "description": "CSS selector for element to click" }
+                                            "selector": { "type": "string", "description": "CSS selector for element to click" },
+                                            "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button (default left). A non-left button clicks the element's centre as a point." },
+                                            "click_count": { "type": "integer", "description": "1 (default), 2 for a double click, 3 for a triple." }
                                         },
                                         "required": ["selector"]
                                     }
@@ -479,9 +485,44 @@ impl Tool for BrowserTool {
                                         "type": "object",
                                         "properties": {
                                             "x": { "type": "number", "description": "Viewport x coordinate in CSS pixels. If it came from a screenshot, divide image pixels by the device_pixel_ratio the screenshot reported (and subtract its scroll offset for a full_page capture). A point outside the live viewport is refused." },
-                                            "y": { "type": "number", "description": "Viewport y coordinate in CSS pixels, same units as x." }
+                                            "y": { "type": "number", "description": "Viewport y coordinate in CSS pixels, same units as x." },
+                                            "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button (default left)." },
+                                            "click_count": { "type": "integer", "description": "1 (default), 2 for a double click, 3 for a triple." }
                                         },
                                         "required": ["x", "y"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "Drag": {
+                                        "type": "object",
+                                        "properties": {
+                                            "selector": { "type": "string", "description": "CSS selector of the element to drag" },
+                                            "target_selector": { "type": "string", "description": "CSS selector of the drop target. Omit to drag by delta_x/delta_y instead." },
+                                            "delta_x": { "type": "integer", "description": "Horizontal offset in CSS pixels when there is no target_selector (default 100)" },
+                                            "delta_y": { "type": "integer", "description": "Vertical offset in CSS pixels when there is no target_selector (default 0)" },
+                                            "steps": { "type": "integer", "description": "Intermediate moves between press and release (default 12). A drag needs movement: pages that track it see a gesture only if the pointer passes through the points between." }
+                                        },
+                                        "required": ["selector"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "DragAt": {
+                                        "type": "object",
+                                        "properties": {
+                                            "from_x": { "type": "number", "description": "Start x, viewport CSS pixels (same units as ClickAt, and refused if outside the viewport)" },
+                                            "from_y": { "type": "number", "description": "Start y" },
+                                            "to_x": { "type": "number", "description": "End x" },
+                                            "to_y": { "type": "number", "description": "End y" },
+                                            "steps": { "type": "integer", "description": "Intermediate moves between press and release (default 12)" },
+                                            "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button to hold (default left)" }
+                                        },
+                                        "required": ["from_x", "from_y", "to_x", "to_y"]
                                     }
                                 }
                             },
@@ -723,7 +764,11 @@ mod tests {
         assert!(json.contains("navigate"));
         assert!(json.contains("example.com"));
 
-        let click = BrowserAction::Click { selector: "#btn".to_string() };
+        let click = BrowserAction::Click {
+            selector: "#btn".to_string(),
+            button: None,
+            click_count: None,
+        };
         let json = serde_json::to_string(&click).unwrap();
         assert!(json.contains("click"));
 
@@ -869,7 +914,12 @@ mod tests {
         let json = serde_json::to_string(&hover).unwrap();
         assert!(json.contains("hover"));
 
-        let click_at = BrowserAction::ClickAt { x: 100.5, y: 200.0 };
+        let click_at = BrowserAction::ClickAt {
+            x: 100.5,
+            y: 200.0,
+            button: None,
+            click_count: None,
+        };
         let json = serde_json::to_string(&click_at).unwrap();
         assert!(json.contains("click_at"));
 
@@ -928,6 +978,7 @@ mod tests {
             target_selector: Some("#dropzone".to_string()),
             delta_x: Some(100),
             delta_y: Some(0),
+            steps: None,
         };
         let json = serde_json::to_string(&drag).unwrap();
         assert!(json.contains("drag"));
