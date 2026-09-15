@@ -16,6 +16,10 @@ pub enum TuiError {
     #[error("websocket error: {0}")]
     WebSocket(String),
 
+    /// The gateway did not answer in time.
+    #[error("timed out waiting for `{0}`")]
+    Timeout(String),
+
     /// Gateway returned an error response.
     #[error("gateway error {code}: {message}")]
     Gateway { code: String, message: String },

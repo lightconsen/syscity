@@ -68,8 +68,13 @@ Two interactive options:
 **Terminal client** — attach the TUI to the running daemon:
 
 ```bash
-syscity tui
+syscity tui                 # fresh conversation
+syscity tui --continue      # resume the most recent session
+syscity tui --resume        # list sessions and pick one with /resume <n>
 ```
+
+The TUI runs inline: the conversation goes into your terminal's own scrollback,
+so normal scrolling, text selection and post-exit history all work.
 
 Try a physical-AI prompt:
 

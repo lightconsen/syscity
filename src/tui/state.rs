@@ -1,19 +1,28 @@
 //! Central application state for the TUI.
+//!
+//! The TUI keeps no message cache of its own: the transcript (scrollback plus
+//! the live tail) *is* the record of the conversation, and switching sessions
+//! re-reads history from the gateway. That removes the class of bug where the
+//! local copy and the gateway disagree.
+// INVARIANTS-NONE: presentation-layer state; owns no persistent data.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::time::Instant;
 
-use chrono::{DateTime, Local};
 use serde_json::Value;
+
+use crate::tui::gateway_calls::{AgentInfo, ApprovalDetail, SessionInfo};
+use crate::tui::transcript::Transcript;
 
 /// Connection state of the TUI to the gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConnectionState {
-    /// Disconnected, ready to reconnect.
+    /// Not connected; a reconnect is either scheduled or in flight.
     #[default]
     Disconnected,
-    /// TCP / WebSocket handshake in progress.
+    /// Handshake in progress.
     Connecting,
-    /// Connected and handshake complete.
+    /// Connected and handshaken.
     Connected {
         /// Features advertised by the server.
         features: Vec<String>,
@@ -22,176 +31,56 @@ pub enum ConnectionState {
         /// Server version string.
         server_version: String,
     },
-    /// Recoverable error state with a human-readable message.
-    Error(String),
+    /// Connection lost; the payload is the last error, if any.
+    Lost(String),
 }
 
-/// Status of an in-flight or completed chat message.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum MessageStatus {
-    /// Message is being sent.
-    Sending,
-    /// Assistant response is streaming in.
-    Streaming,
-    /// Message is complete.
-    #[default]
-    Complete,
-    /// An error occurred while generating the response.
-    Error(String),
-}
-
-/// A chat message rendered in the TUI.
-#[derive(Debug, Clone, Default)]
-pub struct ChatMessage {
-    /// Unique message id.
-    pub id: String,
-    /// Role: "user", "assistant", "system", or "tool".
-    pub role: String,
-    /// Renderable text content.
-    pub content: String,
-    /// Optional reasoning / thinking text.
-    pub thinking: Option<String>,
-    /// Optional tool name when role is "tool".
-    pub tool_name: Option<String>,
-    /// Message status.
-    pub status: MessageStatus,
-    /// Timestamp.
-    pub timestamp: DateTime<Local>,
-    /// Extra metadata (duration, tool count, etc.).
-    pub metadata: Option<Value>,
-    /// Structured parts for rich rendering (reasoning, tool-call, text).
-    pub parts: Vec<ChatMessagePart>,
-}
-
-/// A structured part inside a chat message.
-#[derive(Debug, Clone, Default)]
-pub struct ChatMessagePart {
-    /// Part type: "text", "reasoning", or "tool-call".
-    pub part_type: String,
-    /// Text content for text/reasoning parts.
-    pub text: Option<String>,
-    /// Tool name for tool-call parts.
-    pub tool_name: Option<String>,
-    /// Tool arguments for tool-call parts.
-    pub args: Option<Value>,
-    /// Tool result for tool-call parts.
-    pub result: Option<Value>,
-}
-
-/// Summary of a session shown in the sidebar.
-#[derive(Debug, Clone, Default)]
-pub struct SessionSummary {
-    /// Session id.
-    pub id: String,
-    /// Human-readable label, if any.
-    pub label: Option<String>,
-    /// Agent id for the session.
-    pub agent_id: Option<String>,
-    /// Whether the session is currently selected.
-    pub selected: bool,
-}
-
-/// Which UI element has keyboard focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InputMode {
-    /// Normal chat input.
-    #[default]
-    Normal,
-    /// Editing a config value.
-    ConfigEdit,
-    /// Navigating a popup.
-    Popup,
-}
-
-/// A transient toast notification.
-#[derive(Debug, Clone)]
-pub struct Toast {
-    /// Message text.
-    pub message: String,
-    /// Creation timestamp.
-    pub created_at: DateTime<Local>,
-    /// Seconds to live.
-    pub ttl_seconds: u64,
-    /// Whether this is an error toast.
-    pub is_error: bool,
-}
-
-impl Toast {
-    /// Create a new toast.
-    pub fn new(message: impl Into<String>, ttl_seconds: u64, is_error: bool) -> Self {
-        Self {
-            message: message.into(),
-            created_at: Local::now(),
-            ttl_seconds,
-            is_error,
+impl ConnectionState {
+    /// Short, human-readable form for the status row.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Disconnected => "disconnected".to_string(),
+            Self::Connecting => "connecting…".to_string(),
+            Self::Connected { server_version, .. } => format!("v{server_version}"),
+            Self::Lost(e) => format!("disconnected: {e}"),
         }
+    }
+
+    /// Whether the socket is usable right now.
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
     }
 }
 
-/// Active popup overlay.
+/// Which prompt owns the input area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Popup {
-    /// No popup.
+pub enum LiveMode {
+    /// Normal typing.
     #[default]
-    None,
-    /// Help popup.
-    Help,
-    /// Config editor popup.
-    ConfigEditor,
+    Composer,
+    /// A tool approval is waiting; only the decision keys apply.
+    Approval,
+    /// The agent asked a question; options or a free-text answer apply.
+    Ask,
 }
 
-/// Central mutable application state.
-#[derive(Debug, Default)]
-pub struct AppState {
-    /// Current connection state.
-    pub connection: ConnectionState,
-    /// Terminal size (width, height).
-    pub terminal_size: (u16, u16),
-    /// Currently selected session id.
-    pub current_session: Option<String>,
-    /// Sessions known to the client.
-    pub sessions: Vec<SessionSummary>,
-    /// Chat messages for the current session.
-    pub messages: Vec<ChatMessage>,
-    /// Messages stored per session id.
-    pub messages_by_session: HashMap<String, Vec<ChatMessage>>,
-    /// Current input buffer.
-    pub input_buffer: String,
-    /// Cursor position in the input buffer (byte index).
-    pub input_cursor: usize,
-    /// Current input mode.
-    pub input_mode: InputMode,
-    /// Current popup, if any.
-    pub popup: Popup,
-    /// Scroll offset for the chat panel (lines from bottom).
-    pub scroll_offset: usize,
-    /// Index of the selected session in the sidebar.
-    pub selected_session_index: usize,
-    /// Transient toasts.
-    pub toasts: Vec<Toast>,
-    /// Cached config values for the config editor.
-    pub config_cache: HashMap<String, Value>,
-    /// Pending config edits (key -> new value).
-    pub config_edits: HashMap<String, String>,
-    /// Index of selected config row in the editor.
-    pub config_selected_index: usize,
-    /// Cached command list for the help popup and command palette.
-    pub command_list: Vec<CommandInfo>,
-    /// Filtered command palette entries.
-    pub palette_commands: Vec<CommandInfo>,
-    /// Selected index in the command palette.
-    pub palette_index: usize,
-    /// Whether a response is currently streaming.
-    pub is_running: bool,
-    /// Fatal error that should end the TUI.
-    pub fatal_error: Option<String>,
-    /// Whether the app should quit on next loop iteration.
-    pub should_quit: bool,
+/// A question from `ask_user` waiting for a human answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AskPrompt {
+    /// Ask id, echoed back on the answer.
+    pub ask_id: String,
+    /// The question itself.
+    pub question: String,
+    /// Selectable answers, when the agent offered any.
+    pub options: Vec<String>,
+    /// Whether an answer is mandatory.
+    pub required: bool,
+    /// Answer the agent suggests.
+    pub default: Option<String>,
 }
 
-/// Information about a gateway command shown in the help popup and command
-/// palette.
-#[derive(Debug, Clone, Default)]
+/// Information about a gateway command, for `/help` and the completion hints.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandInfo {
     /// Canonical key (e.g. "new").
     pub key: String,
@@ -201,37 +90,131 @@ pub struct CommandInfo {
     pub description: String,
     /// Usage pattern.
     pub usage: String,
-    /// Category string (session, model, status, agents, tools, admin).
+    /// Category string.
     pub category: String,
-    /// Tier (essential, standard, power).
+    /// Tier.
     pub tier: String,
-    /// Whether the command is client-side only.
+    /// Whether the command runs client-side.
     pub local: bool,
     /// Whether the command requires admin scope.
     pub requires_admin: bool,
 }
 
 impl CommandInfo {
-    /// Match against a query string (name prefix or description contains).
+    /// Match against a completion query (name prefix or description).
     pub fn matches(&self, query: &str) -> bool {
         let q = query.to_lowercase();
         self.name.to_lowercase().starts_with(&q) || self.description.to_lowercase().contains(&q)
     }
 }
 
+/// Central mutable application state.
+#[derive(Debug)]
+pub struct AppState {
+    /// Connection state.
+    pub connection: ConnectionState,
+    /// Session the TUI is talking to.
+    pub current_session: Option<String>,
+    /// Agent bound to the current session, if any.
+    pub current_agent: Option<String>,
+    /// Known sessions (refreshed from the gateway).
+    pub sessions: Vec<SessionInfo>,
+    /// Known agents (refreshed from the gateway).
+    pub agents: Vec<AgentInfo>,
+    /// Scrollback + live tail.
+    pub transcript: Transcript,
+    /// Current input buffer.
+    pub input_buffer: String,
+    /// Cursor position in `input_buffer` (byte index).
+    pub input_cursor: usize,
+    /// Previously sent lines, oldest first.
+    pub input_history: Vec<String>,
+    /// Position while browsing history; `None` means "editing a fresh line".
+    pub history_index: Option<usize>,
+    /// The fresh line stashed when history browsing started, restored on the
+    /// way back down.
+    pub history_draft: String,
+    /// Which prompt owns the input area.
+    pub live_mode: LiveMode,
+    /// Approvals awaiting a decision, oldest first.
+    pub approvals: VecDeque<ApprovalDetail>,
+    /// Which decision is highlighted in the approval prompt.
+    pub approval_approve_selected: bool,
+    /// An unanswered `ask_user` question.
+    pub pending_ask: Option<AskPrompt>,
+    /// Free-text answer being typed for the ask prompt.
+    pub ask_input: String,
+    /// Cached configuration payload + revision (for `/config`).
+    pub config_cache: Option<Value>,
+    /// Revision the cache was read at, for optimistic writes.
+    pub config_revision: Option<String>,
+    /// Command catalog (feeds `/help` and completion).
+    pub command_list: Vec<CommandInfo>,
+    /// Highlighted entry in the completion list.
+    pub completion_index: usize,
+    /// A response is streaming.
+    pub is_running: bool,
+    /// When the current run started, for the elapsed counter.
+    pub run_started: Option<Instant>,
+    /// Spinner frame counter.
+    pub spinner: u8,
+    /// Transient status text + when it was set (expires on its own).
+    pub status: Option<(String, Instant)>,
+    /// Set when a redraw is needed.
+    pub dirty: bool,
+    /// A fatal error that should end the TUI.
+    pub fatal_error: Option<String>,
+    /// Quit on the next loop iteration.
+    pub should_quit: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            connection: ConnectionState::default(),
+            current_session: None,
+            current_agent: None,
+            sessions: Vec::new(),
+            agents: Vec::new(),
+            transcript: Transcript::new(),
+            input_buffer: String::new(),
+            input_cursor: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            live_mode: LiveMode::default(),
+            approvals: VecDeque::new(),
+            approval_approve_selected: true,
+            pending_ask: None,
+            ask_input: String::new(),
+            config_cache: None,
+            config_revision: None,
+            command_list: Vec::new(),
+            completion_index: 0,
+            is_running: false,
+            run_started: None,
+            spinner: 0,
+            status: None,
+            dirty: true,
+            fatal_error: None,
+            should_quit: false,
+        }
+    }
+}
+
 impl AppState {
-    /// Insert a character at the current input cursor position.
+    /// Insert a character at the cursor.
     pub fn insert_char(&mut self, c: char) {
         self.input_buffer.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
     }
 
-    /// Insert a newline at the current input cursor position.
+    /// Insert a newline at the cursor.
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
 
-    /// Delete the character before the input cursor.
+    /// Delete the character before the cursor.
     pub fn input_backspace(&mut self) {
         if self.input_cursor == 0 {
             return;
@@ -244,7 +227,7 @@ impl AppState {
         self.input_cursor = prev;
     }
 
-    /// Move the input cursor one character to the left.
+    /// Move the cursor one character left.
     pub fn move_cursor_left(&mut self) {
         if self.input_cursor == 0 {
             return;
@@ -256,7 +239,7 @@ impl AppState {
         self.input_cursor = prev;
     }
 
-    /// Move the input cursor one character to the right.
+    /// Move the cursor one character right.
     pub fn move_cursor_right(&mut self) {
         if self.input_cursor >= self.input_buffer.len() {
             return;
@@ -268,179 +251,227 @@ impl AppState {
         self.input_cursor = next.min(self.input_buffer.len());
     }
 
-    /// Persist the current `messages` buffer into `messages_by_session`.
-    pub fn save_current_session_messages(&mut self) {
-        if let Some(ref sid) = self.current_session {
-            if !self.messages.is_empty() {
-                self.messages_by_session
-                    .insert(sid.clone(), self.messages.clone());
+    /// Byte offset of the start of the line the cursor is on.
+    fn line_start(&self) -> usize {
+        self.input_buffer[..self.input_cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    /// Byte offset just past the end of the line the cursor is on.
+    fn line_end(&self) -> usize {
+        self.input_buffer[self.input_cursor..]
+            .find('\n')
+            .map(|i| self.input_cursor + i)
+            .unwrap_or(self.input_buffer.len())
+    }
+
+    /// Whether the cursor is on the first line of the input.
+    pub fn cursor_on_first_line(&self) -> bool {
+        self.line_start() == 0
+    }
+
+    /// Whether the cursor is on the last line of the input.
+    pub fn cursor_on_last_line(&self) -> bool {
+        self.line_end() == self.input_buffer.len()
+    }
+
+    /// Move the cursor up one visual line, falling back to history recall.
+    ///
+    /// Returns `true` when history was consulted instead of the cursor moved —
+    /// the caller may need to redraw.
+    pub fn cursor_up_or_history(&mut self) -> bool {
+        if !self.cursor_on_first_line() {
+            let col = self.input_cursor - self.line_start();
+            let start = self.input_buffer[..self.line_start().saturating_sub(1)]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let prev_line_end = self.line_start().saturating_sub(1);
+            self.input_cursor = (start + col).min(prev_line_end);
+            return false;
+        }
+        self.history_older();
+        true
+    }
+
+    /// Move the cursor down one visual line, falling back to history recall.
+    pub fn cursor_down_or_history(&mut self) -> bool {
+        if !self.cursor_on_last_line() {
+            let col = self.input_cursor - self.line_start();
+            let next_start = self.line_end() + 1;
+            let next_end = self.input_buffer[next_start..]
+                .find('\n')
+                .map(|i| next_start + i)
+                .unwrap_or(self.input_buffer.len());
+            self.input_cursor = (next_start + col).min(next_end);
+            return false;
+        }
+        self.history_newer();
+        true
+    }
+
+    /// Recall the previous submitted line.
+    pub fn history_older(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            None => {
+                self.history_draft = self.input_buffer.clone();
+                self.input_history.len() - 1
+            }
+            Some(0) => return,
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next);
+        self.set_input(self.input_history[next].clone());
+    }
+
+    /// Come back down towards the line being edited.
+    pub fn history_newer(&mut self) {
+        match self.history_index {
+            None => {}
+            Some(i) if i + 1 < self.input_history.len() => {
+                self.history_index = Some(i + 1);
+                self.set_input(self.input_history[i + 1].clone());
+            }
+            Some(_) => {
+                self.history_index = None;
+                let draft = std::mem::take(&mut self.history_draft);
+                self.set_input(draft);
             }
         }
     }
 
-    /// Load messages for a session from `messages_by_session` into `messages`.
-    pub fn load_session_messages(&mut self, session_id: &str) {
-        self.messages = self
-            .messages_by_session
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
+    /// Replace the input buffer and put the cursor at its end.
+    fn set_input(&mut self, text: String) {
+        self.input_buffer = text;
+        self.input_cursor = self.input_buffer.len();
     }
 
-    /// Switch the current session, persisting the previous session's messages.
-    pub fn switch_session(&mut self, session_id: &str) {
-        self.save_current_session_messages();
-        self.current_session = Some(session_id.to_string());
-        self.load_session_messages(session_id);
-        self.scroll_offset = 0;
-        for (idx, s) in self.sessions.iter_mut().enumerate() {
-            s.selected = s.id == session_id;
-            if s.selected {
-                self.selected_session_index = idx;
-            }
+    /// Remember a submitted line (skipping a repeat of the previous one).
+    pub fn remember_input(&mut self, line: &str) {
+        if !line.trim().is_empty() && self.input_history.last().map(String::as_str) != Some(line) {
+            self.input_history.push(line.to_string());
         }
+        self.history_index = None;
+        self.history_draft.clear();
     }
 
-    /// Append a user message to the current session and return its id.
-    pub fn append_user_message(
-        &mut self,
-        id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> String {
-        let id = id.into();
-        self.messages.push(ChatMessage {
-            id: id.clone(),
-            role: "user".to_string(),
-            content: content.into(),
-            status: MessageStatus::Complete,
-            timestamp: Local::now(),
-            ..ChatMessage::default()
-        });
-        id
+    /// Clear the input and the completion highlight.
+    pub fn clear_input(&mut self) {
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.completion_index = 0;
     }
 
-    /// Append an empty assistant message and return its id.
-    pub fn append_assistant_message(&mut self, id: impl Into<String>) -> String {
-        let id = id.into();
-        self.messages.push(ChatMessage {
-            id: id.clone(),
-            role: "assistant".to_string(),
-            status: MessageStatus::Streaming,
-            timestamp: Local::now(),
-            ..ChatMessage::default()
-        });
-        self.is_running = true;
-        id
-    }
-
-    /// Append a system/tool message.
-    pub fn append_system_message(&mut self, id: impl Into<String>, content: impl Into<String>) {
-        self.messages.push(ChatMessage {
-            id: id.into(),
-            role: "system".to_string(),
-            content: content.into(),
-            status: MessageStatus::Complete,
-            timestamp: Local::now(),
-            ..ChatMessage::default()
-        });
-    }
-
-    /// Append an assistant message that is already complete.
-    pub fn append_complete_assistant_message(
-        &mut self,
-        id: impl Into<String>,
-        content: impl Into<String>,
-    ) {
-        self.messages.push(ChatMessage {
-            id: id.into(),
-            role: "assistant".to_string(),
-            content: content.into(),
-            status: MessageStatus::Complete,
-            timestamp: Local::now(),
-            ..ChatMessage::default()
-        });
-    }
-
-    /// Find the last assistant message that is still streaming.
-    pub fn last_streaming_message(&mut self) -> Option<&mut ChatMessage> {
-        self.messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == "assistant" && matches!(m.status, MessageStatus::Streaming))
-    }
-
-    /// Update or create an assistant streaming message with a delta.
-    pub fn append_delta(&mut self, content: &str) {
-        if let Some(msg) = self.last_streaming_message() {
-            msg.content.push_str(content);
-        } else {
-            self.append_assistant_message(format!("assistant_{}", self.messages.len()));
-            if let Some(msg) = self.last_streaming_message() {
-                msg.content.push_str(content);
-            }
+    /// Candidates for completing the `/command` being typed.
+    pub fn completions(&self) -> Vec<&CommandInfo> {
+        let trimmed = self.input_buffer.trim_start();
+        let Some(rest) = trimmed.strip_prefix('/') else {
+            return Vec::new();
+        };
+        // Only the first word is being completed.
+        if rest.contains(char::is_whitespace) {
+            return Vec::new();
         }
-    }
-
-    /// Finalize the current streaming assistant message.
-    pub fn finalize_assistant(&mut self, content: Option<&str>) {
-        if let Some(msg) = self.last_streaming_message() {
-            if let Some(c) = content {
-                msg.content = c.to_string();
-            }
-            msg.status = MessageStatus::Complete;
-        }
-        self.is_running = false;
-    }
-
-    /// Mark the current streaming message as errored.
-    pub fn error_assistant(&mut self, message: &str) {
-        if let Some(msg) = self.last_streaming_message() {
-            msg.status = MessageStatus::Error(message.to_string());
-        }
-        self.is_running = false;
-    }
-
-    /// Add a non-fatal toast.
-    pub fn toast(&mut self, message: impl Into<String>) {
-        self.toasts.push(Toast::new(message, 5, false));
-    }
-
-    /// Add an error toast.
-    pub fn error_toast(&mut self, message: impl Into<String>) {
-        self.toasts.push(Toast::new(message, 8, true));
-    }
-
-    /// Clear expired toasts.
-    pub fn clear_expired_toasts(&mut self) {
-        let now = Local::now();
-        self.toasts.retain(|t| {
-            let elapsed = now.signed_duration_since(t.created_at).num_seconds().max(0) as u64;
-            elapsed < t.ttl_seconds
-        });
-    }
-
-    /// Return true if the current session is in the list, creating a
-    /// placeholder if needed.
-    pub fn ensure_session(&mut self, session_id: &str) {
-        if !self.sessions.iter().any(|s| s.id == session_id) {
-            self.sessions.push(SessionSummary {
-                id: session_id.to_string(),
-                label: None,
-                agent_id: None,
-                selected: false,
-            });
-        }
-    }
-
-    /// Find a command in the cached catalog by key or name.
-    pub fn find_command(&self, name: &str) -> Option<&CommandInfo> {
-        let normalized = name.to_lowercase();
         self.command_list
             .iter()
-            .find(|c| c.key == normalized || c.name == normalized)
+            .filter(|c| c.name.to_lowercase().starts_with(&rest.to_lowercase()))
+            .collect()
     }
 
-    /// Return true if the granted scopes include `scope`.
+    /// Apply the highlighted completion to the input buffer.
+    pub fn apply_completion(&mut self) {
+        let candidates = self.completions();
+        if candidates.is_empty() {
+            return;
+        }
+        let idx = self.completion_index.min(candidates.len() - 1);
+        let completed = format!("/{} ", candidates[idx].name);
+        self.set_input(completed);
+        self.completion_index = 0;
+    }
+
+    /// Move the completion highlight.
+    pub fn move_completion(&mut self, forward: bool) {
+        let len = self.completions().len();
+        if len == 0 {
+            return;
+        }
+        self.completion_index = if forward {
+            (self.completion_index + 1) % len
+        } else {
+            (self.completion_index + len - 1) % len
+        };
+    }
+
+    /// Set the transient status line.
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status = Some((message.into(), Instant::now()));
+    }
+
+    /// Note that a run started.
+    pub fn begin_run(&mut self) {
+        self.is_running = true;
+        self.run_started = Some(Instant::now());
+    }
+
+    /// Note that the current run ended.
+    pub fn end_run(&mut self) {
+        self.is_running = false;
+        self.run_started = None;
+    }
+
+    /// Seconds the current run has been going, if any.
+    pub fn run_elapsed_secs(&self) -> Option<u64> {
+        self.run_started.map(|t| t.elapsed().as_secs())
+    }
+
+    /// Advance time-based state. Returns `true` when something changed and the
+    /// live region needs repainting.
+    pub fn advance_animations(&mut self) -> bool {
+        let mut changed = false;
+        if self.is_running {
+            self.spinner = self.spinner.wrapping_add(1);
+            changed = true;
+        }
+        if let Some((_, set_at)) = &self.status {
+            if set_at.elapsed().as_secs() >= 6 {
+                self.status = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The approval at the front of the queue.
+    pub fn current_approval(&self) -> Option<&ApprovalDetail> {
+        self.approvals.front()
+    }
+
+    /// Retire the approval at the front of the queue and return to typing.
+    pub fn pop_approval(&mut self) {
+        self.approvals.pop_front();
+        self.approval_approve_selected = true;
+        if self.approvals.is_empty() {
+            self.live_mode = if self.pending_ask.is_some() {
+                LiveMode::Ask
+            } else {
+                LiveMode::Composer
+            };
+        }
+    }
+
+    /// The agent bound to the current session, if it is a known one.
+    pub fn current_agent_info(&self) -> Option<&AgentInfo> {
+        let id = self.current_agent.as_deref()?;
+        self.agents.iter().find(|a| a.id == id)
+    }
+
+    /// Whether the granted scopes include `scope`.
     pub fn has_scope(&self, scope: &str) -> bool {
         matches!(
             &self.connection,
@@ -454,38 +485,134 @@ impl AppState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn append_and_finalize_delta() {
-        let mut state = AppState::default();
-        state.append_delta("Hello");
-        state.append_delta(" world");
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].content, "Hello world");
-        state.finalize_assistant(None);
-        assert!(matches!(state.messages[0].status, MessageStatus::Complete));
-        assert!(!state.is_running);
+    fn typing(state: &mut AppState, text: &str) {
+        for c in text.chars() {
+            state.insert_char(c);
+        }
     }
 
     #[test]
-    fn toasts_expire() {
-        let mut state = AppState::default();
-        state.toast("hello");
-        assert_eq!(state.toasts.len(), 1);
-        // Simulate expiration by setting created_at far in the past.
-        state.toasts[0].created_at = Local::now() - chrono::Duration::seconds(10);
-        state.clear_expired_toasts();
-        assert!(state.toasts.is_empty());
+    fn edits_multibyte_input_by_character() {
+        let mut s = AppState::default();
+        typing(&mut s, "中文ab");
+        s.input_backspace();
+        assert_eq!(s.input_buffer, "中文a");
+        s.move_cursor_left();
+        s.input_backspace();
+        assert_eq!(s.input_buffer, "中a");
+    }
+
+    #[test]
+    fn history_recalls_on_the_first_line_and_restores_the_draft() {
+        let mut s = AppState::default();
+        s.remember_input("first");
+        s.remember_input("second");
+        typing(&mut s, "draft");
+
+        assert!(s.cursor_up_or_history());
+        assert_eq!(s.input_buffer, "second");
+        assert!(s.cursor_up_or_history());
+        assert_eq!(s.input_buffer, "first");
+        // Already at the oldest entry: stays put.
+        assert!(s.cursor_up_or_history());
+        assert_eq!(s.input_buffer, "first");
+
+        assert!(s.cursor_down_or_history());
+        assert_eq!(s.input_buffer, "second");
+        assert!(s.cursor_down_or_history());
+        assert_eq!(s.input_buffer, "draft", "the typed draft comes back");
+    }
+
+    #[test]
+    fn up_moves_within_a_multiline_buffer_before_touching_history() {
+        let mut s = AppState::default();
+        s.remember_input("older");
+        typing(&mut s, "one\ntwo");
+        // Cursor is at the end (line 2): up moves to line 1, not to history.
+        assert!(!s.cursor_up_or_history());
+        assert!(s.cursor_on_first_line());
+        assert_eq!(s.input_buffer, "one\ntwo");
+        // Now on the first line, up recalls history.
+        assert!(s.cursor_up_or_history());
+        assert_eq!(s.input_buffer, "older");
+    }
+
+    #[test]
+    fn remembers_input_without_duplicating_consecutive_repeats() {
+        let mut s = AppState::default();
+        s.remember_input("same");
+        s.remember_input("same");
+        s.remember_input("   ");
+        s.remember_input("different");
+        assert_eq!(s.input_history, vec!["same", "different"]);
+    }
+
+    #[test]
+    fn completes_a_slash_command_from_the_catalog() {
+        let mut s = AppState::default();
+        s.command_list = vec![
+            CommandInfo {
+                name: "status".into(),
+                description: "Show status".into(),
+                ..Default::default()
+            },
+            CommandInfo {
+                name: "stop".into(),
+                description: "Stop".into(),
+                ..Default::default()
+            },
+            CommandInfo {
+                name: "help".into(),
+                description: "Help".into(),
+                ..Default::default()
+            },
+        ];
+        typing(&mut s, "/st");
+        assert_eq!(s.completions().len(), 2);
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "/status ");
+        assert!(s.completions().is_empty(), "no completion once a space is typed");
+
+        s.clear_input();
+        typing(&mut s, "/st");
+        s.move_completion(true);
+        assert_eq!(s.completion_index, 1, "second candidate highlighted");
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "/stop ");
+    }
+
+    #[test]
+    fn approval_queue_returns_to_typing_only_when_empty() {
+        let mut s = AppState::default();
+        s.approvals.push_back(ApprovalDetail::default());
+        s.approvals.push_back(ApprovalDetail::default());
+        s.live_mode = LiveMode::Approval;
+        s.pop_approval();
+        assert_eq!(s.live_mode, LiveMode::Approval);
+        s.pop_approval();
+        assert_eq!(s.live_mode, LiveMode::Composer);
+    }
+
+    #[test]
+    fn idle_state_does_not_repaint_forever() {
+        let mut s = AppState::default();
+        assert!(!s.advance_animations(), "nothing running, nothing set");
+        s.begin_run();
+        assert!(s.advance_animations(), "the spinner advances while running");
+        s.end_run();
+        s.set_status("hello");
+        assert!(s.advance_animations() || s.status.is_some());
     }
 
     #[test]
     fn scope_check() {
-        let mut state = AppState::default();
-        assert!(!state.has_scope("write"));
-        state.connection = ConnectionState::Connected {
+        let mut s = AppState::default();
+        assert!(!s.has_scope("write"));
+        s.connection = ConnectionState::Connected {
             features: vec![],
             scopes_granted: vec!["chat".to_string(), "write".to_string()],
-            server_version: "0.1.2".to_string(),
+            server_version: "0.3.6".to_string(),
         };
-        assert!(state.has_scope("write"));
+        assert!(s.has_scope("write"));
     }
 }

@@ -201,40 +201,32 @@ Goals are checkpointed per round to `~/.syscity/goals/<goal_id>.json`. After a g
 
 ## TUI-Only Local Commands
 
-These commands are handled directly by `src/tui/commands.rs` and never leave the terminal:
+Handled directly by `src/tui/commands.rs`; anything not listed here is forwarded
+to the gateway as a `commands.execute` request. Output is printed into the
+terminal's scrollback — the TUI runs inline and has no popups.
 
 | Command | Args | Description |
 |---|---|---|
-| `/new` | — | Create a new session and subscribe to it. |
-| `/clear` | — | Clear the message panel. |
+| `/new` | `[agent]` | Create a session, optionally bound to an agent. |
+| `/resume` | `[n\|id]` | List sessions, or switch to one (also `--continue` / `--resume` at launch). |
+| `/sessions` | — | List sessions. |
+| `/rename` | `<name>` | Rename the current session. |
+| `/pin` | — | Pin or unpin the current session. |
+| `/agents` | — | List agents. |
+| `/agent` | `<id>` | Start a session bound to an agent. |
+| `/clear` | — | Clear the conversation context (`sessions.reset`); the terminal's own scrollback is untouched. |
+| `/config` | `[set <path> <value>]` | Show the effective configuration, or change one value. |
 | `/status` | — | Query gateway presence via `system.presence`. |
-| `/tools` | — | Show the number of available commands via `commands.list`. |
+| `/tools` | — | List the gateway's command catalog via `commands.list`. |
 | `/model` | `<id>` | Set the default model via `models.set_default`. |
-| `/help` | — | Open help popup with the command list. |
-| `/config` | — | Open config editor popup. |
-| `/sessions` | — | List and refresh sessions. |
+| `/answer` | `<text>` | Answer a pending `ask_user` question. |
+| `/help` | — | Keybindings and the command catalog. |
 | `/quit` / `/exit` | — | Exit the TUI. |
-
 ---
 
 ## Inline Shortcuts
 
-The following commands may be embedded inside normal messages. The command is executed and the remaining text continues as a regular chat message.
-
-- `/help`
-- `/commands`
-- `/status`
-- `/whoami`
-
-### Example
-
-```text
-Hey, can you help me with this? /whoami By the way, what's 2+2?
-```
-
-The `/whoami` command executes and returns the sender ID, then the rest of the message is sent to the model.
-
----
+Removed. Embedding a command inside a message silently dropped a word from what the user typed, so commands are now only run when they are the whole message.
 
 ## Command Metadata
 

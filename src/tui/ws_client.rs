@@ -32,7 +32,7 @@ struct ClientRequest {
 
 /// Client-side response frame.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ClientResponse {
+pub struct ClientResponse {
     #[serde(rename = "type")]
     _frame_type: String,
     id: String,
@@ -58,7 +58,7 @@ pub struct ClientEvent {
 
 /// Error shape in a response frame.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ClientError {
+pub struct ClientError {
     pub code: String,
     pub message: String,
 }
@@ -90,7 +90,17 @@ pub enum WsMessage {
     Event(ClientEvent),
     /// Response without a pending waiter.
     OrphanResponse(ClientResponse),
+    /// The socket closed. Sent exactly once, when the driver exits — without
+    /// it the event stream would simply stop producing and the UI would sit
+    /// there looking alive.
+    Disconnected,
 }
+
+/// How long a request may wait for its response before the caller gives up.
+///
+/// Without this a wedged gateway leaves the caller awaiting forever, which —
+/// because requests are awaited inside the event loop — freezes the whole TUI.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Shared state tracking pending request/response waiters.
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<ClientResponse>>>>;
@@ -174,7 +184,7 @@ impl WsClient {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.insert(id, tx);
+            pending.insert(id.clone(), tx);
         }
 
         let text = serde_json::to_string(&request)?;
@@ -182,9 +192,19 @@ impl WsClient {
             .send(Message::Text(text))
             .map_err(|_| TuiError::WebSocket("send channel closed".to_string()))?;
 
-        let response = rx
-            .await
-            .map_err(|_| TuiError::WebSocket("response channel closed".to_string()))?;
+        let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(TuiError::WebSocket("response channel closed".to_string())),
+            Err(_) => {
+                // Drop the waiter so a late response cannot resolve a request
+                // the caller has already abandoned.
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                return Err(TuiError::Timeout(method.to_string()));
+            }
+        };
 
         if response.ok {
             Ok(response.payload.unwrap_or(Value::Null))
@@ -273,6 +293,10 @@ async fn ws_driver(
             else => break,
         }
     }
+
+    // Tell the UI the stream is over, so it can show the disconnect and start
+    // reconnecting instead of spinning on a silent channel.
+    let _ = event_tx.send(WsMessage::Disconnected);
 }
 
 /// Parse an incoming text frame and route it to waiters or events.

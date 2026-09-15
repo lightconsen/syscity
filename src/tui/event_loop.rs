@@ -1,805 +1,989 @@
-//! Central async event loop merging input, network, and rendering.
+//! The async event loop: input, gateway events, and the two render paths.
+//!
+//! Each iteration does one thing — take an action, take a gateway message, or
+//! tick — and then hands the screen back:
+//!
+//! 1. flush anything the transcript has graduated into the scrollback, then
+//! 2. repaint the live region.
+//!
+//! That order is not optional: `insert_before` blanks the live region, so a
+//! flush without a following draw leaves the composer invisible.
+// INVARIANTS-NONE: event loop; state lives in `AppState`.
 
-use std::io::Stdout;
+use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use ratatui::backend::Backend;
 use ratatui::Terminal;
 use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::Interval;
+use tokio::time::interval;
 
 use crate::tui::actions::TuiAction;
-use crate::tui::commands::{
-    action_for_input, extract_inline_command, handle_slash_command, update_palette,
-};
-use crate::tui::state::{AppState, InputMode, Popup, SessionSummary};
-use crate::tui::ui;
+use crate::tui::app::{Endpoint, SessionChoice};
+use crate::tui::commands::handle_slash_command;
+use crate::tui::error::TuiError;
+use crate::tui::gateway_calls::{self as gw, ApprovalDetail};
+use crate::tui::input::poll_action;
+use crate::tui::resume;
+use crate::tui::retry::Backoff;
+use crate::tui::scrollback;
+use crate::tui::state::{AppState, AskPrompt, ConnectionState, LiveMode};
+use crate::tui::transcript::{LineKind, TranscriptLine};
+use crate::tui::ui::{blocks, live};
 use crate::tui::ws_client::{ClientEvent, WsClient, WsMessage};
 
-/// Run the main event loop until the user quits or a fatal error occurs.
-pub async fn run(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-    state: Arc<RwLock<AppState>>,
-    mut ws_client: WsClient,
-    mut input_rx: mpsc::UnboundedReceiver<TuiAction>,
-    mut render_interval: Interval,
-) -> Result<(), crate::tui::error::TuiError> {
-    // Fetch initial session list and command catalog.
-    let _ = fetch_sessions(&mut ws_client, Arc::clone(&state)).await;
-    let _ = fetch_commands(&mut ws_client, Arc::clone(&state)).await;
+/// Stream key for the turn currently being generated (one turn at a time).
+const STREAM_ASSISTANT: &str = "assistant";
+/// Stream key for the reasoning that accompanies it.
+const STREAM_THINKING: &str = "thinking";
 
-    // If we already have a current session, load its history.
-    {
-        let s = state.read().await;
-        if let Some(sid) = s.current_session.clone() {
-            drop(s);
-            let _ = load_session_history(&mut ws_client, Arc::clone(&state), &sid).await;
-        }
-    }
+/// One thing the loop waits for.
+enum Event {
+    /// A gateway message.
+    Gateway(Option<WsMessage>),
+    /// The animation/expiry beat.
+    Tick,
+}
+
+/// Run the TUI until the user quits or a fatal error occurs.
+pub async fn run<B: Backend<Error = io::Error>>(
+    terminal: &mut Terminal<B>,
+    state: Arc<RwLock<AppState>>,
+    ws_client: WsClient,
+    endpoint: Endpoint,
+    session: SessionChoice,
+) -> Result<(), TuiError> {
+    let mut ws = Some(ws_client);
+    let mut backoff = Backoff::new();
+    let mut reconnect_at: Option<Instant> = None;
+    // Short enough that typing feels immediate; the tick itself only marks the
+    // state dirty when something is actually animating.
+    let mut ticker = interval(Duration::from_millis(50));
+
+    startup(&state, &mut ws, &session).await;
+    redraw(terminal, &state).await?;
 
     loop {
-        tokio::select! {
-            Some(action) = input_rx.recv() => {
-                let action = {
-                    let s = state.read().await;
-                    action_for_input(action, &s.input_buffer)
-                };
-                let should_break = handle_action(action, Arc::clone(&state), &mut ws_client).await?;
-                if should_break {
-                    break;
+        // Drain input first: the draw below issues a cursor-position query, and
+        // nothing may be reading stdin while that reply is in flight.
+        while let Some(action) = poll_action() {
+            state.write().await.dirty = true;
+            match ws.as_mut() {
+                Some(client) => handle_action(action, &state, client).await?,
+                None => {
+                    handle_offline_action(action, &state, &mut backoff, &mut reconnect_at).await
                 }
             }
-
-            Some(msg) = ws_client.next() => {
-                handle_network_message(msg, Arc::clone(&state), &mut ws_client).await;
-            }
-
-            _ = render_interval.tick() => {
-                {
-                    let mut s = state.write().await;
-                    s.clear_expired_toasts();
-                    if s.terminal_size == (0, 0) {
-                        s.terminal_size = terminal.size().map(|r| (r.width, r.height)).unwrap_or((80, 24));
-                    }
-                }
-                let guard = state.read().await;
-                terminal.draw(|f| ui::render(f, &guard))?;
+            if state.read().await.should_quit {
+                break;
             }
         }
+
+        let event = tokio::select! {
+            msg = next_gateway(&mut ws) => Event::Gateway(msg),
+            _ = ticker.tick() => Event::Tick,
+        };
+
+        match event {
+            Event::Gateway(Some(WsMessage::Disconnected)) | Event::Gateway(None) => {
+                state.write().await.dirty = true;
+                ws = None;
+                let mut s = state.write().await;
+                s.connection = ConnectionState::Lost("gateway went away".to_string());
+                s.transcript
+                    .push_notice("⚠ lost the gateway — reconnecting…");
+                drop(s);
+                schedule_reconnect(&mut backoff, &mut reconnect_at);
+            }
+            Event::Gateway(Some(message)) => {
+                state.write().await.dirty = true;
+                if let Some(client) = ws.as_mut() {
+                    handle_gateway_message(message, &state, client).await;
+                }
+            }
+            Event::Tick => {
+                let changed = {
+                    let mut s = state.write().await;
+                    s.advance_animations()
+                };
+                if changed {
+                    state.write().await.dirty = true;
+                }
+                if ws.is_none() && reconnect_at.is_some_and(|t| Instant::now() >= t) {
+                    try_reconnect(&state, &mut ws, &endpoint, &mut backoff, &mut reconnect_at)
+                        .await;
+                }
+            }
+        }
+
+        redraw(terminal, &state).await?;
 
         if state.read().await.should_quit {
             break;
         }
-        if let Some(err) = &state.read().await.fatal_error.clone() {
-            return Err(crate::tui::error::TuiError::WebSocket(err.clone()));
+        if let Some(err) = state.read().await.fatal_error.clone() {
+            return Err(TuiError::WebSocket(err));
         }
     }
-
     Ok(())
 }
 
-/// Handle a user action. Returns `true` if the loop should exit.
+/// Await the next gateway message, or never resolve while disconnected.
+async fn next_gateway(ws: &mut Option<WsClient>) -> Option<WsMessage> {
+    match ws.as_mut() {
+        Some(client) => client.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Everything that has to happen before the first paint.
+async fn startup(
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut Option<WsClient>,
+    session: &SessionChoice,
+) {
+    let Some(client) = ws.as_mut() else {
+        return;
+    };
+
+    // The catalog feeds `/help` and Tab completion.
+    if let Ok(catalog) = gw::commands_list(client).await {
+        let mut s = state.write().await;
+        if !catalog.is_empty() {
+            s.command_list = catalog;
+        }
+    }
+
+    match resume::resolve_startup_session(session, state, client).await {
+        Ok(resume::StartupSession::Use(id)) => {
+            if let Err(e) = resume::switch_to(&id, state, client).await {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("⚠ could not resume {id}: {e}"));
+            }
+        }
+        Ok(resume::StartupSession::ListAndWait) => {
+            // `--resume` with no id: show the list, keep `/resume <n>` as the
+            // way in.
+            if let Ok(sessions) = resume::refresh_sessions(state, client).await {
+                let mut lines = vec![TranscriptLine::new(
+                    LineKind::Notice,
+                    format!("{} sessions:", sessions.len()),
+                )];
+                for line in resume::session_lines(&sessions) {
+                    lines.push(TranscriptLine::new(LineKind::Notice, line));
+                }
+                lines.push(TranscriptLine::new(
+                    LineKind::Notice,
+                    "resume one with /resume <number>",
+                ));
+                state.write().await.transcript.push(lines);
+            }
+        }
+        Ok(resume::StartupSession::Fresh) => {}
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("⚠ could not list sessions: {e}"));
+        }
+    }
+
+    let greeting = {
+        let s = state.read().await;
+        match (&s.current_session, s.connection.label()) {
+            (Some(id), label) => format!("── connected ({label}) · session {id} ──"),
+            (None, label) => format!("── connected ({label}) · Ctrl+H for help ──"),
+        }
+    };
+    state.write().await.transcript.push_notice(greeting);
+}
+
+/// Flush graduated lines, then repaint the live region.
+async fn redraw<B: Backend<Error = io::Error>>(
+    terminal: &mut Terminal<B>,
+    state: &Arc<RwLock<AppState>>,
+) -> Result<(), TuiError> {
+    let (pending, dirty) = {
+        let mut s = state.write().await;
+        (s.transcript.take_flushable(), s.dirty)
+    };
+    if pending.is_empty() && !dirty {
+        return Ok(());
+    }
+
+    if !pending.is_empty() {
+        let width = terminal.size()?.width;
+        let lines = blocks::to_lines(&pending);
+        scrollback::flush(terminal, &lines, width)?;
+        // `flush` inserted above the viewport and cleared it — the draw below
+        // is what puts the composer back.
+    }
+
+    {
+        let s = state.read().await;
+        terminal.draw(|f| live::render(f, &s))?;
+    }
+    state.write().await.dirty = false;
+    Ok(())
+}
+
+/// Handle a key action while connected.
 async fn handle_action(
     action: TuiAction,
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
-) -> Result<bool, crate::tui::error::TuiError> {
-    let mut s = state.write().await;
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let mode = state.read().await.live_mode;
+    match mode {
+        LiveMode::Approval => return handle_approval_action(action, state, ws).await,
+        LiveMode::Ask => return handle_ask_action(action, state, ws).await,
+        LiveMode::Composer => {}
+    }
 
-    // In config-edit mode, keys edit the current value.
-    if s.input_mode == InputMode::ConfigEdit {
+    match action {
+        TuiAction::Quit => state.write().await.should_quit = true,
+        TuiAction::Abort => abort_or_quit(state, ws).await?,
+        TuiAction::SendMessage => send_message(state, ws).await?,
+        TuiAction::RunSlashCommand(cmd) => {
+            let mut s = state.write().await;
+            s.transcript.push_user(&cmd);
+            s.clear_input();
+            drop(s);
+            handle_slash_command(&cmd, Arc::clone(state), ws).await?;
+        }
+        TuiAction::InputChar(c) => state.write().await.insert_char(c),
+        TuiAction::InputNewline => state.write().await.insert_newline(),
+        TuiAction::InputBackspace => state.write().await.input_backspace(),
+        TuiAction::InputDelete => {
+            let mut s = state.write().await;
+            s.move_cursor_right();
+            s.input_backspace();
+        }
+        TuiAction::CursorLeft => state.write().await.move_cursor_left(),
+        TuiAction::CursorRight => state.write().await.move_cursor_right(),
+        TuiAction::CursorHome => state.write().await.input_cursor = 0,
+        TuiAction::CursorEnd => {
+            let mut s = state.write().await;
+            s.input_cursor = s.input_buffer.len();
+        }
+        TuiAction::CursorUp => {
+            state.write().await.cursor_up_or_history();
+        }
+        TuiAction::CursorDown => {
+            state.write().await.cursor_down_or_history();
+        }
+        TuiAction::CompleteNext | TuiAction::CompletePrev => {
+            let mut s = state.write().await;
+            s.move_completion(matches!(action, TuiAction::CompleteNext));
+            s.apply_completion();
+        }
+        TuiAction::Escape => {
+            // Esc while a turn is running stops it; otherwise it clears the
+            // draft, which is the least surprising "get me out of here".
+            let running = state.read().await.is_running;
+            if running {
+                abort_or_quit(state, ws).await?;
+            } else {
+                state.write().await.clear_input();
+            }
+        }
+        TuiAction::Resize(..) | TuiAction::None => {}
+    }
+    Ok(())
+}
+
+/// Actions that are still meaningful with the gateway gone.
+async fn handle_offline_action(
+    action: TuiAction,
+    state: &Arc<RwLock<AppState>>,
+    backoff: &mut Backoff,
+    reconnect_at: &mut Option<Instant>,
+) {
+    let edit_only = matches!(
+        action,
+        TuiAction::InputChar(_)
+            | TuiAction::InputNewline
+            | TuiAction::InputBackspace
+            | TuiAction::InputDelete
+            | TuiAction::CursorLeft
+            | TuiAction::CursorRight
+            | TuiAction::CursorHome
+            | TuiAction::CursorEnd
+            | TuiAction::CursorUp
+            | TuiAction::CursorDown
+            | TuiAction::CompleteNext
+            | TuiAction::CompletePrev
+            | TuiAction::Resize(..)
+            | TuiAction::None
+    );
+    if edit_only {
+        // Editing is local; do it through the same paths as usual.
+        let mut s = state.write().await;
         match action {
-            TuiAction::SendMessage => {
-                let value = s.input_buffer.trim().to_string();
-                s.input_buffer.clear();
-                s.input_cursor = 0;
-                let key = config_keys()
-                    .get(s.config_selected_index)
-                    .cloned()
-                    .unwrap_or_default();
-                s.config_edits.insert(key, value);
-                s.input_mode = InputMode::Popup;
-            }
-            TuiAction::SaveConfig => {
-                s.input_mode = InputMode::Popup;
-                s.input_cursor = 0;
-                drop(s);
-                save_config_edits(Arc::clone(&state), ws_client).await.ok();
-                return Ok(false);
-            }
             TuiAction::InputChar(c) => s.insert_char(c),
             TuiAction::InputNewline => s.insert_newline(),
             TuiAction::InputBackspace => s.input_backspace(),
+            TuiAction::InputDelete => {
+                s.move_cursor_right();
+                s.input_backspace();
+            }
             TuiAction::CursorLeft => s.move_cursor_left(),
             TuiAction::CursorRight => s.move_cursor_right(),
             TuiAction::CursorHome => s.input_cursor = 0,
             TuiAction::CursorEnd => s.input_cursor = s.input_buffer.len(),
-            TuiAction::ClosePopup => {
-                s.input_mode = InputMode::Popup;
-                s.input_buffer.clear();
-                s.input_cursor = 0;
+            TuiAction::CursorUp => {
+                s.cursor_up_or_history();
+            }
+            TuiAction::CursorDown => {
+                s.cursor_down_or_history();
+            }
+            TuiAction::CompleteNext | TuiAction::CompletePrev => {
+                s.move_completion(matches!(action, TuiAction::CompleteNext));
+                s.apply_completion();
             }
             _ => {}
         }
-        return Ok(false);
+        return;
     }
 
     match action {
-        TuiAction::Quit => {
-            s.should_quit = true;
-            return Ok(true);
+        TuiAction::Quit => state.write().await.should_quit = true,
+        TuiAction::SendMessage | TuiAction::RunSlashCommand(_) => {
+            // Say so rather than silently swallowing the message; the input
+            // buffer is left intact so nothing is lost.
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice("⚠ not connected — message not sent, retry when reconnected");
+            schedule_reconnect(backoff, reconnect_at);
         }
-        TuiAction::Abort => {
-            if s.is_running {
-                drop(s);
-                let _ = ws_client.request("chat.abort", None).await;
-                let mut s = state.write().await;
-                s.is_running = false;
-                if let Some(msg) = s.last_streaming_message() {
-                    msg.status = crate::tui::state::MessageStatus::Error("Stopped".to_string());
-                }
-                return Ok(false);
-            }
-            s.should_quit = true;
-            return Ok(true);
+        TuiAction::Escape => {
+            state.write().await.clear_input();
         }
-        TuiAction::Resize(cols, rows) => {
-            s.terminal_size = (cols, rows);
-        }
-        TuiAction::SendMessage => {
-            let text = s.input_buffer.trim().to_string();
-            if text.is_empty() {
-                return Ok(false);
-            }
-            s.input_buffer.clear();
-            s.input_cursor = 0;
-            s.scroll_offset = 0;
-            drop(s);
-
-            if text.starts_with('/') {
-                return handle_slash_command(&text, state.clone(), ws_client)
-                    .await
-                    .map(|_| false);
-            }
-
-            let (inline_cmd, remaining) = extract_inline_command(&text);
-            if !remaining.is_empty() {
-                send_chat_message(state.clone(), ws_client, remaining).await?;
-            } else if inline_cmd.is_none() {
-                // The message contained only whitespace after extraction; nothing to send.
-                return Ok(false);
-            }
-            if let Some(cmd) = inline_cmd {
-                handle_slash_command(&cmd, state.clone(), ws_client).await?;
-            }
-        }
-        TuiAction::RunSlashCommand(cmd) => {
-            s.input_buffer.clear();
-            s.input_cursor = 0;
-            drop(s);
-            handle_slash_command(&cmd, state.clone(), ws_client).await?;
-        }
-        TuiAction::InputChar(c) => match s.input_mode {
-            InputMode::Normal | InputMode::ConfigEdit => s.insert_char(c),
-            InputMode::Popup => {}
-        },
-        TuiAction::InputNewline => match s.input_mode {
-            InputMode::Normal | InputMode::ConfigEdit => {
-                s.insert_newline();
-            }
-            InputMode::Popup => {}
-        },
-        TuiAction::InputBackspace => {
-            s.input_backspace();
-        }
-        TuiAction::CursorLeft => {
-            s.move_cursor_left();
-        }
-        TuiAction::CursorRight => {
-            s.move_cursor_right();
-        }
-        TuiAction::CursorHome => {
-            s.input_cursor = 0;
-        }
-        TuiAction::CursorEnd => {
-            s.input_cursor = s.input_buffer.len();
-        }
-        TuiAction::ScrollUp => {
-            s.scroll_offset = s.scroll_offset.saturating_add(3);
-        }
-        TuiAction::ScrollDown => {
-            s.scroll_offset = s.scroll_offset.saturating_sub(3);
-        }
-        TuiAction::FocusNext | TuiAction::FocusPrevious => {
-            // Focus cycling is simplified; input is always focused.
-        }
-        TuiAction::OpenHelp => {
-            s.popup = Popup::Help;
-            s.input_mode = InputMode::Popup;
-            drop(s);
-            let _ = fetch_commands(ws_client, Arc::clone(&state)).await;
-        }
-        TuiAction::ClosePopup => {
-            s.popup = Popup::None;
-            s.input_mode = InputMode::Normal;
-        }
-        TuiAction::OpenConfigEditor => {
-            s.popup = Popup::ConfigEditor;
-            s.input_mode = InputMode::Popup;
-            drop(s);
-            let _ = fetch_config(ws_client, Arc::clone(&state)).await;
-        }
-        TuiAction::SaveConfig => {
-            if s.popup == Popup::ConfigEditor {
-                drop(s);
-                save_config_edits(Arc::clone(&state), ws_client).await.ok();
-            }
-        }
-        TuiAction::SelectUp => match s.popup {
-            Popup::None => {
-                if !s.sessions.is_empty() {
-                    s.selected_session_index = s.selected_session_index.saturating_sub(1);
-                }
-            }
-            Popup::ConfigEditor => {
-                s.config_selected_index = s.config_selected_index.saturating_sub(1);
-            }
-            Popup::Help => {
-                s.palette_index = s.palette_index.saturating_sub(1);
-            }
-        },
-        TuiAction::SelectDown => match s.popup {
-            Popup::None => {
-                if !s.sessions.is_empty() {
-                    s.selected_session_index =
-                        (s.selected_session_index + 1).min(s.sessions.len() - 1);
-                }
-            }
-            Popup::ConfigEditor => {
-                let keys = config_keys();
-                s.config_selected_index =
-                    (s.config_selected_index + 1).min(keys.len().saturating_sub(1));
-            }
-            Popup::Help => {
-                if !s.palette_commands.is_empty() {
-                    s.palette_index = (s.palette_index + 1).min(s.palette_commands.len() - 1);
-                }
-            }
-        },
-        TuiAction::SelectEnter => match s.popup {
-            Popup::None => {
-                if let Some(session) = s.sessions.get(s.selected_session_index).cloned() {
-                    let sid = session.id.clone();
-                    s.switch_session(&sid);
-                    drop(s);
-                    subscribe_session(ws_client, &sid).await.ok();
-                }
-            }
-            Popup::ConfigEditor => {
-                s.input_mode = InputMode::ConfigEdit;
-                let key = config_keys()
-                    .get(s.config_selected_index)
-                    .cloned()
-                    .unwrap_or_default();
-                let current = s.config_cache.get(&key).cloned().unwrap_or(Value::Null);
-                s.input_buffer = current.to_string();
-                s.input_cursor = s.input_buffer.len();
-            }
-            Popup::Help => {
-                if let Some(cmd) = s.palette_commands.get(s.palette_index).cloned() {
-                    s.popup = Popup::None;
-                    s.input_mode = InputMode::Normal;
-                    s.input_buffer = format!("/{}", cmd.name);
-                    s.input_cursor = s.input_buffer.len();
-                    update_palette(&mut s);
-                }
-            }
-        },
-        TuiAction::NewSession => {
-            drop(s);
-            create_session(state.clone(), ws_client).await?;
-        }
-        TuiAction::DeleteSelected => {
-            let idx = s.selected_session_index;
-            if let Some(session) = s.sessions.get(idx).cloned() {
-                drop(s);
-                delete_session(state.clone(), ws_client, &session.id).await?;
-            }
-        }
-        TuiAction::Approve { id } => {
-            drop(s);
-            let _ = ws_client
-                .request(
-                    "approval.respond",
-                    Some(serde_json::json!({ "approval_id": id, "approved": true })),
-                )
-                .await;
-        }
-        TuiAction::Reject { id } => {
-            drop(s);
-            let _ = ws_client
-                .request(
-                    "approval.respond",
-                    Some(serde_json::json!({ "approval_id": id, "approved": false })),
-                )
-                .await;
-        }
-        TuiAction::None => {}
+        _ => {}
     }
-
-    // Keep the command palette in sync whenever typing in normal mode.
-    if state.read().await.input_mode == InputMode::Normal
-        && state.read().await.input_buffer.starts_with('/')
-    {
-        let mut s = state.write().await;
-        update_palette(&mut s);
-    }
-
-    Ok(false)
 }
 
-/// Send a chat message to the gateway.
-async fn send_chat_message(
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
-    text: String,
-) -> Result<(), crate::tui::error::TuiError> {
-    let session_id = {
-        let mut s = state.write().await;
-        let sid = s
-            .current_session
-            .clone()
-            .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4()));
-        s.current_session = Some(sid.clone());
-        s.ensure_session(&sid);
-        s.switch_session(&sid);
-        let msg_id = format!("msg_{}", s.messages.len());
-        s.append_user_message(msg_id, &text);
-        sid
-    };
-
-    ws_client
-        .request(
-            "chat.send",
-            Some(serde_json::json!({
-                "message": text,
-                "session_id": session_id,
-            })),
-        )
-        .await?;
-
-    Ok(())
+/// Schedule the next reconnect attempt.
+fn schedule_reconnect(backoff: &mut Backoff, reconnect_at: &mut Option<Instant>) {
+    let delay = backoff.next_delay();
+    *reconnect_at = Some(Instant::now() + delay);
 }
 
-/// Handle an incoming WebSocket message.
-async fn handle_network_message(
-    msg: WsMessage,
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
+/// Attempt to reconnect, reporting the outcome into the transcript.
+async fn try_reconnect(
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut Option<WsClient>,
+    endpoint: &Endpoint,
+    backoff: &mut Backoff,
+    reconnect_at: &mut Option<Instant>,
 ) {
-    match msg {
-        WsMessage::Event(event) => handle_event(event, Arc::clone(&state), ws_client).await,
-        WsMessage::OrphanResponse(resp) => {
-            if !resp.ok {
-                let mut s = state.write().await;
-                if let Some(err) = resp.error {
-                    s.error_toast(format!("{}: {}", err.code, err.message));
-                }
-            }
-        }
-    }
-}
-
-/// Handle a gateway event.
-async fn handle_event(event: ClientEvent, state: Arc<RwLock<AppState>>, _ws_client: &mut WsClient) {
-    let mut s = state.write().await;
-
-    match event.event.as_str() {
-        "chat.delta" => {
-            if let Some(payload) = event.payload {
-                if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
-                    s.append_delta(content);
-                    if s.scroll_offset == 0 {
-                        // Keep tail pinned when already at the bottom.
-                    }
-                }
-            }
-        }
-        "agent.thinking" => {
-            if let Some(payload) = event.payload {
-                if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
-                    if let Some(msg) = s.last_streaming_message() {
-                        if let Some(ref mut thinking) = msg.thinking {
-                            thinking.push_str(content);
-                        } else {
-                            msg.thinking = Some(content.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        "tool.calling" => {
-            if let Some(payload) = event.payload {
-                let tool_name = payload
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let args = payload.get("args").cloned();
-                let msg_id = format!("tool_call_{}", s.messages.len());
-                s.messages.push(crate::tui::state::ChatMessage {
-                    id: msg_id,
-                    role: "tool".to_string(),
-                    content: format!("Calling {}...", tool_name),
-                    tool_name: Some(tool_name.clone()),
-                    status: crate::tui::state::MessageStatus::Sending,
-                    parts: vec![crate::tui::state::ChatMessagePart {
-                        part_type: "tool-call".to_string(),
-                        text: Some(format!("Calling {}...", tool_name)),
-                        tool_name: Some(tool_name),
-                        args,
-                        result: None,
-                    }],
-                    ..crate::tui::state::ChatMessage::default()
-                });
-            }
-        }
-        "tool.result" => {
-            if let Some(payload) = event.payload {
-                let tool_name = payload
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let result = payload.get("result").cloned();
-                if let Some(msg) = s
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|m| m.role == "tool" && m.tool_name.as_deref() == Some(&tool_name))
-                {
-                    msg.status = crate::tui::state::MessageStatus::Complete;
-                    if let Some(idx) = msg.parts.iter_mut().find(|p| p.part_type == "tool-call") {
-                        idx.result = result.clone();
-                    }
-                } else {
-                    let msg_id = format!("tool_result_{}", s.messages.len());
-                    s.messages.push(crate::tui::state::ChatMessage {
-                        id: msg_id,
-                        role: "tool".to_string(),
-                        content: format!("{}: done", tool_name),
-                        tool_name: Some(tool_name.clone()),
-                        status: crate::tui::state::MessageStatus::Complete,
-                        parts: vec![crate::tui::state::ChatMessagePart {
-                            part_type: "tool-call".to_string(),
-                            text: Some(format!("{}: done", tool_name)),
-                            tool_name: Some(tool_name),
-                            args: None,
-                            result,
-                        }],
-                        ..crate::tui::state::ChatMessage::default()
-                    });
-                }
-            }
-        }
-        "chat.final" => {
-            let content = event
-                .payload
-                .as_ref()
-                .and_then(|p| p.get("response"))
-                .and_then(|v| v.as_str());
-            s.finalize_assistant(content);
-            s.scroll_offset = 0;
-        }
-        "chat.error" => {
-            let message = event
-                .payload
-                .as_ref()
-                .and_then(|p| p.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("chat error")
-                .to_string();
-            s.error_assistant(&message);
-            s.error_toast(message);
-        }
-        "session.created" => {
-            if let Some(payload) = event.payload {
-                if let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) {
-                    s.ensure_session(sid);
-                    s.toast(format!("Session created: {}", sid));
-                }
-            }
-        }
-        "session.renamed" => {
-            if let Some(payload) = event.payload {
-                if let (Some(sid), Some(name)) = (
-                    payload.get("session_id").and_then(|v| v.as_str()),
-                    payload.get("name").and_then(|v| v.as_str()),
-                ) {
-                    if let Some(session) = s.sessions.iter_mut().find(|x| x.id == sid) {
-                        session.label = Some(name.to_string());
-                    }
-                }
-            }
-        }
-        "cron.completed" => {
-            if let Some(payload) = event.payload {
-                let message = payload
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Cron job completed")
-                    .to_string();
-                let msg_id = format!("cron_{}", s.messages.len());
-                s.append_system_message(msg_id, message);
-            }
-        }
-        "approval.required" => {
-            if let Some(payload) = event.payload {
-                let tool_name = payload
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool");
-                s.toast(format!("Approval required: {}", tool_name));
-            }
-        }
-        "channel.status" | "agent.status" => {
-            // Ignored for now.
-        }
-        _ => {
-            // Other events ignored.
-        }
-    }
-}
-
-/// Fetch the list of sessions from the gateway.
-async fn fetch_sessions(
-    ws_client: &mut WsClient,
-    state: Arc<RwLock<AppState>>,
-) -> Result<(), crate::tui::error::TuiError> {
-    let result = ws_client.request("sessions.list", None).await?;
-    let mut s = state.write().await;
-    if let Some(items) = result.as_array() {
-        s.sessions = items
-            .iter()
-            .filter_map(|v| {
-                Some(SessionSummary {
-                    id: v.get("id")?.as_str()?.to_string(),
-                    label: v
-                        .get("name")
-                        .or_else(|| v.get("label"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    agent_id: v.get("agent_id").and_then(|v| v.as_str()).map(String::from),
-                    selected: false,
-                })
-            })
-            .collect();
-        if let Some(current) = s.current_session.clone() {
-            s.switch_session(&current);
-        }
-    }
-    Ok(())
-}
-
-/// Subscribe to a session.
-async fn subscribe_session(
-    ws_client: &mut WsClient,
-    session_id: &str,
-) -> Result<(), crate::tui::error::TuiError> {
-    ws_client
-        .request("sessions.subscribe", Some(serde_json::json!({ "session_id": session_id })))
-        .await?;
-    Ok(())
-}
-
-/// Create a new session and select it.
-async fn create_session(
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
-) -> Result<(), crate::tui::error::TuiError> {
-    let result = ws_client.request("sessions.create", None).await?;
-    if let Some(sid) = result.get("session_id").and_then(|v| v.as_str()) {
-        {
-            let mut s = state.write().await;
-            s.ensure_session(sid);
-            s.switch_session(sid);
-        }
-        subscribe_session(ws_client, sid).await?;
-    }
-    Ok(())
-}
-
-/// Delete a session.
-async fn delete_session(
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
-    session_id: &str,
-) -> Result<(), crate::tui::error::TuiError> {
-    ws_client
-        .request("sessions.delete", Some(serde_json::json!({ "session_id": session_id })))
-        .await?;
+    *reconnect_at = None;
+    let attempt = backoff.attempt() + 1;
+    match WsClient::connect(
+        &endpoint.url,
+        &endpoint.auth,
+        endpoint.session.as_deref(),
+        &["chat", "read", "write"],
+    )
+    .await
     {
-        let mut s = state.write().await;
-        s.sessions.retain(|s| s.id != session_id);
-        if s.current_session.as_deref() == Some(session_id) {
-            s.current_session = None;
-            s.messages.clear();
-        }
-        if s.selected_session_index >= s.sessions.len() {
-            s.selected_session_index = s.sessions.len().saturating_sub(1);
-        }
-    }
-    Ok(())
-}
-
-/// Load persisted chat history for a session.
-async fn load_session_history(
-    ws_client: &mut WsClient,
-    state: Arc<RwLock<AppState>>,
-    session_id: &str,
-) -> Result<(), crate::tui::error::TuiError> {
-    let result = ws_client
-        .request("chat.history", Some(serde_json::json!({ "session_id": session_id })))
-        .await;
-
-    let mut s = state.write().await;
-    match result {
-        Ok(payload) => {
-            let messages: Vec<crate::tui::state::ChatMessage> = payload
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|v| {
-                            Some(crate::tui::state::ChatMessage {
-                                id: v.get("id")?.as_str()?.to_string(),
-                                role: v.get("role")?.as_str()?.to_string(),
-                                content: v
-                                    .get("content")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                thinking: v
-                                    .get("thinking")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                tool_name: v
-                                    .get("tool_name")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                status: crate::tui::state::MessageStatus::Complete,
-                                timestamp: chrono::Local::now(),
-                                metadata: v.get("metadata").cloned(),
-                                parts: vec![],
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            s.messages_by_session
-                .insert(session_id.to_string(), messages);
-            if s.current_session.as_deref() == Some(session_id) {
-                s.load_session_messages(session_id);
+        Ok((client, hello)) => {
+            *ws = Some(client);
+            backoff.reset();
+            let mut s = state.write().await;
+            s.connection = ConnectionState::Connected {
+                features: hello.features,
+                scopes_granted: hello.scopes_granted,
+                server_version: hello.server.version,
+            };
+            s.dirty = true;
+            // Deliberately no history replay: the transcript is already in the
+            // scrollback above, and reprinting it would duplicate everything.
+            s.transcript
+                .push_notice("── reconnected (output produced while offline was not received) ──");
+            let session = s.current_session.clone();
+            drop(s);
+            if let Some(id) = session {
+                if let Some(client) = ws.as_mut() {
+                    let _ = gw::sessions_subscribe(client, &id).await;
+                }
             }
         }
         Err(e) => {
-            s.error_toast(format!("Failed to load history: {}", e));
+            state
+                .write()
+                .await
+                .set_status(format!("⚠ reconnect attempt {attempt} failed: {e}"));
+            schedule_reconnect(backoff, reconnect_at);
         }
+    }
+}
+
+/// Abort the running turn, or quit when idle.
+async fn abort_or_quit(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    let running = state.read().await.is_running;
+    if running {
+        if let Some(id) = session {
+            let _ = gw::chat_abort(ws, &id).await;
+        }
+        let mut s = state.write().await;
+        s.transcript.finish_stream(STREAM_ASSISTANT, None);
+        s.transcript.finish_stream(STREAM_THINKING, None);
+        s.transcript.push_notice("── stopped ──");
+        s.end_run();
+    } else {
+        state.write().await.should_quit = true;
     }
     Ok(())
 }
 
-/// Fetch the command list for the help popup and command palette.
-pub(crate) async fn fetch_commands(
-    ws_client: &mut WsClient,
-    state: Arc<RwLock<AppState>>,
-) -> Result<(), crate::tui::error::TuiError> {
-    let result = ws_client
-        .request("commands.list", Some(serde_json::json!({ "tier": "power" })))
-        .await;
-
-    let mut s = state.write().await;
-    match result {
-        Ok(value) => {
-            if let Some(items) = value.get("commands").and_then(|v| v.as_array()) {
-                s.command_list = items
-                    .iter()
-                    .filter_map(|v| {
-                        Some(crate::tui::state::CommandInfo {
-                            key: v.get("key")?.as_str()?.to_string(),
-                            name: v.get("name")?.as_str()?.to_string(),
-                            description: v
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            usage: v
-                                .get("args")
-                                .and_then(|v| v.as_str())
-                                .map(String::from)
-                                .unwrap_or_default(),
-                            category: v
-                                .get("category")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("status")
-                                .to_string(),
-                            tier: v
-                                .get("tier")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("standard")
-                                .to_string(),
-                            local: v.get("local").and_then(|v| v.as_bool()).unwrap_or(false),
-                            requires_admin: v
-                                .get("requires_admin")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false),
-                        })
-                    })
-                    .collect();
-            }
-        }
-        Err(_) => {
-            s.command_list = crate::tui::commands::fallback_commands();
-        }
-    }
-    update_palette(&mut s);
-    Ok(())
-}
-
-/// Fetch editable config values.
-pub(crate) async fn fetch_config(
-    ws_client: &mut WsClient,
-    state: Arc<RwLock<AppState>>,
-) -> Result<(), crate::tui::error::TuiError> {
-    for key in config_keys() {
-        if let Ok(value) = ws_client
-            .request("config.get", Some(serde_json::json!({ "key": key })))
-            .await
-        {
-            let mut s = state.write().await;
-            s.config_cache.insert(key, value);
-        }
-    }
-    Ok(())
-}
-
-/// Save pending config edits.
-pub async fn save_config_edits(
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
-) -> Result<(), crate::tui::error::TuiError> {
-    let edits = {
+/// Submit whatever is in the input buffer.
+async fn send_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let text = {
         let s = state.read().await;
-        s.config_edits.clone()
+        s.input_buffer.trim().to_string()
     };
+    if text.is_empty() {
+        return Ok(());
+    }
 
-    for (key, value) in edits {
-        ws_client
-            .request("config.set", Some(serde_json::json!({ "key": key, "value": value })))
-            .await?;
+    if text.starts_with('/') {
+        let mut s = state.write().await;
+        s.remember_input(&text);
+        s.transcript.push_user(&text);
+        s.clear_input();
+        drop(s);
+        return handle_slash_command(&text, Arc::clone(state), ws).await;
+    }
+
+    // A session is created lazily, on the first message — the gateway picks
+    // the id, and we adopt whatever it returns.
+    let session = match state.read().await.current_session.clone() {
+        Some(id) => id,
+        None => gw::sessions_create(ws, None).await?,
+    };
+    if state.read().await.current_session.is_none() {
+        gw::sessions_subscribe(ws, &session).await?;
     }
 
     {
         let mut s = state.write().await;
-        s.config_edits.clear();
-        s.popup = Popup::None;
-        s.input_mode = InputMode::Normal;
-        s.toast("Config updated. Restart required for some changes.");
+        s.remember_input(&text);
+        s.current_session = Some(session.clone());
+        s.transcript.push_user(&text);
+        s.transcript.push_separator();
+        s.clear_input();
+        s.begin_run();
     }
 
-    fetch_config(ws_client, Arc::clone(&state)).await?;
+    match gw::chat_send(ws, &session, &text).await {
+        Ok(result) => {
+            let mut s = state.write().await;
+            if !result.session_id.is_empty() && result.session_id != session {
+                s.current_session = Some(result.session_id);
+            }
+            s.current_agent = result.agent_id.or_else(|| s.current_agent.clone());
+        }
+        Err(e) => {
+            let mut s = state.write().await;
+            s.end_run();
+            s.transcript.push_notice(format!("✘ could not send: {e}"));
+        }
+    }
     Ok(())
 }
 
-/// Keys exposed in the config editor.
-pub fn config_keys() -> Vec<String> {
-    vec![
-        "gateway.host".to_string(),
-        "gateway.port".to_string(),
-        "logging.level".to_string(),
-        "model.default".to_string(),
-        "model.provider".to_string(),
-    ]
+/// Handle a key action while an approval is pending.
+async fn handle_approval_action(
+    action: TuiAction,
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let (approve, decide) = match action {
+        // `y`/Enter approve, `n`/Esc deny; arrows move the highlight.
+        TuiAction::InputChar('y') | TuiAction::InputChar('Y') | TuiAction::SendMessage => {
+            (true, true)
+        }
+        TuiAction::InputChar('n') | TuiAction::InputChar('N') | TuiAction::Escape => (false, true),
+        TuiAction::CursorLeft | TuiAction::CursorRight => {
+            let mut s = state.write().await;
+            s.approval_approve_selected = !s.approval_approve_selected;
+            (false, false)
+        }
+        TuiAction::Quit => {
+            state.write().await.should_quit = true;
+            (false, false)
+        }
+        // Everything else is swallowed: while a tool is blocked on a human,
+        // typing must not go into the composer.
+        _ => (false, false),
+    };
+
+    let Some(approval) = state.read().await.current_approval().cloned() else {
+        state.write().await.live_mode = LiveMode::Composer;
+        return Ok(());
+    };
+    if !decide {
+        return Ok(());
+    }
+
+    match gw::approvals_decide(ws, &approval.id, approve, None).await {
+        Ok(()) => {
+            let mut s = state.write().await;
+            let mark = if approve {
+                "✔ approved"
+            } else {
+                "✘ denied"
+            };
+            s.transcript.push_notice(format!(
+                "{mark} {} (risk: {})",
+                approval.tool_name, approval.risk_level
+            ));
+            s.pop_approval();
+            s.dirty = true;
+        }
+        Err(e) => {
+            let mut s = state.write().await;
+            s.transcript
+                .push_notice(format!("✘ could not answer the approval: {e}"));
+            s.pop_approval();
+        }
+    }
+    Ok(())
+}
+
+/// Handle a key action while the agent's question is pending.
+async fn handle_ask_action(
+    action: TuiAction,
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let (submit, dismiss) = match action {
+        TuiAction::SendMessage => (true, false),
+        TuiAction::Escape => (false, true),
+        TuiAction::Quit => {
+            state.write().await.should_quit = true;
+            (false, false)
+        }
+        TuiAction::InputChar(c) if c.is_ascii_digit() => {
+            let mut s = state.write().await;
+            let options = s.pending_ask.as_ref().map(|a| a.options.len()).unwrap_or(0);
+            let idx = c.to_digit(10).unwrap_or(0) as usize;
+            if idx >= 1 && idx <= options {
+                s.ask_input = c.to_string();
+            }
+            (false, false)
+        }
+        TuiAction::InputChar(c) => {
+            state.write().await.ask_input.push(c);
+            (false, false)
+        }
+        TuiAction::InputBackspace => {
+            state.write().await.ask_input.pop();
+            (false, false)
+        }
+        _ => (false, false),
+    };
+
+    if dismiss {
+        // Matching the web UI: the question stays pending server-side until it
+        // times out, and `/answer` can still pick it up.
+        let mut s = state.write().await;
+        s.live_mode = LiveMode::Composer;
+        s.transcript.push_notice(
+            "question left unanswered — /answer <text> will still reach it (it times out in 5 minutes)",
+        );
+        return Ok(());
+    }
+    if !submit {
+        return Ok(());
+    }
+
+    let (ask, typed) = {
+        let s = state.read().await;
+        (s.pending_ask.clone(), s.ask_input.trim().to_string())
+    };
+    let Some(ask) = ask else {
+        state.write().await.live_mode = LiveMode::Composer;
+        return Ok(());
+    };
+    // A digit picks the option at that position; otherwise the typed text is
+    // the answer, falling back to the agent's default.
+    let answer = if let Ok(idx) = typed.parse::<usize>() {
+        ask.options
+            .get(idx.saturating_sub(1))
+            .cloned()
+            .unwrap_or(typed)
+    } else if !typed.is_empty() {
+        typed
+    } else {
+        ask.default.clone().unwrap_or_default()
+    };
+    if answer.is_empty() {
+        return Ok(());
+    }
+
+    match gw::ask_respond(ws, &ask.ask_id, &answer).await {
+        Ok(()) => {
+            let mut s = state.write().await;
+            s.pending_ask = None;
+            s.ask_input.clear();
+            s.live_mode = LiveMode::Composer;
+            s.transcript.push_notice(format!("answered: {answer}"));
+            s.dirty = true;
+        }
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ could not answer: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Route one gateway message.
+async fn handle_gateway_message(
+    message: WsMessage,
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) {
+    match message {
+        WsMessage::Event(event) => handle_event(event, state, ws).await,
+        WsMessage::OrphanResponse(response) => {
+            if !response.ok {
+                if let Some(err) = response.error {
+                    state
+                        .write()
+                        .await
+                        .transcript
+                        .push_notice(format!("⚠ {}: {}", err.code, err.message));
+                }
+            }
+        }
+        WsMessage::Disconnected => {}
+    }
+}
+
+/// Apply one server event to the state.
+async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &mut WsClient) {
+    let Some(payload) = event.payload else {
+        return;
+    };
+    match event.event.as_str() {
+        "chat.delta" => {
+            let content = payload["content"].as_str().unwrap_or_default();
+            let mut s = state.write().await;
+            s.transcript
+                .push_delta(STREAM_ASSISTANT, LineKind::Assistant, content);
+            s.dirty = true;
+        }
+        "agent.thinking" => {
+            let content = payload["content"].as_str().unwrap_or_default();
+            let mut s = state.write().await;
+            s.transcript
+                .push_delta(STREAM_THINKING, LineKind::Reasoning, content);
+            s.dirty = true;
+        }
+        "tool.calling" => {
+            let tool = payload["tool_name"].as_str().unwrap_or("tool").to_string();
+            // The gateway names this field `arguments`; reading `args` (as the
+            // old TUI did) silently dropped every tool's parameters.
+            let args = payload
+                .get("arguments")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .or_else(|| payload.get("args").filter(|v| !v.is_null()).cloned());
+            let mut s = state.write().await;
+            s.transcript.push(tool_call_lines(&tool, args.as_ref()));
+            s.dirty = true;
+        }
+        "tool.result" => {
+            let tool = payload["tool_name"].as_str().unwrap_or("tool").to_string();
+            let result = payload
+                .get("result")
+                .filter(|v| !v.is_null())
+                .map(|v| compact(v, 6));
+            let text = match result {
+                Some(text) => format!("  ↳ {tool}: {text}"),
+                None => format!("  ↳ {tool}: done"),
+            };
+            let mut s = state.write().await;
+            s.transcript
+                .push(vec![TranscriptLine::new(LineKind::ToolResult, text)]);
+            s.dirty = true;
+        }
+        "chat.final" => {
+            let response = payload["response"].as_str().map(str::to_string);
+            let mut s = state.write().await;
+            s.transcript.finish_stream(STREAM_THINKING, None);
+            s.transcript
+                .finish_stream(STREAM_ASSISTANT, response.as_deref());
+            s.end_run();
+            s.dirty = true;
+        }
+        "chat.error" => {
+            let message = payload["message"].as_str().unwrap_or("unknown error");
+            let mut s = state.write().await;
+            s.transcript.finish_stream(STREAM_ASSISTANT, None);
+            s.transcript
+                .push_notice(format!("✘ response failed: {message}"));
+            s.end_run();
+            s.dirty = true;
+        }
+        "session.created" => {
+            if let Some(id) = payload["session_id"].as_str() {
+                let mut s = state.write().await;
+                if s.current_session.is_none() {
+                    s.current_session = Some(id.to_string());
+                }
+                s.dirty = true;
+            }
+            let _ = resume::refresh_sessions(state, ws).await;
+        }
+        "session.renamed" => {
+            let id = payload["session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let name = payload["name"].as_str().unwrap_or_default().to_string();
+            let mut s = state.write().await;
+            if let Some(entry) = s.sessions.iter_mut().find(|x| x.id == id) {
+                entry.name = Some(name);
+            }
+            s.dirty = true;
+        }
+        "cron.completed" => {
+            let name = payload["job_name"].as_str().unwrap_or("cron job");
+            let status = payload["status"].as_str().unwrap_or("ok");
+            let output = payload["output"].as_str().unwrap_or_default();
+            let mut s = state.write().await;
+            s.transcript
+                .push_notice(format!("⏱ {name} [{status}] {output}"));
+            s.dirty = true;
+        }
+        "approval.required" => {
+            let id = payload["approval_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                return;
+            }
+            let mut detail = ApprovalDetail {
+                id: id.clone(),
+                tool_name: payload["tool_name"].as_str().unwrap_or("tool").to_string(),
+                requested_by: payload["requested_by"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                risk_level: payload["risk_level"]
+                    .as_str()
+                    .unwrap_or("Medium")
+                    .to_string(),
+                message: payload["message"].as_str().unwrap_or_default().to_string(),
+                args: None,
+            };
+            // The event carries no arguments, so ask for them. Without this the
+            // prompt would be asking the human to approve a call they cannot
+            // see. A resolved-elsewhere approval comes back NOT_FOUND.
+            match gw::approvals_get(ws, &id).await {
+                Ok(full) => detail = full,
+                Err(TuiError::Gateway { code, .. }) if code == "NOT_FOUND" => {
+                    state.write().await.transcript.push_notice(format!(
+                        "⚠ approval {} was already resolved",
+                        detail.tool_name
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    state
+                        .write()
+                        .await
+                        .set_status(format!("⚠ no details for the approval: {e}"));
+                }
+            }
+            let mut s = state.write().await;
+            s.approvals.push_back(detail);
+            s.live_mode = LiveMode::Approval;
+            s.dirty = true;
+        }
+        "ask.required" => {
+            let mut s = state.write().await;
+            s.pending_ask = Some(AskPrompt {
+                ask_id: payload["ask_id"].as_str().unwrap_or_default().to_string(),
+                question: payload["question"].as_str().unwrap_or_default().to_string(),
+                options: payload["options"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                required: payload["required"].as_bool().unwrap_or(true),
+                default: payload["default"].as_str().map(str::to_string),
+            });
+            s.ask_input.clear();
+            s.live_mode = LiveMode::Ask;
+            s.dirty = true;
+        }
+        "ask.resolved" => {
+            let mut s = state.write().await;
+            s.pending_ask = None;
+            s.ask_input.clear();
+            if s.live_mode == LiveMode::Ask {
+                s.live_mode = LiveMode::Composer;
+            }
+            s.dirty = true;
+        }
+        _ => {}
+    }
+}
+
+/// Transcript lines for a tool invocation.
+fn tool_call_lines(tool: &str, args: Option<&Value>) -> Vec<TranscriptLine> {
+    let mut lines = vec![TranscriptLine::new(LineKind::Tool, format!("⚙ {tool}"))];
+    if let Some(args) = args {
+        lines.push(TranscriptLine::new(LineKind::Tool, format!("  {}", compact(args, 6))));
+    }
+    lines
+}
+
+/// Render a JSON value on a bounded number of lines.
+fn compact(value: &Value, max_lines: usize) -> String {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+    let mut lines: Vec<&str> = text.lines().take(max_lines).collect();
+    if text.lines().count() > max_lines {
+        lines.push("…");
+    }
+    lines.join("\n")
+}
+
+/// Run the TUI in line mode, for a stdout that is not a terminal.
+///
+/// No cursor addressing and no raw mode: input is read line by line, output is
+/// printed as it arrives. Enough for `echo "…" | syscity tui > out.txt`, and a
+/// safe landing spot when the terminal cannot do an inline viewport.
+pub async fn run_plain(endpoint: Endpoint, session: SessionChoice) -> Result<(), TuiError> {
+    let (mut ws, hello) = WsClient::connect(
+        &endpoint.url,
+        &endpoint.auth,
+        endpoint.session.as_deref(),
+        &["chat", "read", "write"],
+    )
+    .await?;
+
+    let state = Arc::new(RwLock::new(AppState::default()));
+    {
+        let mut s = state.write().await;
+        s.connection = ConnectionState::Connected {
+            features: hello.features,
+            scopes_granted: hello.scopes_granted,
+            server_version: hello.server.version,
+        };
+        s.current_session = endpoint.session.clone();
+    }
+
+    match resume::resolve_startup_session(&session, &state, &mut ws).await {
+        Ok(resume::StartupSession::Use(id)) => {
+            if let Err(e) = resume::switch_to(&id, &state, &mut ws).await {
+                eprintln!("could not resume {id}: {e}");
+            }
+        }
+        Ok(resume::StartupSession::ListAndWait) => {
+            if let Ok(sessions) = resume::refresh_sessions(&state, &mut ws).await {
+                for line in resume::session_lines(&sessions) {
+                    println!("{line}");
+                }
+            }
+        }
+        Ok(resume::StartupSession::Fresh) => {}
+        Err(e) => eprintln!("could not list sessions: {e}"),
+    }
+    drain(&state).await;
+
+    // stdin is read on a blocking thread: it is a blocking source and has no
+    // place in the async runtime.
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    tokio::task::spawn_blocking(move || {
+        let stdin = io::stdin();
+        loop {
+            let mut line = String::new();
+            match stdin.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if line_tx.send(line.trim_end().to_string()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            Some(line) = line_rx.recv() => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if line.starts_with('/') {
+                    handle_slash_command(&line, Arc::clone(&state), &mut ws).await?;
+                } else if let Err(e) = send_message(&state, &mut ws).await {
+                    eprintln!("send failed: {e}");
+                }
+                drain(&state).await;
+            }
+            Some(message) = ws.next() => {
+                match message {
+                    WsMessage::Disconnected => {
+                        eprintln!("connection closed");
+                        break;
+                    }
+                    WsMessage::Event(event) => {
+                        // Stream deltas straight out; everything else goes
+                        // through the transcript and is drained below.
+                        if event.event == "chat.delta" {
+                            if let Some(text) = event.payload.as_ref().and_then(|p| p["content"].as_str()) {
+                                print!("{text}");
+                                let _ = io::stdout().flush();
+                                continue;
+                            }
+                        }
+                        if event.event == "chat.final" {
+                            println!();
+                        }
+                        handle_event(event, &state, &mut ws).await;
+                    }
+                    WsMessage::OrphanResponse(_) => {}
+                }
+                drain(&state).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print everything the transcript has graduated.
+async fn drain(state: &Arc<RwLock<AppState>>) {
+    let lines = state.write().await.transcript.take_flushable();
+    for line in lines {
+        println!("{}", line.text);
+    }
+    let _ = io::stdout().flush();
 }
 
 #[cfg(test)]
@@ -807,8 +991,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_keys_listed() {
-        let keys = config_keys();
-        assert!(keys.contains(&"gateway.host".to_string()));
+    fn compact_trims_long_values() {
+        let value = serde_json::json!({ "a": 1, "b": 2, "c": 3, "d": 4 });
+        let text = compact(&value, 2);
+        assert!(text.lines().count() <= 3, "got {text}");
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_call_lines_include_the_arguments() {
+        let args = serde_json::json!({ "path": "/tmp/x" });
+        let lines = tool_call_lines("file_write", Some(&args));
+        assert_eq!(lines[0].text, "⚙ file_write");
+        assert!(lines[1].text.contains("/tmp/x"));
+    }
+
+    #[test]
+    fn reconnect_schedule_grows_with_each_attempt() {
+        let mut backoff = Backoff::new();
+        let mut at = None;
+        schedule_reconnect(&mut backoff, &mut at);
+        let first = at.expect("scheduled");
+        assert!(first > Instant::now());
+        schedule_reconnect(&mut backoff, &mut at);
+        let second = at.expect("scheduled");
+        assert!(second >= first, "later attempts wait longer");
     }
 }

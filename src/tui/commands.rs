@@ -1,375 +1,587 @@
-//! Slash command parser and executor.
+//! Slash commands.
+//!
+//! Anything that used to open a popup now prints into the scrollback, which is
+//! the whole point of running inline: the output stays where you can read it,
+//! scroll it, and copy it. Commands that need the gateway go through
+//! [`crate::tui::gateway_calls`].
+// INVARIANTS-NONE: command dispatch; state lives in `AppState`.
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::tui::actions::TuiAction;
 use crate::tui::error::TuiError;
-use crate::tui::event_loop::{fetch_commands, fetch_config};
-use crate::tui::state::{AppState, InputMode, MessageStatus, Popup};
+use crate::tui::gateway_calls as gw;
+use crate::tui::state::{AppState, CommandInfo};
+use crate::tui::transcript::{LineKind, TranscriptLine};
+use crate::tui::ui::blocks;
 use crate::tui::ws_client::WsClient;
 
-/// Commands handled locally by the TUI.
-const LOCAL_COMMANDS: &[&str] = &[
-    "new", "clear", "quit", "exit", "help", "config", "sessions", "status", "tools", "model",
+/// Commands implemented inside the TUI.
+pub const LOCAL_COMMANDS: &[&str] = &[
+    "new", "clear", "quit", "exit", "help", "config", "status", "tools", "model", "sessions",
+    "resume", "rename", "pin", "agents", "agent", "answer",
 ];
 
-/// Inline shortcuts that may be embedded in normal chat messages.
-const INLINE_SHORTCUTS: &[&str] = &["help", "commands", "status", "whoami"];
-
-/// Parse a slash command line into `(name, args)`.
+/// Split a submitted line into `(name, args)`.
 pub fn parse_slash_command(line: &str) -> Option<(&str, &str)> {
-    let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix('/') {
-        let mut parts = rest.splitn(2, ' ');
-        let name = parts.next()?;
-        let args = parts.next().unwrap_or("").trim();
-        Some((name, args))
-    } else {
+    let rest = line.strip_prefix('/')?;
+    let (name, args) = match rest.split_once(char::is_whitespace) {
+        Some((name, args)) => (name, args.trim()),
+        None => (rest, ""),
+    };
+    if name.is_empty() {
         None
+    } else {
+        Some((name, args))
     }
 }
 
-/// Check whether `name` is a locally-handled TUI command.
+/// Whether a command is handled locally.
 pub fn is_local_command(name: &str) -> bool {
     LOCAL_COMMANDS.contains(&name)
 }
 
-/// Execute a slash command.
+/// Handle a slash command.
 pub async fn handle_slash_command(
     line: &str,
     state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
+    ws: &mut WsClient,
 ) -> Result<(), TuiError> {
-    let (name, args) = match parse_slash_command(line) {
-        Some(p) => p,
-        None => return Ok(()),
+    let Some((name, args)) = parse_slash_command(line) else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ empty command");
+        return Ok(());
     };
-
     if is_local_command(name) {
-        handle_local_command(name, args, state, ws_client).await
+        handle_local_command(name, args, state, ws).await
     } else {
-        execute_remote_command(name, args, state, ws_client).await
+        execute_remote_command(name, args, state, ws).await
     }
 }
 
-/// Handle one of the built-in local TUI commands.
+/// Commands the TUI implements itself.
 async fn handle_local_command(
     name: &str,
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
+    ws: &mut WsClient,
 ) -> Result<(), TuiError> {
     match name {
-        "new" => create_session(state, ws_client).await,
-        "clear" => {
-            let mut s = state.write().await;
-            s.messages.clear();
-            s.scroll_offset = 0;
-            Ok(())
-        }
-        "status" => {
-            match ws_client.request("system.presence", None).await {
-                Ok(value) => {
-                    let mut s = state.write().await;
-                    s.toast(format!("Status: {}", value));
-                }
-                Err(e) => {
-                    let mut s = state.write().await;
-                    s.error_toast(format!("Status failed: {}", e));
-                }
-            }
-            Ok(())
-        }
-        "tools" => {
-            match ws_client.request("commands.list", None).await {
-                Ok(value) => {
-                    let mut s = state.write().await;
-                    let count = value.as_array().map(|a| a.len()).unwrap_or(0);
-                    s.toast(format!("{} commands available", count));
-                }
-                Err(e) => {
-                    let mut s = state.write().await;
-                    s.error_toast(format!("Tools failed: {}", e));
-                }
-            }
-            Ok(())
-        }
-        "model" => {
-            if args.is_empty() {
-                let mut s = state.write().await;
-                s.error_toast("Usage: /model <model-id>");
-                return Ok(());
-            }
-            match ws_client
-                .request("models.set_default", Some(serde_json::json!({ "model": args })))
-                .await
-            {
-                Ok(_) => {
-                    let mut s = state.write().await;
-                    s.toast(format!("Default model set to {}", args));
-                }
-                Err(e) => {
-                    let mut s = state.write().await;
-                    s.error_toast(format!("Model switch failed: {}", e));
-                }
-            }
-            Ok(())
-        }
-        "help" => {
-            {
-                let mut s = state.write().await;
-                s.popup = Popup::Help;
-                s.input_mode = InputMode::Popup;
-            }
-            fetch_commands(ws_client, Arc::clone(&state)).await
-        }
-        "config" => {
-            {
-                let mut s = state.write().await;
-                s.popup = Popup::ConfigEditor;
-                s.input_mode = InputMode::Popup;
-            }
-            fetch_config(ws_client, Arc::clone(&state)).await
-        }
+        "new" => command_new(args, state, ws).await,
+        "clear" => command_clear(state, ws).await,
         "quit" | "exit" => {
-            let mut s = state.write().await;
-            s.should_quit = true;
+            state.write().await.should_quit = true;
             Ok(())
         }
-        "sessions" => {
-            match ws_client.request("sessions.list", None).await {
-                Ok(value) => {
-                    let mut s = state.write().await;
-                    if let Some(items) = value.as_array() {
-                        s.sessions = items
-                            .iter()
-                            .filter_map(|v| {
-                                Some(crate::tui::state::SessionSummary {
-                                    id: v.get("id")?.as_str()?.to_string(),
-                                    label: v
-                                        .get("name")
-                                        .or_else(|| v.get("label"))
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from),
-                                    agent_id: v
-                                        .get("agent_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from),
-                                    selected: false,
-                                })
-                            })
-                            .collect();
-                        if let Some(current) = s.current_session.clone() {
-                            s.switch_session(&current);
-                        }
-                    }
-                    let count = s.sessions.len();
-                    s.toast(format!("{} sessions listed", count));
-                }
-                Err(e) => {
-                    let mut s = state.write().await;
-                    s.error_toast(format!("Sessions failed: {}", e));
-                }
-            }
-            Ok(())
-        }
+        "help" => command_help(state, ws).await,
+        "config" => command_config(args, state, ws).await,
+        "status" => command_status(state, ws).await,
+        "tools" => command_tools(state, ws).await,
+        "model" => command_model(args, state, ws).await,
+        "sessions" => command_sessions(state, ws).await,
+        "resume" => crate::tui::resume::command_resume(args, state, ws).await,
+        "rename" => command_rename(args, state, ws).await,
+        "pin" => command_pin(state, ws).await,
+        "agents" => command_agents(state, ws).await,
+        "agent" => command_agent(args, state, ws).await,
+        "answer" => command_answer(args, state, ws).await,
         _ => {
-            let mut s = state.write().await;
-            s.error_toast(format!("Unknown command: /{}", name));
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("⚠ unknown command /{name}"));
             Ok(())
         }
     }
 }
 
-/// Forward a non-local slash command to the gateway via `commands.execute`.
+/// `/new [agent-id]` — start a conversation, optionally bound to an agent.
+async fn command_new(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let agent = (!args.trim().is_empty()).then(|| args.trim().to_string());
+    let session_id = gw::sessions_create(ws, agent.as_deref()).await?;
+    let mut s = state.write().await;
+    if let Some(old) = s.current_session.take() {
+        let _ = gw::sessions_unsubscribe(ws, &old).await;
+    }
+    gw::sessions_subscribe(ws, &session_id).await?;
+    s.current_session = Some(session_id.clone());
+    s.current_agent = agent;
+    s.transcript.reset();
+    s.transcript
+        .push_notice(format!("── new session {session_id} ──"));
+    Ok(())
+}
+
+/// `/clear` — clear the conversation context.
+///
+/// Scrollback belongs to the terminal and cannot be unprinted; saying so is
+/// better than leaving the user to wonder why the old text is still there.
+async fn command_clear(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    match session {
+        Some(id) => {
+            gw::sessions_reset(ws, &id).await?;
+            let mut s = state.write().await;
+            s.transcript.reset();
+            s.transcript
+                .push_notice("── context cleared (the terminal's own scrollback is untouched) ──");
+        }
+        None => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice("⚠ no session yet — send a message first");
+        }
+    }
+    Ok(())
+}
+
+/// `/help` — print the keybindings and the command catalog.
+async fn command_help(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let catalog = gw::commands_list(ws).await.unwrap_or_default();
+    let mut s = state.write().await;
+    if !catalog.is_empty() {
+        s.command_list = catalog;
+    }
+    let mut lines = vec![TranscriptLine::new(LineKind::Notice, "Keys")];
+    for (key, what) in [
+        ("Enter", "send · Shift+Enter for a newline"),
+        ("Up / Down", "input history (or move within a multiline input)"),
+        ("Tab", "complete a /command"),
+        ("Esc", "dismiss a prompt · stop a running turn"),
+        ("Ctrl+C", "abort the run, or quit when idle"),
+        ("Ctrl+R", "resume a session"),
+        ("Ctrl+H / Ctrl+E", "this help · configuration"),
+        ("Ctrl+Q", "quit"),
+    ] {
+        lines.push(TranscriptLine::new(LineKind::Notice, format!("  {key:<16} {what}")));
+    }
+    lines.push(TranscriptLine::new(LineKind::Notice, ""));
+    lines.push(TranscriptLine::new(LineKind::Notice, "TUI commands"));
+    for cmd in local_command_list() {
+        lines.push(TranscriptLine::new(
+            LineKind::Notice,
+            format!("  /{:<10} {}", cmd.name, cmd.description),
+        ));
+    }
+    if !s.command_list.is_empty() {
+        lines.push(TranscriptLine::new(LineKind::Notice, ""));
+        lines.push(TranscriptLine::new(LineKind::Notice, "Gateway commands (run with /<name>)"));
+        for cmd in &s.command_list {
+            lines.push(TranscriptLine::new(
+                LineKind::Notice,
+                format!("  /{:<10} {}", cmd.name, cmd.description),
+            ));
+        }
+    }
+    s.transcript.push(lines);
+    Ok(())
+}
+
+/// The locally implemented commands, described for `/help`.
+pub fn local_command_list() -> Vec<CommandInfo> {
+    [
+        ("new", "[agent]", "start a new session"),
+        ("clear", "", "clear the conversation context"),
+        ("resume", "[n|id]", "list sessions, or switch to one"),
+        ("sessions", "", "list sessions"),
+        ("rename", "<name>", "rename the current session"),
+        ("pin", "", "pin or unpin the current session"),
+        ("agents", "", "list agents"),
+        ("agent", "<id>", "start a session bound to an agent"),
+        ("config", "[set <path> <value>]", "show or change configuration"),
+        ("status", "", "gateway status"),
+        ("tools", "", "list gateway commands"),
+        ("model", "<id>", "set the default model"),
+        ("answer", "<text>", "answer a pending question"),
+        ("help", "", "this help"),
+        ("quit", "", "leave the TUI"),
+        ("exit", "", "alias of /quit"),
+    ]
+    .into_iter()
+    .map(|(name, usage, description)| CommandInfo {
+        key: name.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        usage: usage.to_string(),
+        category: "tui".to_string(),
+        tier: "essential".to_string(),
+        local: true,
+        requires_admin: false,
+    })
+    .collect()
+}
+
+/// `/status` — gateway presence and connection details.
+async fn command_status(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let value = ws.request("system.presence", None).await?;
+    let mut s = state.write().await;
+    s.transcript
+        .push_notice(format!("gateway: {}", serde_json::to_string(&value).unwrap_or_default()));
+    Ok(())
+}
+
+/// `/tools` — the gateway's command catalog.
+async fn command_tools(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let catalog = gw::commands_list(ws).await?;
+    let count = catalog.len();
+    let mut s = state.write().await;
+    s.command_list = catalog;
+    s.transcript
+        .push_notice(format!("{count} gateway commands available — see /help"));
+    Ok(())
+}
+
+/// `/model <id>` — set the default model.
+async fn command_model(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let model = args.trim();
+    if model.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ usage: /model <model-id>");
+        return Ok(());
+    }
+    ws.request("models.set_default", Some(serde_json::json!({ "model_id": model })))
+        .await?;
+    state
+        .write()
+        .await
+        .transcript
+        .push_notice(format!("default model: {model}"));
+    Ok(())
+}
+
+/// `/sessions` — list the sessions the gateway knows.
+async fn command_sessions(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let sessions = crate::tui::resume::refresh_sessions(&state, ws).await?;
+    let mut s = state.write().await;
+    if sessions.is_empty() {
+        s.transcript.push_notice("no sessions yet");
+    } else {
+        s.transcript
+            .push_notice(format!("{} sessions:", sessions.len()));
+        for line in crate::tui::resume::session_lines(&sessions) {
+            s.transcript.push_notice(line);
+        }
+    }
+    Ok(())
+}
+
+/// `/rename <name>` — rename the current session.
+async fn command_rename(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let name = args.trim();
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to rename yet");
+        return Ok(());
+    };
+    if name.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ usage: /rename <name>");
+        return Ok(());
+    }
+    gw::sessions_rename(ws, &id, name).await?;
+    let mut s = state.write().await;
+    if let Some(entry) = s.sessions.iter_mut().find(|x| x.id == id) {
+        entry.name = Some(name.to_string());
+    }
+    s.transcript.push_notice(format!("renamed to \"{name}\""));
+    Ok(())
+}
+
+/// `/pin` — pin or unpin the current session.
+async fn command_pin(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let current = {
+        let s = state.read().await;
+        s.current_session.clone().map(|id| {
+            let pinned = s
+                .sessions
+                .iter()
+                .find(|x| x.id == id)
+                .map(|x| x.pinned)
+                .unwrap_or(false);
+            (id, pinned)
+        })
+    };
+    let Some((id, was_pinned)) = current else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to pin yet");
+        return Ok(());
+    };
+    let pinned = !was_pinned;
+    gw::sessions_set_pinned(ws, &id, pinned).await?;
+    let mut s = state.write().await;
+    if let Some(entry) = s.sessions.iter_mut().find(|x| x.id == id) {
+        entry.pinned = pinned;
+    }
+    s.transcript.push_notice(if pinned {
+        "session pinned"
+    } else {
+        "session unpinned"
+    });
+    Ok(())
+}
+
+/// `/agents` — list the agents the gateway knows.
+async fn command_agents(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+    let agents = gw::agents_registry(ws).await?;
+    let mut s = state.write().await;
+    let usable: Vec<_> = agents.iter().filter(|a| a.is_valid).collect();
+    if usable.is_empty() {
+        s.transcript.push_notice("no agents configured");
+    } else {
+        s.transcript
+            .push_notice(format!("{} agents:", usable.len()));
+        for agent in usable {
+            s.transcript
+                .push_notice(format!("  {} {}  ({})", agent.emoji, agent.display_name, agent.id));
+        }
+        s.transcript.push_notice("start one with /agent <id>");
+    }
+    s.agents = agents;
+    Ok(())
+}
+
+/// `/agent <id>` — start a session bound to an agent.
+async fn command_agent(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let id = args.trim();
+    if id.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ usage: /agent <agent-id> — see /agents");
+        return Ok(());
+    }
+    command_new(id, state, ws).await
+}
+
+/// `/answer <text>` — answer the pending question.
+async fn command_answer(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let text = args.trim();
+    let ask = state.read().await.pending_ask.clone();
+    let Some(ask) = ask else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("no question is waiting for an answer");
+        return Ok(());
+    };
+    if text.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ usage: /answer <text>");
+        return Ok(());
+    }
+    gw::ask_respond(ws, &ask.ask_id, text).await?;
+    let mut s = state.write().await;
+    s.pending_ask = None;
+    s.ask_input.clear();
+    s.transcript.push_notice(format!("answered: {text}"));
+    Ok(())
+}
+
+/// `/config` and `/config set <path> <value>`.
+async fn command_config(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let mut parts = args.splitn(3, char::is_whitespace);
+    let verb = parts.next().unwrap_or("");
+    if verb != "set" {
+        return command_config_show(state, ws).await;
+    }
+    let path = parts.next().unwrap_or("").trim();
+    let raw = parts.next().unwrap_or("").trim();
+    if path.is_empty() || raw.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ usage: /config set <path> <value>");
+        return Ok(());
+    }
+    // Values are typed where it is unambiguous: a number stays a number, a
+    // bare true/false stays a boolean, everything else is a string.
+    let value: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+    let revision = state.read().await.config_revision.clone();
+    match gw::config_set(ws, path, value.clone(), revision.as_deref()).await {
+        Ok(()) => {
+            let mut s = state.write().await;
+            s.transcript.push_notice(format!(
+                "✓ {path} = {}",
+                serde_json::to_string(&value).unwrap_or_default()
+            ));
+            s.config_cache = None;
+        }
+        Err(e) => {
+            state.write().await.transcript.push_notice(format!("✘ {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// `/config` — print the effective configuration.
+async fn command_config_show(
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let value = gw::config_get(ws).await?;
+    let mut lines = vec![TranscriptLine::new(LineKind::Notice, "configuration")];
+    lines.extend(config_lines(&value));
+    lines.push(TranscriptLine::new(
+        LineKind::Notice,
+        "change one with /config set <path> <value>",
+    ));
+    let mut s = state.write().await;
+    s.config_revision = value["revision"].as_str().map(str::to_string);
+    s.config_cache = Some(value);
+    s.transcript.push(lines);
+    Ok(())
+}
+
+/// Flatten the configuration payload into readable lines.
+pub fn config_lines(value: &Value) -> Vec<TranscriptLine> {
+    let mut out = Vec::new();
+    for key in ["model", "model_provider"] {
+        if let Some(v) = value.get(key).filter(|v| !v.is_null()) {
+            out.push(TranscriptLine::new(
+                LineKind::Notice,
+                format!("  {key} = {}", render_value(v)),
+            ));
+        }
+    }
+    if let Some(agent) = value.get("default_agent").and_then(|v| v.as_object()) {
+        for (key, v) in agent {
+            if key == "system_prompt" {
+                continue;
+            }
+            out.push(TranscriptLine::new(
+                LineKind::Notice,
+                format!("  default_agent.{key} = {}", render_value(v)),
+            ));
+        }
+    }
+    if let Some(overrides) = value.get("agent_overrides").and_then(|v| v.as_object()) {
+        for (agent, fields) in overrides {
+            if let Some(fields) = fields.as_object() {
+                for (key, v) in fields {
+                    if key == "system_prompt" {
+                        continue;
+                    }
+                    out.push(TranscriptLine::new(
+                        LineKind::Notice,
+                        format!("  agent_overrides.{agent}.{key} = {}", render_value(v)),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(heartbeat) = value.get("heartbeat").and_then(|v| v.as_object()) {
+        if let Some(enabled) = heartbeat.get("enabled") {
+            out.push(TranscriptLine::new(
+                LineKind::Notice,
+                format!("  heartbeat.enabled = {}", render_value(enabled)),
+            ));
+        }
+    }
+    out
+}
+
+/// Render a JSON value compactly, truncating a long one.
+fn render_value(value: &Value) -> String {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if text.chars().count() > 80 {
+        let head: String = text.chars().take(80).collect();
+        format!("{head}…")
+    } else {
+        text
+    }
+}
+
+/// Forward a command the TUI does not implement to the gateway.
 async fn execute_remote_command(
     name: &str,
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
+    ws: &mut WsClient,
 ) -> Result<(), TuiError> {
-    let (sid, assistant_id) = {
-        let mut s = state.write().await;
-        let sid = s
-            .current_session
-            .clone()
-            .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4()));
-        s.current_session = Some(sid.clone());
-        s.ensure_session(&sid);
-        let assistant_id = format!("assistant_{}", s.messages.len());
-        s.append_complete_assistant_message(&assistant_id, "Running command...");
-        (sid, assistant_id)
-    };
-
-    let params = serde_json::json!({
-        "command": name,
-        "args": args,
-        "session_id": sid,
-    });
-
-    let result = ws_client.request("commands.execute", Some(params)).await;
-
-    let mut s = state.write().await;
-    if let Some(msg) = s.messages.iter_mut().find(|m| m.id == assistant_id) {
-        match result {
-            Ok(payload) => {
-                let text = payload
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_default());
-                msg.content = text;
-                msg.status = MessageStatus::Complete;
-            }
-            Err(e) => {
-                msg.content = format!("Command error: {}", e);
-                msg.status = MessageStatus::Error(format!("{}", e));
-            }
+    let session = state.read().await.current_session.clone();
+    let mut params = serde_json::json!({ "command": name, "args": args });
+    if let Some(id) = session {
+        params["session_id"] = Value::String(id);
+    }
+    match ws.request("commands.execute", Some(params)).await {
+        Ok(payload) => {
+            let text = payload["text"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| payload.to_string());
+            state.write().await.transcript.push(
+                blocks::text_lines(&text)
+                    .into_iter()
+                    .map(|mut l| {
+                        l.kind = LineKind::Notice;
+                        l
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /{name}: {e}"));
         }
     }
     Ok(())
-}
-
-/// Create a new session and select it.
-async fn create_session(
-    state: Arc<RwLock<AppState>>,
-    ws_client: &mut WsClient,
-) -> Result<(), TuiError> {
-    let result = ws_client.request("sessions.create", None).await?;
-    if let Some(sid) = result.get("session_id").and_then(|v| v.as_str()) {
-        {
-            let mut s = state.write().await;
-            s.ensure_session(sid);
-            s.switch_session(sid);
-        }
-        ws_client
-            .request("sessions.subscribe", Some(serde_json::json!({ "session_id": sid })))
-            .await?;
-        let mut s = state.write().await;
-        s.toast(format!("Created session {}", sid));
-    }
-    Ok(())
-}
-
-/// Convert a `TuiAction::SendMessage` into a slash command when the input
-/// starts with `/`.
-pub fn action_for_input(action: TuiAction, buffer: &str) -> TuiAction {
-    match action {
-        TuiAction::SendMessage if buffer.trim_start().starts_with('/') => {
-            TuiAction::RunSlashCommand(buffer.trim().to_string())
-        }
-        other => other,
-    }
-}
-
-/// Update the command palette filter based on the current input buffer.
-pub fn update_palette(state: &mut AppState) {
-    let query = state.input_buffer.trim_start_matches('/');
-    let all = state.command_list.clone();
-    let filtered: Vec<_> = all.into_iter().filter(|c| c.matches(query)).collect();
-    state.palette_commands = filtered;
-    state.palette_index = 0;
-}
-
-/// Try to extract an inline shortcut command from a normal message.
-/// Returns the command line to execute and the remaining chat text.
-pub fn extract_inline_command(text: &str) -> (Option<String>, String) {
-    let words: Vec<_> = text.split_whitespace().collect();
-    for (idx, word) in words.iter().enumerate() {
-        let name = word.strip_prefix('/').unwrap_or(word);
-        if INLINE_SHORTCUTS.contains(&name) {
-            let remaining: Vec<_> = words
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != idx)
-                .map(|(_, w)| *w)
-                .collect();
-            return (Some(format!("/{}", name)), remaining.join(" "));
-        }
-    }
-    (None, text.to_string())
-}
-
-/// Build a small fallback catalog for offline command palette hints.
-pub fn fallback_commands() -> Vec<crate::tui::state::CommandInfo> {
-    vec![
-        cmd("new", "new", "Create a new session", "[model]", "session", "essential", true),
-        cmd("clear", "clear", "Clear chat history", "", "session", "essential", true),
-        cmd("help", "help", "Show command help", "[page]", "status", "essential", false),
-        cmd("status", "status", "Gateway status", "", "status", "essential", false),
-        cmd(
-            "tools",
-            "tools",
-            "List available tools",
-            "[compact|verbose]",
-            "status",
-            "standard",
-            false,
-        ),
-        cmd(
-            "model",
-            "model",
-            "Set default model",
-            "<id|status>",
-            "model",
-            "essential",
-            false,
-        ),
-        cmd(
-            "usage",
-            "usage",
-            "Show usage statistics",
-            "[off|tokens|full|cost]",
-            "status",
-            "standard",
-            false,
-        ),
-        cmd(
-            "subagents",
-            "subagents",
-            "Manage sub-agents",
-            "<subcommand>",
-            "agents",
-            "power",
-            false,
-        ),
-        cmd("acp", "acp", "Manage ACP sessions", "<subcommand>", "agents", "power", false),
-        cmd("mcp", "mcp", "Manage MCP servers", "<subcommand>", "admin", "power", false),
-        cmd(
-            "config",
-            "config",
-            "Manage runtime config",
-            "<subcommand>",
-            "admin",
-            "power",
-            false,
-        ),
-        cmd("restart", "restart", "Restart the gateway", "", "admin", "power", false),
-        cmd("bash", "bash", "Run a shell command", "<command>", "admin", "power", false),
-    ]
-}
-
-fn cmd(
-    key: &str,
-    name: &str,
-    description: &str,
-    usage: &str,
-    category: &str,
-    tier: &str,
-    local: bool,
-) -> crate::tui::state::CommandInfo {
-    crate::tui::state::CommandInfo {
-        key: key.to_string(),
-        name: name.to_string(),
-        description: description.to_string(),
-        usage: usage.to_string(),
-        category: category.to_string(),
-        tier: tier.to_string(),
-        local,
-        requires_admin: false,
-    }
 }
 
 #[cfg(test)]
@@ -377,31 +589,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_command_with_args() {
-        assert_eq!(parse_slash_command("/model gpt-4"), Some(("model", "gpt-4")));
+    fn parses_commands_with_and_without_arguments() {
+        assert_eq!(parse_slash_command("/help"), Some(("help", "")));
+        assert_eq!(parse_slash_command("/model gpt-4o"), Some(("model", "gpt-4o")));
+        assert_eq!(parse_slash_command("/rename  my  chat "), Some(("rename", "my  chat")));
+        assert_eq!(parse_slash_command("not a command"), None);
+        assert_eq!(parse_slash_command("/"), None);
     }
 
     #[test]
-    fn parse_command_without_args() {
-        assert_eq!(parse_slash_command("/new"), Some(("new", "")));
+    fn local_commands_are_recognised() {
+        assert!(is_local_command("resume"));
+        assert!(is_local_command("config"));
+        assert!(!is_local_command("usage"));
     }
 
     #[test]
-    fn parse_non_command() {
-        assert_eq!(parse_slash_command("hello"), None);
+    fn help_lists_every_local_command() {
+        let listed: Vec<String> = local_command_list().into_iter().map(|c| c.name).collect();
+        for name in LOCAL_COMMANDS {
+            assert!(
+                listed.contains(&name.to_string()),
+                "/{name} is handled but missing from /help"
+            );
+        }
     }
 
     #[test]
-    fn extract_inline_shortcut() {
-        let (cmd, remaining) = extract_inline_command("Hey /whoami thanks");
-        assert_eq!(cmd, Some("/whoami".to_string()));
-        assert_eq!(remaining, "Hey thanks");
+    fn config_lines_flatten_the_payload() {
+        let payload = serde_json::json!({
+            "revision": "abc",
+            "model": "gpt-4o",
+            "model_provider": "openai",
+            "default_agent": { "temperature": 0.7, "system_prompt": "very long…" },
+            "agent_overrides": { "secretary": { "temperature": 0.3 } },
+            "heartbeat": { "enabled": true }
+        });
+        let text: Vec<String> = config_lines(&payload).into_iter().map(|l| l.text).collect();
+        assert!(text.iter().any(|l| l.contains("model = gpt-4o")));
+        assert!(text
+            .iter()
+            .any(|l| l.contains("default_agent.temperature = 0.7")));
+        assert!(text
+            .iter()
+            .any(|l| l.contains("agent_overrides.secretary.temperature = 0.3")));
+        assert!(text.iter().any(|l| l.contains("heartbeat.enabled = true")));
+        assert!(
+            !text.iter().any(|l| l.contains("system_prompt")),
+            "the system prompt is too big to dump"
+        );
     }
 
     #[test]
-    fn no_inline_shortcut_for_unknown_command() {
-        let (cmd, remaining) = extract_inline_command("Hey /restart thanks");
-        assert_eq!(cmd, None);
-        assert_eq!(remaining, "Hey /restart thanks");
+    fn long_values_are_truncated_in_the_config_dump() {
+        let long = "x".repeat(200);
+        let payload = serde_json::json!({ "model": long });
+        let text: Vec<String> = config_lines(&payload).into_iter().map(|l| l.text).collect();
+        assert!(text[0].chars().count() < 100);
     }
 }

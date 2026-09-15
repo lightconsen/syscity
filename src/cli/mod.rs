@@ -333,7 +333,13 @@ pub enum Commands {
         /// Auth token (for token auth mode)
         #[arg(long)]
         token: Option<String>,
-        /// Pre-select a session ID
+        /// Resume the most recently active session
+        #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "session"])]
+        r#continue: bool,
+        /// Resume a specific session (id, or a number from the /resume list)
+        #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "session")]
+        resume: Option<String>,
+        /// Pre-select a session ID (alias for --resume <id>)
         #[arg(long)]
         session: Option<String>,
     },
@@ -500,8 +506,28 @@ impl Cli {
             Commands::Provider { command } => provider::run_provider_command(command, config).await,
             Commands::Doctor { command } => doctor::run_doctor_command(command).await,
             Commands::Capabilities => capability::run_capability_check().await,
-            Commands::Tui { host, port, token, session } => {
-                crate::tui::run(host, *port, token.as_deref(), session.as_deref()).await
+            Commands::Tui {
+                host,
+                port,
+                token,
+                r#continue,
+                resume,
+                session,
+            } => {
+                // `--resume` with no value lists the sessions and lets the user
+                // pick; `--session` remains as an alias for `--resume <id>`.
+                let choice = if *r#continue {
+                    crate::tui::SessionChoice::Continue
+                } else if let Some(id) = resume.as_deref().filter(|s| !s.is_empty()) {
+                    crate::tui::SessionChoice::Resume(id.to_string())
+                } else if resume.is_some() {
+                    crate::tui::SessionChoice::Resume(String::new())
+                } else if let Some(id) = session {
+                    crate::tui::SessionChoice::Resume(id.clone())
+                } else {
+                    crate::tui::SessionChoice::New
+                };
+                crate::tui::run(host, *port, token.as_deref(), choice).await
             }
         }
     }
