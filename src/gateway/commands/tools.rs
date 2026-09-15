@@ -257,7 +257,7 @@ pub(super) async fn handle_learn(
     let mut send = req.clone();
     send.method = "chat.send".to_string();
     let mut params = serde_json::json!({
-        "message": crate::skills::learn::learn_prompt(args),
+        "message": crate::skills::learn::learn_prompt(args, &state.paths.skills_dir()),
     });
     // Stay in the session the command was run in. `chat.send` would otherwise
     // resolve its own, which for a client that passes an explicit session id

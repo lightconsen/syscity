@@ -19,7 +19,13 @@ const DEFAULT_REQUEST: &str =
 
 /// Build the `/learn` prompt for a request. An empty request means "the workflow
 /// we just went through".
-pub fn learn_prompt(request: &str) -> String {
+///
+/// `skills_dir` is named in the prompt because the write has to land somewhere
+/// the running gateway already watches: the skills directory is watched from
+/// startup, while a workspace directory created later would not be, and a skill
+/// written into an unwatched directory does not load until the next restart —
+/// including the load-back this prompt asks for as its last step.
+pub fn learn_prompt(request: &str, skills_dir: &std::path::Path) -> String {
     let request = request.trim();
     let request = if request.is_empty() {
         DEFAULT_REQUEST
@@ -27,6 +33,7 @@ pub fn learn_prompt(request: &str) -> String {
         request
     };
 
+    let skills_dir = skills_dir.display();
     format!(
         "[/learn] Distill a reusable skill from the request below and save it.\n\
          \n\
@@ -44,12 +51,14 @@ pub fn learn_prompt(request: &str) -> String {
          pasted text as given. If the scope is ambiguous, choose and say so rather than stalling.\n\
          2. Invent nothing. Every command, flag, path and endpoint in the skill must appear \
          verbatim in what you gathered — if you did not see it there, it does not go in.\n\
-         3. Write ONE file: `<workspace>/.syscity/skills/<name>/SKILL.md` with `write_file`. \
+         3. Write ONE file: `{skills_dir}/<name>/SKILL.md` with `write_file`. \
          `<name>` is lowercase-hyphenated (e.g. `release-notes`). Prefer extending an existing \
          skill over a near-duplicate: ask the `skill` tool for the name you have in mind — when \
          the name is not there its answer lists the ones that are — and merge into a skill that \
-         already covers the ground. Keep the file under 100 KB: distil structure, do not paste \
-         the source.\n\
+         already covers the ground. When you do overwrite an existing SKILL.md, read that file \
+         with `read_file` first: a write to a file this turn has not read is refused, and reading \
+         through the `skill` tool does not count as having read it. Keep the file under 100 KB: \
+         distil structure, do not paste the source.\n\
          4. The frontmatter is checked when the skill loads, so it has to be exactly this shape:\n\
          \n\
          ---\n\
@@ -93,14 +102,17 @@ mod tests {
 
     #[test]
     fn an_empty_request_means_this_conversation() {
-        let prompt = learn_prompt("   ");
+        let prompt = learn_prompt("   ", std::path::Path::new("/home/u/.syscity/skills"));
         assert!(prompt.contains("workflow we just went through"), "{prompt}");
         assert!(!prompt.contains("THE REQUEST:\n\n"), "request left blank");
     }
 
     #[test]
     fn the_request_is_carried_through_whole() {
-        let prompt = learn_prompt("  /tmp/docs/api.md focus on auth, skip the deprecated parts  ");
+        let prompt = learn_prompt(
+            "  /tmp/docs/api.md focus on auth, skip the deprecated parts  ",
+            std::path::Path::new("/home/u/.syscity/skills"),
+        );
         assert!(
             prompt.contains("focus on auth, skip the deprecated parts"),
             "the requirements must survive: {prompt}"
@@ -112,10 +124,11 @@ mod tests {
     /// model cannot discover a refusal it never sees.
     #[test]
     fn the_contract_the_loader_enforces_is_spelled_out() {
-        let prompt = learn_prompt("the docs in ./docs");
+        let prompt =
+            learn_prompt("the docs in ./docs", std::path::Path::new("/home/u/.syscity/skills"));
         for required in [
-            // Where a workspace skill goes, and how it is named.
-            ".syscity/skills/",
+            // Where the skill goes, named exactly, and how it is named.
+            "/home/u/.syscity/skills/<name>/SKILL.md",
             "write_file",
             // What the loader refuses.
             "At least one trigger is required",
@@ -138,7 +151,7 @@ mod tests {
 
     #[test]
     fn the_prompt_names_the_frontmatter_shape() {
-        let prompt = learn_prompt("x");
+        let prompt = learn_prompt("x", std::path::Path::new("/home/u/.syscity/skills"));
         // The block has to be literal YAML the model can copy, not prose about it.
         assert!(prompt.contains("name: <name, matching the directory>"), "{prompt}");
         assert!(prompt.contains("version: \"1.0.0\""), "{prompt}");

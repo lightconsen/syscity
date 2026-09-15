@@ -521,6 +521,19 @@ impl ToolContext {
 
     /// Check if a path is allowed
     pub fn is_path_allowed(&self, path: &std::path::Path) -> bool {
+        // The skills directory is writable from any context. It sits outside
+        // every workspace, and it is where an agent authors a skill (`/learn`);
+        // what lands there is checked by the skill guard when it loads, not by
+        // this fence.
+        //
+        // Granted here rather than by adding it to `allowed_paths`, which looks
+        // equivalent and is not: a non-empty allowlist switches the check below
+        // into whitelist mode, so adding one path there *narrows* what is
+        // writable to exactly that list — the workspace included.
+        if path_is_within(path, &crate::dirs::skills_dir()) {
+            return true;
+        }
+
         // ── allowlist check ────────────────────────────────────────────────
         if !self.sandbox.allowed_paths.is_empty() {
             let path_canon = path.canonicalize().ok();
@@ -835,3 +848,41 @@ pub trait Tool: Send + Sync + 'static {
 pub type BoxedTool = Box<dyn Tool>;
 /// An atomically-reference-counted tool for shared storage
 pub type SharedTool = Arc<dyn Tool>;
+
+/// Whether `path` is inside `dir`, preferring a canonical comparison so a
+/// symlinked root still matches and falling back to a raw prefix for paths that
+/// do not exist yet — the same two-step the allowlist check uses.
+fn path_is_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    match (path.canonicalize(), dir.canonicalize()) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => path.starts_with(dir),
+    }
+}
+
+#[cfg(test)]
+mod path_permission_tests {
+    use super::*;
+
+    /// The directory an agent authors skills in is outside every workspace, so
+    /// nothing else would grant it.
+    #[test]
+    fn the_skills_directory_is_writable_from_any_context() {
+        let target = crate::dirs::skills_dir()
+            .join("release-notes")
+            .join("SKILL.md");
+        let ctx = ToolContext::new("user", "conv").with_workspace_root("/tmp/workspace");
+        assert!(
+            ctx.is_path_allowed(&target),
+            "a skill could not be written to {}",
+            target.display()
+        );
+    }
+
+    /// And granting it must not have moved the fence for anything else.
+    #[test]
+    fn a_workspace_path_is_still_writable_and_elsewhere_is_not() {
+        let ctx = ToolContext::new("user", "conv").with_workspace_root("/tmp");
+        assert!(ctx.is_path_allowed(std::path::Path::new("/tmp/notes.md")));
+        assert!(!ctx.is_path_allowed(std::path::Path::new("/etc/passwd")));
+    }
+}
