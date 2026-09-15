@@ -373,8 +373,10 @@ pub fn parse_skill_md(content: &str) -> crate::Result<(String, String)> {
     let trimmed = content.trim_start();
 
     if !trimmed.starts_with("---") {
-        // No frontmatter - return empty frontmatter and full content as body
-        return Ok(("---\n---".to_string(), content.to_string()));
+        // No frontmatter at all: nothing to return for it, and the whole file is
+        // the body. An empty string does not deserialize into a skill, which is
+        // the right answer — a file with no name and no triggers cannot route.
+        return Ok((String::new(), content.to_string()));
     }
 
     // Find the end of frontmatter
@@ -384,11 +386,17 @@ pub fn parse_skill_md(content: &str) -> crate::Result<(String, String)> {
         let yaml_content = &after_first[..end_pos];
         let body = &after_first[end_pos + 4..];
 
-        let frontmatter_yaml = format!("---{}\n---", yaml_content);
-        Ok((frontmatter_yaml, body.trim_start().to_string()))
+        // Bare YAML, without the `---` document markers. Callers hand this
+        // straight to a deserializer, and a wrapped string is *two* YAML
+        // documents — "deserializing from YAML containing more than one document
+        // is not supported" — which is how every file-backed skill failed to
+        // load while `load_all` warned and carried on.
+        Ok((yaml_content.trim_start_matches('\n').to_string(), body.trim_start().to_string()))
     } else {
-        // No closing --- found
-        Ok(("---\n---".to_string(), content.to_string()))
+        // No closing `---`: there is no frontmatter to return. An empty string
+        // does not deserialize into a skill, which is the right answer for a
+        // file that is nothing but a body — it has no name and no triggers.
+        Ok((String::new(), content.to_string()))
     }
 }
 
@@ -415,6 +423,29 @@ pub fn format_skill_md(name: &str, description: &str, prompt: &str, emoji: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_frontmatter_deserializes() {
+        // The point of the split: whatever `parse_skill_md` returns for the
+        // frontmatter has to be something a YAML deserializer accepts. It used
+        // to come back wrapped in `---`, which is two documents, and every
+        // file-backed skill failed to load because of it.
+        let content = "---\nname: demo\nversion: \"1.0.0\"\n---\n\nThe body.\n";
+        let (yaml, body) = parse_skill_md(content).unwrap();
+        assert!(!yaml.starts_with("---"), "frontmatter still carries the marker: {yaml:?}");
+        assert_eq!(body.trim(), "The body.");
+
+        let parsed: serde_json::Value =
+            serde_norway::from_str(&yaml).expect("frontmatter must deserialize on its own");
+        assert_eq!(parsed.get("name").and_then(|v| v.as_str()), Some("demo"));
+    }
+
+    #[test]
+    fn a_file_that_is_only_a_body_has_no_frontmatter() {
+        let (yaml, body) = parse_skill_md("just a body, no delimiters").unwrap();
+        assert!(yaml.is_empty());
+        assert_eq!(body, "just a body, no delimiters");
+    }
 
     #[test]
     fn test_parse_basic_frontmatter() {
