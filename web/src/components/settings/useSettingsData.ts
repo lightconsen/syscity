@@ -108,7 +108,12 @@ export interface ToastState {
 
 // Hook -------------------------------------------------------------------------
 
-export function useSettingsData(transport: SyscityWebSocketTransport, initialTab = "general") {
+export function useSettingsData(
+  transport: SyscityWebSocketTransport,
+  initialTab = "general",
+  /** Agent to select once the registry loads (e.g. from the sidebar). */
+  initialAgentId?: string,
+) {
   const [config, setConfig] = useState<SyscityConfig>({});
   const [models, setModels] = useState<Array<{ id: string; name: string; provider: string; provider_name: string }>>([]);
   const [agentRegistry, setAgentRegistry] = useState<Array<{ id: string; display_name: string; emoji?: string; is_valid: boolean; has_heartbeat: boolean }>>([]);
@@ -182,8 +187,14 @@ export function useSettingsData(transport: SyscityWebSocketTransport, initialTab
         setSkills(skillRes.skills || []);
         setMcpServers(mcpRes.servers || []);
         setMcpPresets(mcpPresetRes || []);
-        // Auto-select default agent or first available
-        const toSelect = registry.some((a) => a.id === "default") ? "default" : (registry[0]?.id || "");
+        // Auto-select default agent or first available — unless a specific
+        // agent was requested (sidebar "Agent settings" on one agent).
+        const requested = initialAgentId && registry.some((a) => a.id === initialAgentId);
+        const toSelect = requested
+          ? (initialAgentId as string)
+          : registry.some((a) => a.id === "default")
+            ? "default"
+            : registry[0]?.id || "";
         if (toSelect) {
           setSelectedAgentId(toSelect);
           loadAgentDetail(toSelect);
@@ -191,7 +202,7 @@ export function useSettingsData(transport: SyscityWebSocketTransport, initialTab
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [transport]);
+  }, [transport, initialAgentId]);
 
   // Listen for MCP OAuth events
   useEffect(() => {

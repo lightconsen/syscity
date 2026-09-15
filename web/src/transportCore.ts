@@ -1918,6 +1918,8 @@ function toChatPart(
 export interface SyscityWebSocketTransport {
   listAgents(): Promise<{ agents: string[] }>;
   getAgent(agentId: string): Promise<{ agent_id: string; busy: boolean; status: string; config: Record<string, unknown> | null; personality: Record<string, unknown> | null; } | null>;
+  purgeAgent(agentId: string): Promise<boolean>;
+  renameAgent(agentId: string, fields: { displayName?: string; emoji?: string }): Promise<{ display_name: string; emoji: string } | null>;
   addChannel(payload: { name: string; channel_type: string; enabled?: boolean; agent_id?: string; credentials?: Record<string, string> }): Promise<boolean>;
   updateChannel(payload: { name: string; enabled?: boolean; agent_id?: string; credentials?: Record<string, string> }): Promise<boolean>;
   removeChannel(name: string): Promise<boolean>;

@@ -24,4 +24,26 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
     } | undefined;
     return res || null;
   };
+
+  /** Delete an agent for good: unload it, drop its config overrides, and
+   *  remove `agents/<id>/` (personality, workspace, data, memory). */
+  proto.purgeAgent = async function (this: SyscityWebSocketTransport, agentId: string): Promise<boolean> {
+    const res = await this.sendRequestAndWait("agents.purge", { id: agentId }) as { status?: string } | undefined;
+    return res?.status === "purged";
+  };
+
+  /** Set an agent's display name and/or emoji (written to IDENTITY.md /
+   *  SOUL.md). Returns the values the registry now serves back. */
+  proto.renameAgent = async function (
+    this: SyscityWebSocketTransport,
+    agentId: string,
+    fields: { displayName?: string; emoji?: string },
+  ): Promise<{ display_name: string; emoji: string } | null> {
+    const res = await this.sendRequestAndWait("agents.rename", {
+      agent_id: agentId,
+      display_name: fields.displayName,
+      emoji: fields.emoji,
+    }) as { display_name: string; emoji: string } | undefined;
+    return res || null;
+  };
 }

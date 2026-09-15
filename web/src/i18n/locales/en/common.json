@@ -86,5 +86,7 @@
   "MarketplaceSettings.stateDisabled": "Disabled",
   "MarketplaceSettings.stateError": "Error",
   "MarketplaceSettings.connectedToast": "{{name}} connected",
-  "MarketplaceSettings.connectFailedToast": "Failed to connect {{name}}"
+  "MarketplaceSettings.connectFailedToast": "Failed to connect {{name}}",
+  "ConfirmDialog.cancel": "Cancel",
+  "ConfirmDialog.confirm": "Confirm"
 }

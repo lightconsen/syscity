@@ -1,3 +1,8 @@
 {
-  "App.extensionsTitle": "扩展"
+  "App.extensionsTitle": "扩展",
+  "App.agentDeleteTitle": "确定删除 Agent“{{name}}”吗？",
+  "App.agentDeleteMessage": "将永久删除该 Agent 的目录：人格文件、工作区、数据与记忆。此操作不可恢复。",
+  "App.agentDeleteConfirm": "删除",
+  "App.agentRenameFailed": "重命名 Agent 失败",
+  "App.agentDeleteFailed": "删除 Agent 失败"
 }

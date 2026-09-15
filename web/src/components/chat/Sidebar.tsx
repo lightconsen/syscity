@@ -10,11 +10,14 @@ import {
   Loader2,
   Library,
   Puzzle,
+  MoreHorizontal,
+  MessageSquarePlus,
+  Settings2,
 } from "lucide-react";
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 
-interface AgentItem {
+export interface AgentItem {
   id: string;
   display_name: string;
   emoji: string;
@@ -59,6 +62,12 @@ interface SidebarProps {
   onRenameSession?: (id: string, name: string) => void | Promise<void>;
   onDeleteSession?: (id: string) => void | Promise<void>;
   onPinSession?: (id: string, pinned: boolean) => void | Promise<void>;
+  /** Open the rename dialog for an agent (name + emoji). */
+  onRenameAgent?: (agent: AgentItem) => void;
+  /** Delete an agent — confirmation is the caller's dialog. */
+  onDeleteAgent?: (agent: AgentItem) => void;
+  /** Open Settings on the Agents tab, preselected to this agent. */
+  onOpenAgentSettings?: (agentId: string) => void;
 }
 
 export function Sidebar({
@@ -80,10 +89,21 @@ export function Sidebar({
   onRenameSession,
   onDeleteSession,
   onPinSession,
+  onRenameAgent,
+  onDeleteAgent,
+  onOpenAgentSettings,
 }: SidebarProps) {
 
   const { t } = useTranslation("chat");
   const listContainerRef = useRef<HTMLDivElement>(null);
+  // The open agent menu plus where to anchor it. Rendered as a fixed popup at
+  // the sidebar level so the list's overflow never clips it.
+  const [agentMenu, setAgentMenu] = useState<{
+    agent: AgentItem;
+    top: number;
+    left: number;
+  } | null>(null);
+  const agentMenuRef = useRef<HTMLDivElement>(null);
   // Session rows only read as "current" while a real conversation is on
   // screen — on the welcome page, KB, or Extensions the nav item takes over.
   const chatActive = activeView === "chat" && !chatWelcome;
@@ -130,6 +150,45 @@ export function Sidebar({
     },
     [collapsed]
   );
+
+  /** Open (or toggle shut) the "..." menu for an agent row, anchored to the
+   *  trigger button and clamped to the viewport. */
+  const toggleAgentMenu = useCallback(
+    (agent: AgentItem, e: React.MouseEvent<HTMLButtonElement>) => {
+      if (agentMenu?.agent.id === agent.id) {
+        setAgentMenu(null);
+        return;
+      }
+      const MENU_W = 192; // w-48
+      const MENU_H = 160;
+      const r = e.currentTarget.getBoundingClientRect();
+      const left = Math.max(8, Math.min(r.right - MENU_W, window.innerWidth - MENU_W - 8));
+      let top = r.bottom + 4;
+      if (top + MENU_H > window.innerHeight - 8) top = Math.max(8, r.top - MENU_H - 4);
+      setAgentMenu({ agent, top, left });
+    },
+    [agentMenu]
+  );
+
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!agentMenu) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      // The trigger owns the toggle — let its click handler decide.
+      if (target.closest("[data-agent-menu]")) return;
+      setAgentMenu(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setAgentMenu(null);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [agentMenu]);
 
   const groups = useMemo(() => {
     const now = new Date();
@@ -374,35 +433,135 @@ export function Sidebar({
                 </p>
               </div>
             )}
-            {agents.map((agent) => (
-              <button
-                key={agent.id}
-                onClick={() => onCreateSessionWithAgent(agent.id)}
-                className={`w-full text-left px-3 py-2 rounded-lg text-sm transition flex items-center gap-2 text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04] ${
-                  collapsed ? "justify-center" : ""
-                }`}
-                title={t("Sidebar.newSessionWith", { name: agent.display_name })}
-                role="listitem"
-              >
-                <span className="text-base shrink-0" aria-hidden="true">
-                  {agent.emoji}
-                </span>
-                {!collapsed && (
-                  <>
+            {agents.map((agent) =>
+              collapsed ? (
+                <button
+                  key={agent.id}
+                  onClick={() => onCreateSessionWithAgent(agent.id)}
+                  className="w-full text-left px-3 py-2 rounded-lg text-sm transition flex items-center justify-center text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+                  title={`${agent.emoji} ${agent.display_name}`}
+                  aria-label={agent.display_name}
+                  role="listitem"
+                >
+                  <span className="text-base shrink-0" aria-hidden="true">
+                    {agent.emoji}
+                  </span>
+                </button>
+              ) : (
+                <div
+                  key={agent.id}
+                  className="group flex items-center gap-1 px-1 py-0.5 rounded-lg transition hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+                  role="listitem"
+                >
+                  <button
+                    onClick={() => onCreateSessionWithAgent(agent.id)}
+                    className="flex-1 min-w-0 text-left px-2 py-1.5 rounded-md text-sm transition flex items-center gap-2 text-secondary"
+                    title={t("Sidebar.newSessionWith", { name: agent.display_name })}
+                  >
+                    <span className="text-base shrink-0" aria-hidden="true">
+                      {agent.emoji}
+                    </span>
                     <span className="truncate flex-1 min-w-0">
                       {agent.display_name}
                     </span>
-                  </>
-                )}
-              </button>
-            ))}
+                  </button>
+                  <button
+                    data-agent-menu
+                    onClick={(e) => toggleAgentMenu(agent, e)}
+                    className={`p-1 mr-0.5 rounded-md text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5 transition group-hover:opacity-100 focus:opacity-100 ${
+                      agentMenu?.agent.id === agent.id ? "opacity-100" : "opacity-0"
+                    }`}
+                    title={t("Sidebar.agentActions")}
+                    aria-label={t("Sidebar.agentActions")}
+                    aria-haspopup="menu"
+                    aria-expanded={agentMenu?.agent.id === agent.id}
+                  >
+                    <MoreHorizontal className="w-4 h-4" />
+                  </button>
+                </div>
+              )
+            )}
           </div>
         </div>
       </div>
 
+      {/* Agent actions — one popup shared by every row, anchored to the "..."
+          button that opened it. */}
+      {agentMenu && (
+        <div
+          ref={agentMenuRef}
+          data-agent-menu
+          role="menu"
+          className="fixed z-50 w-48 rounded-lg border border-subtle bg-card shadow-xl p-1"
+          style={{ top: agentMenu.top, left: agentMenu.left }}
+        >
+          <button
+            role="menuitem"
+            onClick={() => {
+              setAgentMenu(null);
+              onCreateSessionWithAgent(agentMenu.agent.id);
+            }}
+            className={agentMenuItemCls}
+          >
+            <MessageSquarePlus className="w-3.5 h-3.5 shrink-0" />
+            {t("Sidebar.menuNewSession")}
+          </button>
+          {onRenameAgent && (
+            <button
+              role="menuitem"
+              onClick={() => {
+                const agent = agentMenu.agent;
+                setAgentMenu(null);
+                onRenameAgent(agent);
+              }}
+              className={agentMenuItemCls}
+            >
+              <Pencil className="w-3.5 h-3.5 shrink-0" />
+              {t("Sidebar.menuRename")}
+            </button>
+          )}
+          {onOpenAgentSettings && (
+            <button
+              role="menuitem"
+              onClick={() => {
+                const agentId = agentMenu.agent.id;
+                setAgentMenu(null);
+                onOpenAgentSettings(agentId);
+              }}
+              className={agentMenuItemCls}
+            >
+              <Settings2 className="w-3.5 h-3.5 shrink-0" />
+              {t("Sidebar.menuAgentSettings")}
+            </button>
+          )}
+          {onDeleteAgent && (
+            <>
+              <div className="my-1 border-t border-subtle" />
+              <button
+                role="menuitem"
+                onClick={() => {
+                  const agent = agentMenu.agent;
+                  setAgentMenu(null);
+                  onDeleteAgent(agent);
+                }}
+                className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-left text-red-600 dark:text-red-400 hover:bg-red-500/10 transition"
+              >
+                <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                {t("Sidebar.menuDeleteAgent")}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
     </aside>
   );
 }
+
+/** Shared row style for entries in the agent "..." menu. */
+const agentMenuItemCls =
+  "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-left text-secondary transition " +
+  "hover:bg-black/[0.04] dark:hover:bg-white/[0.06]";
 
 interface SessionRowProps {
   session: SessionItem;

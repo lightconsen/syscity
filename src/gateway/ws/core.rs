@@ -487,6 +487,8 @@ async fn dispatch_method(
         "agents.list" => agents::handle_agents_list(req, state).await,
         "agents.create" => admin_ws::handle_agents_create(req, state).await,
         "agents.delete" => admin_ws::handle_agents_delete(req, state).await,
+        "agents.purge" => admin_ws::handle_agents_purge(req, state).await,
+        "agents.rename" => admin_ws::handle_agents_rename(req, state).await,
         "agents.get" => agents::handle_agents_get(req, state).await,
         "agents.registry" => agents::handle_agents_registry(req, state).await,
         "agents.get_config" => agents::handle_agents_get_config(req, state).await,

@@ -627,6 +627,145 @@ impl AgentPersonality {
     }
 }
 
+// ── Identity rewriting (rename) ─────────────────────────────────────────────
+//
+// The writers below mirror the precedence [`AgentPersonality::display_name`]
+// and [`AgentPersonality::emoji`] read with, so the value a rename writes is
+// the value read back afterwards. Each one rewrites the *highest-precedence*
+// source it finds and leaves the rest of the file untouched; only a file with
+// no usable source at all gains a new section.
+
+/// Replace the value of `line` matched by capture group 1 of `re`.
+///
+/// Returns `None` when the regex does not match (or the group is missing), so
+/// callers can fall through to the next source.
+fn replace_capture(line: &str, re: &Regex, value: &str) -> Option<String> {
+    let caps = re.captures(line)?;
+    let m = caps.get(1)?;
+    let mut out = String::with_capacity(line.len() + value.len());
+    out.push_str(&line[..m.start()]);
+    out.push_str(value);
+    out.push_str(&line[m.end()..]);
+    Some(out)
+}
+
+/// True for the `## name` / `##name` / `name:` marker whose *next* line holds
+/// the display name.
+fn is_name_marker(line: &str) -> bool {
+    let t = line.trim();
+    t.eq_ignore_ascii_case("## name")
+        || t.eq_ignore_ascii_case("##name")
+        || t.eq_ignore_ascii_case("name:")
+}
+
+/// Rewrite an IDENTITY.md body so [`AgentPersonality::display_name`] returns
+/// `name` for it.
+///
+/// Follows the same order `display_name()` reads in: the `## name` marker's
+/// following line, then a `- **Name**: x` list item, then an inline `name: x`,
+/// then the first non-placeholder heading. A body with none of those gets the
+/// canonical `# <name>` + `## name` header that `seed_agent_personality`
+/// writes.
+pub fn write_display_name(identity: &str, name: &str) -> String {
+    let mut lines: Vec<String> = identity.split('\n').map(str::to_string).collect();
+
+    // 1. `## name` / `##name` / `name:` — the name is on the next line.
+    for i in 0..lines.len() {
+        if is_name_marker(&lines[i]) {
+            match lines.get_mut(i + 1) {
+                Some(next) => *next = name.to_string(),
+                None => lines.push(name.to_string()),
+            }
+            return lines.join("\n");
+        }
+    }
+
+    // 2. `- **名称**: 小明` / `- **Name**: Xiao Ming`
+    for line in lines.iter_mut() {
+        if let Some(replaced) = replace_capture(line, &NAME_LIST_RE, name) {
+            *line = replaced;
+            return lines.join("\n");
+        }
+    }
+
+    // 3. Inline `name: 小明`
+    for line in lines.iter_mut() {
+        if let Some(replaced) = replace_capture(line, &NAME_YAML_RE, name) {
+            *line = replaced;
+            return lines.join("\n");
+        }
+    }
+
+    // 4. First heading, unless the reader would treat it as a placeholder.
+    if let Some(first) = lines.first() {
+        let trimmed = first.trim();
+        if let Some(title) = trimmed.strip_prefix('#') {
+            if !PLACEHOLDER_HEADING_RE.is_match(title.trim()) {
+                let indent = &first[..first.len() - first.trim_start().len()];
+                lines[0] = format!("{}# {}", indent, name);
+                return lines.join("\n");
+            }
+        }
+    }
+
+    // 5. Nothing to rewrite — write the canonical header.
+    let header = format!("# {}\n\n## name\n{}\n", name, name);
+    if identity.trim().is_empty() {
+        header
+    } else {
+        format!("{}\n{}", header, identity)
+    }
+}
+
+/// Rewrite SOUL.md / IDENTITY.md so [`AgentPersonality::emoji`] returns
+/// `emoji` for them.
+///
+/// SOUL.md wins over IDENTITY.md in `emoji()`, so the emoji is written there
+/// whenever it already carries one; otherwise IDENTITY.md's entry is updated.
+/// A personality with an emoji nowhere gets one inserted into SOUL.md's YAML
+/// frontmatter (or as its first line, when it has no frontmatter).
+///
+/// Returns the `(soul, identity)` pair to write back; either may be unchanged.
+pub fn write_emoji(soul: &str, identity: &str, emoji: &str) -> (String, String) {
+    let emoji_line = |line: &str| -> Option<String> {
+        let trimmed = line.trim();
+        for prefix in ["emoji:", "Emoji:", "emoji：", "Emoji："] {
+            if trimmed.strip_prefix(prefix).is_some() {
+                // Keep the file's own spelling of the key and indentation.
+                let indent = &line[..line.len() - line.trim_start().len()];
+                return Some(format!("{}{} \"{}\"", indent, prefix, emoji));
+            }
+        }
+        replace_capture(line, &EMOJI_LIST_RE, emoji)
+    };
+
+    let mut soul_lines: Vec<String> = soul.split('\n').map(str::to_string).collect();
+    for line in soul_lines.iter_mut() {
+        if let Some(replaced) = emoji_line(line) {
+            *line = replaced;
+            return (soul_lines.join("\n"), identity.to_string());
+        }
+    }
+
+    let mut identity_lines: Vec<String> = identity.split('\n').map(str::to_string).collect();
+    for line in identity_lines.iter_mut() {
+        if let Some(replaced) = emoji_line(line) {
+            *line = replaced;
+            return (soul.to_string(), identity_lines.join("\n"));
+        }
+    }
+
+    // No emoji anywhere: give SOUL.md one so the next read finds it.
+    if soul.is_empty() {
+        return (format!("emoji: \"{}\"\n", emoji), identity.to_string());
+    }
+    if soul_lines.first().is_some_and(|l| l.trim() == "---") {
+        soul_lines.insert(1, format!("emoji: \"{}\"", emoji));
+        return (soul_lines.join("\n"), identity.to_string());
+    }
+    (format!("emoji: \"{}\"\n{}", emoji, soul), identity.to_string())
+}
+
 /// Agent Registry for discovered personalities
 #[derive(Debug, Default)]
 pub struct AgentRegistry {
@@ -751,6 +890,14 @@ impl AgentRegistry {
     pub(crate) fn insert_for_test(&mut self, personality: AgentPersonality) {
         self.personalities
             .insert(personality.id.clone(), personality);
+    }
+
+    /// Drop a personality from the registry, returning it if it was present.
+    ///
+    /// Used when an agent's directory is purged: `discover` only ever inserts,
+    /// so a deleted agent would otherwise stay listed until restart.
+    pub fn remove(&mut self, id: &str) -> Option<AgentPersonality> {
+        self.personalities.remove(id)
     }
 
     /// Get all personality IDs
@@ -1266,6 +1413,124 @@ mod tests {
             "Primary system prompt estimated {} tokens, exceeds 8k budget",
             estimated_tokens
         );
+    }
+
+    // ── Identity rewriting (rename) ──────────────────────────────────────────
+
+    /// Read the display name back through the same path the registry uses.
+    fn read_display_name(identity: &str) -> String {
+        AgentPersonality {
+            id: "agent".to_string(),
+            identity: identity.to_string(),
+            ..Default::default()
+        }
+        .display_name()
+    }
+
+    fn read_emoji(soul: &str, identity: &str) -> String {
+        AgentPersonality {
+            id: "agent".to_string(),
+            soul: soul.to_string(),
+            identity: identity.to_string(),
+            ..Default::default()
+        }
+        .emoji()
+    }
+
+    #[test]
+    fn write_display_name_replaces_marker_value() {
+        let identity = "# Old Name\n\n## name\nOld Name\n\nA description.\n";
+        let out = write_display_name(identity, "New Name");
+        assert_eq!(read_display_name(&out), "New Name");
+        // The rest of the file survives.
+        assert!(out.contains("A description."));
+        assert_eq!(out.lines().count(), identity.lines().count());
+    }
+
+    #[test]
+    fn write_display_name_replaces_list_item() {
+        let out = write_display_name("# Identity\n\n- **名称**: 小明\n", "小红");
+        assert_eq!(read_display_name(&out), "小红");
+        assert!(out.contains("- **名称**: 小红"));
+    }
+
+    #[test]
+    fn write_display_name_replaces_inline_yaml() {
+        let out = write_display_name("# Identity\nname: Old\n", "New");
+        assert_eq!(read_display_name(&out), "New");
+    }
+
+    /// A heading-only identity file (no marker) is renamed in place — the
+    /// reader's heading fallback is what it resolves through.
+    #[test]
+    fn write_display_name_replaces_first_heading() {
+        let out = write_display_name("# Old Name\n\nSome notes.\n", "New Name");
+        assert_eq!(read_display_name(&out), "New Name");
+        assert!(out.contains("Some notes."));
+    }
+
+    /// Placeholder headings are not a name source for the reader, so the
+    /// writer must not treat one as the place to write either.
+    #[test]
+    fn write_display_name_prepends_when_only_placeholder_heading() {
+        let out = write_display_name("# IDENTITY.md\n\n## 我是谁\n\nSome notes.\n", "小明");
+        assert_eq!(read_display_name(&out), "小明");
+        assert!(out.contains("Some notes."));
+    }
+
+    #[test]
+    fn write_display_name_creates_header_for_empty_identity() {
+        let out = write_display_name("", "小明");
+        assert_eq!(read_display_name(&out), "小明");
+        assert!(out.starts_with("# 小明\n\n## name\n小明\n"));
+    }
+
+    #[test]
+    fn write_emoji_updates_soul_frontmatter() {
+        let soul = "---\nname: X\nemoji: \"🎨\"\n---\n\n# Body\n";
+        let (soul, identity) = write_emoji(soul, "", "🐼");
+        assert_eq!(read_emoji(&soul, &identity), "🐼");
+        assert!(soul.contains("name: X"), "frontmatter survives");
+        assert!(soul.contains("# Body"), "body survives");
+    }
+
+    /// SOUL.md wins over IDENTITY.md in `emoji()`, so an IDENTITY-only emoji
+    /// is updated in place rather than shadowed by a new SOUL.md entry.
+    #[test]
+    fn write_emoji_updates_identity_when_soul_has_none() {
+        let soul = "---\nname: X\n---\n\n# Body\n";
+        let identity = "# X\n\n- **Emoji**: 🎨\n";
+        let (soul, identity) = write_emoji(soul, identity, "🐼");
+        assert_eq!(read_emoji(&soul, &identity), "🐼");
+        assert!(!soul.contains("emoji"), "soul untouched");
+    }
+
+    #[test]
+    fn write_emoji_inserts_into_soul_when_absent() {
+        let soul = "---\nname: X\n---\n\n# Body\n";
+        let (soul, identity) = write_emoji(soul, "", "🐼");
+        assert_eq!(read_emoji(&soul, &identity), "🐼");
+        assert!(soul.starts_with("---\nemoji: \"🐼\"\nname: X\n"), "soul: {soul}");
+    }
+
+    #[test]
+    fn write_emoji_inserts_into_empty_soul() {
+        let (soul, identity) = write_emoji("", "# X\n", "🐼");
+        assert_eq!(read_emoji(&soul, &identity), "🐼");
+    }
+
+    #[test]
+    fn registry_remove_drops_entry() {
+        let mut registry = AgentRegistry::new();
+        registry.insert_for_test(AgentPersonality {
+            id: "gone".to_string(),
+            identity: "# Gone\n".to_string(),
+            ..Default::default()
+        });
+        assert!(registry.has("gone"));
+        assert!(registry.remove("gone").is_some());
+        assert!(!registry.has("gone"));
+        assert!(registry.remove("gone").is_none());
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

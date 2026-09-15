@@ -114,8 +114,8 @@ pub use group::{
     GroupManagerStats, GroupMember, GroupRole, GroupSession, GroupSessionError, GroupSessionManager,
 };
 pub use personality::{
-    seed_agent_personality, seed_agent_personality_sync, AgentPersonality, AgentRegistry,
-    AgentTemplateParams, PersonalityContext, SharedAgentRegistry,
+    seed_agent_personality, seed_agent_personality_sync, write_display_name, write_emoji,
+    AgentPersonality, AgentRegistry, AgentTemplateParams, PersonalityContext, SharedAgentRegistry,
 };
 pub use planner::PersistedPlan;
 pub use planner::{ActivePlan, TaskPlan, TaskPlanner};

@@ -23,6 +23,8 @@ interface SettingsPanelProps {
   onClose: () => void;
   /** Tab to open on (e.g. "marketplace" when launched from the sidebar). */
   initialTab?: string;
+  /** Agent to preselect on the Agents tab (sidebar "Agent settings"). */
+  initialAgentId?: string;
   /** Marketplace expert summon: open a session bound to the agent
    *  (with an optional starter prompt). */
   onSummonExpert?: (agentId: string, starterPrompt?: string) => void;
@@ -35,11 +37,12 @@ export function SettingsPanel({
   transport,
   onClose,
   initialTab = "general",
+  initialAgentId,
   onSummonExpert,
   onNewSessionWithDraft,
 }: SettingsPanelProps) {
   const { t } = useTranslation("settings");
-  const d = useSettingsData(transport, initialTab);
+  const d = useSettingsData(transport, initialTab, initialAgentId);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-page">

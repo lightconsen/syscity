@@ -86,5 +86,7 @@
   "MarketplaceSettings.stateDisabled": "已停用",
   "MarketplaceSettings.stateError": "错误",
   "MarketplaceSettings.connectedToast": "{{name}} 已连接",
-  "MarketplaceSettings.connectFailedToast": "{{name}} 连接失败"
+  "MarketplaceSettings.connectFailedToast": "{{name}} 连接失败",
+  "ConfirmDialog.cancel": "取消",
+  "ConfirmDialog.confirm": "确定"
 }

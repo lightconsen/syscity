@@ -1,3 +1,8 @@
 {
-  "App.extensionsTitle": "Extensions"
+  "App.extensionsTitle": "Extensions",
+  "App.agentDeleteTitle": "Delete agent \"{{name}}\"?",
+  "App.agentDeleteMessage": "Deletes the agent's directory for good — personality files, workspace, data and memory. This cannot be undone.",
+  "App.agentDeleteConfirm": "Delete",
+  "App.agentRenameFailed": "Failed to rename the agent",
+  "App.agentDeleteFailed": "Failed to delete the agent"
 }

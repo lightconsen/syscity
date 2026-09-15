@@ -332,6 +332,8 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "sessions.delete"
         | "agents.create"
         | "agents.delete"
+        | "agents.purge"
+        | "agents.rename"
         | "sessions.rename"
         | "sessions.set_pinned"
         | "sessions.set_model"
@@ -1006,6 +1008,8 @@ mod tests {
         assert_eq!(method_scope("eval.propose"), Some(SCOPE_WRITE));
 
         // SCOPE_WRITE
+        assert_eq!(method_scope("agents.purge"), Some(SCOPE_WRITE));
+        assert_eq!(method_scope("agents.rename"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("sessions.create"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("sessions.delete"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("sessions.rename"), Some(SCOPE_WRITE));

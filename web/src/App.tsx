@@ -13,7 +13,7 @@ import { cloudSubmitToken } from "@/lib/cloud";
 import { useChatStore } from "@/stores/chatStore";
 import { Titlebar } from "@/components/chrome/Titlebar";
 import { Statusbar } from "@/components/chrome/Statusbar";
-import { Sidebar } from "@/components/chat/Sidebar";
+import { Sidebar, type AgentItem } from "@/components/chat/Sidebar";
 import { SettingsPanel } from "@/components/settings/SettingsPanel";
 import { WelcomeScreen } from "@/components/onboarding/WelcomeScreen";
 import { IdentityWizard } from "@/components/onboarding/IdentityWizard";
@@ -27,7 +27,9 @@ import { CloudEnabledBanner } from "@/components/update/CloudEnabledBanner";
 import { LowBalanceBanner } from "@/components/update/LowBalanceBanner";
 import { ExtensionsView } from "@/components/marketplace/ExtensionsView";
 import { KnowledgeBaseView } from "@/components/kb/KnowledgeBaseView";
-import { Toaster } from "@/components/ui/Toast";
+import { Toaster, pushToast } from "@/components/ui/Toast";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { AgentRenameDialog } from "@/components/chat/AgentRenameDialog";
 import { AskModal, type AskPrompt } from "@/components/ask/AskModal";
 import { ApprovalModal } from "@/components/approval/ApprovalModal";
 import type { ApprovalPrompt } from "@/components/approval/ApprovalModal";
@@ -151,20 +153,18 @@ function ChatApp() {
       last_activity?: number;
     }>
   >([]);
-  const [agents, setAgents] = useState<
-    Array<{
-      id: string;
-      display_name: string;
-      emoji: string;
-      is_valid: boolean;
-      has_heartbeat: boolean;
-    }>
-  >([]);
+  const [agents, setAgents] = useState<AgentItem[]>([]);
   const [runningSessionIds, setRunningSessionIds] = useState<string[]>([]);
   const [sessionKey, setSessionKey] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Tab to open settings on (e.g. "marketplace" via the sidebar shortcut).
   const [settingsTab, setSettingsTab] = useState("general");
+  // Agent to preselect when the Agents tab opens (sidebar "Agent settings").
+  const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
+  // Rename / delete dialogs for a sidebar agent (null = closed).
+  const [renameTarget, setRenameTarget] = useState<AgentItem | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AgentItem | null>(null);
+  const [agentActionBusy, setAgentActionBusy] = useState(false);
   // Full-screen marketplace view (replaces the chat area).
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   // Pre-filter for the marketplace view (connector/skill/expert; null = all).
@@ -176,10 +176,12 @@ function ChatApp() {
   // null = not yet checked; true = identity wizard completed.
   const [onboardingDone, setOnboardingDone] = useState<boolean | null>(null);
 
-  /** Open settings on a specific tab (e.g. "marketplace" from the sidebar). */
-  const openSettings = (tab: string) => {
+  /** Open settings on a specific tab (e.g. "marketplace" from the sidebar),
+   *  optionally preselected to one agent's settings. */
+  const openSettings = (tab: string, agentId: string | null = null) => {
     setMarketplaceOpen(false);
     setSettingsTab(tab);
+    setSettingsAgentId(agentId);
     setSettingsOpen(true);
   };
 
@@ -729,6 +731,51 @@ function ChatApp() {
     [transport, refreshSessions]
   );
 
+  /** Save a new display name / emoji for an agent (IDENTITY.md + SOUL.md). */
+  const handleRenameAgent = useCallback(
+    async (fields: { displayName: string; emoji: string }) => {
+      if (!renameTarget) return;
+      setAgentActionBusy(true);
+      try {
+        await transport.renameAgent(renameTarget.id, fields);
+        await refreshAgents();
+        setRenameTarget(null);
+      } catch (e) {
+        pushToast("error", (e as Error).message || t("App.agentRenameFailed"));
+      } finally {
+        setAgentActionBusy(false);
+      }
+    },
+    [transport, renameTarget, refreshAgents, t]
+  );
+
+  /** Delete an agent for good: files, registry entry and config overrides. */
+  const handleDeleteAgent = useCallback(async () => {
+    if (!deleteTarget) return;
+    setAgentActionBusy(true);
+    try {
+      await transport.purgeAgent(deleteTarget.id);
+      await refreshAgents();
+      // Sessions bound to the agent lose their badge but keep their history.
+      await refreshSessions();
+      setDeleteTarget(null);
+    } catch (e) {
+      pushToast("error", (e as Error).message || t("App.agentDeleteFailed"));
+    } finally {
+      setAgentActionBusy(false);
+    }
+  }, [transport, deleteTarget, refreshAgents, refreshSessions, t]);
+
+  /** Open Settings → Agents with this agent already selected. */
+  const handleOpenAgentSettings = useCallback((agentId: string) => {
+    setMobileNavOpen(false);
+    setMarketplaceOpen(false);
+    setKbOpen(false);
+    setSettingsTab("agents");
+    setSettingsAgentId(agentId);
+    setSettingsOpen(true);
+  }, []);
+
   // Build session items enriched with agent info for sidebar badges.
   const sessionItems = useMemo(() => {
     return sessions.map((s) => ({
@@ -863,6 +910,9 @@ function ChatApp() {
             onRenameSession={handleRenameSession}
             onDeleteSession={handleDeleteSession}
             onPinSession={handlePinSession}
+            onRenameAgent={setRenameTarget}
+            onDeleteAgent={setDeleteTarget}
+            onOpenAgentSettings={handleOpenAgentSettings}
           />
         </div>
 
@@ -912,6 +962,15 @@ function ChatApp() {
                 onRenameSession={handleRenameSession}
                 onDeleteSession={handleDeleteSession}
                 onPinSession={handlePinSession}
+                onRenameAgent={(agent) => {
+                  setMobileNavOpen(false);
+                  setRenameTarget(agent);
+                }}
+                onDeleteAgent={(agent) => {
+                  setMobileNavOpen(false);
+                  setDeleteTarget(agent);
+                }}
+                onOpenAgentSettings={handleOpenAgentSettings}
               />
             </div>
           </div>
@@ -934,9 +993,11 @@ function ChatApp() {
           />
         ) : settingsOpen ? (
           <SettingsPanel
-            key={settingsTab}
+            // Remount when the target changes so the panel re-initialises to it.
+            key={`${settingsTab}:${settingsAgentId ?? ""}`}
             transport={transport}
             initialTab={settingsTab}
+            initialAgentId={settingsAgentId ?? undefined}
             onClose={() => setSettingsOpen(false)}
             onSummonExpert={handleCreateSessionWithAgent}
             onNewSessionWithDraft={handleNewSessionWithDraft}
@@ -1049,6 +1110,29 @@ function ChatApp() {
           prompt={approvalPrompt}
           onDecide={handleApprovalDecide}
           onDismiss={handleApprovalDismiss}
+        />
+      )}
+
+      {/* Sidebar agent actions — rename writes the personality files, delete
+          removes them for good. */}
+      {renameTarget && (
+        <AgentRenameDialog
+          displayName={renameTarget.display_name}
+          emoji={renameTarget.emoji}
+          busy={agentActionBusy}
+          onSave={handleRenameAgent}
+          onCancel={() => setRenameTarget(null)}
+        />
+      )}
+      {deleteTarget && (
+        <ConfirmDialog
+          title={t("App.agentDeleteTitle", { name: deleteTarget.display_name })}
+          message={t("App.agentDeleteMessage")}
+          confirmLabel={t("App.agentDeleteConfirm")}
+          destructive
+          busy={agentActionBusy}
+          onConfirm={handleDeleteAgent}
+          onCancel={() => setDeleteTarget(null)}
         />
       )}
 
