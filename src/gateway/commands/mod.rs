@@ -210,6 +210,13 @@ pub fn built_in_commands() -> Vec<CommandDef> {
             .with_args("spawn|cancel|steer|close|sessions|status|..."),
         CommandDef::new("skill", "skill", "List or show skill details", CommandCategory::Agents)
             .with_args("[name]"),
+        CommandDef::new(
+            "learn",
+            "learn",
+            "Author a skill from a source, the notes you paste, or this session",
+            CommandCategory::Agents,
+        )
+        .with_args("[source or requirements]"),
         CommandDef::new("session", "session", "Manage session timeouts", CommandCategory::Session)
             .with_args("idle|max-age <duration|off>"),
         CommandDef::new("kill", "kill", "Abort sub-agent runs", CommandCategory::Agents)
@@ -522,6 +529,17 @@ pub async fn handle_commands_execute(
             "focus" => agents::handle_focus(req, conn, state, &params.args).await,
             "unfocus" => agents::handle_unfocus(req, conn, state).await,
             "skill" => tools::handle_skill(req, state, &params.args).await,
+            "learn" => {
+                tools::handle_learn(
+                    req,
+                    conn,
+                    state,
+                    ctx,
+                    &params.args,
+                    params.session_id.as_deref(),
+                )
+                .await
+            }
             "allowlist" => tools::handle_allowlist(req, state, &params.args).await,
             "approve" => tools::handle_approve(req, state, &params.args).await,
             "btw" => tools::handle_btw(req, state, &params.args).await,
@@ -596,6 +614,27 @@ fn parse_params<T: serde::de::DeserializeOwned>(req: &WsRequest) -> Result<T, Ws
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/learn` has to be reachable: registered in the listing the clients read
+    /// and named in the dispatch that runs it. A handler without a registration
+    /// is invisible, and a registration without a handler answers "unknown
+    /// command" to a user who just typed it.
+    #[test]
+    fn learn_is_registered_and_dispatchable() {
+        let defs = built_in_commands();
+        let learn = defs
+            .iter()
+            .find(|def| def.key == "learn")
+            .expect("/learn is not in the command list");
+        assert!(
+            learn.description.to_lowercase().contains("skill"),
+            "the description should say what it makes: {}",
+            learn.description
+        );
+        // Tiers decide who may run it: Essential/Standard are user-level, Power
+        // is admin. Authoring a skill is a normal user action.
+        assert_ne!(learn.tier, CommandTier::Power, "/learn should not require admin");
+    }
 
     #[test]
     fn test_help_args_default() {

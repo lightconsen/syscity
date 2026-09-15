@@ -1,7 +1,7 @@
 //! chat.send / chat.history / chat.abort handlers.
 
 use super::*;
-pub(super) async fn handle_chat_send(
+pub(crate) async fn handle_chat_send(
     req: &WsRequest,
     conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
     state: &Arc<GatewayState>,

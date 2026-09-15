@@ -239,6 +239,37 @@ pub(super) async fn handle_btw(
     }
 }
 
+/// `/learn` — author a skill from whatever the user points at.
+///
+/// Builds a prompt and runs it as the next user turn, through the same path a
+/// composed message takes (`chat.send`): same session, same history, same event
+/// stream. The command itself holds no logic beyond that — a second way into the
+/// agent would be a second thing to keep in step, and this one gets every
+/// client's streaming, persistence and cancellation for free.
+pub(super) async fn handle_learn(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+    args: &str,
+    session_id: Option<&str>,
+) -> WsResponse {
+    let mut send = req.clone();
+    send.method = "chat.send".to_string();
+    let mut params = serde_json::json!({
+        "message": crate::skills::learn::learn_prompt(args),
+    });
+    // Stay in the session the command was run in. `chat.send` would otherwise
+    // resolve its own, which for a client that passes an explicit session id
+    // would quietly be a different conversation.
+    if let Some(sid) = session_id {
+        params["session_id"] = serde_json::json!(sid);
+    }
+    send.params = Some(params);
+
+    crate::gateway::ws::chat::handle_chat_send(&send, conn, state, ctx).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

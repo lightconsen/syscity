@@ -140,7 +140,7 @@ mod acp;
 mod admin_ws;
 mod agents;
 mod ask;
-mod chat;
+pub(crate) mod chat;
 mod config_ws;
 pub(crate) mod connectors_ws;
 mod core;

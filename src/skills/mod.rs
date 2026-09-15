@@ -31,6 +31,7 @@ pub mod dependencies;
 mod frontmatter;
 pub mod guard;
 mod install;
+pub mod learn;
 mod manager;
 pub mod registry;
 pub mod semver;
