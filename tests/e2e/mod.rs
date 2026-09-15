@@ -295,6 +295,44 @@ pub fn dump_captured_logs() {
 /// `start()`'s `Result` is captured over a oneshot channel so a timeout can
 /// distinguish "start() returned Err (step N)" from "start() still running",
 /// and any captured gateway logs are dumped before panicking.
+
+/// Answer tool approvals the way an interactive UI does.
+///
+/// Tools that advertise `requires_approval` are gated wherever a question can
+/// reach a human, and these gateways carry a question queue — so without an
+/// approver a turn waits for a decision while the test waits for `chat.final`,
+/// and the failure reads as a timeout rather than as a missing approver.
+/// Approving everything is what a permissive user at a UI does; the call still
+/// travels through the queue and its audit entry, so the gate is exercised
+/// rather than bypassed.
+fn spawn_auto_approver(port: u16) {
+    tokio::spawn(async move {
+        let mut client = FrontendSimulator::connect(port).await;
+        loop {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let frame = client
+                .request("approvals.list", serde_json::json!({}))
+                .await;
+            // The envelope carries `payload`, not `result` — reading the wrong
+            // field is how the first version of this approved nothing while
+            // polling faithfully.
+            let pending = frame
+                .get("payload")
+                .and_then(|r| r.get("approvals"))
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for item in pending {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    client
+                        .request("approvals.approve", serde_json::json!({ "id": id }))
+                        .await;
+                }
+            }
+        }
+    });
+}
+
 pub async fn start_gateway_and_wait(port: u16, gateway: Gateway) {
     init_test_tracing();
 
@@ -309,7 +347,12 @@ pub async fn start_gateway_and_wait(port: u16, gateway: Gateway) {
     let mut last_connect_err = None;
     while tokio::time::Instant::now() < deadline {
         match timeout(Duration::from_secs(5), connect_async(&url)).await {
-            Ok(Ok(_)) => return,
+            Ok(Ok(_)) => {
+                // Every test gateway gets one, so a chat that needs an approval
+                // to keep going is not mistaken for a hang.
+                spawn_auto_approver(port);
+                return;
+            }
             Ok(Err(e)) => last_connect_err = Some(e.to_string()),
             Err(_) => last_connect_err = Some("connect timed out".to_string()),
         }
