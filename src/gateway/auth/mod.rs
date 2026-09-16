@@ -1,7 +1,11 @@
 //! Gateway Authentication Module
 //!
-//! Provides session cookie management and OAuth2 authentication flows
-//! to complement the existing Bearer token auth in `security::AuthManager`.
+//! Authenticates via Bearer token, shared token, device pairing and Tailscale
+//! (`security::AuthManager` and per-mode handlers in `ws/`). Session *cookies*
+//! are a forward-compat shim only: no code ever issues a `Set-Cookie`, so
+//! nothing populates them — the types and parsers below exist so a future
+//! OAuth-callback session (or an external reverse proxy) can hand a token over
+//! without inventing the plumbing after the fact.
 
 use axum::extract::Request;
 use axum::http::header;
@@ -9,7 +13,14 @@ use serde::{Deserialize, Serialize};
 
 pub mod ws_origin;
 
-/// Session cookie configuration
+/// Session cookie configuration.
+///
+/// **Not in active use.** No production code sets a `Set-Cookie` header, so
+/// cookies are never present when these parsers run — they are kept, and kept
+/// honest, as the forward-compat surface for a session handed over by an
+/// OAuth callback or a reverse proxy. If that day never comes, this is
+/// deletable along with `extract_session_cookie*` and their one call site in
+/// the rate limiter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCookieConfig {
     /// Cookie name
@@ -42,7 +53,12 @@ impl Default for SessionCookieConfig {
     }
 }
 
-/// Extract session token from cookie header
+/// Extract a session token from the `Cookie` request header.
+///
+/// See the module docs and [`SessionCookieConfig`]: nothing populates this
+/// today — the return value is almost always `None` because no code sets the
+/// cookie. The parser is kept functional regardless, so a future OAuth
+/// callback or reverse proxy can feed it without new plumbing.
 pub fn extract_session_cookie(req: &Request, cookie_name: &str) -> Option<String> {
     extract_session_cookie_from_headers(req.headers(), cookie_name)
 }

@@ -19,8 +19,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::gateway::auth::extract_session_cookie;
-use crate::gateway::auth::SessionCookieConfig;
 use crate::gateway::GatewayState;
 use crate::security::sliding_window::{LockoutConfig, RateLimitKey, SlidingWindowRateLimiter};
 use crate::security::{RateLimitResult, RateLimiter, UserId};
@@ -607,9 +605,13 @@ pub async fn multi_tier_rate_limit_middleware(
     let scope =
         RequestScope::detect(req.method(), req.uri().path(), auth_header, shared_secret.as_deref());
 
-    // Get user identifier
+    // Get user identifier for rate limiting. The identity is the Bearer token's
+    // session when present; otherwise the client IP, or a static anonymous id.
+    // There is deliberately no session-cookie branch here: no code issues
+    // cookies (`gateway::auth::SessionCookieConfig` is a forward-compat shim
+    // only), so such a branch would be dead and would pretend cookies are a
+    // real credential.
     let user_id = {
-        // Try Bearer token first
         let auth_header = req.headers().get("authorization");
         if let Some(header_value) = auth_header {
             if let Ok(header_str) = header_value.to_str() {
@@ -617,22 +619,9 @@ pub async fn multi_tier_rate_limit_middleware(
                     if let Some(session) = state.auth.manager.validate_session(token).await {
                         session.user_id
                     } else {
-                        // Try session cookie
-                        let cookie_config = SessionCookieConfig::default();
-                        if let Some(token) = extract_session_cookie(&req, &cookie_config.name) {
-                            if let Some(session) = state.auth.manager.validate_session(&token).await
-                            {
-                                session.user_id
-                            } else {
-                                extract_client_ip(&req)
-                                    .map(|ip| UserId::new(format!("ip:{}", ip)))
-                                    .unwrap_or_else(|| UserId::new("anonymous"))
-                            }
-                        } else {
-                            extract_client_ip(&req)
-                                .map(|ip| UserId::new(format!("ip:{}", ip)))
-                                .unwrap_or_else(|| UserId::new("anonymous"))
-                        }
+                        extract_client_ip(&req)
+                            .map(|ip| UserId::new(format!("ip:{}", ip)))
+                            .unwrap_or_else(|| UserId::new("anonymous"))
                     }
                 } else {
                     extract_client_ip(&req)
@@ -645,21 +634,9 @@ pub async fn multi_tier_rate_limit_middleware(
                     .unwrap_or_else(|| UserId::new("anonymous"))
             }
         } else {
-            // Try session cookie for OAuth users
-            let cookie_config = SessionCookieConfig::default();
-            if let Some(token) = extract_session_cookie(&req, &cookie_config.name) {
-                if let Some(session) = state.auth.manager.validate_session(&token).await {
-                    session.user_id
-                } else {
-                    extract_client_ip(&req)
-                        .map(|ip| UserId::new(format!("ip:{}", ip)))
-                        .unwrap_or_else(|| UserId::new("anonymous"))
-                }
-            } else {
-                extract_client_ip(&req)
-                    .map(|ip| UserId::new(format!("ip:{}", ip)))
-                    .unwrap_or_else(|| UserId::new("anonymous"))
-            }
+            extract_client_ip(&req)
+                .map(|ip| UserId::new(format!("ip:{}", ip)))
+                .unwrap_or_else(|| UserId::new("anonymous"))
         }
     };
 

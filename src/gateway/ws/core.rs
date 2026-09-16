@@ -11,7 +11,8 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// Middleware: validate WebSocket upgrade credentials before proceeding.
 ///
 /// Runs BEFORE the WebSocket upgrade. When auth_mode is not "none", rejects
-/// with 401 if no valid session cookie, shared token, or query token is found.
+/// with 401 if no valid Bearer session token, shared token, or query token is
+/// found. There is no cookie credential: the gateway never issues cookies.
 pub async fn ws_auth_middleware(
     State(state): State<Arc<GatewayState>>,
     mut req: axum::extract::Request,
@@ -133,13 +134,11 @@ async fn validate_ws_upgrade_request(
     warn!("WebSocket upgrade rejected: no valid credentials");
     let resp = axum::http::Response::builder()
         .status(axum::http::StatusCode::UNAUTHORIZED)
-        .header(axum::http::header::WWW_AUTHENTICATE, "Bearer, Cookie")
-        .body(axum::body::Body::from(
-            "Unauthorized: valid session cookie or API token required",
-        ))
+        .header(axum::http::header::WWW_AUTHENTICATE, "Bearer")
+        .body(axum::body::Body::from("Unauthorized: a valid API token is required"))
         .unwrap_or_else(|_| {
             axum::http::Response::new(axum::body::Body::from(
-                "Unauthorized: valid session cookie or API token required",
+                "Unauthorized: a valid API token is required",
             ))
         });
     Err(resp)
