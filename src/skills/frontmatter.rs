@@ -404,21 +404,6 @@ pub fn parse_skill_md(content: &str) -> crate::Result<(String, String)> {
 /// Note: This is a simplified version that formats based on the Skill struct
 /// from mod.rs. The actual implementation would need access to the Skill struct
 /// definition.
-pub fn format_skill_md(name: &str, description: &str, prompt: &str, emoji: &str) -> String {
-    let mut content = String::new();
-
-    // Frontmatter
-    content.push_str("---\n");
-    content.push_str(&format!("name: {}\n", name));
-    content.push_str(&format!("emoji: {}\n", emoji));
-    content.push_str("---\n\n");
-
-    // Content
-    content.push_str(&format!("# {}\n\n", description));
-    content.push_str(prompt);
-
-    content
-}
 
 #[cfg(test)]
 mod tests {

@@ -411,37 +411,6 @@ impl SkillManager {
     }
 
     /// Create a new skill
-    pub async fn create_skill(&self, skill: &Skill) -> crate::Result<()> {
-        // Check security
-        let report = guard::scan_skill(skill);
-        if !report.passed {
-            return Err(crate::error::SyscityError::Validation(format!(
-                "Security check failed: {:?}",
-                report.issues
-            )));
-        }
-
-        // Validate
-        if let Err(errors) = guard::validate_skill(skill) {
-            return Err(crate::error::SyscityError::Validation(errors.join(", ")));
-        }
-
-        // Write to user skills directory
-        let user_dir = self.storage.user_dir();
-        let skill_dir = user_dir.join(&skill.name);
-        tokio::fs::create_dir_all(&skill_dir).await?;
-
-        let skill_file = skill_dir.join("SKILL.md");
-
-        // Format as SKILL.md
-        let emoji = skill.metadata.emoji.clone();
-        let content =
-            frontmatter::format_skill_md(&skill.name, &skill.description, &skill.prompt, &emoji);
-        tokio::fs::write(&skill_file, content).await?;
-
-        info!("Created skill: {} at {:?}", skill.name, skill_file);
-        Ok(())
-    }
 
     /// Delete a skill
     pub async fn delete_skill(&mut self, name: &str) -> crate::Result<bool> {
@@ -493,8 +462,7 @@ impl SkillManager {
         // Every route into the manager passes through here or `reload_skill`:
         // discovery at startup, the watcher's hot reload, and `skills.install`'s
         // download (which reloads). Neither check used to run on any of them —
-        // they only ran in `create_skill`, which nothing called, so a scanner
-        // written for exactly this content never saw any of it.
+        // a scanner written for exactly this content never saw any of it.
         guard::validate_skill(&skill).map_err(|errors| {
             crate::error::SyscityError::Validation(format!(
                 "Not loading {}: {}",
@@ -845,10 +813,9 @@ mod tests {
     /// A skill file on disk is checked before it is loaded.
     ///
     /// Before this, the only thing standing between a file and the catalog was
-    /// its size — `scan_skill` / `validate_skill` ran solely in `create_skill`,
-    /// which has no callers. A skill lands in the system prompt every session,
-    /// from a directory the agent itself can write to, so that is where the
-    /// check belongs.
+    /// its size. A skill lands in the system prompt every session, from a
+    /// directory the agent itself can write to, so the check belongs in the
+    /// load path — where every route into the manager passes through it.
     #[tokio::test]
     async fn loading_a_file_skill_applies_the_guard() {
         let dir = std::env::temp_dir().join(format!("syscity-skill-test-{}", std::process::id()));
