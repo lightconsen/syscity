@@ -1197,8 +1197,17 @@ pub(crate) async fn build_router(state: Arc<GatewayState>) -> Router {
     #[cfg(feature = "cloud")]
     let app = app.merge(cloud_router);
 
-    app.layer(cors_layer)
+    // Every request body is bounded. Only two routes accept one
+    // (`/v1/chat/completions` and the webhooks), and neither has a legitimate
+    // body anywhere near this size — while an unbounded body on an
+    // unauthenticated route is a free way to consume memory.
+    app.layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(cors_layer)
 }
+
+/// Largest accepted HTTP request body (10 MiB). Generous for an OpenAI-style
+/// chat request; far below anything that would matter as a memory attack.
+const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 

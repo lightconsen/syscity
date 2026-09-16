@@ -874,6 +874,9 @@ async fn slack_webhook_handler(
 
 /// Verify Slack request signature (v0 format)
 fn verify_slack_signature(secret: &str, timestamp: &str, body: &[u8], signature: &str) -> bool {
+    if !timestamp_is_fresh(timestamp) {
+        return false;
+    }
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -1107,6 +1110,31 @@ async fn generic_webhook_handler(
     .into_response()
 }
 
+/// How old a signed webhook request may be.
+///
+/// The signature covers the timestamp, so a captured request stays valid
+/// forever unless its age is checked — this is the only replay defense on
+/// routes that are unauthenticated by design. Five minutes is what Slack
+/// documents (their own retries land within seconds, so this tolerates clock
+/// skew without leaving a useful window).
+const SIGNATURE_MAX_AGE_SECS: u64 = 300;
+
+/// Whether a signed-request timestamp is recent enough to act on.
+///
+/// Rejects a timestamp that is unparseable, older than
+/// [`SIGNATURE_MAX_AGE_SECS`], or far in the future (which a skewed or
+/// hand-crafted header can claim).
+fn timestamp_is_fresh(timestamp: &str) -> bool {
+    let Ok(secs) = timestamp.trim().parse::<i64>() else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let age = now.saturating_sub(secs);
+    // The future bound is looser than the past one: a few seconds of skew in
+    // the other direction is normal.
+    age <= SIGNATURE_MAX_AGE_SECS as i64 && age >= -(SIGNATURE_MAX_AGE_SECS as i64)
+}
+
 /// Verify HMAC-SHA256 signature
 ///
 /// Used by WhatsApp and generic webhooks
@@ -1147,6 +1175,9 @@ fn verify_feishu_signature(
     body: &[u8],
     expected_sig: &str,
 ) -> bool {
+    if !timestamp_is_fresh(timestamp) {
+        return false;
+    }
     use sha2::{Digest, Sha256};
 
     // Feishu signature: SHA256(timestamp + nonce + secret + body)
@@ -1193,7 +1224,7 @@ mod tests {
     #[test]
     fn test_feishu_signature_verification() {
         let secret = "test_secret";
-        let timestamp = "1234567890";
+        let timestamp = &now_timestamp();
         let nonce = "abc123";
         let body = b"test message";
 
@@ -1275,22 +1306,22 @@ mod tests {
     }
 
     fn signed_slack_request(body: &str) -> Request<Body> {
-        const TIMESTAMP: &str = "1234567890";
-        let signature = make_slack_signature("slack_secret", TIMESTAMP, body);
+        let timestamp = now_timestamp();
+        let signature = make_slack_signature("slack_secret", &timestamp, body);
         Request::builder()
             .method("POST")
             .uri("/webhooks/slack")
             .header("content-type", "application/json")
-            .header("x-slack-request-timestamp", TIMESTAMP)
+            .header("x-slack-request-timestamp", &timestamp)
             .header("x-slack-signature", signature)
             .body(Body::from(body.to_string()))
             .unwrap()
     }
 
     fn signed_feishu_request(body: &str) -> Request<Body> {
-        const TIMESTAMP: &str = "1234567890";
+        let timestamp = now_timestamp();
         const NONCE: &str = "nonce-123";
-        let sign_string = format!("{}{}{}{}", TIMESTAMP, NONCE, "feishu_secret", body);
+        let sign_string = format!("{}{}{}{}", timestamp, NONCE, "feishu_secret", body);
         let digest = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -1301,7 +1332,7 @@ mod tests {
             .method("POST")
             .uri("/webhooks/feishu")
             .header("content-type", "application/json")
-            .header("x-lark-request-timestamp", TIMESTAMP)
+            .header("x-lark-request-timestamp", &timestamp)
             .header("x-lark-request-nonce", NONCE)
             .header("x-lark-signature", digest)
             .body(Body::from(body.to_string()))
@@ -1463,6 +1494,58 @@ mod tests {
 
     // ── Slack webhook tests ────────────────────────────────────────────────
 
+    /// The window is the only replay defense on an unauthenticated route, so
+    /// it gets its own tests rather than riding on the handler tests.
+    #[test]
+    fn timestamp_window_rejects_stale_and_future_and_garbage() {
+        let now = chrono::Utc::now().timestamp();
+        assert!(timestamp_is_fresh(&now.to_string()));
+        assert!(
+            timestamp_is_fresh(&(now - SIGNATURE_MAX_AGE_SECS as i64 + 10).to_string()),
+            "just inside the window"
+        );
+        assert!(
+            !timestamp_is_fresh(&(now - SIGNATURE_MAX_AGE_SECS as i64 - 10).to_string()),
+            "just outside the window"
+        );
+        assert!(!timestamp_is_fresh(&"1234567890".to_string()), "a 2009 timestamp is a replay");
+        assert!(!timestamp_is_fresh(&(now + 3600).to_string()), "far future");
+        assert!(!timestamp_is_fresh(""), "empty");
+        assert!(!timestamp_is_fresh("not-a-number"), "garbage");
+    }
+
+    /// End to end: a request that is *correctly signed* but old must still be
+    /// refused — that is the whole point of the window.
+    #[tokio::test]
+    async fn slack_replay_of_an_old_signed_request_is_refused() {
+        let state = std::sync::Arc::new(make_slack_webhook_state_with_secret().await);
+        let app = create_webhook_router(state);
+        let body_str = serde_json::json!({
+            "type": "event_callback",
+            "event": { "type": "message", "user": "U1", "text": "hi", "channel": "C1" }
+        })
+        .to_string();
+        // Correctly signed, but an hour old.
+        let old = (chrono::Utc::now().timestamp() - 3_600).to_string();
+        let signature = make_slack_signature("slack_secret", &old, &body_str);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/slack")
+            .header("content-type", "application/json")
+            .header("x-slack-request-timestamp", old)
+            .header("x-slack-signature", signature)
+            .body(Body::from(body_str))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A signature timestamp of "now" — the freshness window means a fixed
+    /// timestamp from 2009 would fail verification for the wrong reason.
+    fn now_timestamp() -> String {
+        chrono::Utc::now().timestamp().to_string()
+    }
+
     fn make_slack_signature(secret: &str, timestamp: &str, body: &str) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -1611,8 +1694,8 @@ mod tests {
             }
         });
         let body_str = payload.to_string();
-        let timestamp = "1234567890";
-        let signature = make_slack_signature("slack_secret", timestamp, &body_str);
+        let timestamp = now_timestamp();
+        let signature = make_slack_signature("slack_secret", &timestamp, &body_str);
 
         let req = Request::builder()
             .method("POST")
@@ -1647,7 +1730,8 @@ mod tests {
             .method("POST")
             .uri("/webhooks/slack")
             .header("content-type", "application/json")
-            .header("x-slack-request-timestamp", "1234567890")
+            // Fresh, so the refusal is the bad signature — not the age.
+            .header("x-slack-request-timestamp", now_timestamp())
             .header("x-slack-signature", "v0=bad_signature")
             .body(Body::from(body_str))
             .unwrap();
@@ -1737,7 +1821,8 @@ mod tests {
             .method("POST")
             .uri("/webhooks/feishu")
             .header("content-type", "application/json")
-            .header("x-lark-request-timestamp", "1234567890")
+            // Fresh, so the refusal is the bad signature — not the age.
+            .header("x-lark-request-timestamp", now_timestamp())
             .header("x-lark-request-nonce", "nonce-123")
             .header("x-lark-signature", "deadbeef")
             .body(Body::from(payload.to_string()))
