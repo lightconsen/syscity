@@ -154,6 +154,17 @@ pub fn test_config(port: u16, with_provider: bool) -> GatewayConfig {
     let _ = std::fs::remove_file(&db_path);
     config.storage.database_url = Some(format!("sqlite:{}", db_path.display()));
     config.security.auth_mode = AuthMode::None;
+    // The simulator connects as an anonymous local client and exercises
+    // admin-tier commands (`/mcp`, `/debug`) — `commands.execute` routes those
+    // to the admin scope. Anonymous access no longer carries `admin` by
+    // default, so the harness opts in explicitly, which is the documented way
+    // to run a fully-capable local client.
+    config.security.local_scopes = vec![
+        "chat".to_string(),
+        "read".to_string(),
+        "write".to_string(),
+        "admin".to_string(),
+    ];
     config.plugins.enabled = false;
     config.channels.clear();
     config.vector_memory.enabled = false;
