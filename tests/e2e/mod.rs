@@ -581,6 +581,31 @@ impl FrontendSimulator {
         }
     }
 
+    /// Send a raw text frame and read the next `res` frame.
+    ///
+    /// For protocol-abuse tests: the point is what the gateway sends *back* to
+    /// a frame it cannot parse.
+    pub async fn send_raw_and_read_response(&mut self, frame: &str) -> serde_json::Value {
+        self.write
+            .send(Message::Text(frame.to_string()))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(10), async {
+            while let Some(msg) = self.read.next().await {
+                if let Message::Text(text) = msg.unwrap() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if v.get("type").and_then(|t| t.as_str()) == Some("res") {
+                            return v;
+                        }
+                    }
+                }
+            }
+            panic!("connection closed before answering the frame");
+        })
+        .await
+        .expect("timed out waiting for a response to a malformed frame")
+    }
+
     pub async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let req_id = format!("req-{}", uuid::Uuid::new_v4());
         let req = json!({
@@ -862,6 +887,7 @@ mod llm_chat_tests;
 mod mock_chat_tests;
 mod planner_tests;
 mod post_execute_tests;
+mod protocol_tests;
 mod screen_recorder_tests;
 mod session_tests;
 mod skill_catalog_tests;

@@ -319,7 +319,45 @@ async fn handle_websocket(
     let send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                Ok(event) = event_rx.recv() => {
+                recv = event_rx.recv() => {
+                    // A lagged receiver used to fall through the `Ok(event)`
+                    // pattern into `else => break`: the connection closed with
+                    // no explanation, indistinguishable from a network blip.
+                    // Say what happened first, then close — the client's
+                    // reconnect-and-reload is the only sound recovery, but it
+                    // should be able to choose it deliberately.
+                    let event = match recv {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                            let (conn_id, handshaked) = {
+                                let guard = conn_send.read().await;
+                                (guard.conn_id.clone(), guard.handshaked)
+                            };
+                            warn!(
+                                "[{}] Event stream lagged, {} event(s) dropped — closing so the \
+                                 client can resync",
+                                conn_id, missed
+                            );
+                            // Only a handshaked session has a stream to resync:
+                            // before that the client has not been told which one
+                            // it is on, and an event frame ahead of its connect
+                            // response would only be noise.
+                            if handshaked {
+                                let seq = conn_send.write().await.next_seq();
+                                let notice = WsEvent::new(
+                                    "stream.lagged",
+                                    serde_json::json!({ "missed": missed }),
+                                    seq,
+                                );
+                                if let Ok(text) = serde_json::to_string(&notice) {
+                                    let _ = ws_sender.send(Message::Text(text)).await;
+                                }
+                            }
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+
                     let conn_guard = conn_send.read().await;
                     if !conn_guard.handshaked {
                         continue;
@@ -453,6 +491,13 @@ async fn handle_websocket(
                                     }
                                 }
                                 Err(e) => {
+                                    // Pre-handshake the connection has no
+                                    // identity and its first frame is required
+                                    // to be `connect`, so a malformed one ends
+                                    // it. (Post-handshake the frame is answered
+                                    // instead — there the session is worth
+                                    // keeping and the client is waiting on a
+                                    // request.)
                                     let conn_id = conn.read().await.conn_id.clone();
                                     warn!("[{}] Failed to parse frame: {}", conn_id, e);
                                     break false;
@@ -515,6 +560,31 @@ async fn handle_websocket(
                         Err(e) => {
                             let conn_id = conn.read().await.conn_id.clone();
                             warn!("[{}] Failed to parse request: {}", conn_id, e);
+                            // Answer it. The client sent an id and is waiting
+                            // on its own timeout otherwise; the frame is bad,
+                            // not the connection, so keep it open. The id is
+                            // salvaged with a lenient parse so the error can be
+                            // correlated when it is still readable.
+                            let id = serde_json::from_str::<serde_json::Value>(&text)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("id").and_then(|i| i.as_str()).map(String::from)
+                                })
+                                .unwrap_or_default();
+                            let res = WsResponse::err(
+                                id,
+                                "INVALID_JSON",
+                                format!("Malformed request frame: {}", e),
+                            );
+                            let res_text = serde_json::to_string(&res).unwrap_or_default();
+                            if cmd_tx
+                                .send(WsCommand::SendResponse(res_text))
+                                .await
+                                .is_err()
+                            {
+                                warn!("[{}] Failed to send parse-error response", conn_id);
+                                break;
+                            }
                         }
                     }
                 }
