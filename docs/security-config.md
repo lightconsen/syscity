@@ -43,6 +43,27 @@ syscity reload
 > `revision`; `config.set` accepts an optional `base_revision` and rejects
 > stale writes with `REVISION_CONFLICT` (compare-and-swap).
 
+## Deployment model: one principal per gateway
+
+The gateway serves **one principal per process**. Sessions are not isolated
+between connections: any client that can talk to `/ws` and hold `chat`/`read`
+can list every session, read its history, and act on it by id. There is no
+owner column and no per-object authorization, by design — the supported
+deployments are a single local user, or one gateway instance per tenant (see
+`docs/scale.md`), and a check that is dead code in every supported deployment
+would imply an isolation guarantee nothing exercises.
+
+Consequences to plan around:
+
+- Do **not** serve several people from one instance. Run one gateway (or one
+  container) per tenant, with its own `SYSCITY_HOME`.
+- Treat `/ws` reachability as the security boundary. The `auth_mode` guards,
+  the Origin/Host check on the upgrade, and the connection cap all exist to
+  keep that boundary meaningful — see `docs/modules/tui.md` for the client side.
+- If multi-user sharing is ever needed, it is a design change (owner in the
+  session schema, per-handler authorization, a two-principal test matrix), not
+  a configuration flag.
+
 ## Authentication modes
 
 `auth_mode` (enum in `src/gateway/protocol.rs`) selects the strategy:
@@ -147,10 +168,15 @@ Sessions carry scopes that gate WebSocket RPC methods
 | `read` | read-only queries, `acp.list/status/tree` |
 | `write` | task mutation, config writes |
 | `acp` | sub-agent execution |
-| `pairing` | device pairing operations |
+| `pairing` | receives `device.pair.requested` — the event carrying a pairing code. It gates no RPC method of its own. |
 | `admin` | admin/control-plane operations |
 
-Default granted scopes are `chat` + `read`. Admin commands require `admin`.
+Granted scopes come from the credential, never from the request: a client may
+ask for *less* than it is entitled to, never more (`resolve_scopes`). The
+defaults are `chat`+`read`+`write`+`pairing` for anonymous local clients
+(`local_scopes`) and `chat`+`read`+`pairing` for a `shared_token`
+(`shared_token_scopes`) — all configurable. Narrowing a client's scopes is also
+how pairing codes are kept away from it. Admin commands require `admin`.
 
 ## Rate limiting
 
