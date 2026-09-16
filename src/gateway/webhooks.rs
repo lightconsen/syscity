@@ -44,6 +44,79 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 
+/// How long a repeated delivery counts as a replay.
+///
+/// Comfortably longer than any of these platforms' retry schedules and longer
+/// than the 300 s freshness window Slack and Feishu enforce, so a captured
+/// request cannot be replayed at the edge of one check and inside another.
+const REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// How many deliveries are remembered before the oldest are forgotten.
+///
+/// Bounds the memory a public endpoint can be made to hold; an endpoint seeing
+/// this many distinct deliveries inside `REPLAY_WINDOW` is being retried
+/// rather than used.
+const REPLAY_CAPACITY: usize = 4096;
+
+/// Remembers recently seen webhook deliveries so a repeat is not acted on.
+///
+/// A signature proves a delivery came from the platform; it says nothing about
+/// whether the delivery is *new*. Slack and Feishu carry a timestamp checked
+/// against a 300 s window, but WhatsApp's HMAC covers the body only — that
+/// scheme has no timestamp — so a captured delivery can be replayed
+/// indefinitely, and a Slack or Feishu one can be replayed inside its window.
+/// This is the nonce store that closes both.
+///
+/// The key is the SHA-256 of the raw body. Every one of these platforms embeds
+/// a unique id in each delivery (Slack `event_id`, Telegram `update_id`,
+/// Feishu `header.event_id`, WhatsApp message/status id, WeChat `MsgId`), so
+/// two byte-identical bodies inside the window *are* one delivery — which also
+/// means the common case, a platform retry, needs no per-platform payload
+/// parsing to catch.
+#[derive(Debug, Default)]
+struct ReplayGuard {
+    seen: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+}
+
+impl ReplayGuard {
+    /// Record a delivery. `false` means it was already seen inside the window.
+    ///
+    /// Either way the caller answers 200 — the platform should stop retrying —
+    /// but a delivery that is not new must not be processed again.
+    fn first_sighting(&self, body: &[u8]) -> bool {
+        let key = delivery_digest(body);
+        let now = std::time::Instant::now();
+        // A poisoned lock would only mean another request panicked mid-insert;
+        // the map is still consistent, and refusing every webhook afterwards
+        // would be a worse failure than carrying on.
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|_, at| now.duration_since(*at) < REPLAY_WINDOW);
+        if seen.contains_key(&key) {
+            return false;
+        }
+        if seen.len() >= REPLAY_CAPACITY {
+            // Forget the oldest rather than refuse new deliveries: receiving is
+            // the job, and forgetting only widens the window for an attacker
+            // who can already forge signatures.
+            if let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+            {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert(key, now);
+        true
+    }
+}
+
+/// SHA-256 of the raw body, hex-encoded: the replay key.
+fn delivery_digest(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(body))
+}
+
 /// Get or create a session UUID for a platform user
 async fn get_or_create_session(
     sessions: &RwLock<HashMap<String, String>>,
@@ -85,7 +158,11 @@ pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
         get(wechatmp_verify_handler).post(wechatmp_webhook_handler),
     );
 
-    router.with_state(state)
+    // One guard for the process: a delivery is a replay wherever in the router
+    // it arrives.
+    router
+        .layer(axum::Extension(Arc::new(ReplayGuard::default())))
+        .with_state(state)
 }
 
 /// Verify WhatsApp webhook subscription (GET request for verification)
@@ -139,6 +216,7 @@ async fn whatsapp_verify_handler(
 async fn whatsapp_webhook_handler(
     headers: HeaderMap,
     State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
     body: Bytes,
 ) -> impl IntoResponse {
     info!("Received WhatsApp webhook");
@@ -178,6 +256,16 @@ async fn whatsapp_webhook_handler(
     } else {
         warn!("WhatsApp webhook: missing signature");
         return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
+    }
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("WhatsApp webhook: duplicate delivery ignored");
+        return Json(WebhookResponse {
+            success: true,
+            message: "duplicate ignored".to_string(),
+        })
+        .into_response();
     }
 
     // Parse the webhook payload
@@ -349,7 +437,8 @@ struct TelegramChat {
 async fn telegram_webhook_handler(
     Path(token): Path<String>,
     State(state): State<Arc<GatewayState>>,
-    Json(update): Json<TelegramUpdate>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
+    body: Bytes,
 ) -> impl IntoResponse {
     // Verify webhook token from URL path - required for all Telegram webhook
     // channels
@@ -375,6 +464,26 @@ async fn telegram_webhook_handler(
         return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
     }
     debug!("Telegram webhook: token verified");
+
+    // A token in the URL proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("Telegram webhook: duplicate delivery ignored");
+        return Json(WebhookResponse {
+            success: true,
+            message: "duplicate ignored".to_string(),
+        })
+        .into_response();
+    }
+
+    // The body is parsed here rather than by the `Json` extractor so the raw
+    // delivery is available to the replay guard above.
+    let update: TelegramUpdate = match serde_json::from_slice(&body) {
+        Ok(update) => update,
+        Err(e) => {
+            error!("Failed to parse Telegram webhook: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
+        }
+    };
 
     // Process the update
     if let Some(message) = update.message {
@@ -434,6 +543,7 @@ async fn telegram_webhook_handler(
 async fn feishu_webhook_handler(
     headers: HeaderMap,
     State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
     body: Bytes,
 ) -> impl IntoResponse {
     info!("Received Feishu webhook");
@@ -491,6 +601,16 @@ async fn feishu_webhook_handler(
         return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
     }
     debug!("Feishu webhook: signature verified");
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("Feishu webhook: duplicate delivery ignored");
+        return Json(WebhookResponse {
+            success: true,
+            message: "duplicate ignored".to_string(),
+        })
+        .into_response();
+    }
 
     // Parse the payload
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
@@ -653,6 +773,7 @@ async fn wechatmp_verify_handler(
 #[cfg(feature = "wechatmp")]
 async fn wechatmp_webhook_handler(
     State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
     body: Bytes,
 ) -> impl IntoResponse {
     use crate::channels::wechatmp::{
@@ -683,6 +804,12 @@ async fn wechatmp_webhook_handler(
     if expected != envelope.msg_signature {
         warn!("WeChat MP webhook: invalid signature");
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("WeChat MP webhook: duplicate delivery ignored");
+        return StatusCode::OK.into_response();
     }
 
     // Decrypt and parse the inner message.
@@ -796,6 +923,7 @@ async fn wechatmp_webhook_handler(
 async fn slack_webhook_handler(
     headers: HeaderMap,
     State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
     body: Bytes,
 ) -> impl IntoResponse {
     info!("Received Slack webhook");
@@ -837,6 +965,14 @@ async fn slack_webhook_handler(
     } else {
         warn!("Slack webhook: missing signature headers");
         return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
+    }
+
+    // A signature proves where a delivery came from, not that it is new: Slack
+    // retries, and a captured request can be replayed inside the freshness
+    // window.
+    if !replay.first_sighting(&body) {
+        info!("Slack webhook: duplicate delivery ignored");
+        return (StatusCode::OK, "duplicate ignored").into_response();
     }
 
     // Parse payload
@@ -968,6 +1104,7 @@ async fn generic_webhook_handler(
     Path(channel): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
     body: Bytes,
 ) -> impl IntoResponse {
     info!("Received generic webhook for channel: {}", channel);
@@ -1021,6 +1158,12 @@ async fn generic_webhook_handler(
     } else {
         warn!("{} webhook: missing signature", channel);
         return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
+    }
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("{} webhook: duplicate delivery ignored", channel);
+        return (StatusCode::OK, "duplicate ignored").into_response();
     }
 
     // Parse generic JSON payload
@@ -1577,6 +1720,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "slack_challenge_123");
+    }
+
+    /// The guard's own contract: one sighting per distinct delivery.
+    #[test]
+    fn replay_guard_allows_each_delivery_once() {
+        let guard = ReplayGuard::default();
+        assert!(guard.first_sighting(b"{\"id\": 1}"));
+        assert!(!guard.first_sighting(b"{\"id\": 1}"), "the same delivery is not new");
+        assert!(guard.first_sighting(b"{\"id\": 2}"), "a different delivery is");
+        assert!(!guard.first_sighting(b"{\"id\": 2}"));
+    }
+
+    /// A retry is a replay: the platform resends the delivery byte for byte, so
+    /// it is acknowledged (the platform should stop retrying) but not acted on
+    /// twice.
+    #[tokio::test]
+    async fn a_repeated_signed_delivery_is_acknowledged_but_not_reprocessed() {
+        let state = std::sync::Arc::new(make_webhook_state().await);
+        let app = create_webhook_router(state);
+
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "user": "U123456",
+                "text": "Hello bot",
+                "channel": "CABCDEF"
+            }
+        });
+        let body = payload.to_string();
+
+        let first = app
+            .clone()
+            .oneshot(signed_slack_request(&body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+        assert_ne!(first_body.as_ref(), b"duplicate ignored");
+
+        let second = app.oneshot(signed_slack_request(&body)).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "a retry still gets 200, or the platform keeps retrying"
+        );
+        let second_body = axum::body::to_bytes(second.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_body.as_ref(),
+            b"duplicate ignored",
+            "the second delivery must be recognised as a replay"
+        );
     }
 
     #[tokio::test]
