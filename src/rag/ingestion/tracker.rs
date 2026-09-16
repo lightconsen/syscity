@@ -558,3 +558,36 @@ mod tests {
         assert_eq!(IngestionStatus::Stale.as_str(), "stale");
     }
 }
+
+/// Create the `kb_ingestion_log` table if it does not exist (idempotent).
+///
+/// The DDL lives here, beside the only code that reads and writes the table,
+/// so the table and its owner stay together. The unified-database schema init
+/// (`memory::db`) calls this rather than carrying a copy of the definition —
+/// that copy is how the table came to be created by one module and used by
+/// another.
+pub async fn ensure_schema(pool: &Pool<Sqlite>) -> crate::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS kb_ingestion_log (
+            collection TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            checksum TEXT,
+            mtime INTEGER,
+            chunk_count INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'indexed',
+            error TEXT,
+            indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (collection, doc_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| crate::error::SyscityError::Storage {
+        context: "Failed to create kb_ingestion_log table".to_string(),
+        details: e.to_string(),
+    })?;
+    Ok(())
+}

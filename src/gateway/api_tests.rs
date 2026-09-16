@@ -12,30 +12,6 @@ use tower::ServiceExt;
 
 use super::*;
 
-// ── GET /api/v1/config ──
-
-#[tokio::test]
-async fn get_config_returns_json() {
-    let state =
-        Arc::new(crate::gateway::state_tests::make_test_state(GatewayConfig::default()).await);
-    let app = Router::new()
-        .route("/api/v1/config", get(super::get_config_handler))
-        .with_state(state);
-
-    let req = Request::builder()
-        .uri("/api/v1/config")
-        .body(Body::empty())
-        .unwrap();
-    let response = app.oneshot(req).await.unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json.is_object());
-}
-
 // ── GET /ready (not ready by default) ──
 
 #[tokio::test]

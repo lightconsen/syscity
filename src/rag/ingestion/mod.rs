@@ -28,6 +28,10 @@ pub use tracker::{
     list_collections, list_records, mark_stale, upsert_record, CollectionStats, CollectionSummary,
     IngestionRecord, IngestionStatus,
 };
+
+/// Create the ingestion log's table (idempotent). The unified-database schema
+/// init calls this so the table exists before anything reads it.
+pub use tracker::ensure_schema as ensure_tracker_schema;
 pub use watch::{KbWatchEvent, KbWatcher};
 
 use crate::rag::chunk::{EmbeddedChunk, TextChunker};

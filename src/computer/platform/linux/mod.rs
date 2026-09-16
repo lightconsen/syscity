@@ -6,9 +6,9 @@ pub mod log_analyzer;
 pub mod network_diag;
 pub mod notification;
 pub mod package_manager;
-pub mod server_operator;
 pub mod service_manager;
 pub mod system_inspect;
+pub mod system_inspector;
 pub mod user_manager;
 
 pub use cron_manager::CronManagerTool;

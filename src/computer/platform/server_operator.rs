@@ -3,6 +3,12 @@
 //! Orchestrates system inspection, snapshot generation, and LLM-based
 //! diagnosis. Use `LinuxSystemInspector` on Linux or provide your own
 //! `SystemInspector` impl.
+//!
+//! **Not wired up yet.** Nothing constructs a `ServerOperator`, nothing
+//! registers an inspector as a platform tool set, and there are no tests. The
+//! building blocks below an inspector — `SystemInspectTool` — are live and
+//! registered; this layer above them is a design in progress. Say so here so a
+//! reader does not mistake it for a running feature.
 
 use std::sync::Arc;
 

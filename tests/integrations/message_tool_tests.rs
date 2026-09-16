@@ -242,6 +242,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
         update: syscity::gateway::state::UpdateState::new(),
         // Tests control `embedded` explicitly; production captures the env.
         embedded: false,
+        active_ws_connections: std::sync::atomic::AtomicUsize::new(0),
     }
 }
 

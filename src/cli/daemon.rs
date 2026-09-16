@@ -236,9 +236,13 @@ pub async fn run_restart_daemon(
 
 /// Check daemon status
 pub async fn run_daemon_status() -> Result<()> {
+    // Report the endpoint the CLI would actually talk to, not a hardcoded
+    // default — a daemon started with `--port` must not be described as
+    // listening on 18080.
+    let (host, port) = super::ws::endpoint();
     let daemon_config = DaemonConfig {
-        host: "127.0.0.1".to_string(),
-        port: 18080,
+        host,
+        port,
         pid_file: crate::dirs::syscity_dir().join("syscity.pid"),
         remote_control_host: None,
         remote_control_user: None,

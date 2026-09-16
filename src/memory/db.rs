@@ -358,35 +358,12 @@ impl DatabaseStore {
         debug!("Unified schema created");
 
         // --- KB ingestion tracking table ---
-        self.ensure_kb_tables().await?;
+        //
+        // The table belongs to RAG ingestion, which owns its DDL
+        // (`rag::ingestion::tracker::ensure_schema`); the unified-database
+        // schema init is simply the first thing to run, so it asks for it.
+        crate::rag::ingestion::ensure_tracker_schema(&self.pool).await?;
 
-        Ok(())
-    }
-
-    /// Create KB ingestion tracking tables (idempotent).
-    async fn ensure_kb_tables(&self) -> crate::Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS kb_ingestion_log (
-                collection TEXT NOT NULL,
-                doc_id TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                checksum TEXT,
-                mtime INTEGER,
-                chunk_count INTEGER DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'indexed',
-                error TEXT,
-                indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (collection, doc_id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::error::SyscityError::Storage {
-            context: "Failed to create kb_ingestion_log table".to_string(),
-            details: e.to_string(),
-        })?;
         Ok(())
     }
 

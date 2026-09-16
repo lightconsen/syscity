@@ -9,7 +9,9 @@ pub mod update;
 pub mod web_ui;
 pub use admin::*;
 pub use artifacts::*;
-pub use config::*;
+// No `pub use config::*` here: the module now holds only the crate-internal
+// `persist_config_atomic` (the REST config endpoints were replaced by the WS
+// `config.get`/`config.set`), and every caller names it by its full path.
 pub use health::*;
 pub use openai::*;
 pub use web_ui::*;

@@ -3,6 +3,10 @@
 //! This module implements the Channel trait for Lark/Feishu using the ByteDance
 //! Lark Open Platform API. Requires: ByteDance developer account and bot
 //! registration.
+//!
+//! Feishu and Lark are the same platform (China / international branding of one
+//! ByteDance API), so this is the single implementation for both — there is
+//! deliberately no separate `feishu` module to alias it.
 
 use std::collections::HashMap;
 use std::sync::Arc;

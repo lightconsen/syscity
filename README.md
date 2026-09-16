@@ -53,7 +53,7 @@ Your agent runs **locally**: configuration, vector memory, knowledge bases, and 
 
 ### Mobile Apps
 
-Take Syscity with you. The same agent runtime runs natively on **iOS** and **Android** — chat, voice input, camera, location, notifications, and device tools, all talking to your local gateway.
+Take Syscity with you. The same agent runtime runs natively on **iOS** and **Android** — chat, voice input, camera, location and notifications, all talking to your local gateway. Android additionally exposes device tools (screenshots, UI automation, input, app management, pairing); on iOS that surface is smaller — device listing, screenshots and app management — because UI automation there needs WebDriverAgent, which is not implemented yet.
 
 | iOS | Android |
 |---|---|

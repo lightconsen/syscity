@@ -410,8 +410,6 @@ impl SkillManager {
         output
     }
 
-    /// Create a new skill
-
     /// Delete a skill
     pub async fn delete_skill(&mut self, name: &str) -> crate::Result<bool> {
         let skill_dir = self.storage.user_dir().join(name);
