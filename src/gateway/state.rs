@@ -343,4 +343,6 @@ pub struct GatewayState {
     /// from the `SYSCITY_EMBEDDED` env var at construction time; embedded
     /// instances must refuse self-replacement and defer to the desktop updater.
     pub embedded: bool,
+    /// In-flight WebSocket connections to `/ws`, for the connection cap.
+    pub active_ws_connections: std::sync::atomic::AtomicUsize,
 }

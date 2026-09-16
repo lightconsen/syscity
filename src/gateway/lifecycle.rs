@@ -28,6 +28,47 @@ use crate::mcp::McpToolWrapper;
 
 // ── start ────────────────────────────────────────────────────────────
 
+/// Warn about webhook channels that will refuse every request at runtime.
+///
+/// The webhook handlers fail closed (see `src/gateway/webhooks.rs`): a channel
+/// without its verification secret — or, for the pairing-style channels, with
+/// `dm_policy` left open — is a configuration that *looks* enabled but cannot
+/// be verified. This is not a refusal (the runtime does that per request); it
+/// is the loud signal that the operator's first symptom is about to be
+/// "webhooks stopped working".
+fn warn_on_secretless_webhook_channels(config: &GatewayConfig) {
+    for (name, channel) in &config.channels {
+        if !channel.enabled {
+            continue;
+        }
+        // The credential the webhook handler resolves (and now requires).
+        let has_secret = match channel.channel_type {
+            crate::channels::ChannelType::Whatsapp => {
+                channel.credentials.contains_key("app_secret")
+            }
+            crate::channels::ChannelType::Slack => {
+                channel.credentials.contains_key("signing_secret")
+            }
+            crate::channels::ChannelType::Feishu => {
+                // Feishu resolves via the secret store first (runtime check);
+                // the plaintext map is only the legacy fallback, so warn on
+                // its absence but say why it might not matter.
+                channel.credentials.contains_key("webhook_secret")
+                    || channel.credentials.contains_key("secret")
+            }
+            _ => continue,
+        };
+        if has_secret {
+            continue;
+        }
+        warn!(
+            "channel '{name}' ({:?}) is enabled but has no webhook verification secret configured — \
+             every webhook request to it will be refused until one is set",
+            channel.channel_type,
+        );
+    }
+}
+
 /// Start the gateway and all its subsystems.
 pub(crate) async fn start_gateway(
     state: Arc<GatewayState>,
@@ -40,6 +81,12 @@ pub(crate) async fn start_gateway(
     // say so loudly when it is merely risky. This has to happen before the
     // listener exists: the point is to not come up at all.
     crate::gateway::validate_auth_config(&config)?;
+
+    // A webhook channel that does not carry its verification secret will
+    // refuse every request at runtime — the handlers fail closed. Say so at
+    // startup rather than letting the operator learn it from "webhooks stopped
+    // working".
+    warn_on_secretless_webhook_channels(&config);
 
     // ── MCP presets: auto-create mcp.toml with defaults if missing ──
     {

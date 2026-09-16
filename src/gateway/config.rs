@@ -1125,6 +1125,13 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allow_non_loopback_without_auth: bool,
 
+    /// Cap on simultaneous WebSocket connections to `/ws`.
+    ///
+    /// Better to refuse a new connection than to let one more socket claim a
+    /// slot forever. Before this existed there was no bound at all.
+    #[serde(default = "default_max_ws_connections")]
+    pub max_ws_connections: usize,
+
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
     /// Enable security headers
@@ -1254,6 +1261,11 @@ pub fn default_device_scopes() -> Vec<String> {
     default_local_scopes()
 }
 
+/// Default cap on simultaneous WebSocket connections.
+pub fn default_max_ws_connections() -> usize {
+    256
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -1267,6 +1279,7 @@ impl Default for SecurityConfig {
             device_scopes: default_device_scopes(),
             allowed_ws_origins: Vec::new(),
             allow_non_loopback_without_auth: false,
+            max_ws_connections: default_max_ws_connections(),
             rate_limit: RateLimitConfig::default(),
             security_headers: true,
             cors: crate::gateway::auth::CorsConfig::default(),
@@ -1398,13 +1411,20 @@ impl Default for GatewayConfig {
 }
 
 /// Channel-specific configuration
+///
+/// `credentials` and `enabled` default so a channel table can be written
+/// sparsely, matching how [`ChannelConfig::new`] fills them in. `channel_type`
+/// stays required — a channel entry that does not name its type is a mistake
+/// that should fail, not silently become something.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelConfig {
     /// Channel type
     pub channel_type: ChannelType,
     /// Whether channel is enabled
+    #[serde(default = "default_channel_enabled")]
     pub enabled: bool,
     /// Channel-specific credentials/tokens
+    #[serde(default)]
     pub credentials: HashMap<String, String>,
     /// DM policy: open, pairing, or allowlist
     #[serde(default)]
@@ -1420,6 +1440,11 @@ pub struct ChannelConfig {
     pub block_from: Vec<String>,
     /// Agent ID to route to (None = default)
     pub agent_id: Option<String>,
+}
+
+/// Channels default to enabled, matching what `ChannelConfig::new` sets.
+pub fn default_channel_enabled() -> bool {
+    true
 }
 
 impl ChannelConfig {
@@ -1840,6 +1865,23 @@ shared_token = "abc"
         // A genuinely malformed file must still be rejected, so the new
         // leniency does not turn typos into silent defaults.
         assert!(toml::from_str::<GatewayConfig>("port = \"not a number\"").is_err());
+
+        // A channel table can be sparse: the type must not require an entry to
+        // spell out `credentials` and `enabled` (they default like
+        // `ChannelConfig::new` fills them) — but it MUST name its type.
+        let sparse_channel = "[channels.telegram]\nchannel_type = \"telegram\"\n";
+        let parsed: GatewayConfig =
+            toml::from_str(sparse_channel).expect("a sparse channel table must deserialize");
+        let telegram = parsed
+            .channels
+            .get("telegram")
+            .expect("the telegram channel is present");
+        assert!(telegram.enabled, "enabled defaults on like ChannelConfig::new");
+        assert!(telegram.credentials.is_empty(), "credentials default to empty");
+
+        // A channel entry without a type is still rejected — guessing would
+        // silently misroute messages.
+        assert!(toml::from_str::<GatewayConfig>("[channels.ghost]\nenabled = true\n").is_err());
 
         let parsed: GatewayConfig =
             toml::from_str(&toml_str).expect("default config must re-parse");

@@ -593,6 +593,7 @@ impl Gateway {
             },
             update: UpdateState::new(),
             embedded: std::env::var("SYSCITY_EMBEDDED").is_ok(),
+            active_ws_connections: std::sync::atomic::AtomicUsize::new(0),
         });
 
         if let Some(ref store) = state.agents.store {

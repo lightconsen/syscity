@@ -107,14 +107,25 @@ async fn whatsapp_verify_handler(
 
     match (query.hub_mode.as_deref(), query.hub_verify_token) {
         (Some("subscribe"), Some(token)) => {
-            if expected_token.map(|t| t == token).unwrap_or(true) {
-                // Return the challenge
-                if let Some(challenge) = query.hub_challenge {
-                    info!("WhatsApp webhook verified successfully");
-                    return (StatusCode::OK, challenge).into_response();
+            // Fail closed: without a configured verify_token there is nothing
+            // to check the request against, so the challenge must be refused —
+            // not accepted because `expected_token` happened to be None.
+            match expected_token.as_deref() {
+                Some(expected) if expected == token => {
+                    // Return the challenge
+                    if let Some(challenge) = query.hub_challenge {
+                        info!("WhatsApp webhook verified successfully");
+                        return (StatusCode::OK, challenge).into_response();
+                    }
+                }
+                Some(_) => {
+                    warn!("WhatsApp webhook verification failed: invalid token");
+                }
+                None => {
+                    warn!("WhatsApp webhook verification failed: no verify_token configured — \
+                           the webhook cannot be verified and the subscription challenge is refused");
                 }
             }
-            warn!("WhatsApp webhook verification failed: invalid token");
             StatusCode::FORBIDDEN.into_response()
         }
         _ => {
@@ -142,23 +153,31 @@ async fn whatsapp_webhook_handler(
             .cloned()
     };
 
-    // Verify HMAC signature if secret is configured
-    if let Some(secret) = hmac_secret {
-        let signature = headers
-            .get("x-hub-signature-256")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.strip_prefix("sha256=").unwrap_or(s));
-
-        if let Some(sig) = signature {
-            if !verify_hmac_sha256(&secret, &body, sig) {
-                warn!("WhatsApp webhook: invalid HMAC signature");
-                return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
-            }
-            debug!("WhatsApp webhook: HMAC signature verified");
-        } else {
-            warn!("WhatsApp webhook: missing signature");
-            return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
+    // Verify the HMAC signature. The secret is *required*: a WhatsApp webhook
+    // without one would accept unauthenticated POSTs straight into the agent
+    // pipeline. A configured secret with a missing or wrong signature is equally
+    // refused.
+    let secret = match hmac_secret {
+        Some(secret) => secret,
+        None => {
+            warn!("WhatsApp webhook: app_secret is not configured — refusing the request");
+            return (StatusCode::UNAUTHORIZED, "Webhook secret is required").into_response();
         }
+    };
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.strip_prefix("sha256=").unwrap_or(s));
+
+    if let Some(sig) = signature {
+        if !verify_hmac_sha256(&secret, &body, sig) {
+            warn!("WhatsApp webhook: invalid HMAC signature");
+            return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+        }
+        debug!("WhatsApp webhook: HMAC signature verified");
+    } else {
+        warn!("WhatsApp webhook: missing signature");
+        return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
     }
 
     // Parse the webhook payload
@@ -453,15 +472,25 @@ async fn feishu_webhook_handler(
             .map(|v| v.into_inner())
     };
 
-    // Verify signature if secret and headers are present
-    if let (Some(secret), Some(sig), Some(ts), Some(nonce)) = (secret, signature, timestamp, nonce)
-    {
-        if !verify_feishu_signature(&secret, ts, nonce, &body, sig) {
-            warn!("Feishu webhook: invalid signature");
-            return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+    // Verify the signature. Every piece is required: a missing secret or a
+    // missing header means the request cannot be authenticated, which must
+    // refuse it — not let it through by falling out of the `if let`.
+    let (secret, sig, ts, nonce) = match (secret, signature, timestamp, nonce) {
+        (Some(secret), Some(sig), Some(ts), Some(nonce)) => (secret, sig, ts, nonce),
+        _ => {
+            warn!("Feishu webhook: secret or signature headers missing — refusing the request");
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Signature verification requires a configured secret and full signature headers",
+            )
+                .into_response();
         }
-        debug!("Feishu webhook: signature verified");
+    };
+    if !verify_feishu_signature(&secret, ts, nonce, &body, sig) {
+        warn!("Feishu webhook: invalid signature");
+        return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
     }
+    debug!("Feishu webhook: signature verified");
 
     // Parse the payload
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
@@ -781,24 +810,33 @@ async fn slack_webhook_handler(
             .cloned()
     };
 
-    if let Some(secret) = signing_secret {
-        let timestamp = headers
-            .get("x-slack-request-timestamp")
-            .and_then(|v| v.to_str().ok());
-        let signature = headers
-            .get("x-slack-signature")
-            .and_then(|v| v.to_str().ok());
-
-        if let (Some(ts), Some(sig)) = (timestamp, signature) {
-            if !verify_slack_signature(&secret, ts, &body, sig) {
-                warn!("Slack webhook: invalid signature");
-                return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
-            }
-            debug!("Slack webhook: signature verified");
-        } else {
-            warn!("Slack webhook: missing signature headers");
-            return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
+    // The signing secret is required: a Slack webhook without one would accept
+    // unauthenticated POSTs. A configured secret with missing or wrong
+    // signature headers is equally refused.
+    let secret = match signing_secret {
+        Some(secret) => secret,
+        None => {
+            warn!("Slack webhook: signing_secret is not configured — refusing the request");
+            return (StatusCode::UNAUTHORIZED, "Webhook signing secret is required")
+                .into_response();
         }
+    };
+    let timestamp = headers
+        .get("x-slack-request-timestamp")
+        .and_then(|v| v.to_str().ok());
+    let signature = headers
+        .get("x-slack-signature")
+        .and_then(|v| v.to_str().ok());
+
+    if let (Some(ts), Some(sig)) = (timestamp, signature) {
+        if !verify_slack_signature(&secret, ts, &body, sig) {
+            warn!("Slack webhook: invalid signature");
+            return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+        }
+        debug!("Slack webhook: signature verified");
+    } else {
+        warn!("Slack webhook: missing signature headers");
+        return (StatusCode::UNAUTHORIZED, "Missing signature").into_response();
     }
 
     // Parse payload
@@ -1188,6 +1226,10 @@ mod tests {
         whatsapp
             .credentials
             .insert("verify_token".to_string(), "secret123".to_string());
+        // The webhook verification secret the handlers now require.
+        whatsapp
+            .credentials
+            .insert("app_secret".to_string(), "whatsapp_secret".to_string());
         config.channels.insert("whatsapp".to_string(), whatsapp);
 
         let mut telegram =
@@ -1203,7 +1245,10 @@ mod tests {
             .insert("webhook_secret".to_string(), "feishu_secret".to_string());
         config.channels.insert("feishu".to_string(), feishu);
 
-        let slack = crate::gateway::ChannelConfig::new(crate::channels::ChannelType::Slack);
+        let mut slack = crate::gateway::ChannelConfig::new(crate::channels::ChannelType::Slack);
+        slack
+            .credentials
+            .insert("signing_secret".to_string(), "slack_secret".to_string());
         config.channels.insert("slack".to_string(), slack);
 
         let mut disabled =
@@ -1212,6 +1257,55 @@ mod tests {
         config.channels.insert("disabled".to_string(), disabled);
 
         crate::gateway::state_tests::make_test_state(config).await
+    }
+
+    /// A state whose webhook channels are enabled but carry no verification
+    /// secrets — the configuration every fail-closed test is about.
+    async fn make_secretless_webhook_state() -> GatewayState {
+        let mut config = crate::gateway::GatewayConfig::default();
+        for (name, kind) in [
+            ("whatsapp", crate::channels::ChannelType::Whatsapp),
+            ("slack", crate::channels::ChannelType::Slack),
+            ("feishu", crate::channels::ChannelType::Feishu),
+        ] {
+            let channel = crate::gateway::ChannelConfig::new(kind);
+            config.channels.insert(name.to_string(), channel);
+        }
+        crate::gateway::state_tests::make_test_state(config).await
+    }
+
+    fn signed_slack_request(body: &str) -> Request<Body> {
+        const TIMESTAMP: &str = "1234567890";
+        let signature = make_slack_signature("slack_secret", TIMESTAMP, body);
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/slack")
+            .header("content-type", "application/json")
+            .header("x-slack-request-timestamp", TIMESTAMP)
+            .header("x-slack-signature", signature)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn signed_feishu_request(body: &str) -> Request<Body> {
+        const TIMESTAMP: &str = "1234567890";
+        const NONCE: &str = "nonce-123";
+        let sign_string = format!("{}{}{}{}", TIMESTAMP, NONCE, "feishu_secret", body);
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(sign_string.as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/feishu")
+            .header("content-type", "application/json")
+            .header("x-lark-request-timestamp", TIMESTAMP)
+            .header("x-lark-request-nonce", NONCE)
+            .header("x-lark-signature", digest)
+            .body(Body::from(body.to_string()))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1319,12 +1413,7 @@ mod tests {
 
         let payload = serde_json::json!({"challenge": "abc123"});
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/webhooks/feishu")
-            .header("content-type", "application/json")
-            .body(Body::from(payload.to_string()))
-            .unwrap();
+        let req = signed_feishu_request(&payload.to_string());
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1396,12 +1485,7 @@ mod tests {
         });
         let body_str = payload.to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/webhooks/slack")
-            .header("content-type", "application/json")
-            .body(Body::from(body_str))
-            .unwrap();
+        let req = signed_slack_request(&body_str);
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1428,12 +1512,7 @@ mod tests {
         });
         let body_str = payload.to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/webhooks/slack")
-            .header("content-type", "application/json")
-            .body(Body::from(body_str))
-            .unwrap();
+        let req = signed_slack_request(&body_str);
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1455,12 +1534,7 @@ mod tests {
         });
         let body_str = payload.to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/webhooks/slack")
-            .header("content-type", "application/json")
-            .body(Body::from(body_str))
-            .unwrap();
+        let req = signed_slack_request(&body_str);
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1483,12 +1557,7 @@ mod tests {
         });
         let body_str = payload.to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/webhooks/slack")
-            .header("content-type", "application/json")
-            .body(Body::from(body_str))
-            .unwrap();
+        let req = signed_slack_request(&body_str);
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1511,12 +1580,7 @@ mod tests {
         });
         let body_str = payload.to_string();
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/webhooks/slack")
-            .header("content-type", "application/json")
-            .body(Body::from(body_str))
-            .unwrap();
+        let req = signed_slack_request(&body_str);
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1588,6 +1652,96 @@ mod tests {
             .body(Body::from(body_str))
             .unwrap();
 
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    // ── Fail-closed verification (A4) ──────────────────────────────────────
+
+    /// A WhatsApp POST without an app_secret must be refused, not processed —
+    /// this was the unauthenticated message-injection path.
+    #[tokio::test]
+    async fn whatsapp_post_without_secret_is_refused() {
+        let state = std::sync::Arc::new(make_secretless_webhook_state().await);
+        let app = create_webhook_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/whatsapp")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{ "entry": [] }"#))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// WhatsApp's subscription handshake must refuse the challenge when no
+    /// verify_token is configured — accepting it made the URL verifiable by
+    /// anyone who could reach the endpoint.
+    #[tokio::test]
+    async fn whatsapp_verify_without_token_is_refused() {
+        let state = std::sync::Arc::new(make_secretless_webhook_state().await);
+        let app = create_webhook_router(state);
+        let req = Request::builder()
+            .uri(
+                "/webhooks/whatsapp/verify?hub_mode=subscribe&hub_verify_token=anything&\
+                 hub_challenge=identity",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A Slack POST without a signing_secret must be refused.
+    #[tokio::test]
+    async fn slack_post_without_secret_is_refused() {
+        let state = std::sync::Arc::new(make_secretless_webhook_state().await);
+        let app = create_webhook_router(state);
+        let payload = serde_json::json!({
+            "type": "event_callback",
+            "event": { "type": "message", "text": "hi", "channel": "C1" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/slack")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A Feishu POST missing any of the signature pieces must be refused —
+    /// previously a missing header slid the request straight past verification.
+    #[tokio::test]
+    async fn feishu_post_without_signature_headers_is_refused() {
+        let state = std::sync::Arc::new(make_webhook_state().await);
+        let app = create_webhook_router(state);
+        // The state HAS a secret; the request simply omits the headers.
+        let payload = serde_json::json!({ "event": { "type": "message" } });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/feishu")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn feishu_post_with_a_bad_signature_is_refused() {
+        let state = std::sync::Arc::new(make_webhook_state().await);
+        let app = create_webhook_router(state);
+        let payload = serde_json::json!({ "event": { "type": "message" } });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhooks/feishu")
+            .header("content-type", "application/json")
+            .header("x-lark-request-timestamp", "1234567890")
+            .header("x-lark-request-nonce", "nonce-123")
+            .header("x-lark-signature", "deadbeef")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }

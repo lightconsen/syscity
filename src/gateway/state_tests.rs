@@ -256,6 +256,7 @@ pub async fn make_test_state_parts(
         update: UpdateState::new(),
         // Tests control `embedded` explicitly; production captures the env.
         embedded: false,
+        active_ws_connections: std::sync::atomic::AtomicUsize::new(0),
     };
     (state, inbound_entry_rx)
 }

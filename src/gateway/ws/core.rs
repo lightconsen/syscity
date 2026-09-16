@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// Seconds a connection has to complete its `connect` handshake before the
+/// gateway hangs up. Real clients handshake in milliseconds; anything still
+/// quiet after this is wedged or a probe.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+
 /// Middleware: validate WebSocket upgrade credentials before proceeding.
 ///
 /// Runs BEFORE the WebSocket upgrade. When auth_mode is not "none", rejects
@@ -155,7 +160,61 @@ pub async fn ws_handler(
         config.security.auth_mode
     };
 
-    ws.on_upgrade(move |socket| handle_websocket(socket, state, query, auth_mode, auth_result))
+    // Refuse the upgrade outright once the connection cap is reached — a
+    // client that has not even completed its handshake must not hold a slot
+    // forever while others queue behind it.
+    match try_take_connection_slot(&state).await {
+        Some(slot) => ws.on_upgrade(move |socket| {
+            handle_websocket(socket, state, query, auth_mode, auth_result, slot)
+        }),
+        None => {
+            warn!(
+                "WebSocket upgrade refused: connection cap ({}) reached",
+                state.config.read().await.security.max_ws_connections,
+            );
+            const BUSY: &str = "Too many connections";
+            axum::http::Response::builder()
+                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                .body(axum::body::Body::from(BUSY))
+                .unwrap_or_else(|_| axum::http::Response::new(axum::body::Body::from(BUSY)))
+        }
+    }
+}
+
+/// Reserve a slot in the connection cap, holding it if under the limit.
+///
+/// `Some(slot)` means the connection is one of the `max_ws_connections`
+/// allowed, and `slot` carries the counter back down when the connection ends.
+/// `None` means the cap is reached and no slot was taken.
+async fn try_take_connection_slot(state: &Arc<GatewayState>) -> Option<ConnectionSlot> {
+    let current = state
+        .active_ws_connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cap = state.config.read().await.security.max_ws_connections;
+    if current >= cap {
+        state
+            .active_ws_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    Some(ConnectionSlot { state: state.clone() })
+}
+
+/// A connection's slot in the [`GatewayState`]`::active_ws_connections` cap.
+///
+/// The counter is incremented by [`try_take_connection_slot`]; this guard
+/// lives for the whole of [`handle_websocket`] and releases its slot when the
+/// session ends — on every exit path, including a panic.
+struct ConnectionSlot {
+    state: Arc<GatewayState>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.state
+            .active_ws_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 async fn handle_websocket(
@@ -164,9 +223,13 @@ async fn handle_websocket(
     query: WsConnectQuery,
     auth_mode: crate::gateway::protocol::AuthMode,
     auth_result: WsAuthResult,
+    _connection_slot: ConnectionSlot,
 ) {
     let conn_id = Uuid::new_v4().to_string();
     info!("[{}] WebSocket connected", conn_id);
+
+    // `_connection_slot` lives for this whole function: one slot per socket,
+    // taken at the upgrade in `ws_handler`, released when the session ends.
 
     let mut proto_conn = ProtocolConnection::new(conn_id.clone());
     if let Some(sid) = query.session_id {
@@ -264,70 +327,100 @@ async fn handle_websocket(
         .await;
 
     let recv_task = tokio::spawn(async move {
-        let handshake_ok = loop {
-            let msg = ws_receiver.next().await;
+        // A connection that never completes its handshake must not hold a
+        // socket — or a connection-cap slot — forever. A real client sends
+        // `connect` within milliseconds of the upgrade; anything still quiet
+        // after this is either wedged or a probe.
+        let handshake_ok = match tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            async {
+                loop {
+                    let msg = ws_receiver.next().await;
 
-            match msg {
-                Some(Ok(Message::Text(text))) => {
-                    let conn_id = conn.read().await.conn_id.clone();
-                    debug!("[{}] Received: {}", conn_id, text);
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            let conn_id = conn.read().await.conn_id.clone();
+                            debug!("[{}] Received: {}", conn_id, text);
 
-                    match serde_json::from_str::<WsRequest>(&text) {
-                        Ok(req) => {
-                            if req.method == "connect" {
-                                let res = handshake::handle_connect(
-                                    &req,
-                                    &conn,
-                                    &state,
-                                    &auth_mode,
-                                    &cmd_tx,
-                                    &auth_result,
-                                )
-                                .await;
-                                let res_text = serde_json::to_string(&res).unwrap_or_default();
-                                if cmd_tx
-                                    .send(WsCommand::SendResponse(res_text))
-                                    .await
-                                    .is_err()
-                                {
-                                    warn!("[{}] Failed to send handshake response", conn_id);
+                            match serde_json::from_str::<WsRequest>(&text) {
+                                Ok(req) => {
+                                    if req.method == "connect" {
+                                        let res = handshake::handle_connect(
+                                            &req,
+                                            &conn,
+                                            &state,
+                                            &auth_mode,
+                                            &cmd_tx,
+                                            &auth_result,
+                                        )
+                                        .await;
+                                        let res_text =
+                                            serde_json::to_string(&res).unwrap_or_default();
+                                        if cmd_tx
+                                            .send(WsCommand::SendResponse(res_text))
+                                            .await
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                "[{}] Failed to send handshake response",
+                                                conn_id
+                                            );
+                                            break false;
+                                        }
+
+                                        if res.ok {
+                                            conn.write().await.handshaked = true;
+                                            break true;
+                                        } else {
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(1))
+                                                .await;
+                                            break false;
+                                        }
+                                    } else {
+                                        let res = WsResponse::err(
+                                            req.id,
+                                            "INVALID_REQUEST",
+                                            "First message must be connect",
+                                        );
+                                        let res_text =
+                                            serde_json::to_string(&res).unwrap_or_default();
+                                        if cmd_tx
+                                            .send(WsCommand::SendResponse(res_text))
+                                            .await
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                "[{}] Failed to send invalid-request response",
+                                                conn_id
+                                            );
+                                        }
+                                        break false;
+                                    }
+                                }
+                                Err(e) => {
+                                    let conn_id = conn.read().await.conn_id.clone();
+                                    warn!("[{}] Failed to parse frame: {}", conn_id, e);
                                     break false;
                                 }
-
-                                if res.ok {
-                                    conn.write().await.handshaked = true;
-                                    break true;
-                                } else {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                    break false;
-                                }
-                            } else {
-                                let res = WsResponse::err(
-                                    req.id,
-                                    "INVALID_REQUEST",
-                                    "First message must be connect",
-                                );
-                                let res_text = serde_json::to_string(&res).unwrap_or_default();
-                                if cmd_tx
-                                    .send(WsCommand::SendResponse(res_text))
-                                    .await
-                                    .is_err()
-                                {
-                                    warn!("[{}] Failed to send invalid-request response", conn_id);
-                                }
-                                break false;
                             }
                         }
-                        Err(e) => {
-                            let conn_id = conn.read().await.conn_id.clone();
-                            warn!("[{}] Failed to parse frame: {}", conn_id, e);
-                            break false;
-                        }
+                        Some(Ok(Message::Close(_))) | None => break false,
+                        Some(Err(_)) => break false,
+                        _ => {}
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => break false,
-                Some(Err(_)) => break false,
-                _ => {}
+            },
+        )
+        .await
+        {
+            Ok(handshaken) => handshaken,
+            Err(_) => {
+                let conn_id = conn.read().await.conn_id.clone();
+                warn!(
+                    "[{}] Handshake timed out after {}s, disconnecting",
+                    conn_id, HANDSHAKE_TIMEOUT_SECS,
+                );
+                false
             }
         };
 
@@ -846,6 +939,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// One slot per connection is exactly what `max_ws_connections` promises —
+    /// a zero cap takes nothing.
+    #[tokio::test]
+    async fn connection_cap_of_zero_takes_no_slot() {
+        let mut config = GatewayConfig::default();
+        config.security.max_ws_connections = 0;
+        let state = Arc::new(make_test_state(config).await);
+        assert!(
+            try_take_connection_slot(&state).await.is_none(),
+            "a zero cap must refuse the slot"
+        );
+        assert_eq!(
+            state
+                .active_ws_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a refused upgrade must not hold a slot"
+        );
+    }
+
+    /// Up to the cap, every connection gets a slot; past it, none does — and
+    /// the counter tracks the currently-held slots exactly.
+    #[tokio::test]
+    async fn connection_cap_admits_up_to_the_limit() {
+        let mut config = GatewayConfig::default();
+        config.security.max_ws_connections = 2;
+        let state = Arc::new(make_test_state(config).await);
+
+        let slot1 = try_take_connection_slot(&state).await.expect("first fits");
+        let slot2 = try_take_connection_slot(&state).await.expect("second fits");
+        assert!(try_take_connection_slot(&state).await.is_none(), "third is refused");
+        assert_eq!(
+            state
+                .active_ws_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        drop(slot1);
+        assert_eq!(
+            state
+                .active_ws_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "closing a connection frees its slot"
+        );
+        drop(slot2);
+        assert_eq!(
+            state
+                .active_ws_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// The guard releases its slot on drop — the atomic comes back to zero
+    /// even when the connection path ends in a panic (represented here by
+    /// dropping the guard early).
+    #[tokio::test]
+    async fn connection_slot_releases_on_drop() {
+        let config = GatewayConfig::default();
+        let state = Arc::new(make_test_state(config).await);
+        state
+            .active_ws_connections
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let _slot = ConnectionSlot { state: state.clone() };
+        }
+        assert_eq!(
+            state
+                .active_ws_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "dropping the slot must release the counter"
+        );
     }
 
     async fn token_state() -> Arc<GatewayState> {
