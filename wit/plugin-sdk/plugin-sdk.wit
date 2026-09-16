@@ -1,3 +1,12 @@
+// NOTE ON STATUS: this WIT describes a *component-model* plugin ABI and is
+// kept as a forward-looking spec. The runtime (src/plugins/runtime/) loads a
+// *core module* — plugins export plain `extern "C"` symbols, instantiated via
+// `wasmtime::Module`, never `wasmtime::Component`. The two ABIs do not
+// interoperate: nothing in src/ loads this package's worlds. The `wit`
+// feature of `crates/syscity-plugin-sdk` code-generates bindings from this
+// file (so the package is compiled by CI's --all-features), but a deployed
+// plugin today links against the `extern "C"` surface. Do not treat this file
+// as the ABI the runtime instantiates.
 package syscity:plugin-sdk@0.2.0;
 
 /// Core types used across all plugin interfaces

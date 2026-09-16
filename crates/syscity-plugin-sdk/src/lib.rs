@@ -29,6 +29,18 @@
 //! Enable the `wit` feature to use auto-generated bindings from WIT
 //! definitions:
 //!
+//! **> Note — there are two ABIs, and they do not interoperate.** The Syscity
+//! plugin runtime (`src/plugins/runtime/`) loads a *core module*: plugins
+//! export plain `extern "C"` symbols (`call_tool`, `provider_complete`, …), as
+//! shown in the Quick Start above. The `wit` bindings generated here describe a
+//! *component model* ABI that the runtime does not instantiate
+//! (`wasmtime::Module` is used, never `wasmtime::Component`). A plugin written
+//! against `wit_bindings` cannot be loaded by the current runtime, and a
+//! plugin written against the `extern "C"` symbols is not expressible in this
+//! WIT. The bindings compile (they are exercised by CI's `--all-features`)
+//! and are kept for forward compatibility; treat them as a preview of a future
+//! ABI, not as what a deployed plugin links against today.
+//!
 //! ```ignore
 //! // In your plugin's Cargo.toml:
 //! // [dependencies]
