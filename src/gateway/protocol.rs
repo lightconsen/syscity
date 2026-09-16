@@ -4,6 +4,7 @@
 //! Uses req/res/event framing aligned with
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::gateway::GatewayEvent;
 use crate::security::UserId;
@@ -52,14 +53,32 @@ pub struct WsResponse {
     pub error: Option<WsError>,
 }
 
+/// Serialize a frame's payload, reporting the failure rather than dropping it.
+///
+/// The payload field is optional on the wire, so a failure yields a frame with
+/// no payload instead of no frame — but it must not be *silent*: `ok: true`
+/// with nothing in it is indistinguishable, from the caller's side, from a
+/// handler that returned nothing, and this project's rule is that failures are
+/// observable.
+fn payload_or_warn(what: &str, id: &str, payload: &impl Serialize) -> Option<serde_json::Value> {
+    match serde_json::to_value(payload) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            warn!("Failed to serialize payload for {what} '{id}': {e}");
+            None
+        }
+    }
+}
+
 impl WsResponse {
     /// Build a successful response
     pub fn ok(id: impl Into<String>, payload: impl Serialize) -> Self {
+        let id = id.into();
         Self {
             frame_type: "res",
-            id: id.into(),
+            payload: payload_or_warn("response", &id, &payload),
+            id,
             ok: true,
-            payload: serde_json::to_value(payload).ok(),
             error: None,
         }
     }
@@ -98,10 +117,11 @@ pub struct WsEvent {
 impl WsEvent {
     /// Build an event frame
     pub fn new(event: impl Into<String>, payload: impl Serialize, seq: u64) -> Self {
+        let event = event.into();
         Self {
             frame_type: "event",
-            event: event.into(),
-            payload: serde_json::to_value(payload).ok(),
+            payload: payload_or_warn("event", &event, &payload),
+            event,
             seq: Some(seq),
         }
     }
@@ -979,6 +999,32 @@ mod tests {
         assert!(res.ok);
         assert_eq!(res.id, "req_1");
         assert!(res.error.is_none());
+    }
+
+    /// A payload that cannot be serialized is reported and dropped, not
+    /// silently nulled: from the caller's side `ok: true` with no payload in
+    /// it is indistinguishable from a handler that returned nothing.
+    #[test]
+    fn test_unserializable_payload_is_dropped_but_not_silently() {
+        /// A value that refuses to serialize, standing in for whatever a
+        /// handler might return that serde cannot turn into JSON.
+        struct Unserializable;
+
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot be represented as JSON"))
+            }
+        }
+
+        let res = WsResponse::ok("req_1", Unserializable);
+        assert!(res.ok);
+        assert!(res.payload.is_none());
+        assert!(res.error.is_none());
+
+        let event = WsEvent::new("bad.event", Unserializable, 7);
+        assert_eq!(event.event, "bad.event");
+        assert!(event.payload.is_none());
+        assert_eq!(event.seq, Some(7));
     }
 
     #[test]

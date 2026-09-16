@@ -349,8 +349,14 @@ async fn handle_websocket(
                                     serde_json::json!({ "missed": missed }),
                                     seq,
                                 );
-                                if let Ok(text) = serde_json::to_string(&notice) {
-                                    let _ = ws_sender.send(Message::Text(text)).await;
+                                match serde_json::to_string(&notice) {
+                                    Ok(text) => {
+                                        let _ = ws_sender.send(Message::Text(text)).await;
+                                    }
+                                    Err(e) => warn!(
+                                        "[{}] Failed to serialize stream.lagged notice: {}",
+                                        conn_id, e
+                                    ),
                                 }
                             }
                             break;
@@ -383,9 +389,17 @@ async fn handle_websocket(
                             cg.next_seq()
                         };
                         let ws_event = WsEvent::new(event_name, payload, seq);
-                        if let Ok(text) = serde_json::to_string(&ws_event) {
-                            if ws_sender.send(Message::Text(text)).await.is_err() {
-                                break;
+                        match serde_json::to_string(&ws_event) {
+                            Ok(text) => {
+                                if ws_sender.send(Message::Text(text)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            // The event's payload did not serialize; the
+                            // connection is fine, so it stays open and the
+                            // drop is at least on the record.
+                            Err(e) => {
+                                warn!("Failed to serialize '{}' event: {}", ws_event.event, e)
                             }
                         }
                     }
@@ -447,8 +461,7 @@ async fn handle_websocket(
                                             &auth_result,
                                         )
                                         .await;
-                                        let res_text =
-                                            serde_json::to_string(&res).unwrap_or_default();
+                                        let res_text = response_frame(&res);
                                         if cmd_tx
                                             .send(WsCommand::SendResponse(res_text))
                                             .await
@@ -475,8 +488,7 @@ async fn handle_websocket(
                                             "INVALID_REQUEST",
                                             "First message must be connect",
                                         );
-                                        let res_text =
-                                            serde_json::to_string(&res).unwrap_or_default();
+                                        let res_text = response_frame(&res);
                                         if cmd_tx
                                             .send(WsCommand::SendResponse(res_text))
                                             .await
@@ -547,7 +559,7 @@ async fn handle_websocket(
                         Ok(req) => {
                             let res =
                                 dispatch_method(&req, &conn, &state, &cmd_tx, &auth_mode).await;
-                            let res_text = serde_json::to_string(&res).unwrap_or_default();
+                            let res_text = response_frame(&res);
                             if cmd_tx
                                 .send(WsCommand::SendResponse(res_text))
                                 .await
@@ -576,7 +588,7 @@ async fn handle_websocket(
                                 "INVALID_JSON",
                                 format!("Malformed request frame: {}", e),
                             );
-                            let res_text = serde_json::to_string(&res).unwrap_or_default();
+                            let res_text = response_frame(&res);
                             if cmd_tx
                                 .send(WsCommand::SendResponse(res_text))
                                 .await
@@ -627,6 +639,28 @@ async fn handle_websocket(
     task_registry.abort_matching(&conn_task_prefix).await;
 
     info!("[{}] WebSocket session ended", conn_id);
+}
+
+/// Serialize a response frame for the wire, never producing an empty frame.
+///
+/// `WsResponse` is strings and `serde_json::Value`s, so serializing it cannot
+/// actually fail today — but the `unwrap_or_default()` this replaces made the
+/// failure mode an *empty* frame, which a client can neither parse nor act on.
+/// An error frame is the shape that at least names the problem and keeps the
+/// id the caller sent.
+fn response_frame(res: &WsResponse) -> String {
+    if let Ok(text) = serde_json::to_string(res) {
+        return text;
+    }
+    warn!("Failed to serialize response '{}'", res.id);
+    // Built from strings only, so this cannot fail in turn; if it somehow did,
+    // an empty frame is no worse than the one we could not build.
+    serde_json::to_string(&WsResponse::err(
+        res.id.clone(),
+        "INTERNAL_ERROR",
+        "Response could not be serialized",
+    ))
+    .unwrap_or_default()
 }
 
 async fn dispatch_method(
@@ -942,6 +976,25 @@ mod tests {
     use crate::gateway::GatewayConfig;
     use axum::http::StatusCode;
     use tower::ServiceExt;
+
+    /// A frame sent to a client is never empty: an empty frame cannot be
+    /// parsed and is indistinguishable from a protocol bug, which is what the
+    /// `unwrap_or_default()` this replaced would have produced.
+    #[test]
+    fn response_frames_are_never_empty() {
+        let frame = response_frame(&WsResponse::ok("r1", serde_json::json!({"n": 1})));
+        assert!(!frame.is_empty());
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(value["id"], "r1");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["payload"]["n"], 1);
+
+        let err_frame = response_frame(&WsResponse::err("r2", "E", "boom"));
+        let value: serde_json::Value = serde_json::from_str(&err_frame).unwrap();
+        assert_eq!(value["id"], "r2");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "E");
+    }
 
     fn req(id: &str, method: &str, params: Option<serde_json::Value>) -> WsRequest {
         WsRequest {
