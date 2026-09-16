@@ -4,6 +4,7 @@
 //! contract"), the preview panel renders it directly (WYSIWYG), and these
 //! converters turn it into Office files on download.
 //!
+// INVARIANTS-NONE: stateless document converters; own no runtime state.
 //! Contracts per format:
 //! - **Slides** (`slides.rs`): each `<div class="slide">` is a 1280×720 px
 //!   canvas; children use absolute positioning in px. 1 px = 9525 EMU.

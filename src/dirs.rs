@@ -37,6 +37,7 @@
 //! `SYSCITY_HOME` set is byte-for-byte identical to the previous
 //! implementation.
 
+// INVARIANTS-NONE: path resolution + a process-level OnceLock default; OnceLock is the invariant
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 

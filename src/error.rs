@@ -4,6 +4,7 @@
 //! It uses `thiserror` for defining structured errors that can be
 //! easily converted to user-facing messages.
 
+// INVARIANTS-NONE: error type definitions only
 use std::path::PathBuf;
 
 use thiserror::Error;

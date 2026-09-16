@@ -181,19 +181,12 @@ do_full_scan "$PATTERN_SLEEP_LOOP" "$MSG_SLEEP_LOOP"
 # `core::invariants` (see src/core/invariants.rs, surfaced through
 # `syscity invariants`) or carry an explicit `INVARIANTS-NONE:` marker
 # explaining why it holds none. Nothing is silently unchecked.
+# Delegated to a standalone script so CI enforces the same rule; do not
+# duplicate the logic here.
 
-MISSING_INVARIANT_DECLS=''
-for dir in src/*/; do
-    if ! git grep -q -E '(core::invariants|INVARIANTS-NONE:)' -- "$dir" 2>/dev/null; then
-        MISSING_INVARIANT_DECLS="$MISSING_INVARIANT_DECLS $dir"
-    fi
-done
-if [[ -n "$MISSING_INVARIANT_DECLS" ]]; then
-    echo ""
-    echo -e "${RED}ERROR:${RESET} modules without invariant registration or an explicit INVARIANTS-NONE marker:"
-    for m in $MISSING_INVARIANT_DECLS; do
-        echo "  $m"
-    done
+_INVARIANT_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-invariant-decls.sh"
+if ! "$_INVARIANT_CHECK" >/dev/null 2>&1; then
+    "$_INVARIANT_CHECK"
     failures=$((failures + 1))
 fi
 

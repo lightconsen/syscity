@@ -191,3 +191,10 @@ mod tests {
         }
     }
 }
+
+/// Read the catalog cache for invariant checks: `(fetched_at, table)` when a
+/// slot is populated, `None` when it is empty. Exposes the internals rather
+/// than duplicating them, so the check and the cache cannot drift.
+pub async fn catalog_cache_snapshot() -> Option<(std::time::Instant, Arc<CloudModelTable>)> {
+    CACHE.read().await.clone()
+}

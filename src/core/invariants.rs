@@ -97,6 +97,12 @@ pub fn register_builtins() {
     for inv in crate::cron::cron_invariant_checks() {
         register(inv);
     }
+    // Cloud ships behind a feature: its checks register only when the module
+    // exists in this build.
+    #[cfg(feature = "cloud")]
+    for inv in crate::cloud::cloud_invariant_checks() {
+        register(inv);
+    }
 }
 
 /// Snapshot of the currently registered invariant ids/modules.

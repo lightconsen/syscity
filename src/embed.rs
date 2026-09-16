@@ -5,6 +5,7 @@
 //! are read from the filesystem at runtime, which avoids recompiling the Rust
 //! binary on every frontend change during development.
 
+// INVARIANTS-NONE: compiled-in web assets; nothing to check
 #[cfg(feature = "embedded-assets")]
 use rust_embed::Embed;
 

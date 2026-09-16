@@ -79,6 +79,15 @@ jobs:
           chmod +x scripts/static-analysis.sh
           ./scripts/static-analysis.sh
 
+      - name: Run invariant-declaration check
+        # The same rule static-analysis.sh --full enforces, run independently so
+        # its gate cannot silently stop being exercised (--full is red today for
+        # unrelated legacy patterns and CI runs plain static-analysis). A module
+        # with neither registration nor a NONE marker fails the build.
+        run: |
+          chmod +x scripts/check-invariant-decls.sh
+          ./scripts/check-invariant-decls.sh
+
       - name: Gate integrity checks
         run: |
           chmod +x scripts/gate-integrity.sh

@@ -2,6 +2,7 @@
 //!
 //! Provides functionality to view and tail daemon logs.
 
+// INVARIANTS-NONE: log tailing client; owns no state
 use std::path::PathBuf;
 
 use tokio::fs::File;

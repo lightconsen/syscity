@@ -14,6 +14,7 @@
 //! - `assert_eventually`: poll a predicate with backoff until it returns `true`
 //!   or a timeout elapses.
 
+// INVARIANTS-NONE: shipped test utilities; no runtime role
 use std::sync::Arc;
 use std::time::Duration;
 

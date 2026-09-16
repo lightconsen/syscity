@@ -3,6 +3,7 @@
 //! Provides start/stop/status functionality for running Syscity as a background
 //! service.
 
+// INVARIANTS-NONE: process launcher (start/stop); the runtime holds its state
 use std::path::PathBuf;
 
 use tokio::process::Command;
