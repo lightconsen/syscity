@@ -207,51 +207,13 @@ pub async fn run_security_command(command: &SecurityCommands) -> Result<()> {
             // Output based on format
             match format {
                 super::OutputFormat::Json => {
-                    let json = json!({
-                        "timestamp": report.timestamp.duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default().as_secs(),
-                        "score": report.score,
-                        "critical_issues": report.critical_issues.len(),
-                        "warnings": report.warnings.len(),
-                        "recommendations": report.recommendations.len(),
-                        "permissions": {
-                            "total_checks": report.permissions.total_checks,
-                            "passed": report.permissions.passed,
-                            "failed": report.permissions.failed,
-                        },
-                        "tools": {
-                            "total": report.tools.total_tools,
-                            "passing": report.tools.passing,
-                            "failing": report.tools.failing,
-                        },
-                        "data_leaks": {
-                            "checks_performed": report.data_leaks.checks_performed,
-                            "leaks_found": report.data_leaks.leaks_found,
-                        },
-                        "sandbox": {
-                            "enabled": report.sandbox.enabled,
-                            "features": report.sandbox.features.len(),
-                        },
-                        "critical_issues_list": report.critical_issues.iter().map(|i| {
-                            json!({
-                                "category": i.category,
-                                "severity": format!("{:?}", i.severity),
-                                "description": i.description,
-                                "location": i.location,
-                                "recommendation": i.recommendation,
-                            })
-                        }).collect::<Vec<_>>(),
-                        "warnings_list": report.warnings.iter().map(|i| {
-                            json!({
-                                "category": i.category,
-                                "severity": format!("{:?}", i.severity),
-                                "description": i.description,
-                                "location": i.location,
-                            })
-                        }).collect::<Vec<_>>(),
-                        "recommendations": report.recommendations,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    // The payload is built by the report itself so that
+                    // `syscity audit security --format json` cannot drift from
+                    // this one.
+                    match serde_json::to_string_pretty(&report.to_json()) {
+                        Ok(text) => println!("{text}"),
+                        Err(e) => eprintln!("Failed to render JSON: {e}"),
+                    }
                 }
                 super::OutputFormat::Yaml => {
                     println!("Security Audit Report");

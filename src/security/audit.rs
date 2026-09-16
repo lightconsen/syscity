@@ -37,6 +37,65 @@ pub struct SecurityAuditReport {
     pub recommendations: Vec<String>,
 }
 
+impl SecurityAuditReport {
+    /// The report as the machine-readable payload the CLI prints.
+    ///
+    /// One definition for both entry points (`syscity security audit` and
+    /// `syscity audit security`): they run the same audit, and two hand-built
+    /// payloads would drift apart. It carries the issue *lists*, not just their
+    /// counts — a caller asking for JSON wants the findings, not a summary they
+    /// still have to fetch.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": self.timestamp.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs(),
+            "score": self.score,
+            "critical_issues": self.critical_issues.len(),
+            "warnings": self.warnings.len(),
+            "recommendations": self.recommendations.len(),
+            "permissions": {
+                "total_checks": self.permissions.total_checks,
+                "passed": self.permissions.passed,
+                "failed": self.permissions.failed,
+            },
+            "tools": {
+                "total": self.tools.total_tools,
+                "passing": self.tools.passing,
+                "failing": self.tools.failing,
+            },
+            "data_leaks": {
+                "checks_performed": self.data_leaks.checks_performed,
+                "leaks_found": self.data_leaks.leaks_found,
+            },
+            "sandbox": {
+                "enabled": self.sandbox.enabled,
+                "features": self.sandbox.features.len(),
+            },
+            "critical_issues_list": self.critical_issues.iter().map(|i| {
+                serde_json::json!({
+                    "category": i.category,
+                    "severity": format!("{:?}", i.severity),
+                    "description": i.description,
+                    "location": i.location,
+                    "recommendation": i.recommendation,
+                })
+            }).collect::<Vec<_>>(),
+            "warnings_list": self.warnings.iter().map(|i| {
+                serde_json::json!({
+                    "category": i.category,
+                    "severity": format!("{:?}", i.severity),
+                    "description": i.description,
+                    "location": i.location,
+                })
+            }).collect::<Vec<_>>(),
+            // Kept as the array it has always been: `syscity security audit
+            // --format json` already emits it this way, and the count is
+            // derivable while a changed type is not.
+            "recommendations": self.recommendations,
+        })
+    }
+}
+
 /// Permission audit results
 #[derive(Debug, Clone, Default)]
 pub struct PermissionAudit {
