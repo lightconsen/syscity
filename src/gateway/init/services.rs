@@ -315,8 +315,20 @@ pub async fn init_cron(config: &GatewayConfig, state: &Arc<GatewayState>) -> cra
             scheduler.set_schedule_change_tx(schedule_change_tx);
         }
         let event_tx_announce = state.events.tx.clone();
+        // The scheduler keeps `announce_tx` for the life of the process (it is
+        // a field on the scheduler held by `state`), so `recv()` never returns
+        // `None`; without the token this task would be parked until shutdown
+        // aborted it.
+        let announce_shutdown = state.shutdown_token.clone();
         let announce_handle = tokio::spawn(async move {
-            while let Some(delivery) = announce_rx.recv().await {
+            loop {
+                let delivery = tokio::select! {
+                    delivery = announce_rx.recv() => match delivery {
+                        Some(delivery) => delivery,
+                        None => break,
+                    },
+                    _ = announce_shutdown.cancelled() => break,
+                };
                 info!("Cron announce → {}:{}", delivery.channel, delivery.to);
                 match event_tx_announce.send(GatewayEvent::CronAnnounce {
                     channel: delivery.channel,
@@ -351,8 +363,18 @@ pub async fn init_cron(config: &GatewayConfig, state: &Arc<GatewayState>) -> cra
         // the scheduler's `schedule_change_tx` simply stays undrained — zero
         // behaviour change.
         if let Some(bridge) = state.device.bridge.read().await.clone() {
+            // Same shape as `cron:announce`: the scheduler holds
+            // `schedule_change_tx` for the process's life.
+            let wake_shutdown = state.shutdown_token.clone();
             let cron_wake_handle = tokio::spawn(async move {
-                while let Some(jobs) = schedule_change_rx.recv().await {
+                loop {
+                    let jobs = tokio::select! {
+                        jobs = schedule_change_rx.recv() => match jobs {
+                            Some(jobs) => jobs,
+                            None => break,
+                        },
+                        _ = wake_shutdown.cancelled() => break,
+                    };
                     let payload = serde_json::json!({
                         "jobs": jobs.iter().map(|(id, at_ms)| serde_json::json!({
                             "id": id,

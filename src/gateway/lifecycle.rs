@@ -14,6 +14,7 @@ use axum::{
     Router,
 };
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
@@ -189,9 +190,19 @@ pub(crate) async fn start_gateway(
         }
         // Start hot reload processing in background
         let hot_reload_clone = hot_reload.clone();
+        let hot_reload_shutdown = shutdown_token.clone();
         let hot_reload_handle = tokio::spawn(async move {
-            if let Err(e) = hot_reload_clone.run().await {
-                error!("Hot reload error: {}", e);
+            // `run()` parks on the file-watcher's channel, and the watcher
+            // holds the sender for the life of the process, so it never
+            // returns on its own — without the token this task would sit there
+            // until shutdown aborted it.
+            tokio::select! {
+                res = hot_reload_clone.run() => {
+                    if let Err(e) = res {
+                        error!("Hot reload error: {}", e);
+                    }
+                }
+                _ = hot_reload_shutdown.cancelled() => {}
             }
         });
         state
@@ -861,6 +872,133 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
+    /// A task that is winding down gets to finish what it was writing.
+    ///
+    /// The token is cancelled at the top of `stop_gateway`, but a task holding
+    /// an in-flight write only finishes a moment later. Aborting the instant
+    /// the token flips would truncate that write.
+    #[tokio::test]
+    async fn stop_gateway_drains_tasks_that_are_winding_down() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let state = state().await;
+        let wrote = Arc::new(AtomicBool::new(false));
+        let shutdown = state.shutdown_token.clone();
+        let wrote_task = wrote.clone();
+        let handle = tokio::spawn(async move {
+            shutdown.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            wrote_task.store(true, Ordering::SeqCst);
+        });
+        state.task_registry.insert_join("writer", handle).await;
+
+        stop_gateway(&state.shutdown_token, &state).await.unwrap();
+
+        assert!(
+            wrote.load(Ordering::SeqCst),
+            "the drain must let a task finish the write it is in the middle of"
+        );
+    }
+
+    /// A task that never notices the shutdown token is aborted, but only after
+    /// it has had the window — and either way shutdown returns.
+    #[tokio::test]
+    async fn stop_gateway_aborts_tasks_that_ignore_the_shutdown_token() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let state = state().await;
+        let finished = Arc::new(AtomicBool::new(false));
+        // Held open for the whole test: the task below must stay parked, not
+        // finish on its own.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let finished_task = finished.clone();
+        let handle = tokio::spawn(async move {
+            let _dropped = OnDrop(finished_task);
+            let _ = rx.await;
+        });
+        state.task_registry.insert_join("stuck", handle).await;
+
+        let started = tokio::time::Instant::now();
+        stop_gateway(&state.shutdown_token, &state).await.unwrap();
+
+        assert!(
+            started.elapsed() >= BACKGROUND_DRAIN_TIMEOUT,
+            "the task should have been given the drain window before being aborted"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "a task that ignores shutdown must still be aborted, not left running"
+        );
+    }
+
+    /// A connection pump is not a unit of work: its peer may never leave, so
+    /// shutdown aborts it rather than spending its window waiting.
+    #[tokio::test]
+    async fn stop_gateway_does_not_wait_on_socket_lifetime_tasks() {
+        let state = state().await;
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        state
+            .task_registry
+            .insert_join("ws:conn:test:recv", handle)
+            .await;
+
+        let started = tokio::time::Instant::now();
+        stop_gateway(&state.shutdown_token, &state).await.unwrap();
+
+        assert!(
+            started.elapsed() < BACKGROUND_DRAIN_TIMEOUT,
+            "a socket-lifetime task must not consume the drain window"
+        );
+        assert!(is_socket_lifetime_task("ws:conn:1:send"));
+        assert!(is_socket_lifetime_task("openai:sse:abc"));
+        assert!(!is_socket_lifetime_task("hooks:after:x:0"));
+    }
+
+    /// The task driving a shutdown is running *this* function, so it can never
+    /// be awaited and must not be aborted either: `/restart` reaches its
+    /// `process::exit` on the far side of the await.
+    #[tokio::test]
+    async fn stop_gateway_leaves_the_task_running_it_detached() {
+        let state = state().await;
+        let state_for_task = state.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            // Let the registry take the handle first, so this task really is
+            // one of the tasks shutdown has to decide about.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop_gateway(&state_for_task.shutdown_token, &state_for_task)
+                .await
+                .unwrap();
+            // Surviving another yield is the assertion: an abort would have
+            // landed at one of these await points.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = done_tx.send(());
+        });
+        state
+            .task_registry
+            .insert_join("system:restart", task)
+            .await;
+
+        timeout(Duration::from_secs(30), done_rx)
+            .await
+            .expect("shutdown cancelled the task that is running it")
+            .expect("the restart task was dropped before it could finish");
+    }
+
     #[tokio::test]
     async fn init_mcp_servers_empty_config_noop() {
         let state = state().await;
@@ -1051,11 +1189,85 @@ pub(crate) async fn stop_gateway(
         }
     }
 
-    // 12. Abort remaining background tasks (includes followup timers now that they
-    //     live in the unified registry).
-    let background_handles = state.task_registry.take_all().await;
-    for (_name, handle) in background_handles {
-        handle.abort();
+    // 12. Stop what is left in the registry (includes followup timers now that
+    //     they live in the unified registry).
+    //
+    //     Two kinds of task are still here. A writer with a short life left —
+    //     a hook running, an audit row being inserted, a retention sweep
+    //     mid-delete — has already seen `shutdown_token.cancel()` at the top of
+    //     this function, so give it a bounded window to land that write rather
+    //     than cutting it off at its next await point. A task whose lifetime is
+    //     a client's socket ends when the peer goes away, which is not
+    //     something shutdown can wait for; waiting on those would only ever
+    //     burn the whole window and then report a healthy connection as a
+    //     straggler, so they are aborted outright.
+    let current_task = tokio::task::try_id();
+    let mut draining: Vec<(String, JoinHandle<()>)> = Vec::new();
+    let mut aborted: Vec<String> = Vec::new();
+    for (name, task) in state.task_registry.take_all().await {
+        let handle = match task {
+            Task::Join(handle) => handle,
+            Task::Abort(handle) => {
+                handle.abort();
+                aborted.push(name);
+                continue;
+            }
+        };
+        if Some(handle.id()) == current_task {
+            // A restart task *is* the caller of this function: it cannot
+            // finish while these lines run, and aborting it would cancel the
+            // very future that reaches its `process::exit`. Leave it detached
+            // to unwind on its own.
+            info!("Shutdown is running inside task '{}'; leaving it detached", name);
+        } else if is_socket_lifetime_task(&name) {
+            handle.abort();
+            aborted.push(name);
+        } else {
+            draining.push((name, handle));
+        }
+    }
+
+    if !aborted.is_empty() {
+        // Handle-only entries cannot be awaited by design, and a socket task
+        // cannot be waited for; both are aborted outright.
+        debug!("Aborted {} task(s) at shutdown: {}", aborted.len(), aborted.join(", "));
+    }
+
+    let drain = futures::future::join_all(draining.iter_mut().map(|(_, handle)| handle));
+    match timeout(BACKGROUND_DRAIN_TIMEOUT, drain).await {
+        Ok(results) => {
+            for (result, (name, _)) in results.iter().zip(&draining) {
+                if let Err(e) = result {
+                    if e.is_panic() {
+                        warn!("Background task '{}' panicked during shutdown: {}", name, e);
+                    }
+                }
+            }
+            info!("Drained {} background task(s)", draining.len());
+        }
+        Err(_) => {
+            // A task that ignores the shutdown token, or is stuck somewhere
+            // cancellation cannot reach, must not hold the process open.
+            let mut stuck = Vec::new();
+            for (name, handle) in &draining {
+                if !handle.is_finished() {
+                    handle.abort();
+                    stuck.push(name.as_str());
+                }
+            }
+            if stuck.is_empty() {
+                // The window closed on the same poll that finished the last
+                // task; nothing was actually cut short.
+                info!("Drained {} background task(s)", draining.len());
+            } else {
+                warn!(
+                    "{} background task(s) did not stop within {:?} and were aborted: {}",
+                    stuck.len(),
+                    BACKGROUND_DRAIN_TIMEOUT,
+                    stuck.join(", ")
+                );
+            }
+        }
     }
 
     // 13. Plugin manager shutdown.
@@ -1063,10 +1275,44 @@ pub(crate) async fn stop_gateway(
         warn!("Failed to shutdown plugin manager: {}", e);
     }
 
-    // 14. Storage is left to flush on process exit.
+    // 14. Flush durable state, rather than leaving it to process exit — the
+    //     `/restart` path ends in `std::process::exit`, which runs no
+    //     destructors at all.
+    //
+    //     This is why the close comes after the drain and not before:
+    //     `SqlitePool::close()` waits for every checked-out connection to be
+    //     returned, so closing while a tracked task is still mid-query blocks
+    //     here instead of flushing.
+    match timeout(STORAGE_CLOSE_TIMEOUT, state.infra.storage.read().await.close()).await {
+        Ok(Ok(())) => info!("Storage flushed and closed"),
+        Ok(Err(e)) => warn!("Failed to close storage at shutdown: {}", e),
+        Err(_) => warn!("Storage did not close within {:?}", STORAGE_CLOSE_TIMEOUT),
+    }
+
     info!("Gateway shutdown complete");
     Ok(())
 }
+
+/// Tasks whose lifetime is a client's socket rather than a unit of work.
+///
+/// The registry holds tasks for the gateway's own loops and for per-connection
+/// pumps alike, but only the former can be waited for: a socket task ends when
+/// its peer goes away, so [`stop_gateway`] aborts these instead of spending its
+/// drain window on them.
+fn is_socket_lifetime_task(name: &str) -> bool {
+    name.starts_with("ws:") || name.starts_with("openai:sse:")
+}
+
+/// How long [`stop_gateway`] waits for the tasks left in the registry to finish
+/// what they were writing before aborting them.
+#[cfg(not(test))]
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// How long [`stop_gateway`] waits for the storage backend to release its
+/// connection pool.
+const STORAGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── build_router ─────────────────────────────────────────────────────
 

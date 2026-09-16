@@ -106,6 +106,21 @@ pub trait Storage: Send + Sync {
     ) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
     }
+
+    /// Release backend resources at shutdown.
+    ///
+    /// Default implementation does nothing: there is nothing to release for a
+    /// store that owns no connection. [`SqliteStorage`] overrides it to close
+    /// the connection pool, which is what checkpoints the WAL — every
+    /// sqlite-backed store (sessions, memory, auth, audit) holds a clone of
+    /// that same pool, so closing it through any one of them closes them all.
+    ///
+    /// Callers must have stopped writing first: [`sqlx::Pool::close`] waits for
+    /// every checked-out connection to come back, so calling it while a task is
+    /// mid-query blocks instead of flushing.
+    async fn close(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /// In-memory storage implementation
@@ -511,6 +526,13 @@ impl SqliteStorage {
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    /// Close the shared pool: checkpoints the WAL and releases the database
+    /// file, so shutdown does not have to rely on process exit for it.
+    async fn close(&self) -> Result<(), StorageError> {
+        self.pool.close().await;
+        Ok(())
+    }
+
     async fn get(&self, id: Id) -> Result<Entity, StorageError> {
         let row = sqlx::query("SELECT * FROM entities WHERE id = ?1")
             .bind(id.to_string())
@@ -819,6 +841,26 @@ mod tests {
     fn test_in_memory_storage_default() {
         let storage: InMemoryStorage = Default::default();
         assert_eq!(storage.max_size, 10_000);
+    }
+
+    /// `close()` is what flushes the shared pool at shutdown, so it has to
+    /// really close it — a no-op would leave the checkpoint to process exit.
+    #[tokio::test]
+    async fn test_sqlite_storage_close_releases_the_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        // sqlx will not create the file itself (the gateway creates it before
+        // connecting, see `init_storage`).
+        let db_path = tmp.path().join("close.db");
+        std::fs::File::create(&db_path).unwrap();
+        let url = format!("sqlite:///{}", db_path.display());
+        let storage = SqliteStorage::connect(&url).await.unwrap();
+
+        assert!(storage.count().await.is_ok(), "usable before close");
+        storage.close().await.unwrap();
+        assert!(
+            storage.count().await.is_err(),
+            "close() must release the pool, not just empty it"
+        );
     }
 
     #[tokio::test]
