@@ -36,6 +36,116 @@ pub struct DaemonConfig {
     pub nocloud: bool,
 }
 
+/// The `config.toml` written on first start.
+///
+/// Every key here is one `GatewayConfig` actually reads, and the top-level
+/// keys come first because TOML attaches a bare key to the table above it. The
+/// file used to disagree with the schema in four places — `[model]` and
+/// `[server]` as tables over scalar fields (which made the whole document fail
+/// to parse, so the daemon silently ran on defaults), `connection` (the field
+/// is `database_url`), and `workspace_only` sitting inside `[cost_guard]` —
+/// and `#[serde(default)]` on the structs means a key the schema does not know
+/// is dropped without a word. `default_config_toml_round_trips` is what keeps
+/// that from happening again.
+pub const DEFAULT_CONFIG_TOML: &str = r#"# Syscity Configuration
+# Auto-generated on first start
+
+# ── Server ────────────────────────────────────────────────────────────
+host = "127.0.0.1"
+port = 18080
+
+# ── Model ─────────────────────────────────────────────────────────────
+model = "claude-3-sonnet-20240229"
+model_provider = "anthropic"
+
+# ── Workspace ─────────────────────────────────────────────────────────
+# Restrict file operations to this directory. Without `workspace_dir` the
+# default is ~/.syscity/workspace.
+# workspace_dir = "~/projects"
+workspace_only = true
+
+[security]
+enabled = true
+auth_required = false
+pairing_required = false
+auth_mode = "none"
+shared_token = ""
+security_headers = true
+# Credential precedence: "env_first" (env overrides config) or "config_first" (config overrides env)
+# credential_precedence = "env_first"
+
+[security.rate_limit]
+enabled = true
+capacity = 100
+refill_rate = 10
+
+[storage]
+storage_type = "sqlite"
+# database_url = "sqlite:///path/to/syscity.db"
+
+[acp]
+enabled = true
+max_subagents = 10
+default_timeout_seconds = 300
+
+[cron]
+enabled = true
+check_interval_seconds = 60
+
+[plugins]
+enabled = true
+auto_load = true
+
+[hot_reload]
+enabled = true
+watch_config = true
+watch_agents = true
+watch_plugins = true
+debounce_seconds = 2
+
+[cost_guard]
+daily_limit_cents = 0
+hourly_action_limit = 0
+"#;
+
+/// A `config.toml` template that does not parse is worse than none: the daemon
+/// warns once and runs on defaults, so every setting in the file looks applied
+/// and is not.
+#[cfg(test)]
+mod default_config_tests {
+    use super::DEFAULT_CONFIG_TOML;
+    use crate::gateway::GatewayConfig;
+
+    #[test]
+    fn default_config_toml_round_trips() {
+        let config: GatewayConfig = toml::from_str(DEFAULT_CONFIG_TOML)
+            .expect("the generated config.toml must parse as a GatewayConfig");
+
+        // Parsing is not enough — the point is that these values take effect
+        // rather than landing in a table the schema never reads.
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 18080);
+        assert_eq!(config.model, "claude-3-sonnet-20240229");
+        assert_eq!(config.model_provider, "anthropic");
+        assert!(config.workspace_only);
+        assert_eq!(config.storage.storage_type, "sqlite");
+        assert!(config.security.enabled);
+        assert_eq!(config.security.rate_limit.capacity, 100);
+        assert!(config.cron.enabled);
+        assert!(config.plugins.auto_load);
+        assert_eq!(config.hot_reload.debounce_seconds, 2);
+
+        // `workspace_only` defaults to true, so asserting it here would pass
+        // even if the key were landing in a table nothing reads (which it was:
+        // it sat under `[cost_guard]`). Flipping it in the template has to
+        // flip it here.
+        let flipped =
+            DEFAULT_CONFIG_TOML.replace("workspace_only = true", "workspace_only = false");
+        let config: GatewayConfig = toml::from_str(&flipped).unwrap();
+        assert!(!config.workspace_only, "workspace_only must be read from the top level");
+    }
+}
+
 /// Daemon manager
 pub struct DaemonManager {
     config: DaemonConfig,
@@ -365,66 +475,7 @@ impl DaemonManager {
 
         if !config_path.exists() {
             println!("📄 Creating default config.toml at {:?}...", config_path);
-            let default_config = r#"# Syscity Configuration
-# Auto-generated on first start
-
-[server]
-host = "127.0.0.1"
-port = 18080
-
-[security]
-enabled = true
-auth_required = false
-pairing_required = false
-auth_mode = "none"
-shared_token = ""
-security_headers = true
-# Credential precedence: "env_first" (env overrides config) or "config_first" (config overrides env)
-# credential_precedence = "env_first"
-
-[security.rate_limit]
-enabled = true
-capacity = 100
-refill_rate = 10
-
-[model]
-model = "claude-3-sonnet-20240229"
-model_provider = "anthropic"
-
-[storage]
-storage_type = "sqlite"
-connection = ""
-
-[acp]
-enabled = true
-max_subagents = 10
-default_timeout_seconds = 300
-
-[cron]
-enabled = true
-check_interval_seconds = 60
-
-[plugins]
-enabled = true
-auto_load = true
-
-[hot_reload]
-enabled = true
-watch_config = true
-watch_agents = true
-watch_plugins = true
-debounce_seconds = 2
-
-[cost_guard]
-daily_limit_cents = 0
-hourly_action_limit = 0
-
-# Workspace settings (restrict file operations to this directory)
-# When workspace_dir is not set, it defaults to ~/.syscity/workspace
-# workspace_dir = "~/projects"
-workspace_only = true
-"#;
-            tokio::fs::write(&config_path, default_config)
+            tokio::fs::write(&config_path, DEFAULT_CONFIG_TOML)
                 .await
                 .map_err(crate::error::SyscityError::Io)?;
             println!("✅ Default config created. Edit {:?} to customize.", config_path);
@@ -447,7 +498,13 @@ workspace_only = true
                             config
                         }
                         Err(e) => {
-                            warn!("Failed to parse config.toml: {}, using defaults", e);
+                            // Spell out the consequence: a config that does not
+                            // parse is not "mostly applied" — nothing in it is.
+                            warn!(
+                                "Failed to parse {:?}: {}. No setting from that file is in \
+                                 effect; running on defaults.",
+                                config_path, e
+                            );
                             let mut default_config = GatewayConfig::default();
                             // Attempt to extract [search] section separately, since the
                             // config.toml uses [server] section format that doesn't
