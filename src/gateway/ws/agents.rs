@@ -270,6 +270,12 @@ pub(crate) async fn handle_agents_memory_get(
         Ok(p) => p,
         Err(res) => return res,
     };
+    // `agent_id` comes from the caller and is about to become a path: refuse
+    // anything that would walk out of the agents directory. Two of these four
+    // handlers write (`memory.clear`, `import`).
+    if let Err(msg) = validate_agent_id(&params.agent_id) {
+        return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
+    }
     let dir = state.paths.agents_dir().join(&params.agent_id);
     let path = dir.join("MEMORY.md");
     let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
@@ -289,6 +295,12 @@ pub(crate) async fn handle_agents_memory_clear(
         Ok(p) => p,
         Err(res) => return res,
     };
+    // `agent_id` comes from the caller and is about to become a path: refuse
+    // anything that would walk out of the agents directory. Two of these four
+    // handlers write (`memory.clear`, `import`).
+    if let Err(msg) = validate_agent_id(&params.agent_id) {
+        return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
+    }
     let dir = state.paths.agents_dir().join(&params.agent_id);
     match tokio::fs::create_dir_all(&dir).await {
         Ok(()) => {}
@@ -320,6 +332,12 @@ pub(crate) async fn handle_agents_export(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
+    // `agent_id` comes from the caller and is about to become a path: refuse
+    // anything that would walk out of the agents directory. Two of these four
+    // handlers write (`memory.clear`, `import`).
+    if let Err(msg) = validate_agent_id(&params.agent_id) {
+        return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
+    }
     let dir = state.paths.agents_dir().join(&params.agent_id);
     const MD_FILES: &[&str] = &[
         "PERSONALITY.md",
@@ -356,6 +374,12 @@ pub(crate) async fn handle_agents_import(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
+    // `agent_id` comes from the caller and is about to become a path: refuse
+    // anything that would walk out of the agents directory. Two of these four
+    // handlers write (`memory.clear`, `import`).
+    if let Err(msg) = validate_agent_id(&params.agent_id) {
+        return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
+    }
     let dir = state.paths.agents_dir().join(&params.agent_id);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return WsResponse::err(&req.id, "INTERNAL", format!("Failed to create agent dir: {}", e));
@@ -479,6 +503,54 @@ mod tests {
         let payload = resp.payload.unwrap();
         let t = payload["config"]["temperature"].as_f64().unwrap();
         assert!((t - 0.3).abs() < 1e-6, "effective temperature {t} should be ~0.3");
+    }
+
+    /// `agent_id` becomes a path: a traversal must be refused before the join,
+    /// not left to the filesystem.
+    #[tokio::test]
+    async fn agents_memory_get_rejects_path_traversal() {
+        let state = state().await;
+        for id in ["../../etc", "a/b", "..", ".hidden", ""] {
+            let resp = handle_agents_memory_get(
+                &req("r1", Some(serde_json::json!({ "agent_id": id }))),
+                &state,
+            )
+            .await;
+            assert!(!resp.ok, "agent_id {id:?} must be refused");
+            assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS", "agent_id {id:?}");
+        }
+    }
+
+    /// The check is about path shape only — the built-in default agent is a
+    /// legitimate target for reading and export, even though the mutating
+    /// handlers refuse it.
+    #[tokio::test]
+    async fn agents_memory_get_allows_the_default_agent() {
+        let state = state().await;
+        let resp = handle_agents_memory_get(
+            &req("r1", Some(serde_json::json!({ "agent_id": "default" }))),
+            &state,
+        )
+        .await;
+        assert!(resp.ok, "the default agent must remain readable: {:?}", resp.error);
+    }
+
+    #[tokio::test]
+    async fn agents_import_rejects_path_traversal() {
+        let state = state().await;
+        let resp = handle_agents_import(
+            &req(
+                "r1",
+                Some(serde_json::json!({
+                    "agent_id": "../../escape",
+                    "files": { "SOUL.md": "x" }
+                })),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]

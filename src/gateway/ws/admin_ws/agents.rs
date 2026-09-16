@@ -16,17 +16,16 @@ const MAX_DISPLAY_NAME_LEN: usize = 120;
 /// skin-tone modifiers), so this is looser than a single char.
 const MAX_EMOJI_LEN: usize = 32;
 
-/// Reject agent ids that would escape `agents_dir()` or name the built-in
+/// Reject agent ids that would escape `agents_dir()` *and* the built-in
 /// default agent — the two ways a rename/delete could reach outside its lane.
-fn validate_agent_id(id: &str) -> Result<(), &'static str> {
-    if id.is_empty() {
-        return Err("agent id is required");
-    }
+///
+/// The path-shape half is shared with every other handler that joins an
+/// `agent_id` into a path; the default-agent refusal is specific to the
+/// mutating handlers (reading or exporting the default agent is legitimate).
+fn validate_mutable_agent_id(id: &str) -> Result<(), &'static str> {
+    crate::gateway::ws::validate_agent_id(id)?;
     if id == "default" {
         return Err("the default agent cannot be renamed or deleted");
-    }
-    if id.contains('/') || id.contains('\\') || id.contains("..") || id.starts_with('.') {
-        return Err("agent id must not contain path separators");
     }
     Ok(())
 }
@@ -124,7 +123,7 @@ pub(crate) async fn handle_agents_purge(req: &WsRequest, state: &Arc<GatewayStat
         Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
         Err(res) => return res,
     };
-    if let Err(msg) = validate_agent_id(&id) {
+    if let Err(msg) = validate_mutable_agent_id(&id) {
         return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
     }
 
@@ -209,7 +208,7 @@ pub(crate) async fn handle_agents_rename(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
-    if let Err(msg) = validate_agent_id(&params.agent_id) {
+    if let Err(msg) = validate_mutable_agent_id(&params.agent_id) {
         return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
     }
 

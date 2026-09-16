@@ -136,6 +136,23 @@ async fn persist_config(state: &Arc<GatewayState>) -> Result<(), WsResponse> {
     Ok(())
 }
 
+/// Reject an agent id that would escape the agents directory.
+///
+/// Every handler that turns a caller-supplied `agent_id` into a path must run
+/// it through here first: `agents_dir().join(id)` walks straight out of the
+/// directory for `..`, a separator, or an absolute path, and `import` /
+/// `memory.clear` write. Handlers that must also refuse the built-in default
+/// agent layer that check on top.
+pub(crate) fn validate_agent_id(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("agent id is required");
+    }
+    if id.contains('/') || id.contains('\\') || id.contains("..") || id.starts_with('.') {
+        return Err("agent id must not contain path separators");
+    }
+    Ok(())
+}
+
 mod acp;
 mod admin_ws;
 mod agents;
@@ -548,5 +565,24 @@ mod tests {
         let res = device_ws::handle_device_adb_pair(&req, &state).await;
         assert!(!res.ok);
         assert_eq!(res.error.as_ref().unwrap().code, "UNSUPPORTED_PLATFORM");
+    }
+}
+
+#[cfg(test)]
+mod validate_agent_id_tests {
+    use super::validate_agent_id;
+
+    #[test]
+    fn rejects_ids_that_would_escape_the_agents_directory() {
+        for id in ["", "..", "../x", "a/b", "a\\b", ".hidden"] {
+            assert!(validate_agent_id(id).is_err(), "{id:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_agent_ids() {
+        for id in ["default", "secretary_xiaoming", "agent-1234", "中文小花"] {
+            assert!(validate_agent_id(id).is_ok(), "{id:?} must be accepted");
+        }
     }
 }
