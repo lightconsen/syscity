@@ -177,7 +177,38 @@ fn resolve_artifact_path(paths: &SyscityPaths, path: &str) -> Option<std::path::
         (paths.artifacts_dir(), path)
     };
 
-    Some(root.join(std::path::Path::new(rel)))
+    let full = root.join(std::path::Path::new(rel));
+
+    // The checks above are lexical, so they cannot see a symlink: one planted
+    // inside the root (agents have shell and write tools) would be followed by
+    // the read below and serve a file from outside the tree. Resolve the root
+    // and the file's *directory* and keep the result inside the root. The
+    // final component is deliberately never canonicalized — on macOS that
+    // fails when the caller's Unicode form (NFC/NFD) differs from the name on
+    // disk, which is why the read opens the name the caller asked for.
+    if let (Ok(canon_root), Some(Ok(canon_dir))) =
+        (root.canonicalize(), full.parent().map(std::path::Path::canonicalize))
+    {
+        if !canon_dir.starts_with(&canon_root) {
+            return None;
+        }
+    }
+    // Neither branch above resolves when the file simply does not exist; the
+    // lexical result stands and the read reports it the way it always has
+    // (404, not 403).
+
+    // A final component that *is* a symlink is the escape the directory check
+    // cannot catch, so it is refused outright. A symlinked artifact is not a
+    // configuration worth the confused-deputy risk: copy the file in instead.
+    if full
+        .symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    Some(full)
 }
 
 /// GET /api/v1/artifacts/*path  (+ `?to=pptx` for on-demand conversion)
@@ -283,6 +314,74 @@ mod tests {
             let resp = get(&state, bad, None).await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "should reject {:?}", bad);
         }
+    }
+
+    /// The lexical checks stop `..` and absolute paths; a symlink is what they
+    /// cannot see. A link inside the root must not serve a file from outside
+    /// it — agents can write into these directories.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_artifact_is_refused() {
+        let state = state().await;
+        let root = state.paths.artifacts_dir();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let outside = root.parent().unwrap().join("outside-secret.md");
+        tokio::fs::write(&outside, "not yours").await.unwrap();
+
+        let link = root.join("leak.md");
+        let _ = tokio::fs::remove_file(&link).await;
+        tokio::fs::symlink(&outside, &link).await.unwrap();
+        assert_eq!(
+            get(&state, "leak.md", None).await.status(),
+            StatusCode::FORBIDDEN,
+            "a symlink inside the root must not be followed out of it"
+        );
+
+        // The absolute case, which is the one that matters on a real host.
+        let absolute = root.join("hosts.md");
+        let _ = tokio::fs::remove_file(&absolute).await;
+        tokio::fs::symlink("/etc/hosts", &absolute).await.unwrap();
+        assert_eq!(get(&state, "hosts.md", None).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A symlinked *directory* is the same escape one level up: the join stays
+    /// lexical, so only resolving the directory catches it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_directory_inside_root_is_refused() {
+        let state = state().await;
+        let root = state.paths.artifacts_dir();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let outside = root.parent().unwrap();
+        tokio::fs::write(outside.join("outside-secret.md"), "not yours")
+            .await
+            .unwrap();
+
+        let link = root.join("outdir");
+        let _ = tokio::fs::remove_file(&link).await;
+        tokio::fs::symlink(outside, &link).await.unwrap();
+        assert_eq!(
+            get(&state, "outdir/outside-secret.md", None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A name the caller sends in a different Unicode form than the one on
+    /// disk must keep working, which is why the final component is never
+    /// canonicalized (see `resolve_artifact_path`).
+    #[tokio::test]
+    async fn test_unicode_filename_served() {
+        let state = state().await;
+        let root = state.paths.artifacts_dir();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("baogao-报告.md"), "# 报告")
+            .await
+            .unwrap();
+
+        let resp = get(&state, "baogao-报告.md", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("报告"));
     }
 
     #[tokio::test]
