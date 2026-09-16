@@ -1247,6 +1247,11 @@ pub fn default_local_scopes() -> Vec<String> {
         crate::gateway::protocol::SCOPE_CHAT.to_string(),
         crate::gateway::protocol::SCOPE_READ.to_string(),
         crate::gateway::protocol::SCOPE_WRITE.to_string(),
+        // `pairing` grants no method of its own; it decides which connections
+        // receive `device.pair.requested` — the event carrying a pairing code.
+        // A local client is the operator, so it keeps seeing them; narrowing
+        // this away is how an operator hides pairing codes from a client.
+        crate::gateway::protocol::SCOPE_PAIRING.to_string(),
     ]
 }
 
@@ -1256,6 +1261,10 @@ pub fn default_shared_token_scopes() -> Vec<String> {
     vec![
         crate::gateway::protocol::SCOPE_CHAT.to_string(),
         crate::gateway::protocol::SCOPE_READ.to_string(),
+        // See `default_local_scopes`: without `pairing` a token-authenticated
+        // client would stop receiving device pairing codes, which is a UX
+        // regression rather than a hardening win.
+        crate::gateway::protocol::SCOPE_PAIRING.to_string(),
     ]
 }
 

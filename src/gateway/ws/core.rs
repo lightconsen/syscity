@@ -216,6 +216,76 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// Which connections may receive a gateway event.
+///
+/// The classification is exhaustive on purpose: adding a `GatewayEvent`
+/// variant stops this file compiling until its audience is decided, so a new
+/// event cannot quietly inherit "send to everyone".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Audience {
+    /// Operator-level fact; every handshaked connection may see it.
+    All,
+    /// One session's business: only connections subscribed to it.
+    Session(String),
+    /// Carries a device pairing code, which is the key to a device: only
+    /// connections granted the `pairing` scope.
+    Pairing,
+}
+
+/// Decide who may receive `event`.
+fn audience_of(event: &GatewayEvent) -> Audience {
+    use GatewayEvent as E;
+    let session = |id: &str| Audience::Session(id.to_string());
+    match event {
+        // ── One session's business ──────────────────────────────────────────
+        E::AgentResponse { session_id, .. }
+        | E::Thinking { session_id, .. }
+        | E::ContentDelta { session_id, .. }
+        | E::ToolCalling { session_id, .. }
+        | E::ToolResult { session_id, .. }
+        | E::Completed { session_id, .. }
+        | E::ProcessingError { session_id, .. }
+        | E::GoalProgress { session_id, .. }
+        | E::SessionCreated { session_id, .. }
+        | E::SessionRenamed { session_id, .. }
+        | E::SessionPinned { session_id, .. }
+        | E::SessionModelChanged { session_id, .. }
+        | E::AcpSpawned { session_id, .. }
+        | E::AcpCompleted { session_id, .. }
+        | E::AcpStatusChanged { session_id, .. }
+        | E::AcpRecovered { session_id, .. } => session(session_id),
+        E::AskRequired(e) => session(&e.session_id),
+        E::AskResolved(e) => session(&e.session_id),
+
+        // ── The pairing code ────────────────────────────────────────────────
+        // Whoever can act on it, and no one else: the code is what lets a
+        // device in.
+        E::DevicePairRequested { .. } => Audience::Pairing,
+
+        // ── Operator-level facts the UI renders ─────────────────────────────
+        // Deliberate, not accidental: these have no session to key on (the
+        // approval event carries no session id) and every client that shows
+        // them is the operator's own.
+        E::ApprovalRequired { .. }
+        | E::AgentStatus { .. }
+        | E::ChannelStatus { .. }
+        | E::CronAnnounce { .. }
+        | E::RepairAction { .. }
+        | E::DeviceStatusChanged { .. }
+        | E::ConnectorChanged { .. }
+        | E::McpConnected { .. }
+        | E::McpDisconnected { .. }
+        | E::McpRecovered { .. }
+        | E::McpResourceChanged { .. }
+        | E::McpAuthRequired { .. }
+        | E::McpAuthComplete { .. }
+        | E::McpAuthFailed { .. }
+        | E::McpTokenRefreshed { .. }
+        | E::AcpThreadSwitched { .. }
+        | E::MessageReceived { .. } => Audience::All,
+    }
+}
+
 async fn handle_websocket(
     socket: WebSocket,
     state: Arc<GatewayState>,
@@ -255,27 +325,13 @@ async fn handle_websocket(
                         continue;
                     }
 
-                    let should_send = match &event {
-                        GatewayEvent::AgentResponse { session_id, .. }
-                        | GatewayEvent::ToolCalling { session_id, .. }
-                        | GatewayEvent::ToolResult { session_id, .. }
-                        | GatewayEvent::Completed { session_id, .. }
-                        | GatewayEvent::ProcessingError { session_id, .. }
-                        | GatewayEvent::Thinking { session_id, .. }
-                        | GatewayEvent::GoalProgress { session_id, .. }
-                        | GatewayEvent::AskRequired(crate::tools::ask_user::AskRequiredEvent {
-                            session_id,
-                            ..
-                        }) => {
-                            conn_guard.is_subscribed(session_id)
-                        }
-                        GatewayEvent::AskResolved(e) => {
-                            // Route resolution to whoever is subscribed to the
-                            // session the question belonged to (best-effort:
-                            // the ask_id may resolve across subscribers).
-                            conn_guard.is_subscribed(&e.session_id)
-                        }
-                        _ => true,
+                    let should_send = match audience_of(&event) {
+                        Audience::All => true,
+                        Audience::Session(session_id) => conn_guard.is_subscribed(&session_id),
+                        Audience::Pairing => conn_guard.scopes.iter().any(|s| {
+                            s == crate::gateway::protocol::SCOPE_PAIRING
+                                || s == crate::gateway::protocol::SCOPE_ADMIN
+                        }),
                     };
 
                     if !should_send {
@@ -1016,6 +1072,61 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "dropping the slot must release the counter"
+        );
+    }
+
+    /// The classification is what decides who sees an event; the exhaustive
+    /// match is the compile-time guard (a new variant fails to build until it
+    /// is placed), and these are the runtime assertions for each family.
+    #[test]
+    fn events_are_classified_by_audience() {
+        use crate::gateway::runtime::GatewayEvent as E;
+
+        let session_events = vec![
+            E::ContentDelta {
+                session_id: "s1".into(),
+                agent_id: "default".into(),
+                delta: "x".into(),
+            },
+            E::SessionRenamed {
+                session_id: "s1".into(),
+                name: "n".into(),
+            },
+            E::SessionPinned {
+                session_id: "s1".into(),
+                pinned: true,
+            },
+            E::Thinking {
+                session_id: "s1".into(),
+                agent_id: "default".into(),
+                content: Some("t".into()),
+            },
+        ];
+        for event in session_events {
+            assert_eq!(
+                audience_of(&event),
+                Audience::Session("s1".to_string()),
+                "{event:?} is one session's business"
+            );
+        }
+
+        // A pairing code is the key to a device: scope-gated, never broadcast.
+        assert_eq!(
+            audience_of(&E::DevicePairRequested {
+                device_id: "d1".into(),
+                code: "ABCD1234".into(),
+                display_name: None,
+            }),
+            Audience::Pairing
+        );
+
+        // Operator-level facts the UI renders stay broadcast.
+        assert_eq!(
+            audience_of(&E::AgentStatus {
+                agent_id: "default".into(),
+                status: crate::gateway::AgentStatus::Idle,
+            }),
+            Audience::All
         );
     }
 
