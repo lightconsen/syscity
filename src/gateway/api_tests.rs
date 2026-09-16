@@ -40,6 +40,37 @@ async fn ready_handler_returns_503_when_not_ready() {
 
 use crate::gateway::protocol::AuthMode;
 
+/// A wildcard origin together with `allow_credentials` tells every browser
+/// that any site may make credentialed requests — refused at startup rather
+/// than mirrored at runtime.
+#[test]
+fn validate_auth_refuses_wildcard_cors_with_credentials() {
+    let mut config = GatewayConfig::default();
+    config.security.cors.allowed_origins = vec!["*".into()];
+    config.security.cors.allow_credentials = true;
+    let err = super::validate_auth_config(&config).expect_err("must refuse");
+    assert!(err.to_string().contains("allow_credentials"), "{err}");
+}
+
+/// The same credentials setting is fine once the origins are listed.
+#[test]
+fn validate_auth_allows_credentials_with_an_explicit_origin_list() {
+    let mut config = GatewayConfig::default();
+    config.security.cors.allowed_origins = vec!["https://app.example".into()];
+    config.security.cors.allow_credentials = true;
+    assert!(super::validate_auth_config(&config).is_ok());
+}
+
+/// And the default (wildcard, no credentials) is untouched — this is the
+/// combination a browser will not send credentials to.
+#[test]
+fn validate_auth_allows_the_default_cors() {
+    let config = GatewayConfig::default();
+    assert_eq!(config.security.cors.allowed_origins, vec!["*".to_string()]);
+    assert!(!config.security.cors.allow_credentials);
+    assert!(super::validate_auth_config(&config).is_ok());
+}
+
 #[test]
 fn validate_auth_passes_when_security_disabled() {
     let mut config = GatewayConfig::default();

@@ -81,6 +81,10 @@ pub fn extract_session_cookie_from_headers(
 
 /// CORS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A partial table in the config file must fill the rest from the defaults
+// rather than fail the whole parse — the outer `#[serde(default)]` only
+// covers *absent* fields, not a present-but-incomplete nested table.
+#[serde(default)]
 pub struct CorsConfig {
     /// Enable CORS
     pub enabled: bool,
@@ -113,7 +117,13 @@ impl Default for CorsConfig {
                 "Authorization".to_string(),
                 "X-Requested-With".to_string(),
             ],
-            allow_credentials: true,
+            // Off by default. With `allowed_origins = ["*"]` a browser would
+            // refuse credentialed requests anyway, and a gateway that never
+            // issues cookies (see this module's docs) has nothing to send —
+            // so the only thing `true` buys is a wrong security expectation.
+            // Turn it on together with an explicit origin allowlist, and
+            // `validate_auth_config` will insist on exactly that pairing.
+            allow_credentials: false,
             max_age_secs: 3600,
         }
     }
@@ -121,6 +131,10 @@ impl Default for CorsConfig {
 
 /// CSP (Content Security Policy) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A partial table in the config file must fill the rest from the defaults
+// rather than fail the whole parse — the outer `#[serde(default)]` only
+// covers *absent* fields, not a present-but-incomplete nested table.
+#[serde(default)]
 pub struct CspConfig {
     /// Enable CSP
     pub enabled: bool,
@@ -249,7 +263,10 @@ mod tests {
         let config = CorsConfig::default();
         assert!(config.enabled);
         assert_eq!(config.allowed_origins, vec!["*"]);
-        assert!(config.allow_credentials);
+        assert!(
+            !config.allow_credentials,
+            "credentials stay off until an explicit origin allowlist is configured"
+        );
         assert_eq!(config.max_age_secs, 3600);
     }
 

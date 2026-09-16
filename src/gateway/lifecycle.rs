@@ -1122,21 +1122,16 @@ pub(crate) async fn build_router(state: Arc<GatewayState>) -> Router {
             if config.security.cors.allow_credentials {
                 cors = cors.allow_credentials(true);
             }
-            let has_wildcard = config
-                .security
-                .cors
-                .allowed_origins
-                .iter()
-                .any(|o| o == "*");
-            if has_wildcard && config.security.cors.allow_credentials {
-                cors = cors.allow_origin(tower_http::cors::AllowOrigin::mirror_request());
-            } else {
-                for origin in &config.security.cors.allowed_origins {
-                    if origin == "*" {
-                        cors = cors.allow_origin(tower_http::cors::Any);
-                    } else if let Ok(header_value) = origin.parse() {
-                        cors = cors.allow_origin([header_value]);
-                    }
+            // A wildcard is `Any`, never a mirror of the request's own Origin.
+            // Mirroring is the dangerous reading of "allow anything": it pairs
+            // with `allow_credentials` and tells the browser that *any* site
+            // may make credentialed calls. Wildcard + credentials is refused at
+            // startup (`validate_auth_config`), so the two never meet here.
+            for origin in &config.security.cors.allowed_origins {
+                if origin == "*" {
+                    cors = cors.allow_origin(tower_http::cors::Any);
+                } else if let Ok(header_value) = origin.parse() {
+                    cors = cors.allow_origin([header_value]);
                 }
             }
             let methods: Vec<_> = config

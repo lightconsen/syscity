@@ -942,6 +942,28 @@ pub(crate) fn validate_auth_config(config: &GatewayConfig) -> crate::Result<()> 
         }
     }
 
+    // CORS: a wildcard origin may not be combined with credentials. The pair
+    // tells every browser that any site may make credentialed calls, and it is
+    // the one combination that turns "allow anything" from a convenience into
+    // a cross-origin read. Refused rather than mirrored (see `build_router`).
+    if config.security.cors.enabled && config.security.cors.allow_credentials {
+        let wildcard = config
+            .security
+            .cors
+            .allowed_origins
+            .iter()
+            .any(|o| o == "*");
+        if wildcard {
+            return Err(crate::error::SyscityError::Validation(
+                "security.cors allows every origin (\"*\") together with \
+                 allow_credentials — any site could make credentialed requests. List the \
+                 origins you trust in security.cors.allowed_origins, or set \
+                 allow_credentials = false."
+                    .into(),
+            ));
+        }
+    }
+
     if !config.security.enabled || !config.security.auth_required {
         return Ok(());
     }

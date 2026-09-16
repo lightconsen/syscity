@@ -1170,6 +1170,10 @@ fn default_tailscale_ttl() -> u64 {
 
 /// Rate limiting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A partial table in the config file must fill the rest from the defaults
+// rather than fail the whole parse — the outer `#[serde(default)]` only
+// covers *absent* fields, not a present-but-incomplete nested table.
+#[serde(default)]
 pub struct RateLimitConfig {
     /// Enable rate limiting
     pub enabled: bool,
@@ -1865,6 +1869,19 @@ shared_token = "abc"
         // A genuinely malformed file must still be rejected, so the new
         // leniency does not turn typos into silent defaults.
         assert!(toml::from_str::<GatewayConfig>("port = \"not a number\"").is_err());
+
+        // The same for the security sub-tables: a partial `[security.cors]`
+        // must fill the rest from defaults, not fail the whole parse (which
+        // would silently revert every other setting to its default).
+        let partial_security = "[security.cors]\nallow_credentials = true\n";
+        let parsed: GatewayConfig =
+            toml::from_str(partial_security).expect("a partial cors table must deserialize");
+        assert!(parsed.security.cors.allow_credentials);
+        assert_eq!(
+            parsed.security.cors.allowed_origins,
+            vec!["*".to_string()],
+            "unspecified fields come from the default"
+        );
 
         // A channel table can be sparse: the type must not require an entry to
         // spell out `credentials` and `enabled` (they default like
