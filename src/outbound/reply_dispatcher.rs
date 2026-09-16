@@ -117,6 +117,21 @@ pub enum ReplyDispatchError {
     SendFailed(String),
 }
 
+/// The largest index `≤ max_len` that is a character boundary in `s`.
+///
+/// `str` slicing panics on a non-boundary index, so every byte offset used to
+/// cut a string has to come through here first.
+fn floor_char_boundary(s: &str, max_len: usize) -> usize {
+    if max_len >= s.len() {
+        return s.len();
+    }
+    let mut idx = max_len;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Split content into chunks at word boundaries, each at most `max_len` bytes.
 ///
 /// Each chunk ends at a space character when possible to avoid splitting words.
@@ -130,9 +145,24 @@ fn chunk_content(content: &str, max_len: usize) -> Vec<String> {
     let mut remaining = content;
 
     while remaining.len() > max_len {
-        // Find the last space within the first max_len characters
-        let slice = &remaining[..max_len];
-        let split_at = slice.rfind(' ').map(|pos| pos + 1).unwrap_or(max_len);
+        // `max_len` is a byte budget, but a chunk may only be cut where a
+        // character ends — slicing at an arbitrary byte panics on the first
+        // multi-byte character that straddles the limit (CJK, emoji), which is
+        // exactly the content this is most likely to see.
+        let limit = floor_char_boundary(remaining, max_len);
+        let split_at = if limit == 0 {
+            // The limit is narrower than a single character: emit that one
+            // character whole rather than looping without progress.
+            remaining
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(remaining.len())
+        } else {
+            // Prefer the last word boundary inside the limit.
+            let slice = &remaining[..limit];
+            slice.rfind(' ').map(|pos| pos + 1).unwrap_or(limit)
+        };
         chunks.push(remaining[..split_at].to_string());
         remaining = remaining[split_at..].trim_start();
     }
@@ -202,9 +232,44 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn test_chunk_content_max_len_zero() {
         let chunks = chunk_content("hello", 0);
         assert_eq!(chunks, vec!["hello"]);
+    }
+
+    /// A byte limit that lands mid-character must not panic — CJK and emoji are
+    /// where this bites, and they are the common case for this project.
+    #[test]
+    fn test_chunk_content_multibyte_boundary_does_not_panic() {
+        // Each of these is 3 bytes; a 5-byte limit lands inside the second one.
+        let text = "中文中文中文";
+        let chunks = chunk_content(text, 5);
+        assert_eq!(chunks.concat(), text, "no character may be lost or split");
+        assert!(chunks.len() > 1, "the text is longer than the limit");
+    }
+
+    #[test]
+    fn test_chunk_content_emoji_boundary_does_not_panic() {
+        // 4-byte characters.
+        let text = "🎉🎉🎉";
+        let chunks = chunk_content(text, 6);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    /// A limit narrower than a single character would otherwise loop without
+    /// making progress; the character is emitted whole instead.
+    #[test]
+    fn test_chunk_content_limit_smaller_than_one_character() {
+        let chunks = chunk_content("中文", 1);
+        assert_eq!(chunks.concat(), "中文");
+    }
+
+    /// Mixed content with spaces still breaks on words where it can.
+    #[test]
+    fn test_chunk_content_multibyte_word_boundary() {
+        let chunks = chunk_content("中文 测试 内容", 7);
+        assert_eq!(chunks.concat().replace(' ', ""), "中文测试内容");
     }
 
     #[test]
