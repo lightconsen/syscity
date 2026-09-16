@@ -903,7 +903,44 @@ impl Gateway {
 /// Validate authentication configuration for ambiguity and conflicts.
 ///
 /// Fails fast when the configured security settings cannot work at runtime.
+///
+/// Called on the gateway startup path as well as from the auth CLI: a
+/// misconfiguration that leaves the gateway open used to be silent.
 pub(crate) fn validate_auth_config(config: &GatewayConfig) -> crate::Result<()> {
+    // Anonymous mode is loud, whatever else is configured: it is the difference
+    // between "nobody has to authenticate" and "anyone who reaches this port
+    // controls the machine's runtime".
+    if config.security.auth_mode == crate::gateway::protocol::AuthMode::None {
+        if !crate::gateway::auth::ws_origin::is_loopback_bind(&config.host)
+            && !config.security.allow_non_loopback_without_auth
+        {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "auth_mode is 'none' but the gateway binds {} — an unauthenticated listener on a \
+                 reachable interface. Set auth_mode = \"token\" (or \"device\"), bind 127.0.0.1, or \
+                 set security.allow_non_loopback_without_auth = true to accept the risk.",
+                config.host
+            )));
+        }
+        tracing::warn!(
+            "auth_mode is 'none': clients that can reach {}:{} get {:?} without authenticating",
+            config.host,
+            config.port,
+            config.security.local_scopes
+        );
+        if config
+            .security
+            .shared_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
+            // Never checked: the middleware short-circuits before the token.
+            tracing::warn!(
+                "security.shared_token is set but auth_mode is 'none', so it is not checked at \
+                 all — requests are unauthenticated. Set auth_mode = \"token\"."
+            );
+        }
+    }
+
     if !config.security.enabled || !config.security.auth_required {
         return Ok(());
     }

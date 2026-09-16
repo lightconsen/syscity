@@ -232,6 +232,32 @@ pub const ALL_SCOPES: &[&str] = &[
 /// Default scopes granted when none are explicitly requested
 pub const DEFAULT_SCOPES: &[&str] = &[SCOPE_CHAT, SCOPE_READ];
 
+/// Resolve the scopes a connection is actually granted.
+///
+/// `entitled` is what the *credential* confers — derived from configuration or
+/// from the stored record, never from the request. `requested` is the client's
+/// wish list, and it may only ever **narrow** the result: a client can ask for
+/// less than it is entitled to, never more.
+///
+/// This is the single place authorization is decided. Before it existed, three
+/// of the four auth paths assigned the client's requested scopes verbatim
+/// (`params.scopes.clone()`), so any client that could reach `/ws` could ask
+/// for `admin` and receive it — under `auth_mode = "none"` that needed no
+/// credential at all.
+///
+/// An empty request means "give me what this credential is worth", which is
+/// what a client that does not care about scopes should send.
+pub fn resolve_scopes(entitled: &[String], requested: &[String]) -> Vec<String> {
+    if requested.is_empty() {
+        return entitled.to_vec();
+    }
+    entitled
+        .iter()
+        .filter(|scope| requested.contains(scope))
+        .cloned()
+        .collect()
+}
+
 /// Check if a method requires a specific scope
 pub fn method_scope(method: &str) -> Option<&'static str> {
     match method {
@@ -250,14 +276,12 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "config.get"
         | "models.list"
         | "models.presets"
-        | "models.fetch_remote"
-        | "models.add"
-        | "models.remove"
+        // `models.default` genuinely is a read; the rest of the `models.*`
+        // family writes provider config (and API keys) to disk — see the write
+        // group.
         | "models.default"
-        | "models.set_default"
         | "cron.list"
         | "skills.list"
-        | "skills.install"
         | "logs.subscribe"
         | "logs.unsubscribe"
         | "workspace.list"
@@ -266,15 +290,10 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "mcp.list"
         | "mcp.presets"
         | "mcp.tools"
-        | "mcp.call_tool"
         | "mcp.resources"
         | "mcp.auth_status"
         | "device.capabilities"
         | "device.permission.status"
-        | "device.pairing.pending"
-        | "device.pairing.authorized"
-        | "device.pairing.qr"
-        | "device.pairing.setup"
         | "device.adb.status"
         | "device.shortcut.results"
         | "device.shortcut.inbox"
@@ -354,9 +373,26 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "device.permission.request"
         | "device.adb.pair"
         | "device.shortcut.run"
+        // Pairing-request inspection hands out the pairing code and the device
+        // inventory, so it sits with approve/reject/revoke rather than with the
+        // read-only queries: a `read` client must not be able to mint a code.
+        | "device.pairing.pending"
+        | "device.pairing.authorized"
+        | "device.pairing.qr"
+        | "device.pairing.setup"
         | "device.pairing.approve"
         | "device.pairing.reject"
         | "device.pairing.revoke"
+        // These mutate durable state or execute code: models.* writes provider
+        // config (including API keys) to `config.toml`, `models.fetch_remote`
+        // takes the endpoint from the caller, `skills.install` extracts an
+        // archive, and `mcp.call_tool` invokes an arbitrary tool.
+        | "models.fetch_remote"
+        | "models.add"
+        | "models.remove"
+        | "models.set_default"
+        | "skills.install"
+        | "mcp.call_tool"
         | "system.reload"
         | "channels.enable"
         | "channels.disable"
@@ -982,13 +1018,9 @@ mod tests {
         assert_eq!(method_scope("config.get"), Some(SCOPE_READ));
         assert_eq!(method_scope("models.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("models.presets"), Some(SCOPE_READ));
-        assert_eq!(method_scope("models.fetch_remote"), Some(SCOPE_READ));
-        assert_eq!(method_scope("models.add"), Some(SCOPE_READ));
-        assert_eq!(method_scope("models.remove"), Some(SCOPE_READ));
-        assert_eq!(method_scope("models.set_default"), Some(SCOPE_READ));
+        assert_eq!(method_scope("models.default"), Some(SCOPE_READ));
         assert_eq!(method_scope("cron.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("skills.list"), Some(SCOPE_READ));
-        assert_eq!(method_scope("skills.install"), Some(SCOPE_READ));
         assert_eq!(method_scope("logs.subscribe"), Some(SCOPE_READ));
         assert_eq!(method_scope("logs.unsubscribe"), Some(SCOPE_READ));
         assert_eq!(method_scope("tasks.list"), Some(SCOPE_READ));
@@ -1008,6 +1040,25 @@ mod tests {
         assert_eq!(method_scope("eval.propose"), Some(SCOPE_WRITE));
 
         // SCOPE_WRITE
+        // Writes that used to be mislabelled as reads.
+        for method in [
+            "models.fetch_remote",
+            "models.add",
+            "models.remove",
+            "models.set_default",
+            "skills.install",
+            "mcp.call_tool",
+            "device.pairing.qr",
+            "device.pairing.setup",
+            "device.pairing.pending",
+            "device.pairing.authorized",
+        ] {
+            assert_eq!(
+                method_scope(method),
+                Some(SCOPE_WRITE),
+                "{method} mutates state or hands out credentials"
+            );
+        }
         assert_eq!(method_scope("agents.purge"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("agents.rename"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("sessions.create"), Some(SCOPE_WRITE));
@@ -1176,5 +1227,78 @@ mod tests {
         };
         let (_, payload) = gateway_event_to_ws(&plain).expect("mapped event");
         assert!(payload.get("code").is_none());
+    }
+
+    /// `resolve_scopes` is the whole authorization model in one function, so it
+    /// gets its own tests.
+    #[test]
+    fn resolve_scopes_narrows_but_never_widens() {
+        let entitled = vec!["chat".to_string(), "read".to_string()];
+
+        // A client asking for more than it has keeps only what it has.
+        let asked = vec!["chat".to_string(), "read".to_string(), "admin".to_string()];
+        assert_eq!(resolve_scopes(&entitled, &asked), entitled);
+
+        // Asking for a subset narrows.
+        let asked = vec!["read".to_string()];
+        assert_eq!(resolve_scopes(&entitled, &asked), vec!["read".to_string()]);
+
+        // Asking for nothing means "everything I am entitled to".
+        assert_eq!(resolve_scopes(&entitled, &[]), entitled);
+
+        // Asking only for what it cannot have grants nothing.
+        let asked = vec!["admin".to_string(), "pairing".to_string()];
+        assert!(resolve_scopes(&entitled, &asked).is_empty());
+
+        // The order of the result follows the entitlement, not the request.
+        let asked = vec!["read".to_string(), "chat".to_string()];
+        assert_eq!(resolve_scopes(&entitled, &asked), vec!["chat".to_string(), "read".to_string()]);
+    }
+
+    /// The dispatcher and the scope table are two hand-maintained lists that
+    /// have to agree. They drifted once (writes labelled as reads, a method
+    /// missing entirely), so the agreement is a test rather than a convention.
+    #[test]
+    fn every_dispatched_method_declares_a_scope() {
+        // Methods that genuinely need no scope, because they are part of
+        // establishing the connection itself.
+        const UN_SCOPED: &[&str] = &["connect", "ping"];
+
+        let dispatcher = include_str!("ws/core.rs");
+        let mut checked = 0;
+        for line in dispatcher.lines() {
+            let Some(rest) = line.strip_prefix("        ") else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some((method, tail)) = rest.split_once('"') else {
+                continue;
+            };
+            // Only dispatch arms: `"name" => …`.
+            if !tail.trim_start().starts_with("=>") {
+                continue;
+            }
+            checked += 1;
+            if UN_SCOPED.contains(&method) {
+                assert_eq!(
+                    method_scope(method),
+                    None,
+                    "{method} is listed as unscoped but the table gives it a scope"
+                );
+                continue;
+            }
+            assert!(
+                method_scope(method).is_some(),
+                "`{method}` is dispatched but has no entry in `method_scope` — every method must \
+                 declare a scope, or say why it needs none in UN_SCOPED"
+            );
+        }
+        assert!(
+            checked > 150,
+            "the dispatcher parse found only {checked} methods — the \
+            extraction is probably broken rather than the table being complete"
+        );
     }
 }

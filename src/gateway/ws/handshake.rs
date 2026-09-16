@@ -28,15 +28,14 @@ pub(super) async fn handle_connect(
 
     let (user_id, granted_scopes) = match auth_mode {
         crate::gateway::protocol::AuthMode::None => {
-            // WebSocket upgrade already validated credentials at the HTTP layer.
-            // Use the pre-validated identity instead of granting anonymous access.
-            let mut scopes = pre_validated_auth.scopes.clone();
-            for s in &params.scopes {
-                if crate::gateway::protocol::ALL_SCOPES.contains(&s.as_str()) && !scopes.contains(s)
-                {
-                    scopes.push(s.clone());
-                }
-            }
+            // The upgrade middleware already resolved this connection's
+            // identity and its entitlement (`security.local_scopes`). The
+            // client's request may only narrow that — asking for more must not
+            // add anything.
+            let scopes = crate::gateway::protocol::resolve_scopes(
+                &pre_validated_auth.scopes,
+                &params.scopes,
+            );
             (Some(pre_validated_auth.user_id.clone()), scopes)
         }
         crate::gateway::protocol::AuthMode::Token => {
@@ -45,10 +44,11 @@ pub(super) async fn handle_connect(
         crate::gateway::protocol::AuthMode::Device => {
             return handle_device_auth(req, state, &params, conn).await;
         }
-        crate::gateway::protocol::AuthMode::Tailscale => (
-            Some(UserId::new("tailscale")),
-            DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
-        ),
+        crate::gateway::protocol::AuthMode::Tailscale => {
+            let entitled: Vec<String> = DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
+            let scopes = crate::gateway::protocol::resolve_scopes(&entitled, &params.scopes);
+            (Some(UserId::new("tailscale")), scopes)
+        }
     };
 
     finalize_hello_ok(req, conn, &params, user_id, granted_scopes).await
@@ -133,11 +133,12 @@ async fn resolve_token_auth(
         if let Some(auth) = &params.auth {
             if let Some(token) = &auth.token {
                 if token == shared_token {
-                    let scopes = if params.scopes.is_empty() {
-                        DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()
-                    } else {
-                        params.scopes.clone()
-                    };
+                    // The token is worth `security.shared_token_scopes` — not
+                    // whatever the holder asks for.
+                    let scopes = crate::gateway::protocol::resolve_scopes(
+                        &config.security.shared_token_scopes,
+                        &params.scopes,
+                    );
                     return (Some(UserId::new("shared")), scopes);
                 }
             }
@@ -145,6 +146,15 @@ async fn resolve_token_auth(
     }
 
     (None, Vec::new())
+}
+
+/// Scopes a paired device is entitled to.
+///
+/// Deployment-wide rather than per-device for now: recording the scopes the
+/// human approved at pairing time is the natural follow-up, but either way the
+/// entitlement has to come from the server side.
+async fn device_entitled_scopes(state: &Arc<GatewayState>) -> Vec<String> {
+    state.config.read().await.security.device_scopes.clone()
 }
 
 pub(super) async fn handle_device_auth(
@@ -158,11 +168,10 @@ pub(super) async fn handle_device_auth(
 
     if let Some(token) = params.auth.as_ref().and_then(|a| a.token.as_ref()) {
         if let Some(device_id) = state.auth.device_pairing_store.validate_token(token).await {
-            let scopes = if params.scopes.is_empty() {
-                DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()
-            } else {
-                params.scopes.clone()
-            };
+            let scopes = crate::gateway::protocol::resolve_scopes(
+                &device_entitled_scopes(state).await,
+                &params.scopes,
+            );
             return finalize_hello_ok(req, conn, params, Some(UserId::new(&device_id)), scopes)
                 .await;
         }
@@ -183,11 +192,10 @@ pub(super) async fn handle_device_auth(
 
     match result {
         DeviceAccessResult::Authorized { token: _ } => {
-            let scopes = if params.scopes.is_empty() {
-                DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect()
-            } else {
-                params.scopes.clone()
-            };
+            let scopes = crate::gateway::protocol::resolve_scopes(
+                &device_entitled_scopes(state).await,
+                &params.scopes,
+            );
             finalize_hello_ok(req, conn, params, Some(UserId::new(&device.id)), scopes).await
         }
         DeviceAccessResult::PairingRequired { code } => {
@@ -357,13 +365,12 @@ mod tests {
     async fn connect_none_mode_hello_ok() {
         let state = state().await;
         let conn = make_test_conn(&[]);
-        // Requesting "admin" grants it only if present in ALL_SCOPES.
         let resp = dispatch_connect(
             &conn,
             &state,
             AuthMode::None,
             params(serde_json::json!({
-                "scopes": ["admin"],
+                "scopes": ["chat"],
                 "client": { "id": "web", "version": "1.0" },
             })),
         )
@@ -380,16 +387,161 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&"chat".into()));
-        assert!(payload["scopes_granted"]
-            .as_array()
-            .unwrap()
-            .contains(&"admin".into()));
         assert_eq!(payload["server"]["conn_id"], "test-conn");
 
         // Connection state mutated by the handshake.
         let cg = conn.read().await;
         assert!(cg.handshaked);
-        assert!(cg.scopes.contains(&"admin".to_string()));
+        assert!(cg.scopes.contains(&"chat".to_string()));
+    }
+
+    /// The entitlement is what the credential is worth, never what the client
+    /// asks for. This used to grant `admin` to anyone who requested it.
+    #[tokio::test]
+    async fn connect_none_mode_cannot_escalate_by_asking() {
+        let state = state().await;
+        let conn = make_test_conn(&[]);
+        let resp = dispatch_connect(
+            &conn,
+            &state,
+            AuthMode::None,
+            params(serde_json::json!({ "scopes": ["chat", "admin", "pairing", "acp"] })),
+        )
+        .await;
+        assert!(resp.ok);
+        let granted = resp.payload.as_ref().unwrap()["scopes_granted"]
+            .as_array()
+            .unwrap()
+            .clone();
+        // The test connection is entitled to "chat" only: it keeps that and
+        // gets nothing else.
+        assert_eq!(granted, vec![serde_json::json!("chat")]);
+        let cg = conn.read().await;
+        assert!(!cg.scopes.contains(&"admin".to_string()));
+    }
+
+    /// Asking *only* for scopes the credential does not carry yields nothing —
+    /// the request is a filter over the entitlement, so a filter that matches
+    /// nothing grants nothing.
+    #[tokio::test]
+    async fn connect_asking_only_for_unentitled_scopes_grants_nothing() {
+        let state = state().await;
+        let conn = make_test_conn(&[]);
+        let resp = dispatch_connect(
+            &conn,
+            &state,
+            AuthMode::None,
+            params(serde_json::json!({ "scopes": ["admin"] })),
+        )
+        .await;
+        assert!(resp.ok);
+        assert_eq!(
+            resp.payload.as_ref().unwrap()["scopes_granted"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            Vec::<serde_json::Value>::new()
+        );
+        assert!(!conn.read().await.scopes.contains(&"admin".to_string()));
+    }
+
+    /// A client may ask for *less* than it is entitled to — that is the one
+    /// thing the request is allowed to do.
+    #[tokio::test]
+    async fn connect_can_narrow_its_scopes() {
+        let mut gateway_config = GatewayConfig::default();
+        gateway_config.security.local_scopes = vec![
+            "chat".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+            "admin".to_string(),
+        ];
+        let state = Arc::new(make_test_state(gateway_config).await);
+        let conn = make_test_conn(&[]);
+        let pre = WsAuthResult {
+            user_id: UserId::new("u1"),
+            scopes: vec![
+                "chat".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+                "admin".to_string(),
+            ],
+        };
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCommand>(1);
+        let resp = handle_connect(
+            &req("r1", params(serde_json::json!({ "scopes": ["chat"] }))),
+            &conn,
+            &state,
+            &AuthMode::None,
+            &cmd_tx,
+            &pre,
+        )
+        .await;
+        assert!(resp.ok);
+        // Only the intersection: narrowing works, widening does not.
+        assert_eq!(
+            resp.payload.as_ref().unwrap()["scopes_granted"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            vec![serde_json::json!("chat")],
+            "narrowing to what was asked for"
+        );
+        // An empty request still means "everything I am entitled to".
+        let conn2 = make_test_conn(&[]);
+        let resp2 = handle_connect(
+            &req("r2", params(serde_json::json!({}))),
+            &conn2,
+            &state,
+            &AuthMode::None,
+            &cmd_tx,
+            &pre,
+        )
+        .await;
+        assert_eq!(
+            resp2.payload.as_ref().unwrap()["scopes_granted"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            vec![
+                serde_json::json!("chat"),
+                serde_json::json!("read"),
+                serde_json::json!("write"),
+                serde_json::json!("admin")
+            ],
+            "an empty request means the full entitlement"
+        );
+    }
+
+    /// The shared token is worth `security.shared_token_scopes`; holding it is
+    /// not a licence to declare your own scopes.
+    #[tokio::test]
+    async fn connect_shared_token_cannot_escalate_by_asking() {
+        let mut gateway_config = GatewayConfig::default();
+        gateway_config.security.auth_mode = AuthMode::Token;
+        gateway_config.security.shared_token = Some("s3cret".to_string());
+        let state = Arc::new(make_test_state(gateway_config).await);
+        let conn = make_test_conn(&[]);
+        let resp = dispatch_connect(
+            &conn,
+            &state,
+            AuthMode::Token,
+            params(serde_json::json!({
+                "scopes": ["chat", "read", "admin"],
+                "auth": { "token": "s3cret" },
+            })),
+        )
+        .await;
+        assert!(resp.ok, "the shared token should authenticate: {:?}", resp.error);
+        let granted = resp.payload.as_ref().unwrap()["scopes_granted"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            granted,
+            vec![serde_json::json!("chat"), serde_json::json!("read")],
+            "the default shared-token entitlement, not the request"
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,15 @@ use crate::mcp::McpSettings;
 use crate::security::pairing::DmPolicy;
 
 /// Gateway configuration
+///
+/// `#[serde(default)]` is load-bearing, not cosmetic: several call sites parse
+/// a `config.toml` written by hand or by an older build straight into this
+/// type, and without it any file missing a single field fails to deserialize.
+/// The failure mode was the worst kind — the daemon logged a warning and
+/// carried on with `GatewayConfig::default()`, so *every* setting in the file
+/// was silently discarded, not just the missing one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GatewayConfig {
     /// Host to bind to
     pub host: String,
@@ -1076,6 +1084,47 @@ pub struct SecurityConfig {
     /// Shared secret token for simple authentication
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_token: Option<String>,
+
+    // ── Scope entitlements ───────────────────────────────────────────────
+    //
+    // What each credential is *worth*. A connection's granted scopes are the
+    // intersection of these with whatever the client asks for, so a client can
+    // narrow its access but never widen it (`protocol::resolve_scopes`). Keep
+    // the sets here rather than in code: granting `admin` to an unauthenticated
+    // local client has to be a visible decision in the config, not a default
+    // buried in a match arm.
+    /// Scopes granted to anonymous clients when `auth_mode = "none"`.
+    ///
+    /// Deliberately excludes `admin`: the local-only mode still runs a runtime
+    /// that executes shell commands and drives the desktop, so "reachable on
+    /// loopback" is not a reason to hand over the control plane.
+    #[serde(default = "default_local_scopes")]
+    pub local_scopes: Vec<String>,
+    /// Scopes granted to a client presenting `shared_token`.
+    #[serde(default = "default_shared_token_scopes")]
+    pub shared_token_scopes: Vec<String>,
+    /// Scopes granted to a paired device (`auth_mode = "device"`).
+    ///
+    /// Named per-deployment rather than per-device; a device-scoped entitlement
+    /// recorded at pairing time is the natural follow-up.
+    #[serde(default = "default_device_scopes")]
+    pub device_scopes: Vec<String>,
+    /// Browser origins allowed to open a WebSocket to `/ws`, in addition to the
+    /// gateway's own origins and the desktop (Tauri) ones.
+    ///
+    /// A browser always sends `Origin` on a WebSocket upgrade; a non-browser
+    /// client (CLI, TUI) sends none. Only Origins listed here — or the built-ins
+    /// — are accepted, which is what stops a web page the user visits from
+    /// driving the local runtime.
+    #[serde(default)]
+    pub allowed_ws_origins: Vec<String>,
+    /// Allow `auth_mode = "none"` on a non-loopback bind.
+    ///
+    /// Off by default: an unauthenticated listener on a reachable interface is
+    /// almost never what someone means, and the failure is silent otherwise.
+    #[serde(default)]
+    pub allow_non_loopback_without_auth: bool,
+
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
     /// Enable security headers
@@ -1177,6 +1226,34 @@ impl Default for TierConfig {
     }
 }
 
+/// Scopes an anonymous local client gets when `auth_mode = "none"`.
+///
+/// Chatting, reading and the write-side it needs (sessions, config, files) —
+/// but not `admin`, which is what made the old behaviour a privilege
+/// escalation rather than a convenience.
+pub fn default_local_scopes() -> Vec<String> {
+    vec![
+        crate::gateway::protocol::SCOPE_CHAT.to_string(),
+        crate::gateway::protocol::SCOPE_READ.to_string(),
+        crate::gateway::protocol::SCOPE_WRITE.to_string(),
+    ]
+}
+
+/// Scopes a client presenting `shared_token` gets: the same read-mostly pair a
+/// client gets by default.
+pub fn default_shared_token_scopes() -> Vec<String> {
+    vec![
+        crate::gateway::protocol::SCOPE_CHAT.to_string(),
+        crate::gateway::protocol::SCOPE_READ.to_string(),
+    ]
+}
+
+/// Scopes a paired device gets — the mobile and desktop apps need the write
+/// side to open sessions and drive tools.
+pub fn default_device_scopes() -> Vec<String> {
+    default_local_scopes()
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -1185,6 +1262,11 @@ impl Default for SecurityConfig {
             pairing_required: false,
             auth_mode: crate::gateway::protocol::AuthMode::None,
             shared_token: None,
+            local_scopes: default_local_scopes(),
+            shared_token_scopes: default_shared_token_scopes(),
+            device_scopes: default_device_scopes(),
+            allowed_ws_origins: Vec::new(),
+            allow_non_loopback_without_auth: false,
             rate_limit: RateLimitConfig::default(),
             security_headers: true,
             cors: crate::gateway::auth::CorsConfig::default(),
@@ -1731,6 +1813,33 @@ mod tests {
             toml_str.contains("[security.rate_limit]"),
             "security.rate_limit missing from default config"
         );
+
+        // A hand-written file with a handful of keys must load those keys and
+        // default the rest — not fail and take the whole file with it.
+        let partial = r#"
+host = "0.0.0.0"
+port = 12345
+model = "some-model"
+
+[security]
+auth_mode = "token"
+shared_token = "abc"
+"#;
+        let parsed: GatewayConfig =
+            toml::from_str(partial).expect("a partial config must deserialize");
+        assert_eq!(parsed.host, "0.0.0.0");
+        assert_eq!(parsed.port, 12345);
+        assert_eq!(parsed.model, "some-model", "specified fields win");
+        assert_eq!(parsed.security.auth_mode, crate::gateway::protocol::AuthMode::Token);
+        assert_eq!(parsed.security.shared_token.as_deref(), Some("abc"));
+        // Everything the file did not mention keeps its default.
+        assert_eq!(parsed.model_provider, default_model_provider());
+        assert_eq!(parsed.security.local_scopes, default_local_scopes());
+        assert!(parsed.security.allowed_ws_origins.is_empty());
+
+        // A genuinely malformed file must still be rejected, so the new
+        // leniency does not turn typos into silent defaults.
+        assert!(toml::from_str::<GatewayConfig>("port = \"not a number\"").is_err());
 
         let parsed: GatewayConfig =
             toml::from_str(&toml_str).expect("default config must re-parse");

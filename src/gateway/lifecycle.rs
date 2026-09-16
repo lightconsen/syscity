@@ -36,6 +36,11 @@ pub(crate) async fn start_gateway(
 ) -> crate::Result<()> {
     info!("Starting Syscity Gateway control plane...");
 
+    // Refuse to serve a configuration that leaves the control plane open, and
+    // say so loudly when it is merely risky. This has to happen before the
+    // listener exists: the point is to not come up at all.
+    crate::gateway::validate_auth_config(&config)?;
+
     // ── MCP presets: auto-create mcp.toml with defaults if missing ──
     {
         let mcps_path = state.paths.config_dir().join("mcp.toml");

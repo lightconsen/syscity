@@ -7,6 +7,8 @@ use axum::extract::Request;
 use axum::http::header;
 use serde::{Deserialize, Serialize};
 
+pub mod ws_origin;
+
 /// Session cookie configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCookieConfig {

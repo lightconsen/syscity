@@ -12,17 +12,46 @@ pub async fn ws_auth_middleware(
     mut req: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    // Check auth_mode — if "none", allow anonymous connections
-    let auth_mode = {
+    // Before credentials: is this upgrade coming from somewhere we will talk
+    // to at all? A browser reaches a loopback port from any page it likes, so
+    // the Origin and Host headers are the only thing standing between the local
+    // runtime and a drive-by connection.
+    let (auth_mode, bound_host, port, allowed_origins) = {
         let config = state.config.read().await;
-        config.security.auth_mode
+        (
+            config.security.auth_mode,
+            config.host.clone(),
+            config.port,
+            config.security.allowed_ws_origins.clone(),
+        )
     };
+    if let Err(reason) = crate::gateway::auth::ws_origin::check_upgrade(
+        req.headers(),
+        &bound_host,
+        port,
+        &allowed_origins,
+    ) {
+        warn!("WebSocket upgrade rejected: {}", reason);
+        return axum::http::Response::builder()
+            .status(axum::http::StatusCode::FORBIDDEN)
+            .body(axum::body::Body::from(format!("Forbidden: {reason}")))
+            .unwrap_or_else(|_| {
+                axum::http::Response::new(axum::body::Body::from("Forbidden".to_string()))
+            });
+    }
 
     if matches!(auth_mode, crate::gateway::protocol::AuthMode::None) {
-        // Allow anonymous access
+        // Anonymous local access. The entitlement is what the *config* says a
+        // local client is worth (`security.local_scopes`) — not a fixed pair
+        // and certainly not anything the client sends; the handshake narrows
+        // this further if the client asks for less.
+        let local_scopes = {
+            let config = state.config.read().await;
+            config.security.local_scopes.clone()
+        };
         req.extensions_mut().insert(WsAuthResult {
             user_id: UserId::new("anonymous"),
-            scopes: DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
+            scopes: local_scopes,
         });
         return next.run(req).await;
     }
@@ -81,7 +110,7 @@ async fn validate_ws_upgrade_request(
             if tok == shared_token {
                 return Ok(WsAuthResult {
                     user_id: UserId::new("shared"),
-                    scopes: DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
+                    scopes: config.security.shared_token_scopes.clone(),
                 });
             }
         }
@@ -90,7 +119,7 @@ async fn validate_ws_upgrade_request(
             if qt == shared_token {
                 return Ok(WsAuthResult {
                     user_id: UserId::new("shared"),
-                    scopes: DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
+                    scopes: config.security.shared_token_scopes.clone(),
                 });
             }
         }
@@ -418,48 +447,13 @@ async fn dispatch_method(
     };
     if let Some(required) = method_scope(&req.method) {
         if !scopes_allow(&scopes, &req.method) {
-            if req.method == "commands.execute" {
-                if let Some(ref params_val) = req.params {
-                    if let Ok(params) =
-                        serde_json::from_value::<serde_json::Value>(params_val.clone())
-                    {
-                        if let Some(session_id) = params.get("session_id").and_then(|v| v.as_str())
-                        {
-                            let command = params
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let user_text = format!("/{}", command);
-                            let error_text =
-                                format!("Command error: Missing required scope: {}", required);
-                            if let Some(ref store) = state.agents.store {
-                                if let Err(e) = store
-                                    .append_message(&AppendMessageParams {
-                                        session_id,
-                                        role: "user",
-                                        content: &user_text,
-                                        ..Default::default()
-                                    })
-                                    .await
-                                {
-                                    warn!("Failed to append user command message: {}", e);
-                                }
-                                if let Err(e) = store
-                                    .append_message(&AppendMessageParams {
-                                        session_id,
-                                        role: "assistant",
-                                        content: &error_text,
-                                        ..Default::default()
-                                    })
-                                    .await
-                                {
-                                    warn!("Failed to append assistant error message: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // A refused request must not touch anything. This branch used to
+            // append a `/cmd` + "Command error: …" pair to the session history
+            // for `commands.execute` — a write performed by a request that was
+            // rejected for lack of write scope, into a session id taken from
+            // the rejected request (which the store would happily create). The
+            // caller already receives the error and reports it itself.
+            warn!("Rejected {} for user {}: missing scope {}", req.method, ctx.user_id(), required);
             return error_forbidden(&req.id, required);
         }
     }
