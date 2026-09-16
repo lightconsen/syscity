@@ -91,7 +91,9 @@ impl PromptContext {
     /// Detect task type from user message
     pub fn detect_task_type(&mut self) {
         let msg = self.user_message.to_lowercase();
-        let words: Vec<&str> = msg.split_whitespace().collect();
+        // Counted, not collected: `split_whitespace()` below would report 1 for
+        // a whole sentence in a script that does not use spaces.
+        let word_count = approx_word_count(&self.user_message);
 
         // Score each task type with positive and negative signals
         let mut scores: Vec<(TaskType, i32)> = Vec::new();
@@ -296,9 +298,13 @@ impl PromptContext {
         }
 
         // Follow-up: explicitly flagged as follow-up, or very short message
-        // (<=3 words) with no strong signals from other categories.
+        // (<=3 words) with no strong signals from other categories. Note that
+        // the keyword lists above are English, so for a message in another
+        // language `scores` is empty by construction and this length test is
+        // what decides — which is exactly why it has to measure length in a
+        // way that works for the language in front of it.
         let is_follow_up = self.is_follow_up
-            || (words.len() <= 3 && !msg.contains("new session") && scores.is_empty());
+            || (word_count <= 3 && !msg.contains("new session") && scores.is_empty());
         if is_follow_up {
             scores.push((TaskType::FollowUp, 1));
         }
@@ -468,6 +474,48 @@ impl ConversationPhase {
 /// Count how many of the given substrings appear in `text`.
 fn count_matches(text: &str, needles: &[&str]) -> i32 {
     needles.iter().filter(|n| text.contains(*n)).count() as i32
+}
+
+/// True for scripts that are written without spaces between words.
+///
+/// The distinction matters to [`approx_word_count`] and nowhere else here: the
+/// keyword lists in [`PromptContext::detect_task_type`] are English, so a
+/// non-English message scores zero on every category and the only thing left
+/// deciding its `TaskType` is the length test.
+fn is_unspaced_script(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3040..=0x30FF     // hiragana, katakana
+        | 0x3400..=0x4DBF   // CJK unified ideographs extension A
+        | 0x4E00..=0x9FFF   // CJK unified ideographs
+        | 0xF900..=0xFAFF   // CJK compatibility ideographs
+        | 0xAC00..=0xD7AF   // hangul syllables
+    )
+}
+
+/// Approximate word count that does not collapse a spaceless script to one.
+///
+/// `split_whitespace().count()` reports 1 for a whole Chinese sentence, which
+/// the follow-up heuristic read as "very short message" — so a long, concrete
+/// Chinese request was classified as a follow-up to something else. Unspaced
+/// scripts are counted per character (a character is roughly a word), and
+/// everything else per run of alphanumerics.
+fn approx_word_count(text: &str) -> usize {
+    let mut words = 0;
+    let mut in_word = false;
+    for ch in text.chars() {
+        if is_unspaced_script(ch) {
+            words += 1;
+            in_word = false;
+        } else if ch.is_alphanumeric() {
+            if !in_word {
+                words += 1;
+                in_word = true;
+            }
+        } else {
+            in_word = false;
+        }
+    }
+    words
 }
 
 /// Dynamic prompt builder
@@ -754,6 +802,46 @@ mod tests {
         assert_eq!(section.name, "test");
         assert_eq!(section.priority, 8);
         assert!(section.token_estimate > 0);
+    }
+
+    /// A message in a script without spaces is not a "very short message".
+    ///
+    /// It used to be: `split_whitespace().count()` is 1 for a whole Chinese
+    /// sentence, so a concrete request was filed as a follow-up. The keyword
+    /// lists are English, so nothing else was going to catch it either.
+    #[test]
+    fn test_cjk_message_is_not_mistaken_for_a_follow_up() {
+        let mut ctx = PromptContext::new("帮我把这个项目的配置迁移到新的数据库，并且补上回归测试");
+        ctx.detect_task_type();
+        assert_ne!(ctx.task_type, TaskType::FollowUp);
+
+        // Genuinely short, in the same script, still reads as a follow-up.
+        let mut short = PromptContext::new("继续");
+        short.detect_task_type();
+        assert_eq!(short.task_type, TaskType::FollowUp);
+
+        // And the English behaviour is unchanged, short and long.
+        let mut english_short = PromptContext::new("go on");
+        english_short.detect_task_type();
+        assert_eq!(english_short.task_type, TaskType::FollowUp);
+
+        let mut english_long =
+            PromptContext::new("Explain how the scheduler decides when to wake an agent");
+        english_long.detect_task_type();
+        assert_ne!(english_long.task_type, TaskType::FollowUp);
+    }
+
+    #[test]
+    fn test_approx_word_count() {
+        assert_eq!(approx_word_count("go on"), 2);
+        assert_eq!(approx_word_count("  go   on  "), 2);
+        assert_eq!(approx_word_count(""), 0);
+        assert_eq!(approx_word_count("!!!"), 0);
+        // Each ideograph counts; spaces between them do not double-count.
+        assert_eq!(approx_word_count("继续"), 2);
+        assert_eq!(approx_word_count("继续 吧"), 3);
+        // Mixed: one English word plus four ideographs.
+        assert_eq!(approx_word_count("run 这个命令"), 1 + 4);
     }
 
     #[test]
