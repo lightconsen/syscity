@@ -19,6 +19,7 @@ mod auth;
 mod capability;
 mod channel;
 mod config_cmd;
+mod cost;
 mod cron;
 mod daemon;
 mod device;
@@ -47,6 +48,7 @@ pub use audit::AuditCommands;
 pub use auth::AuthCommands;
 pub use channel::ChannelCommands;
 pub use config_cmd::ConfigCommands;
+pub use cost::CostCommands;
 pub use cron::CronCommands;
 pub use device::DeviceCommands;
 pub use doctor::DoctorCommands;
@@ -296,6 +298,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ApprovalCommands,
     },
+    Cost {
+        /// Cost-guard subcommand
+        #[command(subcommand)]
+        command: CostCommands,
+    },
     /// Audit log and security audit
     Audit {
         /// Audit subcommand
@@ -501,6 +508,7 @@ impl Cli {
             Commands::Setup => setup::run_setup().await,
             Commands::Device { command } => device::run_device_command(command).await,
             Commands::Approval { command } => approval::run_approval_command(command).await,
+            Commands::Cost { command } => cost::run_cost_command(command).await,
             Commands::Audit { command } => audit::run_audit_command(command).await,
             Commands::Auth { command } => auth::run_auth_command(command).await,
             Commands::Provider { command } => provider::run_provider_command(command, config).await,

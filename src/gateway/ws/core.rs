@@ -746,6 +746,8 @@ async fn dispatch_method(
         "providers.switch" => admin_ws::handle_providers_switch(req, state).await,
         "models.default" => admin_ws::handle_models_default(req, state).await,
         "traces.get" => admin_ws::handle_traces_get(req, state).await,
+        "cost.get" => admin_ws::handle_cost_get(req, state).await,
+        "cost.reset" => admin_ws::handle_cost_reset(req, state).await,
         "status.get" => admin_ws::handle_status_get(req, state).await,
         "audit.recent" => admin_ws::handle_audit_recent(req, state).await,
         "audit.all" => admin_ws::handle_audit_all(req, state).await,

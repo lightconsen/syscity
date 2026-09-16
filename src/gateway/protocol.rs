@@ -272,6 +272,7 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "agents.registry"
         | "health"
         | "system.presence"
+        | "cost.get"
         | "commands.list"
         | "config.get"
         | "models.list"
@@ -353,6 +354,7 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "agents.delete"
         | "agents.purge"
         | "agents.rename"
+        | "cost.reset"
         | "sessions.rename"
         | "sessions.set_pinned"
         | "sessions.set_model"
@@ -1019,6 +1021,7 @@ mod tests {
         assert_eq!(method_scope("models.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("models.presets"), Some(SCOPE_READ));
         assert_eq!(method_scope("models.default"), Some(SCOPE_READ));
+        assert_eq!(method_scope("cost.get"), Some(SCOPE_READ));
         assert_eq!(method_scope("cron.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("skills.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("logs.subscribe"), Some(SCOPE_READ));
@@ -1059,6 +1062,7 @@ mod tests {
                 "{method} mutates state or hands out credentials"
             );
         }
+        assert_eq!(method_scope("cost.reset"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("agents.purge"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("agents.rename"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("sessions.create"), Some(SCOPE_WRITE));

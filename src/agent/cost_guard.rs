@@ -5,7 +5,11 @@
 //! provider call in `Agent::get_completion()`.
 //!
 //! Counters auto-reset every 24 h (daily) and 1 h (hourly) without requiring
-//! a cron job.
+//! a cron job — including *after* a limit has tripped: the reset is evaluated
+//! on the read path (`is_exceeded`), because a tripped guard refuses every
+//! provider call and so would otherwise never reach the write path that used
+//! to be the only place the windows were checked. `reset_exceeded` remains for
+//! an operator who wants to clear it immediately (`cost.reset` over WS).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,8 +65,14 @@ impl CostGuard {
     }
 
     /// Returns `true` if any spending or rate limit has been exceeded.
-    #[inline]
+    ///
+    /// Evaluates the windows first. This is load-bearing: once the guard trips,
+    /// every provider call is refused, so `record_usage` — and with it the only
+    /// other call to [`Self::maybe_reset`] — never runs again. Without the
+    /// check here the hourly and daily rollovers could never clear the flag,
+    /// and a tripped guard stayed tripped until the process restarted.
     pub fn is_exceeded(&self) -> bool {
+        self.maybe_reset();
         self.budget_exceeded.load(Ordering::Acquire)
     }
 
@@ -107,7 +117,31 @@ impl CostGuard {
     }
 
     /// Manually reset the exceeded flag (e.g. after a config change).
+    ///
+    /// Clears only the latch: the window's counters are untouched, so if the
+    /// limit was not also raised, the next successful call trips it again. Use
+    /// [`Self::clear_and_rebase`] to start a fresh window.
     pub fn reset_exceeded(&self) {
+        self.budget_exceeded.store(false, Ordering::Release);
+    }
+
+    /// Clear the latch *and* start a fresh window.
+    ///
+    /// This is the operator's "let me work again" path (`cost.reset` over WS):
+    /// zeroing the counters is what makes it more than a one-call reprieve. It
+    /// overrides a guardrail deliberately, which is why it is reachable only by
+    /// an explicit `write`-scoped request — the agent itself never calls it.
+    pub fn clear_and_rebase(&self) {
+        self.daily_cents.store(0, Ordering::Release);
+        self.hourly_actions.store(0, Ordering::Release);
+        *self
+            .last_daily_reset
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = SystemTime::now();
+        *self
+            .last_hourly_reset
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.budget_exceeded.store(false, Ordering::Release);
     }
 
@@ -209,6 +243,72 @@ mod tests {
         assert!(guard.is_exceeded());
         guard.reset_exceeded();
         assert!(!guard.is_exceeded());
+    }
+
+    /// The operator path must leave the agent *working*, not grant a single
+    /// call: with the counters left over the limit, the next call would
+    /// re-trip immediately.
+    #[test]
+    fn test_clear_and_rebase_starts_a_fresh_window() {
+        let guard = CostGuard::new(0, 1);
+        guard.record_usage(0, 0, "claude-3-haiku");
+        assert!(guard.is_exceeded(), "one call hits a limit of one");
+
+        guard.clear_and_rebase();
+
+        assert!(!guard.is_exceeded());
+        assert_eq!(guard.hourly_action_count(), 0, "the window's count is reset");
+        assert_eq!(guard.daily_spend_cents(), 0);
+        // And the window is usable again: one more call fits.
+        guard.record_usage(0, 0, "claude-3-haiku");
+        assert!(guard.is_exceeded(), "the limit still applies to the fresh window");
+    }
+
+    /// A tripped guard must clear itself when the window rolls over.
+    ///
+    /// The flag is read before every provider call, and a tripped guard makes
+    /// no further calls — so if the rollover were only evaluated on the *write*
+    /// path, a tripped guard could never clear itself and the agent stayed
+    /// wedged until the process restarted.
+    #[test]
+    fn test_cost_guard_clears_when_the_hour_rolls_over() {
+        let guard = CostGuard {
+            daily_cents: AtomicU64::new(0),
+            daily_limit_cents: 0,
+            hourly_actions: AtomicU64::new(2),
+            hourly_action_limit: 2,
+            budget_exceeded: AtomicBool::new(true),
+            last_daily_reset: Mutex::new(SystemTime::now()),
+            last_hourly_reset: Mutex::new(Instant::now()),
+        };
+        assert!(guard.is_exceeded(), "a tripped guard reports exceeded");
+
+        // An hour passes.
+        *guard.last_hourly_reset.lock().unwrap() = Instant::now() - Duration::from_secs(3_601);
+
+        assert!(!guard.is_exceeded(), "the hour rolling over must clear the flag");
+        assert_eq!(guard.hourly_action_count(), 0, "and reset the counter");
+    }
+
+    /// The same for the daily window, which only clears when no hourly limit
+    /// is also tripped.
+    #[test]
+    fn test_cost_guard_clears_when_the_day_rolls_over() {
+        let guard = CostGuard {
+            daily_cents: AtomicU64::new(500),
+            daily_limit_cents: 500,
+            hourly_actions: AtomicU64::new(0),
+            hourly_action_limit: 0,
+            budget_exceeded: AtomicBool::new(true),
+            last_daily_reset: Mutex::new(SystemTime::now()),
+            last_hourly_reset: Mutex::new(Instant::now()),
+        };
+        assert!(guard.is_exceeded());
+
+        *guard.last_daily_reset.lock().unwrap() = SystemTime::now() - Duration::from_secs(86_401);
+
+        assert!(!guard.is_exceeded(), "the day rolling over must clear the flag");
+        assert_eq!(guard.daily_spend_cents(), 0);
     }
 
     #[test]
