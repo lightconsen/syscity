@@ -432,7 +432,13 @@ async fn try_reconnect(
             drop(s);
             if let Some(id) = session {
                 if let Some(client) = ws.as_mut() {
-                    let _ = gw::sessions_subscribe(client, &id).await;
+                    if let Err(e) = gw::sessions_subscribe(client, &id).await {
+                        state
+                            .write()
+                            .await
+                            .transcript
+                            .push_notice(format!("⚠ reconnected but not subscribed to {id}: {e}"));
+                    }
                 }
             }
         }

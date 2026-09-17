@@ -110,16 +110,34 @@ async fn command_new(
 ) -> Result<(), TuiError> {
     let agent = (!args.trim().is_empty()).then(|| args.trim().to_string());
     let session_id = gw::sessions_create(ws, agent.as_deref()).await?;
-    let mut s = state.write().await;
-    if let Some(old) = s.current_session.take() {
-        let _ = gw::sessions_unsubscribe(ws, &old).await;
+
+    // The gateway work happens *before* the lock is taken. Holding `AppState`
+    // across a round-trip queues every other writer behind the network, and
+    // the moment handlers stop running inside the event loop it stops being a
+    // delay and becomes a deadlock.
+    let previous = { state.read().await.current_session.clone() };
+    if let Some(old) = previous.filter(|old| old != &session_id) {
+        // Without this the connection keeps receiving the old session's deltas.
+        if let Err(e) = gw::sessions_unsubscribe(ws, &old).await {
+            state.write().await.transcript.push_notice(format!(
+                "⚠ could not unsubscribe from {old}: {e} — its events may still arrive"
+            ));
+        }
     }
     gw::sessions_subscribe(ws, &session_id).await?;
+
+    let mut s = state.write().await;
     s.current_session = Some(session_id.clone());
     s.current_agent = agent;
+    // Anything queued belongs to the session being left behind.
+    let dropped = s.clear_queue();
     s.transcript.reset();
     s.transcript
         .push_notice(format!("── new session {session_id} ──"));
+    if dropped > 0 {
+        s.transcript
+            .push_notice(format!("⚠ {dropped} queued message(s) dropped"));
+    }
     Ok(())
 }
 
@@ -648,6 +666,8 @@ async fn execute_remote_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::tui::test_gateway::TestGateway;
 
     /// A state and client on the test gateway.
@@ -706,6 +726,36 @@ mod tests {
             })
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "oldest first: {positions:?}");
+    }
+
+    /// `/new` does not hold the state lock across the gateway.
+    ///
+    /// It used to: `state.write()` was taken, then two requests were awaited
+    /// inside the guard. Today that only queues other writers behind a
+    /// round-trip. It is a precondition for moving handlers off the event
+    /// loop, where the same code would deadlock instead of merely stall.
+    #[tokio::test]
+    async fn new_session_does_not_hold_the_state_lock() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = connect(&gateway).await;
+        state.write().await.current_session = Some("old".to_string());
+        // Park `command_new` in the middle of its gateway work.
+        gateway.hold("sessions.subscribe");
+
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { command_new("", state, &mut client).await }
+        });
+        gateway
+            .wait_for("sessions.subscribe", Duration::from_secs(5))
+            .await;
+
+        // While that request is in flight, the state must be readable at once.
+        let free = tokio::time::timeout(Duration::from_millis(500), state.write()).await;
+        assert!(free.is_ok(), "the state lock is held across the gateway call");
+        drop(free);
+
+        task.abort();
     }
 
     /// An unreadable count is a usage error, not a gateway call.

@@ -38,6 +38,7 @@ pub struct TestGateway {
     failures: Arc<Mutex<HashMap<String, String>>>,
     upgrade_headers: Arc<Mutex<Vec<(String, String)>>>,
     history: Arc<Mutex<Vec<Value>>>,
+    held: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestGateway {
@@ -57,6 +58,8 @@ impl TestGateway {
         let header_sink = Arc::clone(&upgrade_headers);
         let history: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let stored = Arc::clone(&history);
+        let held: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let on_hold = Arc::clone(&held);
 
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
@@ -100,7 +103,8 @@ impl TestGateway {
                                 method: method.clone(),
                                 params: params.clone(),
                             });
-                        if mute.load(std::sync::atomic::Ordering::SeqCst) {
+                        let on_hold = on_hold.lock().expect("held methods").contains(&method);
+                        if mute.load(std::sync::atomic::Ordering::SeqCst) || on_hold {
                             // Recorded, deliberately unanswered: a request left
                             // in flight.
                             continue;
@@ -141,7 +145,20 @@ impl TestGateway {
             failures,
             upgrade_headers,
             history,
+            held,
         }
+    }
+
+    /// Take `method`: accept it, record it, and never answer it.
+    ///
+    /// For a test that needs the client parked mid-call — the difference
+    /// between "slow" and "never" is what makes a lock held across a request
+    /// observable instead of a race.
+    pub fn hold(&self, method: &str) {
+        self.held
+            .lock()
+            .expect("held methods")
+            .push(method.to_string());
     }
 
     /// Serve these messages from `chat.history`, oldest first.

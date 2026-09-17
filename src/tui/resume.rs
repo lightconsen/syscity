@@ -100,16 +100,22 @@ pub async fn switch_to(
     state: &Arc<RwLock<AppState>>,
     ws: &mut WsClient,
 ) -> Result<(), TuiError> {
-    let previous = state.read().await.current_session.clone();
+    let previous = { state.read().await.current_session.clone() };
     if let Some(previous) = previous.filter(|p| p != id) {
         // Without this the connection keeps receiving the old session's deltas.
-        let _ = gw::sessions_unsubscribe(ws, &previous).await;
+        if let Err(e) = gw::sessions_unsubscribe(ws, &previous).await {
+            state.write().await.transcript.push_notice(format!(
+                "⚠ could not unsubscribe from {previous}: {e} — its events may still arrive"
+            ));
+        }
     }
     gw::sessions_subscribe(ws, id).await?;
 
     {
         let mut s = state.write().await;
         s.transcript.reset();
+        // A queued message was written for the session being left.
+        s.clear_queue();
         s.current_session = Some(id.to_string());
         s.current_agent = s
             .sessions
