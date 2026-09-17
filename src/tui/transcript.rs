@@ -319,6 +319,18 @@ impl Transcript {
         }
     }
 
+    /// Close every open stream, keeping whatever text already arrived.
+    ///
+    /// For a turn that cannot be completed — an abort, a dropped connection.
+    /// The text did arrive; it just never got an ending, and leaving the
+    /// stream open would keep it in the live region forever.
+    pub fn finish_open_streams(&mut self) {
+        let open: Vec<String> = self.streams.iter().map(|(id, _)| id.clone()).collect();
+        for id in open {
+            self.finish_stream(&id, None);
+        }
+    }
+
     /// Drop in-flight streams (session switch, `/clear`).
     ///
     /// Scrollback is the terminal's and is deliberately untouched.
@@ -485,6 +497,22 @@ mod tests {
         t.push_delta("m1", LineKind::Assistant, "live one\nlive two");
         assert_eq!(texts(&t.preview(10)), vec!["live one", "live two"]);
         assert_eq!(texts(&t.preview(1)), vec!["live two"]);
+    }
+
+    /// Closing an open stream keeps what arrived and ends it, so nothing is
+    /// left sitting in the live region.
+    #[test]
+    fn finish_open_streams_flushes_what_arrived() {
+        let mut t = Transcript::new();
+        t.push_delta("assistant", LineKind::Assistant, "half a line\nand a tail");
+        t.push_delta("thinking", LineKind::Reasoning, "still thinking");
+        t.finish_open_streams();
+
+        let flushed: Vec<String> = t.take_flushable().into_iter().map(|l| l.text).collect();
+        assert!(flushed.contains(&"half a line".to_string()));
+        assert!(flushed.contains(&"and a tail".to_string()));
+        assert!(flushed.contains(&"still thinking".to_string()));
+        assert!(t.preview(10).is_empty(), "nothing is left live");
     }
 
     #[test]

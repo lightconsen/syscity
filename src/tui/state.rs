@@ -428,6 +428,42 @@ impl AppState {
         self.run_started = None;
     }
 
+    /// Converge to "nothing is in flight" after the connection is lost.
+    ///
+    /// Neither a run nor a prompt can make progress without the gateway, and
+    /// both lie if they stay set: the status row spins "running" forever, and
+    /// a pending approval owns the keyboard, so the composer swallows every
+    /// keystroke. Whatever is dropped is said out loud — silently discarding
+    /// a prompt the user was looking at would be worse than the lock-up.
+    pub fn connection_lost(&mut self, reason: impl Into<String>) {
+        self.connection = ConnectionState::Lost(reason.into());
+        let was_running = self.is_running;
+        self.end_run();
+        self.transcript.finish_open_streams();
+
+        let dropped_approvals = self.approvals.len();
+        self.approvals.clear();
+        self.approval_approve_selected = true;
+        let dropped_ask = self.pending_ask.take().is_some();
+        self.ask_input.clear();
+        self.live_mode = LiveMode::Composer;
+
+        if was_running {
+            self.transcript.push_notice("── the run was interrupted ──");
+        }
+        if dropped_approvals > 0 {
+            self.transcript.push_notice(format!(
+                "⚠ {dropped_approvals} pending approval(s) dropped — the gateway times them out \
+                 unless another client answers"
+            ));
+        }
+        if dropped_ask {
+            self.transcript.push_notice(
+                "⚠ the pending question was dropped — ask the agent again once reconnected",
+            );
+        }
+    }
+
     /// Seconds the current run has been going, if any.
     pub fn run_elapsed_secs(&self) -> Option<u64> {
         self.run_started.map(|t| t.elapsed().as_secs())
@@ -487,6 +523,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::transcript::LineKind;
 
     fn typing(state: &mut AppState, text: &str) {
         for c in text.chars() {
@@ -605,6 +642,55 @@ mod tests {
         s.end_run();
         s.set_status("hello");
         assert!(s.advance_animations() || s.status.is_some());
+    }
+
+    /// Losing the connection converges the run state, and says what it dropped.
+    #[test]
+    fn a_lost_connection_clears_the_run_and_the_prompts() {
+        let mut s = AppState::default();
+        s.begin_run();
+        s.approvals.push_back(ApprovalDetail::default());
+        s.pending_ask = Some(AskPrompt::default());
+        s.live_mode = LiveMode::Approval;
+        s.transcript
+            .push_delta("assistant", LineKind::Assistant, "half an answer");
+
+        s.connection_lost("gateway went away");
+
+        assert!(!s.is_running, "no run survives the gateway");
+        assert_eq!(s.run_started, None);
+        assert!(s.approvals.is_empty(), "a prompt that owns the keyboard cannot be left set");
+        assert!(s.pending_ask.is_none());
+        assert_eq!(s.live_mode, LiveMode::Composer, "the composer takes the input back");
+        assert!(matches!(s.connection, ConnectionState::Lost(_)));
+
+        let flushed: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(flushed.iter().any(|l| l.contains("half an answer")), "got {flushed:?}");
+        assert!(flushed.iter().any(|l| l.contains("run was interrupted")), "got {flushed:?}");
+        assert!(
+            flushed.iter().any(|l| l.contains("approval")),
+            "a dropped prompt is said out loud: {flushed:?}"
+        );
+        assert!(s.transcript.preview(10).is_empty(), "nothing is left live");
+    }
+
+    /// Converging twice is harmless — a reconnect can drop again.
+    #[test]
+    fn a_second_loss_drops_nothing_and_says_nothing_new() {
+        let mut s = AppState::default();
+        s.connection_lost("gone");
+        let first = s.transcript.take_flushable().len();
+        s.connection_lost("gone again");
+        assert_eq!(
+            s.transcript.take_flushable().len(),
+            0,
+            "no run and no prompt means nothing to report (first loss queued {first} lines)"
+        );
     }
 
     #[test]

@@ -41,6 +41,15 @@ pub enum TuiError {
     Serialization(#[from] serde_json::Error),
 }
 
+/// A backend that cannot fail — ratatui's `TestBackend` is one — has no error
+/// to convert. Without this, `event_loop::run` could only be driven by a real
+/// terminal backend, and the loop would stay untested.
+impl From<std::convert::Infallible> for TuiError {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
 impl TuiError {
     /// Build a gateway error from code and message.
     #[allow(dead_code)]

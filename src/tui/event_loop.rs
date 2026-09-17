@@ -48,13 +48,17 @@ enum Event {
 }
 
 /// Run the TUI until the user quits or a fatal error occurs.
-pub async fn run<B: Backend<Error = io::Error>>(
+pub async fn run<B>(
     terminal: &mut Terminal<B>,
     state: Arc<RwLock<AppState>>,
     ws_client: WsClient,
     endpoint: Endpoint,
     session: SessionChoice,
-) -> Result<(), TuiError> {
+) -> Result<(), TuiError>
+where
+    B: Backend,
+    TuiError: From<B::Error>,
+{
     let mut ws = Some(ws_client);
     let mut backoff = Backoff::new();
     let mut reconnect_at: Option<Instant> = None;
@@ -91,9 +95,9 @@ pub async fn run<B: Backend<Error = io::Error>>(
                 state.write().await.dirty = true;
                 ws = None;
                 let mut s = state.write().await;
-                s.connection = ConnectionState::Lost("gateway went away".to_string());
                 s.transcript
                     .push_notice("⚠ lost the gateway — reconnecting…");
+                s.connection_lost("gateway went away");
                 drop(s);
                 schedule_reconnect(&mut backoff, &mut reconnect_at);
             }
@@ -205,10 +209,14 @@ async fn startup(
 }
 
 /// Flush graduated lines, then repaint the live region.
-async fn redraw<B: Backend<Error = io::Error>>(
+async fn redraw<B>(
     terminal: &mut Terminal<B>,
     state: &Arc<RwLock<AppState>>,
-) -> Result<(), TuiError> {
+) -> Result<(), TuiError>
+where
+    B: Backend,
+    TuiError: From<B::Error>,
+{
     let (pending, dirty) = {
         let mut s = state.write().await;
         (s.transcript.take_flushable(), s.dirty)
@@ -1052,6 +1060,41 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// The async form, for conditions that live behind a lock.
+    async fn eventually_async<F, Fut>(mut check: F, what: &str)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while tokio::time::Instant::now() < deadline {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A terminal with an inline viewport and a real scrollback, as
+    /// `tests/tui_inline.rs` builds one.
+    fn inline_terminal() -> Terminal<ratatui::backend::TestBackend> {
+        use ratatui::TerminalOptions;
+        use ratatui::Viewport;
+
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::TestBackend::new(60, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(live::LIVE_HEIGHT),
+            },
+        )
+        .expect("inline terminal");
+        terminal
+            .set_cursor_position(ratatui::layout::Position::new(0, 0))
+            .expect("cursor home");
+        terminal
+    }
+
     /// A `Write` sink the test can read back.
     #[derive(Clone, Default)]
     struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1222,6 +1265,70 @@ mod tests {
         run.await.expect("join").expect("line mode exits cleanly");
         let text = out.text();
         assert_eq!(text.matches("pong from the model").count(), 1, "got {text:?}");
+    }
+
+    /// Losing the connection converges the loop's state, not just the client's.
+    ///
+    /// Driver the real [`run`] against the test gateway: a run in progress and
+    /// a pending approval, then the socket goes away. Neither can make
+    /// progress without a gateway, and a pending approval owns the keyboard —
+    /// left set, it swallows every keystroke and the composer is unreachable.
+    #[tokio::test]
+    async fn a_lost_connection_converges_the_running_loop() {
+        let gateway = TestGateway::start().await;
+        let state = Arc::new(RwLock::new(AppState::default()));
+        {
+            let mut s = state.write().await;
+            s.begin_run();
+            s.approvals.push_back(ApprovalDetail {
+                id: "ap1".to_string(),
+                tool_name: "file_write".to_string(),
+                ..Default::default()
+            });
+            s.live_mode = LiveMode::Approval;
+            s.transcript
+                .push_delta(STREAM_ASSISTANT, LineKind::Assistant, "half an answer");
+        }
+
+        let auth = crate::tui::auth::AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        let (client, _hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+
+        let driver = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let mut terminal = inline_terminal();
+                run(&mut terminal, state, client, test_endpoint(gateway.port), SessionChoice::New)
+                    .await
+            }
+        });
+
+        gateway.close().await;
+        eventually_async(
+            || {
+                let state = Arc::clone(&state);
+                async move { !state.read().await.is_running }
+            },
+            "the run to end",
+        )
+        .await;
+
+        {
+            let s = state.read().await;
+            assert!(matches!(s.connection, ConnectionState::Lost(_)));
+            assert!(s.approvals.is_empty(), "a prompt that cannot be answered is not kept");
+            assert_eq!(s.live_mode, LiveMode::Composer, "the composer takes the input back");
+            assert!(s.pending_ask.is_none());
+            assert!(
+                s.transcript.preview(10).is_empty(),
+                "nothing is left hanging in the live region"
+            );
+        }
+
+        state.write().await.should_quit = true;
+        driver.await.expect("join").expect("the loop exits");
     }
 
     #[test]
