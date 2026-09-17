@@ -901,6 +901,12 @@ impl PlainIo {
 /// No cursor addressing and no raw mode: input is read line by line, output is
 /// printed as it arrives. Enough for `echo "…" | syscity tui > out.txt`, and a
 /// safe landing spot when the terminal cannot do an inline viewport.
+///
+/// The transcript is the only writer: a line is printed when it graduates out
+/// of the transcript, so nothing is printed twice and nothing needs to know
+/// which path a line came from. Streaming therefore shows up at line
+/// granularity — a partial line waits for its newline — which is what a pipe
+/// or a file wants anyway.
 pub async fn run_plain(endpoint: Endpoint, session: SessionChoice) -> Result<(), TuiError> {
     run_plain_with(endpoint, session, PlainIo::stdio()).await
 }
@@ -987,18 +993,11 @@ pub async fn run_plain_with(
                         break;
                     }
                     WsMessage::Event(event) => {
-                        // Stream deltas straight out; everything else goes
-                        // through the transcript and is drained below.
-                        if event.event == "chat.delta" {
-                            if let Some(text) = event.payload.as_ref().and_then(|p| p["content"].as_str()) {
-                                print!("{text}");
-                                let _ = io::stdout().flush();
-                                continue;
-                            }
-                        }
-                        if event.event == "chat.final" {
-                            println!();
-                        }
+                        // Every event goes through the transcript, which is
+                        // then drained to the writer. Deltas that also went
+                        // straight to stdout came out twice: once as they
+                        // arrived, and again when `chat.final` re-stated the
+                        // whole turn.
                         handle_event(event, &state, &mut ws).await;
                     }
                     WsMessage::OrphanResponse(_) => {}
@@ -1175,6 +1174,66 @@ mod tests {
 
         gateway.close().await;
         run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// A streamed answer reaches the writer as it arrives, and exactly once.
+    ///
+    /// Line mode used to print each `chat.delta` with `print!` *and* let
+    /// `chat.final` re-emit the whole turn through the transcript, so a
+    /// streamed response came out twice — the deltas, a blank line, then the
+    /// whole thing again. Routing every event through the transcript is what
+    /// makes "printed once" true by construction.
+    #[tokio::test]
+    async fn a_streamed_answer_is_printed_once() {
+        let gateway = TestGateway::start().await;
+        let (io, out) = plain_io("hello\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        gateway.wait_for("chat.send", PATIENCE).await;
+        gateway.push_event(
+            "chat.delta",
+            serde_json::json!({ "session_id": "s1", "content": "pong from the model\n" }),
+        );
+        // It graduates when it arrives, not when the turn closes.
+        eventually(|| out.text().contains("pong from the model"), "the streamed line").await;
+
+        gateway.push_event(
+            "chat.final",
+            serde_json::json!({
+                "session_id": "s1",
+                "response": "pong from the model\n",
+            }),
+        );
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+
+        let text = out.text();
+        assert_eq!(
+            text.matches("pong from the model").count(),
+            1,
+            "printed once, not twice: {text:?}"
+        );
+    }
+
+    /// A non-streaming turn — `chat.final` alone — still prints once: the
+    /// transcript's "no deltas ever arrived" path covers it.
+    #[tokio::test]
+    async fn a_non_streaming_answer_is_printed_once() {
+        let gateway = TestGateway::start().await;
+        let (io, out) = plain_io("hello\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        gateway.wait_for("chat.send", PATIENCE).await;
+        gateway.push_event(
+            "chat.final",
+            serde_json::json!({ "session_id": "s1", "response": "pong from the model\n" }),
+        );
+        eventually(|| out.text().contains("pong from the model"), "the answer").await;
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+        let text = out.text();
+        assert_eq!(text.matches("pong from the model").count(), 1, "got {text:?}");
     }
 
     #[test]

@@ -147,7 +147,10 @@ already above. Output produced while offline is lost, which the notice says.
 - Frozen lines are wrapped at the width they were written with. Resizing the
   window afterwards reflows them the way any other scrollback text reflows.
 - Non-tty stdout (a pipe or a file) degrades to line mode: no raw mode, no
-  cursor addressing, one line per event.
+  cursor addressing. Lines are read from stdin (a blank one is ignored, a `/`
+  one is a command) and printed as the transcript graduates them, so a
+  streamed answer arrives a line at a time rather than a token at a time —
+  a partial line waits for its newline.
 
 ## Testing
 
