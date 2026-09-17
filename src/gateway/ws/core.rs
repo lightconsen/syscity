@@ -1238,6 +1238,84 @@ mod tests {
         assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN");
     }
 
+    /// The scope table is this gateway's authorization contract, and it is
+    /// hand-maintained: nothing checks that a *label* is right, only that one
+    /// exists (`every_dispatched_method_declares_a_scope`). A batch of
+    /// side-effecting methods was once filed under `read`, which let a
+    /// read-only client change the model, install skills and call MCP tools.
+    ///
+    /// The expectations below are written out rather than read from
+    /// `method_scope`, because a test that asks the table what it says cannot
+    /// notice the table being wrong. For each method: the label it must carry,
+    /// a connection without it being refused, and one with it getting through
+    /// the check (the handler may then fail for its own reasons — that is not
+    /// this test's business).
+    #[tokio::test]
+    async fn sensitive_methods_require_the_scope_they_declare() {
+        use crate::gateway::protocol::{SCOPE_ADMIN, SCOPE_CHAT, SCOPE_READ, SCOPE_WRITE};
+
+        let expectations: &[(&str, &str)] = &[
+            // Writes: a read-only client must not reach any of these.
+            ("models.add", SCOPE_WRITE),
+            ("models.remove", SCOPE_WRITE),
+            ("models.set_default", SCOPE_WRITE),
+            ("models.fetch_remote", SCOPE_WRITE),
+            ("skills.install", SCOPE_WRITE),
+            ("skills.uninstall", SCOPE_WRITE),
+            ("mcp.call_tool", SCOPE_WRITE),
+            ("sessions.create", SCOPE_WRITE),
+            ("sessions.delete", SCOPE_WRITE),
+            ("channels.enable", SCOPE_WRITE),
+            // The pairing code is the key to a device: taking it must not be
+            // something a read-only client can do.
+            ("device.pairing.qr", SCOPE_WRITE),
+            ("device.pairing.setup", SCOPE_WRITE),
+            ("device.pairing.approve", SCOPE_WRITE),
+            // Reads.
+            ("sessions.list", SCOPE_READ),
+            ("models.default", SCOPE_READ),
+            ("health", SCOPE_READ),
+            // Chat.
+            ("chat.send", SCOPE_CHAT),
+            ("chat.abort", SCOPE_CHAT),
+            // Anything unlisted is admin by the default-deny arm.
+            ("definitely.not.a.method", SCOPE_ADMIN),
+        ];
+
+        for (method, required) in expectations {
+            assert_eq!(
+                method_scope(method),
+                Some(*required),
+                "'{method}' must be declared {required}"
+            );
+
+            // A connection with only the *weaker* scopes is refused. `read` is
+            // the interesting one: it is what an untrusted client is most
+            // likely to hold.
+            for weak in [vec![SCOPE_CHAT], vec![SCOPE_READ], vec![]] {
+                if weak.contains(required) {
+                    continue;
+                }
+                let conn = make_test_conn(&weak);
+                let resp = dispatch(&conn, &req("r1", method, Some(serde_json::json!({})))).await;
+                assert_eq!(
+                    resp.error.as_ref().map(|e| e.code.as_str()),
+                    Some("FORBIDDEN"),
+                    "'{method}' must be refused to a client holding {weak:?}"
+                );
+            }
+
+            // With the scope it declares, the call gets past the check.
+            let conn = make_test_conn(&[*required]);
+            let resp = dispatch(&conn, &req("r1", method, Some(serde_json::json!({})))).await;
+            assert_ne!(
+                resp.error.as_ref().map(|e| e.code.as_str()),
+                Some("FORBIDDEN"),
+                "'{method}' must be reachable with {required}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_commands_execute_without_scope_forbidden() {
         // A scope-refused `commands.execute` is answered and nothing else
