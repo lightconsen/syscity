@@ -272,7 +272,7 @@ Query 参数：
 | 模式 | 说明 |
 |------|-------------|
 | `none` | 无鉴权。仅用于本地开发。 |
-| `token` | 共享 secret token（通过 `SYSCITY_GATEWAY_TOKEN` 环境变量或配置） |
+| `token` | 共享 secret token。CLI 从 `SYSCITY_GATEWAY_TOKEN` 环境变量或配置的 `security.shared_token` 读取（见 `docs/security-config.md`）；网关自身只从配置文件读 |
 | `device` | 需要设备配对。新设备须经管理员批准。 |
 | `tailscale` | 通过 Tailscale identity header 自动鉴权 |
 

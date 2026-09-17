@@ -58,8 +58,33 @@ fn gateway_config_endpoint() -> Option<(String, u16)> {
 /// Invoke one WS method on the daemon and return the response payload.
 pub async fn call(method: &str, params: Value) -> crate::Result<Value> {
     let (host, port) = endpoint();
-    let client = DaemonClient::with_ws(&host, port);
+    let client = DaemonClient::with_ws(&host, port).with_token(gateway_token());
     client.ws_call(method, params).await
+}
+
+/// The credential to present to the gateway, if any.
+///
+/// Sources, in order:
+///
+/// 1. `SYSCITY_GATEWAY_TOKEN` — the name `docs/protocol.md` has always
+///    documented for this, and which nothing read until now.
+/// 2. `security.shared_token` from the same `config.toml` the endpoint comes
+///    from. The CLI runs on the operator's machine and reads their config
+///    already; requiring the token to be exported as well would make every
+///    command fail on a token-mode gateway for no gain.
+///
+/// `auth_mode = "none"` (the local default) needs neither.
+fn gateway_token() -> Option<String> {
+    if let Some(token) = env_or("SYSCITY_GATEWAY_TOKEN") {
+        return Some(token);
+    }
+    let path = crate::dirs::paths().default_config_file();
+    let content = std::fs::read_to_string(path).ok()?;
+    let config: crate::gateway::GatewayConfig = toml::from_str(&content).ok()?;
+    config
+        .security
+        .shared_token
+        .filter(|token| !token.is_empty())
 }
 
 /// Convenience: invoke a WS method and parse the payload into `T`.
