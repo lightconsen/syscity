@@ -162,8 +162,6 @@ pub struct AppState {
     pub status: Option<(String, Instant)>,
     /// Set when a redraw is needed.
     pub dirty: bool,
-    /// A fatal error that should end the TUI.
-    pub fatal_error: Option<String>,
     /// Quit on the next loop iteration.
     pub should_quit: bool,
 }
@@ -196,7 +194,6 @@ impl Default for AppState {
             spinner: 0,
             status: None,
             dirty: true,
-            fatal_error: None,
             should_quit: false,
         }
     }

@@ -75,7 +75,11 @@ where
         while let Some(action) = poll_action() {
             state.write().await.dirty = true;
             match ws.as_mut() {
-                Some(client) => handle_action(action, &state, client).await?,
+                Some(client) => {
+                    if let Err(e) = handle_action(action, &state, client).await {
+                        absorb_action_error(e, &state).await?;
+                    }
+                }
                 None => {
                     handle_offline_action(action, &state, &mut backoff, &mut reconnect_at).await
                 }
@@ -127,10 +131,24 @@ where
         if state.read().await.should_quit {
             break;
         }
-        if let Some(err) = state.read().await.fatal_error.clone() {
-            return Err(TuiError::WebSocket(err));
-        }
     }
+    Ok(())
+}
+
+/// Report a failed action, or end the session if it is not survivable.
+///
+/// A command that fails is a line of output. Only a terminal that cannot be
+/// drawn to, or an internal bug, leaves the loop with nothing to do — and it
+/// is the error itself, not a flag parked in the state, that decides which.
+async fn absorb_action_error(err: TuiError, state: &Arc<RwLock<AppState>>) -> Result<(), TuiError> {
+    if err.is_fatal() {
+        return Err(err);
+    }
+    state
+        .write()
+        .await
+        .transcript
+        .push_notice(format!("✘ {err}"));
     Ok(())
 }
 
@@ -1005,8 +1023,20 @@ pub async fn run_plain_with(
                     continue;
                 }
                 if line.starts_with('/') {
-                    handle_slash_command(&line, Arc::clone(&state), &mut ws).await?;
+                    // A command that fails is a line of output, not the end of
+                    // the pipe: a script feeding several lines should get the
+                    // rest of them run.
+                    if let Err(e) =
+                        handle_slash_command(&line, Arc::clone(&state), &mut ws).await
+                    {
+                        absorb_action_error(e, &state).await?;
+                    }
                 } else if let Err(e) = submit_plain_line(&line, &state, &mut ws).await {
+                    // A send failure is not a line of transcript: it goes to
+                    // stderr so the pipe's stdout stays the conversation.
+                    if e.is_fatal() {
+                        return Err(e);
+                    }
                     eprintln!("send failed: {e}");
                 }
                 drain(&state, output.as_mut()).await;
@@ -1360,15 +1390,20 @@ mod tests {
         driver.await.expect("join").expect("the loop exits");
     }
 
-    /// A pending approval, on a connection to `gateway`.
-    async fn state_with_approval(gateway: &TestGateway) -> (Arc<RwLock<AppState>>, WsClient) {
+    /// A fresh state and a connected client.
+    async fn state_and_client(gateway: &TestGateway) -> (Arc<RwLock<AppState>>, WsClient) {
         let auth = crate::tui::auth::AuthConfig::None;
         let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
         let (client, _hello) = WsClient::connect(&url, &auth, &["chat"])
             .await
             .expect("connect");
-
         let state = Arc::new(RwLock::new(AppState::default()));
+        (state, client)
+    }
+
+    /// The same, with a pending approval waiting for a decision.
+    async fn state_with_approval(gateway: &TestGateway) -> (Arc<RwLock<AppState>>, WsClient) {
+        let (state, client) = state_and_client(gateway).await;
         {
             let mut s = state.write().await;
             s.approvals.push_back(ApprovalDetail {
@@ -1476,6 +1511,76 @@ mod tests {
                 .any(|r| r.method.starts_with("approvals.")),
             "no decision was sent"
         );
+    }
+
+    /// A command that fails is a notice, not the end of the TUI.
+    ///
+    /// `handle_action` propagated every error, so a timed-out `/status` — or
+    /// any other command the gateway refused — tore the whole TUI down while
+    /// an ordinary chat error only printed a line.
+    #[tokio::test]
+    async fn a_failing_command_does_not_end_the_session() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("system.presence", "INTERNAL");
+        let (state, mut client) = state_and_client(&gateway).await;
+
+        let err =
+            handle_action(TuiAction::RunSlashCommand("/status".to_string()), &state, &mut client)
+                .await
+                .expect_err("the command itself failed");
+        assert!(!err.is_fatal(), "and the failure is survivable: {err:?}");
+
+        absorb_action_error(err, &state)
+            .await
+            .expect("the session carries on");
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.starts_with("✘")),
+            "the failure is a line of output: {lines:?}"
+        );
+    }
+
+    /// An un-drawable terminal still ends the session — it has to, there is
+    /// nothing left to draw to.
+    #[tokio::test]
+    async fn a_broken_terminal_still_ends_the_session() {
+        let state = Arc::new(RwLock::new(AppState::default()));
+        let err = absorb_action_error(TuiError::Terminal(io::Error::other("tty gone")), &state)
+            .await
+            .expect_err("nothing to carry on with");
+        assert!(err.is_fatal());
+    }
+
+    /// A failing command in line mode does not eat the lines behind it.
+    #[tokio::test]
+    async fn a_failing_command_does_not_stop_the_pipe() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("system.presence", "INTERNAL");
+        let (io, out) = plain_io("/status\nhello\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        gateway.wait_for("chat.send", PATIENCE).await;
+        eventually(|| out.text().contains("✘"), "the failure to be reported").await;
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .find(|r| r.method == "chat.send")
+                .and_then(|r| r.params["message"].as_str()),
+            Some("hello"),
+            "the line after the failed command still went"
+        );
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
     }
 
     #[test]
