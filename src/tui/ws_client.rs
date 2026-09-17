@@ -98,8 +98,10 @@ pub enum WsMessage {
 
 /// How long a request may wait for its response before the caller gives up.
 ///
-/// Without this a wedged gateway leaves the caller awaiting forever, which —
-/// because requests are awaited inside the event loop — freezes the whole TUI.
+/// Without this a wedged gateway leaves the caller awaiting forever. The
+/// caller is a task rather than the event loop, so a wedged gateway no longer
+/// freezes the TUI — but a command that never returns still holds its own
+/// place in the queue, so the bound is what keeps that from being permanent.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Shared state tracking pending request/response waiters.

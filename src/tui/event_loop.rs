@@ -10,6 +10,7 @@
 //! flush without a following draw leaves the composer invisible.
 // INVARIANTS-NONE: event loop; state lives in `AppState`.
 
+use std::collections::VecDeque;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ use ratatui::backend::Backend;
 use ratatui::Terminal;
 use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::tui::actions::TuiAction;
@@ -45,6 +47,8 @@ enum Event {
     Gateway(Option<WsMessage>),
     /// The animation/expiry beat.
     Tick,
+    /// The command that was running has finished.
+    Finished(Result<(), TuiError>),
 }
 
 /// Run the TUI until the user quits or a fatal error occurs.
@@ -59,14 +63,31 @@ where
     B: Backend,
     TuiError: From<B::Error>,
 {
-    let mut ws = Some(ws_client);
+    let mut ws: Option<Arc<WsClient>> = Some(Arc::new(ws_client));
     let mut backoff = Backoff::new();
     let mut reconnect_at: Option<Instant> = None;
     // Short enough that typing feels immediate; the tick itself only marks the
     // state dirty when something is actually animating.
     let mut ticker = interval(Duration::from_millis(50));
 
-    startup(&state, &mut ws, &session).await;
+    // Commands run as tasks, so the loop keeps polling input and painting while
+    // they wait on the gateway. One at a time, the rest in order behind it: two
+    // `/new`s racing would leave the state describing whichever finished last.
+    let mut in_flight: Option<JoinHandle<Result<(), TuiError>>> = None;
+    let mut queued: VecDeque<TuiAction> = VecDeque::new();
+
+    // Startup is the first piece of work rather than a prologue. It makes two
+    // requests, and painting the frame before them is the difference between a
+    // usable composer and eight blank rows when the gateway is slow to answer.
+    if let Some(client) = ws.as_ref() {
+        let state = Arc::clone(&state);
+        let client = Arc::clone(client);
+        let session = session.clone();
+        in_flight = Some(tokio::spawn(async move {
+            startup(&state, &client, &session).await;
+            Ok(())
+        }));
+    }
     redraw(terminal, &state).await?;
 
     loop {
@@ -74,14 +95,16 @@ where
         // nothing may be reading stdin while that reply is in flight.
         while let Some(action) = poll_action() {
             state.write().await.dirty = true;
-            match ws.as_mut() {
-                Some(client) => {
-                    if let Err(e) = handle_action(action, &state, client).await {
-                        absorb_action_error(e, &state).await?;
-                    }
-                }
-                None => {
+            match dispatch(&action, ws.is_some(), in_flight.is_some()) {
+                Dispatch::Quit => state.write().await.should_quit = true,
+                Dispatch::Offline => {
                     handle_offline_action(action, &state, &mut backoff, &mut reconnect_at).await
+                }
+                Dispatch::Queue => queued.push_back(action),
+                Dispatch::Run => {
+                    if let Some(client) = ws.as_ref() {
+                        in_flight = Some(spawn_action(action, &state, Arc::clone(client)));
+                    }
                 }
             }
             if state.read().await.should_quit {
@@ -90,14 +113,20 @@ where
         }
 
         let event = tokio::select! {
-            msg = next_gateway(&mut ws) => Event::Gateway(msg),
+            msg = next_gateway(&ws) => Event::Gateway(msg),
             _ = ticker.tick() => Event::Tick,
+            done = settle(&mut in_flight) => Event::Finished(done),
         };
 
         match event {
             Event::Gateway(Some(WsMessage::Disconnected)) | Event::Gateway(None) => {
                 state.write().await.dirty = true;
                 ws = None;
+                // A command left running would be waiting on a socket that is
+                // gone, and would hold the queue behind it. It also needs no
+                // cancelling: the dropped connection fails its requests at
+                // once, so it ends on its own and says why.
+                queued.clear();
                 let mut s = state.write().await;
                 s.transcript
                     .push_notice("⚠ lost the gateway — reconnecting…");
@@ -107,7 +136,7 @@ where
             }
             Event::Gateway(Some(message)) => {
                 state.write().await.dirty = true;
-                if let Some(client) = ws.as_mut() {
+                if let Some(client) = ws.as_ref() {
                     handle_gateway_message(message, &state, client).await;
                 }
             }
@@ -124,6 +153,15 @@ where
                         .await;
                 }
             }
+            Event::Finished(result) => {
+                in_flight = None;
+                if let Err(e) = result {
+                    absorb_action_error(e, &state).await?;
+                }
+                if let (Some(next), Some(client)) = (queued.pop_front(), ws.as_ref()) {
+                    in_flight = Some(spawn_action(next, &state, Arc::clone(client)));
+                }
+            }
         }
 
         redraw(terminal, &state).await?;
@@ -132,7 +170,70 @@ where
             break;
         }
     }
+
+    // Nothing outlives the loop: a task still waiting on a request would keep
+    // the client and the state alive after the terminal has been handed back.
+    if let Some(handle) = in_flight {
+        handle.abort();
+    }
     Ok(())
+}
+
+/// What the loop does with an action it has just read.
+///
+/// Pulled out of the loop because this is the whole rule, and the rule is the
+/// point: one command at a time, edits still work with no gateway, and Quit
+/// waits for neither.
+#[derive(Debug, PartialEq, Eq)]
+enum Dispatch {
+    /// Nothing is in flight — run it.
+    Run,
+    /// Something is — remember it for when that finishes.
+    Queue,
+    /// No gateway; only what the loop can do on its own is left.
+    Offline,
+    /// Set the quit flag and stop reading.
+    Quit,
+}
+
+/// Decide what to do with `action`.
+fn dispatch(action: &TuiAction, online: bool, busy: bool) -> Dispatch {
+    if matches!(action, TuiAction::Quit) {
+        Dispatch::Quit
+    } else if !online {
+        Dispatch::Offline
+    } else if busy {
+        Dispatch::Queue
+    } else {
+        Dispatch::Run
+    }
+}
+
+/// Run one action off the loop.
+///
+/// The loop's own work is polling input and painting. Everything else is a
+/// round-trip, and a round-trip must not hold either up: one request can take
+/// the full timeout, and `/new` is three of them in a row.
+fn spawn_action(
+    action: TuiAction,
+    state: &Arc<RwLock<AppState>>,
+    client: Arc<WsClient>,
+) -> JoinHandle<Result<(), TuiError>> {
+    let state = Arc::clone(state);
+    tokio::spawn(async move { handle_action(action, &state, &client).await })
+}
+
+/// Resolve when the in-flight command finishes — never, if there is none.
+async fn settle(in_flight: &mut Option<JoinHandle<Result<(), TuiError>>>) -> Result<(), TuiError> {
+    match in_flight.as_mut() {
+        Some(handle) => match handle.await {
+            Ok(result) => result,
+            // The task panicked or was cancelled. Nothing useful to do beyond
+            // saying so; the loop carries on.
+            Err(e) => Err(TuiError::WebSocket(format!("a command task ended early: {e}"))),
+        },
+        None => std::future::pending().await,
+    }
 }
 
 /// Report a failed action, or end the session if it is not survivable.
@@ -153,23 +254,15 @@ async fn absorb_action_error(err: TuiError, state: &Arc<RwLock<AppState>>) -> Re
 }
 
 /// Await the next gateway message, or never resolve while disconnected.
-async fn next_gateway(ws: &mut Option<WsClient>) -> Option<WsMessage> {
-    match ws.as_mut() {
+async fn next_gateway(ws: &Option<Arc<WsClient>>) -> Option<WsMessage> {
+    match ws.as_ref() {
         Some(client) => client.next().await,
         None => std::future::pending().await,
     }
 }
 
 /// Everything that has to happen before the first paint.
-async fn startup(
-    state: &Arc<RwLock<AppState>>,
-    ws: &mut Option<WsClient>,
-    session: &SessionChoice,
-) {
-    let Some(client) = ws.as_mut() else {
-        return;
-    };
-
+async fn startup(state: &Arc<RwLock<AppState>>, client: &WsClient, session: &SessionChoice) {
     // The catalog feeds `/help` and Tab completion.
     if let Ok(catalog) = gw::commands_list(client).await {
         let mut s = state.write().await;
@@ -406,7 +499,7 @@ fn schedule_reconnect(backoff: &mut Backoff, reconnect_at: &mut Option<Instant>)
 /// Attempt to reconnect, reporting the outcome into the transcript.
 async fn try_reconnect(
     state: &Arc<RwLock<AppState>>,
-    ws: &mut Option<WsClient>,
+    ws: &mut Option<Arc<WsClient>>,
     endpoint: &Endpoint,
     backoff: &mut Backoff,
     reconnect_at: &mut Option<Instant>,
@@ -415,7 +508,7 @@ async fn try_reconnect(
     let attempt = backoff.attempt() + 1;
     match WsClient::connect(&endpoint.url, &endpoint.auth, &["chat", "read", "write"]).await {
         Ok((client, hello)) => {
-            *ws = Some(client);
+            *ws = Some(Arc::new(client));
             backoff.reset();
             let mut s = state.write().await;
             s.connection = ConnectionState::Connected {
@@ -431,7 +524,7 @@ async fn try_reconnect(
             let session = s.current_session.clone();
             drop(s);
             if let Some(id) = session {
-                if let Some(client) = ws.as_mut() {
+                if let Some(client) = ws.as_ref() {
                     if let Err(e) = gw::sessions_subscribe(client, &id).await {
                         state
                             .write()
@@ -1638,6 +1731,63 @@ mod tests {
         run.await.expect("join").expect("line mode exits cleanly");
         let text = out.text();
         assert_eq!(text.matches("pong from the model").count(), 1, "got {text:?}");
+    }
+
+    /// The rule the loop dispatches on.
+    #[test]
+    fn one_command_at_a_time_and_quit_waits_for_nothing() {
+        use TuiAction::{Quit, SendMessage};
+
+        // Idle and online: run it.
+        assert_eq!(dispatch(&SendMessage, true, false), Dispatch::Run);
+        // A command is already in flight: it waits its turn instead of racing
+        // it — two `/new`s finishing in the wrong order would leave the state
+        // describing a session the user is not in.
+        assert_eq!(dispatch(&SendMessage, true, true), Dispatch::Queue);
+        // No gateway: the offline path still lets the user edit and says the
+        // message was not sent, rather than queueing it forever.
+        assert_eq!(dispatch(&SendMessage, false, false), Dispatch::Offline);
+        assert_eq!(dispatch(&SendMessage, false, true), Dispatch::Offline);
+        // Quit never waits — not for a gateway, not for a running command.
+        assert_eq!(dispatch(&Quit, true, false), Dispatch::Quit);
+        assert_eq!(dispatch(&Quit, true, true), Dispatch::Quit);
+        assert_eq!(dispatch(&Quit, false, true), Dispatch::Quit);
+    }
+
+    /// The loop does not wait for a request that never comes back.
+    ///
+    /// Startup ran as a prologue — `startup(...).await` ahead of the loop and
+    /// of the first paint — so a gateway that did not answer meant eight blank
+    /// rows, no input, and no events, for as long as it took. It is the first
+    /// piece of work now, and the loop is running underneath it.
+    #[tokio::test]
+    async fn the_loop_runs_while_a_request_is_still_in_flight() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+
+        // Park startup on its first request, and never answer it.
+        gateway.hold("commands.list");
+
+        let driver = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let mut terminal = inline_terminal();
+                run(&mut terminal, state, client, test_endpoint(gateway.port), SessionChoice::New)
+                    .await
+            }
+        });
+
+        // Startup really did start, and is really still waiting.
+        gateway.wait_for("commands.list", PATIENCE).await;
+
+        // The loop is alive underneath it, so it sees this and stops.
+        state.write().await.should_quit = true;
+        let finished = tokio::time::timeout(PATIENCE, driver).await;
+        assert!(finished.is_ok(), "the loop waited for a request the gateway never answered");
+        finished
+            .expect("checked")
+            .expect("join")
+            .expect("the loop exits");
     }
 
     /// Losing the connection converges the loop's state, not just the client's.

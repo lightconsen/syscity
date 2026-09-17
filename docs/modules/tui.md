@@ -152,6 +152,19 @@ purpose — cron notices, and `approval.required`, which the gateway scopes to a
 tool call rather than to a conversation, so an approval raised anywhere is
 offered here.
 
+Commands run off the loop: `run` spawns one task per command and `select!`s
+over it alongside input, gateway events and the animation tick. `WsClient`
+takes `&self` throughout, so the loop keeps its connection while a command
+holds it. One command at a time — the rest queue in order — because two
+`/new`s racing would leave the state describing whichever finished last.
+Startup is the first such task, so the frame is painted while its two requests
+are still on the wire.
+
+Gateway *events* are still handled inline. Their handlers can make requests
+(`approvals.get`, `sessions.list`), which is what the loop is no longer
+blocked by, but routing them through the queue would stall a streaming answer
+behind whatever command is running — the worse trade of the two.
+
 ## Deliberate Limitations
 
 - No markdown rendering: only fenced code blocks are styled; headings, tables
