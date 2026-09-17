@@ -27,13 +27,20 @@ RESET='\033[0m'
 
 RUN_TESTS=true
 RUN_FRONTEND=true
+# A missing tool is a *skip* by default so a local run tells you what to install
+# rather than blocking on it. In CI — or with --strict — it is a failure: a
+# green run that silently omitted the audit and the coverage gate is worse than
+# a red one, because nothing downstream can tell the difference.
+STRICT=false
+[[ -n "${CI:-}" ]] && STRICT=true
 
 for arg in "$@"; do
     case "$arg" in
         --skip-tests) RUN_TESTS=false ;;
         --backend) RUN_FRONTEND=false ;;
+        --strict) STRICT=true ;;
         -h|--help)
-            echo "Usage: $0 [--skip-tests] [--backend]"
+            echo "Usage: $0 [--skip-tests] [--backend] [--strict]"
             echo ""
             echo "  (default)     Mirror of .github/workflows/ci.yml: frontend,"
             echo "                fmt, clippy, static-analysis, cargo check, msrv,"
@@ -41,6 +48,8 @@ for arg in "$@"; do
             echo "                security audit, coverage, plugin boundary"
             echo "  --skip-tests  Skip all cargo test steps"
             echo "  --backend     Skip frontend (pnpm) steps"
+            echo "  --strict      Fail (instead of skipping) when a tool is missing."
+            echo "                Always on when CI is set in the environment."
             exit 0
             ;;
     esac
@@ -76,6 +85,14 @@ in_dir() {
 skip_with_hint() {
     local name=$1
     shift
+    if $STRICT; then
+        echo -e "${RED}[${name}] FAILED${RESET} $*"
+        echo -e "${RED}[${name}] $1 is not installed, and --strict (or CI) is set:"
+        echo -e "${RED}          this step must run, not be skipped. Install it.${RESET}"
+        errors=$((errors + 1))
+        echo ""
+        return
+    fi
     echo -e "${YELLOW}[${name}]${RESET} $*"
     echo -e "${YELLOW}[${name}] skipped (${RESET}$1${YELLOW} not installed — install it to match CI)${RESET}"
     skipped=$((skipped + 1))
@@ -109,10 +126,13 @@ check "cargo check (default)" cargo check
 # ── Jobs: test + test-macos (ci.yml `test` / `test-macos`) ─────────────────
 if $RUN_TESTS; then
     check "tests (all-features)" cargo test --all-features -- --skip e2e:: --nocapture
+    # The chat journeys run against the mock provider when no real one is
+    # configured, so they belong here. `browser_chat_tests` is the exception:
+    # it needs a real Chrome, and self-skips without one — a self-skip inside a
+    # green test run is exactly the kind of "passed by not running" this list
+    # should keep visible.
     check "tests (e2e mock/no-provider)" \
         cargo test --test e2e_test -- \
-        --skip llm_chat_tests \
-        --skip tool_chat_tests \
         --skip browser_chat_tests \
         --test-threads=1
     check "tests (doc)" cargo test --doc --all-features
@@ -154,5 +174,6 @@ fi
 
 echo -e "${GREEN}All CI checks passed locally.${RESET}"
 if [[ $skipped -gt 0 ]]; then
-    echo -e "${YELLOW}  ($skipped step(s) skipped — install the tools above to match CI fully)${RESET}"
+    echo -e "${YELLOW}  ($skipped step(s) skipped — install the tools above to match CI fully,"
+    echo -e "${YELLOW}   or re-run with --strict to treat them as failures)${RESET}"
 fi

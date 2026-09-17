@@ -179,10 +179,12 @@ jobs:
         run: "cargo test --all-features -- --skip e2e:: --nocapture"
 
       - name: Run E2E tests (mock + no-provider)
+        # The chat journeys fall back to the mock provider when none is
+        # configured, so they run here. `browser_chat_tests` is skipped on
+        # purpose: it needs a real Chrome and self-skips without one, which
+        # would report green without running anything.
         run: |
           cargo test --test e2e_test -- \
-            --skip llm_chat_tests \
-            --skip tool_chat_tests \
             --skip browser_chat_tests \
             --test-threads=1
 
