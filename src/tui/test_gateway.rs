@@ -32,6 +32,7 @@ pub struct TestGateway {
     requests: Arc<Mutex<Vec<Received>>>,
     events: mpsc::UnboundedSender<Message>,
     close: Mutex<Option<oneshot::Sender<()>>>,
+    silent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TestGateway {
@@ -43,6 +44,8 @@ impl TestGateway {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Message>();
         let (close_tx, mut close_rx) = oneshot::channel::<()>();
         let recorder = Arc::clone(&requests);
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mute = Arc::clone(&silent);
 
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
@@ -72,6 +75,11 @@ impl TestGateway {
                             .lock()
                             .expect("request log")
                             .push(Received { method: method.clone(), params });
+                        if mute.load(std::sync::atomic::Ordering::SeqCst) {
+                            // Recorded, deliberately unanswered: a request left
+                            // in flight.
+                            continue;
+                        }
                         let reply = json!({
                             "type": "res",
                             "id": frame["id"].clone(),
@@ -91,7 +99,13 @@ impl TestGateway {
             requests,
             events: event_tx,
             close: Mutex::new(Some(close_tx)),
+            silent,
         }
+    }
+
+    /// Record requests from here on, but never answer them.
+    pub fn go_silent(&self) {
+        self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Every request received so far, in order.

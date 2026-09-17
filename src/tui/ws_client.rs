@@ -192,7 +192,13 @@ impl WsClient {
 
         let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(TuiError::WebSocket("response channel closed".to_string())),
+            // The driver drained the waiters on its way out, which is how a
+            // request learns the connection is gone.
+            Ok(Err(_)) => {
+                return Err(TuiError::WebSocket(
+                    "the gateway connection was lost before it answered".to_string(),
+                ))
+            }
             Err(_) => {
                 // Drop the waiter so a late response cannot resolve a request
                 // the caller has already abandoned.
@@ -292,6 +298,12 @@ async fn ws_driver(
         }
     }
 
+    // Unblock every in-flight request. The driver is the only thing that can
+    // ever resolve one and it is about to stop, so a waiter left in the map
+    // sits out its full timeout and is then told the request *timed out* —
+    // which is the wrong story, and 15 seconds of a frozen UI to tell it.
+    pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
     // Tell the UI the stream is over, so it can show the disconnect and start
     // reconnecting instead of spinning on a silent channel.
     let _ = event_tx.send(WsMessage::Disconnected);
@@ -362,6 +374,44 @@ mod tests {
 
         let methods: Vec<String> = gateway.requests().into_iter().map(|r| r.method).collect();
         assert_eq!(methods, vec!["connect"], "the handshake is the only request a connect makes");
+    }
+
+    /// A dropped connection fails in-flight requests at once, and says why.
+    ///
+    /// The driver is the only thing that can resolve a request and it exits
+    /// with the socket. Without draining the waiter map, each caller sat out
+    /// the full request timeout and was then told the request had *timed out*
+    /// — a frozen UI, and the wrong diagnosis for the user to act on.
+    #[tokio::test]
+    async fn a_lost_connection_fails_in_flight_requests_at_once() {
+        let gateway = TestGateway::start().await;
+        let auth = AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        let (mut client, _) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+
+        // A request the gateway accepts and then never answers.
+        gateway.go_silent();
+        let waiting = tokio::spawn(async move { client.request("system.presence", None).await });
+        gateway
+            .wait_for("system.presence", std::time::Duration::from_secs(5))
+            .await;
+
+        let started = std::time::Instant::now();
+        gateway.close().await;
+        let err = waiting
+            .await
+            .expect("join")
+            .expect_err("nothing can answer");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, TuiError::WebSocket(_)), "the connection is what failed: {err:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "it must not sit out the {}s request timeout: took {elapsed:?}",
+            REQUEST_TIMEOUT.as_secs()
+        );
     }
 
     #[test]
