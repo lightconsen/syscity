@@ -1,7 +1,14 @@
 # Syscity 协议规范 v1.0
 
-> **状态**: 草案
-> **目标**: 将 Syscity 的前后端通信统一到单一的 WebSocket-native 协议，并支持 `assistant-ui` 作为主力 Web 前端。
+> **状态**: 已落地。WebSocket-native 是网关唯一的客户端协议——UI、CLI、桌面端
+> 都只走 `/ws`（方法分发在 `src/gateway/ws/core.rs`，作用域表在
+> `src/gateway/protocol.rs`）。REST 面收缩为 `CLAUDE.md` "API Protocol
+> Convention" 列出的几类例外（OpenAI 兼容端点、OAuth 回调、外部平台 webhook、
+> artifact 下载、探针与 metrics）。
+>
+> **这是一份设计记录。** §1.1、§9.3、§10 的"之前（当前）"描述的是**迁移前**的
+> 系统，保留下来是为了解释动机；各阶段的落地程度以实现为准——本文与代码或
+> `CLAUDE.md` 不一致时，按代码。
 
 ---
 
@@ -9,7 +16,7 @@
 
 ### 1.1 为什么采用 WebSocket-Native
 
-Syscity 目前使用混合架构（REST API + SSE + WebSocket），这带来了以下问题：
+Syscity **在迁移前**使用混合架构（REST API + SSE + WebSocket），这带来了以下问题：
 
 - **协议碎片化**: Web UI 用 `POST /api/chat` + `SSE /api/events`；CLI 用裸 HTTP；WebSocket 存在但未被充分利用。
 - **鉴权不一致**: Web 端用 OAuth2，CLI 无鉴权，WS 用 query token。
@@ -62,7 +69,7 @@ Query 参数：
 | GET | `/v1/models` | OpenAI 兼容模型列表 |
 | GET | `/api/v1/artifacts/*path` | 文档预览产物（`write_report` 生成的报告） |
 
-> 其余所有 `/api/*` 和 `/api/v1/*` 端点已 **废弃**，将在 v2.0 中移除。
+> 其余 `/api/*` 与 `/api/v1/*` 端点已在迁移中移除；上表就是保留的全部 HTTP 面。
 
 **产物 URL 形态**（通配路由，只读）：
 
@@ -187,7 +194,7 @@ Query 参数：
       "version": "1.0.0"
     },
     "auth": {
-      "token": "syscity_shared_token_xxx"
+      "token": "syscity_shared_token_<redacted>"
     },
     "device": {
       "id": "device_abc",
@@ -260,7 +267,7 @@ Query 参数：
 
 ### 5.1 鉴权模式（服务端配置）
 
-通过 `syscity.yaml` 中的 `gateway.auth.mode` 配置：
+通过 `config.toml` 的 `[security] auth_mode` 配置：
 
 | 模式 | 说明 |
 |------|-------------|
@@ -419,7 +426,7 @@ syscity setup
 #   - 配置默认模型和 Provider
 #   - 设置数据目录路径
 #   - 启用/禁用内置 Channel（web/cli/telegram 等）
-#   - 生成初始 `syscity.yaml` 并写入磁盘
+#   - 生成初始 `config.toml` 并写入磁盘
 
 # 设备配对
 syscity device list
@@ -545,17 +552,15 @@ Session key 统一采用 `{channel}:{user_id}` 格式：
 
 ### 9.3 向后兼容
 
-迁移窗口期间：
-
-- 现有 REST API 和 SSE 端点继续运行，但标记为废弃。
-- REST 端点被调用时记录废弃警告日志。
-- 目标在 v2.0 中彻底移除。
+迁移窗口已经结束：`/ws` 是主协议，REST 只剩上面列出的几类例外，它们不再标记
+为废弃，也不会被移除（OpenAI 兼容端点和 webhook 是外部工具/平台硬依赖的路径）。
+本节的其余内容保留为当时的过渡设想。
 
 ---
 
 ## 10. 对比: 之前 vs 之后
 
-| 维度 | 之前（当前） | 之后（本规范） |
+| 维度 | 之前（迁移前） | 之后（本规范） |
 |--------|-----------------|-------------------|
 | 传输层 | REST + SSE + WS | WebSocket-native |
 | 鉴权 | OAuth2 / 无 / token | 统一: token + 设备配对 + 作用域 |
