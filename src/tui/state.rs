@@ -154,6 +154,9 @@ pub struct AppState {
     pub completion_index: usize,
     /// A response is streaming.
     pub is_running: bool,
+    /// Messages submitted while a turn was running, oldest first. They go out
+    /// when the current turn ends — one turn at a time, in order.
+    pub queued: VecDeque<String>,
     /// When the current run started, for the elapsed counter.
     pub run_started: Option<Instant>,
     /// Spinner frame counter.
@@ -190,6 +193,7 @@ impl Default for AppState {
             command_list: Vec::new(),
             completion_index: 0,
             is_running: false,
+            queued: VecDeque::new(),
             run_started: None,
             spinner: 0,
             status: None,
@@ -425,6 +429,23 @@ impl AppState {
         self.run_started = None;
     }
 
+    /// Queue a message to send when the current turn ends.
+    pub fn queue_message(&mut self, text: String) {
+        self.queued.push_back(text);
+    }
+
+    /// Take the oldest queued message.
+    pub fn pop_queued(&mut self) -> Option<String> {
+        self.queued.pop_front()
+    }
+
+    /// Drop the queue, returning how many were waiting.
+    pub fn clear_queue(&mut self) -> usize {
+        let dropped = self.queued.len();
+        self.queued.clear();
+        dropped
+    }
+
     /// Converge to "nothing is in flight" after the connection is lost.
     ///
     /// Neither a run nor a prompt can make progress without the gateway, and
@@ -444,6 +465,7 @@ impl AppState {
         let dropped_ask = self.pending_ask.take().is_some();
         self.ask_input.clear();
         self.live_mode = LiveMode::Composer;
+        let dropped_queue = self.clear_queue();
 
         if was_running {
             self.transcript.push_notice("── the run was interrupted ──");
@@ -458,6 +480,11 @@ impl AppState {
             self.transcript.push_notice(
                 "⚠ the pending question was dropped — ask the agent again once reconnected",
             );
+        }
+        if dropped_queue > 0 {
+            self.transcript.push_notice(format!(
+                "⚠ {dropped_queue} queued message(s) dropped — the gateway cannot take them yet"
+            ));
         }
     }
 

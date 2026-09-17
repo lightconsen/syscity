@@ -163,7 +163,12 @@ offered here.
   cursor addressing. Lines are read from stdin (a blank one is ignored, a `/`
   one is a command) and printed as the transcript graduates them, so a
   streamed answer arrives a line at a time rather than a token at a time —
-  a partial line waits for its newline.
+  a partial line waits for its newline. Lines are submitted one turn at a
+  time, in order, however fast the pipe delivers them: a message arriving
+  mid-turn queues behind it rather than opening a second turn on the session.
+- One turn at a time is the rule everywhere: a message typed mid-response
+  queues and goes out when the turn ends. Esc stops the turn *and* drops the
+  queue, and a lost connection drops it too, saying so.
 
 ## Testing
 

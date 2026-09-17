@@ -459,6 +459,14 @@ async fn abort_or_quit(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resu
         s.transcript.finish_stream(STREAM_THINKING, None);
         s.transcript.push_notice("── stopped ──");
         s.end_run();
+        // "Stop" means stop: the queued messages were lined up behind the turn
+        // that was just cancelled, and sending them now would be the opposite
+        // of what the key asked for.
+        let dropped = s.clear_queue();
+        if dropped > 0 {
+            s.transcript
+                .push_notice(format!("⚠ {dropped} queued message(s) dropped"));
+        }
     } else {
         state.write().await.should_quit = true;
     }
@@ -484,6 +492,38 @@ async fn send_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resul
         return handle_slash_command(&text, Arc::clone(state), ws).await;
     }
 
+    // One turn at a time. Pressing Enter mid-response used to open a second
+    // turn on the same session, in parallel with the first: two streams
+    // interleaved into one transcript, and the second `chat.final` ending a
+    // run that was still going. The message is queued instead, and goes out
+    // when this turn finishes.
+    if state.read().await.is_running {
+        let mut s = state.write().await;
+        s.remember_input(&text);
+        s.transcript.push_user(&text);
+        s.clear_input();
+        s.queue_message(text);
+        let waiting = s.queued.len();
+        s.transcript.push_notice(format!(
+            "⏳ queued ({waiting} waiting) — sent when this turn ends; Esc stops it and the queue"
+        ));
+        return Ok(());
+    }
+
+    submit_message(text, state, ws, true).await
+}
+
+/// Send `text` as a chat message, creating the session if there is none.
+///
+/// `echo_user` is false for a queued message: it was echoed when it was typed,
+/// and printing it again when it finally goes out would read as a second
+/// message.
+async fn submit_message(
+    text: String,
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+    echo_user: bool,
+) -> Result<(), TuiError> {
     // A session is created lazily, on the first message — the gateway picks
     // the id, and we adopt whatever it returns.
     let session = match state.read().await.current_session.clone() {
@@ -498,7 +538,9 @@ async fn send_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resul
         let mut s = state.write().await;
         s.remember_input(&text);
         s.current_session = Some(session.clone());
-        s.transcript.push_user(&text);
+        if echo_user {
+            s.transcript.push_user(&text);
+        }
         s.transcript.push_separator();
         s.clear_input();
         s.begin_run();
@@ -519,6 +561,31 @@ async fn send_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resul
         }
     }
     Ok(())
+}
+
+/// Send the oldest queued message, if there is one.
+///
+/// Called when a turn ends, which is the only moment the queue may move: the
+/// point of queueing is that a second turn does not run alongside the first.
+async fn start_queued_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) {
+    loop {
+        // Scoped: the guard must not be alive across the await below.
+        let next = { state.write().await.pop_queued() };
+        let Some(text) = next else {
+            return;
+        };
+        match submit_message(text, state, ws, false).await {
+            Ok(()) => return,
+            // The queue is not a place to strand a message: say this one
+            // failed, and give the rest their turn.
+            Err(e) => {
+                let mut s = state.write().await;
+                s.end_run();
+                s.transcript
+                    .push_notice(format!("✘ could not send a queued message: {e}"));
+            }
+        }
+    }
 }
 
 /// Handle a key action while an approval is pending.
@@ -787,21 +854,28 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &mu
         }
         "chat.final" => {
             let response = payload["response"].as_str().map(str::to_string);
-            let mut s = state.write().await;
-            s.transcript.finish_stream(STREAM_THINKING, None);
-            s.transcript
-                .finish_stream(STREAM_ASSISTANT, response.as_deref());
-            s.end_run();
-            s.dirty = true;
+            {
+                let mut s = state.write().await;
+                s.transcript.finish_stream(STREAM_THINKING, None);
+                s.transcript
+                    .finish_stream(STREAM_ASSISTANT, response.as_deref());
+                s.end_run();
+                s.dirty = true;
+            }
+            start_queued_message(state, ws).await;
         }
         "chat.error" => {
             let message = payload["message"].as_str().unwrap_or("unknown error");
-            let mut s = state.write().await;
-            s.transcript.finish_stream(STREAM_ASSISTANT, None);
-            s.transcript
-                .push_notice(format!("✘ response failed: {message}"));
-            s.end_run();
-            s.dirty = true;
+            {
+                let mut s = state.write().await;
+                s.transcript.finish_stream(STREAM_ASSISTANT, None);
+                s.transcript
+                    .push_notice(format!("✘ response failed: {message}"));
+                s.end_run();
+                s.dirty = true;
+            }
+            // The turn failed, but the queue is still the user's next move.
+            start_queued_message(state, ws).await;
         }
         "session.created" => {
             if let Some(id) = payload["session_id"].as_str() {
@@ -1225,33 +1299,42 @@ mod tests {
         run.await.expect("join").expect("line mode exits cleanly");
     }
 
-    /// Every line of a multi-line pipe is sent, in order.
+    /// Every line of a multi-line pipe is sent, in order, one turn at a time.
+    ///
+    /// A pipe hands its lines over as fast as it has them, and line mode used
+    /// to fire every one at the session at once — the same parallel-turn bug
+    /// the composer had, with a script's worth of messages behind it. They
+    /// queue instead, and each goes out when the turn in front of it ends.
     #[tokio::test]
-    async fn every_piped_line_is_submitted() {
+    async fn piped_lines_are_submitted_one_turn_at_a_time() {
         let gateway = TestGateway::start().await;
         let (io, _out) = plain_io("one\ntwo\nthree\n");
         let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
 
-        gateway.wait_for("chat.send", PATIENCE).await;
-        eventually(
-            || {
+        for (idx, text) in ["one", "two", "three"].iter().enumerate() {
+            eventually_async(
+                || async {
+                    gateway.requests().iter().any(|r| {
+                        r.method == "chat.send" && r.params["message"].as_str() == Some(text)
+                    })
+                },
+                &format!("a chat.send of {text:?}"),
+            )
+            .await;
+            assert_eq!(
                 gateway
                     .requests()
                     .iter()
                     .filter(|r| r.method == "chat.send")
-                    .count()
-                    == 3
-            },
-            "three messages",
-        )
-        .await;
-        let sent: Vec<String> = gateway
-            .requests()
-            .into_iter()
-            .filter(|r| r.method == "chat.send")
-            .map(|r| r.params["message"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(sent, vec!["one", "two", "three"]);
+                    .count(),
+                idx + 1,
+                "only the current turn has gone out"
+            );
+            gateway.push_event(
+                "chat.final",
+                serde_json::json!({ "session_id": "s1", "response": "ok\n" }),
+            );
+        }
 
         gateway.close().await;
         run.await.expect("join").expect("line mode exits cleanly");
@@ -1595,6 +1678,108 @@ mod tests {
 
         gateway.close().await;
         run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// A message typed mid-turn is queued, not sent alongside the first.
+    ///
+    /// `send_message` had no `is_running` guard: Enter during a stream ran
+    /// `sessions.create`-less but `begin_run` + `chat.send` unconditionally, so
+    /// a second turn started on the same session in parallel with the first —
+    /// two streams interleaved into one transcript, and the second `final`
+    /// ending a run that was still going.
+    #[tokio::test]
+    async fn a_message_typed_mid_turn_is_queued() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.begin_run();
+            s.set_input("and another thing".to_string());
+        }
+
+        send_message(&state, &mut client).await.expect("queued");
+
+        {
+            let s = state.read().await;
+            assert!(s.is_running, "the first turn is untouched");
+            assert_eq!(s.queued.len(), 1);
+            assert_eq!(s.queued[0], "and another thing");
+            assert!(s.input_buffer.is_empty(), "the composer is cleared");
+        }
+        assert!(!gateway.requests().iter().any(|r| r.method == "chat.send"), "nothing was sent");
+    }
+
+    /// A queued message goes out when the turn in front of it ends.
+    #[tokio::test]
+    async fn a_queued_message_is_sent_when_the_turn_ends() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.begin_run();
+            s.queue_message("second".to_string());
+        }
+
+        handle_event(
+            event("chat.final", serde_json::json!({ "session_id": "s1", "response": "first\n" })),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        let sent = gateway.wait_for("chat.send", PATIENCE).await;
+        assert_eq!(sent["message"], "second");
+        assert_eq!(sent["session_id"], "s1");
+        assert!(state.read().await.queued.is_empty());
+    }
+
+    /// An abort means stop, queue included.
+    #[tokio::test]
+    async fn aborting_drops_the_queue() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.begin_run();
+            s.queue_message("second".to_string());
+        }
+
+        abort_or_quit(&state, &mut client).await.expect("aborted");
+
+        let mut s = state.write().await;
+        assert!(!s.is_running);
+        assert!(s.queued.is_empty(), "stop means stop");
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("queued message")),
+            "and it says what it dropped: {lines:?}"
+        );
+    }
+
+    /// The queue is not a way to lose a message quietly.
+    #[tokio::test]
+    async fn a_lost_connection_drops_the_queue_out_loud() {
+        let mut s = AppState::default();
+        s.begin_run();
+        s.queue_message("second".to_string());
+        s.connection_lost("gone");
+
+        assert!(s.queued.is_empty());
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(lines.iter().any(|l| l.contains("queued message")), "got {lines:?}");
     }
 
     /// A server event, as it arrives off the wire.
