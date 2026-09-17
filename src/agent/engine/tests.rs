@@ -59,6 +59,7 @@ impl Provider for ContextLengthThenOk {
             reasoning_content: None,
             tool_calls: None,
             is_done: true,
+            error: None,
             usage: None,
         });
         Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
@@ -169,6 +170,7 @@ impl Provider for EmptyThenOk {
             reasoning_content: None,
             tool_calls: None,
             is_done: true,
+            error: None,
             usage: None,
         });
         Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
@@ -253,6 +255,7 @@ impl Provider for AlwaysOk {
             reasoning_content: None,
             tool_calls: None,
             is_done: true,
+            error: None,
             usage: None,
         });
         Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
@@ -456,6 +459,7 @@ impl Provider for JudgeRecordingProvider {
             reasoning_content: None,
             tool_calls: None,
             is_done: true,
+            error: None,
             usage: None,
         });
         Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
@@ -940,5 +944,136 @@ async fn test_mentions_block_reaches_llm_only() {
         seen[1].iter().any(|c| c == "plain text"),
         "no block without mentions, got: {:?}",
         seen[1]
+    );
+}
+
+/// A provider that streams slowly enough to be interrupted mid-reply.
+struct SlowStreamProvider {
+    chunks: usize,
+    delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl Provider for SlowStreamProvider {
+    fn name(&self) -> &str {
+        "slow-stream"
+    }
+    fn default_model(&self) -> &str {
+        "test-model"
+    }
+    fn supports_tools(&self) -> bool {
+        false
+    }
+    fn max_context(&self) -> usize {
+        128_000
+    }
+    async fn complete(&self, _request: CompletionRequest) -> crate::Result<CompletionResponse> {
+        unimplemented!("this provider streams")
+    }
+    async fn stream(&self, _request: CompletionRequest) -> crate::Result<CompletionStream> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let chunks = self.chunks;
+        let delay = self.delay;
+        tokio::spawn(async move {
+            for i in 0..chunks {
+                tokio::time::sleep(delay).await;
+                let is_done = i + 1 == chunks;
+                let chunk = CompletionChunk {
+                    content: Some(format!("c{i} ")),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    is_done,
+                    error: None,
+                    usage: None,
+                };
+                // A send failure means the consumer dropped the stream —
+                // cancellation — so the producer stops rather than streaming
+                // into nothing.
+                if tx.send(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+    }
+    async fn health_check(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+    async fn set_credential(
+        &self,
+        _credential: crate::model_router::Credential,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+fn metrics_collector(conversation: &str) -> crate::observe::collector::TurnMetricsCollector {
+    crate::observe::collector::TurnMetricsCollector::new(crate::observe::collector::TurnContext {
+        session_id: None,
+        conversation_id: conversation.to_string(),
+        agent_id: "default".to_string(),
+        thread_id: "t1".to_string(),
+        turn_index: 0,
+        user_message: "go".to_string(),
+        enqueued_at: None,
+    })
+}
+
+/// `chat.abort` has to interrupt a reply, not just the next tool step.
+///
+/// A long generation is *one* iteration, and the controller was only consulted
+/// between tool iterations, so a stop had nothing to interrupt: the turn kept
+/// consuming the provider's stream to the end.
+#[tokio::test]
+async fn test_cancelling_stops_a_streaming_reply() {
+    let provider = Arc::new(SlowStreamProvider {
+        chunks: 200,
+        delay: std::time::Duration::from_millis(10),
+    });
+    let agent =
+        Agent::new(AgentConfig::default(), provider, Arc::new(crate::tools::ToolRegistry::new()));
+    let controller = crate::acp::ExecutionController::new();
+    {
+        let mut slot = agent.execution_controller.write().await;
+        *slot = Some(controller.clone());
+    }
+
+    let mut context = Context::new("conv-cancel", "You are a test assistant", 100_000);
+    let mut collector = metrics_collector("conv-cancel");
+    let cb: ProgressCallback = Arc::new(|_| Box::pin(async {}));
+
+    let started = std::time::Instant::now();
+    let task = tokio::spawn(async move {
+        agent
+            .get_completion_with_progress_inner(&mut context, &mut collector, cb, "user", true)
+            .await
+    });
+
+    // Let a few chunks through, then stop.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    controller.cancel().await;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("cancelling must not hang the turn")
+        .expect("the turn task must not panic")
+        .expect("a cancelled turn is still a response");
+
+    assert_eq!(
+        response.finish_reason.as_deref(),
+        Some("aborted"),
+        "the round ends as cancelled"
+    );
+    assert!(
+        response.message.content.contains("Execution halted"),
+        "the caller is told why the reply stopped: {}",
+        response.message.content
+    );
+    // 200 chunks at 10 ms is two seconds of streaming; returning early means
+    // the loop noticed the cancel, not that the provider ran out.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the stream kept going after the cancel: {:?}",
+        started.elapsed()
     );
 }

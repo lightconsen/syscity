@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// A provider stream that has been opened, with its first item held back.
+///
+/// Held so that "the stream failed before producing anything" can be treated as
+/// a failed open — and retried on the next candidate — while the item itself is
+/// still delivered in order.
+struct OpenedStream {
+    stream: CompletionStream,
+    first: Option<crate::providers::CompletionChunk>,
+}
+
 impl ModelRouter {
     // ==================== COMPLETION (non-streaming) ====================
 
@@ -74,11 +84,34 @@ impl ModelRouter {
             .get_providers_to_try(&provider, &model_id, &request)
             .await;
 
-        let (stream, mut rec) = self
+        let (opened, mut rec) = self
             .route_with_fallback(&model_id, request, providers_to_try, |provider, req| async move {
-                provider.stream(req).await
+                let mut stream = provider.stream(req).await?;
+                // A stream that fails *before* producing anything is the same
+                // failure as one that would not open: nothing has been emitted,
+                // so the next candidate can serve this call. Waiting for the
+                // first item is what tells the two cases apart — once a chunk
+                // has gone out, a retry would duplicate output, and this
+                // deliberately stops there.
+                match tokio_stream::StreamExt::next(&mut stream).await {
+                    Some(chunk) if chunk.error.is_some() => {
+                        Err(crate::error::SyscityError::ExternalService {
+                            source: chunk.error.unwrap_or_else(|| "stream failed".to_string()),
+                            cause: None,
+                        })
+                    }
+                    first => Ok(OpenedStream { stream, first }),
+                }
             })
             .await?;
+
+        // The peeked item goes back on the front of the stream.
+        let stream: CompletionStream = match opened.first {
+            Some(chunk) => {
+                Box::pin(tokio_stream::StreamExt::chain(tokio_stream::once(chunk), opened.stream))
+            }
+            None => opened.stream,
+        };
 
         if model_id != requested {
             Self::merge_reason(
@@ -443,6 +476,230 @@ mod tests {
             .await
             .expect("complete should succeed");
         assert_eq!(response.message.content, "ok");
+    }
+
+    /// A provider whose stream fails before emitting anything, and one that
+    /// emits a chunk *then* fails — the two sides of the retry boundary.
+    struct StreamFailsImmediatelyProvider;
+    struct StreamFailsAfterOutputProvider;
+
+    fn chunk(
+        content: Option<&str>,
+        error: Option<&str>,
+        is_done: bool,
+    ) -> crate::providers::CompletionChunk {
+        crate::providers::CompletionChunk {
+            content: content.map(str::to_string),
+            reasoning_content: None,
+            tool_calls: None,
+            is_done,
+            usage: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for StreamFailsImmediatelyProvider {
+        fn name(&self) -> &str {
+            "flaky-stream"
+        }
+        fn default_model(&self) -> &str {
+            "m1"
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn max_context(&self) -> usize {
+            128_000
+        }
+        async fn complete(
+            &self,
+            _request: crate::providers::CompletionRequest,
+        ) -> crate::Result<CompletionResponse> {
+            unimplemented!()
+        }
+        async fn stream(
+            &self,
+            _request: crate::providers::CompletionRequest,
+        ) -> crate::Result<CompletionStream> {
+            Ok(Box::pin(tokio_stream::once(chunk(None, Some("boom"), true))))
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn set_credential(
+            &self,
+            _credential: crate::model_router::Credential,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for StreamFailsAfterOutputProvider {
+        fn name(&self) -> &str {
+            "flaky-stream"
+        }
+        fn default_model(&self) -> &str {
+            "m1"
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn max_context(&self) -> usize {
+            128_000
+        }
+        async fn complete(
+            &self,
+            _request: crate::providers::CompletionRequest,
+        ) -> crate::Result<CompletionResponse> {
+            unimplemented!()
+        }
+        async fn stream(
+            &self,
+            _request: crate::providers::CompletionRequest,
+        ) -> crate::Result<CompletionStream> {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                chunk(Some("partial"), None, false),
+                chunk(None, Some("boom"), true),
+            ])))
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn set_credential(
+            &self,
+            _credential: crate::model_router::Credential,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A provider that streams a complete answer.
+    struct HealthyStreamProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for HealthyStreamProvider {
+        fn name(&self) -> &str {
+            "healthy-stream"
+        }
+        fn default_model(&self) -> &str {
+            "m1"
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn max_context(&self) -> usize {
+            128_000
+        }
+        async fn complete(
+            &self,
+            _request: crate::providers::CompletionRequest,
+        ) -> crate::Result<CompletionResponse> {
+            unimplemented!()
+        }
+        async fn stream(
+            &self,
+            _request: crate::providers::CompletionRequest,
+        ) -> crate::Result<CompletionStream> {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                chunk(Some("ok"), None, false),
+                chunk(None, None, true),
+            ])))
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn set_credential(
+            &self,
+            _credential: crate::model_router::Credential,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn collect(stream: CompletionStream) -> Vec<crate::providers::CompletionChunk> {
+        use tokio_stream::StreamExt;
+        let mut stream = stream;
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.push(chunk);
+        }
+        out
+    }
+
+    async fn streaming_router(
+        flaky: Arc<dyn Provider>,
+    ) -> (ModelRouter, crate::model_router::ProviderConfig) {
+        let router = ModelRouter::new(crate::model_router::config::ModelRouterConfig::default());
+        router.add_provider_instance("flaky", flaky).await.unwrap();
+        router
+            .add_provider_instance("healthy", Arc::new(HealthyStreamProvider))
+            .await
+            .unwrap();
+        router
+            .model_catalog
+            .register(ModelCatalogEntry::new("m1", "m1", "flaky"))
+            .await;
+        router
+            .set_fallback_chain("m1", vec!["flaky".into(), "healthy".into()])
+            .await
+            .unwrap();
+        (router, pcfg(&["m1"]))
+    }
+
+    /// A stream that dies before producing anything is retried on the next
+    /// candidate: nothing has been emitted, so nothing can be duplicated.
+    #[tokio::test]
+    async fn a_stream_that_fails_before_its_first_chunk_falls_back() {
+        let (router, _) = streaming_router(Arc::new(StreamFailsImmediatelyProvider)).await;
+
+        let (stream, rec) = router
+            .stream_with_route("m1", vec![Message::user("hi")], None)
+            .await
+            .expect("the healthy candidate should serve this call");
+
+        assert_eq!(rec.chosen, "healthy/m1");
+        assert!(rec.fallback_occurred);
+        let chunks = collect(stream).await;
+        assert_eq!(
+            chunks
+                .iter()
+                .filter_map(|c| c.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["ok"],
+            "the caller sees the healthy stream, unaltered"
+        );
+        assert!(chunks.iter().all(|c| c.error.is_none()));
+    }
+
+    /// Once output exists, a failure is reported instead of retried: a retry
+    /// would duplicate what the caller has already received.
+    #[tokio::test]
+    async fn a_stream_that_fails_after_output_reports_instead_of_retrying() {
+        let (router, _) = streaming_router(Arc::new(StreamFailsAfterOutputProvider)).await;
+
+        let (stream, rec) = router
+            .stream_with_route("m1", vec![Message::user("hi")], None)
+            .await
+            .expect("the stream opened; its failure comes later");
+
+        assert_eq!(rec.chosen, "flaky/m1", "no fallback once output exists");
+        assert!(!rec.fallback_occurred);
+        let chunks = collect(stream).await;
+        assert_eq!(
+            chunks
+                .iter()
+                .filter_map(|c| c.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["partial"],
+            "the output that was already produced is not duplicated"
+        );
+        let error = chunks
+            .iter()
+            .find_map(|c| c.error.as_deref())
+            .expect("the failure reaches the caller");
+        assert!(error.contains("boom"), "error: {error}");
     }
 
     /// Minimal OpenAI-compatible provider config for routing tests.

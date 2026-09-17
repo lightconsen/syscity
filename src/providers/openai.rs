@@ -403,6 +403,7 @@ impl Provider for OpenAiProvider {
                         reasoning_content: resp.message.reasoning_content,
                         tool_calls: resp.message.tool_calls,
                         is_done: true,
+                        error: None,
                         usage: resp.usage,
                     }
                 })));
@@ -653,6 +654,7 @@ impl OpenAiStream {
                     reasoning_content: None,
                     tool_calls: None,
                     is_done: true,
+                    error: None,
                     usage: None,
                 });
             }
@@ -696,6 +698,7 @@ impl OpenAiStream {
                         reasoning_content,
                         tool_calls,
                         is_done,
+                        error: None,
                         usage: response.usage.as_ref().map(|u| {
                             u.to_usage_with_credits(
                                 response.x_credits_used,
@@ -711,6 +714,7 @@ impl OpenAiStream {
                         reasoning_content: None,
                         tool_calls: None,
                         is_done: true,
+                        error: None,
                         usage: Some(usage.to_usage_with_credits(
                             response.x_credits_used,
                             response.x_credit_balance,
@@ -750,7 +754,17 @@ impl Stream for OpenAiStream {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     warn!("Stream error: {}", e);
-                    return Poll::Ready(None);
+                    // Report it rather than ending the stream as if it had
+                    // finished: a truncated response that looks complete is
+                    // worse than a failed one.
+                    return Poll::Ready(Some(CompletionChunk {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        is_done: true,
+                        error: Some(e.to_string()),
+                        usage: None,
+                    }));
                 }
                 Poll::Ready(None) => {
                     // Inner stream is done. Process any remaining text

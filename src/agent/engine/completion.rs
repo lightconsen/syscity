@@ -615,7 +615,53 @@ impl Agent {
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<crate::providers::Usage> = None;
 
+        let controller = self.execution_controller.read().await.clone();
+
         while let Some(chunk) = stream.next().await {
+            // Stop between chunks, not only between tool iterations: a long
+            // generation is one iteration, so without this a `chat.abort` (or a
+            // pause) had nothing to interrupt — the turn kept consuming the
+            // provider's stream to the end. Dropping out of the loop drops the
+            // stream, which is what closes the HTTP body.
+            if let Some(ref ctrl) = controller {
+                if let Err(reason) = ctrl.wait_until_resumed().await {
+                    collector.end_round(usage.as_ref(), Some("aborted".to_string()));
+                    let content = if accumulated_text.is_empty() {
+                        format!("Execution halted: {reason}")
+                    } else {
+                        format!("{accumulated_text}\n\n[Execution halted: {reason}]")
+                    };
+                    return Ok(crate::providers::CompletionResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content,
+                            content_blocks: None,
+                            reasoning_content: None,
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            metadata: None,
+                        },
+                        usage,
+                        model: String::new(),
+                        finish_reason: Some("aborted".to_string()),
+                    });
+                }
+            }
+
+            // A chunk that carries a failure ends the round as a failure. The
+            // providers used to either end the stream as if it had finished
+            // (a truncated reply that looks complete) or write the error into
+            // the content (so it became assistant text); this is the one place
+            // that decides what a failed stream means.
+            if let Some(err) = chunk.error {
+                collector.end_round(usage.as_ref(), Some("error".to_string()));
+                return Err(crate::error::SyscityError::ExternalService {
+                    source: format!("stream failed: {err}"),
+                    cause: None,
+                });
+            }
+
             // Emit reasoning delta
             if let Some(ref reasoning_delta) = chunk.reasoning_content {
                 if !reasoning_delta.is_empty() {

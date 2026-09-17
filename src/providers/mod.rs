@@ -306,6 +306,17 @@ pub struct CompletionChunk {
     pub is_done: bool,
     /// Usage statistics (only in final chunk)
     pub usage: Option<Usage>,
+    /// The stream failed, with the reason.
+    ///
+    /// The channel for a failure that happens *after* a stream has opened: a
+    /// dropped connection, a malformed SSE frame, a provider error event. It
+    /// used to have none — two providers wrote the message into `content`, so
+    /// the failure became assistant text in the transcript, and one ended the
+    /// stream as if it had finished. A caller can now tell a truncated stream
+    /// from a complete one, and the router can retry a stream that failed
+    /// before producing anything.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Usage statistics for a completion
@@ -876,6 +887,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             is_done: false,
+            error: None,
             usage: None,
         };
         assert_eq!(chunk.content, Some("hi".to_string()));
@@ -935,6 +947,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: true,
+                error: None,
                 usage: None,
             });
             Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))

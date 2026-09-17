@@ -251,6 +251,7 @@ impl Provider for MockProvider {
             reasoning_content: message.reasoning_content.clone(),
             tool_calls: message.tool_calls.clone(),
             is_done: false,
+            error: None,
             usage: None,
         }) {
             warn!("MockProvider stream: failed to send content chunk: {}", e);
@@ -267,6 +268,7 @@ impl Provider for MockProvider {
             reasoning_content: None,
             tool_calls: None,
             is_done: true,
+            error: None,
             usage: Some(Usage {
                 prompt_tokens,
                 completion_tokens: message.content.len() as u32 / 4,

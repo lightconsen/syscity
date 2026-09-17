@@ -59,6 +59,28 @@ impl ExecutionController {
     }
 
     /// Transition to `Paused`.
+    /// Wait until this execution may continue, without counting an iteration.
+    ///
+    /// [`check_and_wait`](Self::check_and_wait) is the *iteration* gate — it
+    /// bumps the step counter, which is what the ACP view reports. A caller
+    /// inside one iteration (a streaming reply, which has many chunks and no
+    /// steps) needs the waiting half without the counting half.
+    pub async fn wait_until_resumed(&self) -> Result<(), &'static str> {
+        loop {
+            let state = *self.state.read().await;
+            match state {
+                RuntimeState::Idle | RuntimeState::Running | RuntimeState::Stepping => {
+                    return Ok(());
+                }
+                RuntimeState::Paused => {
+                    self.notify.notified().await;
+                    continue;
+                }
+                RuntimeState::Cancelled => return Err("Execution cancelled by user"),
+            }
+        }
+    }
+
     pub async fn pause(&self) {
         let mut state = self.state.write().await;
         if *state == RuntimeState::Running || *state == RuntimeState::Idle {

@@ -510,6 +510,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: false,
+                error: None,
                 usage: None,
             },
             CompletionChunk {
@@ -517,6 +518,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: true,
+                error: None,
                 usage: Some(crate::providers::Usage {
                     prompt_tokens: 10,
                     completion_tokens: 2,
@@ -547,6 +549,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             is_done: true,
+            error: None,
             usage: None,
         }];
         let stream = Box::pin(futures::stream::iter(chunks));
@@ -568,6 +571,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: false,
+                error: None,
                 usage: None,
             },
             CompletionChunk {
@@ -575,6 +579,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: true,
+                error: None,
                 usage: None,
             },
             CompletionChunk {
@@ -582,6 +587,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: true,
+                error: None,
                 usage: Some(crate::providers::Usage {
                     prompt_tokens: 50,
                     completion_tokens: 10,
@@ -671,6 +677,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: false,
+                error: None,
                 usage: None,
             },
             CompletionChunk {
@@ -678,6 +685,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: None,
                 is_done: true,
+                error: None,
                 usage: None,
             },
         ];

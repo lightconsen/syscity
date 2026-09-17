@@ -490,6 +490,7 @@ impl AnthropicProvider {
                         reasoning_content: None,
                         tool_calls: None,
                         is_done: true,
+                        error: None,
                         usage: None,
                     });
                     break;
@@ -509,6 +510,7 @@ impl AnthropicProvider {
                                                     reasoning_content: None,
                                                     tool_calls: None,
                                                     is_done: false,
+                                                    error: None,
                                                     usage: None,
                                                 });
                                             }
@@ -559,6 +561,7 @@ impl AnthropicProvider {
                                             result: None,
                                         }]),
                                         is_done: false,
+                                        error: None,
                                         usage: None,
                                     });
                                 }
@@ -569,6 +572,7 @@ impl AnthropicProvider {
                                     reasoning_content: None,
                                     tool_calls: None,
                                     is_done: true,
+                                    error: None,
                                     usage: usage_accum.to_usage(),
                                 });
                             }
@@ -758,11 +762,15 @@ impl Provider for AnthropicProvider {
                     }
                     Err(e) => {
                         error!("Stream error: {}", e);
+                        // The failure has a channel of its own now: writing it
+                        // into `content` made it assistant text, so it landed
+                        // in the transcript as something the model "said".
                         yield CompletionChunk {
-                            content: Some(format!("[Stream error: {}]", e)),
+                            content: None,
                             reasoning_content: None,
                             tool_calls: None,
                             is_done: true,
+                            error: Some(e.to_string()),
                             usage: None,
                         };
                     }

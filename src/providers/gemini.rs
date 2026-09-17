@@ -682,6 +682,7 @@ impl GeminiStream {
                     reasoning_content: None,
                     tool_calls: None,
                     is_done,
+                    error: None,
                     usage: response.usage_metadata.map(|u| Usage {
                         prompt_tokens: u.prompt_token_count,
                         completion_tokens: u.candidates_token_count,
@@ -698,6 +699,7 @@ impl GeminiStream {
                     reasoning_content: None,
                     tool_calls: None,
                     is_done: true,
+                    error: None,
                     usage: Some(Usage {
                         prompt_tokens: usage.prompt_token_count,
                         completion_tokens: usage.candidates_token_count,
@@ -734,10 +736,11 @@ impl Stream for GeminiStream {
                 Poll::Ready(Some(Err(e))) => {
                     warn!("Gemini stream error: {}", e);
                     return Poll::Ready(Some(CompletionChunk {
-                        content: Some(format!("[Stream error: {}]", e)),
+                        content: None,
                         reasoning_content: None,
                         tool_calls: None,
                         is_done: true,
+                        error: Some(e.to_string()),
                         usage: None,
                     }));
                 }
