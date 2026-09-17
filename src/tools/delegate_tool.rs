@@ -66,8 +66,10 @@ pub struct TaskSpec {
     pub allowed_tools: Vec<String>,
     /// Context to pass to child
     pub context: HashMap<String, serde_json::Value>,
-    /// Target agent type for routing (e.g., "coder", "reviewer"). Defaults to
-    /// "delegate".
+    /// Agent to run this child as. Only the agent the delegation is made for
+    /// (its parent) may be named here: this field is filled from the *model's*
+    /// tool arguments, and honouring another name would run the child under
+    /// that agent's workspace, secrets and skill trust.
     #[serde(default)]
     pub target_agent: Option<String>,
     /// Optional shared-task id for the child (registry run id).  When set, the
@@ -399,25 +401,47 @@ impl DelegateTool {
         };
         let parent_task_id = parent_scope.as_ref().map(|ps| ps.task_id.clone());
 
-        // Determine which agent to use for child execution:
-        // 1. If target_agent is set and we have a resolver, look it up
-        // 2. Fall back to self.agent if not found or no target specified
-        let child_agent = if let Some(ref resolver) = self.agent_resolver {
-            if let Some(target) = &task.target_agent {
+        // Which agent runs this child.
+        //
+        // `target_agent` is parsed out of the *model's* tool arguments (see the
+        // `task_json` handling above), so it is a privilege selector rather than
+        // a routing hint from the operator: naming another running agent runs
+        // the child under that agent's workspace, secrets and skill trust. A
+        // delegation may therefore only name the agent it delegates for;
+        // anything else falls back to that agent and is logged. Nothing else in
+        // the tree sets `target_agent`, and no configuration exposes it, so
+        // default-deny costs no supported use — if cross-agent delegation is
+        // wanted, it should arrive as an operator-configured allowlist rather
+        // than as a name the model chose.
+        let parent_agent_id = self.agent.as_ref().map(|a| a.agent_id.clone());
+        let child_agent = match (&task.target_agent, &self.agent_resolver) {
+            (Some(target), Some(resolver))
+                if parent_agent_id.as_deref() == Some(target.as_str()) =>
+            {
                 resolver
                     .resolve(target)
                     .await
                     .or_else(|| self.agent.clone())
-            } else {
+            }
+            (Some(target), _) => {
+                warn!(
+                    "delegate: refusing target_agent '{}' — a delegation may only name the \
+                     agent it delegates for ({:?})",
+                    target, parent_agent_id
+                );
                 self.agent.clone()
             }
-        } else {
-            self.agent.clone()
+            (None, _) => self.agent.clone(),
         };
 
-        let agent_type = task
-            .target_agent
-            .clone()
+        // The identity recorded on the task row and its events is the agent that
+        // will actually run the child, not the string the caller asked for: that
+        // string reached the audit trail even when the lookup fell back to the
+        // parent, so the record named an agent that did not run.
+        let agent_type = child_agent
+            .as_ref()
+            .map(|a| a.agent_id.clone())
+            .filter(|id| !id.is_empty())
             .unwrap_or_else(|| "delegate".to_string());
 
         // Build the execution closure. The registry will supply the run_id, which
@@ -1486,6 +1510,94 @@ mod tests {
         let cloned = tracker.clone();
         assert_eq!(cloned.depth, tracker.depth);
         assert_eq!(cloned.max_children, tracker.max_children);
+    }
+
+    /// A resolver that hands back a named agent, so a test can tell "the name
+    /// was honoured" from "it fell back to the parent".
+    struct StubResolver {
+        agents: HashMap<String, Arc<Agent>>,
+    }
+
+    #[async_trait]
+    impl AgentResolver for StubResolver {
+        async fn resolve(&self, name: &str) -> Option<Arc<Agent>> {
+            self.agents.get(name).cloned()
+        }
+    }
+
+    fn named_agent(id: &str, response: &str) -> Arc<Agent> {
+        let provider =
+            Arc::new(MockProvider::new().with_responses(vec![Message::assistant(response)]));
+        Arc::new(Agent::new(
+            AgentConfig {
+                agent_id: Some(id.to_string()),
+                ..Default::default()
+            },
+            provider,
+            Arc::new(ToolRegistry::new()),
+        ))
+    }
+
+    /// `target_agent` is parsed out of the model's tool arguments, so it must
+    /// not be able to pick which agent — and therefore which workspace, secrets
+    /// and skill trust — the child runs under. And the task row must name the
+    /// agent that actually ran: it used to record the requested string even when
+    /// the lookup fell back to the parent.
+    #[tokio::test]
+    async fn target_agent_cannot_select_another_agent() {
+        let store = Arc::new(
+            DelegationTaskStore::new("sqlite::memory:")
+                .await
+                .expect("in-memory store"),
+        );
+        let parent = named_agent("parent", "done");
+        let resolver: Arc<dyn AgentResolver> = Arc::new(StubResolver {
+            agents: HashMap::from([
+                ("parent".to_string(), parent.clone()),
+                ("other".to_string(), named_agent("other", "done")),
+            ]),
+        });
+        let tool = DelegateTool::with_agent(0, parent)
+            .with_agent_resolver(resolver)
+            .with_task_store(store.clone());
+        let context = ToolContext::new("user", "parent-session");
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "spawn",
+                    "task": { "prompt": "do the other agent's work", "target_agent": "other" }
+                }),
+                &context,
+            )
+            .await
+            .expect("the delegation still runs — as the parent agent");
+        assert!(result.success, "spawn should succeed: {:?}", result);
+        let child_id = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("child_id"))
+            .and_then(|v| v.as_str())
+            .expect("child_id in result")
+            .to_string();
+
+        // The row is written inside the spawned child, so it may land just
+        // after `execute` returns.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let row = loop {
+            if let Some(row) = store.get_task(&child_id).await.expect("read task row") {
+                break row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child's task row was never written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            row.agent_id, "parent",
+            "the row must name the agent that ran the child, not the one asked for"
+        );
     }
 
     #[tokio::test]
