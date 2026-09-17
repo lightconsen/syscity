@@ -59,8 +59,30 @@ export async function initGatewayBase(): Promise<string> {
   return base;
 }
 
-/** Gateway token for HTTP requests (mobile / remote mode), if any. */
+let cachedToken: string | null = null;
+
+/**
+ * Remember a gateway token the *host* supplied, for this session only.
+ *
+ * The mobile build hands the per-install token over through the Tauri command
+ * (`get_gateway_token`), and the host can hand it over again after any reload —
+ * so it lives in memory rather than in `localStorage`, where it would outlive
+ * the session and be readable by anything running in the WebView. A token the
+ * *user* typed (see `ConnectionSettings`) is a different case: nothing else can
+ * re-supply it, so that one stays in `localStorage` and is read as a fallback.
+ */
+export function setGatewayToken(token: string | null): void {
+  cachedToken = token;
+}
+
+/**
+ * Gateway token for HTTP requests, if any.
+ *
+ * The host-supplied token wins: on mobile it is the credential for the app's
+ * own gateway. Otherwise fall back to the one the user saved.
+ */
 export function getGatewayToken(): string | null {
+  if (cachedToken) return cachedToken;
   return typeof localStorage !== "undefined"
     ? localStorage.getItem("syscity_gateway_token")
     : null;

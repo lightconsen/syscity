@@ -18,7 +18,7 @@ import {
   LOCAL_COMMANDS,
 } from "./slash-commands";
 
-import { getGatewayBase, setGatewayBase } from "./lib/gatewayBase";
+import { getGatewayBase, setGatewayBase, setGatewayToken } from "./lib/gatewayBase";
 
 import { useChatStore } from "./stores/chatStore";
 import { pushToast } from "./components/ui/Toast";
@@ -133,8 +133,11 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
         const token = await invoke<string | null>("get_gateway_token");
         if (token) {
           this.gatewayToken = token;
-          // Shared with plain-HTTP fetches (e.g. artifact preview).
-          localStorage.setItem("syscity_gateway_token", token);
+          // Shared with plain-HTTP fetches (e.g. artifact preview) for this
+          // session. Deliberately *not* written to localStorage: the host
+          // re-supplies it on every launch, so persisting it would only leave
+          // a credential behind in the WebView after the app is gone.
+          setGatewayToken(token);
         }
       } catch {
         // Not a mobile build — no token required.
