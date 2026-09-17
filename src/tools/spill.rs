@@ -4,8 +4,9 @@
 //!
 //! The spill directory lives under the workspace root so that the sandboxed
 //! `file_read` / `grep` tools can read spilled content back under
-//! `workspace_only`. Files accumulate without GC for now (they are small);
-//! a retention policy can be added later.
+//! `workspace_only`. Files are swept by age on the next spill
+//! ([`SPILL_RETENTION`]) — they used to accumulate forever, which is fine until
+//! the workspace is a long-lived one.
 //!
 //! Note: the spilled file keeps the raw, unfiltered output. The content
 //! filter applies to the model-facing preview only — matching the upstream
@@ -18,6 +19,46 @@ use serde_json::Value;
 
 /// Subdirectory (inside the workspace root) holding spilled outputs.
 const SPILL_DIR: &str = ".syscity/spill";
+
+/// How long a spill file is kept before the next spill sweeps it.
+///
+/// Generous on purpose: the file exists so a later turn can read back what an
+/// earlier one produced, so the window only has to outlast "one conversation's
+/// work" to be safe. Nothing needs to track readers — the window is what
+/// guarantees a live turn's spill is still there.
+const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Delete spill files older than [`SPILL_RETENTION`]; returns how many went.
+///
+/// A missing spill directory is not an error (most workspaces never spill).
+/// Individual files that cannot be deleted are skipped rather than failing the
+/// sweep: reclaiming is best-effort and one stubborn file should not stop the
+/// rest.
+pub fn sweep_spill_dir(workspace_root: &Path) -> io::Result<usize> {
+    let dir = workspace_root.join(SPILL_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(SPILL_RETENTION)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Age from the mtime: an entry whose metadata cannot be read is left
+        // alone rather than guessed at.
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
 
 /// The result of spilling one tool output to disk.
 #[derive(Debug)]
@@ -143,6 +184,16 @@ pub fn spill_output(
     let dir = workspace_root.join(SPILL_DIR);
     std::fs::create_dir_all(&dir)?;
 
+    // Sweep before writing, so the directory cannot grow without bound: a spill
+    // is the only thing that creates files here, and therefore the only thing
+    // that needs to clean them up. Best-effort — a failure to reclaim is not a
+    // reason to fail the spill the caller is waiting on.
+    match sweep_spill_dir(workspace_root) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!("Swept {} expired spill file(s)", n),
+        Err(e) => tracing::warn!("Failed to sweep the spill directory: {e}"),
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let file_name = format!("{}-{}.log", &id[..8], sanitize_tool_name(tool_name));
     let path = dir.join(&file_name);
@@ -190,6 +241,50 @@ pub fn spill_output(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Spilled files used to accumulate forever. A sweep keeps the directory
+    /// bounded by age, and leaves fresh files — the ones a live turn may still
+    /// read back — alone.
+    #[test]
+    fn sweep_removes_only_expired_spills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join(SPILL_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = dir.join("old.log");
+        let fresh = dir.join("fresh.log");
+        std::fs::write(&old, "from last week").unwrap();
+        std::fs::write(&fresh, "from this turn").unwrap();
+
+        // Backdate one file past the retention window.
+        let backdated =
+            std::time::SystemTime::now() - SPILL_RETENTION - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+
+        assert_eq!(sweep_spill_dir(root).unwrap(), 1);
+        assert!(!old.exists(), "the expired spill is gone");
+        assert!(fresh.exists(), "the live one stays");
+
+        // Nothing to do on a workspace that never spilled.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(sweep_spill_dir(empty.path()).unwrap(), 0);
+
+        // And the sweep is wired into the only thing that creates spills.
+        std::fs::File::options()
+            .write(true)
+            .open(&fresh)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+        spill_output(root, "shell", "a big output", 64).unwrap();
+        assert!(!fresh.exists(), "spilling sweeps first");
+    }
 
     #[test]
     fn head_tail_passthrough_when_fits() {
