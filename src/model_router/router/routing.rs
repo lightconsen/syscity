@@ -123,6 +123,12 @@ impl ModelRouter {
                 };
                 (provider, bare)
             } else {
+                // A model nobody knows falls back to the global default. That
+                // is deliberate for model ids that come from outside the
+                // gateway (a client's `model` on the OpenAI-compatible route),
+                // but it must not be *quiet*: a caller asking for A and
+                // silently getting B is how a misconfiguration survives. The
+                // route record carries the substitution too (`RouteRecord`).
                 let default_model = self.get_default_model().await;
                 let provider = self
                     .provider_for_model(&default_model)
@@ -131,6 +137,10 @@ impl ModelRouter {
                         key: "model".to_string(),
                         message: format!("Unknown model: {model_id}"),
                     })?;
+                warn!(
+                    "Unknown model '{}' — routing to the default '{}' instead",
+                    model_id, default_model
+                );
                 (provider, default_model)
             }
         };
