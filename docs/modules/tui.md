@@ -136,11 +136,26 @@ gateway ◀── WS ──▶ chat.delta/final │              │ take_flusha
 
 Reconnecting: a dropped socket surfaces as `WsMessage::Disconnected`, which the
 loop turns into a visible "lost the gateway" notice and a backoff retry. The
-session is re-subscribed, and history is **not** reprinted — the transcript is
-already above. Output produced while offline is lost, which the notice says.
-The run state converges with it: a disconnected run cannot finish and a
-disconnected prompt cannot be answered, so both are cleared and said so, rather
-than left claiming to be in progress.
+run state converges with it: a disconnected run cannot finish and a disconnected
+prompt cannot be answered, so both are cleared and said so, rather than left
+claiming to be in progress.
+
+The reconnect then asks what became of it. `chat.history` is read for the
+current session, and any message the gateway wrote *after* the socket went
+away is printed under a "while offline" rule — those are exactly the ones the
+TUI never received, so nothing already in the transcript is reprinted. With no
+run in flight there is nothing to explain and nothing is printed. The window
+comes from `AppState::interrupted`, which the disconnect records; it is spent
+once a reconnect has answered it. If nothing arrived while a run was in
+flight, the TUI says that instead — which is the answer to "what happened to
+it", and better than leaving "interrupted" as the last word.
+
+The watermark is our wall clock against the gateway's `created_at`. Those
+agree when the gateway is local, which is the ordinary case; the reconnect
+backoff is half a second and up, far more than the skew between two machines
+kept in sync, and a skewed clock can only widen or narrow the window — it
+cannot reprint what the TUI already showed, because nothing it showed carries
+a timestamp after the disconnect.
 
 Subscription filtering: the gateway reads an *empty* subscription list as
 "every session" (`ProtocolConnection::is_subscribed`), and a session created

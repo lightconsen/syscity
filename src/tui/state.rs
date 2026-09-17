@@ -64,6 +64,27 @@ pub enum LiveMode {
     Ask,
 }
 
+/// What the connection dropped in the middle of.
+///
+/// Kept so a reconnect can say what actually *happened* to the work in flight,
+/// rather than leaving "interrupted" as the last word on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interruption {
+    /// Wall-clock milliseconds when the socket went away. Anything the gateway
+    /// wrote after this is what the TUI never received.
+    pub since_ms: i64,
+    /// A turn was in flight at the time.
+    pub run_in_flight: bool,
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// A question from `ask_user` waiting for a human answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AskPrompt {
@@ -165,6 +186,9 @@ pub struct AppState {
     pub status: Option<(String, Instant)>,
     /// Set when a redraw is needed.
     pub dirty: bool,
+    /// What the last lost connection interrupted, until a reconnect has
+    /// reconciled it.
+    pub interrupted: Option<Interruption>,
     /// Quit on the next loop iteration.
     pub should_quit: bool,
 }
@@ -198,6 +222,7 @@ impl Default for AppState {
             spinner: 0,
             status: None,
             dirty: true,
+            interrupted: None,
             should_quit: false,
         }
     }
@@ -467,6 +492,13 @@ impl AppState {
         self.live_mode = LiveMode::Composer;
         let dropped_queue = self.clear_queue();
 
+        // Remember what we lost, so the reconnect can check what became of it
+        // rather than leaving "interrupted" as the answer.
+        self.interrupted = Some(Interruption {
+            since_ms: now_millis(),
+            run_in_flight: was_running,
+        });
+
         if was_running {
             self.transcript.push_notice("── the run was interrupted ──");
         }
@@ -701,6 +733,34 @@ mod tests {
             "a dropped prompt is said out loud: {flushed:?}"
         );
         assert!(s.transcript.preview(10).is_empty(), "nothing is left live");
+    }
+
+    /// The loss records what it interrupted, so a reconnect can check on it.
+    #[test]
+    fn a_lost_connection_records_what_it_interrupted() {
+        let mut s = AppState::default();
+        assert!(s.interrupted.is_none(), "nothing lost yet");
+
+        s.begin_run();
+        s.connection_lost("gone");
+
+        let interrupted = s.interrupted.expect("recorded");
+        assert!(interrupted.run_in_flight, "a turn was in flight");
+        assert!(
+            interrupted.since_ms > 1_600_000_000_000,
+            "a wall clock reading, not a zero: {}",
+            interrupted.since_ms
+        );
+    }
+
+    /// With nothing running there is still a window, just no run to explain.
+    #[test]
+    fn a_loss_with_no_run_still_records_the_window() {
+        let mut s = AppState::default();
+        s.connection_lost("gone");
+
+        let interrupted = s.interrupted.expect("recorded");
+        assert!(!interrupted.run_in_flight);
     }
 
     /// Converging twice is harmless — a reconnect can drop again.

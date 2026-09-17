@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
@@ -27,13 +27,20 @@ pub struct Received {
     pub params: Value,
 }
 
-/// A stand-in gateway, listening on a loopback port.
-pub struct TestGateway {
-    /// The port the client should connect to.
-    pub port: u16,
+/// What every connection to the same stand-in gateway shares.
+///
+/// Separate from [`TestGateway`] because the serving tasks outlive any one
+/// connection: a client that reconnects gets a new socket onto the same
+/// gateway, with the same scripted history and the same refusals.
+#[derive(Clone)]
+struct Shared {
     requests: Arc<Mutex<Vec<Received>>>,
-    events: mpsc::UnboundedSender<Message>,
-    close: Mutex<Option<oneshot::Sender<()>>>,
+    /// Events go to whichever connection is live. A broadcast rather than a
+    /// queue: connections come and go, and a receiver held for one
+    /// connection's lifetime would lock out the next one — which is exactly
+    /// what a reconnect test does.
+    events: broadcast::Sender<Message>,
+    close: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     silent: Arc<std::sync::atomic::AtomicBool>,
     failures: Arc<Mutex<HashMap<String, String>>>,
     upgrade_headers: Arc<Mutex<Vec<(String, String)>>>,
@@ -41,121 +48,57 @@ pub struct TestGateway {
     held: Arc<Mutex<Vec<String>>>,
 }
 
+/// A stand-in gateway, listening on a loopback port.
+pub struct TestGateway {
+    /// The port the client should connect to.
+    pub port: u16,
+    shared: Shared,
+    /// Push events at whichever connection is live.
+    events: broadcast::Sender<Message>,
+}
+
 impl TestGateway {
-    /// Bind a port and start serving one client.
+    /// Bind a port and start serving clients.
+    ///
+    /// Connections are served one after another, so a test can drop the socket
+    /// and watch the client come back to the same gateway.
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
         let port = listener.local_addr().expect("local addr").port();
-        let requests: Arc<Mutex<Vec<Received>>> = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Message>();
-        let (close_tx, mut close_rx) = oneshot::channel::<()>();
-        let recorder = Arc::clone(&requests);
-        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mute = Arc::clone(&silent);
-        let failures: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-        let refusals = Arc::clone(&failures);
-        let upgrade_headers: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let header_sink = Arc::clone(&upgrade_headers);
-        let history: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let stored = Arc::clone(&history);
-        let held: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let on_hold = Arc::clone(&held);
+        let (event_tx, _) = broadcast::channel::<Message>(64);
+        let shared = Shared {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            events: event_tx.clone(),
+            close: Arc::new(Mutex::new(None)),
+            silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failures: Arc::new(Mutex::new(HashMap::new())),
+            upgrade_headers: Arc::new(Mutex::new(Vec::new())),
+            history: Arc::new(Mutex::new(Vec::new())),
+            held: Arc::new(Mutex::new(Vec::new())),
+        };
 
+        let serving = shared.clone();
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let record_headers =
-                move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                    let mut sink = header_sink.lock().expect("upgrade headers");
-                    for (name, value) in req.headers() {
-                        sink.push((
-                            name.as_str().to_lowercase(),
-                            value.to_str().unwrap_or_default().to_string(),
-                        ));
-                    }
-                    Ok(resp)
-                };
-            let Ok(mut socket) = accept_hdr_async(stream, record_headers).await else {
-                return;
-            };
             loop {
-                tokio::select! {
-                    _ = &mut close_rx => break,
-                    Some(message) = event_rx.recv() => {
-                        if socket.send(message).await.is_err() {
-                            break;
-                        }
-                    }
-                    incoming = socket.next() => {
-                        let Some(Ok(Message::Text(text))) = incoming else {
-                            break;
-                        };
-                        let Ok(frame) = serde_json::from_str::<Value>(&text) else {
-                            continue;
-                        };
-                        let method = frame["method"].as_str().unwrap_or_default().to_string();
-                        let params = frame["params"].clone();
-                        recorder
-                            .lock()
-                            .expect("request log")
-                            .push(Received {
-                                method: method.clone(),
-                                params: params.clone(),
-                            });
-                        let on_hold = on_hold.lock().expect("held methods").contains(&method);
-                        if mute.load(std::sync::atomic::Ordering::SeqCst) || on_hold {
-                            // Recorded, deliberately unanswered: a request left
-                            // in flight.
-                            continue;
-                        }
-                        let failure = refusals
-                            .lock()
-                            .expect("failure table")
-                            .get(&method)
-                            .cloned();
-                        let reply = match failure {
-                            Some(code) => json!({
-                                "type": "res",
-                                "id": frame["id"].clone(),
-                                "ok": false,
-                                "error": { "code": code, "message": format!("{method} refused") },
-                            }),
-                            None => json!({
-                                "type": "res",
-                                "id": frame["id"].clone(),
-                                "ok": true,
-                                "payload": payload_for(&method, &params, &stored),
-                            }),
-                        };
-                        if socket.send(Message::Text(reply.to_string())).await.is_err() {
-                            break;
-                        }
-                    }
-                }
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (close_tx, close_rx) = oneshot::channel::<()>();
+                *serving.close.lock().expect("close slot") = Some(close_tx);
+                tokio::spawn(serve(stream, serving.clone(), close_rx));
             }
         });
 
-        Self {
-            port,
-            requests,
-            events: event_tx,
-            close: Mutex::new(Some(close_tx)),
-            silent,
-            failures,
-            upgrade_headers,
-            history,
-            held,
-        }
+        Self { port, shared, events: event_tx }
     }
-
     /// Take `method`: accept it, record it, and never answer it.
     ///
     /// For a test that needs the client parked mid-call — the difference
     /// between "slow" and "never" is what makes a lock held across a request
     /// observable instead of a race.
     pub fn hold(&self, method: &str) {
-        self.held
+        self.shared
+            .held
             .lock()
             .expect("held methods")
             .push(method.to_string());
@@ -163,12 +106,13 @@ impl TestGateway {
 
     /// Serve these messages from `chat.history`, oldest first.
     pub fn with_history(&self, messages: Vec<Value>) {
-        *self.history.lock().expect("history") = messages;
+        *self.shared.history.lock().expect("history") = messages;
     }
 
     /// One header of the WebSocket upgrade request, lower-cased.
     pub fn upgrade_header(&self, name: &str) -> Option<String> {
-        self.upgrade_headers
+        self.shared
+            .upgrade_headers
             .lock()
             .expect("upgrade headers")
             .iter()
@@ -178,12 +122,15 @@ impl TestGateway {
 
     /// Record requests from here on, but never answer them.
     pub fn go_silent(&self) {
-        self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared
+            .silent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make `method` answer with an error carrying `code`.
     pub fn fail_with(&self, method: &str, code: &str) {
-        self.failures
+        self.shared
+            .failures
             .lock()
             .expect("failure table")
             .insert(method.to_string(), code.to_string());
@@ -191,7 +138,7 @@ impl TestGateway {
 
     /// Every request received so far, in order.
     pub fn requests(&self) -> Vec<Received> {
-        self.requests.lock().expect("request log").clone()
+        self.shared.requests.lock().expect("request log").clone()
     }
 
     /// Wait for the first request named `method`, and return its parameters.
@@ -202,7 +149,7 @@ impl TestGateway {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let found = {
-                let requests = self.requests.lock().expect("request log");
+                let requests = self.shared.requests.lock().expect("request log");
                 requests
                     .iter()
                     .find(|r| r.method == method)
@@ -226,16 +173,97 @@ impl TestGateway {
     /// Push a server event at the client.
     pub fn push_event(&self, event: &str, payload: Value) {
         let frame = json!({ "type": "event", "event": event, "payload": payload, "seq": 1 });
+        // Nobody listening is not an error: a test may push before the client
+        // has connected, or between connections.
         let _ = self.events.send(Message::Text(frame.to_string()));
     }
 
     /// Drop the connection, the way a gateway restart would.
     pub async fn close(&self) {
-        if let Some(tx) = self.close.lock().expect("close slot").take() {
+        if let Some(tx) = self.shared.close.lock().expect("close slot").take() {
             let _ = tx.send(());
         }
         // Give the serving task a moment to drop the socket.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Serve one connection until the test closes it or the client leaves.
+async fn serve(stream: tokio::net::TcpStream, shared: Shared, mut close_rx: oneshot::Receiver<()>) {
+    let record_headers = {
+        let sink = Arc::clone(&shared.upgrade_headers);
+        move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            let mut sink = sink.lock().expect("upgrade headers");
+            for (name, value) in req.headers() {
+                sink.push((
+                    name.as_str().to_lowercase(),
+                    value.to_str().unwrap_or_default().to_string(),
+                ));
+            }
+            Ok(resp)
+        }
+    };
+    let Ok(mut socket) = accept_hdr_async(stream, record_headers).await else {
+        return;
+    };
+
+    let mut events = shared.events.subscribe();
+    loop {
+        tokio::select! {
+            _ = &mut close_rx => break,
+            Ok(message) = events.recv() => {
+                if socket.send(message).await.is_err() {
+                    break;
+                }
+            }
+            incoming = socket.next() => {
+                let Some(Ok(Message::Text(text))) = incoming else {
+                    break;
+                };
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let method = frame["method"].as_str().unwrap_or_default().to_string();
+                let params = frame["params"].clone();
+                shared
+                    .requests
+                    .lock()
+                    .expect("request log")
+                    .push(Received {
+                        method: method.clone(),
+                        params: params.clone(),
+                    });
+                let held = shared.held.lock().expect("held methods").contains(&method);
+                if shared.silent.load(std::sync::atomic::Ordering::SeqCst) || held {
+                    // Recorded, deliberately unanswered: a request left in
+                    // flight.
+                    continue;
+                }
+                let failure = shared
+                    .failures
+                    .lock()
+                    .expect("failure table")
+                    .get(&method)
+                    .cloned();
+                let reply = match failure {
+                    Some(code) => json!({
+                        "type": "res",
+                        "id": frame["id"].clone(),
+                        "ok": false,
+                        "error": { "code": code, "message": format!("{method} refused") },
+                    }),
+                    None => json!({
+                        "type": "res",
+                        "id": frame["id"].clone(),
+                        "ok": true,
+                        "payload": payload_for(&method, &params, &shared.history),
+                    }),
+                };
+                if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
 }
 

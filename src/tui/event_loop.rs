@@ -26,12 +26,12 @@ use crate::tui::actions::TuiAction;
 use crate::tui::app::{Endpoint, SessionChoice};
 use crate::tui::commands::handle_slash_command;
 use crate::tui::error::TuiError;
-use crate::tui::gateway_calls::{self as gw, ApprovalDetail};
+use crate::tui::gateway_calls::{self as gw, ApprovalDetail, HistoryMessage};
 use crate::tui::input::poll_action;
 use crate::tui::resume;
 use crate::tui::retry::Backoff;
 use crate::tui::scrollback;
-use crate::tui::state::{AppState, AskPrompt, ConnectionState, LiveMode};
+use crate::tui::state::{AppState, AskPrompt, ConnectionState, Interruption, LiveMode};
 use crate::tui::transcript::{LineKind, TranscriptLine};
 use crate::tui::ui::{blocks, live};
 use crate::tui::ws_client::{ClientEvent, WsClient, WsMessage};
@@ -517,23 +517,25 @@ async fn try_reconnect(
                 server_version: hello.server.version,
             };
             s.dirty = true;
-            // Deliberately no history replay: the transcript is already in the
-            // scrollback above, and reprinting it would duplicate everything.
-            s.transcript
-                .push_notice("── reconnected (output produced while offline was not received) ──");
+            s.transcript.push_notice("── reconnected ──");
             let session = s.current_session.clone();
+            let interrupted = s.interrupted.take();
             drop(s);
-            if let Some(id) = session {
-                if let Some(client) = ws.as_ref() {
-                    if let Err(e) = gw::sessions_subscribe(client, &id).await {
-                        state
-                            .write()
-                            .await
-                            .transcript
-                            .push_notice(format!("⚠ reconnected but not subscribed to {id}: {e}"));
-                    }
-                }
+            let Some(id) = session else {
+                return;
+            };
+            let Some(client) = ws.as_ref() else {
+                return;
+            };
+            if let Err(e) = gw::sessions_subscribe(client, &id).await {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("⚠ reconnected but not subscribed to {id}: {e}"));
+                return;
             }
+            reconcile_after_reconnect(&id, interrupted, state, client).await;
         }
         Err(e) => {
             state
@@ -542,6 +544,64 @@ async fn try_reconnect(
                 .set_status(format!("⚠ reconnect attempt {attempt} failed: {e}"));
             schedule_reconnect(backoff, reconnect_at);
         }
+    }
+}
+
+/// How many messages back a reconnect looks for what it missed.
+const RECONCILE_TAIL: usize = 20;
+
+/// Print what the gateway produced while the connection was down.
+///
+/// The transcript is the record, so nothing already printed is printed again:
+/// only messages the gateway wrote *after* the socket went away, which by
+/// definition the TUI never received. That is what turns "the run was
+/// interrupted" — true when we last looked — into what actually became of it.
+///
+/// The comparison is our clock against the gateway's `created_at`. Those agree
+/// when the gateway is local, which is the ordinary case, and the reconnect
+/// backoff is half a second and up — far more than the skew between two
+/// machines kept in sync. A skewed clock can only make the window a little
+/// wide or narrow; it cannot make the TUI reprint what it already showed,
+/// because nothing it showed has a timestamp after the disconnect.
+async fn reconcile_after_reconnect(
+    session: &str,
+    interrupted: Option<Interruption>,
+    state: &Arc<RwLock<AppState>>,
+    client: &WsClient,
+) {
+    let Some(interrupted) = interrupted else {
+        return;
+    };
+    let messages = match gw::chat_history(client, session, RECONCILE_TAIL).await {
+        Ok((messages, _)) => messages,
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("⚠ could not check what arrived while offline: {e}"));
+            return;
+        }
+    };
+    let missed: Vec<HistoryMessage> = messages
+        .into_iter()
+        .filter(|m| m.timestamp_ms.is_some_and(|ts| ts > interrupted.since_ms))
+        .collect();
+
+    let mut lines = Vec::new();
+    if missed.is_empty() {
+        if interrupted.run_in_flight {
+            lines.push(TranscriptLine::new(
+                LineKind::Notice,
+                "── the run did not finish while offline — nothing arrived ──",
+            ));
+        }
+    } else {
+        lines.push(blocks::rule(&format!("while offline: {} message(s)", missed.len())));
+        lines.extend(blocks::history_lines(&missed));
+    }
+    if !lines.is_empty() {
+        state.write().await.transcript.push(lines);
     }
 }
 
@@ -2126,6 +2186,114 @@ mod tests {
         assert_eq!(sent["message"], "second");
         assert_eq!(sent["session_id"], "s1");
         assert!(state.read().await.queued.is_empty());
+    }
+
+    /// A reconnect shows what arrived while the connection was down.
+    ///
+    /// The notice used to say only "output produced while offline was not
+    /// received" and leave it there — so a turn that finished while the socket
+    /// was gone was indistinguishable from one that died. The client now asks
+    /// the gateway what it missed: messages written after the disconnect,
+    /// which by definition it never saw, so nothing already in the transcript
+    /// is printed twice.
+    #[tokio::test]
+    async fn a_reconnect_shows_what_arrived_while_offline() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        let mut ws = Some(Arc::new(client));
+        let disconnected_at = 1_757_000_000_000_i64;
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.interrupted = Some(Interruption {
+                since_ms: disconnected_at,
+                run_in_flight: true,
+            });
+        }
+        gateway.with_history(vec![
+            // Written before the socket went away: already in the transcript.
+            serde_json::json!({
+                "id": "msg_old",
+                "role": "user",
+                "content": "already seen",
+                "timestamp": disconnected_at - 1_000,
+            }),
+            // Written after: this is what the TUI never received.
+            serde_json::json!({
+                "id": "msg_new",
+                "role": "assistant",
+                "content": "the answer you missed",
+                "timestamp": disconnected_at + 1_000,
+            }),
+        ]);
+
+        let mut backoff = Backoff::new();
+        let mut reconnect_at = None;
+        try_reconnect(
+            &state,
+            &mut ws,
+            &test_endpoint(gateway.port),
+            &mut backoff,
+            &mut reconnect_at,
+        )
+        .await;
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(lines.iter().any(|l| l.contains("the answer you missed")), "got {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("already seen")),
+            "and nothing it already had: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("while offline")), "framed as such: {lines:?}");
+        assert!(
+            state.read().await.interrupted.is_none(),
+            "the window is spent once it has been answered"
+        );
+    }
+
+    /// A reconnect that finds nothing says that too — a run was in flight, and
+    /// "nothing arrived" is the answer to "what happened to it".
+    #[tokio::test]
+    async fn a_reconnect_that_finds_nothing_closes_the_question() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        let mut ws = Some(Arc::new(client));
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.interrupted = Some(Interruption {
+                since_ms: 1_757_000_000_000,
+                run_in_flight: true,
+            });
+        }
+
+        let mut backoff = Backoff::new();
+        let mut reconnect_at = None;
+        try_reconnect(
+            &state,
+            &mut ws,
+            &test_endpoint(gateway.port),
+            &mut backoff,
+            &mut reconnect_at,
+        )
+        .await;
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(lines.iter().any(|l| l.contains("did not finish")), "got {lines:?}");
     }
 
     /// A failed abort does not claim the run stopped.
