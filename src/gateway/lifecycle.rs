@@ -625,6 +625,36 @@ pub(crate) async fn start_gateway(
             .await;
     }
 
+    // Deny approvals whose waiter has gone away. `ApprovalQueue::cleanup_stale`
+    // existed but had no caller, so an approval that nobody was left waiting on
+    // stayed pending forever — visible to the UI, resolvable by nobody. The
+    // timeout it enforces is the queue's own (`default_timeout`).
+    {
+        let queue = state.tools.approval_queue.clone();
+        let shutdown_token = shutdown_token.clone();
+        let sweeper = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(APPROVAL_SWEEP_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        info!("Approval sweeper received shutdown signal, exiting");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        let expired = queue.cleanup_stale().await;
+                        if expired > 0 {
+                            info!("Denied {} stale approval(s)", expired);
+                        }
+                    }
+                }
+            }
+        });
+        state
+            .task_registry
+            .insert_join("approval_sweeper", sweeper)
+            .await;
+    }
+
     // Forward ask_user events from the ask queue into the Gateway event bus.
     {
         let mut ask_rx = state.tools.ask_queue.event_tx.subscribe();
@@ -1302,6 +1332,12 @@ pub(crate) async fn stop_gateway(
 fn is_socket_lifetime_task(name: &str) -> bool {
     name.starts_with("ws:") || name.starts_with("openai:sse:")
 }
+
+/// How often stale approvals are denied.
+///
+/// The approval queue's own `default_timeout` decides what "stale" means; this
+/// is only how promptly the sweep notices.
+const APPROVAL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long [`stop_gateway`] waits for the tasks left in the registry to finish
 /// what they were writing before aborting them.

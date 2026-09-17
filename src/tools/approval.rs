@@ -419,6 +419,29 @@ impl Default for ApprovalQueue {
 mod tests {
     use super::*;
 
+    /// What the gateway's approval sweeper relies on: an approval that has
+    /// outlived the queue's own timeout leaves `pending`, even when the waiter
+    /// it was raised for is gone. Nothing called this before, so such an entry
+    /// stayed pending forever — visible to the UI and resolvable by nobody.
+    #[tokio::test]
+    async fn cleanup_stale_removes_expired_approvals() {
+        let queue = ApprovalQueue::new();
+
+        let (tx, rx) = oneshot::channel();
+        let mut stale = PendingApproval::new("stale", "shell", serde_json::json!({}), "user");
+        stale.requested_at = Instant::now() - Duration::from_secs(3600);
+        queue.submit(stale.with_response_tx(tx)).await;
+        drop(rx); // the waiter went away, which is the case that used to leak
+
+        queue
+            .submit(PendingApproval::new("fresh", "shell", serde_json::json!({}), "user"))
+            .await;
+
+        assert_eq!(queue.cleanup_stale().await, 1, "only the expired approval is denied");
+        assert!(queue.get("stale").await.is_none(), "and it is gone");
+        assert!(queue.get("fresh").await.is_some(), "a fresh one is untouched");
+    }
+
     #[tokio::test]
     async fn test_approval_queue_submit_and_resolve() {
         let queue = ApprovalQueue::new();
