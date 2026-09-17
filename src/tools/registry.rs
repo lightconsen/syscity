@@ -347,6 +347,29 @@ impl ToolRegistry {
         false
     }
 
+    /// What a caller should know about a call whose outcome is unknown.
+    ///
+    /// A timeout is the one moment the gateway knows a tool *may* have taken
+    /// effect and cannot say whether it did — and the shape of that doubt
+    /// differs per tool: a read can be repeated, a send cannot. Quoting the
+    /// tool's own [`ToolCapabilities`] is what the declaration is for.
+    fn uncertainty_note(&self, tool_name: &str) -> String {
+        let caps = self.get_capabilities(tool_name);
+        if caps.idempotent {
+            " The tool is idempotent: retrying it is safe.".to_string()
+        } else {
+            match caps.compensation {
+                Some(compensation) => format!(
+                    " It is not idempotent — the call may have taken effect. To undo it: \
+                     {compensation}."
+                ),
+                None => " It is not idempotent and has no compensating action: retrying may \
+                         duplicate the effect."
+                    .to_string(),
+            }
+        }
+    }
+
     /// Helper to look up tool capabilities from either registry.
     fn tool_capabilities(&self, name: &str) -> crate::tools::sdk::ToolCapabilities {
         self.tools
@@ -1524,10 +1547,11 @@ impl ToolRegistry {
                     .await
                     .map_err(|_| {
                         crate::error::SyscityError::Timeout(format!(
-                            "Tool '{}' timed out after {:?} (actual execution: {:?})",
+                            "Tool '{}' timed out after {:?} (actual execution: {:?}).{}",
                             tool_name,
                             timeout,
-                            exec_start.elapsed()
+                            exec_start.elapsed(),
+                            self.uncertainty_note(&tool_name)
                         ))
                     })?;
             info!(
@@ -1564,10 +1588,11 @@ impl ToolRegistry {
                         .await
                         .map_err(|_| {
                             crate::error::SyscityError::Timeout(format!(
-                                "Tool '{}' timed out after {:?} (actual execution: {:?})",
+                                "Tool '{}' timed out after {:?} (actual execution: {:?}).{}",
                                 tool_name,
                                 timeout,
-                                exec_start.elapsed()
+                                exec_start.elapsed(),
+                                self.uncertainty_note(&tool_name)
                             ))
                         })?;
                 info!(
@@ -1725,9 +1750,98 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     use super::*;
+    use crate::tools::sdk::ToolCapabilities;
+
+    /// A tool whose only job is to declare retry semantics.
+    struct DeclaredTool {
+        name: String,
+        caps: ToolCapabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DeclaredTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "declares retry semantics"
+        }
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn capabilities(&self) -> ToolCapabilities {
+            self.caps.clone()
+        }
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> crate::Result<ToolExecutionResult> {
+            Ok(ToolExecutionResult::success("ok"))
+        }
+    }
+
+    /// The retry declaration has to be honest in the careful direction, and the
+    /// timeout path is where it is quoted: a caller that has just lost a tool to
+    /// a timeout is deciding whether to try again.
+    #[test]
+    fn retry_safety_is_declared_and_quoted_on_timeout() {
+        // The default is the careful answer: a tool that says nothing is
+        // assumed not to be safely repeatable.
+        let default = ToolCapabilities::default();
+        assert!(!default.idempotent);
+        assert!(default.compensation.is_none());
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DeclaredTool {
+            name: "repeatable".into(),
+            caps: ToolCapabilities {
+                idempotent: true,
+                ..Default::default()
+            },
+        }));
+        registry.register(Box::new(DeclaredTool {
+            name: "undoable".into(),
+            caps: ToolCapabilities {
+                compensation: Some("delete the thing it made"),
+                ..Default::default()
+            },
+        }));
+        registry.register(Box::new(DeclaredTool {
+            name: "one_way".into(),
+            caps: ToolCapabilities::default(),
+        }));
+
+        assert!(registry.uncertainty_note("repeatable").contains("safe"));
+        let undoable = registry.uncertainty_note("undoable");
+        assert!(
+            undoable.contains("delete the thing it made"),
+            "the compensating action is what the caller needs: {undoable}"
+        );
+        let one_way = registry.uncertainty_note("one_way");
+        assert!(
+            one_way.contains("duplicate"),
+            "a tool with no way back has to say so: {one_way}"
+        );
+    }
+
+    /// The tools that act on the world declare it, so the answer does not
+    /// depend on a caller's guess.
+    #[test]
+    fn the_consequential_tools_declare_their_retry_safety() {
+        // A read is repeatable.
+        assert!(
+            crate::tools::grep::GrepTool::new()
+                .capabilities()
+                .idempotent
+        );
+        // A command is not, and has nothing to compensate with.
+        let shell = crate::tools::shell::ShellTool::default().capabilities();
+        assert!(!shell.idempotent);
+        assert!(shell.compensation.is_none());
+    }
 
     /// A minimal tool that records whether its body actually ran.
     struct SpyTool {

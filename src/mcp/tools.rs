@@ -67,6 +67,12 @@ impl Tool for McpToolWrapper {
             requires_approval: true,
             risk_level: RiskLevel::High,
             categories: vec!["system".to_string(), "mcp".to_string()],
+            // What an MCP tool does with a retry is the server's business, so
+            // the honest declaration is the careful one — the default, written
+            // out because this is the tool family callers reach for when they
+            // want to act on an external system.
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }

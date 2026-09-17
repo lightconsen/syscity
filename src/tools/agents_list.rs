@@ -44,6 +44,7 @@ impl Tool for AgentsListTool {
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["system".to_string(), "info".to_string()],
+            idempotent: true,
             ..Default::default()
         }
     }

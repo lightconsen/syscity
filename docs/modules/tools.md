@@ -71,6 +71,7 @@ Capabilities the AI assistant can use to interact with the world.
 - **Privilege filtering** — Privileged tools hidden when `skill_trust == Community`
 - **Fine-grained RBAC** — Role-based tool access via `Role`, `UserContext`, and `ToolPolicy` with deny/allow lists, required role, max risk level, and category filtering. Evaluated in `ToolRegistry::is_excluded()`. See `src/tools/rbac.rs`.
 - **Content filtering** — Secret scanning and PII detection in tool outputs via `ContentFilter`
+- **Retry declaration** — `ToolCapabilities` carries `idempotent` and `compensation`, because a tool call whose outcome is unknown (a timeout) is exactly when a caller decides whether to try again, and only the tool knows. The default is the careful one — *not* idempotent, no compensation — so a tool that says nothing is never assumed safe to repeat; reads (`file_read`, `grep`, …) declare `idempotent: true`, the file writers name the undo they support ("write the content you read back"), and the one-way ones (`shell`, `send_message`, `delegate`, `mcp__*`) say so explicitly. `ToolRegistry::uncertainty_note` quotes the declaration on the timeout path. There is no rollback machinery for side effects, and the declaration exists so nothing pretends there is.
 
 ### MCP Integration
 

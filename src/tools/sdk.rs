@@ -56,6 +56,23 @@ pub struct ToolCapabilities {
     pub risk_level: RiskLevel,
     /// Categories (e.g. ["file", "system", "network"]).
     pub categories: Vec<String>,
+    /// Whether running this call twice has the same effect as running it once.
+    ///
+    /// The default is `false` — *assume a retry can duplicate the effect* —
+    /// because the alternative direction is the dangerous one: a tool that
+    /// unsends nothing, spends money twice or posts twice is worse than a
+    /// caller being needlessly careful. Tools that are genuinely safe to repeat
+    /// (reads, whole-snapshot writes) say so here, and the timeout path quotes
+    /// this field back when a call's outcome is unknown.
+    pub idempotent: bool,
+    /// How this tool's effect can be undone, if it can.
+    ///
+    /// `None` means "nothing to compensate with", which is the honest answer
+    /// for sending a message or running a shell command. Where a compensating
+    /// action exists it is named for the caller: the agent has no rollback
+    /// machinery for side effects, and this field exists so nothing pretends
+    /// it does.
+    pub compensation: Option<&'static str>,
 }
 
 impl Default for ToolCapabilities {
@@ -66,6 +83,8 @@ impl Default for ToolCapabilities {
             streaming: false,
             risk_level: RiskLevel::Low,
             categories: vec![],
+            idempotent: false,
+            compensation: None,
         }
     }
 }
@@ -452,9 +471,15 @@ mod tests {
             streaming: false,
             risk_level: RiskLevel::High,
             categories: vec!["file".to_string(), "system".to_string()],
+            idempotent: false,
+            compensation: Some("delete the file it wrote"),
         };
         let json = serde_json::to_string(&caps).unwrap();
         assert!(json.contains("requires_approval"));
+        assert!(
+            json.contains("delete the file it wrote"),
+            "the declaration travels with the capabilities: {json}"
+        );
     }
 
     #[test]

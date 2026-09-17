@@ -304,6 +304,8 @@ impl Tool for GatewayTool {
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::High,
             categories: vec!["network".to_string(), "gateway".to_string()],
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }
@@ -705,7 +707,7 @@ mod tests {
                 retry_delay_ms: 1000,
             },
         );
-        cfg.search.api_key = "tvly-plaintext-12345".to_string();
+        cfg.search.api_key = "tvly-plaintext-1234".to_string();
         cfg.search
             .keys
             .insert("tavily".to_string(), "tvly-secret-99999".to_string());

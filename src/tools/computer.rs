@@ -134,6 +134,10 @@ Common workflows:
             requires_approval: true,
             risk_level: RiskLevel::Medium,
             categories: vec!["computer".to_string(), "desktop".to_string()],
+            // UI actions act on whatever is on screen *now*: repeating one
+            // clicks a second time, which is rarely what a retry means.
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }

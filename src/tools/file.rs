@@ -122,6 +122,7 @@ impl Tool for FileReadTool {
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Medium,
             categories: vec!["file".to_string(), "read".to_string()],
+            idempotent: true,
             ..Default::default()
         }
     }
@@ -363,6 +364,12 @@ impl Tool for FileWriteTool {
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::Medium,
             categories: vec!["file".to_string(), "write".to_string()],
+            // Not idempotent in the sense that matters: a retry after a
+            // timeout may write twice, and the second write is the one that
+            // lands.
+            compensation: Some(
+                "write the content you read before the edit back with the same tool",
+            ),
             ..ToolCapabilities::default()
         }
     }
@@ -562,6 +569,7 @@ impl Tool for GlobTool {
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["file".to_string(), "search".to_string()],
+            idempotent: true,
             ..Default::default()
         }
     }

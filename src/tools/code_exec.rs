@@ -638,6 +638,8 @@ print(json.dumps({"average": result, "count": len(data)}))
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::High,
             categories: vec!["system".to_string(), "exec".to_string()],
+            idempotent: false,
+            compensation: None,
             ..ToolCapabilities::default()
         }
     }

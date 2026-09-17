@@ -866,6 +866,9 @@ aggregate. You may also poll action="status" (child_id) at any time."#
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::High,
             categories: vec!["system".to_string(), "delegate".to_string()],
+            // A retry spawns a second child that does the work again.
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }

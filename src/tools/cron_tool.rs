@@ -117,6 +117,7 @@ impl Tool for CronTool {
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Medium,
             categories: vec!["system".to_string(), "scheduling".to_string()],
+            compensation: Some("remove the job with the cron tool"),
             ..Default::default()
         }
     }

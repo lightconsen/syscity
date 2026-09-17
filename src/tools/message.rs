@@ -133,6 +133,10 @@ impl Tool for MessageTool {
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Medium,
             categories: vec!["communication".to_string()],
+            // Sent is sent: there is nothing to compensate with, and the
+            // retry a caller might reach for would send it twice.
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }

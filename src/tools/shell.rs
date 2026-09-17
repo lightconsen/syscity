@@ -388,6 +388,10 @@ impl Tool for ShellTool {
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::High,
             categories: vec!["system".to_string(), "exec".to_string()],
+            // A command run twice runs twice. Nothing to compensate with:
+            // the tool cannot know what the command did.
+            idempotent: false,
+            compensation: None,
             ..ToolCapabilities::default()
         }
     }

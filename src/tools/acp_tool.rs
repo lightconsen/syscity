@@ -109,6 +109,8 @@ impl Tool for AcpSpawnTool {
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::High,
             categories: vec!["system".to_string(), "acp".to_string()],
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }

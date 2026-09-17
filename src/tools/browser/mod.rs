@@ -807,6 +807,8 @@ impl Tool for BrowserTool {
             requires_approval: true,
             risk_level: crate::tools::approval::RiskLevel::High,
             categories: vec!["network".to_string(), "browser".to_string()],
+            idempotent: false,
+            compensation: None,
             ..Default::default()
         }
     }
