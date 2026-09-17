@@ -128,10 +128,10 @@ impl WsClient {
     /// thing — and was, with the wrong parameter name, silently rejected.
     pub async fn connect(
         url: &str,
-        _auth: &AuthConfig,
+        auth: &AuthConfig,
         scopes: &[&str],
     ) -> Result<(Self, HelloOkPayload), TuiError> {
-        let (ws_stream, _response) = connect_async(url)
+        let (ws_stream, _response) = connect_async(ws_request(url, auth)?)
             .await
             .map_err(|e| TuiError::WebSocket(e.to_string()))?;
 
@@ -252,6 +252,33 @@ impl WsClient {
     }
 }
 
+/// The upgrade request for `url`, presenting the token as a Bearer credential.
+///
+/// A browser cannot set headers on a WebSocket upgrade, which is why the
+/// gateway also accepts `?token=`. A Rust client can, and this is one — so the
+/// credential does not have to sit in a URL that reaches the access log, the
+/// process list and any proxy in between. It is also what stops the TUI
+/// tripping the gateway's "token in the upgrade URL" warning.
+fn ws_request(
+    url: &str,
+    auth: &AuthConfig,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, TuiError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    // `into_client_request` is what `connect_async(&url)` uses internally, and
+    // it adds the handshake headers a hand-built request would be missing.
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| TuiError::WebSocket(format!("bad websocket url: {e}")))?;
+    if let Some(bearer) = auth.bearer() {
+        let value = bearer
+            .parse()
+            .map_err(|e| TuiError::Auth(format!("invalid token header: {e}")))?;
+        request.headers_mut().insert("authorization", value);
+    }
+    Ok(request)
+}
+
 /// Combined read/write WebSocket driver.
 async fn ws_driver(
     ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -361,6 +388,30 @@ mod tests {
     /// `session_id` where the method wants `session_ids`, so every connect
     /// that carried a session id also sent a request the gateway rejected as
     /// invalid. Nothing surfaced the rejection: the reply went to `.ok()`.
+    /// The credential travels in a header, not in the URL.
+    ///
+    /// The TUI used to connect with `?token=…`, which puts the shared secret
+    /// in the gateway's access log, in the process list of every hop, and in
+    /// any proxy in between. The CLI has always sent a Bearer header; the TUI
+    /// can do the same and the gateway accepts both.
+    #[tokio::test]
+    async fn the_credential_travels_in_a_header() {
+        let gateway = TestGateway::start().await;
+        let auth = AuthConfig::Token { token: "s3cret".to_string() };
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        assert!(!url.contains("s3cret"), "not in the URL: {url}");
+
+        let (_client, hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+
+        assert_eq!(hello.server.version, "test");
+        assert_eq!(gateway.upgrade_header("authorization").as_deref(), Some("Bearer s3cret"));
+        // And the handshake's own headers survive, or the gateway refuses the
+        // upgrade outright.
+        assert!(gateway.upgrade_header("sec-websocket-key").is_some());
+    }
+
     #[tokio::test]
     async fn connecting_subscribes_to_nothing() {
         let gateway = TestGateway::start().await;

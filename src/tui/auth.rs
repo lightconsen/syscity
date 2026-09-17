@@ -23,8 +23,24 @@ impl AuthConfig {
         }
     }
 
-    /// Build the WebSocket URL, appending the token query parameter when
-    /// needed.
+    /// The `Authorization` header value, when there is a credential.
+    ///
+    /// The credential belongs here rather than in the URL: a WebSocket
+    /// upgrade can carry headers when the client can set them, and this one
+    /// can. A URL reaches the gateway's access log, the process list and every
+    /// proxy in between.
+    pub fn bearer(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Token { token } => Some(format!("Bearer {token}")),
+        }
+    }
+
+    /// Build the WebSocket URL.
+    ///
+    /// Deliberately carries no credential — see [`AuthConfig::bearer`]. The
+    /// gateway also accepts `?token=`, because a browser cannot set headers on
+    /// an upgrade, but nothing here needs that.
     pub fn ws_url(&self, host: &str, port: u16, session_id: Option<&str>, client: &str) -> String {
         let mut url = format!("ws://{}:{}/ws", host, port);
         let mut first = true;
@@ -42,9 +58,6 @@ impl AuthConfig {
             url.push_str(&urlencoding::encode(value));
         };
 
-        if let Self::Token { token } = self {
-            append("token", token);
-        }
         if let Some(sid) = session_id {
             append("session_id", sid);
         }
@@ -84,14 +97,25 @@ mod tests {
         );
     }
 
+    /// The URL never carries the credential, whatever else it carries.
     #[test]
-    fn ws_url_with_token_and_session() {
+    fn ws_url_keeps_the_token_out_of_the_url() {
         let auth = AuthConfig::Token {
             token: "secret token".to_string(),
         };
+        let url = auth.ws_url("127.0.0.1", 18080, Some("sess-1"), "tui");
+        assert_eq!(url, "ws://127.0.0.1:18080/ws?session_id=sess-1&client=tui");
+        assert!(!url.contains("secret"), "a URL is not a place for a credential");
+    }
+
+    #[test]
+    fn the_token_becomes_a_bearer_header() {
         assert_eq!(
-            auth.ws_url("127.0.0.1", 18080, Some("sess-1"), "tui"),
-            "ws://127.0.0.1:18080/ws?token=secret%20token&session_id=sess-1&client=tui"
+            AuthConfig::Token { token: "s3cret".to_string() }
+                .bearer()
+                .as_deref(),
+            Some("Bearer s3cret")
         );
+        assert_eq!(AuthConfig::None.bearer(), None);
     }
 }

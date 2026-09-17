@@ -14,7 +14,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 /// One request the client sent.
@@ -35,6 +36,7 @@ pub struct TestGateway {
     close: Mutex<Option<oneshot::Sender<()>>>,
     silent: Arc<std::sync::atomic::AtomicBool>,
     failures: Arc<Mutex<HashMap<String, String>>>,
+    upgrade_headers: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl TestGateway {
@@ -50,12 +52,25 @@ impl TestGateway {
         let mute = Arc::clone(&silent);
         let failures: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let refusals = Arc::clone(&failures);
+        let upgrade_headers: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let header_sink = Arc::clone(&upgrade_headers);
 
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let Ok(mut socket) = accept_async(stream).await else {
+            let record_headers =
+                move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                    let mut sink = header_sink.lock().expect("upgrade headers");
+                    for (name, value) in req.headers() {
+                        sink.push((
+                            name.as_str().to_lowercase(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        ));
+                    }
+                    Ok(resp)
+                };
+            let Ok(mut socket) = accept_hdr_async(stream, record_headers).await else {
                 return;
             };
             loop {
@@ -118,7 +133,18 @@ impl TestGateway {
             close: Mutex::new(Some(close_tx)),
             silent,
             failures,
+            upgrade_headers,
         }
+    }
+
+    /// One header of the WebSocket upgrade request, lower-cased.
+    pub fn upgrade_header(&self, name: &str) -> Option<String> {
+        self.upgrade_headers
+            .lock()
+            .expect("upgrade headers")
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
     }
 
     /// Record requests from here on, but never answer them.
