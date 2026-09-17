@@ -10,7 +10,7 @@
 //! flush without a following draw leaves the composer invisible.
 // INVARIANTS-NONE: event loop; state lives in `AppState`.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -526,7 +526,8 @@ async fn submit_message(
 ) -> Result<(), TuiError> {
     // A session is created lazily, on the first message — the gateway picks
     // the id, and we adopt whatever it returns.
-    let session = match state.read().await.current_session.clone() {
+    let existing = { state.read().await.current_session.clone() };
+    let session = match existing {
         Some(id) => id,
         None => gw::sessions_create(ws, None).await?,
     };
@@ -676,6 +677,27 @@ async fn handle_approval_action(
     Ok(())
 }
 
+/// The answer a typed line gives to a pending question.
+///
+/// A digit picks the option at that position; otherwise the text is the answer,
+/// falling back to the agent's own default. `None` means there is nothing to
+/// send — an empty line and no default — which is not the same as an empty
+/// answer: `ask.respond` rejects that outright.
+fn resolve_ask_answer(ask: &AskPrompt, typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    let answer = if let Ok(idx) = typed.parse::<usize>() {
+        ask.options
+            .get(idx.saturating_sub(1))
+            .cloned()
+            .unwrap_or_else(|| typed.to_string())
+    } else if !typed.is_empty() {
+        typed.to_string()
+    } else {
+        ask.default.clone().unwrap_or_default()
+    };
+    (!answer.trim().is_empty()).then_some(answer)
+}
+
 /// Handle a key action while the agent's question is pending.
 async fn handle_ask_action(
     action: TuiAction,
@@ -725,27 +747,15 @@ async fn handle_ask_action(
 
     let (ask, typed) = {
         let s = state.read().await;
-        (s.pending_ask.clone(), s.ask_input.trim().to_string())
+        (s.pending_ask.clone(), s.ask_input.clone())
     };
     let Some(ask) = ask else {
         state.write().await.live_mode = LiveMode::Composer;
         return Ok(());
     };
-    // A digit picks the option at that position; otherwise the typed text is
-    // the answer, falling back to the agent's default.
-    let answer = if let Ok(idx) = typed.parse::<usize>() {
-        ask.options
-            .get(idx.saturating_sub(1))
-            .cloned()
-            .unwrap_or(typed)
-    } else if !typed.is_empty() {
-        typed
-    } else {
-        ask.default.clone().unwrap_or_default()
-    };
-    if answer.is_empty() {
+    let Some(answer) = resolve_ask_answer(&ask, &typed) else {
         return Ok(());
-    }
+    };
 
     match gw::ask_respond(ws, &ask.ask_id, &answer).await {
         Ok(()) => {
@@ -1019,15 +1029,23 @@ pub struct PlainIo {
     pub input: Box<dyn BufRead + Send>,
     /// Everything line mode prints.
     pub output: Box<dyn Write + Send>,
+    /// Whether a human can answer a prompt through this input. False for a
+    /// pipe: nothing can answer, so a prompt has to fail closed rather than
+    /// hold the whole pipe until the gateway times it out.
+    pub interactive: bool,
 }
 
 impl PlainIo {
     /// The real thing: the process's stdin and stdout.
+    ///
+    /// `syscity tui > out.txt` is line mode with a terminal still on stdin, so
+    /// prompts can be answered by typing; `echo … | syscity tui` cannot be.
     pub fn stdio() -> Self {
         Self {
             // `Stdin` is only `Read`; the buffering lives in the wrapper.
             input: Box::new(io::BufReader::new(io::stdin())),
             output: Box::new(io::stdout()),
+            interactive: io::stdin().is_terminal(),
         }
     }
 }
@@ -1053,7 +1071,7 @@ pub async fn run_plain_with(
     session: SessionChoice,
     io: PlainIo,
 ) -> Result<(), TuiError> {
-    let PlainIo { input, mut output } = io;
+    let PlainIo { input, mut output, interactive } = io;
     let (mut ws, hello) =
         WsClient::connect(&endpoint.url, &endpoint.auth, &["chat", "read", "write"]).await?;
 
@@ -1107,10 +1125,11 @@ pub async fn run_plain_with(
     loop {
         tokio::select! {
             Some(line) = line_rx.recv() => {
-                if line.trim().is_empty() {
+                if interactive && state.read().await.live_mode != LiveMode::Composer {
+                    answer_prompt_from_line(&line, &state, &mut ws).await?;
+                } else if line.trim().is_empty() {
                     continue;
-                }
-                if line.starts_with('/') {
+                } else if line.starts_with('/') {
                     // A command that fails is a line of output, not the end of
                     // the pipe: a script feeding several lines should get the
                     // rest of them run.
@@ -1145,11 +1164,191 @@ pub async fn run_plain_with(
                     }
                     WsMessage::OrphanResponse(_) => {}
                 }
+                // A prompt with nobody to answer it is settled as it arrives:
+                // waiting for a line that a pipe will never send would park the
+                // whole pipe on the gateway's timeout.
+                if !interactive {
+                    answer_prompt_without_a_human(&state, &mut ws).await?;
+                }
                 drain(&state, output.as_mut()).await;
             }
         }
     }
     Ok(())
+}
+
+/// Answer a pending prompt from a typed line.
+///
+/// Only reached when stdin is a terminal. A pipe's lines are messages: there
+/// is no reading a `y` that was never typed.
+async fn answer_prompt_from_line(
+    line: &str,
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    // Bound first: a `match` on a temporary guard keeps it alive for the whole
+    // block, and the arms below take the write lock.
+    let mode = state.read().await.live_mode;
+    match mode {
+        LiveMode::Composer => return Ok(()),
+        LiveMode::Approval => {
+            let Some(approval) = state.read().await.current_approval().cloned() else {
+                state.write().await.live_mode = LiveMode::Composer;
+                return Ok(());
+            };
+            let approve = match line.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" | "approve" => true,
+                "n" | "no" | "deny" => false,
+                other => {
+                    state.write().await.transcript.push_notice(format!(
+                        "⚠ answer the prompt for {}: y approves it, n denies it (got {other:?})",
+                        approval.tool_name
+                    ));
+                    return Ok(());
+                }
+            };
+            match gw::approvals_decide(ws, &approval.id, approve, None).await {
+                Ok(()) => {
+                    let mut s = state.write().await;
+                    s.transcript.push_notice(format!(
+                        "{} {}",
+                        if approve {
+                            "✔ approved"
+                        } else {
+                            "✘ denied"
+                        },
+                        approval.tool_name
+                    ));
+                    s.pop_approval();
+                }
+                Err(TuiError::Gateway { ref code, .. }) if code == "NOT_FOUND" => {
+                    let mut s = state.write().await;
+                    s.transcript
+                        .push_notice(format!("⚠ {} was already resolved", approval.tool_name));
+                    s.pop_approval();
+                }
+                Err(e) => {
+                    state.write().await.transcript.push_notice(format!(
+                        "✘ could not answer the approval: {e} — send y or n again"
+                    ));
+                }
+            }
+        }
+        LiveMode::Ask => {
+            let Some(ask) = state.read().await.pending_ask.clone() else {
+                state.write().await.live_mode = LiveMode::Composer;
+                return Ok(());
+            };
+            let Some(answer) = resolve_ask_answer(&ask, line) else {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice("⚠ type an answer, or the number of an option");
+                return Ok(());
+            };
+            match gw::ask_respond(ws, &ask.ask_id, &answer).await {
+                Ok(()) => {
+                    let mut s = state.write().await;
+                    s.pending_ask = None;
+                    s.live_mode = LiveMode::Composer;
+                    s.transcript.push_notice(format!("answered: {answer}"));
+                }
+                Err(e) => {
+                    state
+                        .write()
+                        .await
+                        .transcript
+                        .push_notice(format!("✘ could not answer: {e}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a prompt nobody can answer.
+///
+/// Line mode usually drives a pipe: stdin is a file or another process, and no
+/// one will ever type `y`. A prompt that waits for a human who cannot answer
+/// blocks every line behind it until the gateway times it out, so it is settled
+/// here instead — immediately, and out loud.
+async fn answer_prompt_without_a_human(
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    loop {
+        // Same reason as above: the guard must not outlive this line.
+        let mode = state.read().await.live_mode;
+        match mode {
+            LiveMode::Composer => return Ok(()),
+            LiveMode::Approval => {
+                // Denying is the fail-closed answer: the tool does not run,
+                // and the turn carries on with the refusal.
+                let Some(approval) = state.read().await.current_approval().cloned() else {
+                    state.write().await.live_mode = LiveMode::Composer;
+                    return Ok(());
+                };
+                let outcome = gw::approvals_decide(ws, &approval.id, false, None).await;
+                let mut s = state.write().await;
+                match outcome {
+                    Ok(()) => s.transcript.push_notice(format!(
+                        "✘ denied {} — nothing here can answer an approval prompt",
+                        approval.tool_name
+                    )),
+                    Err(e) => s
+                        .transcript
+                        .push_notice(format!("✘ could not deny {}: {e}", approval.tool_name)),
+                }
+                // Either way the prompt goes: leaving it up would block every
+                // later line behind a question nobody can answer.
+                s.pop_approval();
+            }
+            LiveMode::Ask => {
+                let Some(ask) = state.read().await.pending_ask.clone() else {
+                    state.write().await.live_mode = LiveMode::Composer;
+                    return Ok(());
+                };
+                // The agent's own default answers the question; without one
+                // there is nothing to send that `ask.respond` would accept, and
+                // the question would hold the turn for its full timeout — so
+                // the turn is stopped instead.
+                let Some(answer) = ask.default.clone().filter(|d| !d.trim().is_empty()) else {
+                    let session = state.read().await.current_session.clone();
+                    if let Some(id) = session {
+                        if let Err(e) = gw::chat_abort(ws, &id).await {
+                            state
+                                .write()
+                                .await
+                                .transcript
+                                .push_notice(format!("✘ could not stop the turn: {e}"));
+                        }
+                    }
+                    let mut s = state.write().await;
+                    s.transcript.push_notice(
+                        "⚠ the agent asked a question with no default and nothing here can \
+                         answer it — the turn was stopped",
+                    );
+                    s.pending_ask = None;
+                    s.live_mode = LiveMode::Composer;
+                    s.end_run();
+                    return Ok(());
+                };
+                let outcome = gw::ask_respond(ws, &ask.ask_id, &answer).await;
+                let mut s = state.write().await;
+                match outcome {
+                    Ok(()) => s
+                        .transcript
+                        .push_notice(format!("answered with the default: {answer}")),
+                    Err(e) => s
+                        .transcript
+                        .push_notice(format!("✘ could not answer the question: {e}")),
+                }
+                s.pending_ask = None;
+                s.live_mode = LiveMode::Composer;
+            }
+        }
+    }
 }
 
 /// Submit one line of piped input as a chat message.
@@ -1268,12 +1467,28 @@ mod tests {
     }
 
     /// Line mode reading `input`, with the output captured.
+    ///
+    /// `interactive` is false: this is a pipe, which is what line mode is for.
     fn plain_io(input: &str) -> (PlainIo, SharedOutput) {
         let out = SharedOutput::default();
         (
             PlainIo {
                 input: Box::new(Cursor::new(input.as_bytes().to_vec())),
                 output: Box::new(out.clone()),
+                interactive: false,
+            },
+            out,
+        )
+    }
+
+    /// The same, but with a terminal on stdin — `syscity tui > out.txt`.
+    fn plain_io_interactive(input: &str) -> (PlainIo, SharedOutput) {
+        let out = SharedOutput::default();
+        (
+            PlainIo {
+                input: Box::new(Cursor::new(input.as_bytes().to_vec())),
+                output: Box::new(out.clone()),
+                interactive: true,
             },
             out,
         )
@@ -1780,6 +1995,186 @@ mod tests {
             .map(|l| l.text)
             .collect();
         assert!(lines.iter().any(|l| l.contains("queued message")), "got {lines:?}");
+    }
+
+    /// An `approval.required` event with the arguments the prompt needs.
+    fn approval_event() -> ClientEvent {
+        event(
+            "approval.required",
+            serde_json::json!({
+                "approval_id": "ap1",
+                "tool_name": "file_write",
+                "requested_by": "secretary",
+                "risk_level": "High",
+                "message": "writes outside the workspace",
+            }),
+        )
+    }
+
+    /// An `ask.required` event, optionally with a default.
+    fn ask_event(default: Option<&str>) -> ClientEvent {
+        let mut payload = serde_json::json!({
+            "ask_id": "ask1",
+            "question": "which branch?",
+            "options": ["main", "dev"],
+            "required": true,
+        });
+        if let Some(default) = default {
+            payload["default"] = serde_json::json!(default);
+        }
+        event("ask.required", payload)
+    }
+
+    /// A prompt in a pipe is denied at once, not left to time out.
+    ///
+    /// Line mode's loop only ever handled `LiveMode::Composer` — the approval
+    /// and question branches existed in the interactive loop alone. A pipe
+    /// that produced one parked on the gateway's five-minute timeout with
+    /// every later line stuck behind it.
+    #[tokio::test]
+    async fn a_pipe_denies_an_approval_nobody_can_answer() {
+        let gateway = TestGateway::start().await;
+        let (io, out) = plain_io("hello\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+        gateway.wait_for("chat.send", PATIENCE).await;
+
+        gateway.push_event(
+            "approval.required",
+            serde_json::json!({
+                "approval_id": "ap1",
+                "tool_name": "file_write",
+                "requested_by": "secretary",
+                "risk_level": "High",
+                "message": "writes outside the workspace",
+            }),
+        );
+
+        let params = gateway.wait_for("approvals.deny", PATIENCE).await;
+        assert_eq!(params["id"], "ap1");
+        eventually(|| out.text().contains("denied file_write"), "the denial to be reported").await;
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// A question with a default is answered with it — the agent's own
+    /// suggestion is the least surprising answer, and it keeps the turn alive.
+    #[tokio::test]
+    async fn a_pipe_answers_a_question_with_its_default() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        handle_event(ask_event(Some("main")), &state, &mut client).await;
+        answer_prompt_without_a_human(&state, &mut client)
+            .await
+            .expect("settled");
+
+        let params = gateway.wait_for("ask.respond", PATIENCE).await;
+        assert_eq!(params["response"], "main");
+        let s = state.read().await;
+        assert!(s.pending_ask.is_none());
+        assert_eq!(s.live_mode, LiveMode::Composer);
+    }
+
+    /// A question with no default cannot be answered at all — `ask.respond`
+    /// rejects an empty response — so the turn is stopped rather than left to
+    /// hold the pipe for the full timeout.
+    #[tokio::test]
+    async fn a_pipe_stops_the_turn_for_a_question_it_cannot_answer() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.begin_run();
+        }
+
+        handle_event(ask_event(None), &state, &mut client).await;
+        answer_prompt_without_a_human(&state, &mut client)
+            .await
+            .expect("settled");
+
+        let params = gateway.wait_for("chat.abort", PATIENCE).await;
+        assert_eq!(params["session_id"], "s1");
+        assert!(
+            !gateway.requests().iter().any(|r| r.method == "ask.respond"),
+            "there was no answer to send"
+        );
+        let s = state.read().await;
+        assert!(s.pending_ask.is_none());
+        assert!(!s.is_running, "the turn is over");
+    }
+
+    /// With a terminal on stdin, `syscity tui > out.txt` can still answer.
+    #[tokio::test]
+    async fn a_typed_line_answers_an_approval() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        handle_event(approval_event(), &state, &mut client).await;
+        answer_prompt_from_line("y", &state, &mut client)
+            .await
+            .expect("answered");
+
+        let params = gateway.wait_for("approvals.approve", PATIENCE).await;
+        assert_eq!(params["id"], "ap1");
+        let s = state.read().await;
+        assert!(s.approvals.is_empty());
+        assert_eq!(s.live_mode, LiveMode::Composer);
+    }
+
+    /// Typing anything else does not guess at an approval.
+    #[tokio::test]
+    async fn an_unreadable_answer_leaves_the_prompt_up() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        handle_event(approval_event(), &state, &mut client).await;
+        answer_prompt_from_line("maybe", &state, &mut client)
+            .await
+            .expect("handled");
+
+        assert_eq!(state.read().await.approvals.len(), 1, "the prompt waits for a real answer");
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|r| r.method == "approvals.approve" || r.method == "approvals.deny"),
+            "nothing was decided"
+        );
+    }
+
+    /// A pipe's lines are never read as prompt answers.
+    #[tokio::test]
+    async fn a_pipe_does_not_read_a_line_as_a_prompt_answer() {
+        let gateway = TestGateway::start().await;
+        let (io, _out) = plain_io("y\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        // `y` is a message like any other line.
+        let params = gateway.wait_for("chat.send", PATIENCE).await;
+        assert_eq!(params["message"], "y");
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// And a terminal on stdin is read as prompt answers, not messages.
+    #[tokio::test]
+    async fn an_interactive_line_answers_instead_of_sending() {
+        let gateway = TestGateway::start().await;
+        let (io, _out) = plain_io_interactive("y\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        // The line arrives before any prompt exists, so it is a message.
+        let params = gateway.wait_for("chat.send", PATIENCE).await;
+        assert_eq!(params["message"], "y");
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
     }
 
     /// A server event, as it arrives off the wire.

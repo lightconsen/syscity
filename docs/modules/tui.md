@@ -175,6 +175,13 @@ offered here.
 - One turn at a time is the rule everywhere: a message typed mid-response
   queues and goes out when the turn ends. Esc stops the turn *and* drops the
   queue, and a lost connection drops it too, saying so.
+- Prompts in line mode depend on what stdin is. With a terminal on it
+  (`syscity tui > out.txt`) a typed line answers: `y`/`n` for an approval, the
+  text — or the number of an option — for a question. With a pipe
+  (`echo … | syscity tui`) nobody can answer, so a prompt is settled as it
+  arrives: an approval is denied, a question is answered with the agent's own
+  default, and a question with no default stops the turn. Nothing parks on the
+  gateway's five-minute timeout with the pipe behind it.
 
 ## Testing
 

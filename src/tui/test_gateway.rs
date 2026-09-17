@@ -251,6 +251,16 @@ fn payload_for(method: &str, params: &Value, stored: &Arc<Mutex<Vec<Value>>>) ->
         "chat.history" => {
             history_page(stored, params, params["limit"].as_u64().unwrap_or(100) as usize)
         }
+        // The announcement carries no arguments, so the client asks for them;
+        // echo the id back so a decision goes to the approval it was shown for.
+        "approvals.get" => json!({
+            "id": params["id"],
+            "tool_name": "file_write",
+            "requested_by": "secretary",
+            "risk_level": "High",
+            "message": "writes outside the workspace",
+            "args": { "path": "/etc/hosts" },
+        }),
         _ => canned(method),
     }
 }
