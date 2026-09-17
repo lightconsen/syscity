@@ -110,6 +110,13 @@ pub struct ContextCompressor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionStrategy {
     /// Remove oldest low-priority messages first
+    ///
+    /// NOTE: pair-unsafe. Selection here is by priority, not by adjacency, so
+    /// it can keep a tool result and drop the assistant `tool_calls` it
+    /// answers (or the reverse). Nothing in production calls `compress()` with
+    /// this strategy — `compact_context` asks for `Summarize`, and automatic
+    /// compaction goes through `compact_with_llm` / `Context::summarize`, both
+    /// of which keep pairs together. Give it a pair check before using it.
     OldestFirst,
     /// Summarize groups of messages
     Summarize,
@@ -215,12 +222,21 @@ impl ContextCompressor {
 
     /// Compress by summarizing message groups
     fn compress_summarize(&self, messages: &[Message]) -> Vec<Message> {
-        // Keep system and recent messages
+        // Keep system and recent messages. The tail boundary moves forward past
+        // any tool result that would start it: a `tool` message whose assistant
+        // `tool_calls` ended up inside the summary is a request providers
+        // refuse. `compact_with_llm` snaps its boundaries the same way.
+        const KEEP_TAIL: usize = 4;
+        let mut tail_start = messages.len().saturating_sub(KEEP_TAIL);
+        while tail_start < messages.len() && messages[tail_start].role == Role::Tool {
+            tail_start += 1;
+        }
+
         let mut result = Vec::new();
         let mut to_summarize = Vec::new();
 
         for (i, msg) in messages.iter().enumerate() {
-            if msg.role == Role::System || i >= messages.len().saturating_sub(4) {
+            if msg.role == Role::System || i >= tail_start {
                 result.push(msg.clone());
             } else {
                 to_summarize.push(msg.clone());
@@ -269,6 +285,16 @@ impl ContextCompressor {
         }
 
         recent.reverse();
+
+        // Same boundary rule as `compress_summarize`: a tool result left
+        // stranded at the window's edge (its assistant `tool_calls` fell
+        // outside) is a request providers refuse, so the pair boundary wins
+        // over the token budget.
+        let first_kept = recent
+            .iter()
+            .position(|m| m.role != Role::Tool)
+            .unwrap_or(recent.len());
+        recent.drain(..first_kept);
 
         let mut result = system_messages;
         result.extend(recent);
@@ -666,6 +692,114 @@ mod tests {
         // threshold = 100 * 0.5 = 50 tokens
         // 5 messages * ~7 tokens each = ~35 tokens, under 50
         assert!(!compressor.needs_compression(&create_test_messages(5)));
+    }
+
+    /// The codebase models a tool call and its result by adjacency, so a kept
+    /// `Role::Tool` must be preceded by its call (or by the result of the same
+    /// call): anything else is a request the provider refuses.
+    fn assert_pairs_intact(messages: &[Message]) {
+        let roles: Vec<&Role> = messages.iter().map(|m| &m.role).collect();
+        for (i, m) in messages.iter().enumerate() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            let paired = i.checked_sub(1).is_some_and(|prev| {
+                let p = &messages[prev];
+                p.role == Role::Tool || (p.role == Role::Assistant && p.tool_calls.is_some())
+            });
+            assert!(paired, "tool result at {i} has no preceding tool call: {roles:?}");
+        }
+    }
+
+    /// The kept tail must never begin on a tool result.
+    ///
+    /// `Summarize` keeps the last few messages verbatim, so a tool result
+    /// landing exactly on that boundary used to survive while its assistant
+    /// `tool_calls` were folded into the summary — a `tool` message with no
+    /// matching call, which providers reject.
+    #[test]
+    fn summarize_never_keeps_an_orphaned_tool_result() {
+        let compressor = ContextCompressor::new(10).with_strategy(CompressionStrategy::Summarize);
+
+        let mut call = msg(Role::Assistant, "");
+        call.tool_calls = Some(vec![]);
+        let tool_result = Message {
+            role: Role::Tool,
+            content: "tool result".to_string(),
+            content_blocks: None,
+            reasoning_content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some("c1".to_string()),
+            metadata: None,
+        };
+        // len 7 → the 4-message tail would start at index 3, which is the tool
+        // result; snapping pushes it to the user message behind it.
+        let messages = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "do a thing"),
+            call,
+            tool_result,
+            msg(Role::User, "next question"),
+            msg(Role::Assistant, "an answer"),
+            msg(Role::User, "and another"),
+        ];
+
+        let compressed = compressor.compress(&messages);
+
+        assert!(
+            !compressed.iter().any(|m| m.role == Role::Tool),
+            "the orphaned tool result must not survive: {:?}",
+            compressed.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+        assert_pairs_intact(&compressed);
+        assert_eq!(compressed[0].role, Role::System);
+        assert_eq!(
+            compressed[1].name.as_deref(),
+            Some("summary"),
+            "the summary follows the system prompt"
+        );
+        assert_eq!(compressed.len(), 5, "system + summary + three kept");
+    }
+
+    /// The same boundary rule for the sliding window: the pair wins over the
+    /// budget. With room for the tool result but not for the assistant call it
+    /// answers, neither is kept.
+    #[test]
+    fn sliding_window_never_keeps_an_orphaned_tool_result() {
+        let compressor =
+            ContextCompressor::new(18).with_strategy(CompressionStrategy::SlidingWindow);
+
+        let mut call = msg(Role::Assistant, "calling");
+        call.tool_calls = Some(vec![]);
+        let tool_result = Message {
+            role: Role::Tool,
+            content: "a tool result that is long enough to matter".to_string(),
+            content_blocks: None,
+            reasoning_content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some("c1".to_string()),
+            metadata: None,
+        };
+        let messages = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "do a thing"),
+            msg(Role::Assistant, "an answer"),
+            msg(Role::User, "next question"),
+            call,
+            tool_result,
+        ];
+
+        let compressed = compressor.compress(&messages);
+
+        assert_pairs_intact(&compressed);
+        assert!(
+            !compressed.iter().any(|m| m.role == Role::Tool),
+            "a stranded tool result must not be kept: {:?}",
+            compressed.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+        assert_eq!(compressed[0].role, Role::System, "system messages stay");
     }
 
     #[test]
