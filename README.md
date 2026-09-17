@@ -25,7 +25,7 @@ Syscity is an **agent system** — a runtime that lets AI agents act on your com
 
 Traditional AI lives inside a browser tab. Syscity lives inside your machine.
 
-**One agent runtime, every device.** Run the same local agent on **macOS**, **Windows**, **Linux**, **iOS**, and **Android** — your data, memory, and tools stay on your machine. Only model inference leaves it.
+**One agent runtime, every device.** Run the same local agent on **macOS**, **Windows**, **Linux**, **iOS**, and **Android** — your data, memory, and tools stay on your machine. What leaves it goes where you point it: your model provider, and any chat channel or MCP server you connect.
 
 **For developers** who want to build LLM-powered automation. **For power users** who want AI to control their desktop, not just chat.
 
@@ -49,7 +49,7 @@ One agent runtime, every device you own. Syscity runs natively on **macOS**, **W
 | **iOS** | Chat, voice input, camera, location, notifications, Shortcuts/Siri |
 | **Android** | Chat, voice input, camera, location, notifications, device tools |
 
-Your agent runs **locally**: configuration, vector memory, knowledge bases, and artifacts all stay on your device. Only model inference goes to the LLM provider you configure — or stays fully on-device with Ollama.
+Your agent runs **locally**: configuration, vector memory, knowledge bases, and artifacts all stay on your device. Model inference goes to the LLM provider you configure — or stays fully on-device with Ollama. Once you connect a chat channel (Slack, WhatsApp, Telegram, Feishu, WeChat), that channel's messages arrive from and go back through its platform, as they would in any client for it.
 
 ### Mobile Apps
 
@@ -68,7 +68,7 @@ Most "AI agents" today are just chatbots with function calling — they can fetc
 - **Your desktop is the canvas** — Click buttons, type text, read UI trees, take screenshots. Not just chat.
 - **Your browser, automated** — Navigate, fill forms, capture network requests, debug console errors with sourcemaps. The agent debugs like a developer.
 - **Your tools, connected** — MCP servers, shell commands, file operations, AppleScript. Bring your own ecosystem.
-- **Your data, private** — Runs 100% locally. Vector memory, knowledge bases, artifacts all on your machine.
+- **Your data, private** — Memory, knowledge bases and artifacts live on your machine, with no service of ours in the middle. Only the endpoints you configure — your model provider, the chat channels you connect — see what you send them.
 - **Every platform, one agent** — macOS, Windows, Linux, iOS, Android. The same local runtime and memory, on every device you own.
 - **Multiple models, one agent** — Swap between OpenAI, Anthropic, DeepSeek, GLM, Ollama, or custom endpoints. Use the right model for each task.
 

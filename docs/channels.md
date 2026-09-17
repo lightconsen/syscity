@@ -5,6 +5,16 @@ what is supported, what credentials to provide, and how to wire the platform
 side. For the internal architecture (the `Channel` trait, inbound/outbound
 pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 
+> **Data flow.** A connected channel is a bridge to that platform, and the bridge
+> carries content both ways: inbound messages arrive from the platform's servers
+> and your replies go back through them, so what you and your users exchange over
+> the channel is visible to that platform exactly as it would be in that
+> platform's own client. This is what a channel *is* — not a leak — but it is the
+> one thing to keep in mind when deciding what to connect: `README.md`'s "your
+> data, memory, and tools stay on your machine" describes the runtime, and names
+> the provider, channels and MCP servers you configure as the places data
+> leaves for.
+
 ## Supported channels
 
 | Channel | Feature | Default | Direction | Webhook path |

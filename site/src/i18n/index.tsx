@@ -25,7 +25,7 @@ const en = {
     titleTop: "One agent runtime,",
     titleBottom: "every device.",
     subtitle:
-      "Syscity turns a language model into an agent that lives inside your machine — clicking buttons, browsing the web, running code, and managing files. Runs natively on macOS, Windows, Linux, iOS, and Android. Your data never leaves.",
+      "Syscity turns a language model into an agent that lives inside your machine — clicking buttons, browsing the web, running code, and managing files. Runs natively on macOS, Windows, Linux, iOS, and Android. Your data stays on it — what leaves goes only where you point it: your model provider, and any chat channel or MCP server you connect.",
     getStarted: "Get Started",
     viewOnGithub: "View on GitHub",
     copyInstall: "Copy install command",
@@ -61,7 +61,7 @@ const en = {
       },
       {
         title: "Your data, private",
-        body: "Runs 100% locally. Vector memory, knowledge bases, and artifacts stay on your machine.",
+        body: "Memory, knowledge bases and artifacts stay on your machine, with no service of ours in the middle. Only the endpoints you configure — your model provider, the chat channels you connect — see what you send them.",
       },
       {
         title: "Every platform, one agent",
@@ -181,7 +181,7 @@ const zh: Dict = {
     titleTop: "一个智能体运行时，",
     titleBottom: "覆盖每一台设备。",
     subtitle:
-      "Syscity 把大语言模型变成住在你电脑里的智能体——点击按钮、浏览网页、运行代码、管理文件。原生支持 macOS、Windows、Linux、iOS 和 Android，数据不出本机。",
+      "Syscity 把大语言模型变成住在你电脑里的智能体——点击按钮、浏览网页、运行代码、管理文件。原生支持 macOS、Windows、Linux、iOS 和 Android。数据留在本机，只有你指向的地方会收到它——你配置的模型服务，以及你接入的聊天渠道或 MCP 服务器。",
     getStarted: "开始使用",
     viewOnGithub: "在 GitHub 查看",
     copyInstall: "复制安装命令",
@@ -217,7 +217,7 @@ const zh: Dict = {
       },
       {
         title: "数据完全私有",
-        body: "100% 本地运行。向量记忆、知识库和产物文件都留在你自己的机器上。",
+        body: "记忆、知识库和产物文件都留在你自己的机器上，中间没有我们的服务。只有你配置的端点——模型服务、你接入的聊天渠道——会看到你发给它们的内容。",
       },
       {
         title: "全平台，同一个智能体",
