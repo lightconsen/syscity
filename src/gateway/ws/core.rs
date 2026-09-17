@@ -264,6 +264,15 @@ enum Audience {
     /// Carries a device pairing code, which is the key to a device: only
     /// connections granted the `pairing` scope.
     Pairing,
+    /// Traffic from a messaging channel: content that entered the gateway from
+    /// outside it (a Slack/WhatsApp/Telegram message, its sender and text).
+    ///
+    /// Narrower than `All` on purpose. It is not the operator's own data, so it
+    /// belongs to the clients that can act on channels — `write` is the scope
+    /// that enables and disables them — rather than to every handshaked
+    /// connection. When the protocol grows a per-channel subscription this is
+    /// where it filters; today the scope is the whole gate.
+    Channel,
 }
 
 /// Decide who may receive `event`.
@@ -315,8 +324,14 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         | E::McpAuthComplete { .. }
         | E::McpAuthFailed { .. }
         | E::McpTokenRefreshed { .. }
-        | E::AcpThreadSwitched { .. }
-        | E::MessageReceived { .. } => Audience::All,
+        | E::AcpThreadSwitched { .. } => Audience::All,
+
+        // ── One channel's traffic ───────────────────────────────────────────
+        // The only event here whose payload is written by someone other than
+        // the operator: the sender and text of an inbound message. "Every
+        // operator client renders it" was the rule that put it in the block
+        // above; that is a wider audience than the content warrants.
+        E::MessageReceived { .. } => Audience::Channel,
     }
 }
 
@@ -408,6 +423,13 @@ async fn handle_websocket(
                         Audience::Session(session_id) => conn_guard.is_subscribed(&session_id),
                         Audience::Pairing => conn_guard.scopes.iter().any(|s| {
                             s == crate::gateway::protocol::SCOPE_PAIRING
+                                || s == crate::gateway::protocol::SCOPE_ADMIN
+                        }),
+                        // Channel traffic is third-party content: only the
+                        // clients that can act on channels (the ones that can
+                        // enable/disable them) are shown it.
+                        Audience::Channel => conn_guard.scopes.iter().any(|s| {
+                            s == crate::gateway::protocol::SCOPE_WRITE
                                 || s == crate::gateway::protocol::SCOPE_ADMIN
                         }),
                     };
@@ -1320,6 +1342,20 @@ mod tests {
                 status: crate::gateway::AgentStatus::Idle,
             }),
             Audience::All
+        );
+
+        // Inbound channel traffic is not the operator's own data: it is the one
+        // event here written by someone outside the gateway, so it is neither
+        // broadcast nor session-scoped.
+        assert_eq!(
+            audience_of(&E::MessageReceived {
+                channel: "slack".into(),
+                user_id: "U123".into(),
+                content: "hello".into(),
+                timestamp: chrono::Utc::now(),
+            }),
+            Audience::Channel,
+            "a third party's message text must not go to every handshaked client"
         );
     }
 
