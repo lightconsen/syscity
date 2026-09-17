@@ -13,8 +13,6 @@ pub struct AgentBuilder {
     pub(super) config: Option<AgentConfig>,
     pub(super) provider: Option<Arc<dyn Provider>>,
     pub(super) tools: Option<Arc<ToolRegistry>>,
-    memory_store: Option<Arc<dyn crate::memory::MemoryStore>>,
-    chat_history: Option<Arc<dyn crate::memory::ChatHistoryStore>>,
     session_search: Option<Arc<crate::memory::SessionSearch>>,
     transcript_store: Option<Arc<crate::agent::TranscriptStore>>,
     artifact_store: Option<Arc<crate::agent::ArtifactStore>>,
@@ -65,18 +63,6 @@ impl AgentBuilder {
     /// Set tools
     pub fn tools(mut self, tools: Arc<ToolRegistry>) -> Self {
         self.tools = Some(tools);
-        self
-    }
-
-    /// Set memory store for persistent memory
-    pub fn memory_store(mut self, store: Arc<dyn crate::memory::MemoryStore>) -> Self {
-        self.memory_store = Some(store);
-        self
-    }
-
-    /// Set chat history store for conversation persistence
-    pub fn chat_history(mut self, store: Arc<dyn crate::memory::ChatHistoryStore>) -> Self {
-        self.chat_history = Some(store);
         self
     }
 
@@ -188,14 +174,6 @@ impl AgentBuilder {
             })?,
             self.tools.unwrap_or_else(|| Arc::new(ToolRegistry::new())),
         );
-
-        if let Some(store) = self.memory_store {
-            agent = agent.with_memory_store(store);
-        }
-
-        if let Some(store) = self.chat_history {
-            agent = agent.with_chat_history(store);
-        }
 
         if let Some(search) = self.session_search {
             agent = agent.with_session_search(search);

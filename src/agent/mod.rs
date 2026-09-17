@@ -206,11 +206,6 @@ pub struct Agent {
     /// Memory manager for unified memory operations (retrieval, storage,
     /// compaction)
     memory_manager: Option<Arc<crate::memory::MemoryManager>>,
-    /// Memory store for persistence (legacy, prefer memory_manager)
-    pub(crate) memory_store: Option<Arc<dyn crate::memory::MemoryStore>>,
-    /// Chat history store for conversation persistence (legacy, prefer
-    /// memory_manager)
-    chat_history: Option<Arc<dyn crate::memory::ChatHistoryStore>>,
     /// Session search for conversation history indexing
     session_search: Option<Arc<crate::memory::SessionSearch>>,
     /// Response cache for identical prompts

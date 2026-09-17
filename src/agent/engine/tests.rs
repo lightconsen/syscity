@@ -85,7 +85,11 @@ async fn test_get_completion_retries_once_on_context_length() {
         provider.clone(),
         Arc::new(crate::tools::ToolRegistry::new()),
     )
-    .with_chat_history(store.clone());
+    .with_memory_manager(std::sync::Arc::new(crate::memory::MemoryManager::new(
+        store.clone(),
+        store.clone(),
+        crate::memory::MemoryManagerConfig::default(),
+    )));
 
     let mut context =
         crate::agent::Context::new("conv-overflow", "You are a helpful assistant", 100_000);
@@ -191,7 +195,11 @@ async fn test_get_completion_nudges_once_on_empty_reply() {
         provider.clone(),
         Arc::new(crate::tools::ToolRegistry::new()),
     )
-    .with_chat_history(store.clone());
+    .with_memory_manager(std::sync::Arc::new(crate::memory::MemoryManager::new(
+        store.clone(),
+        store.clone(),
+        crate::memory::MemoryManagerConfig::default(),
+    )));
 
     let mut context =
         crate::agent::Context::new("conv-empty", "You are a helpful assistant", 100_000);

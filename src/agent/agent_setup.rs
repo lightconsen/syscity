@@ -41,8 +41,6 @@ impl Agent {
             session_id: None,
             shutdown_tx: Arc::new(RwLock::new(None)),
             memory_manager: None,
-            memory_store: None,
-            chat_history: None,
             session_search: None,
             response_cache: Arc::new(ResponseCache::new(Duration::from_secs(3600))), // 1 hour TTL
             task_planner: Arc::new(TaskPlanner::new(provider_clone)),
@@ -302,16 +300,24 @@ impl Agent {
         self
     }
 
-    /// Set the memory store
-    pub fn with_memory_store(mut self, store: Arc<dyn crate::memory::MemoryStore>) -> Self {
-        self.memory_store = Some(store);
-        self
+    /// The memory store to persist through.
+    ///
+    /// Owned by the memory manager — this used to be a second field holding its
+    /// own handle to the same store (`with_memory_store`), which let an agent be
+    /// built with memory its manager did not know about and made "who owns
+    /// persistence" a question you had to read two fields to answer.
+    pub(crate) fn memory_store(&self) -> Option<Arc<dyn crate::memory::MemoryStore>> {
+        self.memory_manager.as_ref().map(|m| m.store())
     }
 
-    /// Set the chat history store
-    pub fn with_chat_history(mut self, store: Arc<dyn crate::memory::ChatHistoryStore>) -> Self {
-        self.chat_history = Some(store);
-        self
+    /// The chat-history store for conversation persistence.
+    ///
+    /// Owned by the memory manager, like [`memory_store`](Self::memory_store):
+    /// the two handles an agent used to carry were always the same object
+    /// (`agent_spawn` took both from the manager), so one owner answers for
+    /// both now.
+    pub(crate) fn chat_history(&self) -> Option<Arc<dyn crate::memory::ChatHistoryStore>> {
+        self.memory_manager.as_ref().map(|m| m.chat_history())
     }
 
     /// Set the session search for conversation indexing
@@ -360,7 +366,7 @@ impl Agent {
         // Auto-create GoalPlanner when adapter + provider are both available.
         let mut planner =
             crate::planner::GoalPlanner::with_provider(adapter, self.provider.clone());
-        if let Some(ref memory) = self.memory_store {
+        if let Some(memory) = self.memory_store() {
             planner = planner.with_memory(memory.clone());
         }
         self.goal_planner = Some(Arc::new(planner));
@@ -548,7 +554,7 @@ impl Agent {
         conversation_id: &str,
         limit: usize,
     ) -> crate::Result<Vec<crate::memory::ChatMessage>> {
-        if let Some(ref store) = self.chat_history {
+        if let Some(store) = self.chat_history() {
             store.get_conversation_history(conversation_id, limit).await
         } else {
             Ok(Vec::new())
@@ -557,7 +563,7 @@ impl Agent {
 
     /// Get the last conversation ID for a user
     pub async fn get_last_conversation(&self, user_id: &str) -> crate::Result<Option<String>> {
-        if let Some(ref store) = self.chat_history {
+        if let Some(store) = self.chat_history() {
             store.get_last_conversation(user_id).await
         } else {
             Ok(None)
@@ -681,7 +687,7 @@ impl Agent {
         // Restore prior conversation messages so the LLM sees real history
         // instead of relying only on the memory-injected summary (which can
         // leak wrong/stale context from other sessions).
-        if let Some(ref store) = self.chat_history {
+        if let Some(store) = self.chat_history() {
             let limit = cfg.max_turns.unwrap_or(50) * 2;
             // A durable compaction record rehydrates as `[summary] + tail`
             // instead of the full history, keeping the token mask effective
@@ -892,6 +898,49 @@ mod tests {
         assert!(ctx.allowed_paths().is_empty());
     }
 
+    /// The agent's persistence handles *are* the manager's.
+    ///
+    /// They used to be separate fields (`with_memory_store` /
+    /// `with_chat_history`) that happened to be handed the same objects in
+    /// production — but nothing stopped a caller from building an agent whose
+    /// history its manager did not own, and answering "who persists
+    /// conversations" took reading two fields.
+    #[tokio::test]
+    async fn the_memory_manager_owns_the_persistence_handles() {
+        let store =
+            std::sync::Arc::new(crate::memory::DatabaseStore::new_in_memory().await.unwrap());
+        let manager = std::sync::Arc::new(crate::memory::MemoryManager::new(
+            store.clone(),
+            store.clone(),
+            crate::memory::MemoryManagerConfig::default(),
+        ));
+
+        let agent = Agent::new(
+            AgentConfig::default(),
+            std::sync::Arc::new(MockProvider::new()),
+            std::sync::Arc::new(ToolRegistry::new()),
+        )
+        .with_memory_manager(manager.clone());
+
+        let agent_history = agent.chat_history().expect("manager provides history");
+        assert!(
+            std::sync::Arc::ptr_eq(&agent_history, &manager.chat_history()),
+            "the agent must read history from the manager, not a private copy"
+        );
+        let agent_store = agent.memory_store().expect("manager provides a store");
+        assert!(std::sync::Arc::ptr_eq(&agent_store, &manager.store()));
+
+        // And an agent without a manager has neither — there is no way to
+        // build one that persists to a store nobody owns.
+        let bare = Agent::new(
+            AgentConfig::default(),
+            std::sync::Arc::new(MockProvider::new()),
+            std::sync::Arc::new(ToolRegistry::new()),
+        );
+        assert!(bare.chat_history().is_none());
+        assert!(bare.memory_store().is_none());
+    }
+
     #[tokio::test]
     async fn test_build_fresh_context_rehydrates_compaction_boundary() {
         use crate::memory::{ChatHistoryStore, ChatMessage};
@@ -901,7 +950,11 @@ mod tests {
             Arc::new(MockProvider::new()),
             Arc::new(ToolRegistry::new()),
         )
-        .with_chat_history(store.clone());
+        .with_memory_manager(std::sync::Arc::new(crate::memory::MemoryManager::new(
+            store.clone(),
+            store.clone(),
+            crate::memory::MemoryManagerConfig::default(),
+        )));
 
         // Populate persisted history and record a compaction whose boundary is
         // the final user turn — everything before it is "masked" by the summary.

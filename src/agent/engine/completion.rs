@@ -354,7 +354,7 @@ impl Agent {
         }) else {
             return;
         };
-        let Some(ref store) = self.chat_history else {
+        let Some(store) = self.chat_history() else {
             return;
         };
         if let Err(e) = store

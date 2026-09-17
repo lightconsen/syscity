@@ -119,7 +119,7 @@ impl Agent {
                 info!("Cache hit for user {} - returning cached response", user_id);
 
                 // Store user message in chat history
-                if let Some(ref store) = self.chat_history {
+                if let Some(store) = self.chat_history() {
                     use crate::memory::ChatMessage;
                     let chat_msg = ChatMessage::new(&conversation_id, &user_id, "user", &content);
                     if let Err(e) = store.store_message(chat_msg).await {
@@ -128,7 +128,7 @@ impl Agent {
                 }
 
                 // Store cached assistant response in chat history
-                if let Some(ref store) = self.chat_history {
+                if let Some(store) = self.chat_history() {
                     use crate::memory::ChatMessage;
                     let chat_msg =
                         ChatMessage::new(&conversation_id, &user_id, "assistant", &cached.response);
@@ -502,7 +502,7 @@ impl Agent {
                 .await;
 
                 // Store user message in chat history
-                if let Some(ref store) = self.chat_history {
+                if let Some(store) = self.chat_history() {
                     use crate::memory::ChatMessage;
                     let chat_msg = ChatMessage::new(&conversation_id, &user_id, "user", &content);
                     if let Err(e) = store.store_message(chat_msg).await {
@@ -511,7 +511,7 @@ impl Agent {
                 }
 
                 // Store cached assistant response in chat history
-                if let Some(ref store) = self.chat_history {
+                if let Some(store) = self.chat_history() {
                     use crate::memory::ChatMessage;
                     let chat_msg =
                         ChatMessage::new(&conversation_id, &user_id, "assistant", &cached.response);
@@ -976,7 +976,7 @@ impl Agent {
 
         // Store user message in chat history and index for search
         let message_id = uuid::Uuid::new_v4().to_string();
-        if let Some(ref store) = self.chat_history {
+        if let Some(store) = self.chat_history() {
             use crate::memory::ChatMessage;
             let chat_msg = ChatMessage::new(conversation_id, user_id, "user", content);
             // Clone message_id before moving chat_msg
@@ -1062,7 +1062,7 @@ impl Agent {
             }
         }
 
-        if let Some(ref store) = self.chat_history {
+        if let Some(store) = self.chat_history() {
             use crate::memory::ChatMessage;
             let chat_msg = ChatMessage::new(conversation_id, user_id, "assistant", content);
             let msg_id = chat_msg.id.clone();

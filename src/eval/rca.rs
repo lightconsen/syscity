@@ -800,7 +800,7 @@ impl RcaPipeline {
 
     /// Persist RCA result to MemoryStore.
     pub async fn persist(&self, result: RcaResult) -> Result<()> {
-        if let Some(ref _store) = self.agent.memory_store {
+        if self.agent.memory_store().is_some() {
             // Persist to memory store for later querying
             let content = serde_json::to_string(&result)?;
             info!(
