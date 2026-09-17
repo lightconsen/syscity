@@ -243,6 +243,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
         // Tests control `embedded` explicitly; production captures the env.
         embedded: false,
         active_ws_connections: std::sync::atomic::AtomicUsize::new(0),
+        ws_tickets: std::sync::Arc::new(syscity::gateway::ws::tickets::WsTickets::new()),
     }
 }
 
