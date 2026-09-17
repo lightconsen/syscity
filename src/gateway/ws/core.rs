@@ -62,16 +62,19 @@ pub async fn ws_auth_middleware(
         return next.run(req).await;
     }
 
-    // Extract optional token from query parameter
-    let query_token = req.uri().query().and_then(|q| {
-        q.split('&')
-            .find(|p| p.starts_with("token="))
-            .and_then(|p| urlencoding::decode(&p["token=".len()..]).ok())
-            .map(|s| s.to_string())
-    });
+    // Optional credentials from the query string: `?token=` (the long-lived
+    // credential, kept for clients that cannot fetch a ticket first) and
+    // `?ticket=` (the short-lived one, preferred).
+    let query_token = query_param(req.uri(), "token");
+    let query_ticket = query_param(req.uri(), "ticket");
 
-    let auth_result =
-        validate_ws_upgrade_request(&state, req.headers(), query_token.as_deref()).await;
+    let auth_result = validate_ws_upgrade_request(
+        &state,
+        req.headers(),
+        query_token.as_deref(),
+        query_ticket.as_deref(),
+    )
+    .await;
     match auth_result {
         Ok(result) => {
             req.extensions_mut().insert(result);
@@ -81,12 +84,43 @@ pub async fn ws_auth_middleware(
     }
 }
 
+/// One decoded query parameter from the upgrade URL, if present.
+fn query_param(uri: &axum::http::Uri, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    uri.query().and_then(|q| {
+        q.split('&')
+            .find(|p| p.starts_with(&prefix))
+            .and_then(|p| urlencoding::decode(&p[prefix.len()..]).ok())
+            .map(|s| s.to_string())
+    })
+}
+
 /// Validate WebSocket upgrade request credentials BEFORE the handshake.
 async fn validate_ws_upgrade_request(
     state: &Arc<GatewayState>,
     headers: &axum::http::HeaderMap,
     query_token: Option<&str>,
+    query_ticket: Option<&str>,
 ) -> Result<WsAuthResult, axum::response::Response> {
+    // 0. A ticket is the short-lived credential a client exchanges its token
+    //    for over HTTP, so the upgrade URL never has to carry the long-lived
+    //    one (`gateway::ws::tickets`). Tried first, and refused outright when
+    //    present-but-invalid rather than falling through to the token paths: a
+    //    stale ticket should mean "get a new one", not "try my other
+    //    credential".
+    if let Some(ticket) = query_ticket {
+        return match state.ws_tickets.consume(ticket).await {
+            Some(grant) => Ok(WsAuthResult {
+                user_id: UserId::new(grant.user_id),
+                scopes: grant.scopes,
+            }),
+            None => {
+                warn!("WebSocket upgrade rejected: invalid or expired ticket");
+                Err(unauthorized_upgrade("Unauthorized: the ticket is invalid or expired"))
+            }
+        };
+    }
+
     // 1. Try Bearer token from Authorization header
     let token_from_header = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -132,16 +166,16 @@ async fn validate_ws_upgrade_request(
     }
 
     warn!("WebSocket upgrade rejected: no valid credentials");
-    let resp = axum::http::Response::builder()
+    Err(unauthorized_upgrade("Unauthorized: a valid API token is required"))
+}
+
+/// The 401 an upgrade gets when its credential is missing, unknown or expired.
+fn unauthorized_upgrade(body: &str) -> axum::response::Response {
+    axum::http::Response::builder()
         .status(axum::http::StatusCode::UNAUTHORIZED)
         .header(axum::http::header::WWW_AUTHENTICATE, "Bearer")
-        .body(axum::body::Body::from("Unauthorized: a valid API token is required"))
-        .unwrap_or_else(|_| {
-            axum::http::Response::new(axum::body::Body::from(
-                "Unauthorized: a valid API token is required",
-            ))
-        });
-    Err(resp)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap_or_else(|_| axum::http::Response::new(axum::body::Body::from(body.to_string())))
 }
 
 /// Handler: WebSocket upgrade.
@@ -1007,6 +1041,41 @@ mod tests {
 
     async fn state() -> Arc<GatewayState> {
         Arc::new(make_test_state(GatewayConfig::default()).await)
+    }
+
+    /// A ticket buys exactly one upgrade, carrying the scopes it was minted
+    /// with — and a second attempt with the same ticket is refused rather than
+    /// falling through to the token paths.
+    #[tokio::test]
+    async fn a_ticket_authenticates_one_upgrade() {
+        let state = state().await;
+        let ticket = state
+            .ws_tickets
+            .issue("shared", vec!["chat".to_string(), "read".to_string()])
+            .await;
+        let headers = axum::http::HeaderMap::new();
+
+        let first = validate_ws_upgrade_request(&state, &headers, None, Some(&ticket)).await;
+        let grant = first.expect("the ticket should authenticate the upgrade");
+        assert_eq!(grant.user_id.0, "shared");
+        assert_eq!(grant.scopes, vec!["chat".to_string(), "read".to_string()]);
+
+        let second = validate_ws_upgrade_request(&state, &headers, None, Some(&ticket)).await;
+        assert!(
+            second.is_err(),
+            "a ticket is single-use: a replayed upgrade URL must not authenticate"
+        );
+    }
+
+    /// A ticket that was never issued (or has expired) is refused, and does not
+    /// quietly let the request through on some other credential.
+    #[tokio::test]
+    async fn an_unknown_ticket_is_refused() {
+        let state = state().await;
+        let headers = axum::http::HeaderMap::new();
+        assert!(validate_ws_upgrade_request(&state, &headers, None, Some("wst_nope"))
+            .await
+            .is_err());
     }
 
     async fn dispatch(

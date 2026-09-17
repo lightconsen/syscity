@@ -13,6 +13,11 @@
     external tools hardcode these paths.
   - OAuth browser redirects (`/api/v1/cloud/login`).
   - Inbound webhooks from external platforms (`/webhooks/*`).
+  - The WebSocket upgrade-ticket exchange (`/api/v1/ws-ticket`) — the caller has
+    no WS connection yet and a browser cannot set headers on a WebSocket
+    upgrade, so this is the only way to hand a credential over without putting
+    it in the upgrade URL. It is in the authenticated router, and a ticket is
+    worth the minting credential's own scopes and nothing more.
   - File/static download (`/api/v1/artifacts/*`, `/assets/*`).
   - Health/liveness/readiness probes (`/health`, `/ready`, `/live`) and
     Prometheus metrics (`/metrics`) — bare, unversioned paths by convention.

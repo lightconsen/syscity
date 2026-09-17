@@ -257,6 +257,7 @@ pub async fn make_test_state_parts(
         // Tests control `embedded` explicitly; production captures the env.
         embedded: false,
         active_ws_connections: std::sync::atomic::AtomicUsize::new(0),
+        ws_tickets: std::sync::Arc::new(crate::gateway::ws::tickets::WsTickets::new()),
     };
     (state, inbound_entry_rx)
 }

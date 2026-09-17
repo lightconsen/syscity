@@ -476,13 +476,29 @@ fn shared_token_matches(shared_token: Option<&str>, presented: &str) -> bool {
     }
 }
 
+/// What [`auth_middleware`] validated, for handlers that need the caller's
+/// entitlement rather than just "authenticated".
+///
+/// Only the WS-ticket exchange reads it today: a ticket hands the caller's own
+/// scopes to a WebSocket connection, so the handler has to know what they are.
+/// A route that sees no `RestAuthContext` is one where auth was not required —
+/// `security.auth_required = false` — and its caller is an anonymous local
+/// client.
+#[derive(Debug, Clone)]
+pub struct RestAuthContext {
+    /// Who the credential belonged to.
+    pub user_id: String,
+    /// What it was entitled to.
+    pub scopes: Vec<String>,
+}
+
 /// Middleware: Authentication check
 ///
 /// Validates Bearer token from Authorization header.
 /// If security.auth_required is false, allows all requests.
 pub async fn auth_middleware(
     State(state): State<Arc<GatewayState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     use crate::security::runtime_audit::AuditEventType;
@@ -512,8 +528,23 @@ pub async fn auth_middleware(
             if let Ok(header_str) = header_value.to_str() {
                 if let Some(token) = header_str.strip_prefix("Bearer ") {
                     // Validate session; AuthManager emits the TokenValidation event.
-                    if state.auth.manager.validate_session(token).await.is_some() {
+                    if let Some(session) = state.auth.manager.validate_session(token).await {
                         debug!("Valid auth token, allowing request");
+                        // Same default the WS handshake applies to a session
+                        // with no scopes of its own, so the two paths cannot
+                        // disagree about what a session token is worth.
+                        let scopes = if session.scopes.is_empty() {
+                            crate::gateway::protocol::DEFAULT_SCOPES
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect()
+                        } else {
+                            session.scopes.clone()
+                        };
+                        req.extensions_mut().insert(RestAuthContext {
+                            user_id: session.user_id.to_string(),
+                            scopes,
+                        });
                         return Ok(next.run(req).await);
                     }
                     // The configured shared token (auth_mode=token) is also a
@@ -528,6 +559,14 @@ pub async fn auth_middleware(
                     };
                     if shared_token_matches(shared_token.as_deref(), token) {
                         debug!("Valid shared token, allowing request");
+                        let scopes = {
+                            let config = state.config.read().await;
+                            config.security.shared_token_scopes.clone()
+                        };
+                        req.extensions_mut().insert(RestAuthContext {
+                            user_id: "shared".to_string(),
+                            scopes,
+                        });
                         return Ok(next.run(req).await);
                     }
                     warn!("Invalid or expired auth token");

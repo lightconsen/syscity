@@ -7,6 +7,7 @@ pub mod health;
 pub mod openai;
 pub mod update;
 pub mod web_ui;
+pub mod ws_ticket;
 pub use admin::*;
 pub use artifacts::*;
 // No `pub use config::*` here: the module now holds only the crate-internal

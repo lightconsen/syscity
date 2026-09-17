@@ -1425,6 +1425,10 @@ pub(crate) async fn build_router(state: Arc<GatewayState>) -> Router {
     let essential_auth_router = Router::new()
         .route("/v1/chat/completions", post(super::openai_chat_completions_handler))
         .route("/v1/models", get(super::openai_list_models_handler))
+        // The credential exchange the WS protocol needs: a browser cannot set
+        // headers on a WebSocket upgrade, so without this the token would have
+        // to travel in the upgrade URL. See `handlers/ws_ticket.rs`.
+        .route("/api/v1/ws-ticket", post(super::handlers::ws_ticket::ws_ticket_handler))
         // (Everything else in the former admin tier — models, reload, channels,
         // device pairing, providers, plugins, cron, skills — is WS-only now,
         // driven by the admin WS methods in ws/admin_ws.rs.)

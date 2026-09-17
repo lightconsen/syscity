@@ -233,7 +233,28 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     return "dev_" + Math.random().toString(36).slice(2, 10);
   }
 
-  private connect() {
+  /**
+   * A single-use upgrade ticket, if the gateway will mint one.
+   *
+   * Returns `null` when the exchange is unavailable, so the caller can fall
+   * back to putting the token in the URL — the behaviour this replaces.
+   */
+  private async fetchTicket(): Promise<string | null> {
+    if (!this.gatewayToken) return null;
+    try {
+      const res = await fetch(`${getGatewayBase()}/api/v1/ws-ticket`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.gatewayToken}` },
+      });
+      if (!res.ok) return null;
+      const body = (await res.json()) as { ticket?: string };
+      return body.ticket ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async connect() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -259,13 +280,19 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       url = getGatewayBase().replace(/^http/, "ws") + "/ws";
     }
 
-    // Mobile gateways require the shared token at the WS *upgrade* (before
-    // any connect message arrives); browsers can't set headers on WebSocket,
-    // so the token goes in the query string (`?token=` is accepted by
-    // `gateway/ws/core.rs`).
+    // A gateway that authenticates the *upgrade* (before any connect message
+    // can arrive) needs a credential in the URL: browsers can't set headers on
+    // WebSocket. Prefer a ticket over the token — it is single-use and dies in
+    // 30 s, where the token in a URL lives in devtools, proxy logs and anything
+    // that copies a URL. The exchange happens over HTTP, where headers work.
+    const ticket = await this.fetchTicket();
     if (this.gatewayToken) {
       const sep = url.includes("?") ? "&" : "?";
-      url = `${url}${sep}token=${encodeURIComponent(this.gatewayToken)}`;
+      url = ticket
+        ? `${url}${sep}ticket=${encodeURIComponent(ticket)}`
+        : // Older gateway without the exchange, or the POST failed: the token
+          // still works, and the connect frame carries it as well.
+          `${url}${sep}token=${encodeURIComponent(this.gatewayToken)}`;
     }
 
     this.gatewayUrl = url;

@@ -345,4 +345,8 @@ pub struct GatewayState {
     pub embedded: bool,
     /// In-flight WebSocket connections to `/ws`, for the connection cap.
     pub active_ws_connections: std::sync::atomic::AtomicUsize,
+    /// Single-use tickets a client exchanges for a `/ws` upgrade URL, so the
+    /// long-lived credential does not have to go in the query string (see
+    /// [`crate::gateway::ws::tickets`]).
+    pub ws_tickets: std::sync::Arc<crate::gateway::ws::tickets::WsTickets>,
 }

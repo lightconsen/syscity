@@ -594,6 +594,7 @@ impl Gateway {
             update: UpdateState::new(),
             embedded: std::env::var("SYSCITY_EMBEDDED").is_ok(),
             active_ws_connections: std::sync::atomic::AtomicUsize::new(0),
+            ws_tickets: std::sync::Arc::new(crate::gateway::ws::tickets::WsTickets::new()),
         });
 
         if let Some(ref store) = state.agents.store {

@@ -88,7 +88,7 @@ The simplest authenticated setup. Define a shared secret:
 enabled = true
 auth_required = true
 auth_mode = "token"
-shared_token = "REPLACE_WITH_A_STRONG_RANDOM_SECRET"
+shared_token = "<generated below>"
 ```
 
 Generate a strong secret instead of hand-picking one:
@@ -100,8 +100,17 @@ syscity config set security.shared_token="$(openssl rand -hex 32)"
 Clients present the token in any of these ways (any one suffices):
 
 - **Bearer header:** `Authorization: Bearer <token>`
-- **Query parameter** (for browser WebSocket where headers can't be set):
-  `ws://host:18080/ws?token=<token>`
+- **Upgrade ticket** (preferred for browser WebSocket, where headers can't be
+  set): `POST /api/v1/ws-ticket` with the token as a Bearer header returns
+  `{"ticket": "...", "expires_in": 30}`, and the connection then uses
+  `ws://host:18080/ws?ticket=<ticket>`. A ticket is single-use and short-lived,
+  so a URL that leaks — devtools, a proxy log, a copy-paste — is worthless
+  within seconds. What the ticket is worth is what the minting credential was
+  worth; minting never widens access.
+- **Query parameter** (kept for a client that cannot fetch a ticket first):
+  `ws://host:18080/ws?token=<token>`. The token therefore still appears in URLs
+  for those clients — prefer the ticket — and the gateway redacts credential
+  parameters from its own log lines (`gateway/middleware.rs::redact_uri`).
 - **ACP `connect` handshake:** `params.auth.token = "<token>"`
 
 The TUI client passes it directly:

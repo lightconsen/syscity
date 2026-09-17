@@ -172,6 +172,7 @@ mod models;
 mod sessions;
 mod skills_ws;
 mod tasks;
+pub mod tickets;
 mod workspace;
 
 pub(crate) use config_ws::push_default_agent_update;
