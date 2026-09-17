@@ -59,6 +59,8 @@ impl Agent {
         let system_prompt = context.system_prompt().to_string();
         let tools_json = super::super::session_store::compact_tools_json(tools);
         tokio::spawn(async move {
+            // Counted: shutdown waits for this write before closing storage.
+            let _owed = crate::agent::writes::pending().guard();
             let snapshot = super::super::session_store::RequestSnapshot {
                 session_id: session_id.as_deref(),
                 conversation_id: Some(&conversation_id),

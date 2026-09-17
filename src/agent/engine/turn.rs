@@ -255,6 +255,8 @@ impl Agent {
                 let tid = thread_id.clone();
                 let label = conversation_id.clone();
                 tokio::spawn(async move {
+                    // Counted: shutdown waits for this write before closing storage.
+                    let _owed = crate::agent::writes::pending().guard();
                     if let Err(e) = store
                         .save_thread(&sid, &tid, &label, chrono::Utc::now().timestamp_millis())
                         .await
@@ -322,6 +324,8 @@ impl Agent {
                     let user_c = content.clone();
                     let t_idx = turn_idx as i64;
                     tokio::spawn(async move {
+                        // Counted: shutdown waits for this write before closing storage.
+                        let _owed = crate::agent::writes::pending().guard();
                         if let Err(e) = store
                             .append_turn(&sid, &tid, t_idx, &user_c, &asst_text, "complete", None)
                             .await
@@ -598,6 +602,8 @@ impl Agent {
                 let tid = thread_id.clone();
                 let label = conversation_id.clone();
                 tokio::spawn(async move {
+                    // Counted: shutdown waits for this write before closing storage.
+                    let _owed = crate::agent::writes::pending().guard();
                     if let Err(e) = store
                         .save_thread(&sid, &tid, &label, chrono::Utc::now().timestamp_millis())
                         .await
@@ -744,6 +750,8 @@ impl Agent {
                     let asst_text_spawn = asst_text.clone();
                     let turn_id_spawn = turn_id.clone();
                     tokio::spawn(async move {
+                        // Counted: shutdown waits for this write before closing storage.
+                        let _owed = crate::agent::writes::pending().guard();
                         if let Err(e) = store
                             .append_turn(
                                 &sid,

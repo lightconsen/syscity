@@ -74,6 +74,8 @@ impl Agent {
         let agent_id = self.agent_id.clone();
         let turn_id = turn_id.to_string();
         tokio::spawn(async move {
+            // Counted: shutdown waits for this write before closing storage.
+            let _owed = crate::agent::writes::pending().guard();
             let mut risk_signals = risks;
             // Deep LLM judge on the flagged turn. Runs before the pending insert
             // so the verdict can ride along on the badcase row.
@@ -186,6 +188,8 @@ impl Agent {
         let response = response.to_string();
         let conversation_id = conversation_id.to_string();
         tokio::spawn(async move {
+            // Counted: shutdown waits for this write before closing storage.
+            let _owed = crate::agent::writes::pending().guard();
             let params = crate::eval::InsertSampleParams {
                 turn_id,
                 session_id,

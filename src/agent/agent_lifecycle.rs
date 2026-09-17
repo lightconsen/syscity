@@ -167,6 +167,8 @@ impl Agent {
                 {
                     let tid = thread.id.clone();
                     tokio::spawn(async move {
+                        // Counted: shutdown waits for this write before closing storage.
+                        let _owed = crate::agent::writes::pending().guard();
                         if let Err(e) = store.delete_turn(&sid, &tid, last_idx).await {
                             warn!("Failed to delete turn {} for session {}: {}", last_idx, sid, e);
                         }
@@ -349,6 +351,8 @@ impl Agent {
             if let Some(mm) = self.memory_manager.clone() {
                 let conv_id = conversation_id.to_string();
                 tokio::spawn(async move {
+                    // Counted: shutdown waits for this write before closing storage.
+                    let _owed = crate::agent::writes::pending().guard();
                     match mm.compact_session(&conv_id, None).await {
                         Ok(ids) => {
                             info!("Session {} compacted: {} facts extracted", conv_id, ids.len());

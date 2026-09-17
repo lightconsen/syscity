@@ -91,6 +91,7 @@ pub mod subagent_registry;
 pub mod todo;
 pub mod transcript;
 pub mod turns;
+pub mod writes;
 
 pub use acp::{
     AcpCommand, AcpController, AcpSessionStatus, ExecutionController, ExecutionMode, RuntimeState,

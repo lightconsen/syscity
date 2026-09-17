@@ -424,6 +424,8 @@ impl SessionManager {
             let store = store.clone();
             let sid = session_id;
             tokio::spawn(async move {
+                // Counted: shutdown waits for this write before closing storage.
+                let _owed = crate::agent::writes::pending().guard();
                 if let Err(e) = store.ensure_session_row(&sid).await {
                     tracing::warn!("Failed to auto-persist session {}: {}", sid, e);
                 }
@@ -463,6 +465,8 @@ impl SessionManager {
             let store = store.clone();
             let sid = session_id.to_string();
             tokio::spawn(async move {
+                // Counted: shutdown waits for this write before closing storage.
+                let _owed = crate::agent::writes::pending().guard();
                 if let Err(e) = store.set_session_active(&sid, false).await {
                     tracing::warn!("Failed to update session {} status in store: {}", sid, e);
                 }

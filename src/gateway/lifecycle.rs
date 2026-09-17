@@ -902,6 +902,35 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
+    /// The engine's fire-and-forget writes are not in the registry, so the
+    /// drain above cannot see them. Shutdown still has to wait for them: a turn
+    /// that is already marked complete in memory is lost if storage closes
+    /// under its insert.
+    #[tokio::test]
+    async fn stop_gateway_waits_for_engine_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let state = state().await;
+        let written = Arc::new(AtomicBool::new(false));
+
+        // Longer than the rest of a test shutdown, so the write is still in
+        // flight when shutdown would otherwise return.
+        let guard = crate::agent::writes::pending().guard();
+        let written_task = written.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(guard);
+            written_task.store(true, Ordering::SeqCst);
+        });
+
+        stop_gateway(&state.shutdown_token, &state).await.unwrap();
+
+        assert!(
+            written.load(Ordering::SeqCst),
+            "shutdown closed storage while an engine write was still in flight"
+        );
+    }
+
     /// A task that is winding down gets to finish what it was writing.
     ///
     /// The token is cancelled at the top of `stop_gateway`, but a task holding
@@ -1305,6 +1334,24 @@ pub(crate) async fn stop_gateway(
         warn!("Failed to shutdown plugin manager: {}", e);
     }
 
+    // 13b. Writes the engine still owes the database.
+    //
+    //      Turn, thread, sample and session-row persistence runs on
+    //      fire-and-forget tasks (`agent::writes`), so the registry drain above
+    //      cannot see them — they are not in it by design, since those tasks
+    //      must finish rather than be cancelled. Closing the pool under them
+    //      loses a turn that the in-memory state already calls complete.
+    if !crate::agent::writes::pending()
+        .wait_idle(PENDING_WRITES_TIMEOUT)
+        .await
+    {
+        warn!(
+            "{} engine write(s) still in flight after {:?}; closing storage anyway",
+            crate::agent::writes::pending().in_flight(),
+            PENDING_WRITES_TIMEOUT
+        );
+    }
+
     // 14. Flush durable state, rather than leaving it to process exit — the
     //     `/restart` path ends in `std::process::exit`, which runs no
     //     destructors at all.
@@ -1332,6 +1379,12 @@ pub(crate) async fn stop_gateway(
 fn is_socket_lifetime_task(name: &str) -> bool {
     name.starts_with("ws:") || name.starts_with("openai:sse:")
 }
+
+/// How long shutdown waits for the engine's fire-and-forget writes.
+///
+/// They are ordinary SQLite inserts on the shared pool, so seconds is generous;
+/// the bound exists so a stuck writer cannot hold the process open.
+const PENDING_WRITES_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often stale approvals are denied.
 ///
