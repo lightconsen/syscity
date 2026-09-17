@@ -10,6 +10,7 @@
 // INVARIANTS-NONE: process-lifetime terminal setup; owns no shared state.
 
 use std::io::{stdout, IsTerminal, Stdout, Write};
+use std::sync::Arc;
 
 use crossterm::cursor::Show;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -90,11 +91,17 @@ async fn run_inline(endpoint: Endpoint, session: SessionChoice) -> Result<(), Tu
     };
 
     // A panic must not leave the terminal in raw mode with a hidden cursor.
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = restore_terminal();
-        original_hook(info);
-    }));
+    // The hook is taken back when this function returns — see `PanicHookGuard`
+    // — because it restores a terminal the process no longer owns.
+    let original: PanicHook = Arc::from(std::panic::take_hook());
+    std::panic::set_hook({
+        let original = Arc::clone(&original);
+        Box::new(move |info| {
+            let _ = restore_terminal();
+            original(info);
+        })
+    });
+    let _hook_guard = PanicHookGuard(Some(original));
 
     let result = run_app(&mut terminal, endpoint, session).await;
 
@@ -105,6 +112,25 @@ async fn run_inline(endpoint: Endpoint, session: SessionChoice) -> Result<(), Tu
     }
     restore?;
     result
+}
+
+/// The process's panic hook, as `std::panic` stores it — held behind an `Arc`
+/// because the installed closure and the guard need the same copy.
+type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+
+/// Holds the panic hook for exactly as long as the terminal is ours.
+///
+/// Dropping it puts the original back, on the ordinary return *and* on the
+/// unwind — the installed hook calls `restore_terminal`, which is the right
+/// thing while the TUI owns the terminal and pointless afterwards.
+struct PanicHookGuard(Option<PanicHook>);
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.0.take() {
+            std::panic::set_hook(Box::new(move |info| original(info)));
+        }
+    }
 }
 
 /// Initialize crossterm and ratatui for an inline viewport.
