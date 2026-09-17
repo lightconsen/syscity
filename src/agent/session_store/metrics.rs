@@ -404,6 +404,7 @@ mod tests {
                     cache_read_tokens: 40,
                     cache_creation_tokens: 0,
                 }),
+                estimated_prompt_tokens: Some(120),
                 finish_reason: Some("stop".into()),
                 error: None,
                 input: None,

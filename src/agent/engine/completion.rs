@@ -595,7 +595,15 @@ impl Agent {
         let mut stream = registry.apply(family, raw_stream);
 
         // Begin an observability round for this LLM call.
-        collector.begin_round(&round_provider, &round_model, Some(input_json));
+        // The estimate recorded here is the same one the budget, pruning and
+        // cost decisions use — which is what makes it comparable with the
+        // provider's own count on the same record.
+        collector.begin_round(
+            &round_provider,
+            &round_model,
+            Some(input_json),
+            Some(context.token_count().min(u32::MAX as usize) as u32),
+        );
         // Persist the route decision on the turn record.
         if let Some(rec) = route_record {
             collector.record_route(rec);

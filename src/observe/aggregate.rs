@@ -92,6 +92,16 @@ pub struct Stats {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_hit_rate: Option<f64>,
+    /// What the gateway's own estimate said these prompts would cost, summed
+    /// over the rounds that reported both numbers.
+    ///
+    /// Sits next to the provider's count so the two can be reconciled: budget,
+    /// pruning and cost-guard decisions are all made on the estimate, and this
+    /// is how far off it was.
+    pub estimated_prompt_tokens: u64,
+    /// `prompt_tokens / estimated_prompt_tokens` over those same rounds —
+    /// how much the estimate under- or over-counts, as a ratio.
+    pub estimate_drift: Option<f64>,
     pub by_model: Vec<ModelStats>,
     pub by_tool: Vec<ToolStats>,
 }
@@ -153,6 +163,12 @@ pub fn compute_stats(records: &[TurnRecord]) -> Stats {
                 stats.prompt_tokens += u.prompt_tokens as u64;
                 stats.completion_tokens += u.completion_tokens as u64;
                 stats.cache_read_tokens += u.cache_read_tokens as u64;
+                // Only the rounds with both numbers say anything about the
+                // estimate: one without a provider count has nothing to compare
+                // against, and one without an estimate was never estimated.
+                if let Some(estimated) = round.estimated_prompt_tokens {
+                    stats.estimated_prompt_tokens += estimated as u64;
+                }
             }
             let entry = models.entry(round.model.clone()).or_default();
             entry.0 += 1;
@@ -181,6 +197,10 @@ pub fn compute_stats(records: &[TurnRecord]) -> Stats {
     stats.avg_tools = total_tools as f64 / records.len() as f64;
     if stats.prompt_tokens > 0 {
         stats.cache_hit_rate = Some(stats.cache_read_tokens as f64 / stats.prompt_tokens as f64);
+    }
+    if stats.estimated_prompt_tokens > 0 {
+        stats.estimate_drift =
+            Some(stats.prompt_tokens as f64 / stats.estimated_prompt_tokens as f64);
     }
 
     stats.by_model = models
@@ -263,6 +283,7 @@ mod tests {
                     cache_read_tokens: 40,
                     cache_creation_tokens: 0,
                 }),
+                estimated_prompt_tokens: Some(120),
                 finish_reason: Some("stop".into()),
                 error: None,
                 input: None,
@@ -306,6 +327,10 @@ mod tests {
         assert_eq!(stats.avg_duration_ms, 200);
         assert_eq!(stats.llm_calls, 3);
         assert_eq!(stats.prompt_tokens, 300);
+        // The estimate sits beside the provider's count so the two can be
+        // reconciled: the fixtures estimate 120 against 100 actual each.
+        assert_eq!(stats.estimated_prompt_tokens, 360);
+        assert_eq!(stats.estimate_drift, Some(300.0 / 360.0));
         assert_eq!(stats.cache_read_tokens, 120);
         assert!((stats.cache_hit_rate.unwrap() - 0.4).abs() < 1e-9);
         assert_eq!(stats.by_tool.len(), 1);

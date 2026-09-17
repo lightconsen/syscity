@@ -33,6 +33,9 @@ struct OpenRound {
     started_at: String,
     start: Instant,
     ttft_ms: Option<u64>,
+    /// The gateway's own pre-call estimate for this round (see
+    /// [`LlmRoundRecord::estimated_prompt_tokens`]).
+    estimated_prompt_tokens: Option<u32>,
 }
 
 pub struct TurnMetricsCollector {
@@ -270,7 +273,13 @@ impl TurnMetricsCollector {
     }
 
     /// Begin a new LLM round. Defensively closes any prior open round.
-    pub fn begin_round(&mut self, provider: &str, model: &str, input: Option<String>) {
+    pub fn begin_round(
+        &mut self,
+        provider: &str,
+        model: &str,
+        input: Option<String>,
+        estimated_prompt_tokens: Option<u32>,
+    ) {
         if self.open_round.is_some() {
             self.end_round(None, Some("interrupted".to_string()));
         }
@@ -289,6 +298,7 @@ impl TurnMetricsCollector {
             started_at: chrono::Local::now().to_rfc3339(),
             start: Instant::now(),
             ttft_ms: None,
+            estimated_prompt_tokens,
         });
     }
 
@@ -333,6 +343,7 @@ impl TurnMetricsCollector {
             duration_ms: open.start.elapsed().as_millis() as u64,
             ttft_ms: open.ttft_ms,
             usage,
+            estimated_prompt_tokens: open.estimated_prompt_tokens,
             finish_reason,
             error,
             input: open.input,
@@ -618,7 +629,7 @@ mod tests {
     async fn finish_writes_complete_record() {
         let dir = TempDir::new().unwrap();
         let mut c = make_collector(&dir);
-        c.begin_round("p", "m", None);
+        c.begin_round("p", "m", None, None);
         c.round_first_token();
         c.end_round(None, Some("stop".into()));
         let id = c.turn_id().to_string();
@@ -636,7 +647,7 @@ mod tests {
     async fn fail_writes_error_record() {
         let dir = TempDir::new().unwrap();
         let mut c = make_collector(&dir);
-        c.begin_round("p", "m", None);
+        c.begin_round("p", "m", None, None);
         let id = c.turn_id().to_string();
         c.fail(ErrorSource::Llm, "boom").await;
 
@@ -650,7 +661,7 @@ mod tests {
     async fn abort_writes_aborted_record_with_partial_text() {
         let dir = TempDir::new().unwrap();
         let mut c = make_collector(&dir);
-        c.begin_round("p", "m", None);
+        c.begin_round("p", "m", None, None);
         c.push_text_delta("partial ");
         c.push_text_delta("content");
         c.push_reasoning_delta("thinking");
@@ -669,7 +680,7 @@ mod tests {
         let id;
         {
             let mut c = make_collector(&dir);
-            c.begin_round("p", "m", None);
+            c.begin_round("p", "m", None, None);
             c.push_text_delta("partial");
             id = c.turn_id().to_string();
             drop(c); // no terminal call -> Drop persists aborted
@@ -687,7 +698,7 @@ mod tests {
     async fn drop_after_terminal_is_noop() {
         let dir = TempDir::new().unwrap();
         let mut c = make_collector(&dir);
-        c.begin_round("p", "m", None);
+        c.begin_round("p", "m", None, None);
         c.end_round(None, None);
         let id = c.turn_id().to_string();
         c.finish("ok").await; // consumes self; terminal set, Drop must not rewrite
@@ -699,7 +710,7 @@ mod tests {
     fn first_token_only_recorded_once() {
         let dir = TempDir::new().unwrap();
         let mut c = make_collector(&dir);
-        c.begin_round("p", "m", None);
+        c.begin_round("p", "m", None, None);
         std::thread::sleep(std::time::Duration::from_millis(2));
         c.round_first_token();
         let first = c.open_round.as_ref().unwrap().ttft_ms;
@@ -791,6 +802,7 @@ mod tests {
             "p",
             "m",
             Some(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string()),
+            Some(11),
         );
         // Output longer than the 4 KiB summary field cap must survive in full.json.
         let long_delta = "x".repeat(5000);
@@ -834,13 +846,13 @@ mod tests {
         let mut c = make_collector(&dir);
 
         // Round 0 output exceeds the 64 KiB abort-fallback cap but stays intact.
-        c.begin_round("p", "m", Some(r#"{"n":0}"#.to_string()));
+        c.begin_round("p", "m", Some(r#"{"n":0}"#.to_string()), Some(7));
         let chunk = "y".repeat(70 * 1024);
         c.push_text_delta(&chunk);
         c.end_round(None, Some("stop".into()));
 
         // Round 1 starts with a fresh per-round buffer.
-        c.begin_round("p", "m", Some(r#"{"n":1}"#.to_string()));
+        c.begin_round("p", "m", Some(r#"{"n":1}"#.to_string()), Some(7));
         c.push_text_delta("second");
         c.end_round(None, Some("stop".into()));
 

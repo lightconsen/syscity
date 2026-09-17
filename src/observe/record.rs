@@ -66,6 +66,16 @@ pub struct LlmRoundRecord {
     pub duration_ms: u64,
     pub ttft_ms: Option<u64>,
     pub usage: Option<ObservedUsage>,
+    /// What the gateway itself estimated this round's prompt would cost in
+    /// tokens, before the call.
+    ///
+    /// Recorded next to the provider's own count so the two can be compared:
+    /// everything a budget decision rests on — pruning, compaction, the cost
+    /// guard — uses the estimate, and `usage.prompt_tokens` is what it was
+    /// actually worth. Without both on the record the difference is
+    /// unmeasurable.
+    #[serde(default)]
+    pub estimated_prompt_tokens: Option<u32>,
     pub finish_reason: Option<String>,
     pub error: Option<String>,
     /// Full request messages serialized as JSON (untruncated at capture time).
