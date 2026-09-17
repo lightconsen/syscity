@@ -134,6 +134,25 @@ sleep/await**: snapshot → release lock → sleep → snapshot.
 parent's tool instance reads. So `wait` can poll `tracker.get_child(id)` and
 reliably observe transitions to `Completed`/`Failed`.
 
+### 3.5 Who a child may run as (`target_agent`)
+
+`TaskSpec.target_agent` is parsed out of the **model's** tool arguments (the
+`task_json` handling in `delegate_tool.rs`), which makes it a privilege
+selector rather than a routing hint from the operator: the child runs as the
+agent that name resolves to, and therefore with that agent's workspace, secrets
+and skill trust.
+
+It is default-deny: a delegation may only name the agent it delegates for, and
+any other name is refused, logged, and the child runs as that agent
+(`spawn_child`). Default-deny costs no supported use — nothing else in the tree
+sets the field, and no configuration exposes it. If cross-agent delegation is
+wanted, the allowlist belongs in operator configuration (a gateway-level list of
+delegatable agents), never in a name the model chose.
+
+The delegation task row and its events record the id of the agent that actually
+executes the child, not the requested string: a lookup that fell back to the
+parent used to leave the row naming an agent that never ran.
+
 ---
 
 ## 4. Component 1: the `wait` action (v1)

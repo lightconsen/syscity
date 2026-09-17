@@ -54,6 +54,9 @@ Capabilities the AI assistant can use to interact with the world.
 - **Screenshot producers** (`browser`, `computer`, `screen_state`) — Large image payloads are written once to the content-addressed attachment store at `~/.syscity/attachments/sha256/<2>/<rest>`; tool results carry a compact `{"type":"image_ref",...}` marker plus a human note instead of megabytes of base64. Current-turn refs are materialized back as image blocks at request time; older-turn refs degrade to a one-line placeholder. Unreferenced objects are swept by `syscity observe prune`.
 - **Output spill** — Successful tool outputs above 32 KiB (configurable, `ToolRegistry::with_spill_threshold`) are written to `<workspace>/.syscity/spill/` and replaced with a head/tail preview plus a retrieval hint. The exemption is path-aware: only calls whose path-like argument resolves under the spill directory return full content, which breaks the read → spill → read loop without exempting every `file_read`.
 
+- **`delegate`** — A child runs as the agent the delegation is made *for*. `target_agent` arrives in the model's own arguments, so it is default-deny: any other name is refused, logged, and ignored, and the delegation task row records the agent that actually ran rather than the string that was asked for. Cross-agent delegation would need an operator-configured allowlist; see [delegation-wake.md](../delegation-wake.md) §3.5.
+- **MCP tools** — Registered as `mcp__{server}__{tool}` and reached through the registry from both the agent path and `mcp.call_tool`, so blocked/degraded prefixes, policy hooks, approval and the content filter apply to either. A name the registry cannot dispatch (server not connected, or beyond `max_tools`) falls back to a direct client call, guarded by the blocked list alone; see [mcp.md](mcp.md).
+
 ### Security Features
 
 - **Path traversal detection** — `../`, `~`, null bytes blocked in SecurityValidator

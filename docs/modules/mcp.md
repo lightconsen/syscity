@@ -85,3 +85,23 @@ pub struct McpServerConfig {
 - Timeout and auto-connect configuration
 - Integration with `ToolRegistry` for dynamic tool registration
 
+
+## Tool Call Authorization
+
+MCP tools are registered as `mcp__{server}__{tool}`, and both the agent path and
+the `mcp.call_tool` WS method reach them **through the `ToolRegistry`**
+(`execute_call`). That is what makes blocked and degraded prefixes, policy hooks,
+the approval route and the content filter apply to a call however it was
+started — calling the MCP client directly, which the WS method used to do,
+bypassed all of them.
+
+Two details of that path are worth knowing:
+
+- The context `mcp.call_tool` builds carries **no ask channel**, so a tool that
+  merely advertises `requires_approval` does not stop to ask a human: the caller
+  is the operator who asked for it. A policy *hook* that returns
+  `NeedsApproval` is still honoured, and routed through the full approval flow.
+- A name the registry cannot dispatch — a server that is not connected, or one
+  exposing more tools than `max_tools` registered — falls back to a direct client
+  call, because the rest of the policy needs a registry entry to evaluate. The
+  blocked-name list still applies there; nothing else does.
