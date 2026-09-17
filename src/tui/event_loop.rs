@@ -387,14 +387,7 @@ async fn try_reconnect(
 ) {
     *reconnect_at = None;
     let attempt = backoff.attempt() + 1;
-    match WsClient::connect(
-        &endpoint.url,
-        &endpoint.auth,
-        endpoint.session.as_deref(),
-        &["chat", "read", "write"],
-    )
-    .await
-    {
+    match WsClient::connect(&endpoint.url, &endpoint.auth, &["chat", "read", "write"]).await {
         Ok((client, hello)) => {
             *ws = Some(client);
             backoff.reset();
@@ -918,13 +911,8 @@ pub async fn run_plain_with(
     io: PlainIo,
 ) -> Result<(), TuiError> {
     let PlainIo { input, mut output } = io;
-    let (mut ws, hello) = WsClient::connect(
-        &endpoint.url,
-        &endpoint.auth,
-        endpoint.session.as_deref(),
-        &["chat", "read", "write"],
-    )
-    .await?;
+    let (mut ws, hello) =
+        WsClient::connect(&endpoint.url, &endpoint.auth, &["chat", "read", "write"]).await?;
 
     let state = Arc::new(RwLock::new(AppState::default()));
     {

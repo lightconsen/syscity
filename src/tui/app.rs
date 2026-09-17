@@ -138,13 +138,8 @@ async fn run_app(
     endpoint: Endpoint,
     session: SessionChoice,
 ) -> Result<(), TuiError> {
-    let (ws_client, hello) = WsClient::connect(
-        &endpoint.url,
-        &endpoint.auth,
-        endpoint.session.as_deref(),
-        &["chat", "read", "write"],
-    )
-    .await?;
+    let (ws_client, hello) =
+        WsClient::connect(&endpoint.url, &endpoint.auth, &["chat", "read", "write"]).await?;
 
     let state = std::sync::Arc::new(RwLock::new(AppState::default()));
     {

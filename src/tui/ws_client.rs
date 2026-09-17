@@ -120,10 +120,15 @@ pub struct WsClient {
 impl WsClient {
     /// Connect to `url`, perform the `connect` handshake, and return the client
     /// plus the `hello-ok` payload.
+    ///
+    /// Deliberately subscribes to nothing: the gateway seeds the connection's
+    /// subscriptions from the `session_id` in the upgrade URL, and later
+    /// switches go through `gateway_calls::sessions_subscribe`. A second,
+    /// private subscribe here would be a second source of truth for the same
+    /// thing — and was, with the wrong parameter name, silently rejected.
     pub async fn connect(
         url: &str,
         _auth: &AuthConfig,
-        session_id: Option<&str>,
         scopes: &[&str],
     ) -> Result<(Self, HelloOkPayload), TuiError> {
         let (ws_stream, _response) = connect_async(url)
@@ -156,13 +161,6 @@ impl WsClient {
         let response = client.request("connect", Some(params)).await?;
 
         let payload: HelloOkPayload = serde_json::from_value(response)?;
-
-        if let Some(sid) = session_id {
-            client
-                .request("sessions.subscribe", Some(serde_json::json!({ "session_id": sid })))
-                .await
-                .ok();
-        }
 
         Ok((client, payload))
     }
@@ -340,6 +338,31 @@ fn handle_text(text: &str, event_tx: &mpsc::UnboundedSender<WsMessage>, pending:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_gateway::TestGateway;
+
+    /// Connecting subscribes to nothing of its own.
+    ///
+    /// The gateway seeds the connection's subscriptions from the `session_id`
+    /// in the upgrade URL, and session switches go through
+    /// `gateway_calls::sessions_subscribe`. A private subscribe here is a
+    /// second source of truth for the same thing — and was, with a bare
+    /// `session_id` where the method wants `session_ids`, so every connect
+    /// that carried a session id also sent a request the gateway rejected as
+    /// invalid. Nothing surfaced the rejection: the reply went to `.ok()`.
+    #[tokio::test]
+    async fn connecting_subscribes_to_nothing() {
+        let gateway = TestGateway::start().await;
+        let auth = AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, Some("s1"), "tui");
+
+        let (_client, hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+        assert_eq!(hello.server.version, "test");
+
+        let methods: Vec<String> = gateway.requests().into_iter().map(|r| r.method).collect();
+        assert_eq!(methods, vec!["connect"], "the handshake is the only request a connect makes");
+    }
 
     #[test]
     fn request_serializes() {
