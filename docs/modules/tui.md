@@ -136,6 +136,19 @@ Reconnecting: a dropped socket surfaces as `WsMessage::Disconnected`, which the
 loop turns into a visible "lost the gateway" notice and a backoff retry. The
 session is re-subscribed, and history is **not** reprinted — the transcript is
 already above. Output produced while offline is lost, which the notice says.
+The run state converges with it: a disconnected run cannot finish and a
+disconnected prompt cannot be answered, so both are cleared and said so, rather
+than left claiming to be in progress.
+
+Subscription filtering: the gateway reads an *empty* subscription list as
+"every session" (`ProtocolConnection::is_subscribed`), and a session created
+from the TUI is unsubscribed until its id comes back — so there is a window in
+which the connection legitimately receives other conversations' events. The
+client therefore filters as well: an event whose payload names a session is
+applied only if it names the current one. Events naming none are global on
+purpose — cron notices, and `approval.required`, which the gateway scopes to a
+tool call rather than to a conversation, so an approval raised anywhere is
+offered here.
 
 ## Deliberate Limitations
 

@@ -728,6 +728,20 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &mu
     let Some(payload) = event.payload else {
         return;
     };
+
+    // A connection with no subscriptions receives *every* session's traffic:
+    // the gateway reads an empty subscription list as "all", and the window
+    // between creating a session and subscribing to it is exactly that. So the
+    // client checks too — an event that names a session is ours only if it
+    // names *our* session. Events that name none are global on purpose: cron
+    // notices, and approvals, which the queue scopes to a tool call rather
+    // than to a conversation.
+    if let Some(session_id) = payload["session_id"].as_str() {
+        if state.read().await.current_session.as_deref() != Some(session_id) {
+            return;
+        }
+    }
+
     match event.event.as_str() {
         "chat.delta" => {
             let content = payload["content"].as_str().unwrap_or_default();
@@ -1581,6 +1595,113 @@ mod tests {
 
         gateway.close().await;
         run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// A server event, as it arrives off the wire.
+    fn event(name: &str, payload: Value) -> ClientEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "event",
+            "event": name,
+            "payload": payload,
+            "seq": 1,
+        }))
+        .expect("a client event")
+    }
+
+    /// Another session's traffic never reaches this transcript.
+    ///
+    /// A connection with no subscriptions receives every session's events —
+    /// the gateway reads an empty subscription list as "all" — and a session
+    /// created from here is unsubscribed until its id comes back. In that
+    /// window, and whenever the gateway's fail-open applies, another
+    /// conversation's answer would otherwise be printed as ours.
+    #[tokio::test]
+    async fn events_for_another_session_are_ignored() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("mine".to_string());
+
+        handle_event(
+            event(
+                "chat.delta",
+                serde_json::json!({ "session_id": "theirs", "content": "not ours\n" }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+        assert!(
+            state.read().await.transcript.preview(10).is_empty(),
+            "another session's delta is dropped"
+        );
+
+        handle_event(
+            event("chat.delta", serde_json::json!({ "session_id": "mine", "content": "ours\n" })),
+            &state,
+            &mut client,
+        )
+        .await;
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(lines, vec!["ours"]);
+    }
+
+    /// Before there is a session, no session's event is ours.
+    #[tokio::test]
+    async fn session_scoped_events_are_dropped_before_a_session_exists() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+
+        handle_event(
+            event(
+                "chat.final",
+                serde_json::json!({ "session_id": "someone-elses", "response": "hello\n" }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        let s = state.read().await;
+        assert!(s.current_session.is_none(), "and it does not get adopted");
+        assert!(s.transcript.preview(10).is_empty());
+    }
+
+    /// Events that name no session are global, and still arrive.
+    #[tokio::test]
+    async fn events_without_a_session_still_arrive() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("mine".to_string());
+
+        handle_event(
+            event(
+                "cron.completed",
+                serde_json::json!({ "job_name": "nightly", "status": "ok", "output": "done" }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("nightly")),
+            "a global notice is not filtered: {lines:?}"
+        );
     }
 
     #[test]
