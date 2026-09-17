@@ -23,6 +23,48 @@ use crate::gateway::rate_limit::RequestScope;
 use crate::gateway::GatewayState;
 use crate::security::UserId;
 
+/// Query parameters whose *values* must never reach a log line.
+///
+/// The WS upgrade accepts `?token=` (and `?ticket=`, once a ticket flow
+/// exists), so a logged request line is a logged credential — and these
+/// middlewares log on every access decision, including the refusals, which is
+/// exactly when someone reads the log. A credential in a log outlives the
+/// request it belonged to.
+const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+    "token",
+    "ticket",
+    "access_token",
+    "api_key",
+    "apikey",
+    "secret",
+    "password",
+];
+
+/// A request URI with sensitive query values masked, safe to log.
+///
+/// The path is kept whole: it is what the middlewares are deciding about. Query
+/// parameters are kept in place so a log still says *that* a token was supplied
+/// — the presence is useful, the value is not.
+pub fn redact_uri(uri: &axum::http::Uri) -> String {
+    let Some(query) = uri.query() else {
+        return uri.path().to_string();
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_sensitive_param(name) => format!("{name}=***"),
+            // A bare `token` (no `=`) carries no value to leak.
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{}?{}", uri.path(), masked.join("&"))
+}
+
+fn is_sensitive_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SENSITIVE_QUERY_PARAMS.contains(&name.as_str())
+}
+
 /// Allowed network origins for admin APIs
 #[derive(Debug, Clone, Default)]
 pub enum AllowedOrigin {
@@ -145,11 +187,15 @@ pub async fn localhost_only_middleware(req: Request, next: Next) -> Result<Respo
 
     match client_ip {
         Some(ip) if is_localhost(ip) => {
-            debug!("Localhost access granted for: {:?}", req.uri());
+            debug!("Localhost access granted for: {}", redact_uri(req.uri()));
             Ok(next.run(req).await)
         }
         Some(ip) => {
-            warn!("Non-localhost access attempt to admin API from: {} - {:?}", ip, req.uri());
+            warn!(
+                "Non-localhost access attempt to admin API from: {} - {}",
+                ip,
+                redact_uri(req.uri())
+            );
             Err(StatusCode::FORBIDDEN)
         }
         None => {
@@ -194,17 +240,17 @@ pub async fn tailscale_auth_middleware(
 
     match client_ip {
         Some(ip) if is_localhost(ip) => {
-            debug!("Localhost access granted for: {:?}", req.uri());
+            debug!("Localhost access granted for: {}", redact_uri(req.uri()));
             Ok(next.run(req).await)
         }
         Some(ip) if is_tailscale(ip) => {
             // Tailscale IP: verify via whois
             if let Some(ref auth) = state.auth.tailscale_authenticator {
                 if auth.is_authorized(&ip.to_string(), &allowed_tailnets).await {
-                    debug!("Tailscale whois verified: {} - {:?}", ip, req.uri());
+                    debug!("Tailscale whois verified: {} - {}", ip, redact_uri(req.uri()));
                     Ok(next.run(req).await)
                 } else {
-                    warn!("Tailscale whois rejected: {} - {:?}", ip, req.uri());
+                    warn!("Tailscale whois rejected: {} - {}", ip, redact_uri(req.uri()));
                     Err(StatusCode::FORBIDDEN)
                 }
             } else {
@@ -214,7 +260,11 @@ pub async fn tailscale_auth_middleware(
             }
         }
         Some(ip) => {
-            warn!("Non-Tailscale, non-localhost access attempt from: {} - {:?}", ip, req.uri());
+            warn!(
+                "Non-Tailscale, non-localhost access attempt from: {} - {}",
+                ip,
+                redact_uri(req.uri())
+            );
             Err(StatusCode::FORBIDDEN)
         }
         None => {
@@ -374,11 +424,15 @@ pub async fn tailscale_only_middleware(req: Request, next: Next) -> Result<Respo
 
     match client_ip {
         Some(ip) if is_tailscale(ip) || is_localhost(ip) => {
-            debug!("Tailscale/localhost access granted for: {:?}", req.uri());
+            debug!("Tailscale/localhost access granted for: {}", redact_uri(req.uri()));
             Ok(next.run(req).await)
         }
         Some(ip) => {
-            warn!("Non-Tailscale access attempt to admin API from: {} - {:?}", ip, req.uri());
+            warn!(
+                "Non-Tailscale access attempt to admin API from: {} - {}",
+                ip,
+                redact_uri(req.uri())
+            );
             Err(StatusCode::FORBIDDEN)
         }
         None => {
@@ -394,11 +448,15 @@ pub async fn private_only_middleware(req: Request, next: Next) -> Result<Respons
 
     match client_ip {
         Some(ip) if is_private_ip(ip) => {
-            debug!("Private network access granted for: {:?}", req.uri());
+            debug!("Private network access granted for: {}", redact_uri(req.uri()));
             Ok(next.run(req).await)
         }
         Some(ip) => {
-            warn!("Public network access attempt to admin API from: {} - {:?}", ip, req.uri());
+            warn!(
+                "Public network access attempt to admin API from: {} - {}",
+                ip,
+                redact_uri(req.uri())
+            );
             Err(StatusCode::FORBIDDEN)
         }
         None => {
@@ -792,6 +850,44 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    /// A credential in a URL must not survive into a log line.
+    #[test]
+    fn redact_uri_masks_credentials_and_keeps_the_rest() {
+        let uri = "/ws?token=super-secret&since=42"
+            .parse::<axum::http::Uri>()
+            .unwrap();
+        assert_eq!(redact_uri(&uri), "/ws?token=***&since=42");
+
+        // Whatever else a client may call it, and whatever case they use.
+        for param in [
+            "ticket",
+            "access_token",
+            "api_key",
+            "APIKEY",
+            "secret",
+            "password",
+        ] {
+            let uri = format!("/x?{param}=leak-me")
+                .parse::<axum::http::Uri>()
+                .unwrap();
+            assert_eq!(redact_uri(&uri), format!("/x?{param}=***"));
+        }
+
+        // Nothing sensitive to hide, nothing hidden.
+        let uri = "/api/v1/artifacts/a.md?to=pptx"
+            .parse::<axum::http::Uri>()
+            .unwrap();
+        assert_eq!(redact_uri(&uri), "/api/v1/artifacts/a.md?to=pptx");
+
+        // No query at all.
+        let uri = "/health".parse::<axum::http::Uri>().unwrap();
+        assert_eq!(redact_uri(&uri), "/health");
+
+        // A bare flag carries no value; a value-less name is left alone.
+        let uri = "/ws?token".parse::<axum::http::Uri>().unwrap();
+        assert_eq!(redact_uri(&uri), "/ws?token");
+    }
 
     #[test]
     fn test_shared_token_matches() {
