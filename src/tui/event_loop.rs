@@ -549,25 +549,40 @@ async fn try_reconnect(
 async fn abort_or_quit(state: &Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let session = state.read().await.current_session.clone();
     let running = state.read().await.is_running;
-    if running {
-        if let Some(id) = session {
-            let _ = gw::chat_abort(ws, &id).await;
-        }
-        let mut s = state.write().await;
-        s.transcript.finish_stream(STREAM_ASSISTANT, None);
-        s.transcript.finish_stream(STREAM_THINKING, None);
-        s.transcript.push_notice("── stopped ──");
-        s.end_run();
-        // "Stop" means stop: the queued messages were lined up behind the turn
-        // that was just cancelled, and sending them now would be the opposite
-        // of what the key asked for.
-        let dropped = s.clear_queue();
-        if dropped > 0 {
-            s.transcript
-                .push_notice(format!("⚠ {dropped} queued message(s) dropped"));
-        }
-    } else {
+    if !running {
         state.write().await.should_quit = true;
+        return Ok(());
+    }
+
+    // The gateway has to hear about it. `chat.abort` only fails for transport
+    // reasons — the handler itself always reports "aborted" — so a failure
+    // means we do not know whether the turn is still running. Claiming
+    // "stopped" anyway would leave the UI asserting something we have no
+    // evidence for, while the gateway keeps generating into a transcript
+    // nobody is watching.
+    if let Some(id) = session {
+        if let Err(e) = gw::chat_abort(ws, &id).await {
+            state.write().await.transcript.push_notice(format!(
+                "✘ could not stop the run: {e} — it may still be going; press Esc or Ctrl+C again"
+            ));
+            return Ok(());
+        }
+    }
+    // No session means no turn can be running on the gateway, so there is
+    // nothing to tell it about.
+
+    let mut s = state.write().await;
+    s.transcript.finish_stream(STREAM_ASSISTANT, None);
+    s.transcript.finish_stream(STREAM_THINKING, None);
+    s.transcript.push_notice("── stopped ──");
+    s.end_run();
+    // "Stop" means stop: the queued messages were lined up behind the turn
+    // that was just cancelled, and sending them now would be the opposite of
+    // what the key asked for.
+    let dropped = s.clear_queue();
+    if dropped > 0 {
+        s.transcript
+            .push_notice(format!("⚠ {dropped} queued message(s) dropped"));
     }
     Ok(())
 }
@@ -990,7 +1005,16 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
                 }
                 s.dirty = true;
             }
-            let _ = resume::refresh_sessions(state, ws).await;
+            // The list feeds `/resume`, `/sessions` and the status row. A
+            // failed refresh leaves all three showing what the gateway knew
+            // last time, which looks exactly like a list that has not changed.
+            if let Err(e) = resume::refresh_sessions(state, ws).await {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("⚠ could not refresh the session list: {e}"));
+            }
         }
         "session.renamed" => {
             let id = payload["session_id"]
@@ -1409,21 +1433,24 @@ async fn answer_prompt_without_a_human(
                 // the question would hold the turn for its full timeout — so
                 // the turn is stopped instead.
                 let Some(answer) = ask.default.clone().filter(|d| !d.trim().is_empty()) else {
+                    // Stopping the turn is the only way to decline a question
+                    // the gateway will not accept an empty answer for.
                     let session = state.read().await.current_session.clone();
-                    if let Some(id) = session {
-                        if let Err(e) = gw::chat_abort(ws, &id).await {
-                            state
-                                .write()
-                                .await
-                                .transcript
-                                .push_notice(format!("✘ could not stop the turn: {e}"));
-                        }
-                    }
+                    let stopped = match session {
+                        Some(id) => gw::chat_abort(ws, &id).await.is_ok(),
+                        None => true,
+                    };
                     let mut s = state.write().await;
-                    s.transcript.push_notice(
+                    s.transcript.push_notice(if stopped {
                         "⚠ the agent asked a question with no default and nothing here can \
-                         answer it — the turn was stopped",
-                    );
+                         answer it — the turn was stopped"
+                    } else {
+                        "⚠ the agent asked a question with no default and nothing here can \
+                         answer it, and the turn could not be stopped — the gateway will time \
+                         it out"
+                    });
+                    // Either way the prompt goes: nothing here can answer it,
+                    // and holding it would stall the rest of the pipe.
                     s.pending_ask = None;
                     s.live_mode = LiveMode::Composer;
                     s.end_run();
@@ -2101,6 +2128,40 @@ mod tests {
         assert!(state.read().await.queued.is_empty());
     }
 
+    /// A failed abort does not claim the run stopped.
+    ///
+    /// `abort_or_quit` dropped the error and reported "── stopped ──" anyway,
+    /// so a lost `chat.abort` left the UI asserting a stop it had no evidence
+    /// for while the gateway carried on generating. The key still works: Esc
+    /// or Ctrl+C tries again.
+    #[tokio::test]
+    async fn a_failed_abort_does_not_claim_the_run_stopped() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("chat.abort", "INTERNAL");
+        let (state, client) = state_and_client(&gateway).await;
+        {
+            let mut s = state.write().await;
+            s.current_session = Some("s1".to_string());
+            s.begin_run();
+        }
+
+        abort_or_quit(&state, &client).await.expect("handled");
+
+        let mut s = state.write().await;
+        assert!(s.is_running, "the turn may still be running, and the UI says so");
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(lines.iter().any(|l| l.contains("could not stop the run")), "got {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("── stopped ──")),
+            "and it does not claim otherwise: {lines:?}"
+        );
+    }
+
     /// An abort means stop, queue included.
     #[tokio::test]
     async fn aborting_drops_the_queue() {
@@ -2402,6 +2463,42 @@ mod tests {
         let s = state.read().await;
         assert!(s.current_session.is_none(), "and it does not get adopted");
         assert!(s.transcript.preview(10).is_empty());
+    }
+
+    /// A session list that could not be refreshed says so.
+    ///
+    /// `session.created` refreshed it with `let _ =`, so a failure left
+    /// `/resume`, `/sessions` and the status row reading from a list that had
+    /// quietly stopped matching the gateway — indistinguishable from one that
+    /// simply had not changed.
+    #[tokio::test]
+    async fn a_failed_session_refresh_is_reported() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("sessions.list", "INTERNAL");
+        let (state, client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        handle_event(
+            event("session.created", serde_json::json!({ "session_id": "s1" })),
+            &state,
+            &client,
+        )
+        .await;
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("could not refresh the session list")),
+            "got {lines:?}"
+        );
     }
 
     /// Events that name no session are global, and still arrive.
