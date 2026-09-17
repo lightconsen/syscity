@@ -8,6 +8,62 @@ use super::*;
 /// quiet after this is wedged or a probe.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
+/// Sustained request rate a single connection may keep, in frames per second.
+///
+/// A WebSocket connection is one HTTP request that never finishes, so the REST
+/// rate limiter — which sees a request per connection — cannot bound what a
+/// client does *inside* one. This is the per-frame bound, and it is per
+/// connection rather than global so one busy client cannot starve the rest.
+const WS_RATE_PER_SEC: f64 = 600.0;
+
+/// How large a burst a connection may spend at once.
+const WS_RATE_BURST: f64 = 1200.0;
+
+/// Consecutive refused frames before the connection is closed.
+///
+/// A client that is merely fast backs off when it starts getting refusals; a
+/// flood keeps going, and there is nothing to keep it around for.
+const WS_RATE_STRIKES: u32 = 10;
+
+/// A per-connection token bucket over incoming request frames.
+#[derive(Debug)]
+struct FrameLimiter {
+    tokens: f64,
+    last: tokio::time::Instant,
+    /// Refused frames since the last accepted one.
+    strikes: u32,
+}
+
+impl FrameLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: WS_RATE_BURST,
+            last: tokio::time::Instant::now(),
+            strikes: 0,
+        }
+    }
+
+    /// Account for one frame. `false` means it is over budget.
+    fn allow(&mut self) -> bool {
+        self.allow_at(tokio::time::Instant::now())
+    }
+
+    /// The clock is a parameter so the bucket can be tested without sleeping.
+    fn allow_at(&mut self, now: tokio::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * WS_RATE_PER_SEC).min(WS_RATE_BURST);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            self.strikes = 0;
+            true
+        } else {
+            self.strikes += 1;
+            false
+        }
+    }
+}
+
 /// Middleware: validate WebSocket upgrade credentials before proceeding.
 ///
 /// Runs BEFORE the WebSocket upgrade. When auth_mode is not "none", rejects
@@ -598,6 +654,7 @@ async fn handle_websocket(
             return;
         }
 
+        let mut limiter = FrameLimiter::new();
         loop {
             let msg = ws_receiver.next().await;
 
@@ -610,6 +667,51 @@ async fn handle_websocket(
                 Some(Ok(Message::Text(text))) => {
                     let conn_id = conn.read().await.conn_id.clone();
                     debug!("[{}] Received: {}", conn_id, text);
+
+                    // Answered, not serviced: a client that is over its rate
+                    // still gets a correlated error frame (it is waiting on an
+                    // id), and only a client that keeps going after that is
+                    // disconnected. The first strike is a warning; the ones
+                    // after it are not, or a flood would write a log line per
+                    // frame — the amplification the limit exists to prevent.
+                    if !limiter.allow() {
+                        if limiter.strikes == 1 {
+                            warn!(
+                                "[{}] Request rate exceeded ({} frames/s sustained, {} burst); \
+                                 refusing frames",
+                                conn_id, WS_RATE_PER_SEC, WS_RATE_BURST
+                            );
+                        } else {
+                            debug!("[{}] Still over the request rate", conn_id);
+                        }
+                        if limiter.strikes >= WS_RATE_STRIKES {
+                            warn!(
+                                "[{}] {} frames refused in a row, disconnecting",
+                                conn_id, limiter.strikes
+                            );
+                            break;
+                        }
+                        let id = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+                            .unwrap_or_default();
+                        let res = WsResponse::err(
+                            id,
+                            "RATE_LIMITED",
+                            format!(
+                                "Too many requests: {} frames/s sustained, {} burst",
+                                WS_RATE_PER_SEC, WS_RATE_BURST
+                            ),
+                        );
+                        if cmd_tx
+                            .send(WsCommand::SendResponse(response_frame(&res)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
 
                     match serde_json::from_str::<WsRequest>(&text) {
                         Ok(req) => {
@@ -1288,6 +1390,57 @@ mod tests {
             0,
             "dropping the slot must release the counter"
         );
+    }
+
+    /// The bucket allows a burst, then refuses, and refills over time.
+    ///
+    /// Driven with synthetic instants so the test does not sleep 1200 frames
+    /// worth of wall clock.
+    #[test]
+    fn the_frame_limiter_bursts_then_refills() {
+        let start = tokio::time::Instant::now();
+        let mut limiter = FrameLimiter::new();
+
+        // The whole burst is available at once.
+        for i in 0..WS_RATE_BURST as usize {
+            assert!(limiter.allow_at(start), "frame {i} is within the burst");
+        }
+        assert!(!limiter.allow_at(start), "the burst is spent — the next frame is refused");
+        assert_eq!(limiter.strikes, 1);
+
+        // A second of elapsed time buys a second's worth of frames.
+        let later = start + std::time::Duration::from_secs(1);
+        let mut allowed = 0;
+        for _ in 0..WS_RATE_PER_SEC as usize {
+            if limiter.allow_at(later) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, WS_RATE_PER_SEC as usize,
+            "one second of refill is one second of budget"
+        );
+        assert!(!limiter.allow_at(later), "and no more than that");
+    }
+
+    /// A refused frame resets nothing: the strike count is what closes the
+    /// connection, and one accepted frame clears it.
+    #[test]
+    fn the_frame_limiter_counts_consecutive_refusals() {
+        let now = tokio::time::Instant::now();
+        let mut limiter = FrameLimiter::new();
+        for _ in 0..WS_RATE_BURST as usize {
+            assert!(limiter.allow_at(now));
+        }
+        for _ in 0..3 {
+            assert!(!limiter.allow_at(now));
+        }
+        assert_eq!(limiter.strikes, 3);
+
+        // An accepted frame clears the count.
+        let later = now + std::time::Duration::from_secs(1);
+        assert!(limiter.allow_at(later));
+        assert_eq!(limiter.strikes, 0);
     }
 
     /// The classification is what decides who sees an event; the exhaustive

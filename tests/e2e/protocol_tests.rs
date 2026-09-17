@@ -34,3 +34,54 @@ async fn malformed_frames_are_answered_and_keep_the_connection() {
     let health = client.request("health", json!(null)).await;
     assert_eq!(health["ok"], true, "the connection must still work: {health}");
 }
+
+/// A connection that floods is refused, and one that keeps going is hung up.
+///
+/// The REST rate limiter sees one request per WebSocket connection, so it
+/// cannot bound what a client does *inside* one; the per-frame bucket is what
+/// does. Frames are sent in bursts (a round trip per frame would refill the
+/// bucket faster than the test spends it, and prove nothing), and the refusals
+/// are answered rather than dropped — a client over its budget is still waiting
+/// on ids.
+#[tokio::test]
+#[serial]
+async fn a_flood_of_requests_is_refused() {
+    let port = free_port();
+    start_test_gateway(port, false).await;
+    let mut client = FrontendSimulator::connect(port).await;
+
+    // Burst 1200, plus a little: enough to spend it and collect the refusals.
+    let total = 1_250;
+    let batch = 250;
+    let mut refusals = 0;
+    let mut closed = false;
+    for sent in (0..total).step_by(batch) {
+        for i in sent..(sent + batch).min(total) {
+            client
+                .send_raw_frame(&format!(r#"{{"type":"req","id":"flood-{i}","method":"ping"}}"#))
+                .await;
+        }
+        for _ in sent..(sent + batch).min(total) {
+            match client.read_response().await {
+                Some(resp) => {
+                    if resp["error"]["code"] == "RATE_LIMITED" {
+                        refusals += 1;
+                    }
+                }
+                None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+
+    assert!(
+        refusals > 0,
+        "1250 requests through a 1200-frame burst must be refused at some point"
+    );
+    assert!(closed, "a client that keeps sending after the refusals is disconnected");
+}

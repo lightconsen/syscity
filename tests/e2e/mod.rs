@@ -581,6 +581,33 @@ impl FrontendSimulator {
         }
     }
 
+    /// Send a frame without waiting for its response — for tests that need a
+    /// burst rather than a round trip.
+    pub async fn send_raw_frame(&mut self, frame: &str) {
+        let _ = self.write.send(Message::Text(frame.to_string())).await;
+    }
+
+    /// Read the next `res` frame, or `None` when the connection ends.
+    pub async fn read_response(&mut self) -> Option<serde_json::Value> {
+        timeout(Duration::from_secs(5), async {
+            while let Some(msg) = self.read.next().await {
+                let Ok(msg) = msg else { return None };
+                if let Message::Text(text) = msg {
+                    if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if frame.get("type").and_then(|v| v.as_str()) == Some("res") {
+                            return Some(frame);
+                        }
+                        self.event_buffer.push_back(frame);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Send a raw text frame and read the next `res` frame.
     ///
     /// For protocol-abuse tests: the point is what the gateway sends *back* to
