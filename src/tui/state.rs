@@ -346,7 +346,10 @@ impl AppState {
     }
 
     /// Replace the input buffer and put the cursor at its end.
-    fn set_input(&mut self, text: String) {
+    ///
+    /// Public because line mode has no composer to type into: it reads a whole
+    /// line and has to place it in the buffer before submitting it.
+    pub fn set_input(&mut self, text: String) {
         self.input_buffer = text;
         self.input_cursor = self.input_buffer.len();
     }

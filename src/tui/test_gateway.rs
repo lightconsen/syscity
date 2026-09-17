@@ -1,0 +1,164 @@
+//! A minimal in-process gateway for line-mode tests.
+//!
+//! Line mode talks to a real socket, so testing it needs one. Booting the real
+//! gateway would drag in storage, providers and a port; instead this speaks
+//! just enough of the protocol — it completes the handshake, answers the
+//! handful of methods line mode calls, and hands the test both the frames the
+//! client sent and a way to push events back at it.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
+
+/// One request the client sent.
+#[derive(Debug, Clone)]
+pub struct Received {
+    /// Method name.
+    pub method: String,
+    /// Parameters, verbatim.
+    pub params: Value,
+}
+
+/// A stand-in gateway, listening on a loopback port.
+pub struct TestGateway {
+    /// The port the client should connect to.
+    pub port: u16,
+    requests: Arc<Mutex<Vec<Received>>>,
+    events: mpsc::UnboundedSender<Message>,
+    close: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl TestGateway {
+    /// Bind a port and start serving one client.
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests: Arc<Mutex<Vec<Received>>> = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Message>();
+        let (close_tx, mut close_rx) = oneshot::channel::<()>();
+        let recorder = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    _ = &mut close_rx => break,
+                    Some(message) = event_rx.recv() => {
+                        if socket.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    incoming = socket.next() => {
+                        let Some(Ok(Message::Text(text))) = incoming else {
+                            break;
+                        };
+                        let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        let method = frame["method"].as_str().unwrap_or_default().to_string();
+                        let params = frame["params"].clone();
+                        recorder
+                            .lock()
+                            .expect("request log")
+                            .push(Received { method: method.clone(), params });
+                        let reply = json!({
+                            "type": "res",
+                            "id": frame["id"].clone(),
+                            "ok": true,
+                            "payload": canned(&method),
+                        });
+                        if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            port,
+            requests,
+            events: event_tx,
+            close: Mutex::new(Some(close_tx)),
+        }
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<Received> {
+        self.requests.lock().expect("request log").clone()
+    }
+
+    /// Wait for the first request named `method`, and return its parameters.
+    ///
+    /// Panics on timeout: a test that waits for a frame the client never sent
+    /// has already failed, and saying which frame makes that readable.
+    pub async fn wait_for(&self, method: &str, timeout: Duration) -> Value {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let found = {
+                let requests = self.requests.lock().expect("request log");
+                requests
+                    .iter()
+                    .find(|r| r.method == method)
+                    .map(|r| r.params.clone())
+            };
+            if let Some(params) = found {
+                return params;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the client never sent {method}; it sent {:?}",
+                self.requests()
+                    .into_iter()
+                    .map(|r| r.method)
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Push a server event at the client.
+    pub fn push_event(&self, event: &str, payload: Value) {
+        let frame = json!({ "type": "event", "event": event, "payload": payload, "seq": 1 });
+        let _ = self.events.send(Message::Text(frame.to_string()));
+    }
+
+    /// Drop the connection, the way a gateway restart would.
+    pub async fn close(&self) {
+        if let Some(tx) = self.close.lock().expect("close slot").take() {
+            let _ = tx.send(());
+        }
+        // Give the serving task a moment to drop the socket.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The reply for a method — only the shapes the client parses.
+fn canned(method: &str) -> Value {
+    match method {
+        "connect" => json!({
+            "protocol_version": 1,
+            "session_key": "test",
+            "features": [],
+            "scopes_granted": ["chat", "read", "write"],
+            "server": { "version": "test", "conn_id": "conn-1" },
+        }),
+        "sessions.create" => json!({ "session_id": "s1" }),
+        "sessions.list" => json!({ "sessions": [] }),
+        "chat.send" => json!({ "session_id": "s1" }),
+        "chat.history" => json!({ "messages": [], "has_more": false }),
+        "commands.list" => json!({ "commands": [] }),
+        _ => json!({}),
+    }
+}

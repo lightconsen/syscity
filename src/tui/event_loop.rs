@@ -10,7 +10,7 @@
 //! flush without a following draw leaves the composer invisible.
 // INVARIANTS-NONE: event loop; state lives in `AppState`.
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -873,12 +873,45 @@ fn compact(value: &Value, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+/// Where line mode reads its lines and writes its output.
+///
+/// Injected rather than hard-wired to the process's stdio so the path can be
+/// driven from a test. Line mode had no coverage at all, which is how the line
+/// it read came to be thrown away without anyone noticing.
+pub struct PlainIo {
+    /// The command lines.
+    pub input: Box<dyn BufRead + Send>,
+    /// Everything line mode prints.
+    pub output: Box<dyn Write + Send>,
+}
+
+impl PlainIo {
+    /// The real thing: the process's stdin and stdout.
+    pub fn stdio() -> Self {
+        Self {
+            // `Stdin` is only `Read`; the buffering lives in the wrapper.
+            input: Box::new(io::BufReader::new(io::stdin())),
+            output: Box::new(io::stdout()),
+        }
+    }
+}
+
 /// Run the TUI in line mode, for a stdout that is not a terminal.
 ///
 /// No cursor addressing and no raw mode: input is read line by line, output is
 /// printed as it arrives. Enough for `echo "…" | syscity tui > out.txt`, and a
 /// safe landing spot when the terminal cannot do an inline viewport.
 pub async fn run_plain(endpoint: Endpoint, session: SessionChoice) -> Result<(), TuiError> {
+    run_plain_with(endpoint, session, PlainIo::stdio()).await
+}
+
+/// Line mode, against an injected reader and writer.
+pub async fn run_plain_with(
+    endpoint: Endpoint,
+    session: SessionChoice,
+    io: PlainIo,
+) -> Result<(), TuiError> {
+    let PlainIo { input, mut output } = io;
     let (mut ws, hello) = WsClient::connect(
         &endpoint.url,
         &endpoint.auth,
@@ -907,23 +940,23 @@ pub async fn run_plain(endpoint: Endpoint, session: SessionChoice) -> Result<(),
         Ok(resume::StartupSession::ListAndWait) => {
             if let Ok(sessions) = resume::refresh_sessions(&state, &mut ws).await {
                 for line in resume::session_lines(&sessions) {
-                    println!("{line}");
+                    let _ = writeln!(output, "{line}");
                 }
             }
         }
         Ok(resume::StartupSession::Fresh) => {}
         Err(e) => eprintln!("could not list sessions: {e}"),
     }
-    drain(&state).await;
+    drain(&state, output.as_mut()).await;
 
-    // stdin is read on a blocking thread: it is a blocking source and has no
+    // Input is read on a blocking thread: it is a blocking source and has no
     // place in the async runtime.
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
     tokio::task::spawn_blocking(move || {
-        let stdin = io::stdin();
+        let mut input = input;
         loop {
             let mut line = String::new();
-            match stdin.read_line(&mut line) {
+            match input.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     if line_tx.send(line.trim_end().to_string()).is_err() {
@@ -942,10 +975,10 @@ pub async fn run_plain(endpoint: Endpoint, session: SessionChoice) -> Result<(),
                 }
                 if line.starts_with('/') {
                     handle_slash_command(&line, Arc::clone(&state), &mut ws).await?;
-                } else if let Err(e) = send_message(&state, &mut ws).await {
+                } else if let Err(e) = submit_plain_line(&line, &state, &mut ws).await {
                     eprintln!("send failed: {e}");
                 }
-                drain(&state).await;
+                drain(&state, output.as_mut()).await;
             }
             Some(message) = ws.next() => {
                 match message {
@@ -970,25 +1003,179 @@ pub async fn run_plain(endpoint: Endpoint, session: SessionChoice) -> Result<(),
                     }
                     WsMessage::OrphanResponse(_) => {}
                 }
-                drain(&state).await;
+                drain(&state, output.as_mut()).await;
             }
         }
     }
     Ok(())
 }
 
+/// Submit one line of piped input as a chat message.
+///
+/// The line came from the reader, not from a composer, so it has to be put
+/// into the input buffer first — [`send_message`] submits what is in that
+/// buffer. Without this the line was read, checked for a leading `/`, and then
+/// silently discarded along with the whole buffer.
+async fn submit_plain_line(
+    line: &str,
+    state: &Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    state.write().await.set_input(line.to_string());
+    send_message(state, ws).await
+}
+
 /// Print everything the transcript has graduated.
-async fn drain(state: &Arc<RwLock<AppState>>) {
+async fn drain(state: &Arc<RwLock<AppState>>, out: &mut (dyn Write + Send)) {
     let lines = state.write().await.transcript.take_flushable();
     for line in lines {
-        println!("{}", line.text);
+        // A closed pipe (`| head`) is not worth reporting — the reader asked
+        // us to stop — but the transcript still has to be drained.
+        let _ = writeln!(out, "{}", line.text);
     }
-    let _ = io::stdout().flush();
+    let _ = out.flush();
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+    use crate::tui::test_gateway::TestGateway;
+
+    /// How long a test waits for a frame or an effect before calling it lost.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// An endpoint pointing at a test gateway.
+    fn test_endpoint(port: u16) -> Endpoint {
+        let auth = crate::tui::auth::AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", port, None, "tui");
+        Endpoint { url, auth, session: None }
+    }
+
+    /// Poll `check` until it holds, or fail.
+    async fn eventually(check: impl Fn() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A `Write` sink the test can read back.
+    #[derive(Clone, Default)]
+    struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedOutput {
+        fn text(&self) -> String {
+            let buf = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    }
+
+    impl Write for SharedOutput {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Line mode reading `input`, with the output captured.
+    fn plain_io(input: &str) -> (PlainIo, SharedOutput) {
+        let out = SharedOutput::default();
+        (
+            PlainIo {
+                input: Box::new(Cursor::new(input.as_bytes().to_vec())),
+                output: Box::new(out.clone()),
+            },
+            out,
+        )
+    }
+
+    /// A piped line is a message, not a no-op.
+    ///
+    /// This is the whole point of line mode: `echo hello | syscity tui` has to
+    /// send `hello`. It used to read the line, check it for a leading `/` and
+    /// throw it away, because `send_message` submits the *input buffer* and
+    /// nothing ever put the line in it.
+    #[tokio::test]
+    async fn a_piped_line_is_submitted_as_a_message() {
+        let gateway = TestGateway::start().await;
+        let (io, _out) = plain_io("hello\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        let params = gateway.wait_for("chat.send", PATIENCE).await;
+        assert_eq!(params["message"], "hello");
+        assert_eq!(params["session_id"], "s1", "the created session is used");
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// Every line of a multi-line pipe is sent, in order.
+    #[tokio::test]
+    async fn every_piped_line_is_submitted() {
+        let gateway = TestGateway::start().await;
+        let (io, _out) = plain_io("one\ntwo\nthree\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        gateway.wait_for("chat.send", PATIENCE).await;
+        eventually(
+            || {
+                gateway
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == "chat.send")
+                    .count()
+                    == 3
+            },
+            "three messages",
+        )
+        .await;
+        let sent: Vec<String> = gateway
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "chat.send")
+            .map(|r| r.params["message"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(sent, vec!["one", "two", "three"]);
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+    }
+
+    /// A blank line is not a message.
+    #[tokio::test]
+    async fn blank_piped_lines_are_ignored() {
+        let gateway = TestGateway::start().await;
+        let (io, _out) = plain_io("\n   \nhello\n");
+        let run = tokio::spawn(run_plain_with(test_endpoint(gateway.port), SessionChoice::New, io));
+
+        let params = gateway.wait_for("chat.send", PATIENCE).await;
+        assert_eq!(params["message"], "hello");
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|r| r.method == "chat.send")
+                .count(),
+            1,
+            "only the line with content is sent"
+        );
+
+        gateway.close().await;
+        run.await.expect("join").expect("line mode exits cleanly");
+    }
 
     #[test]
     fn compact_trims_long_values() {

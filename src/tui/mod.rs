@@ -20,6 +20,8 @@ mod resume;
 mod retry;
 pub mod scrollback;
 pub mod state;
+#[cfg(test)]
+mod test_gateway;
 pub mod transcript;
 pub mod ui;
 mod ws_client;
