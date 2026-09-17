@@ -19,8 +19,8 @@ pub mod ws_origin;
 /// cookies are never present when these parsers run — they are kept, and kept
 /// honest, as the forward-compat surface for a session handed over by an
 /// OAuth callback or a reverse proxy. If that day never comes, this is
-/// deletable along with `extract_session_cookie*` and their one call site in
-/// the rate limiter.
+/// deletable along with `extract_session_cookie*` — nothing calls either of
+/// them today (the rate-limiter branch that used them is gone).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCookieConfig {
     /// Cookie name

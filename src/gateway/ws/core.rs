@@ -1047,9 +1047,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_commands_execute_without_scope_forbidden() {
-        // Exercises the commands.execute scope-denied special case that tries
-        // to append a user + assistant error message pair (no store here, so
-        // the append is skipped).
+        // A scope-refused `commands.execute` is answered and nothing else
+        // happens: the frame carries the id and the session id it named goes
+        // untouched (this used to append a `/cmd` + error pair to the session
+        // history it was refused for).
         let conn = make_test_conn(&[]);
         let params = Some(serde_json::json!({ "session_id": "s1", "command": "status" }));
         let resp = dispatch(&conn, &req("r1", "commands.execute", params)).await;

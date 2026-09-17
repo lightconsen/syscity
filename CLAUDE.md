@@ -16,10 +16,21 @@
   - File/static download (`/api/v1/artifacts/*`, `/assets/*`).
   - Health/liveness/readiness probes (`/health`, `/ready`, `/live`) and
     Prometheus metrics (`/metrics`) — bare, unversioned paths by convention.
-- **Every REST endpoint MUST be authenticated.** No REST endpoint may be
-  open/unauthenticated. Register it in the authenticated router (admin tier)
-  so the auth middleware applies; keep only what the auth config allows
-  (`shared_token`, device pairing, tailscale, trusted proxy).
+- **Every REST endpoint MUST be authenticated.** No endpoint may be open.
+  Register it in the authenticated router (admin tier) so the auth middleware
+  applies; keep only what the auth config allows (`shared_token`, device
+  pairing, tailscale, trusted proxy).
+  - Two exceptions live in the *essential* tier — which carries the
+    tailscale/trusted-proxy allow-check, rate limiting and security headers,
+    but not the token middleware:
+    - `/webhooks/*` — authenticated by per-channel signature verification
+      instead of a token. Every handler fails closed when its channel's secret
+      is absent or the signature is wrong, so this is authentication by other
+      means, not an open route.
+    - `/api/v1/artifacts/*` — download path for files the gateway itself
+      produced, reachable from loopback/tailnet.
+  - `/health`, `/ready`, `/live`, `/metrics` are unauthenticated on purpose
+    (probes and scraping) and sit on the same tier.
 - **Adding a WS method:**
   1. Implement the handler in `src/gateway/ws/admin_ws.rs` (or the relevant
      `ws/` submodule).
