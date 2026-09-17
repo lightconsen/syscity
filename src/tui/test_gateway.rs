@@ -6,6 +6,7 @@
 //! handful of methods line mode calls, and hands the test both the frames the
 //! client sent and a way to push events back at it.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ pub struct TestGateway {
     events: mpsc::UnboundedSender<Message>,
     close: Mutex<Option<oneshot::Sender<()>>>,
     silent: Arc<std::sync::atomic::AtomicBool>,
+    failures: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl TestGateway {
@@ -46,6 +48,8 @@ impl TestGateway {
         let recorder = Arc::clone(&requests);
         let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mute = Arc::clone(&silent);
+        let failures: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let refusals = Arc::clone(&failures);
 
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
@@ -80,12 +84,25 @@ impl TestGateway {
                             // in flight.
                             continue;
                         }
-                        let reply = json!({
-                            "type": "res",
-                            "id": frame["id"].clone(),
-                            "ok": true,
-                            "payload": canned(&method),
-                        });
+                        let failure = refusals
+                            .lock()
+                            .expect("failure table")
+                            .get(&method)
+                            .cloned();
+                        let reply = match failure {
+                            Some(code) => json!({
+                                "type": "res",
+                                "id": frame["id"].clone(),
+                                "ok": false,
+                                "error": { "code": code, "message": format!("{method} refused") },
+                            }),
+                            None => json!({
+                                "type": "res",
+                                "id": frame["id"].clone(),
+                                "ok": true,
+                                "payload": canned(&method),
+                            }),
+                        };
                         if socket.send(Message::Text(reply.to_string())).await.is_err() {
                             break;
                         }
@@ -100,12 +117,21 @@ impl TestGateway {
             events: event_tx,
             close: Mutex::new(Some(close_tx)),
             silent,
+            failures,
         }
     }
 
     /// Record requests from here on, but never answer them.
     pub fn go_silent(&self) {
         self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make `method` answer with an error carrying `code`.
+    pub fn fail_with(&self, method: &str, code: &str) {
+        self.failures
+            .lock()
+            .expect("failure table")
+            .insert(method.to_string(), code.to_string());
     }
 
     /// Every request received so far, in order.

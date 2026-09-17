@@ -524,6 +524,20 @@ async fn handle_approval_action(
             state.write().await.should_quit = true;
             (false, false)
         }
+        // Ctrl+C gets the keyboard back. It cannot answer the approval — that
+        // is the gateway's to resolve, and a tool call blocked on a human
+        // stays blocked — but a prompt that swallows every key with no way out
+        // is a trap, and this is the key that means "stop waiting on this"
+        // everywhere else in the TUI.
+        TuiAction::Abort => {
+            let mut s = state.write().await;
+            s.pop_approval();
+            s.transcript.push_notice(
+                "⚠ approval left unanswered — the tool call stays blocked on the gateway until \
+                 it times out; another client can still answer it",
+            );
+            (false, false)
+        }
         // Everything else is swallowed: while a tool is blocked on a human,
         // typing must not go into the composer.
         _ => (false, false),
@@ -552,11 +566,26 @@ async fn handle_approval_action(
             s.pop_approval();
             s.dirty = true;
         }
-        Err(e) => {
+        // `NOT_FOUND` means the approval is gone — resolved by another client,
+        // expired, or the turn ended. Retrying cannot succeed, and the prompt
+        // owns the keyboard, so it has to go.
+        Err(TuiError::Gateway { ref code, .. }) if code == "NOT_FOUND" => {
             let mut s = state.write().await;
-            s.transcript
-                .push_notice(format!("✘ could not answer the approval: {e}"));
+            s.transcript.push_notice(format!(
+                "⚠ {} was already resolved — the {} was not recorded",
+                approval.tool_name,
+                if approve { "approval" } else { "denial" }
+            ));
             s.pop_approval();
+            s.dirty = true;
+        }
+        // Anything else may pass on a second try, and the tool call is still
+        // blocked on this prompt: dropping it would leave the human with no
+        // way to unblock anything.
+        Err(e) => {
+            state.write().await.transcript.push_notice(format!(
+                "✘ could not answer the approval: {e} — y or n tries again, Ctrl+C dismisses"
+            ));
         }
     }
     Ok(())
@@ -1329,6 +1358,124 @@ mod tests {
 
         state.write().await.should_quit = true;
         driver.await.expect("join").expect("the loop exits");
+    }
+
+    /// A pending approval, on a connection to `gateway`.
+    async fn state_with_approval(gateway: &TestGateway) -> (Arc<RwLock<AppState>>, WsClient) {
+        let auth = crate::tui::auth::AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        let (client, _hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+
+        let state = Arc::new(RwLock::new(AppState::default()));
+        {
+            let mut s = state.write().await;
+            s.approvals.push_back(ApprovalDetail {
+                id: "ap1".to_string(),
+                tool_name: "file_write".to_string(),
+                risk_level: "High".to_string(),
+                ..Default::default()
+            });
+            s.live_mode = LiveMode::Approval;
+        }
+        (state, client)
+    }
+
+    /// A decision the gateway refuses is not a decision.
+    ///
+    /// Both arms used to `pop_approval()`. On the error path that retired the
+    /// prompt while the approval was still pending server-side and the tool
+    /// call was still blocked — so the UI had thrown away the only thing that
+    /// could unblock it, and the human's "yes" was never recorded anywhere.
+    #[tokio::test]
+    async fn a_refused_decision_keeps_the_prompt() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("approvals.approve", "INTERNAL");
+        let (state, mut client) = state_with_approval(&gateway).await;
+
+        handle_approval_action(TuiAction::InputChar('y'), &state, &mut client)
+            .await
+            .expect("handled");
+
+        let mut s = state.write().await;
+        assert_eq!(s.approvals.len(), 1, "the approval is still waiting for an answer");
+        assert_eq!(s.live_mode, LiveMode::Approval);
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("could not answer")),
+            "and it says so: {lines:?}"
+        );
+    }
+
+    /// An approval that is already gone retires its prompt.
+    ///
+    /// `NOT_FOUND` means another client answered it, or it expired, or the turn
+    /// ended. Retrying cannot succeed, and the prompt owns the keyboard, so
+    /// keeping it would be a trap.
+    #[tokio::test]
+    async fn a_decision_for_a_resolved_approval_retires_the_prompt() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("approvals.approve", "NOT_FOUND");
+        let (state, mut client) = state_with_approval(&gateway).await;
+
+        handle_approval_action(TuiAction::InputChar('y'), &state, &mut client)
+            .await
+            .expect("handled");
+
+        let mut s = state.write().await;
+        assert!(s.approvals.is_empty(), "the prompt goes");
+        assert_eq!(s.live_mode, LiveMode::Composer, "the composer comes back");
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("already resolved")),
+            "and it says why: {lines:?}"
+        );
+    }
+
+    /// Ctrl+C is never swallowed by the prompt.
+    ///
+    /// A tool call blocked on a human stays blocked however the human feels
+    /// about it, but the prompt must not be able to keep the keyboard forever.
+    #[tokio::test]
+    async fn ctrl_c_dismisses_the_prompt_without_answering_it() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_with_approval(&gateway).await;
+
+        handle_approval_action(TuiAction::Abort, &state, &mut client)
+            .await
+            .expect("handled");
+
+        let mut s = state.write().await;
+        assert!(s.approvals.is_empty());
+        assert_eq!(s.live_mode, LiveMode::Composer);
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("stays blocked")),
+            "dismissing is not answering, and it says so: {lines:?}"
+        );
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|r| r.method.starts_with("approvals.")),
+            "no decision was sent"
+        );
     }
 
     #[test]
