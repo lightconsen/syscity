@@ -140,6 +140,30 @@ pub async fn ws_auth_middleware(
     }
 }
 
+/// Whether the "a client used `?token=`" warning has been logged already.
+static QUERY_TOKEN_WARNING_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say once that a client is still putting the long-lived credential in the
+/// upgrade URL.
+///
+/// `?token=` is still accepted, for a client that cannot fetch a ticket first —
+/// but a URL is the credential in a place that outlives the request (devtools,
+/// proxy logs, anything that copies it), and the ticket flow exists for exactly
+/// that. Once per process: this fires on every reconnect of an un-migrated
+/// client, and a warning per connection is noise an operator learns to ignore.
+/// What is worth knowing is that *something* still does it.
+fn warn_query_token_once() {
+    if !QUERY_TOKEN_WARNING_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            "A client authenticated with `?token=` in the WebSocket URL. The token is \
+             long-lived and the URL outlives the request (devtools, proxy logs, anything that \
+             copies it) — exchange it for a single-use ticket at POST /api/v1/ws-ticket and \
+             connect with `?ticket=`. Logged once per process."
+        );
+    }
+}
+
 /// One decoded query parameter from the upgrade URL, if present.
 fn query_param(uri: &axum::http::Uri, name: &str) -> Option<String> {
     let prefix = format!("{name}=");
@@ -213,6 +237,7 @@ async fn validate_ws_upgrade_request(
         // Check query parameter token
         if let Some(qt) = query_token {
             if qt == shared_token {
+                warn_query_token_once();
                 return Ok(WsAuthResult {
                     user_id: UserId::new("shared"),
                     scopes: config.security.shared_token_scopes.clone(),
