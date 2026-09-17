@@ -20,7 +20,7 @@ use crate::tui::ws_client::WsClient;
 /// Refresh the session list held in state and return it.
 pub async fn refresh_sessions(
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<Vec<SessionInfo>, TuiError> {
     let sessions = gw::sessions_list(ws).await?;
     state.write().await.sessions = sessions.clone();
@@ -43,7 +43,7 @@ pub enum StartupSession {
 pub async fn resolve_startup_session(
     choice: &SessionChoice,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<StartupSession, TuiError> {
     match choice {
         SessionChoice::New => Ok(StartupSession::Fresh),
@@ -98,7 +98,7 @@ pub fn pick_session<'a>(sessions: &'a [SessionInfo], arg: &str) -> Option<&'a Se
 pub async fn switch_to(
     id: &str,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let previous = { state.read().await.current_session.clone() };
     if let Some(previous) = previous.filter(|p| p != id) {
@@ -153,7 +153,7 @@ pub async fn switch_to(
 pub async fn command_resume(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let sessions = refresh_sessions(&state, ws).await?;
     let arg = args.trim();

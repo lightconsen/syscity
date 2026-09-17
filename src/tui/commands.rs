@@ -47,7 +47,7 @@ pub fn is_local_command(name: &str) -> bool {
 pub async fn handle_slash_command(
     line: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let Some((name, args)) = parse_slash_command(line) else {
         state
@@ -69,7 +69,7 @@ async fn handle_local_command(
     name: &str,
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     match name {
         "new" => command_new(args, state, ws).await,
@@ -106,7 +106,7 @@ async fn handle_local_command(
 async fn command_new(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let agent = (!args.trim().is_empty()).then(|| args.trim().to_string());
     let session_id = gw::sessions_create(ws, agent.as_deref()).await?;
@@ -145,7 +145,7 @@ async fn command_new(
 ///
 /// Scrollback belongs to the terminal and cannot be unprinted; saying so is
 /// better than leaving the user to wonder why the old text is still there.
-async fn command_clear(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_clear(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let session = state.read().await.current_session.clone();
     match session {
         Some(id) => {
@@ -167,7 +167,7 @@ async fn command_clear(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resul
 }
 
 /// `/help` — print the keybindings and the command catalog.
-async fn command_help(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_help(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let catalog = gw::commands_list(ws).await.unwrap_or_default();
     let mut s = state.write().await;
     if !catalog.is_empty() {
@@ -244,7 +244,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
 }
 
 /// `/status` — gateway presence and connection details.
-async fn command_status(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_status(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let value = ws.request("system.presence", None).await?;
     let mut s = state.write().await;
     s.transcript
@@ -266,7 +266,7 @@ const HISTORY_DEFAULT: usize = 200;
 async fn command_history(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let requested = args.trim();
     let limit = if requested.is_empty() {
@@ -312,7 +312,7 @@ async fn command_history(
 }
 
 /// `/tools` — the gateway's command catalog.
-async fn command_tools(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_tools(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let catalog = gw::commands_list(ws).await?;
     let count = catalog.len();
     let mut s = state.write().await;
@@ -326,7 +326,7 @@ async fn command_tools(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resul
 async fn command_model(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let model = args.trim();
     if model.is_empty() {
@@ -348,7 +348,7 @@ async fn command_model(
 }
 
 /// `/sessions` — list the sessions the gateway knows.
-async fn command_sessions(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_sessions(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let sessions = crate::tui::resume::refresh_sessions(&state, ws).await?;
     let mut s = state.write().await;
     if sessions.is_empty() {
@@ -367,7 +367,7 @@ async fn command_sessions(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Re
 async fn command_rename(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let name = args.trim();
     let session = state.read().await.current_session.clone();
@@ -397,7 +397,7 @@ async fn command_rename(
 }
 
 /// `/pin` — pin or unpin the current session.
-async fn command_pin(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_pin(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let current = {
         let s = state.read().await;
         s.current_session.clone().map(|id| {
@@ -433,7 +433,7 @@ async fn command_pin(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<
 }
 
 /// `/agents` — list the agents the gateway knows.
-async fn command_agents(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn command_agents(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let agents = gw::agents_registry(ws).await?;
     let mut s = state.write().await;
     let usable: Vec<_> = agents.iter().filter(|a| a.is_valid).collect();
@@ -456,7 +456,7 @@ async fn command_agents(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resu
 async fn command_agent(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let id = args.trim();
     if id.is_empty() {
@@ -474,7 +474,7 @@ async fn command_agent(
 async fn command_answer(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let text = args.trim();
     let ask = state.read().await.pending_ask.clone();
@@ -506,7 +506,7 @@ async fn command_answer(
 async fn command_config(
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let mut parts = args.splitn(3, char::is_whitespace);
     let verb = parts.next().unwrap_or("");
@@ -544,10 +544,7 @@ async fn command_config(
 }
 
 /// `/config` — print the effective configuration.
-async fn command_config_show(
-    state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
-) -> Result<(), TuiError> {
+async fn command_config_show(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let value = gw::config_get(ws).await?;
     let mut lines = vec![TranscriptLine::new(LineKind::Notice, "configuration")];
     lines.extend(config_lines(&value));
@@ -629,7 +626,7 @@ async fn execute_remote_command(
     name: &str,
     args: &str,
     state: Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let session = state.read().await.current_session.clone();
     let mut params = serde_json::json!({ "command": name, "args": args });
@@ -711,7 +708,7 @@ mod tests {
                 .collect(),
         );
 
-        command_history("", Arc::clone(&state), &mut client)
+        command_history("", Arc::clone(&state), &client)
             .await
             .expect("history");
 
@@ -765,7 +762,7 @@ mod tests {
         let (state, mut client) = connect(&gateway).await;
         state.write().await.current_session = Some("s1".to_string());
 
-        command_history("banana", Arc::clone(&state), &mut client)
+        command_history("banana", Arc::clone(&state), &client)
             .await
             .expect("handled");
 
@@ -786,7 +783,7 @@ mod tests {
         let gateway = TestGateway::start().await;
         let (state, mut client) = connect(&gateway).await;
 
-        command_history("", Arc::clone(&state), &mut client)
+        command_history("", Arc::clone(&state), &client)
             .await
             .expect("handled");
 

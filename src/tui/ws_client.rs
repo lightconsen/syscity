@@ -7,7 +7,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
@@ -106,9 +106,18 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<ClientResponse>>>>;
 
 /// WebSocket client connected to a Syscity gateway.
+///
+/// Every method takes `&self`, so one client can serve the event loop and the
+/// handlers it spawns at the same time. That is what lets a command run off
+/// the loop without the loop losing its connection: requests are independent
+/// (each carries its own id and its own waiter), and the socket is fed by a
+/// channel, so the only thing that needs a lock is the receive side.
 pub struct WsClient {
     /// Channel of incoming messages (events + orphan responses).
-    event_rx: mpsc::UnboundedReceiver<WsMessage>,
+    ///
+    /// Behind a mutex purely so `next` can take `&self`; only the loop reads
+    /// it, so it is never contended.
+    event_rx: AsyncMutex<mpsc::UnboundedReceiver<WsMessage>>,
     /// Sender half for outgoing messages.
     write_tx: mpsc::UnboundedSender<Message>,
     /// Pending response waiters.
@@ -142,8 +151,8 @@ impl WsClient {
 
         tokio::spawn(ws_driver(ws_stream, write_rx, event_tx, Arc::clone(&pending), stop_rx));
 
-        let mut client = Self {
-            event_rx,
+        let client = Self {
+            event_rx: AsyncMutex::new(event_rx),
             write_tx,
             pending,
             _stop_tx: stop_tx,
@@ -166,11 +175,11 @@ impl WsClient {
     }
 
     /// Send a request and await the matching response.
-    pub async fn request(
-        &mut self,
-        method: &str,
-        params: Option<Value>,
-    ) -> Result<Value, TuiError> {
+    ///
+    /// `&self`, not `&mut self`: concurrent callers are the point — each
+    /// request carries its own id and its own waiter, and the socket is fed by
+    /// a channel, so nothing here races.
+    pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, TuiError> {
         let id = format!("tui_{}", Uuid::new_v4());
         let request = ClientRequest {
             frame_type: "req",
@@ -247,8 +256,8 @@ impl WsClient {
     }
 
     /// Receive the next message, if any.
-    pub async fn next(&mut self) -> Option<WsMessage> {
-        self.event_rx.recv().await
+    pub async fn next(&self) -> Option<WsMessage> {
+        self.event_rx.lock().await.recv().await
     }
 }
 
@@ -379,6 +388,16 @@ mod tests {
     use super::*;
     use crate::tui::test_gateway::TestGateway;
 
+    /// A client on the test gateway.
+    async fn connect(gateway: &TestGateway) -> WsClient {
+        let auth = AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        let (client, _hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+        client
+    }
+
     /// Connecting subscribes to nothing of its own.
     ///
     /// The gateway seeds the connection's subscriptions from the `session_id`
@@ -463,6 +482,41 @@ mod tests {
             "it must not sit out the {}s request timeout: took {elapsed:?}",
             REQUEST_TIMEOUT.as_secs()
         );
+    }
+
+    /// One client serves concurrent callers.
+    ///
+    /// `request` took `&mut self`, which is what forced every call to happen
+    /// inside the event loop: the client could not be in two places at once,
+    /// so a command holding it froze the loop. Each request carries its own id
+    /// and its own waiter and the socket is fed by a channel, so it can.
+    #[tokio::test]
+    async fn the_client_serves_concurrent_requests() {
+        let gateway = TestGateway::start().await;
+        let client = Arc::new(connect(&gateway).await);
+
+        // Park one request on the wire...
+        gateway.hold("sessions.list");
+        let parked = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.request("sessions.list", None).await })
+        };
+        gateway
+            .wait_for("sessions.list", std::time::Duration::from_secs(5))
+            .await;
+
+        // ...and a second still goes out and comes back behind it.
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.request("agents.registry", None),
+        )
+        .await;
+        assert!(
+            answered.is_ok(),
+            "the second request queued behind the first instead of running alongside it"
+        );
+
+        parked.abort();
     }
 
     #[test]

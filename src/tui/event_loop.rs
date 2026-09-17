@@ -263,7 +263,7 @@ where
 async fn handle_action(
     action: TuiAction,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let mode = state.read().await.live_mode;
     match mode {
@@ -453,7 +453,7 @@ async fn try_reconnect(
 }
 
 /// Abort the running turn, or quit when idle.
-async fn abort_or_quit(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn abort_or_quit(state: &Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let session = state.read().await.current_session.clone();
     let running = state.read().await.is_running;
     if running {
@@ -480,7 +480,7 @@ async fn abort_or_quit(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resu
 }
 
 /// Submit whatever is in the input buffer.
-async fn send_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Result<(), TuiError> {
+async fn send_message(state: &Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let text = {
         let s = state.read().await;
         s.input_buffer.trim().to_string()
@@ -527,7 +527,7 @@ async fn send_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resul
 async fn submit_message(
     text: String,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
     echo_user: bool,
 ) -> Result<(), TuiError> {
     // A session is created lazily, on the first message — the gateway picks
@@ -574,7 +574,7 @@ async fn submit_message(
 ///
 /// Called when a turn ends, which is the only moment the queue may move: the
 /// point of queueing is that a second turn does not run alongside the first.
-async fn start_queued_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) {
+async fn start_queued_message(state: &Arc<RwLock<AppState>>, ws: &WsClient) {
     loop {
         // Scoped: the guard must not be alive across the await below.
         let next = { state.write().await.pop_queued() };
@@ -599,7 +599,7 @@ async fn start_queued_message(state: &Arc<RwLock<AppState>>, ws: &mut WsClient) 
 async fn handle_approval_action(
     action: TuiAction,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let (approve, decide) = match action {
         // `y`/Enter approve, `n`/Esc deny; arrows move the highlight.
@@ -708,7 +708,7 @@ fn resolve_ask_answer(ask: &AskPrompt, typed: &str) -> Option<String> {
 async fn handle_ask_action(
     action: TuiAction,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     let (submit, dismiss) = match action {
         TuiAction::SendMessage => (true, false),
@@ -784,11 +784,7 @@ async fn handle_ask_action(
 }
 
 /// Route one gateway message.
-async fn handle_gateway_message(
-    message: WsMessage,
-    state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
-) {
+async fn handle_gateway_message(message: WsMessage, state: &Arc<RwLock<AppState>>, ws: &WsClient) {
     match message {
         WsMessage::Event(event) => handle_event(event, state, ws).await,
         WsMessage::OrphanResponse(response) => {
@@ -807,7 +803,7 @@ async fn handle_gateway_message(
 }
 
 /// Apply one server event to the state.
-async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &mut WsClient) {
+async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &WsClient) {
     let Some(payload) = event.payload else {
         return;
     };
@@ -1078,7 +1074,7 @@ pub async fn run_plain_with(
     io: PlainIo,
 ) -> Result<(), TuiError> {
     let PlainIo { input, mut output, interactive } = io;
-    let (mut ws, hello) =
+    let (ws, hello) =
         WsClient::connect(&endpoint.url, &endpoint.auth, &["chat", "read", "write"]).await?;
 
     let state = Arc::new(RwLock::new(AppState::default()));
@@ -1092,14 +1088,14 @@ pub async fn run_plain_with(
         s.current_session = endpoint.session.clone();
     }
 
-    match resume::resolve_startup_session(&session, &state, &mut ws).await {
+    match resume::resolve_startup_session(&session, &state, &ws).await {
         Ok(resume::StartupSession::Use(id)) => {
-            if let Err(e) = resume::switch_to(&id, &state, &mut ws).await {
+            if let Err(e) = resume::switch_to(&id, &state, &ws).await {
                 eprintln!("could not resume {id}: {e}");
             }
         }
         Ok(resume::StartupSession::ListAndWait) => {
-            if let Ok(sessions) = resume::refresh_sessions(&state, &mut ws).await {
+            if let Ok(sessions) = resume::refresh_sessions(&state, &ws).await {
                 for line in resume::session_lines(&sessions) {
                     let _ = writeln!(output, "{line}");
                 }
@@ -1132,7 +1128,7 @@ pub async fn run_plain_with(
         tokio::select! {
             Some(line) = line_rx.recv() => {
                 if interactive && state.read().await.live_mode != LiveMode::Composer {
-                    answer_prompt_from_line(&line, &state, &mut ws).await?;
+                    answer_prompt_from_line(&line, &state, &ws).await?;
                 } else if line.trim().is_empty() {
                     continue;
                 } else if line.starts_with('/') {
@@ -1140,11 +1136,11 @@ pub async fn run_plain_with(
                     // the pipe: a script feeding several lines should get the
                     // rest of them run.
                     if let Err(e) =
-                        handle_slash_command(&line, Arc::clone(&state), &mut ws).await
+                        handle_slash_command(&line, Arc::clone(&state), &ws).await
                     {
                         absorb_action_error(e, &state).await?;
                     }
-                } else if let Err(e) = submit_plain_line(&line, &state, &mut ws).await {
+                } else if let Err(e) = submit_plain_line(&line, &state, &ws).await {
                     // A send failure is not a line of transcript: it goes to
                     // stderr so the pipe's stdout stays the conversation.
                     if e.is_fatal() {
@@ -1166,7 +1162,7 @@ pub async fn run_plain_with(
                         // straight to stdout came out twice: once as they
                         // arrived, and again when `chat.final` re-stated the
                         // whole turn.
-                        handle_event(event, &state, &mut ws).await;
+                        handle_event(event, &state, &ws).await;
                     }
                     WsMessage::OrphanResponse(_) => {}
                 }
@@ -1174,7 +1170,7 @@ pub async fn run_plain_with(
                 // waiting for a line that a pipe will never send would park the
                 // whole pipe on the gateway's timeout.
                 if !interactive {
-                    answer_prompt_without_a_human(&state, &mut ws).await?;
+                    answer_prompt_without_a_human(&state, &ws).await?;
                 }
                 drain(&state, output.as_mut()).await;
             }
@@ -1190,7 +1186,7 @@ pub async fn run_plain_with(
 async fn answer_prompt_from_line(
     line: &str,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     // Bound first: a `match` on a temporary guard keeps it alive for the whole
     // block, and the arms below take the write lock.
@@ -1281,7 +1277,7 @@ async fn answer_prompt_from_line(
 /// here instead — immediately, and out loud.
 async fn answer_prompt_without_a_human(
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     loop {
         // Same reason as above: the guard must not outlive this line.
@@ -1366,7 +1362,7 @@ async fn answer_prompt_without_a_human(
 async fn submit_plain_line(
     line: &str,
     state: &Arc<RwLock<AppState>>,
-    ws: &mut WsClient,
+    ws: &WsClient,
 ) -> Result<(), TuiError> {
     state.write().await.set_input(line.to_string());
     send_message(state, ws).await
@@ -1747,7 +1743,7 @@ mod tests {
         gateway.fail_with("approvals.approve", "INTERNAL");
         let (state, mut client) = state_with_approval(&gateway).await;
 
-        handle_approval_action(TuiAction::InputChar('y'), &state, &mut client)
+        handle_approval_action(TuiAction::InputChar('y'), &state, &client)
             .await
             .expect("handled");
 
@@ -1777,7 +1773,7 @@ mod tests {
         gateway.fail_with("approvals.approve", "NOT_FOUND");
         let (state, mut client) = state_with_approval(&gateway).await;
 
-        handle_approval_action(TuiAction::InputChar('y'), &state, &mut client)
+        handle_approval_action(TuiAction::InputChar('y'), &state, &client)
             .await
             .expect("handled");
 
@@ -1805,7 +1801,7 @@ mod tests {
         let gateway = TestGateway::start().await;
         let (state, mut client) = state_with_approval(&gateway).await;
 
-        handle_approval_action(TuiAction::Abort, &state, &mut client)
+        handle_approval_action(TuiAction::Abort, &state, &client)
             .await
             .expect("handled");
 
@@ -1842,10 +1838,9 @@ mod tests {
         gateway.fail_with("system.presence", "INTERNAL");
         let (state, mut client) = state_and_client(&gateway).await;
 
-        let err =
-            handle_action(TuiAction::RunSlashCommand("/status".to_string()), &state, &mut client)
-                .await
-                .expect_err("the command itself failed");
+        let err = handle_action(TuiAction::RunSlashCommand("/status".to_string()), &state, &client)
+            .await
+            .expect_err("the command itself failed");
         assert!(!err.is_fatal(), "and the failure is survivable: {err:?}");
 
         absorb_action_error(err, &state)
@@ -2072,7 +2067,7 @@ mod tests {
         state.write().await.current_session = Some("s1".to_string());
 
         handle_event(ask_event(Some("main")), &state, &mut client).await;
-        answer_prompt_without_a_human(&state, &mut client)
+        answer_prompt_without_a_human(&state, &client)
             .await
             .expect("settled");
 
@@ -2097,7 +2092,7 @@ mod tests {
         }
 
         handle_event(ask_event(None), &state, &mut client).await;
-        answer_prompt_without_a_human(&state, &mut client)
+        answer_prompt_without_a_human(&state, &client)
             .await
             .expect("settled");
 
@@ -2120,7 +2115,7 @@ mod tests {
         state.write().await.current_session = Some("s1".to_string());
 
         handle_event(approval_event(), &state, &mut client).await;
-        answer_prompt_from_line("y", &state, &mut client)
+        answer_prompt_from_line("y", &state, &client)
             .await
             .expect("answered");
 
@@ -2139,7 +2134,7 @@ mod tests {
         state.write().await.current_session = Some("s1".to_string());
 
         handle_event(approval_event(), &state, &mut client).await;
-        answer_prompt_from_line("maybe", &state, &mut client)
+        answer_prompt_from_line("maybe", &state, &client)
             .await
             .expect("handled");
 

@@ -196,16 +196,13 @@ pub fn parse_commands(value: &Value) -> Vec<crate::tui::state::CommandInfo> {
 // ── Calls ──────────────────────────────────────────────────────────────────
 
 /// List sessions.
-pub async fn sessions_list(ws: &mut WsClient) -> Result<Vec<SessionInfo>, TuiError> {
+pub async fn sessions_list(ws: &WsClient) -> Result<Vec<SessionInfo>, TuiError> {
     let value = ws.request("sessions.list", None).await?;
     Ok(parse_sessions(&value))
 }
 
 /// Create a session, optionally bound to an agent, returning its id.
-pub async fn sessions_create(
-    ws: &mut WsClient,
-    agent_id: Option<&str>,
-) -> Result<String, TuiError> {
+pub async fn sessions_create(ws: &WsClient, agent_id: Option<&str>) -> Result<String, TuiError> {
     let params = match agent_id {
         Some(id) => json!({ "agent_id": id }),
         None => json!({}),
@@ -221,39 +218,35 @@ pub async fn sessions_create(
 ///
 /// A connection with no subscriptions receives *every* session's deltas, so
 /// switching sessions must also unsubscribe from the previous one.
-pub async fn sessions_subscribe(ws: &mut WsClient, session_id: &str) -> Result<(), TuiError> {
+pub async fn sessions_subscribe(ws: &WsClient, session_id: &str) -> Result<(), TuiError> {
     ws.request("sessions.subscribe", Some(json!({ "session_ids": [session_id] })))
         .await
         .map(|_| ())
 }
 
 /// Stop receiving a session's events.
-pub async fn sessions_unsubscribe(ws: &mut WsClient, session_id: &str) -> Result<(), TuiError> {
+pub async fn sessions_unsubscribe(ws: &WsClient, session_id: &str) -> Result<(), TuiError> {
     ws.request("sessions.unsubscribe", Some(json!({ "session_ids": [session_id] })))
         .await
         .map(|_| ())
 }
 
 /// Rename a session.
-pub async fn sessions_rename(ws: &mut WsClient, id: &str, name: &str) -> Result<(), TuiError> {
+pub async fn sessions_rename(ws: &WsClient, id: &str, name: &str) -> Result<(), TuiError> {
     ws.request("sessions.rename", Some(json!({ "session_id": id, "name": name })))
         .await
         .map(|_| ())
 }
 
 /// Pin or unpin a session.
-pub async fn sessions_set_pinned(
-    ws: &mut WsClient,
-    id: &str,
-    pinned: bool,
-) -> Result<(), TuiError> {
+pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))
         .await
         .map(|_| ())
 }
 
 /// Clear a session's context (this is what `/clear` means).
-pub async fn sessions_reset(ws: &mut WsClient, id: &str) -> Result<(), TuiError> {
+pub async fn sessions_reset(ws: &WsClient, id: &str) -> Result<(), TuiError> {
     ws.request("sessions.reset", Some(json!({ "session_id": id })))
         .await
         .map(|_| ())
@@ -268,7 +261,7 @@ pub async fn sessions_reset(ws: &mut WsClient, id: &str) -> Result<(), TuiError>
 /// `has_more`: true whenever the window came back full, which is a page-size
 /// heuristic rather than a count of what is left.
 pub async fn chat_history(
-    ws: &mut WsClient,
+    ws: &WsClient,
     session_id: &str,
     limit: usize,
 ) -> Result<(Vec<HistoryMessage>, bool), TuiError> {
@@ -280,7 +273,7 @@ pub async fn chat_history(
 
 /// Send a message, returning the session the gateway routed it to.
 pub async fn chat_send(
-    ws: &mut WsClient,
+    ws: &WsClient,
     session_id: &str,
     message: &str,
 ) -> Result<ChatSendResult, TuiError> {
@@ -297,7 +290,7 @@ pub async fn chat_send(
 }
 
 /// Abort the in-flight turn for a session.
-pub async fn chat_abort(ws: &mut WsClient, session_id: &str) -> Result<(), TuiError> {
+pub async fn chat_abort(ws: &WsClient, session_id: &str) -> Result<(), TuiError> {
     ws.request("chat.abort", Some(json!({ "session_id": session_id })))
         .await
         .map(|_| ())
@@ -305,7 +298,7 @@ pub async fn chat_abort(ws: &mut WsClient, session_id: &str) -> Result<(), TuiEr
 
 /// Look up a pending approval — the event that announces one carries no
 /// arguments, so this is how the prompt learns what it is asking about.
-pub async fn approvals_get(ws: &mut WsClient, id: &str) -> Result<ApprovalDetail, TuiError> {
+pub async fn approvals_get(ws: &WsClient, id: &str) -> Result<ApprovalDetail, TuiError> {
     let value = ws
         .request("approvals.get", Some(json!({ "id": id })))
         .await?;
@@ -314,7 +307,7 @@ pub async fn approvals_get(ws: &mut WsClient, id: &str) -> Result<ApprovalDetail
 
 /// Answer a pending approval.
 pub async fn approvals_decide(
-    ws: &mut WsClient,
+    ws: &WsClient,
     id: &str,
     approve: bool,
     reason: Option<&str>,
@@ -331,20 +324,20 @@ pub async fn approvals_decide(
 }
 
 /// Answer an `ask_user` question.
-pub async fn ask_respond(ws: &mut WsClient, ask_id: &str, response: &str) -> Result<(), TuiError> {
+pub async fn ask_respond(ws: &WsClient, ask_id: &str, response: &str) -> Result<(), TuiError> {
     ws.request("ask.respond", Some(json!({ "ask_id": ask_id, "response": response })))
         .await
         .map(|_| ())
 }
 
 /// Read the whole configuration (`config.get` takes no parameters).
-pub async fn config_get(ws: &mut WsClient) -> Result<Value, TuiError> {
+pub async fn config_get(ws: &WsClient) -> Result<Value, TuiError> {
     ws.request("config.get", None).await
 }
 
 /// Write one configuration value.
 pub async fn config_set(
-    ws: &mut WsClient,
+    ws: &WsClient,
     path: &str,
     value: Value,
     base_revision: Option<&str>,
@@ -357,15 +350,13 @@ pub async fn config_set(
 }
 
 /// List agents.
-pub async fn agents_registry(ws: &mut WsClient) -> Result<Vec<AgentInfo>, TuiError> {
+pub async fn agents_registry(ws: &WsClient) -> Result<Vec<AgentInfo>, TuiError> {
     let value = ws.request("agents.registry", None).await?;
     Ok(parse_agents(&value))
 }
 
 /// List the gateway's command catalog.
-pub async fn commands_list(
-    ws: &mut WsClient,
-) -> Result<Vec<crate::tui::state::CommandInfo>, TuiError> {
+pub async fn commands_list(ws: &WsClient) -> Result<Vec<crate::tui::state::CommandInfo>, TuiError> {
     let value = ws
         .request("commands.list", Some(json!({ "tier": "power" })))
         .await?;
