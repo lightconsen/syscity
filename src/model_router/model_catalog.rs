@@ -170,24 +170,25 @@ impl ModelDiscoverySource for StaticModelSource {
 fn apply_known_model_metadata(mut entry: ModelCatalogEntry, model_id: &str) -> ModelCatalogEntry {
     let id_lower = model_id.to_lowercase();
 
-    if id_lower.contains("claude-4-opus")
-        || id_lower.contains("claude-4-sonnet")
-        || id_lower.contains("claude-4-haiku")
-        || id_lower.contains("claude-3-opus")
-        || id_lower.contains("claude-3-5-sonnet")
-        || id_lower.contains("claude-3.5-sonnet")
-    {
+    // Family match, not version match. The list this replaced enumerated
+    // shapes like `claude-3-5-sonnet` and `claude-4-sonnet`, so it had already
+    // stopped recognising the model the shipped Anthropic preset ships
+    // (`claude-sonnet-4-6` — the version sits in the middle) and would have
+    // missed every later id too. What is true of a family stays true across its
+    // generations: Claude models take images, call tools, and read 200k tokens.
+    let is_claude = id_lower.starts_with("claude")
+        && ["opus", "sonnet", "haiku"]
+            .iter()
+            .any(|family| id_lower.contains(family));
+    if is_claude {
         entry.context_window = Some(200_000);
         entry.supports_vision = true;
         entry.supports_tools = true;
         entry.supports_reasoning = true;
         entry.input_modalities = vec!["text".to_string(), "image".to_string()];
         entry.capabilities = vec!["long_context".to_string(), "vision".to_string()];
-    } else if id_lower.contains("claude-3-haiku") {
-        entry.context_window = Some(200_000);
-        entry.supports_vision = true;
-        entry.supports_tools = true;
-        entry.input_modalities = vec!["text".to_string(), "image".to_string()];
+    // (The `claude-3-haiku` branch that used to sit here is subsumed by the
+    // family match above: any Claude model with `haiku` in the id takes it.)
     } else if id_lower.contains("gpt-4o") || id_lower.contains("gpt-4-turbo") {
         entry.context_window = Some(128_000);
         entry.supports_vision = true;
@@ -429,6 +430,41 @@ impl ModelCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Capability inference must not be keyed on a version.
+    ///
+    /// The list this replaced enumerated shapes like `claude-3-5-sonnet` and
+    /// `claude-4-sonnet`, which meant it did not recognise the model the
+    /// shipped Anthropic preset ships (`claude-sonnet-4-6` — version in the
+    /// middle) and would not have recognised the default either.
+    #[test]
+    fn claude_families_are_recognised_whatever_the_version_shape() {
+        for id in [
+            crate::providers::DEFAULT_MODEL,
+            "claude-sonnet-4-6",
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-5",
+            "claude-haiku-4-5",
+        ] {
+            let entry = apply_known_model_metadata(ModelCatalogEntry::new(id, id, "anthropic"), id);
+            assert_eq!(
+                entry.context_window,
+                Some(200_000),
+                "{id} should be known as a Claude-family model"
+            );
+            assert!(entry.supports_vision, "{id} should be known to take images");
+            assert!(entry.supports_tools, "{id} should be known to call tools");
+        }
+
+        // A non-Claude id is still left alone.
+        let other = apply_known_model_metadata(
+            ModelCatalogEntry::new("gpt-4o", "GPT-4o", "openai"),
+            "gpt-4o",
+        );
+        assert!(
+            other.capabilities.is_empty() || !other.capabilities.contains(&"vision".to_string())
+        );
+    }
 
     #[test]
     fn test_entry_builder() {

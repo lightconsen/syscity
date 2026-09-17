@@ -97,37 +97,46 @@ struct DeprecationRule {
     pattern: &'static str,
     /// Human-readable reason for deprecation
     reason: &'static str,
-    /// Suggested migration action
-    migration: &'static str,
+    /// Suggested migration action. Owned because the suggestion names the
+    /// current default (`providers::DEFAULT_MODEL`), which must not be
+    /// duplicated here as a literal that goes stale.
+    migration: String,
 }
 
-static DEPRECATION_RULES: &[DeprecationRule] = &[
-    DeprecationRule {
-        pattern: "gpt-3.5-turbo",
-        reason: "OpenAI GPT-3.5 Turbo is deprecated",
-        migration: "Switch to 'gpt-4o-mini' for better cost and performance",
-    },
-    DeprecationRule {
-        pattern: "gpt-3.5",
-        reason: "OpenAI GPT-3.5 family is deprecated",
-        migration: "Switch to 'gpt-4o-mini' for better cost and performance",
-    },
-    DeprecationRule {
-        pattern: "claude-2",
-        reason: "Anthropic Claude 2 is deprecated",
-        migration: "Switch to 'claude-3-5-sonnet' for better performance",
-    },
-    DeprecationRule {
-        pattern: "text-davinci",
-        reason: "OpenAI Davinci models are deprecated",
-        migration: "Switch to GPT-4o or GPT-4o-mini",
-    },
-    DeprecationRule {
-        pattern: "code-davinci",
-        reason: "OpenAI Codex models are deprecated",
-        migration: "Switch to GPT-4o with coding tasks",
-    },
-];
+/// Deprecated models and what to move to.
+///
+/// A function rather than a `static`: the migration text embeds the current
+/// default model, and a literal here would be one more place to keep in step.
+fn deprecation_rules() -> Vec<DeprecationRule> {
+    let current = crate::providers::DEFAULT_MODEL.to_string();
+    vec![
+        DeprecationRule {
+            pattern: "gpt-3.5-turbo",
+            reason: "OpenAI GPT-3.5 Turbo is deprecated",
+            migration: "Switch to 'gpt-4o-mini' for better cost and performance".to_string(),
+        },
+        DeprecationRule {
+            pattern: "gpt-3.5",
+            reason: "OpenAI GPT-3.5 family is deprecated",
+            migration: "Switch to 'gpt-4o-mini' for better cost and performance".to_string(),
+        },
+        DeprecationRule {
+            pattern: "claude-2",
+            reason: "Anthropic Claude 2 is deprecated",
+            migration: format!("Switch to '{current}' for better performance"),
+        },
+        DeprecationRule {
+            pattern: "text-davinci",
+            reason: "OpenAI Davinci models are deprecated",
+            migration: "Switch to GPT-4o or GPT-4o-mini".to_string(),
+        },
+        DeprecationRule {
+            pattern: "code-davinci",
+            reason: "OpenAI Codex models are deprecated",
+            migration: "Switch to GPT-4o with coding tasks".to_string(),
+        },
+    ]
+}
 
 /// Extension point for plugin-provided diagnostics.
 pub trait DoctorPlugin: Send + Sync {
@@ -360,7 +369,7 @@ async fn run_diagnostics(filter_provider: Option<&str>, verbose: bool) -> Result
                 for model in models {
                     let model_id = model.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let provider = model.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-                    for rule in DEPRECATION_RULES {
+                    for rule in deprecation_rules() {
                         if model_id.contains(rule.pattern) || provider.contains(rule.pattern) {
                             let msg = format!(
                                 "{} (model: {}, provider: {})",
@@ -600,5 +609,27 @@ fn print_report(report: &DoctorReport, verbose: bool) {
             println!("  {}. {}", i + 1, rec);
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deprecation hint names the model the project actually recommends
+    /// now — it used to name `claude-3-5-sonnet`, which was older than the
+    /// provider's own default.
+    #[test]
+    fn the_claude_2_migration_names_the_current_default() {
+        let rule = deprecation_rules()
+            .into_iter()
+            .find(|r| r.pattern == "claude-2")
+            .expect("claude-2 is on the deprecation list");
+        assert!(
+            rule.migration.contains(crate::providers::DEFAULT_MODEL),
+            "hint should name {}: {}",
+            crate::providers::DEFAULT_MODEL,
+            rule.migration
+        );
     }
 }

@@ -521,6 +521,26 @@ impl ProviderRegistry {
     }
 }
 
+/// The model used when nobody has chosen one.
+///
+/// **This is the single place that answers "which model does a fresh install
+/// use".** It used to be answered separately in five places — the gateway
+/// config default, the Anthropic provider's built-in default, the provider
+/// preset list, the `config.toml` template the daemon writes, and the migration
+/// hint `syscity doctor` prints — with three different generations between
+/// them, so "the default" depended on which layer you asked and the runtime
+/// default was the oldest of them.
+///
+/// Everything that needs a fallback reads this; nothing carries its own string.
+/// A user's configuration wins over it everywhere: this is only what applies
+/// when no `model` is configured (`config.toml` → top-level `model`), no agent
+/// override is set, and no session pins one.
+pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
+
+/// The provider [`DEFAULT_MODEL`] belongs to, used with it when a caller needs
+/// both and the user has configured neither.
+pub const DEFAULT_MODEL_PROVIDER: &str = "anthropic";
+
 pub mod anthropic;
 pub mod fallback;
 pub mod gemini;

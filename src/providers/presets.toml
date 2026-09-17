@@ -96,7 +96,7 @@ display_name = "Anthropic"
 [[anthropic.variants]]
 protocol = "anthropic"
 default_base_url = "https://api.anthropic.com"
-default_model = "claude-sonnet-4-6"
+default_model = "claude-sonnet-5"
 auth_method = "api_key_header"
 models_endpoint = "/v1/models"
 default_max_context = 200000

@@ -280,7 +280,7 @@ impl AnthropicProvider {
 
         Ok(Self {
             base_url: "https://api.anthropic.com".to_string(),
-            default_model: "claude-3-5-sonnet-20241022".to_string(),
+            default_model: crate::providers::DEFAULT_MODEL.to_string(),
             gateway_client,
             stream_family_override: None,
             max_context: 0,

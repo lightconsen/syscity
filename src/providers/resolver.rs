@@ -240,7 +240,10 @@ mod tests {
     fn test_resolve_anthropic_preset() {
         let provider =
             resolve_provider("anthropic", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "claude-sonnet-4-6");
+        // Asserted against the constant, not a literal: the Anthropic preset
+        // ships the project's default model, and a literal here is one more
+        // place that goes stale when it moves.
+        assert_eq!(provider.default_model(), crate::providers::DEFAULT_MODEL);
     }
 
     #[test]

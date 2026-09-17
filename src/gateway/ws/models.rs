@@ -740,13 +740,14 @@ mod tests {
         assert_eq!(models[0]["has_api_key"].as_bool(), Some(true));
         assert_eq!(models[0]["api_key_masked"].as_str(), Some("tes••••-key"));
         assert_eq!(models[0]["base_url"], serde_json::Value::Null);
-        // Default model is the configured default (not auto-promoted).
+        // Default model is the configured default (not auto-promoted). Named
+        // through the constant so this test does not pin a generation.
         let default = res
             .payload
             .as_ref()
             .and_then(|p| p["default_model"].as_str())
             .unwrap_or_default();
-        assert_eq!(default, "claude-3-sonnet-20240229");
+        assert_eq!(default, crate::providers::DEFAULT_MODEL);
     }
 
     #[tokio::test]

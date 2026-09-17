@@ -735,12 +735,16 @@ impl Default for SearchConfig {
     }
 }
 
+/// The model a gateway uses when the configuration does not name one.
+///
+/// Delegates to [`crate::providers::DEFAULT_MODEL`] so there is one answer to
+/// "what does a fresh install run" — see that constant.
 fn default_model() -> String {
-    "claude-3-sonnet-20240229".to_string()
+    crate::providers::DEFAULT_MODEL.to_string()
 }
 
 fn default_model_provider() -> String {
-    "anthropic".to_string()
+    crate::providers::DEFAULT_MODEL_PROVIDER.to_string()
 }
 
 /// Embedding provider type

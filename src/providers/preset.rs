@@ -101,7 +101,7 @@ fn fallback_providers() -> HashMap<&'static str, ProviderDefinition> {
             variants: vec![ProtocolVariant {
                 protocol: Protocol::Anthropic,
                 default_base_url: "https://api.anthropic.com".into(),
-                default_model: "claude-sonnet-4-6".into(),
+                default_model: crate::providers::DEFAULT_MODEL.into(),
                 auth_method: AuthMethod::ApiKeyHeader,
                 models_endpoint: Some("/v1/models".into()),
                 default_max_context: 200_000,
@@ -117,6 +117,39 @@ fn fallback_providers() -> HashMap<&'static str, ProviderDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The provider list is embedded data, so it cannot reference
+    /// [`DEFAULT_MODEL`] — this is what keeps it in step with the constant
+    /// instead of drifting a generation behind, as it had.
+    #[test]
+    fn the_anthropic_preset_ships_the_default_model() {
+        let providers = builtin_providers();
+        let anthropic = providers.get("anthropic").expect("anthropic preset");
+        let variant = anthropic
+            .variants
+            .iter()
+            .find(|v| v.protocol == Protocol::Anthropic)
+            .expect("anthropic variant");
+        assert_eq!(variant.default_model, crate::providers::DEFAULT_MODEL);
+    }
+
+    /// One place answers "which model does a fresh install use": the config
+    /// default, the provider's built-in default, and the preset all read the
+    /// same constant. They disagreed before — three generations between them.
+    #[test]
+    fn the_default_model_has_one_source() {
+        let config = crate::gateway::GatewayConfig::default();
+        assert_eq!(config.model, crate::providers::DEFAULT_MODEL);
+        assert_eq!(config.model_provider, crate::providers::DEFAULT_MODEL_PROVIDER);
+
+        // The provider's own built-in default (`AnthropicProvider::new`, no
+        // preset involved) is the same value.
+        let provider = crate::providers::AnthropicProvider::new("sk-test").unwrap();
+        assert_eq!(
+            crate::providers::Provider::default_model(&provider),
+            crate::providers::DEFAULT_MODEL
+        );
+    }
 
     #[test]
     fn test_builtin_providers_contains_expected() {

@@ -55,8 +55,11 @@ host = "127.0.0.1"
 port = 18080
 
 # ── Model ─────────────────────────────────────────────────────────────
-model = "claude-3-sonnet-20240229"
-model_provider = "anthropic"
+# Uncomment to pin one. Left out on purpose: an unconfigured gateway uses the
+# built-in default (`providers::DEFAULT_MODEL`), so this file is not a second
+# place that has to be kept in step with it.
+# model = "claude-sonnet-5"
+# model_provider = "anthropic"
 
 # ── Workspace ─────────────────────────────────────────────────────────
 # Restrict file operations to this directory. Without `workspace_dir` the
@@ -125,8 +128,11 @@ mod default_config_tests {
         // rather than landing in a table the schema never reads.
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 18080);
-        assert_eq!(config.model, "claude-3-sonnet-20240229");
-        assert_eq!(config.model_provider, "anthropic");
+        // The template deliberately does not pin a model: the built-in default
+        // applies until the user writes one, and that default lives in exactly
+        // one place (`providers::DEFAULT_MODEL`).
+        assert_eq!(config.model, crate::providers::DEFAULT_MODEL);
+        assert_eq!(config.model_provider, crate::providers::DEFAULT_MODEL_PROVIDER);
         assert!(config.workspace_only);
         assert_eq!(config.storage.storage_type, "sqlite");
         assert!(config.security.enabled);
