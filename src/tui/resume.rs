@@ -126,7 +126,7 @@ pub async fn switch_to(
             if has_more {
                 lines.push(crate::tui::transcript::TranscriptLine::new(
                     LineKind::Notice,
-                    "… (older messages omitted)",
+                    "… older messages omitted — /history prints more",
                 ));
             }
             lines.extend(blocks::history_lines(&messages));

@@ -37,6 +37,7 @@ pub struct TestGateway {
     silent: Arc<std::sync::atomic::AtomicBool>,
     failures: Arc<Mutex<HashMap<String, String>>>,
     upgrade_headers: Arc<Mutex<Vec<(String, String)>>>,
+    history: Arc<Mutex<Vec<Value>>>,
 }
 
 impl TestGateway {
@@ -54,6 +55,8 @@ impl TestGateway {
         let refusals = Arc::clone(&failures);
         let upgrade_headers: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let header_sink = Arc::clone(&upgrade_headers);
+        let history: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let stored = Arc::clone(&history);
 
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
@@ -93,7 +96,10 @@ impl TestGateway {
                         recorder
                             .lock()
                             .expect("request log")
-                            .push(Received { method: method.clone(), params });
+                            .push(Received {
+                                method: method.clone(),
+                                params: params.clone(),
+                            });
                         if mute.load(std::sync::atomic::Ordering::SeqCst) {
                             // Recorded, deliberately unanswered: a request left
                             // in flight.
@@ -115,7 +121,7 @@ impl TestGateway {
                                 "type": "res",
                                 "id": frame["id"].clone(),
                                 "ok": true,
-                                "payload": canned(&method),
+                                "payload": payload_for(&method, &params, &stored),
                             }),
                         };
                         if socket.send(Message::Text(reply.to_string())).await.is_err() {
@@ -134,7 +140,13 @@ impl TestGateway {
             silent,
             failures,
             upgrade_headers,
+            history,
         }
+    }
+
+    /// Serve these messages from `chat.history`, oldest first.
+    pub fn with_history(&self, messages: Vec<Value>) {
+        *self.history.lock().expect("history") = messages;
     }
 
     /// One header of the WebSocket upgrade request, lower-cased.
@@ -207,6 +219,39 @@ impl TestGateway {
         }
         // Give the serving task a moment to drop the socket.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The history reply, following the same contract as the real store: the
+/// newest `limit` messages strictly older than `before`, in reading order.
+fn history_page(stored: &Arc<Mutex<Vec<Value>>>, params: &Value, limit: usize) -> Value {
+    let before = params["before"].as_i64();
+    let mut eligible: Vec<Value> = stored
+        .lock()
+        .expect("history")
+        .iter()
+        .filter(|m| before.is_none_or(|b| m["timestamp"].as_i64().unwrap_or(0) < b))
+        .cloned()
+        .collect();
+    let has_more = eligible.len() > limit;
+    if has_more {
+        let excess = eligible.len() - limit;
+        eligible.drain(..excess);
+    }
+    json!({
+        "session_id": params["session_id"].clone(),
+        "messages": eligible,
+        "has_more": has_more,
+    })
+}
+
+/// The reply for a method — only the shapes the client parses.
+fn payload_for(method: &str, params: &Value, stored: &Arc<Mutex<Vec<Value>>>) -> Value {
+    match method {
+        "chat.history" => {
+            history_page(stored, params, params["limit"].as_u64().unwrap_or(100) as usize)
+        }
+        _ => canned(method),
     }
 }
 

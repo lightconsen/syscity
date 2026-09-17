@@ -259,7 +259,14 @@ pub async fn sessions_reset(ws: &mut WsClient, id: &str) -> Result<(), TuiError>
         .map(|_| ())
 }
 
-/// Load a session's message history.
+/// Load a session's message history, oldest first, up to `limit` messages.
+///
+/// The gateway's `limit` is not capped — `chat.history` answers with the
+/// newest `limit` messages — so one request is a whole window and there is
+/// nothing to page. (Its `before` cursor exists, but is for a caller that
+/// wants to walk backwards itself.) The second return value is the gateway's
+/// `has_more`: true whenever the window came back full, which is a page-size
+/// heuristic rather than a count of what is left.
 pub async fn chat_history(
     ws: &mut WsClient,
     session_id: &str,
@@ -368,6 +375,31 @@ pub async fn commands_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_gateway::TestGateway;
+
+    /// A client talking to the test gateway.
+    async fn connect(gateway: &TestGateway) -> WsClient {
+        let auth = crate::tui::auth::AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        let (client, _hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+        client
+    }
+
+    /// `n` scripted messages, oldest first, one second apart.
+    fn scripted(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({
+                    "id": format!("msg_{i}"),
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message {i}"),
+                    "timestamp": 1_757_000_000_000_i64 + (i as i64 * 1000),
+                })
+            })
+            .collect()
+    }
 
     /// The payloads below are copied from the gateway handlers, so a shape
     /// change on either side shows up as a failing test rather than as an
@@ -481,6 +513,54 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "status");
         assert!(!commands[0].local);
+    }
+
+    /// A window longer than one turn comes back whole, in reading order.
+    ///
+    /// `switch_to` asked for 100 and printed them, and nothing could ask for
+    /// more — so anything past a hundred messages was unreadable from the TUI.
+    #[tokio::test]
+    async fn a_history_window_is_the_newest_n_in_reading_order() {
+        let gateway = TestGateway::start().await;
+        let mut client = connect(&gateway).await;
+        gateway.with_history(scripted(500));
+
+        let (messages, has_more) = chat_history(&mut client, "s1", 300).await.expect("history");
+
+        assert_eq!(messages.len(), 300);
+        assert!(has_more, "a full window may have older messages behind it");
+        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        let expected: Vec<String> = (200..500).map(|i| format!("message {i}")).collect();
+        assert_eq!(contents, expected, "reading order, oldest first");
+    }
+
+    /// Asking for more than there is returns everything and says so.
+    #[tokio::test]
+    async fn a_history_window_short_of_the_limit_reports_the_end() {
+        let gateway = TestGateway::start().await;
+        let mut client = connect(&gateway).await;
+        gateway.with_history(scripted(30));
+
+        let (messages, has_more) = chat_history(&mut client, "s1", 2000)
+            .await
+            .expect("history");
+
+        assert_eq!(messages.len(), 30);
+        assert!(!has_more, "the whole conversation fits");
+        assert_eq!(messages[0].content, "message 0");
+        assert_eq!(messages[29].content, "message 29");
+    }
+
+    /// Nothing stored is not an error, and not an endless loop.
+    #[tokio::test]
+    async fn an_empty_history_terminates() {
+        let gateway = TestGateway::start().await;
+        let mut client = connect(&gateway).await;
+
+        let (messages, has_more) = chat_history(&mut client, "s1", 500).await.expect("history");
+
+        assert!(messages.is_empty());
+        assert!(!has_more);
     }
 
     #[test]

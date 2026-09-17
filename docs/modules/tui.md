@@ -78,6 +78,7 @@ side, which is what makes the terminal's own scroll and selection work.
 | `/new [agent]` | Start a new session, optionally bound to an agent |
 | `/resume [n\|id]` | List sessions, or switch to one |
 | `/sessions` | List sessions |
+| `/history [n]` | Reprint this conversation, oldest first (default 200, max 2000) |
 | `/rename <name>` | Rename the current session |
 | `/pin` | Pin or unpin the current session |
 | `/agents` | List agents |
@@ -97,8 +98,9 @@ Commands the TUI does not implement are forwarded to the gateway
 
 `Enter` send · `Shift+Enter` newline · `Up`/`Down` input history (or move within
 a multiline input) · `Tab`/`Shift+Tab` cycle `/command` completions · `Esc`
-dismiss a prompt, else stop the running turn · `Ctrl+C` abort, or quit when idle
-· `Ctrl+H` help · `Ctrl+E` config · `Ctrl+R` resume · `Ctrl+Q` quit.
+dismiss a prompt, else stop the running turn (and drop its queue) · `Ctrl+C`
+abort, quit when idle, or dismiss an approval prompt · `Ctrl+H` help · `Ctrl+E`
+config · `Ctrl+R` resume · `Ctrl+Q` quit.
 
 While an approval or question prompt is up, typing goes to the prompt rather
 than the composer.
@@ -155,6 +157,10 @@ offered here.
 - No markdown rendering: only fenced code blocks are styled; headings, tables
   and lists appear as their source text.
 - Tool output is truncated (6–8 lines with an ellipsis), not collapsible.
+- Resuming reprints the last 100 messages. The scrollback is append-only and
+  top-anchored, so older messages cannot be spliced in above what is already
+  printed — `/history [n]` reprints a longer window (up to 2000) in reading
+  order below a rule instead.
 - `/clear` resets the conversation context; it cannot unprint what the terminal
   has already scrolled past, and it says so.
 - Frozen lines are wrapped at the width they were written with. Resizing the

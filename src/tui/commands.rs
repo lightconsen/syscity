@@ -20,8 +20,8 @@ use crate::tui::ws_client::WsClient;
 
 /// Commands implemented inside the TUI.
 pub const LOCAL_COMMANDS: &[&str] = &[
-    "new", "clear", "quit", "exit", "help", "config", "status", "tools", "model", "sessions",
-    "resume", "rename", "pin", "agents", "agent", "answer",
+    "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
+    "sessions", "resume", "rename", "pin", "agents", "agent", "answer",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -84,6 +84,7 @@ async fn handle_local_command(
         "tools" => command_tools(state, ws).await,
         "model" => command_model(args, state, ws).await,
         "sessions" => command_sessions(state, ws).await,
+        "history" => command_history(args, state, ws).await,
         "resume" => crate::tui::resume::command_resume(args, state, ws).await,
         "rename" => command_rename(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
@@ -196,6 +197,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("clear", "", "clear the conversation context"),
         ("resume", "[n|id]", "list sessions, or switch to one"),
         ("sessions", "", "list sessions"),
+        ("history", "[n]", "print more of this conversation"),
         ("rename", "<name>", "rename the current session"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
@@ -229,6 +231,65 @@ async fn command_status(state: Arc<RwLock<AppState>>, ws: &mut WsClient) -> Resu
     let mut s = state.write().await;
     s.transcript
         .push_notice(format!("gateway: {}", serde_json::to_string(&value).unwrap_or_default()));
+    Ok(())
+}
+
+/// The most history `/history` will print in one go.
+const HISTORY_MAX: usize = 2000;
+/// What `/history` prints with no argument.
+const HISTORY_DEFAULT: usize = 200;
+
+/// `/history [n]` — print this conversation again, oldest first.
+///
+/// The scrollback is append-only and top-anchored: there is nowhere to put
+/// messages older than what is already printed, so "load more" reprints the
+/// window in reading order under a rule rather than splicing it into the
+/// middle of the transcript.
+async fn command_history(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &mut WsClient,
+) -> Result<(), TuiError> {
+    let requested = args.trim();
+    let limit = if requested.is_empty() {
+        HISTORY_DEFAULT
+    } else {
+        match requested.parse::<usize>() {
+            Ok(n) if n > 0 => n.min(HISTORY_MAX),
+            _ => {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("⚠ usage: /history [1-{HISTORY_MAX}]"));
+                return Ok(());
+            }
+        }
+    };
+
+    let Some(session) = state.read().await.current_session.clone() else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session yet — send a message first");
+        return Ok(());
+    };
+
+    let (messages, has_more) = gw::chat_history(ws, &session, limit).await?;
+    let mut lines = vec![blocks::rule(&format!(
+        "history: {} message(s)",
+        messages.len()
+    ))];
+    if has_more {
+        // Older than the window, so it goes above the messages below.
+        lines.push(TranscriptLine::new(
+            LineKind::Notice,
+            format!("… older messages omitted — /history {HISTORY_MAX} asks for more"),
+        ));
+    }
+    lines.extend(blocks::history_lines(&messages));
+    state.write().await.transcript.push(lines);
     Ok(())
 }
 
@@ -587,6 +648,101 @@ async fn execute_remote_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_gateway::TestGateway;
+
+    /// A state and client on the test gateway.
+    async fn connect(gateway: &TestGateway) -> (Arc<RwLock<AppState>>, WsClient) {
+        let auth = crate::tui::auth::AuthConfig::None;
+        let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
+        let (client, _hello) = WsClient::connect(&url, &auth, &["chat"])
+            .await
+            .expect("connect");
+        (Arc::new(RwLock::new(AppState::default())), client)
+    }
+
+    /// The output lines a command queued.
+    async fn output(state: &Arc<RwLock<AppState>>) -> Vec<String> {
+        state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect()
+    }
+
+    /// `/history` prints the conversation, oldest first, under a rule.
+    #[tokio::test]
+    async fn history_prints_the_conversation_in_order() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+        gateway.with_history(
+            (0..5)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("msg_{i}"),
+                        "role": "user",
+                        "content": format!("message {i}"),
+                        "timestamp": 1_757_000_000_000_i64 + i * 1000,
+                    })
+                })
+                .collect(),
+        );
+
+        command_history("", Arc::clone(&state), &mut client)
+            .await
+            .expect("history");
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("history: 5 message(s)"), "got {lines:?}");
+        let positions: Vec<usize> = (0..5)
+            .map(|i| {
+                lines
+                    .iter()
+                    .position(|l| l.ends_with(&format!("message {i}")))
+                    .unwrap_or_else(|| panic!("message {i} is missing from {lines:?}"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "oldest first: {positions:?}");
+    }
+
+    /// An unreadable count is a usage error, not a gateway call.
+    #[tokio::test]
+    async fn history_rejects_a_count_it_cannot_read() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        command_history("banana", Arc::clone(&state), &mut client)
+            .await
+            .expect("handled");
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("usage: /history"), "got {lines:?}");
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|r| r.method == "chat.history"),
+            "nothing was asked of the gateway"
+        );
+    }
+
+    /// `/history` with no session says so rather than asking about nothing.
+    #[tokio::test]
+    async fn history_needs_a_session() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = connect(&gateway).await;
+
+        command_history("", Arc::clone(&state), &mut client)
+            .await
+            .expect("handled");
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("no session"), "got {lines:?}");
+    }
 
     #[test]
     fn parses_commands_with_and_without_arguments() {
