@@ -774,6 +774,17 @@ impl ToolRegistry {
         result
     }
 
+    /// Whether the blocked-prefix policy refuses this tool name.
+    ///
+    /// [`has`](Self::has) and [`list`](Self::list) fold this together with
+    /// degradation and registration, which is what availability wants. A caller
+    /// that executes a tool the registry does not dispatch — and so cannot run
+    /// it through [`execute_call`](Self::execute_call) — still needs to be able
+    /// to ask this question on its own.
+    pub fn is_name_blocked(&self, name: &str) -> bool {
+        self.is_blocked(name)
+    }
+
     /// Check if a tool exists, is not blocked, and is not degraded.
     /// Checks both static and dynamic registries.
     pub fn has(&self, name: &str) -> bool {

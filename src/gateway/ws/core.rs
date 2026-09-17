@@ -769,7 +769,7 @@ async fn dispatch_method(
         "models.set_default" => models::handle_models_set_default(req, state).await,
         "mcp.list" => mcp_ws::handle_mcp_list(req, state).await,
         "mcp.tools" => admin_ws::handle_mcp_tools(req, state).await,
-        "mcp.call_tool" => admin_ws::handle_mcp_call_tool(req, state).await,
+        "mcp.call_tool" => admin_ws::handle_mcp_call_tool(req, state, &ctx).await,
         "mcp.resources" => admin_ws::handle_mcp_resources(req, state).await,
         "mcp.auth_status" => admin_ws::handle_mcp_auth_status(req, state).await,
         "mcp.presets" => mcp_ws::handle_mcp_presets(req, state).await,

@@ -428,3 +428,114 @@ async fn security_status_returns_summary() {
     assert!(payload["auth_mode"].is_string());
     assert!(payload["gate_levels"].is_number());
 }
+
+// ── mcp.call_tool ───────────────────────────────────────────────────────
+
+/// A stand-in for a tool the MCP subsystem registers, so these tests need no
+/// live server: what is under test is which path the handler takes.
+struct StubMcpTool {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for StubMcpTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "stub mcp tool"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> crate::Result<crate::tools::ToolExecutionResult> {
+        Ok(crate::tools::ToolExecutionResult::success("stub ran")
+            .with_data(serde_json::json!({ "echo": true })))
+    }
+}
+
+fn operator_ctx() -> crate::security::request_context::RequestContext {
+    crate::security::request_context::RequestContext::from_identity(
+        None,
+        crate::security::request_context::AuthSource::None,
+    )
+}
+
+/// A registered MCP tool is executed through the registry, not handed straight
+/// to the MCP client: blocked prefixes, policy hooks and the content filter all
+/// live in the registry, and skipping it meant that being able to *list* a tool
+/// was enough to run it.
+#[tokio::test]
+async fn mcp_call_tool_goes_through_the_registry() {
+    let state = state().await;
+    state.tools.registry.register_dynamic(Arc::new(StubMcpTool {
+        name: "mcp__echo__ping".to_string(),
+    }));
+
+    let resp = handle_mcp_call_tool(
+        &req(
+            "r1",
+            "mcp.call_tool",
+            Some(serde_json::json!({ "server_id": "echo", "tool": "ping", "args": {} })),
+        ),
+        &state,
+        &operator_ctx(),
+    )
+    .await;
+
+    // No MCP server called `echo` is connected here, so a handler that went to
+    // the manager instead of the registry would answer NOT_FOUND.
+    assert!(resp.ok, "registered tool should run: {:?}", resp.error);
+    assert_eq!(resp.payload.as_ref().unwrap()["result"]["echo"], true);
+}
+
+/// A blocked name is refused even with no registry entry to dispatch through —
+/// the fallback used to call the server regardless.
+#[tokio::test]
+async fn mcp_call_tool_refuses_a_blocked_tool() {
+    let state = state().await;
+    state.tools.registry.register_dynamic(Arc::new(StubMcpTool {
+        name: "mcp__echo__ping".to_string(),
+    }));
+    // What a disconnect does: the prefix becomes blocked and its tools go away.
+    state.tools.registry.deregister_prefix("mcp__echo__");
+
+    let resp = handle_mcp_call_tool(
+        &req(
+            "r1",
+            "mcp.call_tool",
+            Some(serde_json::json!({ "server_id": "echo", "tool": "ping" })),
+        ),
+        &state,
+        &operator_ctx(),
+    )
+    .await;
+
+    assert!(!resp.ok);
+    assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn mcp_call_tool_unknown_server_not_found() {
+    let state = state().await;
+    let resp = handle_mcp_call_tool(
+        &req(
+            "r1",
+            "mcp.call_tool",
+            Some(serde_json::json!({ "server_id": "nope", "tool": "t" })),
+        ),
+        &state,
+        &operator_ctx(),
+    )
+    .await;
+
+    assert!(!resp.ok);
+    assert_eq!(resp.error.as_ref().unwrap().code, "NOT_FOUND");
+}
