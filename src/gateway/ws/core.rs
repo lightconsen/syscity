@@ -386,11 +386,16 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         // device in.
         E::DevicePairRequested { .. } => Audience::Pairing,
 
+        // ── An approval belongs to the conversation that raised it ──────────
+        // The blocked turn is there, so that is where the prompt goes. One
+        // with no conversation (a context that never named one) still
+        // broadcasts, the way every approval did before the field existed.
+        E::ApprovalRequired { session_id: Some(sid), .. } => session(sid),
+
         // ── Operator-level facts the UI renders ─────────────────────────────
-        // Deliberate, not accidental: these have no session to key on (the
-        // approval event carries no session id) and every client that shows
-        // them is the operator's own.
-        E::ApprovalRequired { .. }
+        // Deliberate, not accidental: these have no session to key on and
+        // every client that shows them is the operator's own.
+        E::ApprovalRequired { session_id: None, .. }
         | E::AgentStatus { .. }
         | E::ChannelStatus { .. }
         | E::CronAnnounce { .. }
@@ -1589,6 +1594,27 @@ mod tests {
                 display_name: None,
             }),
             Audience::Pairing
+        );
+
+        // An approval goes to the conversation whose turn is blocked on it;
+        // one raised outside any conversation still broadcasts.
+        let approval = |session_id: Option<String>| E::ApprovalRequired {
+            approval_id: "ap1".into(),
+            tool_name: "shell".into(),
+            requested_by: "secretary".into(),
+            risk_level: crate::tools::approval::RiskLevel::High,
+            message: "m".into(),
+            session_id,
+        };
+        assert_eq!(
+            audience_of(&approval(Some("s1".into()))),
+            Audience::Session("s1".to_string()),
+            "the prompt belongs where the blocked turn is"
+        );
+        assert_eq!(
+            audience_of(&approval(None)),
+            Audience::All,
+            "no conversation named: the old broadcast behavior"
         );
 
         // Operator-level facts the UI renders stay broadcast.

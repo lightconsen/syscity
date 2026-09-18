@@ -89,6 +89,10 @@ pub struct PendingApproval {
     pub approval_level: ApprovalLevel,
     /// Human-readable message explaining the request
     pub message: String,
+    /// The conversation the tool call belongs to, when known — the gateway
+    /// routes the announcement to that session's subscribers. `None` (or an
+    /// empty conversation id, e.g. a context with no conversation) broadcasts.
+    pub session_id: Option<String>,
     /// Channel to send resolution back to suspended execution
     pub(crate) response_tx: Option<oneshot::Sender<ApprovalDecision>>,
 }
@@ -112,6 +116,7 @@ impl PendingApproval {
             risk_level: RiskLevel::Medium,
             approval_level: ApprovalLevel::Ask,
             message: String::new(),
+            session_id: None,
             response_tx: None,
         }
     }
@@ -140,6 +145,13 @@ impl PendingApproval {
         self
     }
 
+    /// Set the owning conversation; an empty id means "no conversation" and
+    /// is stored as `None`.
+    pub fn with_session(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id.filter(|s| !s.is_empty());
+        self
+    }
+
     /// Age of this approval request
     pub fn age(&self) -> Duration {
         self.requested_at.elapsed()
@@ -157,6 +169,9 @@ pub struct PendingApprovalSummary {
     pub risk_level: RiskLevel,
     pub approval_level: ApprovalLevel,
     pub message: String,
+    /// The conversation that raised it, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub age_seconds: u64,
 }
 
@@ -172,6 +187,7 @@ impl From<&PendingApproval> for PendingApprovalSummary {
             risk_level: pa.risk_level,
             approval_level: pa.approval_level,
             message: pa.message.clone(),
+            session_id: pa.session_id.clone(),
             age_seconds: pa.age().as_secs(),
         }
     }
@@ -186,6 +202,9 @@ pub struct ApprovalRequiredEvent {
     pub risk_level: RiskLevel,
     pub approval_level: ApprovalLevel,
     pub message: String,
+    /// The conversation that raised it; `None` reaches every client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Filter for listing pending approvals
@@ -235,6 +254,7 @@ impl ApprovalQueue {
             risk_level: approval.risk_level,
             approval_level: approval.approval_level,
             message: approval.message.clone(),
+            session_id: approval.session_id.clone(),
         };
 
         {
@@ -711,6 +731,7 @@ mod tests {
             risk_level: RiskLevel::High,
             approval_level: ApprovalLevel::Ask,
             message: "Approve?".to_string(),
+            session_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("aid"));
@@ -740,5 +761,37 @@ mod tests {
 
         let decision = rx.await.unwrap();
         assert_eq!(decision, ApprovalDecision::Approve);
+    }
+
+    /// The session an approval was raised in rides along on the announcement:
+    /// it is what lets the gateway route the event to that conversation's
+    /// subscribers instead of every connected client.
+    #[tokio::test]
+    async fn the_announcement_carries_the_session() {
+        let queue = ApprovalQueue::new();
+        let mut events = queue.event_tx.subscribe();
+
+        queue
+            .submit(
+                PendingApproval::new("s1a", "tool", serde_json::json!({}), "user")
+                    .with_session(Some("sess-9".to_string())),
+            )
+            .await;
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.session_id.as_deref(), Some("sess-9"));
+
+        // No conversation (or an empty id) means the announcement is global.
+        queue
+            .submit(
+                PendingApproval::new("s1b", "tool", serde_json::json!({}), "user")
+                    .with_session(Some(String::new())),
+            )
+            .await;
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.session_id, None, "an empty conversation id is no conversation");
+
+        // And it is visible on the summary `approvals.get` returns.
+        let summary = queue.get("s1a").await.unwrap();
+        assert_eq!(summary.session_id.as_deref(), Some("sess-9"));
     }
 }

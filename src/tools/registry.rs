@@ -1031,6 +1031,7 @@ impl ToolRegistry {
                         .with_risk_level(risk_level)
                         .with_approval_level(approval_level)
                         .with_message(message)
+                        .with_session(Some(context.conversation_id.clone()))
                         .with_response_tx(tx);
 
                 // Submit to approval queue

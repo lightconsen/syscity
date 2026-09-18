@@ -612,6 +612,7 @@ pub(crate) async fn start_gateway(
                             requested_by: evt.requested_by,
                             risk_level: evt.risk_level,
                             message: evt.message,
+                            session_id: evt.session_id,
                         }) {
                             debug!("No receivers for ApprovalRequired event: {}", e);
                         }

@@ -156,6 +156,8 @@ pub enum GatewayEvent {
         requested_by: String,
         risk_level: crate::tools::approval::RiskLevel,
         message: String,
+        /// The conversation the tool call belongs to; `None` broadcasts.
+        session_id: Option<String>,
     },
     /// Device pairing request initiated
     DevicePairRequested {

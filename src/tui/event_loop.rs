@@ -1100,10 +1100,21 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
     // between creating a session and subscribing to it is exactly that. So the
     // client checks too — an event that names a session is ours only if it
     // names *our* session. Events that name none are global on purpose: cron
-    // notices, and approvals, which the queue scopes to a tool call rather
-    // than to a conversation.
+    // notices, and approvals raised outside any conversation. An approval
+    // that names *another* session is not silently dropped either: someone's
+    // turn is blocked on it, and in the fail-open window we may be the only
+    // client that heard about it.
     if let Some(session_id) = payload["session_id"].as_str() {
         if state.read().await.current_session.as_deref() != Some(session_id) {
+            if event.event == "approval.required" {
+                let tool = payload["tool_name"].as_str().unwrap_or("tool");
+                let mut s = state.write().await;
+                s.transcript.push_notice(format!(
+                    "⚠ {tool} needs approval in another session — that turn is blocked until \
+                     it gets one"
+                ));
+                s.dirty = true;
+            }
             return;
         }
     }
@@ -2753,6 +2764,71 @@ mod tests {
                 "message": "writes outside the workspace",
             }),
         )
+    }
+
+    /// An approval raised in *another* session is a notice here, not a
+    /// prompt: the gateway routes approvals by session now, and in the
+    /// fail-open window (no subscriptions yet) a stray one must neither steal
+    /// the keyboard nor vanish — someone's turn is blocked on it.
+    #[tokio::test]
+    async fn an_approval_for_another_session_is_a_notice_not_a_prompt() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        handle_event(
+            event(
+                "approval.required",
+                serde_json::json!({
+                    "approval_id": "ap9",
+                    "tool_name": "file_write",
+                    "session_id": "s2",
+                }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        let mut s = state.write().await;
+        assert!(s.approvals.is_empty(), "no prompt for another session's approval");
+        assert_eq!(s.live_mode, LiveMode::Composer, "and the keyboard stays ours");
+        let lines: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("another session")),
+            "the blocked turn is announced: {lines:?}"
+        );
+    }
+
+    /// The same event naming *our* session still opens the prompt.
+    #[tokio::test]
+    async fn an_approval_for_our_session_opens_the_prompt() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        handle_event(
+            event(
+                "approval.required",
+                serde_json::json!({
+                    "approval_id": "ap1",
+                    "tool_name": "file_write",
+                    "session_id": "s1",
+                }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        let s = state.read().await;
+        assert_eq!(s.approvals.len(), 1, "our approval prompts");
+        assert_eq!(s.live_mode, LiveMode::Approval);
     }
 
     /// An `ask.required` event, optionally with a default.
