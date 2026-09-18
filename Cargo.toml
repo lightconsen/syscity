@@ -328,6 +328,12 @@ mobile = [
 # WhatsApp, QQ, Lark use reqwest with custom implementations
 # Browser automation requires Chrome/Chromium installed
 
+[target.'cfg(unix)'.dev-dependencies]
+# PTY integration tests (`tests/tui_pty.rs`): spawn the real binary in a real
+# pseudo-terminal so raw-mode/signal behaviour is asserted, not assumed.
+portable-pty = "0.9"
+libc = "0.2"
+
 [dev-dependencies]
 # Testing
 wiremock = "0.6"

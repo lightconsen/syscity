@@ -49,6 +49,74 @@ enum Event {
     Tick,
     /// The command that was running has finished.
     Finished(Result<(), TuiError>),
+    /// The process was asked to terminate.
+    Signal,
+}
+
+/// Resolve when the OS asks the process to go away.
+///
+/// Ctrl+C is *not* this path while the TUI runs: crossterm's raw mode clears
+/// ISIG, so the terminal turns it into a `0x03` key event and the loop's
+/// Abort handling answers. What remains is everything that does come through
+/// as a signal: `kill`, a supervisor stopping us, SIGHUP from a detached
+/// SSH session. With no handler those die here with the default action —
+/// mid-raw-mode, leaving the user a terminal that echoes nothing. Mapping
+/// them to the Quit flag ends the loop through the ordinary path, which
+/// restores the terminal.
+///
+/// Registration happens *before* the first draw, not lazily: the frame is up
+/// and the composer already looks killable while the loop spins its first
+/// select, so a signal landing there must be caught too. Registering a kind
+/// twice in one process fails (unit tests run several loops); a failed arm
+/// degrades to never-fires, which is the pre-existing behaviour, not worse.
+pub struct SignalWatch {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl SignalWatch {
+    #[cfg(unix)]
+    fn new() -> Self {
+        use tokio::signal::unix::{signal, SignalKind};
+        Self {
+            interrupt: signal(SignalKind::interrupt()).ok(),
+            terminate: signal(SignalKind::terminate()).ok(),
+            hangup: signal(SignalKind::hangup()).ok(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self {}
+    }
+
+    /// Resolve on the first signal that arrives — or never.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = recv_opt(&mut self.interrupt) => {}
+                _ = recv_opt(&mut self.terminate) => {}
+                _ = recv_opt(&mut self.hangup) => {}
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
+}
+
+#[cfg(unix)]
+async fn recv_opt(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Run the TUI until the user quits or a fatal error occurs.
@@ -67,6 +135,7 @@ where
     let mut ws: Option<Arc<WsClient>> = Some(Arc::new(ws_client));
     let mut backoff = Backoff::new();
     let mut reconnect_at: Option<Instant> = None;
+    let mut signals = SignalWatch::new();
     // Short enough that typing feels immediate; the tick itself only marks the
     // state dirty when something is actually animating.
     let mut ticker = interval(Duration::from_millis(50));
@@ -124,6 +193,7 @@ where
             msg = next_gateway(&ws) => Event::Gateway(msg),
             _ = ticker.tick() => Event::Tick,
             done = settle(&mut in_flight) => Event::Finished(done),
+            () = signals.recv() => Event::Signal,
         };
 
         match event {
@@ -169,6 +239,11 @@ where
                 if let (Some(next), Some(client)) = (queued.pop_front(), ws.as_ref()) {
                     in_flight = Some(spawn_action(next, &state, Arc::clone(client)));
                 }
+            }
+            Event::Signal => {
+                // Like Quit: stop reading, let the in-flight command be
+                // cancelled at loop end, and the caller restores the terminal.
+                state.write().await.should_quit = true;
             }
         }
 
