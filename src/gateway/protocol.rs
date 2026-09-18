@@ -725,7 +725,7 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
                 payload["session_id"] = serde_json::Value::String(sid.clone());
             }
             Some(("approval.required".to_string(), payload))
-        },
+        }
         GatewayEvent::CronAnnounce { channel: _, to: _, message } => {
             // message is a JSON string produced by CronScheduler; try to parse it
             let payload = serde_json::from_str(message)
