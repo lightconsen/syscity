@@ -39,9 +39,9 @@ async fn malformed_frames_are_answered_and_keep_the_connection() {
 ///
 /// The REST rate limiter sees one request per WebSocket connection, so it
 /// cannot bound what a client does *inside* one; the per-frame bucket is what
-/// does. Frames are sent in bursts (a round trip per frame would refill the
-/// bucket faster than the test spends it, and prove nothing), and the refusals
-/// are answered rather than dropped — a client over its budget is still waiting
+/// does. The whole flood is sent before a single response is read — any round
+/// trip mid-send is time the bucket refills through — and the refusals are
+/// answered rather than dropped: a client over its budget is still waiting
 /// on ids.
 #[tokio::test]
 #[serial]
@@ -51,31 +51,31 @@ async fn a_flood_of_requests_is_refused() {
     let mut client = FrontendSimulator::connect(port).await;
 
     // Burst 1200, plus a little: enough to spend it and collect the refusals.
+    // Send everything before reading anything — every read between sends is a
+    // round trip, and 600 frames/s of refill during five batch waits could
+    // cover the 50-frame slack on a loaded runner, letting the whole flood
+    // through. A true burst arrives faster than the bucket refills.
     let total = 1_250;
-    let batch = 250;
+    for i in 0..total {
+        client
+            .send_raw_frame(&format!(r#"{{"type":"req","id":"flood-{i}","method":"ping"}}"#))
+            .await;
+    }
     let mut refusals = 0;
+    let mut answered = 0;
     let mut closed = false;
-    for sent in (0..total).step_by(batch) {
-        for i in sent..(sent + batch).min(total) {
-            client
-                .send_raw_frame(&format!(r#"{{"type":"req","id":"flood-{i}","method":"ping"}}"#))
-                .await;
-        }
-        for _ in sent..(sent + batch).min(total) {
-            match client.read_response().await {
-                Some(resp) => {
-                    if resp["error"]["code"] == "RATE_LIMITED" {
-                        refusals += 1;
-                    }
-                }
-                None => {
-                    closed = true;
-                    break;
+    while answered < total {
+        match client.read_response().await {
+            Some(resp) => {
+                answered += 1;
+                if resp["error"]["code"] == "RATE_LIMITED" {
+                    refusals += 1;
                 }
             }
-        }
-        if closed {
-            break;
+            None => {
+                closed = true;
+                break;
+            }
         }
     }
 
