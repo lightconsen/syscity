@@ -165,9 +165,24 @@ from the TUI is unsubscribed until its id comes back — so there is a window in
 which the connection legitimately receives other conversations' events. The
 client therefore filters as well: an event whose payload names a session is
 applied only if it names the current one. Events naming none are global on
-purpose — cron notices, and `approval.required`, which the gateway scopes to a
-tool call rather than to a conversation, so an approval raised anywhere is
-offered here.
+purpose — cron notices, and approvals raised outside any conversation.
+
+Approvals name the conversation that raised them: `PendingApproval` carries
+the tool call's `conversation_id`, the gateway routes `approval.required` to
+that session's subscribers (`audience_of`), and a client in the fail-open
+window that sees one for *another* session prints a notice — someone's turn
+is blocked — instead of prompting or dropping it silently. An approval with
+no conversation behind it still broadcasts, which is also the behavior every
+client saw before the field existed.
+
+What this does **not** do is authorization: any connected client with the
+`write` scope can still call `approvals.approve` on any pending id, including
+another session's. That is deliberate for now — the deployment premise is a
+single operator, every client is that operator, and scoping the *prompt* is
+about putting it where the blocked turn is, not about keeping it from anyone.
+Owner-checked approval decisions become worth their complexity when a second
+identity (a paired device, a room member) can connect; until then the audit
+log records who answered what.
 
 Actions take one of two lanes. **Edits** (typing, cursor, completion, resize)
 run inline even while a command is in flight — "input still editable while the
@@ -191,10 +206,12 @@ behind whatever command is running — the worse trade of the two.
 
 - No markdown rendering: only fenced code blocks are styled; headings, tables
   and lists appear as their source text.
-- Untested surface: raw-mode entry/restore, SIGINT, real terminal resize
-  events and the cursor-position query all live below the input and backend
-  seams and can only be exercised through a PTY, which the suite does not
-  have.
+- Untested surface: real terminal resize events, exotic emulators, and the
+  slow-terminal cases still sit below the seams. `tests/tui_pty.rs` runs the
+  real binary under a real pty and pins the rest — the cursor-position query
+  going out and being answered, the tty raw while running and cooked after
+  `/quit` or `SIGTERM` — but it is three scenarios on one platform (macOS/
+  Linux pty), not a terminal-emulator matrix.
 - Tool output is truncated (6–8 lines with an ellipsis), not collapsible.
 - Resuming reprints the last 100 messages. The scrollback is append-only and
   top-anchored, so older messages cannot be spliced in above what is already
@@ -237,6 +254,6 @@ that speaks the protocol — handshake, scripted replies, events pushed at the
 client, requests recorded for assertion) and actions injected through the
 `InputSource` seam. They cover the pipe contract, print-once streaming,
 disconnect convergence, the approval decision round-trip, resize repaint, and
-typing while a request is on the wire. What they do **not** cover: the real
-crossterm/cursor-query layer and process signals — that needs a PTY (see
-Deliberate Limitations).
+typing while a request is on the wire. The PTY suite (`tests/tui_pty.rs`)
+covers what those seams cannot: the cursor query, raw-mode entry and restore
+on `/quit`, and a clean exit with a cooked terminal on `SIGTERM`.

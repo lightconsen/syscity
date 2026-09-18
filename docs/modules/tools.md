@@ -66,7 +66,7 @@ Capabilities the AI assistant can use to interact with the world.
 - **Workspace boundary** — `workspace_only` mode restricts file ops to `workspace_root`
 - **Read-before-edit guard** — `file_write` / `file_edit` reject blind or stale writes to existing files (see `src/tools/write_guard.rs`)
 - **Hooks** — Programmable gates before and after tool execution: pre-execute policy hooks can deny or route to approval; post-execute hooks can replace the output or block the result with feedback the model sees as an error. A Claude-Code-compatible shell hooks bridge (`~/.syscity/hooks.json`, fail-open) maps PreToolUse / PostToolUse / UserPromptSubmit / Stop events onto these points
-- **Approval queue** — Human-in-the-loop for high-risk tools with `RiskLevel` classification
+- **Approval queue** — Human-in-the-loop for high-risk tools with `RiskLevel` classification. The announcement is scoped to the conversation that raised it (`PendingApproval.session_id` → `approval.required` routes to that session's subscribers; no conversation means broadcast). This scopes the *prompt*, not the *decision*: any client holding the `write` scope can still answer any pending approval — the premise is a single operator, and owner-checked decisions are deferred until a second identity can connect (see tui.md).
 - **Circuit breaker** — Tools disabled after 3 consecutive failures
 - **Privilege filtering** — Privileged tools hidden when `skill_trust == Community`
 - **Fine-grained RBAC** — Role-based tool access via `Role`, `UserContext`, and `ToolPolicy` with deny/allow lists, required role, max risk level, and category filtering. Evaluated in `ToolRegistry::is_excluded()`. See `src/tools/rbac.rs`.
