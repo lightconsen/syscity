@@ -65,11 +65,13 @@ side, which is what makes the terminal's own scroll and selection work.
   prints into the scrollback.
 - **`resume.rs`** — `--continue` / `--resume` / `/resume`.
 - **`retry.rs`** — reconnect backoff (500ms → 8s cap).
-- **`input.rs`** — input polling. Events are polled by the event loop rather
-  than read by a background task: an inline viewport asks the terminal for its
-  cursor position on every draw, and that reply arrives on the same stdin a
-  concurrent reader would be draining. Polling from the loop means nothing else
-  reads stdin while a frame is drawn.
+- **`input.rs`** — input polling behind the `InputSource` seam. Events are
+  polled by the event loop rather than read by a background task: an inline
+  viewport asks the terminal for its cursor position on every draw, and that
+  reply arrives on the same stdin a concurrent reader would be draining.
+  Polling from the loop means nothing else reads stdin while a frame is drawn.
+  Production is `CrosstermInput`; tests script actions through the same loop —
+  resize, key timing against a hung request, the approval keys — without a pty.
 
 ### Slash commands
 
@@ -167,13 +169,18 @@ purpose — cron notices, and `approval.required`, which the gateway scopes to a
 tool call rather than to a conversation, so an approval raised anywhere is
 offered here.
 
-Commands run off the loop: `run` spawns one task per command and `select!`s
-over it alongside input, gateway events and the animation tick. `WsClient`
-takes `&self` throughout, so the loop keeps its connection while a command
-holds it. One command at a time — the rest queue in order — because two
-`/new`s racing would leave the state describing whichever finished last.
-Startup is the first such task, so the frame is painted while its two requests
-are still on the wire.
+Actions take one of two lanes. **Edits** (typing, cursor, completion, resize)
+run inline even while a command is in flight — "input still editable while the
+gateway is slow" is the whole point of the loop being non-blocking, and a
+keystroke queued behind an RPC would fail it; with a prompt up the same keys
+are its decision, also inline. **Commands** (`Enter`, a slash command, abort,
+Esc) run as tasks off the loop, one at a time — the rest queue in order —
+because two `/new`s racing would leave the state describing whichever finished
+last. `run` `select!`s over the in-flight command alongside gateway events and
+the animation tick; `WsClient` takes `&self` throughout, so the loop keeps its
+connection while a command holds it. Startup is the first such task, so the
+frame is painted while its two requests are still on the wire. Quit jumps both
+lanes; offline, every action takes the path that existed before.
 
 Gateway *events* are still handled inline. Their handlers can make requests
 (`approvals.get`, `sessions.list`), which is what the loop is no longer
@@ -184,6 +191,10 @@ behind whatever command is running — the worse trade of the two.
 
 - No markdown rendering: only fenced code blocks are styled; headings, tables
   and lists appear as their source text.
+- Untested surface: raw-mode entry/restore, SIGINT, real terminal resize
+  events and the cursor-position query all live below the input and backend
+  seams and can only be exercised through a PTY, which the suite does not
+  have.
 - Tool output is truncated (6–8 lines with an ellipsis), not collapsible.
 - Resuming reprints the last 100 messages. The scrollback is append-only and
   top-anchored, so older messages cannot be spliced in above what is already
@@ -219,3 +230,13 @@ drives flush-then-draw and asserts what lands where; `src/tui/scrollback.rs`
 covers the writer's contract (wrapping, styles, scrolling off the top);
 `transcript.rs`, `wrap.rs`, `state.rs`, `actions.rs`, `retry.rs` and
 `gateway_calls.rs` are pure unit tests.
+
+`src/tui/event_loop.rs` also holds loop-level tests: the real `run` and the
+real `run_plain`, against `src/tui/test_gateway.rs` (an in-process stand-in
+that speaks the protocol — handshake, scripted replies, events pushed at the
+client, requests recorded for assertion) and actions injected through the
+`InputSource` seam. They cover the pipe contract, print-once streaming,
+disconnect convergence, the approval decision round-trip, resize repaint, and
+typing while a request is on the wire. What they do **not** cover: the real
+crossterm/cursor-query layer and process signals — that needs a PTY (see
+Deliberate Limitations).

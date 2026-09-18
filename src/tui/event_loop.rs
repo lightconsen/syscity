@@ -27,7 +27,7 @@ use crate::tui::app::{Endpoint, SessionChoice};
 use crate::tui::commands::handle_slash_command;
 use crate::tui::error::TuiError;
 use crate::tui::gateway_calls::{self as gw, ApprovalDetail, HistoryMessage};
-use crate::tui::input::{CrosstermInput, InputSource};
+use crate::tui::input::InputSource;
 use crate::tui::resume;
 use crate::tui::retry::Backoff;
 use crate::tui::scrollback;
@@ -100,6 +100,13 @@ where
                 Dispatch::Quit => state.write().await.should_quit = true,
                 Dispatch::Offline => {
                     handle_offline_action(action, &state, &mut backoff, &mut reconnect_at).await
+                }
+                Dispatch::Edit => {
+                    if let Some(client) = ws.as_ref() {
+                        if let Err(e) = handle_action(action, &state, client).await {
+                            absorb_action_error(e, &state).await?;
+                        }
+                    }
                 }
                 Dispatch::Queue => queued.push_back(action),
                 Dispatch::Run => {
@@ -183,18 +190,52 @@ where
 /// What the loop does with an action it has just read.
 ///
 /// Pulled out of the loop because this is the whole rule, and the rule is the
-/// point: one command at a time, edits still work with no gateway, and Quit
-/// waits for neither.
+/// point. Two lanes: an action that only touches local state runs *inline*,
+/// even with a command in flight — the audit's acceptance for the non-blocking
+/// loop is "input still editable while the gateway is slow", and a keystroke
+/// that queued behind an RPC would fail it. Only actions that *start* gateway
+/// work are serialized: one at a time, the rest in order, so two `/new`s
+/// cannot race the session state. Quit waits for neither lane, and with no
+/// gateway every action takes the offline path that existed before.
 #[derive(Debug, PartialEq, Eq)]
 enum Dispatch {
-    /// Nothing is in flight — run it.
+    /// Local only — mutate the state and keep draining.
+    Edit,
+    /// Nothing is in flight — run it as a task.
     Run,
-    /// Something is — remember it for when that finishes.
+    /// A command is — remember it for when that finishes.
     Queue,
     /// No gateway; only what the loop can do on its own is left.
     Offline,
     /// Set the quit flag and stop reading.
     Quit,
+}
+
+/// Whether the action belongs to the inline lane rather than a gateway command.
+///
+/// In composer mode these are answered from state alone. With a prompt up the
+/// same keys route to the prompt handler and *can* decide over the network —
+/// still worth the inline lane: a decision is the user's own next step, made
+/// one keystroke at a time, and the thing that must never queue behind a
+/// hung request is the typing that tells them the TUI is still alive.
+fn is_local_edit(action: &TuiAction) -> bool {
+    matches!(
+        action,
+        TuiAction::InputChar(_)
+            | TuiAction::InputNewline
+            | TuiAction::InputBackspace
+            | TuiAction::InputDelete
+            | TuiAction::CursorLeft
+            | TuiAction::CursorRight
+            | TuiAction::CursorHome
+            | TuiAction::CursorEnd
+            | TuiAction::CursorUp
+            | TuiAction::CursorDown
+            | TuiAction::CompleteNext
+            | TuiAction::CompletePrev
+            | TuiAction::Resize(..)
+            | TuiAction::None
+    )
 }
 
 /// Decide what to do with `action`.
@@ -203,6 +244,8 @@ fn dispatch(action: &TuiAction, online: bool, busy: bool) -> Dispatch {
         Dispatch::Quit
     } else if !online {
         Dispatch::Offline
+    } else if is_local_edit(action) {
+        Dispatch::Edit
     } else if busy {
         Dispatch::Queue
     } else {
@@ -1854,8 +1897,8 @@ mod tests {
 
     /// The rule the loop dispatches on.
     #[test]
-    fn one_command_at_a_time_and_quit_waits_for_nothing() {
-        use TuiAction::{Quit, SendMessage};
+    fn one_command_at_a_time_edits_never_queue_and_quit_waits_for_nothing() {
+        use TuiAction::{InputChar, Quit, SendMessage};
 
         // Idle and online: run it.
         assert_eq!(dispatch(&SendMessage, true, false), Dispatch::Run);
@@ -1863,10 +1906,15 @@ mod tests {
         // it — two `/new`s finishing in the wrong order would leave the state
         // describing a session the user is not in.
         assert_eq!(dispatch(&SendMessage, true, true), Dispatch::Queue);
+        // An edit never waits: typing during a slow request is the point of
+        // the loop being non-blocking.
+        assert_eq!(dispatch(&InputChar('x'), true, true), Dispatch::Edit);
+        assert_eq!(dispatch(&InputChar('x'), true, false), Dispatch::Edit);
         // No gateway: the offline path still lets the user edit and says the
         // message was not sent, rather than queueing it forever.
         assert_eq!(dispatch(&SendMessage, false, false), Dispatch::Offline);
         assert_eq!(dispatch(&SendMessage, false, true), Dispatch::Offline);
+        assert_eq!(dispatch(&InputChar('x'), false, false), Dispatch::Offline);
         // Quit never waits — not for a gateway, not for a running command.
         assert_eq!(dispatch(&Quit, true, false), Dispatch::Quit);
         assert_eq!(dispatch(&Quit, true, true), Dispatch::Quit);
@@ -2340,6 +2388,201 @@ mod tests {
             .map(|l| l.text)
             .collect();
         assert!(lines.iter().any(|l| l.contains("did not finish")), "got {lines:?}");
+    }
+
+    /// Everything currently painted or scrolled off, as one string.
+    fn painted(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+        let mut text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        text.push_str(
+            &terminal
+                .backend()
+                .scrollback()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>(),
+        );
+        text
+    }
+
+    /// A window resize repaints the live region at the new size.
+    ///
+    /// The loop treats `Resize` as a dirty-mark like any other action, and the
+    /// next draw runs ratatui's inline-viewport re-layout. Until the input
+    /// seam existed there was no way to put a resize in front of the real
+    /// loop — the audit's acceptance line ("no overlap, no truncation, no
+    /// scrollback damage") had no evidence at all.
+    #[tokio::test]
+    async fn a_resize_repaints_the_live_region_at_the_new_size() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        let (mut input, tx) = ScriptedInput::new();
+        let mut terminal = inline_terminal(); // 60x12
+
+        // The terminal really changed size — crossterm would have reported it.
+        terminal.backend_mut().resize(40, 6);
+        tx.send(TuiAction::Resize(40, 6)).expect("queued");
+        tx.send(TuiAction::Quit).expect("queued");
+
+        run(
+            &mut terminal,
+            state,
+            client,
+            test_endpoint(gateway.port),
+            SessionChoice::New,
+            &mut input,
+        )
+        .await
+        .expect("the loop exits on Quit");
+
+        // The final draw used the new size: the viewport re-clamped to the
+        // shorter terminal and the composer is alive in it.
+        let area = terminal.backend().buffer().area;
+        assert_eq!(area.width, 40, "repainted at the new width");
+        assert!(area.height <= 6, "the inline viewport clamps to the height");
+        let screen = painted(&terminal);
+        assert!(screen.contains("> "), "the composer survived the resize: {screen:?}");
+        let cursor = terminal.get_cursor_position().expect("a cursor");
+        assert!(
+            cursor.x < 40 && cursor.y <= 6,
+            "the cursor sits inside the new frame: {cursor:?}"
+        );
+    }
+
+    /// Keys reach the composer while a request is still on the wire.
+    ///
+    /// This is the audit's TUI-007 acceptance line — "input still editable
+    /// while the gateway takes 15 seconds" — asserted end to end: startup is
+    /// parked on a request the gateway never answers, and a keystroke must
+    /// still land.
+    #[tokio::test]
+    async fn typing_lands_while_a_request_is_still_on_the_wire() {
+        let gateway = TestGateway::start().await;
+        gateway.hold("commands.list"); // startup parks here, forever
+        let (state, client) = state_and_client(&gateway).await;
+        let observed = Arc::clone(&state); // the test's window on the loop's state
+        let (mut input, tx) = ScriptedInput::new();
+
+        let driver = tokio::spawn(async move {
+            let mut terminal = inline_terminal();
+            run(
+                &mut terminal,
+                state,
+                client,
+                test_endpoint(gateway.port),
+                SessionChoice::New,
+                &mut input,
+            )
+            .await
+        });
+
+        // The request is genuinely unanswered: startup is waiting on it.
+        gateway.wait_for("commands.list", PATIENCE).await;
+
+        tx.send(TuiAction::InputChar('h')).expect("queued");
+        tx.send(TuiAction::InputChar('i')).expect("queued");
+        eventually_async(
+            || {
+                let observed = Arc::clone(&observed);
+                async move { observed.read().await.input_buffer == "hi" }
+            },
+            "keystrokes to land while the RPC is still in flight",
+        )
+        .await;
+
+        tx.send(TuiAction::Quit).expect("queued");
+        tokio::time::timeout(PATIENCE, driver)
+            .await
+            .expect("the loop exits despite the unanswered request")
+            .expect("join")
+            .expect("run");
+    }
+
+    /// The approval keys go through the real loop, end to end.
+    ///
+    /// `event → approvals.get → prompt → y → approvals.approve → notice →
+    /// composer returns` — every piece had unit coverage; the round trip
+    /// driving the actual `run`, with a keypress injected through the seam and
+    /// the decision observable on the wire and in the terminal, did not.
+    #[tokio::test]
+    async fn the_approval_keys_drive_a_real_decision() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        let observed = Arc::clone(&state);
+        let (mut input, tx) = ScriptedInput::new();
+
+        let driver = tokio::spawn(async move {
+            let mut terminal = inline_terminal();
+            let r = run(
+                &mut terminal,
+                state,
+                client,
+                test_endpoint(gateway.port),
+                SessionChoice::New,
+                &mut input,
+            )
+            .await;
+            (r, terminal)
+        });
+
+        gateway.push_event(
+            "approval.required",
+            serde_json::json!({
+                "approval_id": "ap1",
+                "tool_name": "file_write",
+                "requested_by": "secretary",
+                "risk_level": "High",
+                "message": "writes outside the workspace",
+            }),
+        );
+
+        let prompt_up = || {
+            let observed = Arc::clone(&observed);
+            async move {
+                let s = observed.read().await;
+                s.live_mode == LiveMode::Approval && s.approvals.len() == 1
+            }
+        };
+        eventually_async(prompt_up, "the approval prompt to open").await;
+
+        tx.send(TuiAction::InputChar('y')).expect("queued");
+        gateway.wait_for("approvals.approve", PATIENCE).await;
+
+        let answered = || {
+            let observed = Arc::clone(&observed);
+            async move {
+                let s = observed.read().await;
+                s.approvals.is_empty() && s.live_mode == LiveMode::Composer
+            }
+        };
+        eventually_async(answered, "the prompt to retire").await;
+
+        tx.send(TuiAction::Quit).expect("queued");
+        let (result, terminal) = tokio::time::timeout(PATIENCE, driver)
+            .await
+            .expect("the loop exits")
+            .expect("join");
+        result.expect("run");
+
+        // The decision is reported where the user can still read it, and the
+        // 'y' went to the prompt, not the composer.
+        let screen = painted(&terminal);
+        assert!(
+            screen.contains("✔ approved file_write"),
+            "the approval is confirmed in the terminal: {screen:?}"
+        );
+        let decision = gateway
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "approvals.approve")
+            .expect("a decision on the wire");
+        assert_eq!(decision.params["id"], "ap1");
     }
 
     /// A failed abort does not claim the run stopped.
