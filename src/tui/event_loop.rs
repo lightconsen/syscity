@@ -27,7 +27,7 @@ use crate::tui::app::{Endpoint, SessionChoice};
 use crate::tui::commands::handle_slash_command;
 use crate::tui::error::TuiError;
 use crate::tui::gateway_calls::{self as gw, ApprovalDetail, HistoryMessage};
-use crate::tui::input::poll_action;
+use crate::tui::input::{CrosstermInput, InputSource};
 use crate::tui::resume;
 use crate::tui::retry::Backoff;
 use crate::tui::scrollback;
@@ -58,6 +58,7 @@ pub async fn run<B>(
     ws_client: WsClient,
     endpoint: Endpoint,
     session: SessionChoice,
+    input: &mut dyn InputSource,
 ) -> Result<(), TuiError>
 where
     B: Backend,
@@ -93,7 +94,7 @@ where
     loop {
         // Drain input first: the draw below issues a cursor-position query, and
         // nothing may be reading stdin while that reply is in flight.
-        while let Some(action) = poll_action() {
+        while let Some(action) = input.poll() {
             state.write().await.dirty = true;
             match dispatch(&action, ws.is_some(), in_flight.is_some()) {
                 Dispatch::Quit => state.write().await.should_quit = true,
@@ -1604,6 +1605,37 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// An input source that never has anything — production without a tty
+    /// behaves the same, and the loop must cope.
+    struct SilentInput;
+
+    impl InputSource for SilentInput {
+        fn poll(&mut self) -> Option<TuiAction> {
+            None
+        }
+    }
+
+    /// Actions a test queues for the loop, one `poll` per action.
+    struct ScriptedInput {
+        rx: mpsc::UnboundedReceiver<TuiAction>,
+    }
+
+    impl ScriptedInput {
+        /// The source and its half of the channel.
+        fn new() -> (Self, mpsc::UnboundedSender<TuiAction>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Self { rx }, tx)
+        }
+    }
+
+    impl InputSource for ScriptedInput {
+        fn poll(&mut self) -> Option<TuiAction> {
+            // try_recv, not recv: like crossterm, `None` means "nothing right
+            // now", and the loop keeps its own beat.
+            self.rx.try_recv().ok()
+        }
+    }
+
     /// A terminal with an inline viewport and a real scrollback, as
     /// `tests/tui_inline.rs` builds one.
     fn inline_terminal() -> Terminal<ratatui::backend::TestBackend> {
@@ -1859,8 +1891,15 @@ mod tests {
             let state = Arc::clone(&state);
             async move {
                 let mut terminal = inline_terminal();
-                run(&mut terminal, state, client, test_endpoint(gateway.port), SessionChoice::New)
-                    .await
+                run(
+                    &mut terminal,
+                    state,
+                    client,
+                    test_endpoint(gateway.port),
+                    SessionChoice::New,
+                    &mut SilentInput,
+                )
+                .await
             }
         });
 
@@ -1910,8 +1949,15 @@ mod tests {
             let state = Arc::clone(&state);
             async move {
                 let mut terminal = inline_terminal();
-                run(&mut terminal, state, client, test_endpoint(gateway.port), SessionChoice::New)
-                    .await
+                run(
+                    &mut terminal,
+                    state,
+                    client,
+                    test_endpoint(gateway.port),
+                    SessionChoice::New,
+                    &mut SilentInput,
+                )
+                .await
             }
         });
 

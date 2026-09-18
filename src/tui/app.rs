@@ -177,7 +177,15 @@ async fn run_app(
         };
     }
 
-    event_loop::run(terminal, state, ws_client, endpoint, session).await
+    event_loop::run(
+        terminal,
+        state,
+        ws_client,
+        endpoint,
+        session,
+        &mut crate::tui::input::CrosstermInput,
+    )
+    .await
 }
 
 #[cfg(test)]
