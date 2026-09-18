@@ -17,7 +17,9 @@ fn gateway_config_default_values() {
     assert_eq!(config.port, 18080);
     assert!(config.channels.is_empty());
     assert!(config.providers.is_empty());
-    assert_eq!(config.model, "claude-3-sonnet-20240229");
+    // The default model lives in exactly one place since e416796; assert
+    // against it rather than a literal, so a bump there does not fail here.
+    assert_eq!(config.model, syscity::providers::DEFAULT_MODEL);
     assert_eq!(config.model_provider, "anthropic");
 }
 
