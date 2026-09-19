@@ -103,6 +103,14 @@ async fn run_inline(endpoint: Endpoint, session: SessionChoice) -> Result<(), Tu
     });
     let _hook_guard = PanicHookGuard(Some(original));
 
+    // A drill for the hook above: a debug build told to die here panics with
+    // the terminal raw and the cursor hidden — the worst possible moment.
+    // tests/tui_pty.rs uses it to prove the hook leaves a cooked terminal.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYSCITY_TUI_DEBUG_PANIC").is_some() {
+        panic!("SYSCITY_TUI_DEBUG_PANIC drill");
+    }
+
     let result = run_app(&mut terminal, endpoint, session).await;
 
     let restore = restore_terminal();

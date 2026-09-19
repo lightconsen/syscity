@@ -247,9 +247,15 @@ behind whatever command is running — the worse trade of the two.
   slow-terminal cases still sit below the seams. `tests/tui_pty.rs` runs the
   real binary under a real pty and pins the rest — the cursor-position query
   going out and being answered, the tty raw while running and cooked after
-  `/quit` or `SIGTERM`, CJK text hitting the wire without padding — but it is
-  a handful of scenarios on one platform (macOS/Linux pty), not a
-  terminal-emulator matrix.
+  `/quit`, `SIGTERM` or `SIGINT`, CJK text hitting the wire without padding,
+  a panic drill leaving the terminal cooked, and a resize staying inside the
+  new bounds. That is still one platform (macOS/Linux pty) with the test
+  playing the terminal — for the emulator-in-the-middle case there is
+  `scripts/tui-tmux-smoke.sh`, which drives the whole loop inside a real
+  detached tmux and asserts on tmux's own captured pane: the composer is the
+  bottom row, a CJK echo comes back tight *through tmux's scroll-region
+  translation*, and `/quit` exits 0. It is a smoke test to run by hand
+  (tmux only), not a gate.
 - Scrollback insertion uses DECSTBM scrolling regions (ratatui's
   `scrolling-regions` feature). Without it, ratatui's fallback draws every
   buffer cell — including the empty continuation cell after a wide character,

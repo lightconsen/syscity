@@ -42,7 +42,7 @@ struct Running {
     /// `None` once it has been moved into the waiter.
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Kept alive: dropping the master tears down the pty.
-    _master: Box<dyn MasterPty + Send>,
+    master: Box<dyn MasterPty + Send>,
     /// The slave's tty device — its termios is what the user's terminal
     /// looks like, and it survives the child while we hold the master.
     tty: PathBuf,
@@ -92,16 +92,42 @@ impl Running {
     }
 
     fn terminate(&self) {
+        self.signal(libc::SIGTERM);
+    }
+
+    fn interrupt(&self) {
+        self.signal(libc::SIGINT);
+    }
+
+    fn signal(&self, sig: libc::c_int) {
         let pid = self.child.as_ref().expect("child").process_id();
         let pid = pid.expect("a pid");
         // SAFETY: signalling our own spawned child by pid.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        assert_eq!(rc, 0, "kill(SIGTERM) failed");
+        let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+        assert_eq!(rc, 0, "kill({sig}) failed");
+    }
+
+    /// Resize the pty, which signals SIGWINCH to the child like a terminal
+    /// emulator would.
+    fn resize(&self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the pty");
     }
 }
 
 /// Spawn `syscity tui --port <port>` under a fresh pty against `port`.
 fn spawn_tui(port: u16) -> Running {
+    spawn_tui_with(port, &[])
+}
+
+/// The same, with extra environment for the child (a debug drill, say).
+fn spawn_tui_with(port: u16, extra_env: &[(&str, &str)]) -> Running {
     let exe = std::env::var("CARGO_BIN_EXE_syscity").expect("the syscity bin is a test dep");
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -164,11 +190,14 @@ fn spawn_tui(port: u16) -> Running {
     cmd.env("RUST_LOG", "off");
     // Isolated so the test cannot touch a real user's config or state.
     cmd.env("SYSCITY_HOME", std::env::temp_dir().join(format!("syscity_pty_{port}")));
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     let child = pair.slave.spawn_command(cmd).expect("spawn the TUI");
 
     Running {
         child: Some(child),
-        _master: pair.master,
+        master: pair.master,
         tty,
         writer,
         output,
@@ -395,4 +424,112 @@ async fn terminate_restores_the_terminal() {
     let status = tui.wait_exit().await;
     assert!(status.success(), "SIGTERM must exit cleanly, got {status:?}");
     assert!(is_cooked(&tui.tty), "a terminated TUI must still leave a working terminal");
+}
+
+/// `SIGINT` from outside the process (not a Ctrl+C keystroke, which arrives
+/// as a byte in raw mode) takes the same signal arm as SIGTERM.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn interrupt_restores_the_terminal() {
+    let port = start_gateway().await;
+    let mut tui = tokio::task::spawn_blocking(move || spawn_tui(port))
+        .await
+        .expect("spawn");
+
+    tui.expect_output("> ", "the composer").await;
+    assert!(!is_cooked(&tui.tty), "raw while running");
+
+    tui.interrupt();
+    let status = tui.wait_exit().await;
+    assert!(status.success(), "SIGINT must exit cleanly, got {status:?}");
+    assert!(is_cooked(&tui.tty), "an interrupted TUI must still leave a working terminal");
+}
+
+/// A panic mid-run is the hook's whole job: the process dies (non-zero exit,
+/// the panic message on the pty) but the terminal comes back cooked.
+///
+/// The drill is an env var checked in debug builds only, fired after the hook
+/// is installed with the terminal raw — its worst case, not a gentle one.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_panic_restores_the_terminal() {
+    let port = start_gateway().await;
+    let mut tui = tokio::task::spawn_blocking(move || {
+        spawn_tui_with(port, &[("SYSCITY_TUI_DEBUG_PANIC", "1")])
+    })
+    .await
+    .expect("spawn");
+
+    let status = tui.wait_exit().await;
+    assert!(!status.success(), "a panic is not a clean exit: {status:?}");
+    assert!(is_cooked(&tui.tty), "the panic hook must leave a working terminal");
+    let text = plain(&tui.snapshot());
+    assert!(
+        text.contains("SYSCITY_TUI_DEBUG_PANIC drill"),
+        "the original hook still reports the panic: {text:?}"
+    );
+}
+
+/// Resizing the window must not paint outside the new bounds.
+///
+/// After the pty goes from 80 to 40 columns, every explicit cursor move the
+/// TUI writes has to stay within 40 — a draw at the old width would smear
+/// cells into wrapped rows a real terminal never asked for.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_resize_redraws_within_the_new_bounds() {
+    let port = start_gateway().await;
+    let mut tui = tokio::task::spawn_blocking(move || spawn_tui(port))
+        .await
+        .expect("spawn");
+
+    tui.expect_output("> ", "the composer").await;
+    // Bytes written before this point were legitimately drawn at 80 columns;
+    // only what the TUI emits after the resize may be judged against 40.
+    let resized_at = tui.snapshot().len();
+    tui.resize(24, 40);
+    // Force a post-resize frame with something in every region: the composer
+    // has content, the block area has the completion list, the status row is
+    // up. Everything visible is a redraw at the new width.
+    tui.feed("/");
+    tui.expect_output("/new", "the completion list at the new width")
+        .await;
+
+    let raw = tui.snapshot();
+    let overruns: Vec<u16> = cursor_columns(&raw[resized_at..])
+        .into_iter()
+        .filter(|c| *c > 40)
+        .collect();
+    assert!(overruns.is_empty(), "cursor moved past column 40: {overruns:?}");
+
+    tui.feed("\x7f/quit\r");
+    let status = tui.wait_exit().await;
+    assert!(status.success(), "exit {status:?}");
+}
+
+/// Every column a `CSI row;col H` cursor move targeted, in order.
+fn cursor_columns(bytes: &[u8]) -> Vec<u16> {
+    let mut cols = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut j = start;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'H' && j > start {
+                let params = String::from_utf8_lossy(&bytes[start..j]);
+                if let Some((_, col)) = params.split_once(';') {
+                    if let Ok(col) = col.parse::<u16>() {
+                        cols.push(col);
+                    }
+                }
+            }
+            i = j.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    cols
 }
