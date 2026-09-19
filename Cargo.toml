@@ -186,7 +186,7 @@ tar = "0.4"
 tempfile = "3.10"
 
 # Audio capture (cross-platform I/O)
-cpal = "0.15"
+cpal = "0.18"
 
 # Embed frontend assets into binary for single-file distribution (optional)
 rust-embed = { version = "8", optional = true }
