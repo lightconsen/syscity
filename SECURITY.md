@@ -45,7 +45,7 @@ Syscity implements multiple layers of security:
 
 ### Transitive Vulnerabilities (Blocked by Upstream)
 
-The following vulnerabilities exist in transitive dependencies and cannot be fixed until upstream crates release updates:
+The following known issues exist in transitive dependencies and cannot be fixed until upstream crates release updates. Not all of them are vulnerabilities: an unsoundness is a correctness defect in a dependency that a caller could trip, and it is listed here because Dependabot reports it as one.
 
 #### rustls-webpki Certificate Parsing Vulnerabilities
 - **Crate**: `rustls-webpki` v0.102.8 (via `serenity` → `tokio-tungstenite` 0.21.0 → `rustls` 0.22.4)
@@ -53,6 +53,13 @@ The following vulnerabilities exist in transitive dependencies and cannot be fix
 - **Issues**: CRL parsing panic, name constraint bypass, wildcard certificate acceptance
 - **Status**: **Blocked upstream** — `serenity` 0.12.5 locks `tokio-tungstenite` 0.21.0 which requires `rustls` 0.22.4
 - **Mitigation**: Tracked in `deny.toml` ignore list with documented reason; monitor serenity releases
+
+#### glib `VariantStrIter` Unsoundness
+- **Crate**: `glib` v0.18.5 (via `gtk` 0.18.2 → `tauri` 2.11.2 → `syscity-desktop`); Linux targets only
+- **Advisories**: RUSTSEC-2024-0429 (GHSA-wrw7-89jp-8q8g) — `informational = "unsound"`, not a vulnerability
+- **Issues**: The `Iterator` and `DoubleEndedIterator` impls for `glib::VariantStrIter` (`next`, `nth`, `last`, `next_back`, `nth_back`) passed an immutable reference to a pointer the C function wrote through. Under optimization the write is discarded, so the iterator can dereference NULL and crash.
+- **Status**: **Blocked upstream** — the fix is `glib >= 0.20.0`, which arrives with `gtk` 0.19.0 (`gtk` 0.18.2 requires `glib ^0.18`). The newest Tauri, 2.11.5, still declares `gtk ^0.18`, so no version in range can carry the fix. This is one upstream pin away, not an open-ended wait: **when Tauri moves to `gtk ^0.19`, the advisory clears on its own**.
+- **Mitigation**: Not tracked in `deny.toml`. It does not need to be: `cargo audit` and `cargo deny check` deny the `vulnerability` category and only warn on `unsound`, so the CI gate passes on its own — an ignore entry would be noise here, and would hide the fix once it lands. Dependabot lists it because it does not make that distinction. Nothing in Syscity's own code calls `VariantStrIter`; exposure would come from the GTK stack iterating GVariant strings.
 
 ### Unmaintained Dependencies
 
