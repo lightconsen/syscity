@@ -293,6 +293,50 @@ async fn startup_queries_the_cursor_and_paints_the_composer() {
     assert!(status.success(), "exit {status:?}");
 }
 
+/// What the TUI puts on the wire for CJK text: the raw bytes must contain the
+/// characters back to back, with no padding between them.
+///
+/// "Chinese looks sparse" reports split into two causes — bytes the TUI
+/// emitted (ours to fix) and how the terminal renders or copies wide cells
+/// (not ours). This test pins the first half: if a space ever appears between
+/// two hanzi on the wire, the bug is in our rendering path, not the terminal.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn cjk_text_is_written_without_padding() {
+    let port = start_gateway().await;
+    let mut tui = tokio::task::spawn_blocking(move || spawn_tui(port))
+        .await
+        .expect("spawn");
+
+    tui.expect_output("> ", "the composer").await;
+    // The submitted line echoes into scrollback through `insert_before` — the
+    // exact path a "sparse Chinese" complaint would come from.
+    tui.feed("你好小王很稀疏吗\r");
+    tui.expect_output("稀疏", "the user echo").await;
+
+    let raw = tui.snapshot();
+    // The composer repaints on every keystroke, so hanzi appear in the stream
+    // several times; the echo through `insert_before` is the LAST one, written
+    // after Enter is processed and the composer is cleared. A correct renderer
+    // may move the cursor between cells (escape sequences), but must never put
+    // a space between two hanzi — strip the escapes and read it like a user.
+    let first = "你".as_bytes();
+    let last_at = raw
+        .windows(first.len())
+        .rposition(|w| w == first)
+        .expect("the echo reached the terminal at all");
+    let end = (last_at + 200).min(raw.len());
+    let echo = plain(&raw[last_at..end]);
+    assert!(
+        echo.starts_with("你好小王很稀疏吗"),
+        "the scrollback echo must be tight, got: {echo:?}"
+    );
+
+    tui.feed("/quit\r");
+    let status = tui.wait_exit().await;
+    assert!(status.success(), "exit {status:?}");
+}
+
 /// An ordinary `/quit` restores the terminal it borrowed.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]

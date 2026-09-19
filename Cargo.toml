@@ -232,7 +232,13 @@ ndarray = { version = "0.17", optional = true }
 qrcode = "0.14"
 
 # Terminal UI (the `tui` client). Not optional: `src/tui` is always compiled.
-ratatui = { version = "0.30" }
+# `scrolling-regions`: without it, `insert_before` falls back to a cell-dump
+# path that prints every buffer cell — including the empty continuation cell
+# after a wide (CJK/emoji) character, which `Cell::symbol()` reports as a
+# space. The visible result is a blank column after every wide char in
+# scrollback ("sparse" Chinese). The diff-based scrolling-regions path skips
+# continuation cells, so wide chars stay adjacent.
+ratatui = { version = "0.30", features = ["scrolling-regions"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-util = { version = "0.7" }
 unicode-width = { version = "0.2" }

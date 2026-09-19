@@ -210,8 +210,15 @@ behind whatever command is running — the worse trade of the two.
   slow-terminal cases still sit below the seams. `tests/tui_pty.rs` runs the
   real binary under a real pty and pins the rest — the cursor-position query
   going out and being answered, the tty raw while running and cooked after
-  `/quit` or `SIGTERM` — but it is three scenarios on one platform (macOS/
-  Linux pty), not a terminal-emulator matrix.
+  `/quit` or `SIGTERM`, CJK text hitting the wire without padding — but it is
+  a handful of scenarios on one platform (macOS/Linux pty), not a
+  terminal-emulator matrix.
+- Scrollback insertion uses DECSTBM scrolling regions (ratatui's
+  `scrolling-regions` feature). Without it, ratatui's fallback draws every
+  buffer cell — including the empty continuation cell after a wide character,
+  which surfaces as a blank column after every CJK character. Any terminal
+  with xterm-style scroll regions (iTerm2, Terminal.app, kitty, alacritty,
+  Windows Terminal) renders this correctly.
 - Tool output is truncated (6–8 lines with an ellipsis), not collapsible.
 - Resuming reprints the last 100 messages. The scrollback is append-only and
   top-anchored, so older messages cannot be spliced in above what is already
