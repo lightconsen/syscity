@@ -269,7 +269,13 @@ behind whatever command is running — the worse trade of the two.
   which surfaces as a blank column after every CJK character. Any terminal
   with xterm-style scroll regions (iTerm2, Terminal.app, kitty, alacritty,
   Windows Terminal) renders this correctly.
-- Tool output is truncated (6–8 lines with an ellipsis), not collapsible.
+- Tool output is truncated with an ellipsis, not collapsible. The cap is a
+  *row budget*: the ellipsis is the last row of it, not an extra one, so a
+  caller can size a region to the cap and be sure nothing is dropped off the
+  end. Two budgets exist because the two contexts compete for different
+  space — `TOOL_ARG_LINES_LIVE` (5) leaves room for the `⚙ tool` header
+  inside the live preview, `TOOL_ARG_LINES_HISTORY` (8) has the screen to
+  itself and nothing streaming to crowd out.
 - Resuming reprints the last 100 messages. The scrollback is append-only and
   top-anchored, so older messages cannot be spliced in above what is already
   printed — history is paged, never spliced. `/history [n]` reprints a window

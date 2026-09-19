@@ -38,19 +38,67 @@ pub fn to_lines(entries: &[TranscriptLine]) -> Vec<Line<'static>> {
     entries.iter().map(to_line).collect()
 }
 
+/// Argument rows the *live* preview may show.
+///
+/// The live region is `LIVE_HEIGHT` rows minus the status row and the
+/// composer, so at most six — and the stream preview competes for the same
+/// space. The cap is five so that the `⚙ tool` header fits the region too:
+/// six argument rows plus the header is seven, and the seventh would be the
+/// line the preview drops.
+pub const TOOL_ARG_LINES_LIVE: usize = 5;
+
+/// Argument rows a reprint from history may show.
+///
+/// A reprint has the whole screen to itself and no live text to crowd out,
+/// so it can afford more than the preview.
+pub const TOOL_ARG_LINES_HISTORY: usize = 8;
+
 /// Pretty-print tool arguments, trimmed to a few lines so one enormous call
 /// cannot take over the screen.
-fn args_lines(args: &Value, indent: &str, max_lines: usize) -> Vec<String> {
+///
+/// One string per row: the caller turns each into its own transcript line,
+/// because the cell renderer drops a `\n` inside a line and a packed value
+/// would come out as a single run-together row.
+pub fn args_lines(args: &Value, indent: &str, max_rows: usize) -> Vec<String> {
     let text = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
-    let mut lines: Vec<String> = text
-        .lines()
-        .take(max_lines)
+    let all: Vec<&str> = text.lines().collect();
+    // At most `max_rows` rows: the ellipsis is the last *of* them, not an
+    // extra one, so a caller can size the region to the cap and be sure
+    // nothing is dropped off the end.
+    if all.len() <= max_rows {
+        return all.into_iter().map(|l| format!("{indent}{l}")).collect();
+    }
+    let mut rows: Vec<String> = all
+        .iter()
+        .take(max_rows.saturating_sub(1))
         .map(|l| format!("{indent}{l}"))
         .collect();
-    if text.lines().count() > max_lines {
-        lines.push(format!("{indent}…"));
-    }
-    lines
+    rows.push(format!("{indent}…"));
+    rows
+}
+
+/// Result rows the live preview may show, for the same reason as
+/// [`TOOL_ARG_LINES_LIVE`].
+pub const TOOL_RESULT_LINES_LIVE: usize = 6;
+
+/// Rows for a tool result: the first carries the `↳ tool:` marker, the rest
+/// are indented under it. One string per row — a packed value loses its
+/// newlines at render time and comes out as one run-together row.
+pub fn result_lines(tool: &str, result: Option<&Value>) -> Vec<String> {
+    let Some(result) = result else {
+        return vec![format!("  ↳ {tool}: done")];
+    };
+    let rows = args_lines(result, "  ", TOOL_RESULT_LINES_LIVE);
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if i == 0 {
+                format!("  ↳ {tool}: {}", row.trim_start())
+            } else {
+                row
+            }
+        })
+        .collect()
 }
 
 /// Pull the arguments out of a tool call, whichever way the gateway encoded
@@ -113,7 +161,7 @@ pub fn history_message_lines(msg: &HistoryMessage) -> Vec<TranscriptLine> {
                 .unwrap_or("tool");
             out.push(TranscriptLine::new(LineKind::Tool, format!("⚙ {name}")));
             if let Some(args) = tool_call_args(call) {
-                for line in args_lines(&args, "  ", 8) {
+                for line in args_lines(&args, "  ", TOOL_ARG_LINES_HISTORY) {
                     out.push(TranscriptLine::new(LineKind::Tool, line));
                 }
             }
@@ -251,6 +299,34 @@ mod tests {
         };
         let lines = history_message_lines(&msg);
         assert!(lines.iter().any(|l| l.text.contains("cmd")));
+    }
+
+    /// The cap is a row budget, not "cap plus an ellipsis": the preview it
+    /// feeds is a fixed height, and one extra row is one row dropped.
+    #[test]
+    fn the_row_cap_includes_the_ellipsis() {
+        let big: Vec<usize> = (0..50).collect();
+        let args = json!({ "items": big });
+        for cap in [1usize, 3, 5, 8] {
+            let rows = args_lines(&args, "  ", cap);
+            assert!(rows.len() <= cap, "cap {cap} gave {} rows", rows.len());
+        }
+        // `{\n  "path": "/tmp/x"\n}` — three rows, nothing to elide.
+        let short = json!({ "path": "/tmp/x" });
+        let rows = args_lines(&short, "  ", 8);
+        assert_eq!(rows.len(), 3, "got {rows:?}");
+        assert!(!rows.iter().any(|r| r.contains('…')));
+    }
+
+    /// Results split the same way, with the marker on the first row only.
+    #[test]
+    fn a_result_puts_its_marker_on_the_first_row() {
+        let result = json!({ "ok": true, "count": 3 });
+        let rows = result_lines("file_read", Some(&result));
+        assert!(rows[0].starts_with("  ↳ file_read: "), "got {:?}", rows[0]);
+        assert!(rows.len() > 1, "the rows follow: {rows:?}");
+        assert!(rows[1..].iter().all(|r| !r.contains('↳')), "the marker appears once: {rows:?}");
+        assert_eq!(result_lines("t", None), vec!["  ↳ t: done"]);
     }
 
     #[test]

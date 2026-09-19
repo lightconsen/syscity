@@ -1152,21 +1152,17 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
         }
         "tool.result" => {
             let tool = payload["tool_name"].as_str().unwrap_or("tool").to_string();
-            let result = payload
-                .get("result")
-                .filter(|v| !v.is_null())
-                .map(|v| compact(v, 6));
-            let text = match result {
-                Some(text) => format!("  ↳ {tool}: {text}"),
-                None => format!("  ↳ {tool}: done"),
-            };
+            let result = payload.get("result").filter(|v| !v.is_null());
             let mut s = state.write().await;
             // The tool is done; whatever runs next has not started saying
             // anything yet. Leaving the name up would label the wait with a
             // call that already finished.
             s.run_phase = RunPhase::Waiting;
-            s.transcript
-                .push(vec![TranscriptLine::new(LineKind::ToolResult, text)]);
+            s.transcript.push(
+                blocks::result_lines(&tool, result)
+                    .into_iter()
+                    .map(|row| TranscriptLine::new(LineKind::ToolResult, row)),
+            );
             s.dirty = true;
         }
         "chat.final" => {
@@ -1317,22 +1313,17 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
 fn tool_call_lines(tool: &str, args: Option<&Value>) -> Vec<TranscriptLine> {
     let mut lines = vec![TranscriptLine::new(LineKind::Tool, format!("⚙ {tool}"))];
     if let Some(args) = args {
-        lines.push(TranscriptLine::new(LineKind::Tool, format!("  {}", compact(args, 6))));
+        // One transcript line per row. Packing the rows into one line loses
+        // the newlines at render time (a `\n` has zero cell width and is
+        // dropped), so a multi-line call came out as a single run-together
+        // row — and again on its way into scrollback.
+        lines.extend(
+            blocks::args_lines(args, "  ", blocks::TOOL_ARG_LINES_LIVE)
+                .into_iter()
+                .map(|row| TranscriptLine::new(LineKind::Tool, row)),
+        );
     }
     lines
-}
-
-/// Render a JSON value on a bounded number of lines.
-fn compact(value: &Value, max_lines: usize) -> String {
-    let text = match value {
-        Value::String(s) => s.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-    };
-    let mut lines: Vec<&str> = text.lines().take(max_lines).collect();
-    if text.lines().count() > max_lines {
-        lines.push("…");
-    }
-    lines.join("\n")
 }
 
 /// Where line mode reads its lines and writes its output.
@@ -3182,12 +3173,18 @@ mod tests {
         );
     }
 
+    /// A multi-line tool call must arrive as one transcript line per row:
+    /// the cell renderer drops a `\n` inside a line (zero width), so a
+    /// packed value renders as one run-together row.
     #[test]
-    fn compact_trims_long_values() {
-        let value = serde_json::json!({ "a": 1, "b": 2, "c": 3, "d": 4 });
-        let text = compact(&value, 2);
-        assert!(text.lines().count() <= 3, "got {text}");
-        assert!(text.ends_with('…'));
+    fn live_tool_args_are_one_line_per_row() {
+        let args = serde_json::json!({
+            "alpha": 1, "beta": 2, "gamma": 3, "delta": 4, "epsilon": 5, "zeta": 6
+        });
+        let lines = tool_call_lines("shell", Some(&args));
+        for line in &lines {
+            assert!(!line.text.contains('\n'), "packed into one row: {:?}", line.text);
+        }
     }
 
     #[test]
@@ -3195,7 +3192,24 @@ mod tests {
         let args = serde_json::json!({ "path": "/tmp/x" });
         let lines = tool_call_lines("file_write", Some(&args));
         assert_eq!(lines[0].text, "⚙ file_write");
-        assert!(lines[1].text.contains("/tmp/x"));
+        assert!(
+            lines.iter().any(|l| l.text.contains("/tmp/x")),
+            "the argument is somewhere in the rows: {lines:?}"
+        );
+    }
+
+    /// The live preview must never exceed what the region can hold, and must
+    /// never starve the text being written into the same space.
+    #[test]
+    fn live_tool_args_are_capped_to_the_preview() {
+        let big: Vec<usize> = (0..50).collect();
+        let lines = tool_call_lines("shell", Some(&serde_json::json!({ "items": big })));
+        assert!(
+            lines.len() <= 1 + blocks::TOOL_ARG_LINES_LIVE,
+            "header plus the cap: {} lines",
+            lines.len()
+        );
+        assert!(lines.last().expect("rows").text.trim_end().ends_with('…'));
     }
 
     #[test]
