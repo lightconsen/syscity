@@ -66,6 +66,10 @@ side, which is what makes the terminal's own scroll and selection work.
   tool's name comes back down when its result lands — the wait that follows is
   not labelled with a call that already finished.
 
+  The block area also shows the slash-command candidates while a `/command`
+  is being typed (windowed around the Tab selection), taking precedence over
+  the stream preview — the typist's attention is on the command.
+
   Token totals appear only once the turn ends, because usage rides on
   `chat.final` and no delta carries it; there is no honest mid-stream count to
   show. The completed turn's total stays on screen until the next one

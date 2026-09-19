@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::state::{AppState, LiveMode, RunPhase};
 use crate::tui::ui::blocks;
@@ -311,6 +311,70 @@ fn ask_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
+/// Chop text to `max` columns, ending with `…` when anything was cut, so one
+/// candidate can never wrap into the row budget of the next.
+fn truncate_to_width(text: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// Slash-command candidates while a `/command` is being typed, with the
+/// current Tab selection highlighted.
+///
+/// Returns `None` when the input is not completing a command, so the block
+/// area falls back to the stream preview. The list is windowed around the
+/// selection: a catalog longer than the block stays readable, and cycling
+/// with Tab always keeps the highlighted row on screen.
+fn completion_lines(state: &AppState, max_rows: usize, width: usize) -> Option<Vec<Line<'static>>> {
+    let candidates = state.completions();
+    if candidates.is_empty() || max_rows == 0 {
+        return None;
+    }
+    let selected = state.completion_index.min(candidates.len() - 1);
+    let window = max_rows.min(candidates.len());
+    let start = selected
+        .saturating_sub(window - 1)
+        .min(candidates.len() - window);
+    let lines = candidates[start..start + window]
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let highlighted = start + i == selected;
+            let name_style = if highlighted {
+                highlight_style()
+            } else {
+                Style::default()
+            };
+            let desc_style = if highlighted {
+                highlight_style()
+            } else {
+                dim_style()
+            };
+            Line::from(vec![
+                Span::styled(format!("  /{:<12}", cmd.name), name_style),
+                Span::styled(
+                    truncate_to_width(&cmd.description, width.saturating_sub(16)),
+                    desc_style,
+                ),
+            ])
+        })
+        .collect();
+    Some(lines)
+}
+
 /// Render the whole live region.
 pub fn render(f: &mut Frame, state: &AppState) {
     let area = f.area();
@@ -320,11 +384,15 @@ pub fn render(f: &mut Frame, state: &AppState) {
     let composer_rows = (input_rows(state, area.width).len() as u16).clamp(1, COMPOSER_MAX_ROWS);
     let l = layout(area, composer_rows);
 
-    // Block area: a blocking prompt takes precedence over the stream preview.
+    // Block area: a blocking prompt takes precedence over the stream preview,
+    // and a completion list takes precedence while a `/command` is being
+    // typed — the typist's attention is on the command, not the stream.
     let block_lines = match state.live_mode {
         LiveMode::Approval => approval_lines(state),
         LiveMode::Ask => ask_lines(state),
-        LiveMode::Composer => None,
+        LiveMode::Composer => {
+            completion_lines(state, l.block.height as usize, l.block.width as usize)
+        }
     };
     let block_lines = match block_lines {
         Some(lines) => Some(lines),
@@ -453,6 +521,74 @@ mod tests {
         state.last_turn_tokens = Some(20_600);
         let (text, _) = status_text(&state);
         assert!(text.contains("↓ 20.6k tokens"), "the completed turn's meter: {text}");
+    }
+
+    /// A command catalog of `n` entries named `c0..c{n-1}`.
+    fn catalog(n: usize) -> Vec<crate::tui::state::CommandInfo> {
+        (0..n)
+            .map(|i| crate::tui::state::CommandInfo {
+                name: format!("c{i}"),
+                description: format!("command {i}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn typing_a_slash_lists_the_commands_with_the_selection_highlighted() {
+        let mut state = AppState {
+            command_list: catalog(3),
+            ..AppState::default()
+        };
+        state.set_input("/".into());
+        let lines = completion_lines(&state, 6, 80).expect("a bare slash lists every command");
+        assert_eq!(lines.len(), 3);
+        assert!(line_text(&lines[0]).contains("/c0"));
+        assert!(line_text(&lines[0]).contains("command 0"));
+        // The first candidate starts highlighted, for the Tab that applies it.
+        assert_eq!(lines[0].spans[0].style, highlight_style());
+        assert_eq!(lines[1].spans[0].style, Style::default());
+
+        // Anything not starting with `/` is not completing: the block area
+        // must fall back to the stream preview.
+        state.set_input("hello".into());
+        assert!(completion_lines(&state, 6, 80).is_none());
+    }
+
+    #[test]
+    fn the_completion_window_follows_the_tab_selection() {
+        let mut state = AppState {
+            command_list: catalog(10),
+            ..AppState::default()
+        };
+        state.set_input("/".into());
+        state.completion_index = 8;
+        let lines = completion_lines(&state, 3, 80).expect("completions");
+        assert_eq!(lines.len(), 3, "capped at the block height");
+        // The window ends on the selection: c6, c7, c8.
+        assert!(line_text(&lines[2]).contains("/c8"), "selection visible: {lines:?}");
+        assert_eq!(lines[2].spans[0].style, highlight_style());
+    }
+
+    #[test]
+    fn a_long_description_is_chopped_rather_than_wrapped() {
+        let mut state = AppState {
+            command_list: vec![crate::tui::state::CommandInfo {
+                name: "c".into(),
+                description: "x".repeat(100),
+                ..Default::default()
+            }],
+            ..AppState::default()
+        };
+        state.set_input("/".into());
+        let lines = completion_lines(&state, 3, 40).expect("completions");
+        let text = line_text(&lines[0]);
+        assert!(UnicodeWidthStr::width(text.as_str()) <= 40, "one row, no wrap: {text}");
+        assert!(text.ends_with('…'), "the cut is marked: {text}");
     }
 
     /// The row has to survive a plain 80-column terminal, which is the narrow

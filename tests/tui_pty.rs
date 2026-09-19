@@ -269,6 +269,28 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Typing `/` shows the command candidates — the completion state and the
+/// Tab key existed for a while, but nothing rendered the list, so a slash
+/// looked exactly like a dead key.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_slash_shows_command_hints() {
+    let port = start_gateway().await;
+    let mut tui = tokio::task::spawn_blocking(move || spawn_tui(port))
+        .await
+        .expect("spawn");
+
+    tui.expect_output("> ", "the composer").await;
+    tui.feed("/");
+    tui.expect_output("/new", "a candidate from the catalog")
+        .await;
+
+    // Backspace the `/` away before typing the real command.
+    tui.feed("\x7f/quit\r");
+    let status = tui.wait_exit().await;
+    assert!(status.success(), "exit {status:?}");
+}
+
 /// Startup asks the terminal where the cursor is, then paints.
 ///
 /// ratatui's inline viewport cannot exist without the `ESC[6n]` answer, and
