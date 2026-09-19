@@ -75,6 +75,14 @@ impl TuiAction {
             KeyCode::Delete => Self::InputDelete,
             KeyCode::Tab => Self::CompleteNext,
             KeyCode::BackTab => Self::CompletePrev,
+            // A control chord that is not bound above is not text. Without
+            // this the catch-all inserted the bare letter, so Ctrl+U put a
+            // `u` in the draft — and every other unbound chord its letter.
+            //
+            // Ctrl+Alt is excluded: on several keyboard layouts that is AltGr,
+            // which types real characters (`@`, `\`, `|`). Swallowing those
+            // would be a worse bug than the one this fixes.
+            KeyCode::Char(_) if ctrl && !key.modifiers.contains(KeyModifiers::ALT) => Self::None,
             KeyCode::Char(c) => Self::InputChar(c),
             _ => Self::None,
         }
@@ -107,6 +115,27 @@ mod tests {
             TuiAction::from_key_event(ctrl('r')),
             TuiAction::RunSlashCommand("/resume".to_string())
         );
+    }
+
+    /// An unbound control chord does nothing — it must not type its letter.
+    #[test]
+    fn unbound_control_chords_do_not_insert_text() {
+        for c in ['u', 'k', 'w', 'a', 'z', 'l', 'b', 'f', 'n', 'p', 't'] {
+            assert_eq!(
+                TuiAction::from_key_event(ctrl(c)),
+                TuiAction::None,
+                "Ctrl+{c} must not reach the composer"
+            );
+        }
+    }
+
+    /// Ctrl+Alt is AltGr on several layouts, where it types real characters.
+    /// Swallowing those would break `@` and `\` for those users.
+    #[test]
+    fn ctrl_alt_still_types_the_character() {
+        let mut altgr = ctrl('@');
+        altgr.modifiers |= KeyModifiers::ALT;
+        assert_eq!(TuiAction::from_key_event(altgr), TuiAction::InputChar('@'));
     }
 
     #[test]

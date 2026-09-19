@@ -126,6 +126,12 @@ config · `Ctrl+R` resume · `Ctrl+Q` quit.
 While an approval or question prompt is up, typing goes to the prompt rather
 than the composer.
 
+Any *other* control chord does nothing. It used to type its bare letter —
+`Ctrl+U` put a `u` in the draft — because the key map's catch-all arm saw a
+`Char` and never looked at the modifier. `Ctrl+Alt` is deliberately exempt:
+that is AltGr on several keyboard layouts, where it types real characters
+(`@`, `\`, `|`), and swallowing those would be the worse bug.
+
 ## Key Types
 
 ```rust
