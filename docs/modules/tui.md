@@ -57,6 +57,21 @@ side, which is what makes the terminal's own scroll and selection work.
   inline viewport's height cannot change after construction, so overflow is the
   transcript's problem, not the layout's). Bottom-up row allocation keeps it
   sane at any terminal size.
+
+  The status row above the composer doubles as the run indicator while a turn
+  is in flight — a rotating word (`state.rs`'s `SPINNER_WORDS`, re-rolled per
+  run, one word every 2.5s) plus a parenthetical that carries the *real*
+  information: elapsed time and the phase, which is `thinking`, `responding`,
+  or the name of the tool in flight (`RunPhase`, set from the event stream). A
+  tool's name comes back down when its result lands — the wait that follows is
+  not labelled with a call that already finished.
+
+  Token totals appear only once the turn ends, because usage rides on
+  `chat.final` and no delta carries it; there is no honest mid-stream count to
+  show. The completed turn's total stays on screen until the next one
+  completes. While running, the row drops the server version to stay inside 80
+  columns — the tail it would otherwise push off is the session id. A
+  *disconnected* connection still speaks up mid-run; that is not noise.
 - **`ui/blocks.rs`** — transcript lines and gateway history → styled lines.
 - **`gateway_calls.rs`** — every WS call the TUI makes, once, with the payload
   shapes the gateway actually serves, plus parser tests written against real

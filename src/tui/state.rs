@@ -64,6 +64,44 @@ pub enum LiveMode {
     Ask,
 }
 
+/// What the in-flight turn is doing, shown as the status row's phase hint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RunPhase {
+    /// Sent, waiting on the first token.
+    #[default]
+    Waiting,
+    /// Reasoning deltas are arriving.
+    Thinking,
+    /// Answer deltas are arriving.
+    Responding,
+    /// A tool call is in flight.
+    ToolCall(String),
+}
+
+/// Whimsical verbs for the running status row. The word rotates slowly so the
+/// row feels alive without flickering; the *phase* next to it carries the
+/// real information.
+const SPINNER_WORDS: &[&str] = &[
+    "Puzzling",
+    "Thinking",
+    "Cooking",
+    "Brewing",
+    "Noodling",
+    "Tinkering",
+    "Mulling",
+    "Scheming",
+    "Churning",
+    "Pondering",
+];
+
+/// How long one spinner word stays before the next rotates in.
+const WORD_ROTATE_MS: u128 = 2_500;
+
+/// The word for a given rotation offset and elapsed run time.
+fn spinner_word_at(offset: usize, elapsed_ms: u128) -> &'static str {
+    SPINNER_WORDS[(offset + (elapsed_ms / WORD_ROTATE_MS) as usize) % SPINNER_WORDS.len()]
+}
+
 /// What the connection dropped in the middle of.
 ///
 /// Kept so a reconnect can say what actually *happened* to the work in flight,
@@ -180,6 +218,13 @@ pub struct AppState {
     pub queued: VecDeque<String>,
     /// When the current run started, for the elapsed counter.
     pub run_started: Option<Instant>,
+    /// What the in-flight turn is doing right now.
+    pub run_phase: RunPhase,
+    /// Rotation offset for the spinner word, re-rolled on every run.
+    pub word_offset: usize,
+    /// Total tokens the last completed turn used, shown until the next one
+    /// completes — usage only arrives with `chat.final`, never mid-stream.
+    pub last_turn_tokens: Option<u64>,
     /// Spinner frame counter.
     pub spinner: u8,
     /// Transient status text + when it was set (expires on its own).
@@ -219,6 +264,9 @@ impl Default for AppState {
             is_running: false,
             queued: VecDeque::new(),
             run_started: None,
+            run_phase: RunPhase::default(),
+            word_offset: 0,
+            last_turn_tokens: None,
             spinner: 0,
             status: None,
             dirty: true,
@@ -446,12 +494,24 @@ impl AppState {
     pub fn begin_run(&mut self) {
         self.is_running = true;
         self.run_started = Some(Instant::now());
+        self.run_phase = RunPhase::Waiting;
+        // Re-roll the word each run, without pulling in an RNG for it.
+        self.word_offset = now_millis() as usize % SPINNER_WORDS.len();
     }
 
     /// Note that the current run ended.
     pub fn end_run(&mut self) {
         self.is_running = false;
         self.run_started = None;
+    }
+
+    /// The whimsical verb for the running status row, rotating slowly.
+    pub fn spinner_word(&self) -> &'static str {
+        let elapsed = self
+            .run_started
+            .map(|t| t.elapsed().as_millis())
+            .unwrap_or(0);
+        spinner_word_at(self.word_offset, elapsed)
     }
 
     /// Queue a message to send when the current turn ends.
@@ -787,5 +847,27 @@ mod tests {
             server_version: "0.3.6".to_string(),
         };
         assert!(s.has_scope("write"));
+    }
+
+    #[test]
+    fn the_spinner_word_holds_then_rotates() {
+        let first = spinner_word_at(0, 0);
+        assert_eq!(spinner_word_at(0, WORD_ROTATE_MS - 1), first, "no flicker mid-window");
+        assert_ne!(spinner_word_at(0, WORD_ROTATE_MS), first, "rotates at the boundary");
+        // The offset re-rolled per run changes where the rotation starts.
+        assert_ne!(spinner_word_at(1, 0), first, "a different run, a different word");
+    }
+
+    #[test]
+    fn begin_run_resets_the_phase_and_rolls_a_word() {
+        let mut s = AppState {
+            run_phase: RunPhase::ToolCall("shell".into()),
+            ..AppState::default()
+        };
+        s.begin_run();
+        assert_eq!(s.run_phase, RunPhase::Waiting);
+        assert!(s.word_offset < SPINNER_WORDS.len());
+        // A running turn always has a word to show.
+        assert!(SPINNER_WORDS.contains(&s.spinner_word()));
     }
 }

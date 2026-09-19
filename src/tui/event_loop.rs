@@ -31,7 +31,7 @@ use crate::tui::input::InputSource;
 use crate::tui::resume;
 use crate::tui::retry::Backoff;
 use crate::tui::scrollback;
-use crate::tui::state::{AppState, AskPrompt, ConnectionState, Interruption, LiveMode};
+use crate::tui::state::{AppState, AskPrompt, ConnectionState, Interruption, LiveMode, RunPhase};
 use crate::tui::transcript::{LineKind, TranscriptLine};
 use crate::tui::ui::{blocks, live};
 use crate::tui::ws_client::{ClientEvent, WsClient, WsMessage};
@@ -1123,6 +1123,7 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
         "chat.delta" => {
             let content = payload["content"].as_str().unwrap_or_default();
             let mut s = state.write().await;
+            s.run_phase = RunPhase::Responding;
             s.transcript
                 .push_delta(STREAM_ASSISTANT, LineKind::Assistant, content);
             s.dirty = true;
@@ -1130,6 +1131,7 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
         "agent.thinking" => {
             let content = payload["content"].as_str().unwrap_or_default();
             let mut s = state.write().await;
+            s.run_phase = RunPhase::Thinking;
             s.transcript
                 .push_delta(STREAM_THINKING, LineKind::Reasoning, content);
             s.dirty = true;
@@ -1144,6 +1146,7 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
                 .cloned()
                 .or_else(|| payload.get("args").filter(|v| !v.is_null()).cloned());
             let mut s = state.write().await;
+            s.run_phase = RunPhase::ToolCall(tool.clone());
             s.transcript.push(tool_call_lines(&tool, args.as_ref()));
             s.dirty = true;
         }
@@ -1158,6 +1161,10 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
                 None => format!("  ↳ {tool}: done"),
             };
             let mut s = state.write().await;
+            // The tool is done; whatever runs next has not started saying
+            // anything yet. Leaving the name up would label the wait with a
+            // call that already finished.
+            s.run_phase = RunPhase::Waiting;
             s.transcript
                 .push(vec![TranscriptLine::new(LineKind::ToolResult, text)]);
             s.dirty = true;
@@ -1169,6 +1176,11 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
                 s.transcript.finish_stream(STREAM_THINKING, None);
                 s.transcript
                     .finish_stream(STREAM_ASSISTANT, response.as_deref());
+                // Usage only ever arrives here, never mid-stream — keep it
+                // until the next turn replaces it.
+                if let Some(tokens) = payload["usage"]["total_tokens"].as_u64() {
+                    s.last_turn_tokens = Some(tokens);
+                }
                 s.end_run();
                 s.dirty = true;
             }
@@ -2829,6 +2841,80 @@ mod tests {
         let s = state.read().await;
         assert_eq!(s.approvals.len(), 1, "our approval prompts");
         assert_eq!(s.live_mode, LiveMode::Approval);
+    }
+
+    /// The phase hint tracks what is actually arriving, and the turn's token
+    /// total is kept once it lands.
+    ///
+    /// Usage only ever rides on `chat.final` — no delta carries it — so the
+    /// status row can show tokens for the turn that just ended but never a
+    /// running count mid-stream. This pins both halves of that.
+    #[tokio::test]
+    async fn the_run_phase_follows_the_events_and_the_tokens_land_at_the_end() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        for (name, payload, expected) in [
+            (
+                "agent.thinking",
+                serde_json::json!({ "session_id": "s1", "content": "hm" }),
+                RunPhase::Thinking,
+            ),
+            (
+                "chat.delta",
+                serde_json::json!({ "session_id": "s1", "content": "hi" }),
+                RunPhase::Responding,
+            ),
+            (
+                "tool.calling",
+                serde_json::json!({ "session_id": "s1", "tool_name": "file_read" }),
+                RunPhase::ToolCall("file_read".to_string()),
+            ),
+            // The call finished; the wait that follows is not labelled with it.
+            (
+                "tool.result",
+                serde_json::json!({ "session_id": "s1", "tool_name": "file_read" }),
+                RunPhase::Waiting,
+            ),
+        ] {
+            handle_event(event(name, payload), &state, &mut client).await;
+            assert_eq!(state.read().await.run_phase, expected, "after {name}");
+        }
+
+        handle_event(
+            event(
+                "chat.final",
+                serde_json::json!({
+                    "session_id": "s1",
+                    "response": "done\n",
+                    "usage": { "total_tokens": 20_600 },
+                }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+        assert_eq!(state.read().await.last_turn_tokens, Some(20_600));
+    }
+
+    /// A turn with no usage payload must not invent one, and must not wipe a
+    /// total a previous turn reported.
+    #[tokio::test]
+    async fn a_turn_without_usage_leaves_the_last_total_alone() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+        state.write().await.last_turn_tokens = Some(1_234);
+
+        handle_event(
+            event("chat.final", serde_json::json!({ "session_id": "s1", "response": "done\n" })),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        assert_eq!(state.read().await.last_turn_tokens, Some(1_234));
     }
 
     /// An `ask.required` event, optionally with a default.

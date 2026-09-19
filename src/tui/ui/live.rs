@@ -14,7 +14,7 @@ use ratatui::Frame;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::state::{AppState, LiveMode};
+use crate::tui::state::{AppState, LiveMode, RunPhase};
 use crate::tui::ui::blocks;
 use crate::tui::ui::wrap as wrapmod;
 use crate::tui::ui::{dim_style, highlight_style, prompt_style, status_error_style, status_style};
@@ -110,11 +110,51 @@ fn input_rows(state: &AppState, width: u16) -> Vec<Line<'static>> {
     wrapmod::wrap_lines(&[Line::from(state.input_buffer.clone())], width as usize)
 }
 
+/// `1m 23s` past a minute, bare seconds below it.
+fn format_elapsed(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `20.6k` past a thousand, the raw number below it.
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// The one-line status row.
 fn status_text(state: &AppState) -> (String, bool) {
-    let mut parts: Vec<String> = vec![state.connection.label()];
+    let mut parts: Vec<String> = Vec::new();
+    // A running row is longer than an idle one, and what it pushes off the end
+    // is the session id. The server version is the least useful thing here and
+    // does not change mid-session, so it yields the space. A connection that is
+    // *not* fine still speaks up: that is not noise.
+    if !state.is_running || !state.connection.is_connected() {
+        parts.push(state.connection.label());
+    }
     if let Some(secs) = state.run_elapsed_secs() {
-        parts.push(format!("running {secs}s — esc to stop"));
+        // The word is whimsy; the parenthetical is the truth.
+        let mut detail = format_elapsed(secs);
+        match &state.run_phase {
+            RunPhase::Waiting => {}
+            RunPhase::Thinking => detail.push_str(" · thinking"),
+            RunPhase::Responding => detail.push_str(" · responding"),
+            RunPhase::ToolCall(name) => {
+                detail.push_str(&format!(" · ⚙ {name}"));
+            }
+        }
+        parts.push(format!("{}… ({detail}) — esc stops", state.spinner_word()));
+    }
+    if !state.is_running {
+        if let Some(tokens) = state.last_turn_tokens {
+            parts.push(format!("↓ {} tokens", format_tokens(tokens)));
+        }
     }
     if let Some(agent) = state.current_agent_info() {
         parts.push(format!("{} {}", agent.emoji, agent.display_name));
@@ -373,6 +413,72 @@ mod tests {
     fn session_ids_are_shortened_for_the_status_row() {
         assert_eq!(short_session("tui:anonymous"), "sess anonymous");
         assert_eq!(short_session("tui:1234567890abcdef"), "sess 1234567890ab");
+    }
+
+    #[test]
+    fn elapsed_and_tokens_format_for_the_status_row() {
+        assert_eq!(format_elapsed(3), "3s");
+        assert_eq!(format_elapsed(83), "1m 23s");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(20_600), "20.6k");
+    }
+
+    #[test]
+    fn a_running_turn_shows_the_word_the_time_and_the_phase() {
+        let mut state = AppState::default();
+        state.begin_run();
+
+        state.run_phase = RunPhase::Thinking;
+        let (text, _) = status_text(&state);
+        assert!(text.contains('…'), "the whimsical word, trailing dots: {text}");
+        assert!(text.contains("(0s · thinking)"), "elapsed plus phase: {text}");
+        assert!(text.contains("esc stops"), "the way out is still labelled: {text}");
+
+        state.run_phase = RunPhase::ToolCall("file_read".into());
+        let (text, _) = status_text(&state);
+        assert!(text.contains("⚙ file_read"), "the tool in flight: {text}");
+
+        // A turn that has only just been sent says nothing beyond the time.
+        state.run_phase = RunPhase::Waiting;
+        let (text, _) = status_text(&state);
+        assert!(text.contains("(0s)"), "no phase hint while waiting: {text}");
+    }
+
+    #[test]
+    fn an_idle_row_carries_the_last_turns_tokens() {
+        let mut state = AppState::default();
+        let (text, _) = status_text(&state);
+        assert!(!text.contains("tokens"), "nothing to report yet: {text}");
+
+        state.last_turn_tokens = Some(20_600);
+        let (text, _) = status_text(&state);
+        assert!(text.contains("↓ 20.6k tokens"), "the completed turn's meter: {text}");
+    }
+
+    /// The row has to survive a plain 80-column terminal, which is the narrow
+    /// case that matters: the run indicator is the longest thing that can
+    /// appear in it, and a row that overflows loses its *tail* — the session
+    /// id — which is exactly what a user goes looking for.
+    #[test]
+    fn the_running_row_fits_an_eighty_column_terminal() {
+        let mut state = AppState {
+            connection: ConnectionState::Connected {
+                features: vec![],
+                scopes_granted: vec![],
+                server_version: "0.3.6".into(),
+            },
+            current_session: Some("tui:1234567890abcdef".into()),
+            current_agent: Some("secretary".into()),
+            ..AppState::default()
+        };
+        state.begin_run();
+        state.run_phase = RunPhase::ToolCall("file_read".into());
+        let (text, _) = status_text(&state);
+        assert!(
+            UnicodeWidthStr::width(text.as_str()) <= 80,
+            "the running row is {} columns: {text}",
+            UnicodeWidthStr::width(text.as_str())
+        );
     }
 
     #[test]
