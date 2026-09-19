@@ -43,6 +43,18 @@ import type {
 export type * from "./transportTypes";
 export * from "./transportTypes";
 
+/**
+ * What the ticket exchange said.
+ *
+ * `unsupported` means the gateway has no such route and is the only outcome
+ * that permits falling back to the token in the URL; `failed` means the
+ * exchange exists and refused, which must not.
+ */
+type TicketResult =
+  | { kind: "ticket"; value: string }
+  | { kind: "unsupported" }
+  | { kind: "failed"; reason: string };
+
 export class SyscityWebSocketTransport implements ChatModelAdapter {
   private ws: WebSocket | null = null;
   private reqId = 0;
@@ -229,6 +241,11 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     this.statusListeners.forEach((cb) => cb(status));
   }
 
+  /**
+   * What the ticket exchange said — see `fetchTicket`.
+   *
+   * `unsupported` is the only outcome that permits the URL-token fallback.
+   */
   private generateId(): string {
     return "dev_" + Math.random().toString(36).slice(2, 10);
   }
@@ -236,22 +253,32 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
   /**
    * A single-use upgrade ticket, if the gateway will mint one.
    *
-   * Returns `null` when the exchange is unavailable, so the caller can fall
-   * back to putting the token in the URL — the behaviour this replaces.
+   * The three outcomes are kept apart on purpose. Only a gateway too old to
+   * have the route may fall back to putting the token in the URL; a *failed*
+   * exchange must not, because that would put the credential in the URL at
+   * exactly the moment it is already being refused. The caller decides.
    */
-  private async fetchTicket(): Promise<string | null> {
-    if (!this.gatewayToken) return null;
+  private async fetchTicket(): Promise<TicketResult> {
+    if (!this.gatewayToken) return { kind: "unsupported" };
+    let res: Response;
     try {
-      const res = await fetch(`${getGatewayBase()}/api/v1/ws-ticket`, {
+      res = await fetch(`${getGatewayBase()}/api/v1/ws-ticket`, {
         method: "POST",
         headers: { Authorization: `Bearer ${this.gatewayToken}` },
       });
-      if (!res.ok) return null;
-      const body = (await res.json()) as { ticket?: string };
-      return body.ticket ?? null;
-    } catch {
-      return null;
+    } catch (e) {
+      return { kind: "failed", reason: e instanceof Error ? e.message : "network error" };
     }
+    // No such route: a gateway from before the exchange existed, which is the
+    // one case the URL token is still kept for.
+    if (res.status === 404 || res.status === 405 || res.status === 501) {
+      return { kind: "unsupported" };
+    }
+    if (!res.ok) return { kind: "failed", reason: `HTTP ${res.status}` };
+    const body = (await res.json().catch(() => null)) as { ticket?: string } | null;
+    return body?.ticket
+      ? { kind: "ticket", value: body.ticket }
+      : { kind: "failed", reason: "the response carried no ticket" };
   }
 
   private async connect() {
@@ -286,13 +313,24 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     // 30 s, where the token in a URL lives in devtools, proxy logs and anything
     // that copies a URL. The exchange happens over HTTP, where headers work.
     const ticket = await this.fetchTicket();
+    if (ticket.kind === "failed") {
+      // Refuse this attempt rather than downgrade. The token would go into the
+      // URL, and the connect frame still carries it, so this is not a lost
+      // connection — it is one that retries the same way every other failed
+      // attempt does, with the credential left where it belongs.
+      console.warn(`WebSocket ticket unavailable: ${ticket.reason}`);
+      this.setStatus("disconnected");
+      this.scheduleReconnect();
+      return;
+    }
     if (this.gatewayToken) {
       const sep = url.includes("?") ? "&" : "?";
-      url = ticket
-        ? `${url}${sep}ticket=${encodeURIComponent(ticket)}`
-        : // Older gateway without the exchange, or the POST failed: the token
-          // still works, and the connect frame carries it as well.
-          `${url}${sep}token=${encodeURIComponent(this.gatewayToken)}`;
+      url =
+        ticket.kind === "ticket"
+          ? `${url}${sep}ticket=${encodeURIComponent(ticket.value)}`
+          : // Older gateway without the exchange: the token still works, and
+            // the connect frame carries it as well.
+            `${url}${sep}token=${encodeURIComponent(this.gatewayToken)}`;
     }
 
     this.gatewayUrl = url;

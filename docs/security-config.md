@@ -111,6 +111,12 @@ Clients present the token in any of these ways (any one suffices):
   `ws://host:18080/ws?token=<token>`. The token therefore still appears in URLs
   for those clients — prefer the ticket — and the gateway redacts credential
   parameters from its own log lines (`gateway/middleware.rs::redact_uri`).
+
+  The web client reaches for this fallback only when the gateway has no
+  exchange at all (a 404/405/501 from `/api/v1/ws-ticket`). A *refused*
+  exchange — a rejected credential, a network fault — refuses the connection
+  and retries on the normal backoff instead, because falling back would put
+  the token in a URL at exactly the moment it is already being declined.
 - **ACP `connect` handshake:** `params.auth.token = "<token>"`
 
 The TUI client passes it directly:
