@@ -66,6 +66,25 @@ impl Running {
         }
     }
 
+    /// Wait until the TUI has written anything past `from`.
+    ///
+    /// The assertion a resize needs: something was drawn, without asking for a
+    /// particular string — the TUI's own repaint is the evidence.
+    async fn expect_growth(&self, from: usize, why: &str) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if self.snapshot().len() > from {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no output past byte {from} ({why}): {:?}",
+                plain(&self.snapshot())
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     fn snapshot(&self) -> Vec<u8> {
         self.output.lock().expect("output").clone()
     }
@@ -539,19 +558,16 @@ async fn a_resize_redraws_within_the_new_bounds() {
     // only what the TUI emits after the resize may be judged against 40.
     let resized_at = tui.snapshot().len();
     tui.resize(24, 40);
-    // Force a post-resize frame with something in every region: the composer
-    // has content, the block area has the completion list, the status row is
-    // up. Everything visible is a redraw at the new width.
-    //
-    // The wait is on the *prompt and the slash*, not on a particular command.
-    // Which candidates the window shows depends on the gateway's catalog, and
-    // this test is about geometry — `a_slash_shows_command_hints` is the one
-    // that asserts the list itself. The slash still raises the list, so the
-    // frame below is drawn with it.
-    tui.feed("/");
-    tui.expect_output("> /", "the composer redrawn at the new width")
+
+    // The resize alone has to produce the frame: a resize arrives as SIGWINCH,
+    // which the loop turns into a dirty mark and a draw. Waiting on *that* —
+    // rather than on a keystroke drawn afterwards — keeps this test about
+    // geometry. A key press would drag in crossterm's cursor-position query,
+    // which shares an event queue with `event::poll` (crossterm documents that
+    // they block each other) and made this test flaky on CI for reasons that
+    // had nothing to do with the width.
+    tui.expect_growth(resized_at, "a frame at the new width")
         .await;
-    assert!(tui.snapshot().len() > resized_at, "the resize produced a fresh frame");
 
     let raw = tui.snapshot();
     let overruns: Vec<u16> = cursor_columns(&raw[resized_at..])
