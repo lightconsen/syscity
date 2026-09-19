@@ -197,6 +197,10 @@ pub struct AppState {
     /// The fresh line stashed when history browsing started, restored on the
     /// way back down.
     pub history_draft: String,
+    /// Oldest message timestamp (ms) shown for the current session — the
+    /// cursor `/history more` pages backwards from. `None` until a history
+    /// load lands, and reset when the session changes.
+    pub history_oldest_ms: Option<i64>,
     /// Which prompt owns the input area.
     pub live_mode: LiveMode,
     /// Approvals awaiting a decision, oldest first.
@@ -253,6 +257,7 @@ impl Default for AppState {
             input_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            history_oldest_ms: None,
             live_mode: LiveMode::default(),
             approvals: VecDeque::new(),
             approval_approve_selected: true,

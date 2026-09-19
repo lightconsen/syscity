@@ -132,6 +132,8 @@ async fn command_new(
     // Anything queued belongs to the session being left behind.
     let dropped = s.clear_queue();
     s.transcript.reset();
+    // A fresh session has no older pages to walk back to.
+    s.history_oldest_ms = None;
     s.transcript
         .push_notice(format!("── new session {session_id} ──"));
     if dropped > 0 {
@@ -215,7 +217,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("clear", "", "clear the conversation context"),
         ("resume", "[n|id]", "list sessions, or switch to one"),
         ("sessions", "", "list sessions"),
-        ("history", "[n]", "print more of this conversation"),
+        ("history", "[n|more]", "print more of this conversation"),
         ("rename", "<name>", "rename the current session"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
@@ -257,33 +259,19 @@ const HISTORY_MAX: usize = 2000;
 /// What `/history` prints with no argument.
 const HISTORY_DEFAULT: usize = 200;
 
-/// `/history [n]` — print this conversation again, oldest first.
+/// `/history [n|more]` — print this conversation again, oldest first.
 ///
 /// The scrollback is append-only and top-anchored: there is nowhere to put
-/// messages older than what is already printed, so "load more" reprints the
-/// window in reading order under a rule rather than splicing it into the
-/// middle of the transcript.
+/// messages older than what is already printed, so paging reprints the window
+/// in reading order under a rule rather than splicing it into the middle of
+/// the transcript. `more` walks backwards from the oldest message shown so
+/// far (the gateway's `before` cursor); a number reprints the newest `n`.
 async fn command_history(
     args: &str,
     state: Arc<RwLock<AppState>>,
     ws: &WsClient,
 ) -> Result<(), TuiError> {
     let requested = args.trim();
-    let limit = if requested.is_empty() {
-        HISTORY_DEFAULT
-    } else {
-        match requested.parse::<usize>() {
-            Ok(n) if n > 0 => n.min(HISTORY_MAX),
-            _ => {
-                state
-                    .write()
-                    .await
-                    .transcript
-                    .push_notice(format!("⚠ usage: /history [1-{HISTORY_MAX}]"));
-                return Ok(());
-            }
-        }
-    };
 
     let Some(session) = state.read().await.current_session.clone() else {
         state
@@ -294,7 +282,27 @@ async fn command_history(
         return Ok(());
     };
 
-    let (messages, has_more) = gw::chat_history(ws, &session, limit).await?;
+    if requested == "more" {
+        return command_history_more(state, ws, &session).await;
+    }
+
+    let limit = if requested.is_empty() {
+        HISTORY_DEFAULT
+    } else {
+        match requested.parse::<usize>() {
+            Ok(n) if n > 0 => n.min(HISTORY_MAX),
+            _ => {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("⚠ usage: /history [1-{HISTORY_MAX}|more]"));
+                return Ok(());
+            }
+        }
+    };
+
+    let (messages, has_more) = gw::chat_history(ws, &session, limit, None).await?;
     let mut lines = vec![blocks::rule(&format!(
         "history: {} message(s)",
         messages.len()
@@ -303,11 +311,64 @@ async fn command_history(
         // Older than the window, so it goes above the messages below.
         lines.push(TranscriptLine::new(
             LineKind::Notice,
-            format!("… older messages omitted — /history {HISTORY_MAX} asks for more"),
+            "… older messages omitted — /history more pages back".to_string(),
+        ));
+    }
+    let oldest = messages.iter().filter_map(|m| m.timestamp_ms).min();
+    lines.extend(blocks::history_lines(&messages));
+    let mut s = state.write().await;
+    // A wide reprint may reach further back than whatever was shown before.
+    s.history_oldest_ms = match (s.history_oldest_ms, oldest) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    s.transcript.push(lines);
+    Ok(())
+}
+
+/// `/history more` — the page older than the oldest message shown so far.
+async fn command_history_more(
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+    session: &str,
+) -> Result<(), TuiError> {
+    let oldest = state.read().await.history_oldest_ms;
+    let Some(before) = oldest else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no history loaded yet — /history prints the newest page first");
+        return Ok(());
+    };
+
+    let (messages, has_more) = gw::chat_history(ws, session, HISTORY_DEFAULT, Some(before)).await?;
+    if messages.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("… no older messages — the beginning of the conversation");
+        return Ok(());
+    }
+
+    let page_oldest = messages.iter().filter_map(|m| m.timestamp_ms).min();
+    let mut lines = vec![blocks::rule(&format!(
+        "history: {} older message(s)",
+        messages.len()
+    ))];
+    if has_more {
+        lines.push(TranscriptLine::new(
+            LineKind::Notice,
+            "… still older messages — /history more again".to_string(),
         ));
     }
     lines.extend(blocks::history_lines(&messages));
-    state.write().await.transcript.push(lines);
+    let mut s = state.write().await;
+    if let Some(ts) = page_oldest {
+        s.history_oldest_ms = Some(ts);
+    }
+    s.transcript.push(lines);
     Ok(())
 }
 
@@ -723,6 +784,74 @@ mod tests {
             })
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "oldest first: {positions:?}");
+    }
+
+    /// `/history more` pages backwards from the oldest message shown, and
+    /// stops cleanly at the beginning of the conversation.
+    #[tokio::test]
+    async fn history_more_walks_backwards_to_the_beginning() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+        gateway.with_history(
+            (0..10)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("msg_{i}"),
+                        "role": "user",
+                        "content": format!("message {i}"),
+                        "timestamp": 1_757_000_000_000_i64 + i * 1000,
+                    })
+                })
+                .collect(),
+        );
+
+        // `/history 5` loads the newest five and marks the cursor.
+        command_history("5", Arc::clone(&state), &client)
+            .await
+            .expect("first page");
+        let _ = output(&state).await;
+        assert_eq!(
+            state.read().await.history_oldest_ms,
+            Some(1_757_000_005_000),
+            "the cursor is message 5's timestamp"
+        );
+
+        command_history("more", Arc::clone(&state), &client)
+            .await
+            .expect("older page");
+        let lines = output(&state).await;
+        assert!(
+            lines.iter().any(|l| l.contains("older message(s)")),
+            "announced as older: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.ends_with("message 0")), "reached the start: {lines:?}");
+        assert_eq!(state.read().await.history_oldest_ms, Some(1_757_000_000_000));
+
+        // The next `more` is past the beginning: a notice, not empty rules.
+        command_history("more", Arc::clone(&state), &client)
+            .await
+            .expect("past the beginning");
+        let lines = output(&state).await;
+        assert!(
+            lines.iter().any(|l| l.contains("no older messages")),
+            "the end is said, not blank: {lines:?}"
+        );
+    }
+
+    /// `more` with nothing loaded yet points at `/history` instead of
+    /// inventing a cursor.
+    #[tokio::test]
+    async fn history_more_without_a_cursor_asks_for_a_first_page() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        command_history("more", Arc::clone(&state), &client)
+            .await
+            .expect("no cursor");
+        let lines = output(&state).await;
+        assert!(lines.iter().any(|l| l.contains("no history loaded yet")), "got {lines:?}");
     }
 
     /// `/new` does not hold the state lock across the gateway.

@@ -691,7 +691,7 @@ async fn reconcile_after_reconnect(
     let Some(interrupted) = interrupted else {
         return;
     };
-    let messages = match gw::chat_history(client, session, RECONCILE_TAIL).await {
+    let messages = match gw::chat_history(client, session, RECONCILE_TAIL, None).await {
         Ok((messages, _)) => messages,
         Err(e) => {
             state

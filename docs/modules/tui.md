@@ -111,7 +111,7 @@ side, which is what makes the terminal's own scroll and selection work.
 | `/new [agent]` | Start a new session, optionally bound to an agent |
 | `/resume [n\|id]` | List sessions, or switch to one |
 | `/sessions` | List sessions |
-| `/history [n]` | Reprint this conversation, oldest first (default 200, max 2000) |
+| `/history [n\|more]` | Reprint this conversation, oldest first (default 200, max 2000); `more` pages backwards |
 | `/rename <name>` | Rename the current session |
 | `/pin` | Pin or unpin the current session |
 | `/agents` | List agents |
@@ -259,8 +259,12 @@ behind whatever command is running — the worse trade of the two.
 - Tool output is truncated (6–8 lines with an ellipsis), not collapsible.
 - Resuming reprints the last 100 messages. The scrollback is append-only and
   top-anchored, so older messages cannot be spliced in above what is already
-  printed — `/history [n]` reprints a longer window (up to 2000) in reading
-  order below a rule instead.
+  printed — history is paged, never spliced. `/history [n]` reprints a window
+  (up to 2000) in reading order under a rule, and `/history more` asks the
+  gateway for the page strictly older than the oldest message shown so far
+  (its `before` cursor, a timestamp). The cursor lives in
+  `AppState::history_oldest_ms`, is reset when the session changes, and a
+  `more` with nothing loaded says so rather than guessing.
 - `/clear` resets the conversation context; it cannot unprint what the terminal
   has already scrolled past, and it says so.
 - Frozen lines are wrapped at the width they were written with. Resizing the

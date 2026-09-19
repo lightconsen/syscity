@@ -122,21 +122,26 @@ pub async fn switch_to(
             .iter()
             .find(|x| x.id == id)
             .and_then(|x| x.agent_id.clone());
+        // The new session's cursor is unknown until its history lands below.
+        s.history_oldest_ms = None;
         s.transcript
             .push(vec![blocks::rule(&format!("resumed {id}"))]);
     }
 
-    match gw::chat_history(ws, id, 100).await {
+    match gw::chat_history(ws, id, 100, None).await {
         Ok((messages, has_more)) => {
             let mut lines = Vec::new();
             if has_more {
                 lines.push(crate::tui::transcript::TranscriptLine::new(
                     LineKind::Notice,
-                    "… older messages omitted — /history prints more",
+                    "… older messages omitted — /history more prints them",
                 ));
             }
+            let oldest = messages.iter().filter_map(|m| m.timestamp_ms).min();
             lines.extend(blocks::history_lines(&messages));
-            state.write().await.transcript.push(lines);
+            let mut s = state.write().await;
+            s.history_oldest_ms = oldest;
+            s.transcript.push(lines);
         }
         Err(e) => {
             state

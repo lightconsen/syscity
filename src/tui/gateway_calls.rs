@@ -254,20 +254,22 @@ pub async fn sessions_reset(ws: &WsClient, id: &str) -> Result<(), TuiError> {
 
 /// Load a session's message history, oldest first, up to `limit` messages.
 ///
-/// The gateway's `limit` is not capped — `chat.history` answers with the
-/// newest `limit` messages — so one request is a whole window and there is
-/// nothing to page. (Its `before` cursor exists, but is for a caller that
-/// wants to walk backwards itself.) The second return value is the gateway's
-/// `has_more`: true whenever the window came back full, which is a page-size
-/// heuristic rather than a count of what is left.
+/// `before` is the gateway's pagination cursor (a timestamp in milliseconds):
+/// only messages strictly older than it come back. `None` asks for the newest
+/// page. The second return value is the gateway's `has_more`: true whenever
+/// the window came back full, which is a page-size heuristic rather than a
+/// count of what is left.
 pub async fn chat_history(
     ws: &WsClient,
     session_id: &str,
     limit: usize,
+    before: Option<i64>,
 ) -> Result<(Vec<HistoryMessage>, bool), TuiError> {
-    let value = ws
-        .request("chat.history", Some(json!({ "session_id": session_id, "limit": limit })))
-        .await?;
+    let mut params = json!({ "session_id": session_id, "limit": limit });
+    if let Some(before) = before {
+        params["before"] = json!(before);
+    }
+    let value = ws.request("chat.history", Some(params)).await?;
     Ok(parse_history(&value))
 }
 
@@ -516,7 +518,9 @@ mod tests {
         let mut client = connect(&gateway).await;
         gateway.with_history(scripted(500));
 
-        let (messages, has_more) = chat_history(&mut client, "s1", 300).await.expect("history");
+        let (messages, has_more) = chat_history(&mut client, "s1", 300, None)
+            .await
+            .expect("history");
 
         assert_eq!(messages.len(), 300);
         assert!(has_more, "a full window may have older messages behind it");
@@ -532,7 +536,7 @@ mod tests {
         let mut client = connect(&gateway).await;
         gateway.with_history(scripted(30));
 
-        let (messages, has_more) = chat_history(&mut client, "s1", 2000)
+        let (messages, has_more) = chat_history(&mut client, "s1", 2000, None)
             .await
             .expect("history");
 
@@ -548,10 +552,36 @@ mod tests {
         let gateway = TestGateway::start().await;
         let mut client = connect(&gateway).await;
 
-        let (messages, has_more) = chat_history(&mut client, "s1", 500).await.expect("history");
+        let (messages, has_more) = chat_history(&mut client, "s1", 500, None)
+            .await
+            .expect("history");
 
         assert!(messages.is_empty());
         assert!(!has_more);
+    }
+
+    /// The `before` cursor walks backwards: a page asked for with it contains
+    /// only strictly-older messages, and nothing from the first page repeats.
+    #[tokio::test]
+    async fn a_before_cursor_pages_backwards() {
+        let gateway = TestGateway::start().await;
+        let mut client = connect(&gateway).await;
+        gateway.with_history(scripted(500));
+
+        let (first, more) = chat_history(&mut client, "s1", 100, None)
+            .await
+            .expect("first page");
+        assert!(more);
+        let cursor = first[0].timestamp_ms.expect("the page's oldest timestamp");
+
+        let (second, _) = chat_history(&mut client, "s1", 100, Some(cursor))
+            .await
+            .expect("second page");
+
+        assert_eq!(second.len(), 100);
+        assert_eq!(second[0].content, "message 300", "the page before 400..500");
+        let newest_in_second = second[99].timestamp_ms.expect("timestamp");
+        assert!(newest_in_second < cursor, "strictly older, no overlap");
     }
 
     #[test]
