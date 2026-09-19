@@ -78,6 +78,13 @@ side, which is what makes the terminal's own scroll and selection work.
   is being typed (windowed around the Tab selection), taking precedence over
   the stream preview — the typist's attention is on the command.
 
+  The composer's prompt is part of the text it wraps, not a marker painted
+  over it (`wrap_line_hanging` keeps the first `PROMPT` columns unbreakable).
+  Wrapping the buffer alone to the full width gives the first row two columns
+  more than it has, so an input that filled the row exactly lost its last
+  character: the row was drawn without it and the cursor clamped on top of the
+  one before.
+
   The row carries the run and nothing else from it: when the turn ends the
   spinner, the word, the elapsed time and the phase all go, leaving the
   connection, agent and session as before. A token meter was tried here and

@@ -60,6 +60,18 @@ fn width_of(ch: char) -> usize {
 /// does not fit in the last column moves to the next row rather than
 /// overflowing.
 pub fn wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    wrap_line_hanging(line, width, 0)
+}
+
+/// Wrap one line, keeping the first `hang` columns of the first row whole.
+///
+/// A caller that draws a marker in front of the text — the composer's `> ` —
+/// needs the text to wrap *after* that marker, not at the space inside it.
+/// Without this the marker's own space is the last one the row contains when
+/// it fills, so the row ends up holding the marker alone and the text starts
+/// on the next one. `hang` is measured in columns and only applies to the
+/// first row; a wrapped continuation row is ordinary text.
+pub fn wrap_line_hanging(line: &Line<'_>, width: usize, hang: usize) -> Vec<Line<'static>> {
     let chars = cells(line);
     if width == 0 {
         return vec![line_of(&chars)];
@@ -95,8 +107,9 @@ pub fn wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
             last_break = None;
         }
         // A run of leading whitespace is indentation, not a place to break —
-        // otherwise a wrapped code line would break off its own indent.
-        if ch == ' ' && row.iter().any(|(c, _)| !c.is_whitespace()) {
+        // otherwise a wrapped code line would break off its own indent. Nor is
+        // anything inside the hanging prefix, which must stay put.
+        if ch == ' ' && used >= hang && row.iter().any(|(c, _)| !c.is_whitespace()) {
             last_break = Some(row.len() + 1);
         }
         used += w;
@@ -167,6 +180,19 @@ mod tests {
     #[test]
     fn keeps_leading_indentation_of_code_lines() {
         assert_eq!(assert_widths("    indented", 8), vec!["    inde", "nted"]);
+    }
+
+    /// A marker in front of the text must stay attached to the first row.
+    #[test]
+    fn a_hanging_prefix_is_not_a_break_point() {
+        let line = Line::from("> abcdef");
+        // Without the hang the space after `>` is the last one on the row, so
+        // the marker would be left alone and the text pushed down.
+        assert_eq!(assert_widths("> abcdef", 4), vec!["> ", "abcd", "ef"]);
+        let hung = wrap_line_hanging(&line, 4, 2);
+        let rows: Vec<String> = hung.iter().map(text).collect();
+        assert_eq!(rows, vec!["> ab", "cdef"], "the marker keeps its first word");
+        assert!(!rows[0].trim_end().eq(">"), "never the marker alone");
     }
 
     #[test]

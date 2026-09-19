@@ -27,8 +27,8 @@ pub const LIVE_HEIGHT: u16 = 8;
 /// Rows the composer may grow to before it scrolls internally.
 const COMPOSER_MAX_ROWS: u16 = 3;
 
-/// Width of the `> ` prompt marker in front of the first input row.
-const PROMPT_WIDTH: u16 = 2;
+/// The prompt marker in front of the first input row.
+const PROMPT: &str = "> ";
 
 /// Where each part of the live region goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,12 +102,21 @@ pub fn locate_cursor(rows: &[Line<'_>], cursor: usize) -> (usize, usize) {
     (rows.len().saturating_sub(1), 0)
 }
 
-/// Wrap the input buffer to the composer width.
+/// Wrap the input buffer to the composer width, prompt included.
+///
+/// The prompt is part of the first row's text, not a marker painted over it.
+/// Wrapping the buffer alone to the full width hands the first row two columns
+/// more than it has, so an input that fills the width exactly loses its last
+/// character — the row is drawn without it and the cursor clamps on top of the
+/// one before.
 fn input_rows(state: &AppState, width: u16) -> Vec<Line<'static>> {
-    if state.input_buffer.is_empty() {
-        return vec![Line::from("")];
-    }
-    wrapmod::wrap_lines(&[Line::from(state.input_buffer.clone())], width as usize)
+    // Spans, not one string: the wrapper carries each character's style
+    // across the wrap point, so the prompt keeps its own.
+    let line = Line::from(vec![
+        Span::styled(PROMPT, prompt_style()),
+        Span::raw(state.input_buffer.clone()),
+    ]);
+    wrapmod::wrap_line_hanging(&line, width as usize, PROMPT.len())
 }
 
 /// `1m 23s` past a minute, bare seconds below it.
@@ -218,32 +227,21 @@ fn render_composer(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
     let rows = input_rows(state, area.width);
-    let (cursor_row, cursor_col) = locate_cursor(&rows, state.input_cursor);
+    // The cursor is a byte offset into the buffer; the rows carry the prompt
+    // in front of it, so the offset shifts by the prompt's own bytes.
+    let (cursor_row, cursor_col) = locate_cursor(&rows, state.input_cursor + PROMPT.len());
 
     // Keep the cursor's row inside the visible window when the buffer is
     // longer than the composer.
     let max_rows = area.height as usize;
     let start = cursor_row.saturating_sub(max_rows.saturating_sub(1));
-    let visible: Vec<Line<'static>> = rows
-        .iter()
-        .skip(start)
-        .take(max_rows)
-        .enumerate()
-        .map(|(idx, row)| {
-            if start + idx == 0 {
-                let mut spans = vec![Span::styled("> ", prompt_style())];
-                spans.extend(row.spans.iter().cloned());
-                Line::from(spans)
-            } else {
-                row.clone()
-            }
-        })
-        .collect();
+    let visible: Vec<Line<'static>> = rows.iter().skip(start).take(max_rows).cloned().collect();
 
     f.render_widget(Paragraph::new(visible), area);
 
     let row_in_window = cursor_row.saturating_sub(start) as u16;
-    let col = cursor_col as u16 + if cursor_row == 0 { PROMPT_WIDTH } else { 0 };
+    // `cursor_col` is measured over the row as drawn, prompt included.
+    let col = cursor_col as u16;
     f.set_cursor_position(ratatui::layout::Position {
         x: area.x + col.min(area.width.saturating_sub(1)),
         y: area.y + row_in_window.min(area.height.saturating_sub(1)),

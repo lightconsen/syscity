@@ -10,6 +10,7 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Position;
 use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthStr;
 
 use syscity::tui::scrollback;
 use syscity::tui::state::{AppState, ConnectionState, LiveMode};
@@ -42,6 +43,22 @@ fn visible(terminal: &Terminal<TestBackend>) -> String {
         .content
         .iter()
         .map(|c| c.symbol())
+        .collect()
+}
+
+/// The painted screen, one string per row.
+///
+/// A wide character occupies two cells: its glyph and an empty continuation
+/// the buffer reports as a space, so a row's string is wider than what the
+/// terminal draws. Read it for *what is on the row*, not for its width.
+fn visible_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        })
         .collect()
 }
 
@@ -192,6 +209,74 @@ fn the_cursor_follows_the_input() {
     settle(&mut terminal, &mut state);
     let position = terminal.get_cursor_position().expect("a cursor position");
     assert_eq!(position.x, 6, "wide characters take two columns each");
+}
+
+/// A wide character landing on the composer's last column moves to the next
+/// row whole, and the cursor follows it there.
+///
+/// `wrap_line` moves a double-width character that does not fit down to the
+/// next row rather than splitting it, and the cursor is measured in display
+/// columns — so the last column of a row is where a two-column character and
+/// a one-column remainder disagree about who gets the cell. Nine hanzi plus
+/// the two-column prompt fill this composer exactly; the tenth must start a
+/// new row.
+#[test]
+fn a_wide_character_at_the_last_column_wraps_whole() {
+    let width = 20u16;
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, HEIGHT),
+        TerminalOptions {
+            viewport: Viewport::Inline(live::LIVE_HEIGHT),
+        },
+    )
+    .expect("inline terminal");
+    terminal
+        .set_cursor_position(Position::new(0, 0))
+        .expect("cursor home");
+
+    // Eight hanzi + prompt = 18 columns: still the first row.
+    let mut state = AppState {
+        input_buffer: "中".repeat(8),
+        input_cursor: "中".len() * 8,
+        ..AppState::default()
+    };
+    settle(&mut terminal, &mut state);
+    let fits = terminal.get_cursor_position().expect("a cursor position");
+    assert_eq!(fits.x, 18, "16 columns of hanzi after the 2-column prompt");
+    // The composer's bottom row: the region is anchored at row 0, so this is
+    // `LIVE_HEIGHT - 1`, and it is where the composer ends however tall it
+    // grows.
+    let last_row = fits.y as usize;
+
+    // Eight hanzi are a one-row composer: the prompt and the input share it.
+    assert!(
+        visible_rows(&terminal)[last_row].starts_with("> 中"),
+        "the prompt row holds the input: {:?}",
+        visible_rows(&terminal)[last_row]
+    );
+
+    // The ninth fills the row exactly (2 + 18 = 20); the tenth has nowhere to
+    // go on it, so the composer grows a row and the tenth starts it.
+    state.input_buffer = "中".repeat(10);
+    state.input_cursor = "中".len() * 10;
+    settle(&mut terminal, &mut state);
+    let rows = visible_rows(&terminal);
+    assert!(
+        rows[last_row].starts_with('中'),
+        "the tenth hanzi is whole, at the start of its own row: {:?}",
+        rows[last_row]
+    );
+    assert!(
+        !rows[last_row].contains("> "),
+        "and it is not the prompt row: {:?}",
+        rows[last_row]
+    );
+    let wrapped = terminal.get_cursor_position().expect("a cursor position");
+    assert_eq!(
+        (wrapped.x, wrapped.y),
+        (2, last_row as u16),
+        "the cursor is two columns into that row — one whole hanzi, never half of one"
+    );
 }
 
 /// A tiny terminal must not panic the render path.
