@@ -11,6 +11,62 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-09-20
+
+### Highlights
+
+- **The TUI runs inline.** `syscity tui` writes the conversation into the terminal's own scrollback as it arrives and redraws only a small live region at the bottom — composer, status row, blocking prompts. Native scrolling, text selection and copy keep working, and the transcript outlives the client. It is also no longer a one-line-at-a-time thing: output streams and freezes line by line, tool calls and results appear as they happen, approvals and `ask_user` questions take over the bottom of the screen rather than the whole of it, a message typed mid-turn is queued instead of run alongside, and a dropped socket is reconciled against the gateway's history on reconnect.
+- **Browser control can actually interact.** Key combinations, right/middle/double/triple clicks, and drags that move; a screenshot now states the coordinate space it is in and refuses clicks outside it; `escalate` is an explicit way to say the page is not enough.
+- **A pass over every trust boundary.** The gateway trades a long-lived token for a single-use, 30-second upgrade ticket and keeps credentials out of its own log lines; every event carries an audience so one client is not handed another's traffic; scopes are granted from the credential rather than from the request; webhook deliveries are bounded and replayed signatures refused; CORS no longer mirrors the request origin.
+
+### Added
+
+- The TUI's status row doubles as a run indicator: an animated frame, a rotating word, and a parenthetical that carries the real information — elapsed time and whether the turn is thinking, responding, or inside a named tool call. It all goes away when the turn ends.
+- `/history [n]` reprints a window of the conversation in reading order, and `/history more` pages backwards from the oldest message shown using the gateway's `before` cursor — so a session longer than the 100 messages a resume loads is now walkable back to its beginning.
+- The composer lists the matching slash commands while a `/command` is being typed, windowed around the current `Tab` selection.
+- `syscity tui` can run against a piped stdin/stdout as a line protocol: one line in, one turn out, slash commands included. Prompts that need a human are settled rather than left to time out.
+- `feat(browser)`: key combinations with the macOS command that makes them deliverable; right, middle, double and triple clicks; drags that move the pointer.
+- `feat(android)`: a stable code on a failed UI dump, an explicit check for whether the screen shows what was expected, and an observation that still hands over the screenshot when the UI tree could not be read.
+- `feat(tools)`: `requires_approval` now gates a call where there is someone to ask; tools declare whether they can be safely retried; tools that drive one shared target are serialized against each other.
+- `feat(skills)`: `/learn` authors a skill from a source or from this session, and writes where the watcher is already looking.
+- A `...` menu on agent rows in the sidebar — rename, delete, settings.
+- Observed token estimates are recorded beside the provider's own count, so the two can be compared.
+
+### Changed
+
+- One place decides which model a fresh install uses, instead of the default being restated wherever it was needed.
+- Authentication no longer treats cookies as a credential.
+- The TUI's tool output is one transcript line per row and is capped by a row budget: the ellipsis is the last row of the budget, not an extra one. Live previews get five argument rows (leaving room for the `⚙ tool` header in a six-row region); a reprint from history gets eight.
+- The web client refuses a connection rather than putting the gateway token in the URL when the ticket exchange fails for a reason other than the gateway not having one.
+
+### Fixed
+
+- The TUI padded every wide character in scrollback with a blank column, which made Chinese text look sparse and made lines wrap sooner than they should.
+- The composer wrapped its input to the full width while the first row also carried the `> ` prompt, so an input that filled the row exactly lost its last character and the cursor clamped onto the one before it.
+- A control chord that was not bound typed its bare letter — `Ctrl+U` put a `u` in the draft. `Ctrl+Alt` is still typed, because that is AltGr on several layouts.
+- A multi-line tool call or result was packed into a single transcript line; the renderer drops a newline, so it came out as one run-together row, on screen and in scrollback.
+- In line mode, a streamed answer was printed twice, and the line read from stdin was never the line sent.
+- A slash command that failed ended the whole TUI; it is now a line of output.
+- An approval the gateway refused was dropped from the queue, leaving the blocked turn with no way to be unblocked.
+- The run state did not converge when the connection dropped: the status row could spin "running" forever and a prompt could keep the keyboard. In-flight requests now fail as soon as the socket dies rather than after their own timeout.
+- Events were applied without checking which session they belonged to.
+- A keystroke typed while a command was in flight was dropped instead of queued.
+- Gateway calls held the state lock across the round trip, and commands ran inside the event loop, so a slow gateway froze input and redraw.
+- The panic hook was left installed after the TUI exited, and a signal left the terminal in raw mode.
+- The TUI reported a failed send as a successful one.
+- An approval is now routed to the session that raised it, not to whichever client asks next, and an approval whose waiting client is gone is denied rather than left to expire.
+- A provider stream that failed mid-flight was dropped; it now has a channel and is retried before any output has been shown.
+- Compaction could separate a tool call from its result; the pair is now kept together.
+- `audit security --format json|yaml` emitted something other than what it says; the daemon endpoint is resolved instead of assuming `18080`; the `config.toml` the daemon writes now parses and takes effect.
+- Outbound replies could be cut inside a multi-byte character.
+- A tripped cost guard now clears itself, and can be cleared.
+- Browser: keys are pressed in a form the browser recognises rather than as script-dispatched events a page can tell are fake; a script that reports an error is no longer counted as a successful action; the action shapes the schema advertises are accepted.
+- Computer-use verification that could not run was being counted as one that passed.
+- A spaceless script is no longer classified as a "very short message".
+- Shutdown lets in-flight writes land before closing the pool.
+- The released notes are drafted from this file; a failure to draft them is no longer silent.
+- `rustls` is bumped to the release that fixes RUSTSEC-2026-0285, and the web client's shipped and build dependency trees are clear of advisories.
+
 ## [0.3.6] - 2026-09-14
 
 ### Added
