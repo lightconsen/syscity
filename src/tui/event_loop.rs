@@ -1176,11 +1176,6 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
                 s.transcript.finish_stream(STREAM_THINKING, None);
                 s.transcript
                     .finish_stream(STREAM_ASSISTANT, response.as_deref());
-                // Usage only ever arrives here, never mid-stream — keep it
-                // until the next turn replaces it.
-                if let Some(tokens) = payload["usage"]["total_tokens"].as_u64() {
-                    s.last_turn_tokens = Some(tokens);
-                }
                 s.end_run();
                 s.dirty = true;
             }
@@ -2843,14 +2838,9 @@ mod tests {
         assert_eq!(s.live_mode, LiveMode::Approval);
     }
 
-    /// The phase hint tracks what is actually arriving, and the turn's token
-    /// total is kept once it lands.
-    ///
-    /// Usage only ever rides on `chat.final` — no delta carries it — so the
-    /// status row can show tokens for the turn that just ended but never a
-    /// running count mid-stream. This pins both halves of that.
+    /// The phase hint tracks what is actually arriving.
     #[tokio::test]
-    async fn the_run_phase_follows_the_events_and_the_tokens_land_at_the_end() {
+    async fn the_run_phase_follows_the_events() {
         let gateway = TestGateway::start().await;
         let (state, mut client) = state_and_client(&gateway).await;
         state.write().await.current_session = Some("s1".to_string());
@@ -2881,40 +2871,6 @@ mod tests {
             handle_event(event(name, payload), &state, &mut client).await;
             assert_eq!(state.read().await.run_phase, expected, "after {name}");
         }
-
-        handle_event(
-            event(
-                "chat.final",
-                serde_json::json!({
-                    "session_id": "s1",
-                    "response": "done\n",
-                    "usage": { "total_tokens": 20_600 },
-                }),
-            ),
-            &state,
-            &mut client,
-        )
-        .await;
-        assert_eq!(state.read().await.last_turn_tokens, Some(20_600));
-    }
-
-    /// A turn with no usage payload must not invent one, and must not wipe a
-    /// total a previous turn reported.
-    #[tokio::test]
-    async fn a_turn_without_usage_leaves_the_last_total_alone() {
-        let gateway = TestGateway::start().await;
-        let (state, mut client) = state_and_client(&gateway).await;
-        state.write().await.current_session = Some("s1".to_string());
-        state.write().await.last_turn_tokens = Some(1_234);
-
-        handle_event(
-            event("chat.final", serde_json::json!({ "session_id": "s1", "response": "done\n" })),
-            &state,
-            &mut client,
-        )
-        .await;
-
-        assert_eq!(state.read().await.last_turn_tokens, Some(1_234));
     }
 
     /// An `ask.required` event, optionally with a default.

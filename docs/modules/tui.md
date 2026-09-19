@@ -26,7 +26,7 @@ captures the mouse, so:
 │    ↳ file_read: //! Terminal setup, panic recovery…                   │
 ├─ live region: Viewport::Inline(8) ───────────────────────────────────┤
 │  (approval / question prompt, or the tail of a streaming answer)      │
-│  v0.3.6 · running 4s — esc to stop · 🦊 Secretary · sess anonymous    │
+│  ⠹ Cooking… (4s · responding) — esc stops · 🦊 Secretary · sess anon  │
 │  > ▊                                                                  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -59,23 +59,35 @@ side, which is what makes the terminal's own scroll and selection work.
   sane at any terminal size.
 
   The status row above the composer doubles as the run indicator while a turn
-  is in flight — a rotating word (`state.rs`'s `SPINNER_WORDS`, re-rolled per
-  run, one word every 2.5s) plus a parenthetical that carries the *real*
-  information: elapsed time and the phase, which is `thinking`, `responding`,
-  or the name of the tool in flight (`RunPhase`, set from the event stream). A
-  tool's name comes back down when its result lands — the wait that follows is
-  not labelled with a call that already finished.
+  is in flight:
+
+      ⠹ Scheming… (1m 23s · thinking) — esc stops  ·  secretary  ·  sess …
+
+  The braille frame animates on the 50ms tick (a full cycle is half a second),
+  and it and the word share one color — cyan and bold — while the facts beside
+  them (time, phase, agent, session) stay in the plain status color. The word
+  rotates every 2.5s (`state.rs`'s `SPINNER_WORDS`, re-rolled per run), and the
+  parenthetical carries the *real* information: elapsed time and the phase,
+  which is `thinking`, `responding`, or the name of the tool in flight
+  (`RunPhase`, set from the event stream). A tool's name comes back down when
+  its result lands — the wait that follows is not labelled with a call that
+  already finished. Everything here is present only while a run is in flight;
+  the idle row is the connection, agent and session as before.
 
   The block area also shows the slash-command candidates while a `/command`
   is being typed (windowed around the Tab selection), taking precedence over
   the stream preview — the typist's attention is on the command.
 
-  Token totals appear only once the turn ends, because usage rides on
-  `chat.final` and no delta carries it; there is no honest mid-stream count to
-  show. The completed turn's total stays on screen until the next one
-  completes. While running, the row drops the server version to stay inside 80
-  columns — the tail it would otherwise push off is the session id. A
-  *disconnected* connection still speaks up mid-run; that is not noise.
+  The row carries the run and nothing else from it: when the turn ends the
+  spinner, the word, the elapsed time and the phase all go, leaving the
+  connection, agent and session as before. A token meter was tried here and
+  removed — usage only rides on `chat.final` (no delta carries it), so it could
+  only ever describe a turn that had already finished, and it read as a
+  leftover of one.
+
+  While running, the row drops the server version to stay inside 80 columns —
+  the tail it would otherwise push off is the session id. A *disconnected*
+  connection still speaks up mid-run; that is not noise.
 - **`ui/blocks.rs`** — transcript lines and gateway history → styled lines.
 - **`gateway_calls.rs`** — every WS call the TUI makes, once, with the payload
   shapes the gateway actually serves, plus parser tests written against real

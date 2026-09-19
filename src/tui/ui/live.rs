@@ -7,7 +7,7 @@
 //! is handled by the transcript, not by growing this.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -119,26 +119,35 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
-/// `20.6k` past a thousand, the raw number below it.
-fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1000 {
-        format!("{:.1}k", tokens as f64 / 1000.0)
-    } else {
-        tokens.to_string()
-    }
+/// The spinner's color: the one piece of the row that moves, in the one color
+/// that means "working".
+fn spinner_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
-/// The one-line status row.
-fn status_text(state: &AppState) -> (String, bool) {
-    let mut parts: Vec<String> = Vec::new();
+/// The one-line status row, as styled spans.
+///
+/// The spinner frame and its word are colored; the facts (time, phase, agent,
+/// session) keep the plain status color. `status_text` flattens this for
+/// tests that only care about the words.
+fn status_line(state: &AppState) -> (Line<'static>, bool) {
+    let sep = || Span::styled("  ·  ", status_style());
+    let mut spans: Vec<Span<'static>> = Vec::new();
     // A running row is longer than an idle one, and what it pushes off the end
     // is the session id. The server version is the least useful thing here and
     // does not change mid-session, so it yields the space. A connection that is
     // *not* fine still speaks up: that is not noise.
     if !state.is_running || !state.connection.is_connected() {
-        parts.push(state.connection.label());
+        spans.push(Span::styled(state.connection.label(), status_style()));
     }
     if let Some(secs) = state.run_elapsed_secs() {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(format!("{} ", state.spinner_frame()), spinner_style()));
+        spans.push(Span::styled(format!("{}…", state.spinner_word()), spinner_style()));
         // The word is whimsy; the parenthetical is the truth.
         let mut detail = format_elapsed(secs);
         match &state.run_phase {
@@ -149,27 +158,45 @@ fn status_text(state: &AppState) -> (String, bool) {
                 detail.push_str(&format!(" · ⚙ {name}"));
             }
         }
-        parts.push(format!("{}… ({detail}) — esc stops", state.spinner_word()));
+        spans.push(Span::styled(format!(" ({detail}) — esc stops"), status_style()));
     }
-    if !state.is_running {
-        if let Some(tokens) = state.last_turn_tokens {
-            parts.push(format!("↓ {} tokens", format_tokens(tokens)));
+    let agent = state
+        .current_agent_info()
+        .map(|a| format!("{} {}", a.emoji, a.display_name))
+        .or_else(|| state.current_agent.as_deref().map(str::to_string));
+    if let Some(agent) = agent {
+        if !spans.is_empty() {
+            spans.push(sep());
         }
-    }
-    if let Some(agent) = state.current_agent_info() {
-        parts.push(format!("{} {}", agent.emoji, agent.display_name));
-    } else if let Some(id) = state.current_agent.as_deref() {
-        parts.push(id.to_string());
+        spans.push(Span::styled(agent, status_style()));
     }
     if let Some(session) = state.current_session.as_deref() {
-        parts.push(short_session(session));
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(short_session(session), status_style()));
     }
     if let Some((status, _)) = &state.status {
         let is_error = status.starts_with('⚠') || status.starts_with('✘');
-        parts.push(status.clone());
-        return (parts.join("  ·  "), is_error);
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        let style = if is_error {
+            status_error_style()
+        } else {
+            status_style()
+        };
+        spans.push(Span::styled(status.clone(), style));
+        return (Line::from(spans), is_error);
     }
-    (parts.join("  ·  "), false)
+    (Line::from(spans), false)
+}
+
+/// The status row as plain text (tests read the words, not the colors).
+#[cfg(test)]
+fn status_text(state: &AppState) -> (String, bool) {
+    let (line, is_error) = status_line(state);
+    (line.spans.iter().map(|s| s.content.to_string()).collect(), is_error)
 }
 
 /// Compact a session id for the status row.
@@ -412,13 +439,8 @@ pub fn render(f: &mut Frame, state: &AppState) {
     }
 
     if let Some(status) = l.status {
-        let (text, is_error) = status_text(state);
-        let style = if is_error {
-            status_error_style()
-        } else {
-            status_style()
-        };
-        f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), status);
+        let (line, _) = status_line(state);
+        f.render_widget(Paragraph::new(line), status);
     }
 
     render_composer(f, state, l.composer);
@@ -484,11 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_and_tokens_format_for_the_status_row() {
+    fn elapsed_formats_for_the_status_row() {
         assert_eq!(format_elapsed(3), "3s");
         assert_eq!(format_elapsed(83), "1m 23s");
-        assert_eq!(format_tokens(999), "999");
-        assert_eq!(format_tokens(20_600), "20.6k");
     }
 
     #[test]
@@ -512,15 +532,57 @@ mod tests {
         assert!(text.contains("(0s)"), "no phase hint while waiting: {text}");
     }
 
+    /// The idle row is the connection, the agent and the session — and
+    /// nothing left over from the turn that just finished.
     #[test]
-    fn an_idle_row_carries_the_last_turns_tokens() {
+    fn an_idle_row_carries_no_run_leftovers() {
         let mut state = AppState::default();
         let (text, _) = status_text(&state);
-        assert!(!text.contains("tokens"), "nothing to report yet: {text}");
+        assert_eq!(text, "disconnected", "nothing but the connection");
 
-        state.last_turn_tokens = Some(20_600);
+        state.current_session = Some("tui:1234567890".into());
+        state.current_agent = Some("secretary".into());
+        state.set_status("");
         let (text, _) = status_text(&state);
-        assert!(text.contains("↓ 20.6k tokens"), "the completed turn's meter: {text}");
+        assert!(text.contains("secretary"));
+        assert!(text.contains("sess"));
+        assert!(!text.contains("tokens"), "no token meter once idle: {text}");
+    }
+
+    /// The run indicator is an animation with a color, not static text — and
+    /// both go away the moment the turn ends.
+    #[test]
+    fn the_spinner_animates_in_color_and_leaves_with_the_run() {
+        let mut state = AppState {
+            connection: ConnectionState::Connected {
+                features: vec![],
+                scopes_granted: vec![],
+                server_version: "0.3.6".into(),
+            },
+            ..AppState::default()
+        };
+        state.begin_run();
+
+        let (line, _) = status_line(&state);
+        let frame = line.spans[0].content.to_string();
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan), "the frame is colored");
+        // The word rides the same color, the facts do not.
+        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan), "the word is colored");
+        assert!(line.spans[1].content.ends_with('…'));
+        assert_ne!(line.spans[2].style.fg, Some(Color::Cyan), "the facts stay plain");
+
+        state.spinner = state.spinner.wrapping_add(1);
+        let (next, _) = status_line(&state);
+        assert_ne!(next.spans[0].content, frame, "the frame moves with the tick");
+
+        // Turn over: nothing of the indicator survives.
+        state.end_run();
+        let (text, _) = status_text(&state);
+        assert!(!text.contains('…'), "no word after the run: {text}");
+        assert!(!text.contains("esc stops"), "no hint after the run: {text}");
+        for frame in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
+            assert!(!text.contains(frame), "no frame after the run: {text}");
+        }
     }
 
     /// A command catalog of `n` entries named `c0..c{n-1}`.

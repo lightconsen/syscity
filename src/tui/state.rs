@@ -97,6 +97,10 @@ const SPINNER_WORDS: &[&str] = &[
 /// How long one spinner word stays before the next rotates in.
 const WORD_ROTATE_MS: u128 = 2_500;
 
+/// Braille spinner frames — one per 50ms tick while a run is in flight, so a
+/// full cycle is half a second.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// The word for a given rotation offset and elapsed run time.
 fn spinner_word_at(offset: usize, elapsed_ms: u128) -> &'static str {
     SPINNER_WORDS[(offset + (elapsed_ms / WORD_ROTATE_MS) as usize) % SPINNER_WORDS.len()]
@@ -222,9 +226,6 @@ pub struct AppState {
     pub run_phase: RunPhase,
     /// Rotation offset for the spinner word, re-rolled on every run.
     pub word_offset: usize,
-    /// Total tokens the last completed turn used, shown until the next one
-    /// completes — usage only arrives with `chat.final`, never mid-stream.
-    pub last_turn_tokens: Option<u64>,
     /// Spinner frame counter.
     pub spinner: u8,
     /// Transient status text + when it was set (expires on its own).
@@ -266,7 +267,6 @@ impl Default for AppState {
             run_started: None,
             run_phase: RunPhase::default(),
             word_offset: 0,
-            last_turn_tokens: None,
             spinner: 0,
             status: None,
             dirty: true,
@@ -512,6 +512,11 @@ impl AppState {
             .map(|t| t.elapsed().as_millis())
             .unwrap_or(0);
         spinner_word_at(self.word_offset, elapsed)
+    }
+
+    /// The current spinner frame, advancing with every animation tick.
+    pub fn spinner_frame(&self) -> &'static str {
+        SPINNER_FRAMES[self.spinner as usize % SPINNER_FRAMES.len()]
     }
 
     /// Queue a message to send when the current turn ends.
