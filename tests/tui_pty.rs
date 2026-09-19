@@ -470,6 +470,29 @@ async fn a_panic_restores_the_terminal() {
     );
 }
 
+/// A *fatal* error takes the other exit: it returns an `Err` rather than
+/// unwinding, so it is the `restore?` line after the loop that hands the
+/// terminal back, not the panic hook. Both paths have to leave it cooked.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_fatal_error_restores_the_terminal() {
+    let port = start_gateway().await;
+    let mut tui = tokio::task::spawn_blocking(move || {
+        spawn_tui_with(port, &[("SYSCITY_TUI_DEBUG_FATAL", "1")])
+    })
+    .await
+    .expect("spawn");
+
+    let status = tui.wait_exit().await;
+    assert!(!status.success(), "a fatal error is not a clean exit: {status:?}");
+    assert!(is_cooked(&tui.tty), "a fatal error must still leave a working terminal");
+    let text = plain(&tui.snapshot());
+    assert!(
+        text.contains("SYSCITY_TUI_DEBUG_FATAL drill"),
+        "the error is reported on the restored terminal: {text:?}"
+    );
+}
+
 /// Resizing the window must not paint outside the new bounds.
 ///
 /// After the pty goes from 80 to 40 columns, every explicit cursor move the
@@ -501,6 +524,15 @@ async fn a_resize_redraws_within_the_new_bounds() {
         .filter(|c| *c > 40)
         .collect();
     assert!(overruns.is_empty(), "cursor moved past column 40: {overruns:?}");
+
+    // The audit's criterion for a resize: the composer and the status row are
+    // still there and still whole afterwards. A redraw that dropped either,
+    // or painted them over each other, would show as a missing prompt.
+    let after = plain(&raw[resized_at..]);
+    assert!(
+        after.contains('v') && after.contains("> "),
+        "both the status row and the composer survived the resize: {after:?}"
+    );
 
     tui.feed("\x7f/quit\r");
     let status = tui.wait_exit().await;

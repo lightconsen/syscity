@@ -104,6 +104,16 @@ pub enum WsMessage {
 /// place in the queue, so the bound is what keeps that from being permanent.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+impl WsClient {
+    /// The same client with a shorter request timeout, for tests that need the
+    /// timeout path to be reachable.
+    #[cfg(test)]
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+}
+
 /// Shared state tracking pending request/response waiters.
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<ClientResponse>>>>;
 
@@ -126,6 +136,10 @@ pub struct WsClient {
     pending: PendingMap,
     /// Stop signal for background tasks.
     _stop_tx: mpsc::Sender<()>,
+    /// How long a request waits for its response. [`REQUEST_TIMEOUT`] in
+    /// production; tests shorten it so the timeout path is reachable without
+    /// waiting a quarter of a minute for it.
+    request_timeout: std::time::Duration,
 }
 
 impl WsClient {
@@ -158,6 +172,7 @@ impl WsClient {
             write_tx,
             pending,
             _stop_tx: stop_tx,
+            request_timeout: REQUEST_TIMEOUT,
         };
 
         let params = serde_json::json!({
@@ -201,7 +216,7 @@ impl WsClient {
             .send(Message::Text(text))
             .map_err(|_| TuiError::WebSocket("send channel closed".to_string()))?;
 
-        let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        let response = match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(response)) => response,
             // The driver drained the waiters on its way out, which is how a
             // request learns the connection is gone.

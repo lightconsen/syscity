@@ -2829,6 +2829,69 @@ mod tests {
         assert_eq!(s.live_mode, LiveMode::Approval);
     }
 
+    /// A slash command whose request never comes back ends as a notice, not
+    /// as a dead TUI.
+    ///
+    /// The request bound is what keeps a wedged gateway from holding the
+    /// command's place in the queue forever; when it fires, the error is a
+    /// line of output and the loop carries on. The timeout is shortened here
+    /// — waiting the production 15 seconds would make this a very slow test.
+    #[tokio::test]
+    async fn a_command_that_times_out_becomes_a_notice() {
+        let gateway = TestGateway::start().await;
+        gateway.hold("commands.list");
+        let (state, client) = state_and_client(&gateway).await;
+        let client = client.with_request_timeout(Duration::from_millis(250));
+        let observed = Arc::clone(&state);
+        let (mut input, tx) = ScriptedInput::new();
+
+        // The task hands the terminal back, because the notice is a *notice*:
+        // it goes to the transcript, which the loop drains into scrollback
+        // every iteration. Reading it means reading what was painted.
+        let driver = tokio::spawn(async move {
+            let mut terminal = inline_terminal();
+            let result = run(
+                &mut terminal,
+                state,
+                client,
+                test_endpoint(gateway.port),
+                SessionChoice::New,
+                &mut input,
+            )
+            .await;
+            (result, terminal)
+        });
+
+        tx.send(TuiAction::RunSlashCommand("/tools".to_string()))
+            .expect("queued");
+        // The command is stuck on the gateway; it becomes a notice when its
+        // own bound fires. Quitting before that would end the loop with the
+        // command still parked, so wait out the bound (250ms) with margin —
+        // and nothing else here would end the loop, which is the point.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!driver.is_finished(), "a held command must not end the session");
+        let _ = observed; // the loop's window on state, kept for symmetry
+        tx.send(TuiAction::Quit).expect("queued");
+        let (result, terminal) = tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("the loop is still running")
+            .expect("join");
+        result.expect("clean exit");
+
+        let backend = terminal.backend();
+        let mut painted: String = backend
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        painted.extend(backend.scrollback().content.iter().map(|c| c.symbol()));
+        assert!(
+            painted.contains("timed out waiting for `commands.list`"),
+            "the timeout is a line of output: {painted:?}"
+        );
+    }
+
     /// The phase hint tracks what is actually arriving.
     #[tokio::test]
     async fn the_run_phase_follows_the_events() {

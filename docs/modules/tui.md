@@ -255,8 +255,12 @@ behind whatever command is running — the worse trade of the two.
   real binary under a real pty and pins the rest — the cursor-position query
   going out and being answered, the tty raw while running and cooked after
   `/quit`, `SIGTERM` or `SIGINT`, CJK text hitting the wire without padding,
-  a panic drill leaving the terminal cooked, and a resize staying inside the
-  new bounds. That is still one platform (macOS/Linux pty) with the test
+  a panic *and* a fatal error each leaving the terminal cooked, and a resize
+  staying inside the new bounds. Those last two are the two ways the process
+  can die badly: a panic unwinds and restores from the hook, a fatal error
+  returns and restores from the `?` after the loop, and both are fired by
+  debug-only env drills (`SYSCITY_TUI_DEBUG_PANIC`, `SYSCITY_TUI_DEBUG_FATAL`)
+  at the moment the terminal is raw. That is still one platform (macOS/Linux pty) with the test
   playing the terminal — for the emulator-in-the-middle case there is
   `scripts/tui-tmux-smoke.sh`, which drives the whole loop inside a real
   detached tmux and asserts on tmux's own captured pane: the composer is the
@@ -276,6 +280,18 @@ behind whatever command is running — the worse trade of the two.
   space — `TOOL_ARG_LINES_LIVE` (5) leaves room for the `⚙ tool` header
   inside the live preview, `TOOL_ARG_LINES_HISTORY` (8) has the screen to
   itself and nothing streaming to crowd out.
+- Terminal resize: an inline viewport's height is fixed when it is built
+  (`Viewport::Inline(LIVE_HEIGHT)`), and ratatui offers no way to change it —
+  `Terminal::resize` recomputes the inline area from the *stored* height. So
+  the region does not grow on a taller terminal or shrink on a shorter one;
+  a terminal shorter than the region clamps it (ratatui takes
+  `min(terminal_height, region_height)`), and the layout inside it is
+  bottom-up, so the composer stays put and rows disappear from the top. Width
+  changes go through ratatui's own autoresize on every draw. `tests/tui_pty.rs`
+  resizes the pty 80 → 40 and asserts every cursor move written afterwards
+  stays inside the new width, with the composer and status row still whole.
+  Growing the region would mean rebuilding the `Terminal`, which re-anchors
+  the viewport and repaints — worse than the fixed height.
 - Resuming reprints the last 100 messages. The scrollback is append-only and
   top-anchored, so older messages cannot be spliced in above what is already
   printed — history is paged, never spliced. `/history [n]` reprints a window
