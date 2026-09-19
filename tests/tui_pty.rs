@@ -121,6 +121,33 @@ impl Running {
     }
 }
 
+/// Counts cursor-position queries (`ESC[6n`) in a stream that arrives in
+/// chunks, remembering the tail so one split across a boundary is still seen.
+///
+/// Missing a query is not a small miss: ratatui's inline viewport blocks in
+/// `get_cursor_position` until the reply arrives, and it re-queries on resize,
+/// so a missed query is a TUI that stops drawing forever.
+#[derive(Default)]
+struct QueryScanner {
+    /// The last two bytes of the previous chunk.
+    carry: Vec<u8>,
+}
+
+impl QueryScanner {
+    /// Feed one chunk; returns how many queries it completed.
+    fn feed(&mut self, chunk: &[u8]) -> usize {
+        let mut scanned = std::mem::take(&mut self.carry);
+        scanned.extend_from_slice(chunk);
+        let mut found = 0;
+        while let Some(at) = scanned.windows(3).position(|w| w == b"[6n") {
+            found += 1;
+            scanned.drain(..at + 3);
+        }
+        self.carry = scanned[scanned.len().saturating_sub(2)..].to_vec();
+        found
+    }
+}
+
 /// Spawn `syscity tui --port <port>` under a fresh pty against `port`.
 fn spawn_tui(port: u16) -> Running {
     spawn_tui_with(port, &[])
@@ -152,6 +179,7 @@ fn spawn_tui_with(port: u16, extra_env: &[(&str, &str)]) -> Running {
         let queried = Arc::clone(&queried_cursor);
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            let mut scanner = QueryScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -160,7 +188,7 @@ fn spawn_tui_with(port: u16, extra_env: &[(&str, &str)]) -> Running {
                         if std::env::var("PTY_DEBUG").is_ok() {
                             eprintln!("MASTER CHUNK: {:?}", &chunk[..n.min(200)]);
                         }
-                        if chunk.windows(3).any(|w| w == b"[6n") {
+                        for _ in 0..scanner.feed(chunk) {
                             if std::env::var("PTY_DEBUG").is_ok() {
                                 eprintln!("ANSWERING CURSOR QUERY");
                             }
@@ -514,9 +542,16 @@ async fn a_resize_redraws_within_the_new_bounds() {
     // Force a post-resize frame with something in every region: the composer
     // has content, the block area has the completion list, the status row is
     // up. Everything visible is a redraw at the new width.
+    //
+    // The wait is on the *prompt and the slash*, not on a particular command.
+    // Which candidates the window shows depends on the gateway's catalog, and
+    // this test is about geometry — `a_slash_shows_command_hints` is the one
+    // that asserts the list itself. The slash still raises the list, so the
+    // frame below is drawn with it.
     tui.feed("/");
-    tui.expect_output("/new", "the completion list at the new width")
+    tui.expect_output("> /", "the composer redrawn at the new width")
         .await;
+    assert!(tui.snapshot().len() > resized_at, "the resize produced a fresh frame");
 
     let raw = tui.snapshot();
     let overruns: Vec<u16> = cursor_columns(&raw[resized_at..])
@@ -564,4 +599,25 @@ fn cursor_columns(bytes: &[u8]) -> Vec<u16> {
         }
     }
     cols
+}
+
+/// The scanner has to survive a query split across two reads, because the
+/// read boundary is the kernel's choice and the TUI blocks waiting for the
+/// answer.
+#[test]
+fn a_cursor_query_split_across_chunks_is_still_seen() {
+    let mut scanner = QueryScanner::default();
+    assert_eq!(scanner.feed(b"\x1b[6"), 0, "not yet a query");
+    assert_eq!(scanner.feed(b"n"), 1, "completed by the next chunk");
+    assert_eq!(scanner.feed(b"rest"), 0, "and not counted twice");
+
+    // Whole queries, several in one chunk.
+    let mut scanner = QueryScanner::default();
+    assert_eq!(scanner.feed(b"\x1b[6n\x1b[6n"), 2);
+
+    // A split that leaves the carry holding a partial prefix which then turns
+    // out not to be one.
+    let mut scanner = QueryScanner::default();
+    assert_eq!(scanner.feed(b"\x1b["), 0);
+    assert_eq!(scanner.feed(b"31mhello"), 0);
 }
