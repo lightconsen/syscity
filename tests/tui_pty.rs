@@ -143,9 +143,11 @@ impl Running {
 /// Counts cursor-position queries (`ESC[6n`) in a stream that arrives in
 /// chunks, remembering the tail so one split across a boundary is still seen.
 ///
-/// Missing a query is not a small miss: ratatui's inline viewport blocks in
-/// `get_cursor_position` until the reply arrives, and it re-queries on resize,
-/// so a missed query is a TUI that stops drawing forever.
+/// Missing one is not a small miss. `crossterm::cursor::position` waits two
+/// seconds for the reply and then errors, and ratatui asks for the position
+/// again on every size change — so a missed query costs the inline UI: the
+/// TUI reports that the cursor position could not be read and falls back to
+/// line mode, where there is no composer to assert anything about.
 #[derive(Default)]
 struct QueryScanner {
     /// The last two bytes of the previous chunk.
