@@ -203,7 +203,7 @@ pub(crate) async fn spawn_agent_inner(
         }
         // Attach planner state store for crash recovery on restart.
         let planner_db = state.paths.root().join("planner.db");
-        let url = format!("sqlite:///{}", planner_db.display());
+        let url = crate::planner::database_url(&planner_db);
         if let Ok(store) = crate::planner::TaskStateStore::new(&url).await {
             builder = builder.with_planner_state_store(store);
         }
@@ -234,7 +234,7 @@ pub(crate) async fn spawn_agent_inner(
         }
         // Attach planner state store for crash recovery on restart.
         let planner_db = state.paths.root().join("planner.db");
-        let url = format!("sqlite:///{}", planner_db.display());
+        let url = crate::planner::database_url(&planner_db);
         if let Ok(store) = crate::planner::TaskStateStore::new(&url).await {
             builder = builder.with_planner_state_store(store);
         }

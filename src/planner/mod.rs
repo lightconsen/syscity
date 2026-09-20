@@ -38,7 +38,7 @@ pub use executor::TaskExecutor;
 pub use persistent_queue::{PersistentTaskManager, QueueHealth, QueueStatus};
 pub use recovery::{check_startup_recovery, RecoveryOutcome};
 pub use scheduled_tasks::{Schedule, ScheduledTask, TaskScheduler};
-pub use state::TaskStateStore;
+pub use state::{database_url, TaskStateStore};
 pub use tool_chain::{ChainAnalysis, ChainLink, ToolChainReasoner};
 pub use tool_learning::{ExperienceContext, ToolExperience, ToolLearningEngine, ToolSuggestion};
 pub use workflow::{

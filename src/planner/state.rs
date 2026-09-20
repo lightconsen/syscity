@@ -11,6 +11,18 @@ use tracing::{info, instrument};
 
 use crate::planner::{Plan, Task, TaskStatus};
 
+/// The SQLite URL for a planner database at `path`.
+///
+/// There is exactly one way to spell it. The daemon spelled it
+/// `sqlite:/// {path}` — a stray space between the scheme and the path — and
+/// the store then tried to create a directory whose name starts with a space
+/// (refused by the read-only root on macOS), which silently disabled
+/// startup plan recovery. Every caller goes through here so the spelling
+/// cannot drift again.
+pub fn database_url(path: &std::path::Path) -> String {
+    format!("sqlite:///{}", path.display())
+}
+
 /// SQLite-backed persistent store for planner state.
 #[derive(Debug, Clone)]
 pub struct TaskStateStore {
@@ -519,5 +531,16 @@ mod tests {
         assert!(matches!(parse_task_status("Failed"), TaskStatus::Failed));
         assert!(matches!(parse_task_status("RolledBack"), TaskStatus::RolledBack));
         assert!(matches!(parse_task_status("unknown"), TaskStatus::Pending));
+    }
+
+    /// The URL is spelled one way: scheme, then the path, with nothing in
+    /// between. The daemon once wrote `sqlite:/// {path}` — a space that
+    /// pointed the store at a directory that cannot exist and silently
+    /// disabled startup recovery.
+    #[test]
+    fn the_database_url_has_nothing_between_the_scheme_and_the_path() {
+        let url = database_url(std::path::Path::new("/home/u/.syscity/planner.db"));
+        assert_eq!(url, "sqlite:////home/u/.syscity/planner.db");
+        assert!(!url.contains(' '), "no space may follow the scheme");
     }
 }

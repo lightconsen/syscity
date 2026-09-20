@@ -927,7 +927,7 @@ async fn run_startup_recovery(gateway: &crate::gateway::Gateway) -> crate::Resul
         return Ok(());
     }
 
-    let url = format!("sqlite:/// {}", db_path.display());
+    let url = crate::planner::database_url(&db_path);
     let store = match crate::planner::TaskStateStore::new(&url).await {
         Ok(s) => s,
         Err(e) => {
