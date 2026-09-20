@@ -232,6 +232,9 @@ pub struct AppState {
     /// The last finished assistant answer, verbatim — what `/copy` (Ctrl+Y)
     /// puts on the clipboard. `None` until a turn completes.
     pub last_assistant_text: Option<String>,
+    /// The last plain-text prompt sent (a slash command is never recorded —
+    /// only a message). What `/retry` resends. `None` until the first send.
+    pub last_user_prompt: Option<String>,
     /// When the current run started, for the elapsed counter.
     pub run_started: Option<Instant>,
     /// What the in-flight turn is doing right now.
@@ -280,6 +283,7 @@ impl Default for AppState {
             is_running: false,
             queued: VecDeque::new(),
             last_assistant_text: None,
+            last_user_prompt: None,
             run_started: None,
             run_phase: RunPhase::default(),
             word_offset: 0,

@@ -815,11 +815,22 @@ async fn send_message(state: &Arc<RwLock<AppState>>, ws: &WsClient) -> Result<()
         return handle_slash_command(&text, Arc::clone(state), ws).await;
     }
 
-    // One turn at a time. Pressing Enter mid-response used to open a second
-    // turn on the same session, in parallel with the first: two streams
-    // interleaved into one transcript, and the second `chat.final` ending a
-    // run that was still going. The message is queued instead, and goes out
-    // when this turn finishes.
+    // What `/retry` will resend. A slash command is never recorded: it was
+    // handled locally, not sent as a message.
+    state.write().await.last_user_prompt = Some(text.clone());
+    submit_prompt(text, state, ws).await
+}
+
+/// Send `text` through the message path: one turn at a time, queued while a
+/// run is in flight, echoed as the user's message.
+///
+/// Shared by Enter and `/retry`, so the two can never race the gate in
+/// opposite directions.
+async fn submit_prompt(
+    text: String,
+    state: &Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
     if state.read().await.is_running {
         let mut s = state.write().await;
         s.remember_input(&text);
@@ -834,6 +845,22 @@ async fn send_message(state: &Arc<RwLock<AppState>>, ws: &WsClient) -> Result<()
     }
 
     submit_message(text, state, ws, true).await
+}
+
+/// `/retry` — resend the last prompt through the same gate as Enter.
+pub(crate) async fn retry_last_message(
+    state: &Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let Some(text) = state.read().await.last_user_prompt.clone() else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ nothing to retry yet — send a message first");
+        return Ok(());
+    };
+    submit_prompt(text, state, ws).await
 }
 
 /// Send `text` as a chat message, creating the session if there is none.
@@ -2027,7 +2054,12 @@ mod tests {
     /// The rule the loop dispatches on.
     #[test]
     fn one_command_at_a_time_edits_never_queue_and_quit_waits_for_nothing() {
-        use TuiAction::{InputChar, Quit, SendMessage};
+        use TuiAction::{InputChar, Quit, RunSlashCommand, SendMessage};
+
+        // `/retry` is a command: it answers to the send gate exactly like a
+        // typed message — queued behind a busy turn, run when idle.
+        assert_eq!(dispatch(&RunSlashCommand("/retry".to_string()), true, false), Dispatch::Run);
+        assert_eq!(dispatch(&RunSlashCommand("/retry".to_string()), true, true), Dispatch::Queue);
 
         // Idle and online: run it.
         assert_eq!(dispatch(&SendMessage, true, false), Dispatch::Run);
@@ -2680,6 +2712,147 @@ mod tests {
             .expect("the loop exits")
             .expect("join")
             .expect("run");
+    }
+
+    /// `/retry` with nothing running resends the last prompt through the real
+    /// loop, carrying the exact text that was sent the first time.
+    #[tokio::test]
+    async fn retry_resends_the_last_prompt() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        state.write().await.last_user_prompt = Some("what is the meaning of life?".to_string());
+        let (mut input, tx) = ScriptedInput::new();
+
+        let driver = tokio::spawn(async move {
+            let mut terminal = inline_terminal();
+            run(
+                &mut terminal,
+                state,
+                client,
+                test_endpoint(gateway.port),
+                SessionChoice::New,
+                &mut input,
+            )
+            .await
+        });
+        gateway.wait_for("commands.list", PATIENCE).await;
+
+        tx.send(TuiAction::RunSlashCommand("/retry".to_string()))
+            .expect("queued");
+        let params = gateway.wait_for("chat.send", PATIENCE).await;
+        assert_eq!(
+            params["message"], "what is the meaning of life?",
+            "the resend carries the prompt that was sent before"
+        );
+
+        tx.send(TuiAction::Quit).expect("queued");
+        tokio::time::timeout(PATIENCE, driver)
+            .await
+            .expect("the loop exits")
+            .expect("join")
+            .expect("run");
+    }
+
+    /// `/retry` while a turn is running honors the send gate exactly like
+    /// Enter: the draft behind a running turn is queued, not sent in
+    /// parallel, and goes out when the turn's `chat.final` ends it.
+    #[tokio::test]
+    async fn retry_queues_behind_a_running_turn() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        let observed = Arc::clone(&state);
+        let (mut input, tx) = ScriptedInput::new();
+
+        let driver = tokio::spawn(async move {
+            let mut terminal = inline_terminal();
+            run(
+                &mut terminal,
+                state,
+                client,
+                test_endpoint(gateway.port),
+                SessionChoice::New,
+                &mut input,
+            )
+            .await
+        });
+        gateway.wait_for("commands.list", PATIENCE).await;
+
+        // A real send opens a turn that never ends on its own here.
+        for c in "hullo".chars() {
+            tx.send(TuiAction::InputChar(c)).expect("queued");
+        }
+        tx.send(TuiAction::SendMessage).expect("queued");
+        gateway.wait_for("chat.send", PATIENCE).await;
+
+        tx.send(TuiAction::RunSlashCommand("/retry".to_string()))
+            .expect("queued");
+        eventually_async(
+            || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    let s = observed.read().await;
+                    s.queued.len() == 1 && s.is_running
+                }
+            },
+            "the retry to join the message queue behind the running turn",
+        )
+        .await;
+
+        // Ending the turn releases the queued resend, and it must carry the
+        // same prompt.
+        gateway.push_event(
+            "chat.final",
+            serde_json::json!({ "session_id": "s1", "response": "answered" }),
+        );
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let count = gateway
+                .requests()
+                .iter()
+                .filter(|r| r.method == "chat.send")
+                .count();
+            if count >= 2 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the queued retry never went out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let sends: Vec<_> = gateway
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "chat.send")
+            .collect();
+        assert_eq!(
+            sends[1].params["message"], "hullo",
+            "the queued retry resends the prompt that was sent before"
+        );
+
+        tx.send(TuiAction::Quit).expect("queued");
+        tokio::time::timeout(PATIENCE, driver)
+            .await
+            .expect("the loop exits")
+            .expect("join")
+            .expect("run");
+    }
+
+    /// `/retry` with nothing to resend says so; the retained prompt is not
+    /// invented out of thin air.
+    #[tokio::test]
+    async fn retry_without_a_prompt_refuses() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+
+        retry_last_message(&state, &client).await.expect("handled");
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(lines[0].contains("nothing to retry"), "got {lines:?}");
     }
 
     /// The approval keys go through the real loop, end to end.

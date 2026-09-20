@@ -21,7 +21,7 @@ use crate::tui::ws_client::WsClient;
 /// Commands implemented inside the TUI.
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
-    "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy",
+    "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy", "retry",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -96,6 +96,7 @@ async fn handle_local_command(
             command_copy(state).await;
             Ok(())
         }
+        "retry" => crate::tui::event_loop::retry_last_message(&state, ws).await,
         _ => {
             state
                 .write()
@@ -234,6 +235,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("model", "<id>", "set the default model"),
         ("answer", "<text>", "answer a pending question"),
         ("copy", "", "copy the last answer to the clipboard"),
+        ("retry", "", "resend the last prompt"),
         ("help", "", "this help"),
         ("quit", "", "leave the TUI"),
         ("exit", "", "alias of /quit"),
