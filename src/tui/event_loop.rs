@@ -1218,21 +1218,32 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
             s.transcript.seal_stream(STREAM_THINKING);
             s.run_phase = RunPhase::ToolCall(tool.clone());
             s.transcript.push(tool_call_lines(&tool, args.as_ref()));
+            // Keep the whole call for `/expand` — the live rows above are
+            // truncated. The next call evicts this one, which is fine: an
+            // expand targets what just ran.
+            s.last_tool_name = Some(tool.clone());
+            s.last_tool_args = args.clone();
+            s.last_tool_result = None;
             s.dirty = true;
         }
         "tool.result" => {
             let tool = payload["tool_name"].as_str().unwrap_or("tool").to_string();
-            let result = payload.get("result").filter(|v| !v.is_null());
+            let result = payload.get("result").filter(|v| !v.is_null()).cloned();
             let mut s = state.write().await;
             // The tool is done; whatever runs next has not started saying
             // anything yet. Leaving the name up would label the wait with a
             // call that already finished.
             s.run_phase = RunPhase::Waiting;
             s.transcript.push(
-                blocks::result_lines(&tool, result)
+                blocks::result_lines(&tool, result.as_ref())
                     .into_iter()
                     .map(|row| TranscriptLine::new(LineKind::ToolResult, row)),
             );
+            // The full result is what `/expand` prints. The name is set here
+            // too: a result without a matching `tool.calling` (a reconnect
+            // mid-call) should still be expandable.
+            s.last_tool_name = Some(tool);
+            s.last_tool_result = result;
             s.dirty = true;
         }
         "chat.final" => {

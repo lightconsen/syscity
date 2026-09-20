@@ -21,7 +21,7 @@ use crate::tui::ws_client::WsClient;
 /// Commands implemented inside the TUI.
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
-    "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy", "retry",
+    "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy", "retry", "expand",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -97,6 +97,10 @@ async fn handle_local_command(
             Ok(())
         }
         "retry" => crate::tui::event_loop::retry_last_message(&state, ws).await,
+        "expand" => {
+            command_expand(&state).await;
+            Ok(())
+        }
         _ => {
             state
                 .write()
@@ -236,6 +240,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("answer", "<text>", "answer a pending question"),
         ("copy", "", "copy the last answer to the clipboard"),
         ("retry", "", "resend the last prompt"),
+        ("expand", "", "print the last tool call in full"),
         ("help", "", "this help"),
         ("quit", "", "leave the TUI"),
         ("exit", "", "alias of /quit"),
@@ -640,6 +645,47 @@ pub fn write_osc52(out: &mut impl std::io::Write, text: &str) -> std::io::Result
     let encoded = STANDARD.encode(text.as_bytes());
     write!(out, "\x1b]52;c;{encoded}\x07")?;
     out.flush()
+}
+
+/// `/expand` — print the last tool call in full.
+///
+/// The live preview truncates a call's arguments and result to a few rows
+/// each. The last call is kept whole in the state; this command reprints it
+/// with no cap, so a payload the live view cut off is still inspectable.
+async fn command_expand(state: &Arc<RwLock<AppState>>) {
+    let mut s = state.write().await;
+    let Some(name) = s.last_tool_name.clone() else {
+        s.transcript
+            .push_notice("⚠ no tool call yet — run a turn that calls a tool");
+        return;
+    };
+    let args = s.last_tool_args.clone();
+    let result = s.last_tool_result.clone();
+    s.transcript.push_separator();
+    s.transcript
+        .push(vec![TranscriptLine::new(LineKind::Tool, format!("⚙ {name}"))]);
+    if let Some(args) = args {
+        // `usize::MAX` rows: nothing truncated, the verbatim arguments.
+        for row in blocks::args_lines(&args, "  ", usize::MAX) {
+            s.transcript
+                .push(vec![TranscriptLine::new(LineKind::Tool, row)]);
+        }
+    }
+    // The result is expanded the same way: first row carries the `↳` marker,
+    // mirroring the live preview's prefix.
+    if let Some(result) = result {
+        let rows = blocks::args_lines(&result, "  ", usize::MAX);
+        for (i, row) in rows.iter().enumerate() {
+            let row = if i == 0 {
+                format!("  ↳ {name}: {}", row.trim_start())
+            } else {
+                row.clone()
+            };
+            s.transcript
+                .push(vec![TranscriptLine::new(LineKind::ToolResult, row)]);
+        }
+    }
+    s.transcript.push_separator();
 }
 
 /// `/config` and `/config set <path> <value>`.
@@ -1058,6 +1104,46 @@ mod tests {
         command_copy(Arc::clone(&state)).await;
         let lines = output(&state).await;
         assert!(lines[0].contains("empty"), "got {lines:?}");
+    }
+
+    /// `/expand` with no prior tool call says so.
+    #[tokio::test]
+    async fn expand_without_a_tool_call_refuses() {
+        let gateway = TestGateway::start().await;
+        let (state, _client) = connect(&gateway).await;
+
+        command_expand(&state).await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("no tool call yet"), "got {lines:?}");
+    }
+
+    /// `/expand` reprints a call whose payload the live preview truncated.
+    #[tokio::test]
+    async fn expand_prints_the_call_whole() {
+        let gateway = TestGateway::start().await;
+        let (state, _client) = connect(&gateway).await;
+        // Forty keys: far past TOOL_ARG_LINES_LIVE, so the live rows would
+        // show the first four and an ellipsis. The expand must not.
+        let mut map = serde_json::Map::new();
+        for i in 0..40 {
+            map.insert(format!("key_{i}"), serde_json::json!(format!("value_{i}")));
+        }
+        state.write().await.last_tool_name = Some("finder".to_string());
+        state.write().await.last_tool_args = Some(serde_json::Value::Object(map));
+        state.write().await.last_tool_result = Some(serde_json::json!({ "found": 3 }));
+
+        command_expand(&state).await;
+        let lines = output(&state).await;
+        assert!(lines.iter().any(|l| l.contains("key_39")), "got {lines:?}");
+        let arg_rows = lines.iter().filter(|l| l.contains("\"key_")).count();
+        assert!(
+            arg_rows > blocks::TOOL_ARG_LINES_LIVE,
+            "expected every key in the output, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("↳ finder:")),
+            "missing the result marker row, got {lines:?}"
+        );
     }
 
     #[test]

@@ -235,6 +235,15 @@ pub struct AppState {
     /// The last plain-text prompt sent (a slash command is never recorded —
     /// only a message). What `/retry` resends. `None` until the first send.
     pub last_user_prompt: Option<String>,
+    /// The most recent tool call, kept whole for `/expand`. Only the latest
+    /// is held: a turn can call many tools, and every one after the first
+    /// makes the previous expand pointless.
+    pub last_tool_name: Option<String>,
+    /// The last tool call's arguments, *untruncated*. `None` until a call.
+    pub last_tool_args: Option<Value>,
+    /// The last tool call's result, *untruncated*. `None` until a result.
+    /// Cleared by the next `tool.calling`, which a result follows.
+    pub last_tool_result: Option<Value>,
     /// When the current run started, for the elapsed counter.
     pub run_started: Option<Instant>,
     /// What the in-flight turn is doing right now.
@@ -284,6 +293,9 @@ impl Default for AppState {
             queued: VecDeque::new(),
             last_assistant_text: None,
             last_user_prompt: None,
+            last_tool_name: None,
+            last_tool_args: None,
+            last_tool_result: None,
             run_started: None,
             run_phase: RunPhase::default(),
             word_offset: 0,
