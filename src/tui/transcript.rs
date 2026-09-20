@@ -164,6 +164,28 @@ impl StreamBuffer {
         out
     }
 
+    /// Flush everything pending — including the unterminated tail — without
+    /// closing the stream.
+    ///
+    /// The tail graduates as if newline-terminated; more deltas append after
+    /// it and resume as a fresh line. Used when another stream starts
+    /// producing content: a reasoning paragraph that never saw a newline
+    /// would otherwise stay pending until `chat.final` and land in the
+    /// scrollback *after* the answer it is the reasoning for.
+    pub fn seal(&mut self) -> Vec<TranscriptLine> {
+        let mut out = self.take_flushable();
+        // A held fence is emitted as-is; the stream is open for more, so the
+        // fence state resets with it.
+        out.append(&mut self.held);
+        self.in_fence = false;
+        let pending = self.pending().to_string();
+        if !pending.is_empty() {
+            out.extend(lines_of(&pending, self.kind));
+            self.emitted = self.full.len();
+        }
+        out
+    }
+
     /// Close the stream with the authoritative final text, returning every
     /// line still owed to scrollback.
     ///
@@ -272,6 +294,22 @@ impl Transcript {
     /// tag it started with.
     pub fn push_delta(&mut self, id: &str, kind: LineKind, delta: &str) {
         self.stream_mut(id, kind).push_delta(delta);
+    }
+
+    /// True while a stream with this id is open.
+    pub fn has_stream(&self, id: &str) -> bool {
+        self.streams.iter().any(|(sid, _)| sid == id)
+    }
+
+    /// Seal an open stream: flush its pending text now, without closing it.
+    ///
+    /// The transcript owns ordering between streams, and a seal is how a later
+    /// stream's content can say "everything still thinking comes before me".
+    pub fn seal_stream(&mut self, id: &str) {
+        if let Some(idx) = self.streams.iter().position(|(sid, _)| sid == id) {
+            let lines = self.streams[idx].1.seal();
+            self.ready.extend(lines);
+        }
     }
 
     /// Close the stream for `id` with the authoritative final text.
@@ -513,6 +551,34 @@ mod tests {
         assert!(flushed.contains(&"and a tail".to_string()));
         assert!(flushed.contains(&"still thinking".to_string()));
         assert!(t.preview(10).is_empty(), "nothing is left live");
+    }
+
+    /// A line with no newline stays pending — unless another stream's
+    /// content seals it first, and sealing must not close the stream.
+    #[test]
+    fn sealing_flushes_the_pending_line_without_closing_the_stream() {
+        let mut t = Transcript::new();
+        t.push_delta("thinking", LineKind::Reasoning, "one long line, no newline");
+        assert!(t.take_flushable().is_empty(), "no newline yet, nothing graduates");
+
+        t.seal_stream("thinking");
+        assert_eq!(texts(&t.take_flushable()), vec!["one long line, no newline"]);
+        assert!(t.has_stream("thinking"), "sealed, not closed");
+
+        // More reasoning appends after the seal and graduates normally.
+        t.push_delta("thinking", LineKind::Reasoning, "more\n");
+        assert_eq!(texts(&t.take_flushable()), vec!["more"]);
+    }
+
+    #[test]
+    fn sealing_twice_emits_nothing_the_second_time() {
+        let mut t = Transcript::new();
+        t.push_delta("thinking", LineKind::Reasoning, "held");
+        t.seal_stream("thinking");
+        t.seal_stream("thinking");
+        assert_eq!(texts(&t.take_flushable()), vec!["held"], "emitted once");
+        // And a stream that does not exist is not an error.
+        t.seal_stream("nope");
     }
 
     #[test]

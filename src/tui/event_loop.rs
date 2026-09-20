@@ -1123,6 +1123,10 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
         "chat.delta" => {
             let content = payload["content"].as_str().unwrap_or_default();
             let mut s = state.write().await;
+            // Reasoning belongs before the answer it produced. A thinking
+            // line that never saw a newline would otherwise stay pending
+            // until chat.final and land after the answer.
+            s.transcript.seal_stream(STREAM_THINKING);
             s.run_phase = RunPhase::Responding;
             s.transcript
                 .push_delta(STREAM_ASSISTANT, LineKind::Assistant, content);
@@ -1131,6 +1135,12 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
         "agent.thinking" => {
             let content = payload["content"].as_str().unwrap_or_default();
             let mut s = state.write().await;
+            // The live stream gets the same header the history renderer adds,
+            // once per turn, the first time reasoning arrives.
+            if !s.transcript.has_stream(STREAM_THINKING) {
+                s.transcript
+                    .push(vec![TranscriptLine::new(LineKind::Reasoning, "thinking:")]);
+            }
             s.run_phase = RunPhase::Thinking;
             s.transcript
                 .push_delta(STREAM_THINKING, LineKind::Reasoning, content);
@@ -1146,6 +1156,9 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
                 .cloned()
                 .or_else(|| payload.get("args").filter(|v| !v.is_null()).cloned());
             let mut s = state.write().await;
+            // Same ordering rule as for answer text: reasoning that never saw
+            // a newline would otherwise land after the call it motivated.
+            s.transcript.seal_stream(STREAM_THINKING);
             s.run_phase = RunPhase::ToolCall(tool.clone());
             s.transcript.push(tool_call_lines(&tool, args.as_ref()));
             s.dirty = true;
@@ -2889,6 +2902,90 @@ mod tests {
         assert!(
             painted.contains("timed out waiting for `commands.list`"),
             "the timeout is a line of output: {painted:?}"
+        );
+    }
+
+    /// Reasoning gets a header once per turn, and a reasoning paragraph that
+    /// never saw a newline freezes *before* the answer it produced — not after
+    /// it at `chat.final`.
+    #[tokio::test]
+    async fn reasoning_gets_a_header_and_seals_before_the_answer() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        // One long reasoning line, no newline: the shape that used to be held
+        // until the turn closed.
+        handle_event(
+            event(
+                "agent.thinking",
+                serde_json::json!({ "session_id": "s1", "content": "用户想知道重启时间，让我用 shell 查" }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+        handle_event(
+            event(
+                "chat.delta",
+                serde_json::json!({ "session_id": "s1", "content": "重启时间是今天凌晨。\n" }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "thinking:".to_string(),
+                "用户想知道重启时间，让我用 shell 查".to_string(),
+                "重启时间是今天凌晨。".to_string(),
+            ],
+            "header, then the reasoning, then the answer"
+        );
+    }
+
+    /// A second reasoning burst in the same turn (the agentic loop's next
+    /// round) does not get a second header — the stream is still open.
+    #[tokio::test]
+    async fn a_second_reasoning_burst_gets_no_second_header() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        for content in ["first thought\n", "second thought\n"] {
+            handle_event(
+                event(
+                    "agent.thinking",
+                    serde_json::json!({ "session_id": "s1", "content": content }),
+                ),
+                &state,
+                &mut client,
+            )
+            .await;
+        }
+
+        let lines: Vec<String> = state
+            .write()
+            .await
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            lines.iter().filter(|l| l.as_str() == "thinking:").count(),
+            1,
+            "one header for the turn: {lines:?}"
         );
     }
 

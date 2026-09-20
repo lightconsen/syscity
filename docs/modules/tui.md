@@ -45,7 +45,13 @@ side, which is what makes the terminal's own scroll and selection work.
   closing fence so the block is styled as one unit (`HOLD_CAP` bounds that
   hold). `chat.final` reconciles the authoritative text against what was
   already printed — including the non-streaming provider case, where no deltas
-  arrive at all.
+  arrive at all. One ordering rule on top: when a *different* stream starts
+  producing content, the thinking stream is sealed first — its pending text
+  graduates as if newline-terminated, without closing the stream — because a
+  reasoning paragraph that never saw a newline would otherwise stay pending
+  until `chat.final` and land in the scrollback after the answer it is the
+  reasoning for. Live reasoning gets the same `thinking:` header the history
+  renderer adds, once per turn.
 - **`scrollback.rs`** — the only caller of `Terminal::insert_before`, because of
   two things that API does not do: it does **not** wrap (an over-wide line is
   silently truncated, so everything is wrapped first) and it **clears the
