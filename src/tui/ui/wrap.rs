@@ -129,6 +129,22 @@ pub fn wrap_lines(lines: &[Line<'_>], width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// Pad a string to a display width with trailing spaces (`unicode-width`).
+///
+/// A cell whose display width already meets `width` is returned unchanged;
+/// a wider-than-`width` string is left alone rather than truncated. Used to
+/// right-align table columns on the display grid, where a hanzi takes two
+/// cells but one byte boundary looks like a column of its own.
+pub fn pad_to_width(s: &str, width: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(width - w));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +157,18 @@ mod tests {
 
     /// The property the scrollback writer depends on: nothing over-wide ever
     /// reaches `insert_before`, and nothing is lost on the way.
+    #[test]
+    fn pad_to_width_measures_display_not_bytes() {
+        // A single hanzi is two columns; padding it toward a three-column
+        // target adds one display column'of space, not bytes.
+        let padded = pad_to_width("名", 3);
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), 3);
+        assert_eq!(padded, "名 ");
+        // At or past the target nothing is truncated, nothing added.
+        assert_eq!(pad_to_width("名字", 3), "名字");
+        assert_eq!(pad_to_width("很长的单元", 2), "很长的单元");
+    }
+
     fn assert_widths(input: &str, width: usize) -> Vec<String> {
         let line = Line::from(input.to_string());
         let wrapped = wrap_line(&line, width);

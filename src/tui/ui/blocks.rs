@@ -7,10 +7,11 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::gateway_calls::HistoryMessage;
 use crate::tui::transcript::{LineKind, TranscriptLine};
-use crate::tui::ui::Theme;
+use crate::tui::ui::{wrap, Theme};
 
 /// The style a transcript line kind renders with.
 pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
@@ -224,25 +225,116 @@ pub fn history_message_lines(msg: &HistoryMessage) -> Vec<TranscriptLine> {
     out
 }
 
-/// Prose → transcript lines, tagging fenced regions as code.
+/// Prose → transcript lines, tagging fenced regions as code and aligning
+/// consecutive pipe rows as a table.
 pub fn text_lines(text: &str) -> Vec<TranscriptLine> {
     if text.is_empty() {
         return Vec::new();
     }
+    let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+
     let mut out = Vec::new();
     let mut in_fence = false;
-    for raw in text.split('\n') {
-        let line = raw.trim_end_matches('\r');
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             out.push(TranscriptLine::new(LineKind::Code, line.to_string()));
-        } else if in_fence {
-            out.push(TranscriptLine::new(LineKind::Code, line.to_string()));
-        } else {
-            out.push(TranscriptLine::new(LineKind::Assistant, line.to_string()));
+            i += 1;
+            continue;
         }
+        if in_fence {
+            out.push(TranscriptLine::new(LineKind::Code, line.to_string()));
+            i += 1;
+            continue;
+        }
+        // At least two consecutive pipe rows are a table, not prose.
+        if let Some((rows, consumed)) = table_block(&lines[i..]) {
+            out.extend(table_lines(&rows));
+            i += consumed;
+            continue;
+        }
+        out.push(TranscriptLine::new(LineKind::Assistant, line.to_string()));
+        i += 1;
     }
     out
+}
+
+/// A row that could belong to a table: a trimmed line opening with `|` and
+/// holding at least one more. A bare `|` slug in prose is not one.
+fn is_pipe_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.matches('|').count() >= 2
+}
+
+/// The maximal run of pipe rows starting at the front of `lines`, when there
+/// are at least two — a single pipe row is ordinary text.
+fn table_block<'a>(lines: &[&'a str]) -> Option<(Vec<&'a str>, usize)> {
+    let count = lines.iter().take_while(|l| is_pipe_row(l)).count();
+    if count < 2 {
+        return None;
+    }
+    Some((lines[..count].to_vec(), count))
+}
+
+/// A table separaator cell: `---`, `:--:`, `-:`, with optional colons.
+fn is_separator_cell(cell: &str) -> bool {
+    let c = cell.trim().trim_start_matches(':').trim_end_matches(':');
+    !c.is_empty() && c.bytes().all(|b| b == b'-')
+}
+
+/// Align the rows of a markdown table.
+///
+/// Every column is padded to its widest cell's display width (`unicode-width`,
+/// so a hanzi's two columns are counted, not its bytes), and each row is
+/// rebuilt with the shared column boundaries. Separator rows (`---`) render
+/// dim, data rows as ordinary prose.
+fn table_lines(rows: &[&str]) -> Vec<TranscriptLine> {
+    let cells: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|row| {
+            row.trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim())
+                .collect()
+        })
+        .collect();
+    let columns = cells.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    // The widest display width per column; short or ragged rows are padded.
+    let widths: Vec<usize> = (0..columns)
+        .map(|c| {
+            cells
+                .iter()
+                .filter_map(|r| r.get(c))
+                .map(|s| UnicodeWidthStr::width(*s))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    cells
+        .iter()
+        .map(|row| {
+            // A row is a separator when every cell is one — and no fewer:
+            // `| a | - |` is a data row that happens to mention a dash.
+            let is_separator = row.iter().all(|c| is_separator_cell(c));
+            let rendered: Vec<String> = (0..columns)
+                .map(|c| match row.get(c) {
+                    Some(cell) => wrap::pad_to_width(cell, widths[c]),
+                    None => " ".repeat(widths[c]),
+                })
+                .collect();
+            let kind = if is_separator {
+                LineKind::Notice
+            } else {
+                LineKind::Assistant
+            };
+            let text = format!("| {} |", rendered.join(" | "));
+            TranscriptLine::new(kind, text)
+        })
+        .collect()
 }
 
 /// Turn a loaded history into one block of transcript lines.
@@ -269,6 +361,7 @@ pub fn rule(text: &str) -> TranscriptLine {
 mod tests {
     use super::*;
     use serde_json::json;
+    use unicode_width::UnicodeWidthChar;
 
     fn texts(entries: &[TranscriptLine]) -> Vec<String> {
         entries.iter().map(|e| e.text.clone()).collect()
@@ -403,8 +496,7 @@ mod tests {
     fn inline_backticks_are_accented_and_every_character_survives() {
         let theme = Theme::dark();
         let text = "run `cargo test` then `cargo fmt`";
-        let line =
-            to_line(&TranscriptLine::new(LineKind::Assistant, text.to_string()), &theme);
+        let line = to_line(&TranscriptLine::new(LineKind::Assistant, text.to_string()), &theme);
         // Every source character survives, in order, across the spans: the
         // decoration is style-only and must not shift the wrapped width.
         let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -423,15 +515,12 @@ mod tests {
     #[test]
     fn a_lone_backtick_and_an_empty_pair_stay_plain() {
         let theme = Theme::dark();
-        let line = to_line(
-            &TranscriptLine::new(LineKind::Assistant, "not `closed".to_string()),
-            &theme,
-        );
+        let line =
+            to_line(&TranscriptLine::new(LineKind::Assistant, "not `closed".to_string()), &theme);
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content, "not `closed");
         // `` with nothing between keeps both characters, unaccented.
-        let empty =
-            to_line(&TranscriptLine::new(LineKind::Assistant, "a``b".to_string()), &theme);
+        let empty = to_line(&TranscriptLine::new(LineKind::Assistant, "a``b".to_string()), &theme);
         let joined: String = empty.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "a``b");
         assert!(empty.spans.iter().all(|s| s.style.fg != Some(theme.accent)));
@@ -440,10 +529,8 @@ mod tests {
     #[test]
     fn code_spans_in_user_lines_keep_the_users_background() {
         let theme = Theme::dark();
-        let line = to_line(
-            &TranscriptLine::new(LineKind::User, "use `Command::new`".to_string()),
-            &theme,
-        );
+        let line =
+            to_line(&TranscriptLine::new(LineKind::User, "use `Command::new`".to_string()), &theme);
         let code = line
             .spans
             .iter()
@@ -456,11 +543,70 @@ mod tests {
     #[test]
     fn fenced_blocks_are_not_re_tokenized() {
         let theme = Theme::dark();
-        let line = to_line(
-            &TranscriptLine::new(LineKind::Code, "let `x = 1;`".to_string()),
-            &theme,
-        );
+        let line =
+            to_line(&TranscriptLine::new(LineKind::Code, "let `x = 1;`".to_string()), &theme);
         assert_eq!(line.spans.len(), 1, "a code fence renders as one span");
+    }
+
+    #[test]
+    fn table_rows_align_columns_including_wide_characters() {
+        let text = "| 名字 | 大小 |\n| --- | ---: |\n| 中文 | 十二 |";
+        let lines = text_lines(text);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].kind, LineKind::Assistant);
+        assert_eq!(lines[1].kind, LineKind::Notice, "the --- row is dim");
+        assert_eq!(lines[2].kind, LineKind::Assistant);
+        // Every row agrees on where each `|` boundary lands in *display columns*:
+        // a hanzi is two columns, so pad_to_width must count columns, not
+        // characters or bytes, for the boundaries to line up.
+        let pipes: Vec<Vec<usize>> = lines
+            .iter()
+            .map(|l| {
+                let (mut cols, mut col) = (Vec::<usize>::new(), 0usize);
+                for ch in l.text.chars() {
+                    if ch == '|' {
+                        cols.push(col);
+                    }
+                    col += UnicodeWidthChar::width(ch).unwrap_or(0);
+                }
+                cols
+            })
+            .collect();
+        assert_eq!(pipes[1], pipes[0], "the separator row aligns");
+        assert_eq!(pipes[2], pipes[0], "a wide cell must not shift the column");
+    }
+
+    #[test]
+    fn a_lone_pipe_row_is_prose_not_a_table() {
+        let lines = text_lines("| just one row |\nand prose after");
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines.iter().all(|l| l.kind != LineKind::Notice),
+            "no table, no dim separator: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_separator_row_after_a_prose_line_is_not_a_table() {
+        // The pipe run starts *after* the prose line; only consecutive rows
+        // form a table.
+        let lines = text_lines("plain text\n| --- |\n| x |");
+        assert_eq!(lines[0].kind, LineKind::Assistant);
+        assert_eq!(lines[0].text, "plain text");
+        // `| --- |` + `| x |` is two rows, so it *is* a table.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].kind, LineKind::Notice);
+        assert_eq!(lines[2].kind, LineKind::Assistant);
+    }
+
+    #[test]
+    fn ragged_rows_are_padded_not_lost() {
+        let lines = text_lines("| a | b |\n| only |");
+        assert_eq!(lines.len(), 2);
+        // The second row still renders both columns, the missing one padded.
+        assert!(lines[1].text.contains("| only |"), "got {}", lines[1].text);
+        let c: Vec<char> = lines[1].text.chars().collect();
+        assert!(c.len() >= lines[0].text.chars().count());
     }
 
     #[test]
