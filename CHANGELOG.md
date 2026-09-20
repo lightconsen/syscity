@@ -17,7 +17,7 @@ if no section matches, the release falls back to auto-generated notes.
 
 - **The TUI runs inline.** `syscity tui` writes the conversation into the terminal's own scrollback as it arrives and redraws only a small live region at the bottom — composer, status row, blocking prompts. Native scrolling, text selection and copy keep working, and the transcript outlives the client. It is also no longer a one-line-at-a-time thing: output streams and freezes line by line, tool calls and results appear as they happen, approvals and `ask_user` questions take over the bottom of the screen rather than the whole of it, a message typed mid-turn is queued instead of run alongside, and a dropped socket is reconciled against the gateway's history on reconnect.
 - **Browser control can actually interact.** Key combinations, right/middle/double/triple clicks, and drags that move; a screenshot now states the coordinate space it is in and refuses clicks outside it; `escalate` is an explicit way to say the page is not enough.
-- **A pass over every trust boundary.** The gateway trades a long-lived token for a single-use, 30-second upgrade ticket and keeps credentials out of its own log lines; every event carries an audience so one client is not handed another's traffic; scopes are granted from the credential rather than from the request; webhook deliveries are bounded and replayed signatures refused; CORS no longer mirrors the request origin.
+- **A pass over every trust boundary.** The gateway trades a long-lived token for a single-use, 30-second upgrade ticket and keeps credentials out of its own log lines; every event carries an audience so one client is not handed another's traffic; scopes are granted from the credential rather than from the request; webhook deliveries are bounded and replayed signatures refused; CORS no longer mirrors the request origin, and a wildcard origin can no longer be paired with credentials — **an existing config that has both will refuse to start** (see the note under Changed for the one-line fix).
 
 ### Added
 
@@ -34,6 +34,7 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Changed
 
+- **Breaking for existing configs: a CORS wildcard may no longer be paired with `allow_credentials`.** The gateway now refuses to start on `security.cors.allowed_origins = ["*"]` together with `security.cors.allow_credentials = true` — the pair tells every browser that any site may make credentialed requests. A config that has both will fail to start with an error naming the setting; set `allow_credentials = false` (nothing here needs it: cookies are not a credential, and the flag only decides whether a browser may attach the ones it holds), or list the origins you trust in `allowed_origins`. The config block in `docs/security-config.md` showed the pair and has been corrected.
 - One place decides which model a fresh install uses, instead of the default being restated wherever it was needed.
 - Authentication no longer treats cookies as a credential.
 - The TUI's tool output is one transcript line per row and is capped by a row budget: the ellipsis is the last row of the budget, not an extra one. Live previews get five argument rows (leaving room for the `⚙ tool` header in a six-row region); a reprint from history gets eight.

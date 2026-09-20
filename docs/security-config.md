@@ -233,7 +233,7 @@ Enabled by `security_headers = true`.
 [security.cors]
 enabled = true
 allowed_origins = ["*"]          # tighten to your UI origin in production
-allow_credentials = true
+allow_credentials = false        # must stay false while allowed_origins is "*"
 max_age_secs = 3600
 
 [security.csp]
@@ -241,6 +241,24 @@ enabled = true
 use_nonce = true                 # nonce inline scripts
 # policy = "default-src 'self'; …"  # override the default policy if needed
 ```
+
+`allowed_origins = ["*"]` and `allow_credentials = true` are refused together,
+and the gateway **refuses to start** on the pair rather than quietly dropping
+one half of it. A wildcard origin with credentials tells every browser that any
+site may make credentialed requests, which turns "allow anything" from a
+convenience into a cross-origin read. To send credentials across origins, list
+the origins you trust instead of the wildcard:
+
+```toml
+[security.cors]
+allowed_origins = ["https://your-ui.example"]
+allow_credentials = true
+```
+
+Nothing in Syscity asks for `allow_credentials`: cookies are not a credential
+here — a client presents a bearer token or a single-use WebSocket upgrade
+ticket — and the flag only decides whether a *browser* is permitted to attach
+cookies it may already hold.
 
 The default CSP restricts scripts/styles to `'self'`, allows `ws:`/`wss:` for
 the WebSocket connection, and sets `frame-ancestors 'none'`. In production,
