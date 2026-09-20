@@ -69,7 +69,12 @@ impl BrowserInstance {
         }
 
         if let Some(ref data_dir) = profile.user_data_dir {
-            builder = builder.arg(format!("--user-data-dir={}", data_dir.display()));
+            // The dedicated config field, not a raw arg: chromiumoxide
+            // unconditionally appends its own `--user-data-dir` (the
+            // `chromiumoxide-runner` temp dir) during build, which overrides
+            // a duplicate raw flag — so configured persistent sessions never
+            // actually used their directory.
+            builder = builder.user_data_dir(data_dir);
         }
 
         for arg in &profile.extra_args {
@@ -175,6 +180,28 @@ impl BrowserInstance {
     pub async fn get_page(&self, target_id: &str) -> Option<PageHandle> {
         let pages = self.pages.read().await;
         pages.get(target_id).cloned()
+    }
+
+    /// The most recently used page this instance still tracks, if any.
+    ///
+    /// Browser state lives on the page, so a follow-up tool call wants the
+    /// page the previous call left behind: opening a fresh `about:blank` per
+    /// call turns a Navigate in one call and a Type in the next into two
+    /// different tabs.
+    pub async fn most_recent_page(&self) -> Option<PageHandle> {
+        let pages = self.pages.read().await;
+        pages.values().max_by_key(|h| h.last_used).cloned()
+    }
+
+    /// Mark a page as just used, so the next reuse picks it over older ones.
+    pub async fn touch_page(&self, target_id: &str) {
+        {
+            let mut pages = self.pages.write().await;
+            if let Some(handle) = pages.get_mut(target_id) {
+                handle.last_used = Instant::now();
+            }
+        }
+        *self.last_used.write().await = Instant::now();
     }
 
     /// Close a page by target ID — closes the CDP page and removes from map

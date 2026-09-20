@@ -88,6 +88,11 @@ BrowserPool::get_or_create_instance()
 ## Implemented Features
 
 - Browser instance pooling with idle eviction
+- **Page reuse across tool calls**: a pooled instance hands the next tool call
+  the page the previous call left behind (with a one-line liveness probe that
+  replaces a page closed or crashed since), so a Navigate in one call and a
+  Type in the next operate on the same tab. Previously every call opened a
+  fresh `about:blank`, which made cross-call sessions impossible.
 - ARIA snapshot generation for LLM-friendly page representation
 - Action execution by reference markers (click, fill, press)
 - Multiple browser profiles (headless/headed, viewport sizes)

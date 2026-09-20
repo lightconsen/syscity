@@ -63,7 +63,24 @@ impl BrowserTool {
         pool: &std::sync::Arc<crate::browser::BrowserPool>,
     ) -> crate::Result<ToolExecutionResult> {
         let instance = pool.get_or_create(&self.profile).await?;
-        let mut current_handle = instance.new_page("about:blank").await?;
+        // Reuse the page a previous call left behind. Every call used to open
+        // a fresh `about:blank`, so a Navigate in one call and a Type in the
+        // next ran on two different tabs — the second found no element, and
+        // every read returned an empty page. A one-line probe detects a page
+        // that died since (closed externally, crashed) and falls back to a
+        // fresh one.
+        let mut current_handle = match instance.most_recent_page().await {
+            Some(handle) if handle.page.evaluate("1").await.is_ok() => handle,
+            Some(handle) => {
+                warn!(
+                    target_id = %handle.target_id,
+                    "Tracked browser page is gone; opening a fresh one"
+                );
+                instance.new_page("about:blank").await?
+            }
+            None => instance.new_page("about:blank").await?,
+        };
+        instance.touch_page(&current_handle.target_id).await;
         if let Err(e) = crate::browser::instrument::ensure_instrumented(&current_handle.page).await
         {
             warn!("Failed to instrument pooled page: {}", e);
