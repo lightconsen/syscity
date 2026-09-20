@@ -16,6 +16,44 @@ use super::super::*;
 const EMPTY_REPLY_NUDGE: &str = "你的上一条回复内容为空（没有生成任何文字，也没有调用工具）。请直接继续：要么基于已有信息给出最终回答，要么执行下一步操作，不要返回空内容。\n\
 Your previous reply was empty (no text and no tool calls were produced). Continue directly: give your final answer based on what you already have, or take the next concrete step — do not reply with empty content.";
 
+/// Some providers (deepseek-v4-pro via a relay) stream tool-call intent as
+/// template markup in the content channel — `<｜DSML｜tool_calls>`,
+/// `<｜｜DSML｜｜invoke ...>` — expecting a structured `tool_calls` sidecar
+/// that never arrives. A round whose whole output is such markup carries no
+/// answer, so it must not complete the turn: the markup would be stored and
+/// displayed verbatim as the reply (observed in real turns). Half- and
+/// full-width pipe forms are both listed because the mangling happens
+/// upstream of this repo.
+const UNPARSED_TOOL_MARKERS: &[&str] = &[
+    "|tool_calls",
+    "｜tool_calls",
+    "|DSML",
+    "｜DSML",
+    "|invoke",
+    "｜invoke",
+    "<tool_call>",
+    "<function_calls>",
+];
+
+/// Whether this content is (mostly) unparsed tool-call markup rather than an
+/// answer. A template leak puts a marker within the first few characters —
+/// including the leading `<` the mangled forms carry — so the check scans
+/// only the head of the content, and an answer that merely mentions the
+/// syntax later on is still delivered.
+pub(crate) fn looks_like_unparsed_tool_markup(content: &str) -> bool {
+    let head: String = content.trim_start().chars().take(200).collect();
+    UNPARSED_TOOL_MARKERS
+        .iter()
+        .any(|marker| head.contains(marker))
+}
+
+/// Injected when a round's only output is unparsed tool-call markup (see
+/// [`looks_like_unparsed_tool_markup`]). The next round runs without tools,
+/// so whatever the model wanted to call, the honest move is to answer with
+/// what it already gathered.
+const MARKUP_NUDGE: &str = "你的上一条回复只包含未解析的工具调用标记文本，没有真正的回答。不要再尝试调用工具：请直接基于已有的工具结果给出给用户的最终回答。\n\
+Your previous reply contained only unparsed tool-call markup text, not an answer. Do not try to call tools again: give your final answer to the user directly based on the tool results you already have.";
+
 impl Agent {
     /// Resolve the effective model id for a conversation, using the same
     /// precedence as the send path: per-session binding > temporary override >
@@ -268,6 +306,24 @@ impl Agent {
                         .handle_tool_calls(context, &response, tool_calls, user_id)
                         .await;
                 }
+            }
+
+            // A reply that is only unparsed tool-call markup is not an
+            // answer: the model wrote the tool-call template as plain text
+            // and no structured calls arrived. Recording it and closing the
+            // turn would store the template as the reply. Record the round
+            // (strict-pairing providers need the assistant turn between tool
+            // results and the next request), nudge the model to summarize,
+            // then run one no-tools round so the turn ends with a real
+            // answer. `final_round` keeps this from re-firing: one extra
+            // round, never a loop.
+            if looks_like_unparsed_tool_markup(&response.message.content) {
+                warn!(
+                    "LLM reply was only unparsed tool-call markup; forcing a no-tools summary round"
+                );
+                context.add_message(response.message.clone());
+                context.add_message(Message::user(MARKUP_NUDGE.to_string()));
+                return Box::pin(self.get_completion_inner(context, user_id, true)).await;
             }
         }
 
@@ -802,6 +858,27 @@ impl Agent {
                         )
                         .await;
                 }
+            }
+
+            // A reply that is only unparsed tool-call markup is not an
+            // answer — same guard as the plain path: record the round,
+            // nudge, then close with one no-tools round. The collector's
+            // round was already closed with its finish reason above; the
+            // forced round opens its own.
+            if looks_like_unparsed_tool_markup(&response.message.content) {
+                warn!(
+                    "LLM reply was only unparsed tool-call markup; forcing a no-tools summary round"
+                );
+                context.add_message(response.message.clone());
+                context.add_message(Message::user(MARKUP_NUDGE.to_string()));
+                return Box::pin(self.get_completion_with_progress_inner(
+                    context,
+                    collector,
+                    progress_cb,
+                    user_id,
+                    true,
+                ))
+                .await;
             }
         }
 

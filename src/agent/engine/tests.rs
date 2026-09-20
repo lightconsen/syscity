@@ -188,6 +188,138 @@ impl Provider for EmptyThenOk {
     }
 }
 
+/// A provider whose first reply is only the tool-call template the model
+/// writes as plain text — the DSML markup whose ASCII pipes an upstream
+/// relay mangles into fullwidth `｜` — and whose second is a real answer.
+/// Models the markup-only round that must not complete the turn as a
+/// template (observed in real sessions: it was stored and shown verbatim).
+struct MarkupThenOk {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for MarkupThenOk {
+    fn name(&self) -> &str {
+        "markup-then-ok-test"
+    }
+
+    fn default_model(&self) -> &str {
+        "test-model"
+    }
+
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    fn max_context(&self) -> usize {
+        128_000
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            return Ok(CompletionResponse {
+                message: Message::assistant(
+                    "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"mcp_connection\">\n\
+                     <｜｜DSML｜｜parameter name=\"action\">list</｜｜DSML｜｜parameter>",
+                ),
+                model: self.default_model().to_string(),
+                usage: Some(Usage::default()),
+                finish_reason: Some("stop".to_string()),
+            });
+        }
+        // The forced summary round must be closed: no tools offered, so the
+        // model can only write text.
+        assert!(
+            request.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true),
+            "the markup-forced summary round must not be offered tools"
+        );
+        Ok(CompletionResponse {
+            message: Message::assistant("final answer"),
+            model: self.default_model().to_string(),
+            usage: Some(Usage::default()),
+            finish_reason: Some("stop".to_string()),
+        })
+    }
+
+    async fn stream(&self, _request: CompletionRequest) -> crate::Result<CompletionStream> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(CompletionChunk {
+            content: Some("final answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            is_done: true,
+            error: None,
+            usage: None,
+        });
+        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+    }
+
+    async fn health_check(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    async fn set_credential(
+        &self,
+        _credential: crate::model_router::Credential,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_get_completion_forces_a_summary_round_on_markup_only_reply() {
+    let provider = Arc::new(MarkupThenOk { calls: AtomicUsize::new(0) });
+    let store = Arc::new(crate::memory::DatabaseStore::new_in_memory().await.unwrap());
+    let agent = crate::agent::Agent::new(
+        crate::agent::AgentConfig::default(),
+        provider.clone(),
+        Arc::new(crate::tools::ToolRegistry::new()),
+    );
+
+    let mut context =
+        crate::agent::Context::new("conv-markup", "You are a helpful assistant", 100_000);
+    context.add_message(Message::user("hello"));
+
+    let response = agent.get_completion(&mut context, "user1").await.unwrap();
+    // The markup round did not become the answer; the forced no-tools round's
+    // reply did.
+    assert_eq!(response.message.content, "final answer");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    // The markup round is still recorded in history (strict-pairing providers
+    // need the assistant turn) but the answer the user sees is the real one.
+    let history = context.history();
+    assert!(
+        history
+            .iter()
+            .any(|m| m.role == crate::providers::Role::Assistant && m.content.contains("DSML")),
+        "the markup round should be recorded in context"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|m| m.role == crate::providers::Role::Assistant && m.content == "final answer"),
+        "the forced round's answer should be recorded in context"
+    );
+}
+
+#[test]
+fn markup_detection_covers_the_mangled_and_plain_forms_only_at_the_start() {
+    use super::completion::looks_like_unparsed_tool_markup;
+    // The exact mangled form observed in stored sessions.
+    assert!(looks_like_unparsed_tool_markup(
+        "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"x\">"
+    ));
+    // ASCII template forms and leading whitespace.
+    assert!(looks_like_unparsed_tool_markup("<|tool_calls|>"));
+    assert!(looks_like_unparsed_tool_markup("\n  <｜DSML｜invoke>"));
+    // An answer that merely mentions the syntax is still delivered.
+    assert!(!looks_like_unparsed_tool_markup(
+        "The DSML markup uses pipe delimiters; here is how it works."
+    ));
+    assert!(!looks_like_unparsed_tool_markup("final answer"));
+}
+
 #[tokio::test]
 async fn test_get_completion_nudges_once_on_empty_reply() {
     let provider = Arc::new(EmptyThenOk { calls: AtomicUsize::new(0) });
