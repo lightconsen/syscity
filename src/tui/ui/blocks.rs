@@ -28,7 +28,63 @@ pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
 
 /// Render one transcript line.
 pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
-    Line::from(Span::styled(entry.text.clone(), kind_style(theme, entry.kind)))
+    let style = kind_style(theme, entry.kind);
+    let spans = match entry.kind {
+        // Prose lines get backtick spans. A fenced block is already tagged
+        // `LineKind::Code` and must not be re-tokenized.
+        LineKind::Assistant | LineKind::User => {
+            inline_code_spans(&entry.text, style, style.fg(theme.accent))
+        }
+        _ => vec![Span::styled(entry.text.clone(), style)],
+    };
+    Line::from(spans)
+}
+
+/// Split prose on backtick pairs so `` `code` `` renders as inline code.
+///
+/// Width-neutral by design: every source character survives, styled or not,
+/// because the scrollback's wrap alignment is measured from the line's width.
+/// The code span inherits the line's style and overrides the foreground with
+/// the accent — so a code span inside a user turn keeps that turn's
+/// background pill. A lone backtick with no closer, or an empty pair, is
+/// ordinary text.
+fn inline_code_spans(text: &str, plain: Style, code: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            // Find the matching closer. The backticks themselves are ordinary
+            // text before and after the code span — only the content between
+            // them is accented, and every source character survives.
+            if let Some(j) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), plain));
+                }
+                buf.push('`');
+                spans.push(Span::styled(std::mem::take(&mut buf), plain));
+                let code_text: String = chars[i + 1..j].iter().collect();
+                if !code_text.is_empty() {
+                    spans.push(Span::styled(code_text, code));
+                }
+                // The closing backtick stays in the buffer, joining whatever
+                // follows into the next plain run.
+                buf.push('`');
+                i = j + 1;
+                continue;
+            }
+            // No closing backtick: ordinary text.
+            buf.push('`');
+        } else {
+            buf.push(chars[i]);
+        }
+        i += 1;
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, plain));
+    }
+    spans
 }
 
 /// Render a batch of transcript lines.
@@ -341,6 +397,70 @@ mod tests {
         let lines = history_message_lines(&msg);
         assert!(lines.len() < 20, "args must be capped, got {}", lines.len());
         assert!(lines.iter().any(|l| l.text.trim_end().ends_with('…')));
+    }
+
+    #[test]
+    fn inline_backticks_are_accented_and_every_character_survives() {
+        let theme = Theme::dark();
+        let text = "run `cargo test` then `cargo fmt`";
+        let line =
+            to_line(&TranscriptLine::new(LineKind::Assistant, text.to_string()), &theme);
+        // Every source character survives, in order, across the spans: the
+        // decoration is style-only and must not shift the wrapped width.
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, text);
+        let code_spans: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| s.content == "cargo test" || s.content == "cargo fmt")
+            .collect();
+        assert_eq!(code_spans.len(), 2);
+        for s in code_spans {
+            assert_eq!(s.style.fg, Some(theme.accent));
+        }
+    }
+
+    #[test]
+    fn a_lone_backtick_and_an_empty_pair_stay_plain() {
+        let theme = Theme::dark();
+        let line = to_line(
+            &TranscriptLine::new(LineKind::Assistant, "not `closed".to_string()),
+            &theme,
+        );
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "not `closed");
+        // `` with nothing between keeps both characters, unaccented.
+        let empty =
+            to_line(&TranscriptLine::new(LineKind::Assistant, "a``b".to_string()), &theme);
+        let joined: String = empty.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "a``b");
+        assert!(empty.spans.iter().all(|s| s.style.fg != Some(theme.accent)));
+    }
+
+    #[test]
+    fn code_spans_in_user_lines_keep_the_users_background() {
+        let theme = Theme::dark();
+        let line = to_line(
+            &TranscriptLine::new(LineKind::User, "use `Command::new`".to_string()),
+            &theme,
+        );
+        let code = line
+            .spans
+            .iter()
+            .find(|s| s.content == "Command::new")
+            .expect("the code span");
+        assert_eq!(code.style.fg, Some(theme.accent));
+        assert_eq!(code.style.bg, Some(theme.user_bg));
+    }
+
+    #[test]
+    fn fenced_blocks_are_not_re_tokenized() {
+        let theme = Theme::dark();
+        let line = to_line(
+            &TranscriptLine::new(LineKind::Code, "let `x = 1;`".to_string()),
+            &theme,
+        );
+        assert_eq!(line.spans.len(), 1, "a code fence renders as one span");
     }
 
     #[test]
