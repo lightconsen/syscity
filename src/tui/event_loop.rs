@@ -395,7 +395,10 @@ async fn startup(state: &Arc<RwLock<AppState>>, client: &WsClient, session: &Ses
             .unwrap_or_default();
         let detected = state.read().await.startup_bg;
         let id = osc11::resolve(setting, osc11::env_hint(), detected);
-        state.write().await.active_theme = crate::tui::ui::Theme::from(id);
+        // The palette is modeless; what the terminal can render is not, so
+        // degrade the chosen dark/light colors at the last possible moment.
+        state.write().await.active_theme =
+            crate::tui::ui::Theme::from(id).for_mode(osc11::color_mode());
     }
 
     // The catalog feeds `/help` and Tab completion.

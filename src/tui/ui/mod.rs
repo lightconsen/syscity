@@ -11,6 +11,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::tui::osc11::ColorMode;
+
 pub mod blocks;
 pub mod live;
 pub mod wrap;
@@ -165,6 +167,83 @@ impl Theme {
             .fg(self.accent)
             .add_modifier(Modifier::BOLD)
     }
+
+    /// Degrade the palette to what the terminal can actually render.
+    ///
+    /// Truecolor terminals keep the exact RGB values; 256-color terminals
+    /// round each channel onto the 6×6×6 ANSI cube; 16-color terminals pick
+    /// the nearest named ANSI color. Non-RGB colors pass through untouched.
+    pub fn for_mode(&self, mode: ColorMode) -> Theme {
+        let d = |c: Color| degrade(c, mode);
+        Theme {
+            text: d(self.text),
+            dim: d(self.dim),
+            subtle: d(self.subtle),
+            user_bg: d(self.user_bg),
+            select_bg: d(self.select_bg),
+            accent: d(self.accent),
+            error: d(self.error),
+            warning: d(self.warning),
+            code_bg: d(self.code_bg),
+        }
+    }
+}
+
+/// The RGB values xterm assigns to the 16 named ANSI colors, normal and
+/// bright; the 16-color degradation target.
+const ANSI_16: [(u8, u8, u8); 16] = [
+    (0, 0, 0),       // 0  black
+    (128, 0, 0),     // 1  red
+    (0, 128, 0),     // 2  green
+    (128, 128, 0),   // 3  yellow
+    (0, 0, 128),     // 4  blue
+    (128, 0, 128),   // 5  magenta
+    (0, 128, 128),   // 6  cyan
+    (192, 192, 192), // 7  white
+    (128, 128, 128), // 8  bright black
+    (255, 0, 0),     // 9  bright red
+    (0, 255, 0),     // 10 bright green
+    (255, 255, 0),   // 11 bright yellow
+    (0, 0, 255),     // 12 bright blue
+    (255, 0, 255),   // 13 bright magenta
+    (0, 255, 255),   // 14 bright cyan
+    (255, 255, 255), // 15 bright white
+];
+
+/// Nearest named ANSI color under squared Euclidean distance.
+fn nearest_ansi16(r: u8, g: u8, b: u8) -> u8 {
+    let (mut best, mut best_d) = (0u8, i64::MAX);
+    for (i, &(ar, ag, ab)) in ANSI_16.iter().enumerate() {
+        let dr = i64::from(r) - i64::from(ar);
+        let dg = i64::from(g) - i64::from(ag);
+        let db = i64::from(b) - i64::from(ab);
+        let d = dr * dr + dg * dg + db * db;
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+/// Round one color onto the terminal's color space; identity on Truecolor.
+pub fn degrade(color: Color, mode: ColorMode) -> Color {
+    match mode {
+        ColorMode::Truecolor => color,
+        ColorMode::C256 => match color {
+            Color::Rgb(r, g, b) => {
+                // Index 16..=231 of the xterm palette: the 6×6×6 color cube
+                // (levels 0, 51, …, 255), plus 16 for the system colors.
+                let cube = |v: u8| ((u16::from(v) * 5 + 127) / 255).min(5) as u8;
+                Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
+            }
+            other => other,
+        },
+        ColorMode::C16 => match color {
+            Color::Rgb(r, g, b) => Color::Indexed(nearest_ansi16(r, g, b)),
+            other => other,
+        },
+    }
 }
 
 impl From<ThemeId> for Theme {
@@ -217,5 +296,58 @@ mod tests {
     fn theme_id_maps_to_the_matching_palette() {
         assert_eq!(Theme::from(ThemeId::Dark), Theme::dark());
         assert_eq!(Theme::from(ThemeId::Light), Theme::light());
+    }
+
+    #[test]
+    fn for_mode_truecolor_is_the_identity() {
+        assert_eq!(Theme::dark().for_mode(ColorMode::Truecolor), Theme::dark());
+        assert_eq!(Theme::light().for_mode(ColorMode::Truecolor), Theme::light());
+    }
+
+    #[test]
+    fn c256_rounds_onto_the_ansi_cube() {
+        // Pure primaries land on the cube corners; index = 16 + 36r + 6g + b.
+        assert_eq!(degrade(Color::Rgb(255, 0, 0), ColorMode::C256), Color::Indexed(196));
+        assert_eq!(degrade(Color::Rgb(0, 255, 0), ColorMode::C256), Color::Indexed(46));
+        assert_eq!(degrade(Color::Rgb(0, 0, 0), ColorMode::C256), Color::Indexed(16));
+        assert_eq!(degrade(Color::Rgb(255, 255, 255), ColorMode::C256), Color::Indexed(231));
+        // Close to 255 rounds up to the top level, not truncation.
+        assert_eq!(degrade(Color::Rgb(253, 0, 0), ColorMode::C256), Color::Indexed(196));
+    }
+
+    #[test]
+    fn c16_picks_the_nearest_named_color() {
+        assert_eq!(degrade(Color::Rgb(255, 0, 0), ColorMode::C16), Color::Indexed(9));
+        assert_eq!(degrade(Color::Rgb(0, 0, 0), ColorMode::C16), Color::Indexed(0));
+        assert_eq!(degrade(Color::Rgb(255, 255, 255), ColorMode::C16), Color::Indexed(15));
+        // A mid gray is closer to plain white (192) than to the black end.
+        assert_eq!(degrade(Color::Rgb(200, 200, 200), ColorMode::C16), Color::Indexed(7));
+        // The pure ANSI red maps to itself.
+        assert_eq!(degrade(Color::Rgb(128, 0, 0), ColorMode::C16), Color::Indexed(1));
+    }
+
+    #[test]
+    fn degraded_palettes_never_carry_truecolor_rgb() {
+        for &mode in &[ColorMode::C256, ColorMode::C16] {
+            for theme in [Theme::dark(), Theme::light()] {
+                let degraded = theme.for_mode(mode);
+                for (name, color) in [
+                    ("text", degraded.text),
+                    ("dim", degraded.dim),
+                    ("subtle", degraded.subtle),
+                    ("user_bg", degraded.user_bg),
+                    ("select_bg", degraded.select_bg),
+                    ("accent", degraded.accent),
+                    ("error", degraded.error),
+                    ("warning", degraded.warning),
+                    ("code_bg", degraded.code_bg),
+                ] {
+                    assert!(
+                        !matches!(color, Color::Rgb(..)),
+                        "{mode:?}: {name} must not stay RGB, got {color:?}"
+                    );
+                }
+            }
+        }
     }
 }
