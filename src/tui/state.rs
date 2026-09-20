@@ -178,6 +178,9 @@ pub struct AppState {
     pub connection: ConnectionState,
     /// Palette in use for the live region and scrollback, resolved at startup.
     pub active_theme: crate::tui::ui::Theme,
+    /// What the OSC 11 query saw at startup, if the terminal answered. Kept so
+    /// an `auto` setting can be re-resolved later without asking again.
+    pub startup_bg: Option<crate::tui::ui::ThemeId>,
     /// Session the TUI is talking to.
     pub current_session: Option<String>,
     /// Agent bound to the current session, if any.
@@ -250,6 +253,7 @@ impl Default for AppState {
         Self {
             connection: ConnectionState::default(),
             active_theme: crate::tui::ui::Theme::dark(),
+            startup_bg: None,
             current_session: None,
             current_agent: None,
             sessions: Vec::new(),

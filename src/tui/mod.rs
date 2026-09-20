@@ -16,6 +16,7 @@ mod error;
 mod event_loop;
 pub mod gateway_calls;
 mod input;
+mod osc11;
 mod resume;
 mod retry;
 pub mod scrollback;

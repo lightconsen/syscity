@@ -11,6 +11,7 @@
 
 use std::io::{stdout, IsTerminal, Stdout, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::cursor::Show;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -21,8 +22,10 @@ use tokio::sync::RwLock;
 use crate::tui::auth::AuthConfig;
 use crate::tui::error::TuiError;
 use crate::tui::event_loop;
+use crate::tui::osc11;
 use crate::tui::state::AppState;
 use crate::tui::ui::live::LIVE_HEIGHT;
+use crate::tui::ui::ThemeId;
 use crate::tui::ws_client::WsClient;
 
 /// Which conversation to open on startup.
@@ -90,6 +93,13 @@ async fn run_inline(endpoint: Endpoint, session: SessionChoice) -> Result<(), Tu
         }
     };
 
+    // Ask the terminal for its background color while nothing else is reading
+    // stdin: crossterm's event loop has not started, so the one-shot raw read
+    // cannot desync its parser — at worst it swallows a keystroke typed inside
+    // the window. A terminal without OSC 11 stays quiet, yielding `None`, and
+    // the theme falls back to dark.
+    let startup_bg = osc11::query_background(Duration::from_millis(120));
+
     // A panic must not leave the terminal in raw mode with a hidden cursor.
     // The hook is taken back when this function returns — see `PanicHookGuard`
     // — because it restores a terminal the process no longer owns.
@@ -117,10 +127,10 @@ async fn run_inline(endpoint: Endpoint, session: SessionChoice) -> Result<(), Tu
     let result: Result<(), TuiError> = if std::env::var_os("SYSCITY_TUI_DEBUG_FATAL").is_some() {
         Err(TuiError::Terminal(std::io::Error::other("SYSCITY_TUI_DEBUG_FATAL drill")))
     } else {
-        run_app(&mut terminal, endpoint, session).await
+        run_app(&mut terminal, startup_bg, endpoint, session).await
     };
     #[cfg(not(debug_assertions))]
-    let result = run_app(&mut terminal, endpoint, session).await;
+    let result = run_app(&mut terminal, startup_bg, endpoint, session).await;
 
     let restore = restore_terminal();
     if let Err(ref e) = result {
@@ -178,6 +188,7 @@ fn restore_terminal() -> Result<(), TuiError> {
 /// Core application lifecycle.
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    startup_bg: Option<ThemeId>,
     endpoint: Endpoint,
     session: SessionChoice,
 ) -> Result<(), TuiError> {
@@ -192,6 +203,7 @@ async fn run_app(
             scopes_granted: hello.scopes_granted,
             server_version: hello.server.version,
         };
+        s.startup_bg = startup_bg;
     }
 
     event_loop::run(

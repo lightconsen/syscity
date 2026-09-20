@@ -28,6 +28,7 @@ use crate::tui::commands::handle_slash_command;
 use crate::tui::error::TuiError;
 use crate::tui::gateway_calls::{self as gw, ApprovalDetail, HistoryMessage};
 use crate::tui::input::InputSource;
+use crate::tui::osc11;
 use crate::tui::resume;
 use crate::tui::retry::Backoff;
 use crate::tui::scrollback;
@@ -382,6 +383,21 @@ async fn next_gateway(ws: &Option<Arc<WsClient>>) -> Option<WsMessage> {
 
 /// Everything that has to happen before the first paint.
 async fn startup(state: &Arc<RwLock<AppState>>, client: &WsClient, session: &SessionChoice) {
+    // Resolve the theme before the first paint: `tui.theme` in the gateway
+    // config, `auto` consulting the OSC 11 result from the setup window. A
+    // silent failure anywhere just keeps the dark default — the theme is a
+    // nicety, and the first frame must not wait on it.
+    if let Ok(config) = gw::config_get(client).await {
+        let setting = config
+            .get("tui")
+            .and_then(|t| t.get("theme"))
+            .and_then(|v| serde_json::from_value::<crate::gateway::ThemeSetting>(v.clone()).ok())
+            .unwrap_or_default();
+        let detected = state.read().await.startup_bg;
+        let id = osc11::resolve(setting, osc11::env_hint(), detected);
+        state.write().await.active_theme = crate::tui::ui::Theme::from(id);
+    }
+
     // The catalog feeds `/help` and Tab completion.
     if let Ok(catalog) = gw::commands_list(client).await {
         let mut s = state.write().await;
