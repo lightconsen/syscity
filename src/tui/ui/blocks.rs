@@ -22,6 +22,7 @@ pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
         LineKind::Tool => theme.tool_call_style(),
         LineKind::ToolResult => theme.tool_call_style().add_modifier(Modifier::DIM),
         LineKind::Code => theme.code_style(),
+        LineKind::Blockquote => theme.dim_style(),
         LineKind::Notice => theme.system_style(),
         LineKind::Separator => Style::default(),
     }
@@ -31,6 +32,11 @@ pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
 pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
     let style = kind_style(theme, entry.kind);
     let spans = match entry.kind {
+        // A block quote draws its own dim `│` gutter ahead of the prose.
+        LineKind::Blockquote => vec![
+            Span::styled("│ ", theme.dim_style()),
+            Span::styled(entry.text.clone(), theme.assistant_style()),
+        ],
         // Prose lines get backtick spans. A fenced block is already tagged
         // `LineKind::Code` and must not be re-tokenized.
         LineKind::Assistant | LineKind::User => {
@@ -253,6 +259,13 @@ pub fn text_lines(text: &str) -> Vec<TranscriptLine> {
         if let Some((rows, consumed)) = table_block(&lines[i..]) {
             out.extend(table_lines(&rows));
             i += consumed;
+            continue;
+        }
+        // A `>`-leading line is a block quote: the marker is dropped and the
+        // renderer draws its own gutter.
+        if let Some(body) = line.trim_start().strip_prefix('>') {
+            out.push(TranscriptLine::new(LineKind::Blockquote, body.trim_start().to_string()));
+            i += 1;
             continue;
         }
         out.push(TranscriptLine::new(LineKind::Assistant, line.to_string()));
@@ -607,6 +620,27 @@ mod tests {
         assert!(lines[1].text.contains("| only |"), "got {}", lines[1].text);
         let c: Vec<char> = lines[1].text.chars().collect();
         assert!(c.len() >= lines[0].text.chars().count());
+    }
+
+    #[test]
+    fn blockquote_lines_strip_the_marker_and_draw_a_gutter() {
+        let theme = Theme::dark();
+        let lines = text_lines("before\n> a quoted line\n>also-quoted\nafter");
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].kind, LineKind::Assistant);
+        // The `>` is dropped — the renderer supplies its own gutter.
+        assert_eq!(lines[1].kind, LineKind::Blockquote);
+        assert_eq!(lines[1].text, "a quoted line");
+        assert_eq!(lines[2].kind, LineKind::Blockquote);
+        assert_eq!(lines[2].text, "also-quoted");
+        assert_eq!(lines[3].kind, LineKind::Assistant);
+
+        let rendered = to_line(&lines[1], &theme);
+        assert_eq!(rendered.spans.len(), 2);
+        assert_eq!(rendered.spans[0].content.as_ref(), "│ ");
+        assert_eq!(rendered.spans[0].style.fg, Some(theme.dim));
+        assert_eq!(rendered.spans[1].content.as_ref(), "a quoted line");
+        assert_eq!(rendered.spans[1].style.fg, Some(theme.text));
     }
 
     #[test]

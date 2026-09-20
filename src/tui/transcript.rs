@@ -27,6 +27,8 @@ pub enum LineKind {
     ToolResult,
     /// A line inside a fenced code block.
     Code,
+    /// A block-quoted line (`> …`), rendered with a dim gutter.
+    Blockquote,
     /// A system notice (connection, resume, errors, command output).
     Notice,
     /// A blank separator line between blocks.
