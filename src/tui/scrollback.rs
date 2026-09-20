@@ -10,7 +10,7 @@
 // INVARIANTS-NONE: terminal writer; holds no state.
 
 use ratatui::backend::Backend;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
@@ -30,7 +30,7 @@ pub fn flush<B: Backend>(
     if lines.is_empty() || width == 0 {
         return Ok(0);
     }
-    let wrapped = wrap::wrap_lines(lines, width as usize);
+    let (wrapped, link_rows) = wrap::wrap_lines_links(lines, width as usize);
     if wrapped.is_empty() {
         return Ok(0);
     }
@@ -46,10 +46,40 @@ pub fn flush<B: Backend>(
                 height: 1,
             };
             line.render(row, buf);
+            inject_links(buf, row, &link_rows[idx]);
         }
     })?;
 
     Ok(height)
+}
+
+/// Wrap a row's URL cells so a click opens the link.
+///
+/// [`Line`]/[`Span`] filter control characters (ratatui's `set_stringn`
+/// drops them), so the OSC 8 escape pair has to go into the cell's symbol
+/// after the row is rendered. The runs are single-width ASCII, so every
+/// character is its own cell and the escapes never straddle a boundary.
+/// [`CellDiffOption::ForcedWidth`] of one tells the diff engine the visible
+/// width is a single column no matter what the symbol's bytes look like;
+/// that is how the terminal gets the sequence intact instead of a padded
+/// cell. A real terminal renders the pair as a hyperlink while still showing
+/// the original character.
+fn inject_links(buf: &mut Buffer, row: Rect, runs: &[wrap::LinkRun]) {
+    for run in runs {
+        for offset in 0..run.len {
+            let x = row.x + (run.start + offset) as u16;
+            let Some(cell) = buf.cell_mut((x, row.y)) else {
+                continue;
+            };
+            let prev = cell.symbol().to_owned();
+            // OSC 8 opens the hyperlink, writes the original character, then
+            // closes it — the URL is the parameter, the visible text is `prev`.
+            let symbol = format!("\x1b]8;;{}\x1b\\{prev}\x1b]8;;\x1b\\", run.url);
+            // `MIN` is 1, the "one display column" width every ASCII cell has.
+            cell.set_symbol(&symbol)
+                .set_diff_option(CellDiffOption::ForcedWidth(std::num::NonZeroU16::MIN));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +223,54 @@ mod tests {
     fn nothing_to_flush_is_not_an_error() {
         let mut terminal = terminal();
         assert_eq!(flush(&mut terminal, &[], WIDTH).expect("flush"), 0);
+    }
+
+    /// Every character of an `https://` URL is its own cell carrying the OSC 8
+    /// pair, forced to a width of one so the escape sequence survives the
+    /// diff. The rest of the line stays untouched.
+    #[test]
+    fn urls_are_wrapped_in_osc8_so_they_open_as_links() {
+        let mut terminal = terminal();
+        draw_live(&mut terminal, "composer");
+        flush(&mut terminal, &[Line::from("see https://example.com/x now")], WIDTH).expect("flush");
+        draw_live(&mut terminal, "composer");
+
+        let link_cells: Vec<_> = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .chain(terminal.backend().scrollback().content.iter())
+            .filter(|c| c.symbol().contains("\x1b]8;;https://example.com/x\x1b\\"))
+            .collect();
+        assert!(!link_cells.is_empty(), "the URL cells carry the OSC 8 starts");
+        for cell in link_cells {
+            assert!(cell.symbol().contains("\x1b]8;;\x1b\\"), "each link cell closes the pair");
+            assert!(
+                matches!(cell.diff_option, CellDiffOption::ForcedWidth(w) if w.get() == 1),
+                "a link cell is forced to width 1, got {:?}",
+                cell.diff_option
+            );
+        }
+        // The visible characters survive the round trip, wrapped as before.
+        let seen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .chain(terminal.backend().scrollback().content.iter())
+            .map(|c| c.symbol())
+            .collect();
+        assert!(seen.contains("https://example.com/x"), "the URL text is still there");
+        assert!(seen.contains("see "), "the prose around it is untouched");
+    }
+
+    /// A URL is dormant when the width is zero — nothing to inject, no panic.
+    #[test]
+    fn no_width_means_no_links_to_inject() {
+        assert_eq!(
+            flush(&mut terminal(), &[Line::from("https://example.com")], 0).expect("flush"),
+            0
+        );
     }
 }
