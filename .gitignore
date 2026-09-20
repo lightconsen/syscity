@@ -86,3 +86,5 @@ lcov.info
 .e2e-tmp/
 
 *.local.md
+audit/
+
