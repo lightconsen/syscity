@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::Show;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -163,6 +164,10 @@ impl Drop for PanicHookGuard {
 /// Initialize crossterm and ratatui for an inline viewport.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, TuiError> {
     enable_raw_mode()?;
+    // Bracketed paste turns a paste into one `Event::Paste` (delivered only
+    // while raw paste mode is on) instead of a keystroke storm that would
+    // replay modifiers and re-trigger completion.
+    crossterm::execute!(stdout(), EnableBracketedPaste).map_err(TuiError::Terminal)?;
     let backend = CrosstermBackend::new(stdout());
     Terminal::with_options(
         backend,
@@ -177,6 +182,9 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, TuiError> {
 fn restore_terminal() -> Result<(), TuiError> {
     disable_raw_mode()?;
     let mut out = stdout();
+    // Paste mode is off with raw mode; still end it explicitly so a terminal
+    // under a non-standard emulator cannot keep quoting pastes.
+    let _ = crossterm::execute!(out, DisableBracketedPaste);
     // Park the cursor on a fresh line so the shell prompt does not land on top
     // of the composer, and make sure it is visible again.
     let _ = out.write_all(b"\r\n");

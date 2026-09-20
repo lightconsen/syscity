@@ -44,6 +44,7 @@ impl InputSource for CrosstermInput {
                 Some(TuiAction::from_key_event(key))
             }
             Ok(Event::Key(_)) => None,
+            Ok(Event::Paste(text)) => Some(TuiAction::Paste(text)),
             Ok(Event::Resize(cols, rows)) => Some(TuiAction::Resize(cols, rows)),
             Ok(_) => None,
             Err(_) => None,

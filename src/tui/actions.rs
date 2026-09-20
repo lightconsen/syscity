@@ -39,6 +39,8 @@ pub enum TuiAction {
     CompleteNext,
     /// Cycle to the previous completion candidate.
     CompletePrev,
+    /// Text bracketed-pasted by the terminal; inserted at the cursor.
+    Paste(String),
     /// Dismiss the current prompt.
     Escape,
     /// Abort the running turn, or quit when idle.

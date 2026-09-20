@@ -300,6 +300,15 @@ impl AppState {
         self.insert_char('\n');
     }
 
+    /// Insert pasted text at the cursor, one character at a time so the cursor
+    /// lands after the whole run. A pasted `\n` is content — only the Enter
+    /// key sends, never the inside of a paste.
+    pub fn insert_paste(&mut self, text: &str) {
+        for c in text.chars() {
+            self.insert_char(c);
+        }
+    }
+
     /// Delete the character before the cursor.
     pub fn input_backspace(&mut self) {
         if self.input_cursor == 0 {
@@ -673,6 +682,21 @@ mod tests {
         s.move_cursor_left();
         s.input_backspace();
         assert_eq!(s.input_buffer, "中a");
+    }
+
+    /// Pasting is insert-only: every pasted character (newlines included)
+    /// lands in the buffer and the cursor ends after the run — a paste never
+    /// sends anything, whatever it contains.
+    #[test]
+    fn paste_inserts_its_newlines_as_content() {
+        let mut s = AppState::default();
+        typing(&mut s, "ab");
+        s.input_cursor = 1;
+        s.insert_paste("X\nZ中文");
+        assert_eq!(s.input_buffer, "aX\nZ中文b");
+        // The paste landed at the cursor (between `a` and `b`), so the cursor
+        // ends after the pasted run, with the trailing `b` still after it.
+        assert_eq!(s.input_cursor, "aX\nZ中文".len());
     }
 
     #[test]

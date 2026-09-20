@@ -298,6 +298,7 @@ fn is_local_edit(action: &TuiAction) -> bool {
     matches!(
         action,
         TuiAction::InputChar(_)
+            | TuiAction::Paste(_)
             | TuiAction::InputNewline
             | TuiAction::InputBackspace
             | TuiAction::InputDelete
@@ -518,6 +519,7 @@ async fn handle_action(
             handle_slash_command(&cmd, Arc::clone(state), ws).await?;
         }
         TuiAction::InputChar(c) => state.write().await.insert_char(c),
+        TuiAction::Paste(text) => state.write().await.insert_paste(&text),
         TuiAction::InputNewline => state.write().await.insert_newline(),
         TuiAction::InputBackspace => state.write().await.input_backspace(),
         TuiAction::InputDelete => {
@@ -568,6 +570,7 @@ async fn handle_offline_action(
     let edit_only = matches!(
         action,
         TuiAction::InputChar(_)
+            | TuiAction::Paste(_)
             | TuiAction::InputNewline
             | TuiAction::InputBackspace
             | TuiAction::InputDelete
@@ -587,6 +590,7 @@ async fn handle_offline_action(
         let mut s = state.write().await;
         match action {
             TuiAction::InputChar(c) => s.insert_char(c),
+            TuiAction::Paste(text) => s.insert_paste(&text),
             TuiAction::InputNewline => s.insert_newline(),
             TuiAction::InputBackspace => s.input_backspace(),
             TuiAction::InputDelete => {
@@ -2619,6 +2623,55 @@ mod tests {
         tokio::time::timeout(PATIENCE, driver)
             .await
             .expect("the loop exits despite the unanswered request")
+            .expect("join")
+            .expect("run");
+    }
+
+    /// A bracketed paste lands in the composer as content, newlines included.
+    ///
+    /// Pasted text must not be re-read as keystrokes — in particular the `\n`
+    /// inside it is content, not an Enter. Only the Enter key sends.
+    #[tokio::test]
+    async fn a_pasted_newline_is_content_not_a_send() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = state_and_client(&gateway).await;
+        let observed = Arc::clone(&state);
+        let (mut input, tx) = ScriptedInput::new();
+
+        let driver = tokio::spawn(async move {
+            let mut terminal = inline_terminal();
+            run(
+                &mut terminal,
+                state,
+                client,
+                test_endpoint(gateway.port),
+                SessionChoice::New,
+                &mut input,
+            )
+            .await
+        });
+        gateway.wait_for("commands.list", PATIENCE).await;
+
+        tx.send(TuiAction::Paste("hi\n there".into()))
+            .expect("queued");
+        eventually_async(
+            || {
+                let observed = Arc::clone(&observed);
+                async move { observed.read().await.input_buffer == "hi\n there" }
+            },
+            "the paste to reach the composer whole",
+        )
+        .await;
+        // The newline inside the paste was content: nothing hit the wire.
+        assert!(
+            !gateway.requests().iter().any(|r| r.method == "chat.send"),
+            "a paste containing \\n must not send"
+        );
+
+        tx.send(TuiAction::Quit).expect("queued");
+        tokio::time::timeout(PATIENCE, driver)
+            .await
+            .expect("the loop exits")
             .expect("join")
             .expect("run");
     }
