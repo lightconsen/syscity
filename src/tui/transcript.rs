@@ -32,6 +32,9 @@ pub enum LineKind {
     /// A markdown list item (`- …`, `* …`, `12. …`): the marker renders
     /// accented, the text as ordinary prose.
     ListItem,
+    /// An ATX heading (`# …`): the `#` marker is dropped, the title renders
+    /// bold (h1 underlined).
+    Heading,
     /// A system notice (connection, resume, errors, command output).
     Notice,
     /// A blank separator line between blocks.

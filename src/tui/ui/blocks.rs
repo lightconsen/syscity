@@ -24,6 +24,7 @@ pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
         LineKind::Code => theme.code_style(),
         LineKind::Blockquote => theme.dim_style(),
         LineKind::ListItem => theme.assistant_style(),
+        LineKind::Heading => theme.assistant_style(),
         LineKind::Notice => theme.system_style(),
         LineKind::Separator => Style::default(),
     }
@@ -65,6 +66,21 @@ pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
                 }
                 None => vec![Span::styled(entry.text.clone(), style)],
             }
+        }
+        // A heading renders as its title — the `#` marker is dropped, the
+        // text goes bold (h1 underlined) — with backtick spans preserved.
+        LineKind::Heading => {
+            let trimmed = entry.text.trim_start();
+            let level = heading_level(trimmed).unwrap_or(1);
+            let title = &trimmed[level..];
+            let mut heading = theme.assistant_style().add_modifier(Modifier::BOLD);
+            if level == 1 {
+                heading = heading.add_modifier(Modifier::UNDERLINED);
+            }
+            // The code span derives from the heading style so a heading keeps
+            // one weight throughout; only the foreground flips to the accent.
+            let code = heading.fg(theme.accent);
+            inline_code_spans(title.trim_start(), heading, code)
         }
         // Prose lines get backtick spans. A fenced block is already tagged
         // `LineKind::Code` and must not be re-tokenized.
@@ -304,6 +320,12 @@ pub fn text_lines(text: &str) -> Vec<TranscriptLine> {
             i += 1;
             continue;
         }
+        // An ATX heading renders as its bold title; the `#` marker is dropped.
+        if heading_level(line).is_some() {
+            out.push(TranscriptLine::new(LineKind::Heading, line.to_string()));
+            i += 1;
+            continue;
+        }
         out.push(TranscriptLine::new(LineKind::Assistant, line.to_string()));
         i += 1;
     }
@@ -338,6 +360,21 @@ fn list_marker_len(text: &str) -> Option<usize> {
     };
     match bytes.get(marker) {
         Some(b) if b.is_ascii_whitespace() => Some(indent + marker + 1),
+        _ => None,
+    }
+}
+
+/// The level of an ATX heading at the line's start: a run of one to six `#`
+/// followed by whitespace. A run without a following space (`#hashtag`) or
+/// longer than six (`#######` is not a heading in markdown) stays prose.
+fn heading_level(text: &str) -> Option<usize> {
+    let trimmed = text.trim_start();
+    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    match trimmed.as_bytes().get(hashes) {
+        Some(b' ') | Some(b'\t') => Some(hashes),
         _ => None,
     }
 }
@@ -799,5 +836,77 @@ mod tests {
             lines.iter().all(|l| l.kind == LineKind::Code),
             "a dash inside a fence is code, got {lines:?}"
         );
+    }
+
+    #[test]
+    fn headings_are_tagged_from_one_to_six_hashes() {
+        let lines =
+            text_lines("# h1\n## h2\n###### h6\n#hashtag stays prose\n####### not a heading");
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::Heading,
+                LineKind::Heading,
+                LineKind::Heading,
+                LineKind::Assistant,
+                LineKind::Assistant
+            ],
+            "one to six hashes are headings, `#tag` and seven are not: {kinds:?}"
+        );
+        // The text is kept verbatim; only rendering restyles it.
+        assert_eq!(lines[2].text, "###### h6");
+    }
+
+    #[test]
+    fn a_heading_renders_as_a_bold_title_without_the_marker() {
+        let theme = Theme::dark();
+        let lines = text_lines("# top `topic`\n## section\n### details");
+
+        // h1: marker dropped, title bold and underlined, backticks preserved.
+        let h1 = to_line(&lines[0], &theme);
+        let text: String = h1.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "top `topic`");
+        let accent = h1
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "topic")
+            .expect("code span");
+        assert_eq!(accent.style.fg, Some(theme.accent));
+        assert!(h1
+            .spans
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(
+            h1.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED),
+            "h1 is underlined: {:?}",
+            h1.spans[0].style
+        );
+
+        // h2: bold, not underlined.
+        let h2 = to_line(&lines[1], &theme);
+        assert_eq!(h2.spans[0].content.as_ref(), "section");
+        assert!(h2.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !h2.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED),
+            "h2 is not underlined: {:?}",
+            h2.spans[0].style
+        );
+
+        // h3 is a heading too; deeper levels stop at six.
+        assert_eq!(to_line(&lines[2], &theme).spans[0].content.as_ref(), "details");
+    }
+
+    #[test]
+    fn quote_and_fence_win_over_heading_detection() {
+        let lines = text_lines("> # quoted heading\n```\n# not a heading\n```");
+        assert_eq!(lines[0].kind, LineKind::Blockquote);
+        assert!(lines[1..].iter().all(|l| l.kind == LineKind::Code));
     }
 }
