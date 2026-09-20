@@ -321,7 +321,9 @@ fn dispatch(action: &TuiAction, online: bool, busy: bool) -> Dispatch {
         Dispatch::Quit
     } else if !online {
         Dispatch::Offline
-    } else if is_local_edit(action) {
+    } else if is_local_edit(action) || matches!(action, TuiAction::CopyAnswer) {
+        // Copying the last answer is local work: it must never wait its turn
+        // behind a hung gateway, any more than typing must.
         Dispatch::Edit
     } else if busy {
         Dispatch::Queue
@@ -510,6 +512,7 @@ async fn handle_action(
     match action {
         TuiAction::Quit => state.write().await.should_quit = true,
         TuiAction::Abort => abort_or_quit(state, ws).await?,
+        TuiAction::CopyAnswer => crate::tui::commands::command_copy(Arc::clone(state)).await,
         TuiAction::SendMessage => send_message(state, ws).await?,
         TuiAction::RunSlashCommand(cmd) => {
             let mut s = state.write().await;
@@ -631,6 +634,7 @@ async fn handle_offline_action(
         TuiAction::Escape => {
             state.write().await.clear_input();
         }
+        TuiAction::CopyAnswer => crate::tui::commands::command_copy(Arc::clone(state)).await,
         _ => {}
     }
 }
@@ -1208,6 +1212,8 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
             let response = payload["response"].as_str().map(str::to_string);
             {
                 let mut s = state.write().await;
+                // The verbatim answer is what `/copy` puts on the clipboard.
+                s.last_assistant_text = response.clone();
                 s.transcript.finish_stream(STREAM_THINKING, None);
                 s.transcript
                     .finish_stream(STREAM_ASSISTANT, response.as_deref());

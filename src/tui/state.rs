@@ -229,6 +229,9 @@ pub struct AppState {
     /// Messages submitted while a turn was running, oldest first. They go out
     /// when the current turn ends — one turn at a time, in order.
     pub queued: VecDeque<String>,
+    /// The last finished assistant answer, verbatim — what `/copy` (Ctrl+Y)
+    /// puts on the clipboard. `None` until a turn completes.
+    pub last_assistant_text: Option<String>,
     /// When the current run started, for the elapsed counter.
     pub run_started: Option<Instant>,
     /// What the in-flight turn is doing right now.
@@ -276,6 +279,7 @@ impl Default for AppState {
             completion_index: 0,
             is_running: false,
             queued: VecDeque::new(),
+            last_assistant_text: None,
             run_started: None,
             run_phase: RunPhase::default(),
             word_offset: 0,

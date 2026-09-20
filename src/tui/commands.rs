@@ -21,7 +21,7 @@ use crate::tui::ws_client::WsClient;
 /// Commands implemented inside the TUI.
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
-    "sessions", "resume", "rename", "pin", "agents", "agent", "answer",
+    "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -91,6 +91,11 @@ async fn handle_local_command(
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
         "answer" => command_answer(args, state, ws).await,
+        "copy" => {
+            // Copy reports through notices, not by returning an error.
+            command_copy(state).await;
+            Ok(())
+        }
         _ => {
             state
                 .write()
@@ -182,6 +187,7 @@ async fn command_help(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(),
         ("Tab", "complete a /command"),
         ("Esc", "dismiss a prompt · stop a running turn"),
         ("Ctrl+C", "abort the run, or quit when idle"),
+        ("Ctrl+Y", "copy the last answer"),
         ("Ctrl+R", "resume a session"),
         ("Ctrl+H / Ctrl+E", "this help · configuration"),
         ("Ctrl+Q", "quit"),
@@ -227,6 +233,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("tools", "", "list gateway commands"),
         ("model", "<id>", "set the default model"),
         ("answer", "<text>", "answer a pending question"),
+        ("copy", "", "copy the last answer to the clipboard"),
         ("help", "", "this help"),
         ("quit", "", "leave the TUI"),
         ("exit", "", "alias of /quit"),
@@ -561,6 +568,76 @@ async fn command_answer(
     s.ask_input.clear();
     s.transcript.push_notice(format!("answered: {text}"));
     Ok(())
+}
+
+/// How much of the last answer `/copy` puts on the clipboard, in bytes.
+///
+/// Most terminals cap an OSC 52 payload at a few kilobytes; a longer answer
+/// is truncated *at a character boundary* before it is encoded.
+const COPY_MAX_BYTES: usize = 4096;
+
+/// `/copy` — copy the last finished answer to the terminal's clipboard.
+///
+/// The clipboard belongs to the terminal, not the gateway, so a copy is local
+/// work: it works offline and while a turn runs, and reports through a notice
+/// either way.
+pub async fn command_copy(state: Arc<RwLock<AppState>>) {
+    let Some(text) = state.read().await.last_assistant_text.clone() else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no finished answer to copy yet");
+        return;
+    };
+    if text.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ the last answer is empty — nothing to copy");
+        return;
+    }
+    let (payload, truncated) = if text.len() > COPY_MAX_BYTES {
+        let mut end = COPY_MAX_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&text[..end], true)
+    } else {
+        (text.as_str(), false)
+    };
+    let mut out = std::io::stdout();
+    let mut s = state.write().await;
+    match write_osc52(&mut out, payload) {
+        Ok(()) => {
+            if truncated {
+                s.transcript.push_notice(format!(
+                    "✓ copied {} of {} answer bytes (truncated)",
+                    payload.len(),
+                    text.len()
+                ));
+            } else {
+                s.transcript
+                    .push_notice(format!("✓ copied the {} byte answer", payload.len()));
+            }
+        }
+        Err(e) => s
+            .transcript
+            .push_notice(format!("✘ clipboard write failed: {e}")),
+    }
+}
+
+/// Emit `text` as an OSC 52 clipboard payload on `out`.
+///
+/// The escape moves no cursor, so writing it on the event lane between frames
+/// is safe — it just must never happen during a render.
+pub fn write_osc52(out: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let encoded = STANDARD.encode(text.as_bytes());
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()
 }
 
 /// `/config` and `/config set <path> <value>`.
@@ -933,7 +1010,52 @@ mod tests {
     fn local_commands_are_recognised() {
         assert!(is_local_command("resume"));
         assert!(is_local_command("config"));
+        assert!(is_local_command("copy"));
         assert!(!is_local_command("usage"));
+    }
+
+    /// OSC 52 is BEL-terminated base64 of the payload.
+    #[test]
+    fn osc52_encodes_the_payload_bel_terminated() {
+        use base64::Engine;
+        let mut out = Vec::new();
+        write_osc52(&mut out, "hi").expect("writes");
+        let expected =
+            format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode("hi"));
+        assert_eq!(String::from_utf8(out).expect("utf8"), expected);
+    }
+
+    /// `/copy` with no finished answer says so instead of clearing the
+    /// clipboard (an empty OSC 52 payload is a clipboard *clear*).
+    #[tokio::test]
+    async fn copy_without_an_answer_refuses() {
+        let gateway = TestGateway::start().await;
+        let (state, _client) = connect(&gateway).await;
+
+        command_copy(Arc::clone(&state)).await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("no finished answer"), "got {lines:?}");
+    }
+
+    /// A long answer is copied at a character boundary, announced as cut.
+    #[tokio::test]
+    async fn copy_truncates_long_answers_at_a_character_boundary() {
+        let gateway = TestGateway::start().await;
+        let (state, _client) = connect(&gateway).await;
+        // 2000 CJK characters: 6000 bytes, past the 4096 cap. 4096 is not a
+        // char boundary (4096 % 3 == 1), so this only passes if the cut walks
+        // back to one.
+        state.write().await.last_assistant_text = Some("中".repeat(2000));
+
+        command_copy(Arc::clone(&state)).await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("truncated"), "got {lines:?}");
+
+        // And an empty answer refuses too: a 0-byte payload would clear.
+        state.write().await.last_assistant_text = Some(String::new());
+        command_copy(Arc::clone(&state)).await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("empty"), "got {lines:?}");
     }
 
     #[test]

@@ -45,6 +45,8 @@ pub enum TuiAction {
     Escape,
     /// Abort the running turn, or quit when idle.
     Abort,
+    /// Copy the last finished answer to the clipboard (OSC 52).
+    CopyAnswer,
     /// Quit.
     Quit,
     /// The terminal was resized.
@@ -59,6 +61,8 @@ impl TuiAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => Self::Abort,
+            // Ctrl+Y copies the last answer; Ctrl+R is already /resume.
+            KeyCode::Char('y') if ctrl => Self::CopyAnswer,
             KeyCode::Char('q') if ctrl => Self::Quit,
             KeyCode::Char('d') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => Self::Quit,
             KeyCode::Char('h') if ctrl => Self::RunSlashCommand("/help".to_string()),
@@ -112,6 +116,7 @@ mod tests {
     #[test]
     fn control_keys_map_to_their_actions() {
         assert_eq!(TuiAction::from_key_event(ctrl('c')), TuiAction::Abort);
+        assert_eq!(TuiAction::from_key_event(ctrl('y')), TuiAction::CopyAnswer);
         assert_eq!(TuiAction::from_key_event(ctrl('q')), TuiAction::Quit);
         assert_eq!(
             TuiAction::from_key_event(ctrl('r')),
