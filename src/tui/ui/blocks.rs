@@ -23,6 +23,7 @@ pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
         LineKind::ToolResult => theme.tool_call_style().add_modifier(Modifier::DIM),
         LineKind::Code => theme.code_style(),
         LineKind::Blockquote => theme.dim_style(),
+        LineKind::ListItem => theme.assistant_style(),
         LineKind::Notice => theme.system_style(),
         LineKind::Separator => Style::default(),
     }
@@ -37,6 +38,34 @@ pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
             Span::styled("│ ", theme.dim_style()),
             Span::styled(entry.text.clone(), theme.assistant_style()),
         ],
+        // A list item renders its marker accented and its text as prose —
+        // bullets become `•`, ordered numbers are kept as typed. The text
+        // after the marker still gets backtick spans.
+        LineKind::ListItem => {
+            let style = theme.assistant_style();
+            let code = style.fg(theme.accent);
+            match list_marker_len(&entry.text) {
+                Some(prefix) => {
+                    let (head, rest) = entry.text.split_at(prefix);
+                    let lead = head.len() - head.trim_start().len();
+                    let indent = &head[..lead];
+                    let marker = head[lead..].trim_end();
+                    let glyph = if marker.chars().count() == 1 {
+                        "•"
+                    } else {
+                        marker
+                    };
+                    let mut spans = Vec::new();
+                    if !indent.is_empty() {
+                        spans.push(Span::styled(indent.to_string(), style));
+                    }
+                    spans.push(Span::styled(format!("{glyph} "), code));
+                    spans.extend(inline_code_spans(rest, style, code));
+                    spans
+                }
+                None => vec![Span::styled(entry.text.clone(), style)],
+            }
+        }
         // Prose lines get backtick spans. A fenced block is already tagged
         // `LineKind::Code` and must not be re-tokenized.
         LineKind::Assistant | LineKind::User => {
@@ -268,6 +297,13 @@ pub fn text_lines(text: &str) -> Vec<TranscriptLine> {
             i += 1;
             continue;
         }
+        // A markdown list item: the renderer accents the marker, bullets as
+        // `•`, numbers as typed.
+        if list_marker_len(line).is_some() {
+            out.push(TranscriptLine::new(LineKind::ListItem, line.to_string()));
+            i += 1;
+            continue;
+        }
         out.push(TranscriptLine::new(LineKind::Assistant, line.to_string()));
         i += 1;
     }
@@ -279,6 +315,31 @@ pub fn text_lines(text: &str) -> Vec<TranscriptLine> {
 fn is_pipe_row(line: &str) -> bool {
     let t = line.trim();
     t.starts_with('|') && t.matches('|').count() >= 2
+}
+
+/// The byte length of a markdown list marker at the line's start, if the line
+/// is a list item: a `-`/`*`/`+` bullet or up to nine digits closed by `.`
+/// or `)`, each followed by whitespace. The whitespace requirement keeps
+/// emphasis (`*x*`), decimals (`1.5x`) and horizontal rules (`---`) prose.
+fn list_marker_len(text: &str) -> Option<usize> {
+    let trimmed = text.trim_start();
+    let indent = text.len() - trimmed.len();
+    let bytes = trimmed.as_bytes();
+    let marker = match bytes.first()? {
+        b'-' | b'*' | b'+' => 1usize,
+        b if b.is_ascii_digit() => {
+            let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            match bytes.get(digits) {
+                Some(b'.') | Some(b')') if digits <= 9 => digits + 1,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    match bytes.get(marker) {
+        Some(b) if b.is_ascii_whitespace() => Some(indent + marker + 1),
+        _ => None,
+    }
 }
 
 /// The maximal run of pipe rows starting at the front of `lines`, when there
@@ -665,6 +726,78 @@ mod tests {
                 .filter(|l| l.kind == LineKind::Separator)
                 .count()
                 == 2
+        );
+    }
+
+    #[test]
+    fn list_items_are_tagged_from_bullets_and_numbers() {
+        let lines = text_lines("- first\n* second\n+ third\n1. one\n2) two\n  - nested");
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![LineKind::ListItem; 6],
+            "every bullet and number row is a list item: {kinds:?}"
+        );
+        // The text is kept verbatim; only rendering restyles it.
+        assert_eq!(lines[0].text, "- first");
+        assert_eq!(lines[5].text, "  - nested");
+    }
+
+    #[test]
+    fn lookalikes_stay_prose() {
+        let lines = text_lines("*emphasis* is not a list\n1.5x is not either\n---\n-\n> - quoted");
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::Assistant,
+                LineKind::Assistant,
+                LineKind::Assistant,
+                LineKind::Assistant,
+                LineKind::Blockquote
+            ],
+            "emphasis, decimals, rules and bare dashes are not list items: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_item_renders_an_accented_marker_and_prose_text() {
+        let theme = Theme::dark();
+        let lines = text_lines("- plain `code` tail\n12. ordered\n  - nested");
+
+        // Every source character survives (the bullet is restyled, not
+        // deleted), the glyph is accented, and the tail's backticks still
+        // tokenize as inline code.
+        let bullet = to_line(&lines[0], &theme);
+        let text: String = bullet.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "• plain `code` tail");
+        let accented: Vec<&str> = bullet
+            .spans
+            .iter()
+            .filter(|s| s.style.fg == Some(theme.accent))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(accented, vec!["• ", "code"], "got {bullet:?}");
+
+        // Ordered numbers are kept as typed, not renumbered.
+        let ordered = to_line(&lines[1], &theme);
+        let text: String = ordered.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "12. ordered");
+        assert_eq!(ordered.spans[0].content.as_ref(), "12. ");
+        assert_eq!(ordered.spans[0].style.fg, Some(theme.accent));
+
+        // Nesting survives as the source indent, rendered plain.
+        let nested = to_line(&lines[2], &theme);
+        assert_eq!(nested.spans[0].content.as_ref(), "  ");
+        assert_eq!(nested.spans[1].content.as_ref(), "• ");
+    }
+
+    #[test]
+    fn fences_win_over_list_detection() {
+        let lines = text_lines("```\n- not a list\n```");
+        assert!(
+            lines.iter().all(|l| l.kind == LineKind::Code),
+            "a dash inside a fence is code, got {lines:?}"
         );
     }
 }

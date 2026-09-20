@@ -29,6 +29,9 @@ pub enum LineKind {
     Code,
     /// A block-quoted line (`> …`), rendered with a dim gutter.
     Blockquote,
+    /// A markdown list item (`- …`, `* …`, `12. …`): the marker renders
+    /// accented, the text as ordinary prose.
+    ListItem,
     /// A system notice (connection, resume, errors, command output).
     Notice,
     /// A blank separator line between blocks.
