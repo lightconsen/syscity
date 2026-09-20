@@ -42,6 +42,9 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
                 })
             }).collect::<Vec<_>>(),
             "auth_mode": config.security.auth_mode,
+            "tui": {
+                "theme": config.tui.theme,
+            },
             "search": {
                 "provider": config.search.provider,
                 "providers": config.search.providers,
@@ -311,6 +314,18 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
                 }
             }
         }
+        "tui.theme" => {
+            match serde_json::from_value::<crate::gateway::ThemeSetting>(params.value.clone()) {
+                Ok(setting) => config.tui.theme = setting,
+                Err(e) => {
+                    return WsResponse::err(
+                        &req.id,
+                        "INVALID_PARAMS",
+                        format!("Expected \"dark\", \"light\" or \"auto\": {e}"),
+                    )
+                }
+            }
+        }
         "search.provider" => {
             if let Some(v) = params.value.as_str() {
                 config.search.provider = v.to_string();
@@ -556,7 +571,31 @@ mod tests {
         assert!(p["heartbeat"]["enabled"].is_boolean());
         assert!(p["channels"].is_array());
         assert!(p["auth_mode"].as_str().is_some());
+        assert!(p["tui"]["theme"].as_str().is_some());
         assert!(p["search"]["provider"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn config_set_tui_theme_roundtrip() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res = set_and_ok(&state, "tui.theme", serde_json::json!("light")).await;
+        assert!(res.ok, "light must set: {:?}", res.error);
+        assert_eq!(state.config.read().await.tui.theme, crate::gateway::ThemeSetting::Light);
+
+        let res = handle_config_get(&req("g", "config.get", serde_json::json!({})), &state).await;
+        let p = res.payload.expect("payload");
+        assert_eq!(p["tui"]["theme"].as_str(), Some("light"));
+
+        // A value the enum does not know is rejected, not silently ignored.
+        let res = set_and_ok(&state, "tui.theme", serde_json::json!("neon")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert_eq!(
+            state.config.read().await.tui.theme,
+            crate::gateway::ThemeSetting::Light,
+            "the reject must leave the previous value intact"
+        );
     }
 
     #[tokio::test]

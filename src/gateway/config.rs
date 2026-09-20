@@ -130,6 +130,35 @@ pub struct GatewayConfig {
     /// Harness self-tuning configuration (§十二: 可反馈/可复盘/可调参/护栏).
     #[serde(default)]
     pub eval: EvalConfig,
+    /// TUI client preferences (appearance). Persisted here so the client can
+    /// restore its theme on next launch and share it across machines.
+    #[serde(default)]
+    pub tui: TuiConfig,
+}
+
+/// Which palette the TUI should render with. `Auto` asks the terminal (an
+/// OSC 11 query) and falls back to dark when no answer comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeSetting {
+    Dark,
+    Light,
+    #[default]
+    Auto,
+}
+
+/// Client-facing TUI preferences, persisted in gateway config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// The theme setting the TUI resolves at startup.
+    pub theme: ThemeSetting,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { theme: ThemeSetting::Auto }
+    }
 }
 
 /// Harness self-tuning configuration.
@@ -1423,6 +1452,7 @@ impl Default for GatewayConfig {
             observe: ObserveConfig::default(),
             update: UpdateConfig::default(),
             eval: EvalConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -2058,6 +2088,25 @@ shared_token = "abc"
                 .max_context_tokens,
             Some(8192)
         );
+    }
+
+    /// `tui.theme` survives a full serialization round-trip, and a config file
+    /// written before the field existed still parses (defaults to `Auto`).
+    #[test]
+    fn tui_theme_roundtrips_and_defaults_for_old_files() {
+        let mut config = GatewayConfig::default();
+        config.tui.theme = ThemeSetting::Light;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.tui.theme, ThemeSetting::Light);
+
+        // A bare `[tui]` (say, an old file someone half-edited) is fine too.
+        let from_scratch: GatewayConfig = toml::from_str("[tui]\n").unwrap();
+        assert_eq!(from_scratch.tui.theme, ThemeSetting::Auto);
+
+        // An unknown value name is a hard parse error, not a silent default.
+        let bad = toml::from_str::<GatewayConfig>("[tui]\ntheme = \"neon\"\n");
+        assert!(bad.is_err());
     }
 
     /// Build two configs with identical content but HashMaps populated in
