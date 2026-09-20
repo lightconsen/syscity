@@ -287,11 +287,35 @@ pub(super) fn parse_action(value: &Value) -> Result<BrowserAction, serde_json::E
     if object.len() == 1 {
         if let Some((name, body)) = object.iter().next() {
             let canonical = snake_case_name(name);
-            if canonical != *name {
+            // A unit variant has no payload to carry: `{"GetHtml": {}}` is
+            // valid for neither the object nor the string form, yet it is the
+            // shape the schema shows next to `{"GetText": {}}` (which parses —
+            // its fields are all optional). When the body is empty, fall back
+            // to the bare name so an argument-less action documented as an
+            // empty object still parses. A non-empty body keeps its original
+            // error: a missing required field must not be reported as a
+            // variant-name mismatch.
+            let rewritten = (canonical != *name).then(|| {
                 let mut tagged = serde_json::Map::new();
-                tagged.insert(canonical, body.clone());
-                return serde_json::from_value(Value::Object(tagged));
+                tagged.insert(canonical.clone(), body.clone());
+                Value::Object(tagged)
+            });
+            let candidate = rewritten.as_ref().unwrap_or(value);
+            if let Ok(parsed) = serde_json::from_value(candidate.clone()) {
+                return Ok(parsed);
             }
+            // Only take the bare-name fallback when it actually parses: an
+            // empty body on a struct variant means a required field is
+            // missing, and its own error is the honest one to return.
+            if body.as_object().is_some_and(|body| body.is_empty()) {
+                if let Ok(parsed) = serde_json::from_value(Value::String(canonical)) {
+                    return Ok(parsed);
+                }
+            }
+            return match rewritten {
+                Some(tagged) => serde_json::from_value(tagged),
+                None => serde_json::from_value(value.clone()),
+            };
         }
     }
 
@@ -335,6 +359,49 @@ mod parse_tests {
         assert!(matches!(parse_action(&json!("ListTabs")).unwrap(), BrowserAction::ListTabs));
     }
 
+    #[test]
+    fn a_unit_variant_documented_as_an_empty_object_parses() {
+        // This is the shape the JSON schema advertises for argument-less
+        // actions; before the fallback it came back as "invalid type: map,
+        // expected unit" while the same shape parsed for variants whose
+        // fields are all optional (GetText, Screenshot).
+        for name in [
+            "GetHtml",
+            "Back",
+            "Forward",
+            "Reload",
+            "GetCookies",
+            "ClearCookies",
+            "GetPerformanceMetrics",
+            "ClearCaptures",
+            "ScreencastStop",
+            "ListTabs",
+        ] {
+            let parsed = parse_action(&json!({ (name): {} })).unwrap_or_else(|e| {
+                panic!("{name} as an empty object must parse: {e}");
+            });
+            let serialized = serde_json::to_string(&parsed).expect("serializable");
+            let expected = snake_case_name(name);
+            assert!(
+                serialized.contains(&expected),
+                "{name} parsed into the wrong variant: {serialized}"
+            );
+            // And the canonical lowercase spelling of the same shape.
+            let lowercase = snake_case_name(name);
+            parse_action(&json!({ lowercase.clone(): {} }))
+                .unwrap_or_else(|e| panic!("{lowercase} as an empty object must parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn an_empty_body_does_not_mask_a_missing_required_field() {
+        // The fallback must not turn a struct variant's missing required
+        // field into a bogus "not a variant" error, nor invent a unit.
+        let err = parse_action(&json!({ "navigate": {} })).expect_err("url is required");
+        assert!(err.to_string().contains("url"), "got: {err}");
+        // A non-empty body that does not fit keeps its own error too.
+        assert!(parse_action(&json!({ "navigate": { "u rl": 1 } })).is_err());
+    }
     #[test]
     fn a_name_that_is_not_a_variant_is_still_an_error() {
         // Tolerating other shapes must not turn a typo into a silent no-op.
