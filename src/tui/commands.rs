@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::tui::error::TuiError;
 use crate::tui::gateway_calls as gw;
+use crate::tui::osc11;
 use crate::tui::state::{AppState, CommandInfo};
 use crate::tui::transcript::{LineKind, TranscriptLine};
 use crate::tui::ui::blocks;
@@ -22,6 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy", "retry", "expand",
+    "theme",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -101,6 +103,7 @@ async fn handle_local_command(
             command_expand(&state).await;
             Ok(())
         }
+        "theme" => command_theme(args, &state, ws).await,
         _ => {
             state
                 .write()
@@ -241,6 +244,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("copy", "", "copy the last answer to the clipboard"),
         ("retry", "", "resend the last prompt"),
         ("expand", "", "print the last tool call in full"),
+        ("theme", "[dark|light|auto]", "switch the palette, persisted in config"),
         ("help", "", "this help"),
         ("quit", "", "leave the TUI"),
         ("exit", "", "alias of /quit"),
@@ -745,6 +749,50 @@ async fn command_config_show(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Res
     Ok(())
 }
 
+/// `/theme [dark|light|auto]` — switch the palette now and persist it.
+///
+/// The setting lives in gateway config (`tui.theme`), so the next launch
+/// comes up the same way. The flip is immediate: the chosen dark/light
+/// palette replaces the active one, degraded to what this terminal can
+/// render. A failed write keeps the current theme.
+async fn command_theme(
+    args: &str,
+    state: &Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let setting =
+        match args.trim() {
+            "" | "auto" => crate::gateway::ThemeSetting::Auto,
+            "dark" => crate::gateway::ThemeSetting::Dark,
+            "light" => crate::gateway::ThemeSetting::Light,
+            other => {
+                state.write().await.transcript.push_notice(format!(
+                    "⚠ /theme is one of dark, light or auto (got \"{other}\")"
+                ));
+                return Ok(());
+            }
+        };
+    let revision = state.read().await.config_revision.clone();
+    // `ThemeSetting` serializes to its own lowercase name.
+    let value = serde_json::to_value(setting).unwrap_or_else(|_| serde_json::json!("auto"));
+    match gw::config_set(ws, "tui.theme", value, revision.as_deref()).await {
+        Ok(()) => {
+            let mut s = state.write().await;
+            // Same resolution chain the startup uses: `auto` consults the
+            // OSC 11 result caught in the setup window, then `$COLORFGBG`.
+            let id = osc11::resolve(setting, osc11::env_hint(), s.startup_bg);
+            s.active_theme = crate::tui::ui::Theme::from(id).for_mode(osc11::color_mode());
+            s.config_cache = None;
+            s.transcript.push_notice(format!("✓ theme = {:?}", setting));
+        }
+        Err(e) => {
+            // The old palette stays: nothing was written.
+            state.write().await.transcript.push_notice(format!("✘ {e}"));
+        }
+    }
+    Ok(())
+}
+
 /// Flatten the configuration payload into readable lines.
 pub fn config_lines(value: &Value) -> Vec<TranscriptLine> {
     let mut out = Vec::new();
@@ -787,6 +835,14 @@ pub fn config_lines(value: &Value) -> Vec<TranscriptLine> {
             out.push(TranscriptLine::new(
                 LineKind::Notice,
                 format!("  heartbeat.enabled = {}", render_value(enabled)),
+            ));
+        }
+    }
+    if let Some(tui) = value.get("tui").and_then(|v| v.as_object()) {
+        if let Some(theme) = tui.get("theme").filter(|v| !v.is_null()) {
+            out.push(TranscriptLine::new(
+                LineKind::Notice,
+                format!("  tui.theme = {}", render_value(theme)),
             ));
         }
     }
@@ -1146,6 +1202,70 @@ mod tests {
         );
     }
 
+    /// `/theme light` writes `tui.theme` and flips the palette now.
+    #[tokio::test]
+    async fn theme_switch_applies_and_persists() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+
+        let _ = command_theme("light", &state, &client).await;
+
+        let requests = gateway.requests();
+        let set = requests
+            .iter()
+            .find(|r| r.method == "config.set")
+            .expect("a config.set request");
+        assert_eq!(set.params["path"], "tui.theme");
+        assert_eq!(set.params["value"], "light");
+        let mode = osc11::color_mode();
+        assert_eq!(
+            state.read().await.active_theme,
+            crate::tui::ui::Theme::light().for_mode(mode),
+            "the palette must switch immediately, degraded to the terminal"
+        );
+        let lines = output(&state).await;
+        assert!(lines[0].contains("theme = Light"), "got {lines:?}");
+    }
+
+    /// An unknown value is refused and the current theme stays put.
+    #[tokio::test]
+    async fn theme_with_an_invalid_name_refuses() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+
+        command_theme("banana", &state, &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("one of dark, light or auto"), "got {lines:?}");
+        assert_eq!(
+            state.read().await.active_theme,
+            crate::tui::ui::Theme::dark(),
+            "a refused /theme must not touch the palette"
+        );
+        assert!(
+            !gateway.requests().iter().any(|r| r.method == "config.set"),
+            "nothing should have been written"
+        );
+    }
+
+    /// `/theme auto` consults the same chain the startup used, so the OSC 11
+    /// result caught in the setup window drives the palette again.
+    #[tokio::test]
+    async fn theme_auto_reuses_startup_detection() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+        state.write().await.startup_bg = Some(crate::tui::ui::ThemeId::Light);
+
+        command_theme("auto", &state, &client).await;
+
+        let mode = osc11::color_mode();
+        assert_eq!(
+            state.read().await.active_theme,
+            crate::tui::ui::Theme::light().for_mode(mode),
+            "auto must resolve through the startup detection"
+        );
+    }
+
     #[test]
     fn help_lists_every_local_command() {
         let listed: Vec<String> = local_command_list().into_iter().map(|c| c.name).collect();
@@ -1165,7 +1285,8 @@ mod tests {
             "model_provider": "openai",
             "default_agent": { "temperature": 0.7, "system_prompt": "very long…" },
             "agent_overrides": { "secretary": { "temperature": 0.3 } },
-            "heartbeat": { "enabled": true }
+            "heartbeat": { "enabled": true },
+            "tui": { "theme": "light" }
         });
         let text: Vec<String> = config_lines(&payload).into_iter().map(|l| l.text).collect();
         assert!(text.iter().any(|l| l.contains("model = gpt-4o")));
@@ -1176,6 +1297,7 @@ mod tests {
             .iter()
             .any(|l| l.contains("agent_overrides.secretary.temperature = 0.3")));
         assert!(text.iter().any(|l| l.contains("heartbeat.enabled = true")));
+        assert!(text.iter().any(|l| l.contains("tui.theme = light")));
         assert!(
             !text.iter().any(|l| l.contains("system_prompt")),
             "the system prompt is too big to dump"
