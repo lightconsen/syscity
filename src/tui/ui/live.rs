@@ -7,7 +7,7 @@
 //! is handled by the transcript, not by growing this.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -17,7 +17,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::tui::state::{AppState, LiveMode, RunPhase};
 use crate::tui::ui::blocks;
 use crate::tui::ui::wrap as wrapmod;
-use crate::tui::ui::{dim_style, highlight_style, prompt_style, status_error_style, status_style};
+use crate::tui::ui::Theme;
 
 /// Total rows the live region occupies.
 ///
@@ -109,11 +109,11 @@ pub fn locate_cursor(rows: &[Line<'_>], cursor: usize) -> (usize, usize) {
 /// more than it has, so an input that fills the width exactly loses its last
 /// character — the row is drawn without it and the cursor clamps on top of the
 /// one before.
-fn input_rows(state: &AppState, width: u16) -> Vec<Line<'static>> {
+fn input_rows(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     // Spans, not one string: the wrapper carries each character's style
     // across the wrap point, so the prompt keeps its own.
     let line = Line::from(vec![
-        Span::styled(PROMPT, prompt_style()),
+        Span::styled(PROMPT, theme.prompt_style()),
         Span::raw(state.input_buffer.clone()),
     ]);
     wrapmod::wrap_line_hanging(&line, width as usize, PROMPT.len())
@@ -128,35 +128,27 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
-/// The spinner's color: the one piece of the row that moves, in the one color
-/// that means "working".
-fn spinner_style() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
-}
-
 /// The one-line status row, as styled spans.
 ///
 /// The spinner frame and its word are colored; the facts (time, phase, agent,
 /// session) keep the plain status color. `status_text` flattens this for
 /// tests that only care about the words.
-fn status_line(state: &AppState) -> (Line<'static>, bool) {
-    let sep = || Span::styled("  ·  ", status_style());
+fn status_line(state: &AppState, theme: &Theme) -> (Line<'static>, bool) {
+    let sep = || Span::styled("  ·  ", theme.status_style());
     let mut spans: Vec<Span<'static>> = Vec::new();
     // A running row is longer than an idle one, and what it pushes off the end
     // is the session id. The server version is the least useful thing here and
     // does not change mid-session, so it yields the space. A connection that is
     // *not* fine still speaks up: that is not noise.
     if !state.is_running || !state.connection.is_connected() {
-        spans.push(Span::styled(state.connection.label(), status_style()));
+        spans.push(Span::styled(state.connection.label(), theme.status_style()));
     }
     if let Some(secs) = state.run_elapsed_secs() {
         if !spans.is_empty() {
             spans.push(sep());
         }
-        spans.push(Span::styled(format!("{} ", state.spinner_frame()), spinner_style()));
-        spans.push(Span::styled(format!("{}…", state.spinner_word()), spinner_style()));
+        spans.push(Span::styled(format!("{} ", state.spinner_frame()), theme.spinner_style()));
+        spans.push(Span::styled(format!("{}…", state.spinner_word()), theme.spinner_style()));
         // The word is whimsy; the parenthetical is the truth.
         let mut detail = format_elapsed(secs);
         match &state.run_phase {
@@ -167,7 +159,7 @@ fn status_line(state: &AppState) -> (Line<'static>, bool) {
                 detail.push_str(&format!(" · ⚙ {name}"));
             }
         }
-        spans.push(Span::styled(format!(" ({detail}) — esc stops"), status_style()));
+        spans.push(Span::styled(format!(" ({detail}) — esc stops"), theme.status_style()));
     }
     let agent = state
         .current_agent_info()
@@ -177,13 +169,13 @@ fn status_line(state: &AppState) -> (Line<'static>, bool) {
         if !spans.is_empty() {
             spans.push(sep());
         }
-        spans.push(Span::styled(agent, status_style()));
+        spans.push(Span::styled(agent, theme.status_style()));
     }
     if let Some(session) = state.current_session.as_deref() {
         if !spans.is_empty() {
             spans.push(sep());
         }
-        spans.push(Span::styled(short_session(session), status_style()));
+        spans.push(Span::styled(short_session(session), theme.status_style()));
     }
     if let Some((status, _)) = &state.status {
         let is_error = status.starts_with('⚠') || status.starts_with('✘');
@@ -191,9 +183,9 @@ fn status_line(state: &AppState) -> (Line<'static>, bool) {
             spans.push(sep());
         }
         let style = if is_error {
-            status_error_style()
+            theme.status_error_style()
         } else {
-            status_style()
+            theme.status_style()
         };
         spans.push(Span::styled(status.clone(), style));
         return (Line::from(spans), is_error);
@@ -203,8 +195,8 @@ fn status_line(state: &AppState) -> (Line<'static>, bool) {
 
 /// The status row as plain text (tests read the words, not the colors).
 #[cfg(test)]
-fn status_text(state: &AppState) -> (String, bool) {
-    let (line, is_error) = status_line(state);
+fn status_text(state: &AppState, theme: &Theme) -> (String, bool) {
+    let (line, is_error) = status_line(state, theme);
     (line.spans.iter().map(|s| s.content.to_string()).collect(), is_error)
 }
 
@@ -222,11 +214,11 @@ fn short_session(id: &str) -> String {
 }
 
 /// Render the composer's rows and place the cursor.
-fn render_composer(f: &mut Frame, state: &AppState, area: Rect) {
+fn render_composer(f: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let rows = input_rows(state, area.width);
+    let rows = input_rows(state, theme, area.width);
     // The cursor is a byte offset into the buffer; the rows carry the prompt
     // in front of it, so the offset shifts by the prompt's own bytes.
     let (cursor_row, cursor_col) = locate_cursor(&rows, state.input_cursor + PROMPT.len());
@@ -249,12 +241,12 @@ fn render_composer(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 /// Render the approval prompt.
-fn approval_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
+fn approval_lines(state: &AppState, theme: &Theme) -> Option<Vec<Line<'static>>> {
     let approval = state.current_approval()?;
     let mut lines = vec![Line::from(vec![
         Span::styled("Allow ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(approval.tool_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("?  (risk: {})", approval.risk_level), dim_style()),
+        Span::styled(format!("?  (risk: {})", approval.risk_level), theme.dim_style()),
     ])];
     lines.push(Line::from(Span::styled(
         if approval.message.is_empty() {
@@ -262,24 +254,27 @@ fn approval_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
         } else {
             format!("{} — {}", approval.requested_by, approval.message)
         },
-        dim_style(),
+        theme.dim_style(),
     )));
-    lines.push(Line::from(Span::styled(args_preview(approval.args.as_ref()), dim_style())));
+    lines.push(Line::from(Span::styled(
+        args_preview(approval.args.as_ref()),
+        theme.dim_style(),
+    )));
     lines.push(Line::from(vec![
         Span::styled(
             "  y approve  ",
             if state.approval_approve_selected {
-                highlight_style()
+                theme.highlight_style()
             } else {
-                dim_style()
+                theme.dim_style()
             },
         ),
         Span::styled(
             "  n deny  ",
             if state.approval_approve_selected {
-                dim_style()
+                theme.dim_style()
             } else {
-                highlight_style()
+                theme.highlight_style()
             },
         ),
     ]));
@@ -300,7 +295,7 @@ fn args_preview(args: Option<&Value>) -> String {
 }
 
 /// Render an `ask_user` question.
-fn ask_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
+fn ask_lines(state: &AppState, theme: &Theme) -> Option<Vec<Line<'static>>> {
     let ask = state.pending_ask.as_ref()?;
     let mut lines = vec![Line::from(vec![
         Span::styled("Agent asks: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -311,7 +306,7 @@ fn ask_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
             format!("  answer: {}", state.ask_input),
             Style::default(),
         )));
-        lines.push(Line::from(Span::styled("  Enter to send", dim_style())));
+        lines.push(Line::from(Span::styled("  Enter to send", theme.dim_style())));
     } else {
         let options: Vec<Span> = ask
             .options
@@ -321,7 +316,7 @@ fn ask_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
             .map(|(i, opt)| {
                 let text = format!("  {}. {}  ", i + 1, opt);
                 if state.ask_input == (i + 1).to_string() {
-                    Span::styled(text, highlight_style())
+                    Span::styled(text, theme.highlight_style())
                 } else {
                     Span::styled(text, Style::default())
                 }
@@ -330,7 +325,7 @@ fn ask_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
         lines.push(Line::from(options));
         lines.push(Line::from(Span::styled(
             format!("  or type an answer: {}", state.ask_input),
-            dim_style(),
+            theme.dim_style(),
         )));
     }
     Some(lines)
@@ -363,7 +358,12 @@ fn truncate_to_width(text: &str, max: usize) -> String {
 /// area falls back to the stream preview. The list is windowed around the
 /// selection: a catalog longer than the block stays readable, and cycling
 /// with Tab always keeps the highlighted row on screen.
-fn completion_lines(state: &AppState, max_rows: usize, width: usize) -> Option<Vec<Line<'static>>> {
+fn completion_lines(
+    state: &AppState,
+    theme: &Theme,
+    max_rows: usize,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
     let candidates = state.completions();
     if candidates.is_empty() || max_rows == 0 {
         return None;
@@ -379,14 +379,14 @@ fn completion_lines(state: &AppState, max_rows: usize, width: usize) -> Option<V
         .map(|(i, cmd)| {
             let highlighted = start + i == selected;
             let name_style = if highlighted {
-                highlight_style()
+                theme.highlight_style()
             } else {
                 Style::default()
             };
             let desc_style = if highlighted {
-                highlight_style()
+                theme.highlight_style()
             } else {
-                dim_style()
+                theme.dim_style()
             };
             Line::from(vec![
                 Span::styled(format!("  /{:<12}", cmd.name), name_style),
@@ -402,21 +402,23 @@ fn completion_lines(state: &AppState, max_rows: usize, width: usize) -> Option<V
 
 /// Render the whole live region.
 pub fn render(f: &mut Frame, state: &AppState) {
+    let theme = &state.active_theme;
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let composer_rows = (input_rows(state, area.width).len() as u16).clamp(1, COMPOSER_MAX_ROWS);
+    let composer_rows =
+        (input_rows(state, theme, area.width).len() as u16).clamp(1, COMPOSER_MAX_ROWS);
     let l = layout(area, composer_rows);
 
     // Block area: a blocking prompt takes precedence over the stream preview,
     // and a completion list takes precedence while a `/command` is being
     // typed — the typist's attention is on the command, not the stream.
     let block_lines = match state.live_mode {
-        LiveMode::Approval => approval_lines(state),
-        LiveMode::Ask => ask_lines(state),
+        LiveMode::Approval => approval_lines(state, theme),
+        LiveMode::Ask => ask_lines(state, theme),
         LiveMode::Composer => {
-            completion_lines(state, l.block.height as usize, l.block.width as usize)
+            completion_lines(state, theme, l.block.height as usize, l.block.width as usize)
         }
     };
     let block_lines = match block_lines {
@@ -426,7 +428,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
             if preview.is_empty() {
                 None
             } else {
-                Some(blocks::to_lines(&preview))
+                Some(blocks::to_lines(&preview, theme))
             }
         }
     };
@@ -437,11 +439,11 @@ pub fn render(f: &mut Frame, state: &AppState) {
     }
 
     if let Some(status) = l.status {
-        let (line, _) = status_line(state);
+        let (line, _) = status_line(state, theme);
         f.render_widget(Paragraph::new(line), status);
     }
 
-    render_composer(f, state, l.composer);
+    render_composer(f, state, theme, l.composer);
 }
 
 #[cfg(test)]
@@ -515,18 +517,18 @@ mod tests {
         state.begin_run();
 
         state.run_phase = RunPhase::Thinking;
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert!(text.contains('…'), "the whimsical word, trailing dots: {text}");
         assert!(text.contains("(0s · thinking)"), "elapsed plus phase: {text}");
         assert!(text.contains("esc stops"), "the way out is still labelled: {text}");
 
         state.run_phase = RunPhase::ToolCall("file_read".into());
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert!(text.contains("⚙ file_read"), "the tool in flight: {text}");
 
         // A turn that has only just been sent says nothing beyond the time.
         state.run_phase = RunPhase::Waiting;
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert!(text.contains("(0s)"), "no phase hint while waiting: {text}");
     }
 
@@ -535,13 +537,13 @@ mod tests {
     #[test]
     fn an_idle_row_carries_no_run_leftovers() {
         let mut state = AppState::default();
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert_eq!(text, "disconnected", "nothing but the connection");
 
         state.current_session = Some("tui:1234567890".into());
         state.current_agent = Some("secretary".into());
         state.set_status("");
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert!(text.contains("secretary"));
         assert!(text.contains("sess"));
         assert!(!text.contains("tokens"), "no token meter once idle: {text}");
@@ -561,21 +563,22 @@ mod tests {
         };
         state.begin_run();
 
-        let (line, _) = status_line(&state);
+        let (line, _) = status_line(&state, &Theme::dark());
         let frame = line.spans[0].content.to_string();
-        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan), "the frame is colored");
+        let accent = Theme::dark().accent;
+        assert_eq!(line.spans[0].style.fg, Some(accent), "the frame is colored");
         // The word rides the same color, the facts do not.
-        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan), "the word is colored");
+        assert_eq!(line.spans[1].style.fg, Some(accent), "the word is colored");
         assert!(line.spans[1].content.ends_with('…'));
-        assert_ne!(line.spans[2].style.fg, Some(Color::Cyan), "the facts stay plain");
+        assert_ne!(line.spans[2].style.fg, Some(accent), "the facts stay plain");
 
         state.spinner = state.spinner.wrapping_add(1);
-        let (next, _) = status_line(&state);
+        let (next, _) = status_line(&state, &Theme::dark());
         assert_ne!(next.spans[0].content, frame, "the frame moves with the tick");
 
         // Turn over: nothing of the indicator survives.
         state.end_run();
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert!(!text.contains('…'), "no word after the run: {text}");
         assert!(!text.contains("esc stops"), "no hint after the run: {text}");
         for frame in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
@@ -605,18 +608,19 @@ mod tests {
             ..AppState::default()
         };
         state.set_input("/".into());
-        let lines = completion_lines(&state, 6, 80).expect("a bare slash lists every command");
+        let lines = completion_lines(&state, &Theme::dark(), 6, 80)
+            .expect("a bare slash lists every command");
         assert_eq!(lines.len(), 3);
         assert!(line_text(&lines[0]).contains("/c0"));
         assert!(line_text(&lines[0]).contains("command 0"));
         // The first candidate starts highlighted, for the Tab that applies it.
-        assert_eq!(lines[0].spans[0].style, highlight_style());
+        assert_eq!(lines[0].spans[0].style, Theme::dark().highlight_style());
         assert_eq!(lines[1].spans[0].style, Style::default());
 
         // Anything not starting with `/` is not completing: the block area
         // must fall back to the stream preview.
         state.set_input("hello".into());
-        assert!(completion_lines(&state, 6, 80).is_none());
+        assert!(completion_lines(&state, &Theme::dark(), 6, 80).is_none());
     }
 
     #[test]
@@ -627,11 +631,11 @@ mod tests {
         };
         state.set_input("/".into());
         state.completion_index = 8;
-        let lines = completion_lines(&state, 3, 80).expect("completions");
+        let lines = completion_lines(&state, &Theme::dark(), 3, 80).expect("completions");
         assert_eq!(lines.len(), 3, "capped at the block height");
         // The window ends on the selection: c6, c7, c8.
         assert!(line_text(&lines[2]).contains("/c8"), "selection visible: {lines:?}");
-        assert_eq!(lines[2].spans[0].style, highlight_style());
+        assert_eq!(lines[2].spans[0].style, Theme::dark().highlight_style());
     }
 
     #[test]
@@ -645,7 +649,7 @@ mod tests {
             ..AppState::default()
         };
         state.set_input("/".into());
-        let lines = completion_lines(&state, 3, 40).expect("completions");
+        let lines = completion_lines(&state, &Theme::dark(), 3, 40).expect("completions");
         let text = line_text(&lines[0]);
         assert!(UnicodeWidthStr::width(text.as_str()) <= 40, "one row, no wrap: {text}");
         assert!(text.ends_with('…'), "the cut is marked: {text}");
@@ -669,7 +673,7 @@ mod tests {
         };
         state.begin_run();
         state.run_phase = RunPhase::ToolCall("file_read".into());
-        let (text, _) = status_text(&state);
+        let (text, _) = status_text(&state, &Theme::dark());
         assert!(
             UnicodeWidthStr::width(text.as_str()) <= 80,
             "the running row is {} columns: {text}",
@@ -685,14 +689,14 @@ mod tests {
             current_agent: Some("secretary".into()),
             ..AppState::default()
         };
-        let (text, is_error) = status_text(&state);
+        let (text, is_error) = status_text(&state, &Theme::dark());
         assert!(text.contains("gateway gone"));
         assert!(text.contains("secretary"));
         assert!(text.contains("sess"));
         assert!(!is_error);
 
         state.set_status("⚠ could not reach the gateway");
-        let (_, is_error) = status_text(&state);
+        let (_, is_error) = status_text(&state, &Theme::dark());
         assert!(is_error, "a warning is styled as an error");
     }
 
@@ -710,7 +714,7 @@ mod tests {
             message: "outside the workspace".into(),
             args: Some(serde_json::json!({ "path": "/tmp/x" })),
         });
-        let lines = approval_lines(&state).expect("a prompt");
+        let lines = approval_lines(&state, &Theme::dark()).expect("a prompt");
         let text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))

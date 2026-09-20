@@ -10,32 +10,30 @@ use serde_json::Value;
 
 use crate::tui::gateway_calls::HistoryMessage;
 use crate::tui::transcript::{LineKind, TranscriptLine};
-use crate::tui::ui::{
-    assistant_style, code_style, reasoning_style, system_style, tool_call_style, user_style,
-};
+use crate::tui::ui::Theme;
 
 /// The style a transcript line kind renders with.
-pub fn kind_style(kind: LineKind) -> Style {
+pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
     match kind {
-        LineKind::User => user_style(),
-        LineKind::Assistant => assistant_style(),
-        LineKind::Reasoning => reasoning_style(),
-        LineKind::Tool => tool_call_style(),
-        LineKind::ToolResult => tool_call_style().add_modifier(Modifier::DIM),
-        LineKind::Code => code_style(),
-        LineKind::Notice => system_style(),
+        LineKind::User => theme.user_style(),
+        LineKind::Assistant => theme.assistant_style(),
+        LineKind::Reasoning => theme.reasoning_style(),
+        LineKind::Tool => theme.tool_call_style(),
+        LineKind::ToolResult => theme.tool_call_style().add_modifier(Modifier::DIM),
+        LineKind::Code => theme.code_style(),
+        LineKind::Notice => theme.system_style(),
         LineKind::Separator => Style::default(),
     }
 }
 
 /// Render one transcript line.
-pub fn to_line(entry: &TranscriptLine) -> Line<'static> {
-    Line::from(Span::styled(entry.text.clone(), kind_style(entry.kind)))
+pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(entry.text.clone(), kind_style(theme, entry.kind)))
 }
 
 /// Render a batch of transcript lines.
-pub fn to_lines(entries: &[TranscriptLine]) -> Vec<Line<'static>> {
-    entries.iter().map(to_line).collect()
+pub fn to_lines(entries: &[TranscriptLine], theme: &Theme) -> Vec<Line<'static>> {
+    entries.iter().map(|e| to_line(e, theme)).collect()
 }
 
 /// Argument rows the *live* preview may show.

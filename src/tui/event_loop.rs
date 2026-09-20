@@ -457,7 +457,10 @@ where
 
     if !pending.is_empty() {
         let width = terminal.size()?.width;
-        let lines = blocks::to_lines(&pending);
+        let lines = {
+            let s = state.read().await;
+            blocks::to_lines(&pending, &s.active_theme)
+        };
         scrollback::flush(terminal, &lines, width)?;
         // `flush` inserted above the viewport and cleared it — the draw below
         // is what puts the composer back.

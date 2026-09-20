@@ -176,6 +176,8 @@ impl CommandInfo {
 pub struct AppState {
     /// Connection state.
     pub connection: ConnectionState,
+    /// Palette in use for the live region and scrollback, resolved at startup.
+    pub active_theme: crate::tui::ui::Theme,
     /// Session the TUI is talking to.
     pub current_session: Option<String>,
     /// Agent bound to the current session, if any.
@@ -247,6 +249,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             connection: ConnectionState::default(),
+            active_theme: crate::tui::ui::Theme::dark(),
             current_session: None,
             current_agent: None,
             sessions: Vec::new(),

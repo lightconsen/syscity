@@ -85,7 +85,8 @@ fn everything(terminal: &Terminal<TestBackend>) -> String {
 fn settle(terminal: &mut Terminal<TestBackend>, state: &mut AppState) {
     let pending = state.transcript.take_flushable();
     if !pending.is_empty() {
-        let lines = blocks::to_lines(&pending);
+        let theme = state.active_theme;
+        let lines = blocks::to_lines(&pending, &theme);
         scrollback::flush(terminal, &lines, WIDTH).expect("flush");
     }
     terminal
@@ -172,7 +173,8 @@ fn a_streamed_turn_freezes_into_scrollback_when_it_finishes() {
     // Mid-stream, only the completed line has graduated.
     let mid = state.transcript.take_flushable();
     assert_eq!(mid.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["first line"]);
-    scrollback::flush(&mut terminal, &blocks::to_lines(&mid), WIDTH).expect("flush");
+    scrollback::flush(&mut terminal, &blocks::to_lines(&mid, &state.active_theme), WIDTH)
+        .expect("flush");
     assert!(everything(&terminal).contains("first line"));
     assert!(
         !everything(&terminal).contains("second"),
@@ -183,7 +185,8 @@ fn a_streamed_turn_freezes_into_scrollback_when_it_finishes() {
         .transcript
         .finish_stream("assistant", Some("first line\nsecond\n"));
     let rest = state.transcript.take_flushable();
-    scrollback::flush(&mut terminal, &blocks::to_lines(&rest), WIDTH).expect("flush");
+    scrollback::flush(&mut terminal, &blocks::to_lines(&rest, &state.active_theme), WIDTH)
+        .expect("flush");
     assert!(everything(&terminal).contains("second"));
     // And the live region is still usable afterwards.
     settle(&mut terminal, &mut state);
