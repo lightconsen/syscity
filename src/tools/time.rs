@@ -282,6 +282,7 @@ Use this for:
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["system".to_string(), "info".to_string()],

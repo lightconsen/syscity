@@ -471,6 +471,7 @@ impl Tool for DeviceShortcutResultsTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["device".to_string(), "automation".to_string()],
@@ -532,6 +533,7 @@ impl Tool for DeviceShortcutInboxTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["device".to_string(), "automation".to_string()],

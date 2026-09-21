@@ -73,6 +73,21 @@ pub struct ToolCapabilities {
     /// machinery for side effects, and this field exists so nothing pretends
     /// it does.
     pub compensation: Option<&'static str>,
+    /// True when this call only observes state and never mutates anything.
+    ///
+    /// The default is the careful `false`: an unclassified tool is never
+    /// treated as read-only, so plan mode (which admits only read-only
+    /// tools) hides and refuses it rather than exposing a possible write.
+    pub read_only: bool,
+}
+
+impl ToolCapabilities {
+    /// Declare this tool read-only. Chain on a `Default` or an existing
+    /// `ToolCapabilities`: `.read_only` can also be set directly.
+    pub fn mark_read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
 }
 
 impl Default for ToolCapabilities {
@@ -85,6 +100,7 @@ impl Default for ToolCapabilities {
             categories: vec![],
             idempotent: false,
             compensation: None,
+            read_only: false,
         }
     }
 }
@@ -473,6 +489,7 @@ mod tests {
             categories: vec!["file".to_string(), "system".to_string()],
             idempotent: false,
             compensation: Some("delete the file it wrote"),
+            read_only: false,
         };
         let json = serde_json::to_string(&caps).unwrap();
         assert!(json.contains("requires_approval"));

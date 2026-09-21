@@ -153,6 +153,7 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["computer".to_string(), "desktop".to_string()],
@@ -394,6 +395,7 @@ Use when the accessibility tree lacks the text you need: PDF viewers, dialogs, i
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["computer".to_string(), "desktop".to_string()],
@@ -520,6 +522,7 @@ Use when the accessibility tree is empty or incomplete: games, image-based UIs, 
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["computer".to_string(), "desktop".to_string()],

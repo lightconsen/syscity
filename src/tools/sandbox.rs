@@ -168,12 +168,17 @@ impl Tool for SandboxedTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            requires_approval: false,
-            risk_level: crate::tools::approval::RiskLevel::Medium,
-            categories: vec!["system".to_string(), "sandbox".to_string()],
-            ..Default::default()
+        // The wrapper's own restriction is *added* to the wrapped tool's
+        // declaration, never substituted for it: permission matching and the
+        // requires_approval fallback must see the tool's real risk/approval
+        // posture. (This used to replace the inner caps entirely, so `shell`
+        // advertised no-approval/Medium here while shell.rs declared
+        // approval/High.)
+        let mut caps = self.inner.capabilities();
+        if !caps.categories.iter().any(|c| c == "sandbox") {
+            caps.categories.push("sandbox".to_string());
         }
+        caps
     }
 
     fn is_available(&self, context: &ToolContext) -> bool {
@@ -406,5 +411,48 @@ mod tests {
         let tool = SandboxedTool::new(WebTool, config);
         let result = tool.execute(json!({}), &dummy_context()).await;
         assert!(matches!(result, Err(SyscityError::SandboxViolation(_))));
+    }
+    #[test]
+    fn sandboxed_tool_preserves_inner_capabilities() {
+        // The wrapper adds its own category; it must not substitute its own
+        // risk/approval posture for the wrapped tool's — permission matching
+        // sees shell's real "requires approval / High" through the wrapper.
+        struct ShellLikeTool;
+
+        #[async_trait]
+        impl Tool for ShellLikeTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> Value {
+                json!({})
+            }
+            fn capabilities(&self) -> ToolCapabilities {
+                ToolCapabilities {
+                    requires_approval: true,
+                    risk_level: crate::tools::approval::RiskLevel::High,
+                    categories: vec!["system".to_string(), "exec".to_string()],
+                    ..Default::default()
+                }
+            }
+            async fn execute(
+                &self,
+                _: Value,
+                _: &ToolContext,
+            ) -> crate::Result<ToolExecutionResult> {
+                Ok(ToolExecutionResult::success("ok".to_string()))
+            }
+        }
+
+        let config = SandboxConfig::default();
+        let wrapped = SandboxedTool::new(ShellLikeTool, config);
+        let caps = wrapped.capabilities();
+        assert!(caps.requires_approval, "inner approval requirement survives");
+        assert_eq!(caps.risk_level, crate::tools::approval::RiskLevel::High);
+        assert!(caps.categories.contains(&"exec".to_string()));
+        assert!(caps.categories.contains(&"sandbox".to_string()));
     }
 }

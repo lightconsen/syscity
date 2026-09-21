@@ -308,6 +308,7 @@ impl Tool for WebFetchTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Medium,
             categories: vec!["network".to_string(), "web".to_string()],
@@ -1455,6 +1456,7 @@ impl Tool for WebSearchTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["network".to_string(), "web".to_string()],

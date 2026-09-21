@@ -1306,6 +1306,51 @@ mod tests {
 
     use super::*;
 
+    /// Drift guard for plan mode: the tools declared read-only must keep
+    /// declaring it, and the workhorse writers must never gain it by
+    /// accident. Tools needing heavy deps (session store, web search
+    /// providers, screen OCR) are exercised by the registry-level plan-mode
+    /// tests instead.
+    #[test]
+    fn the_read_only_sweep_stays_current() {
+        use crate::tools::{
+            file::{FileEditTool, FileReadTool, FileWriteTool, GlobTool},
+            AskUserTool, GrepTool, ImageTool, ListCapabilitiesTool, NodesTool, PdfTool, SttTool,
+            TimeTool,
+        };
+        let reads: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(FileReadTool::new()),
+            Box::new(GlobTool::new()),
+            Box::new(GrepTool::new()),
+            Box::new(TimeTool::new()),
+            Box::new(NodesTool::new()),
+            Box::new(ListCapabilitiesTool),
+            Box::new(PdfTool::new()),
+            Box::new(ImageTool::new()),
+            Box::new(SttTool::new()),
+            Box::new(AskUserTool),
+        ];
+        for tool in reads {
+            assert!(
+                tool.capabilities().read_only,
+                "`{}` is classified read-only; restore the marker",
+                tool.name()
+            );
+        }
+
+        let writers: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(FileWriteTool::new()),
+            Box::new(FileEditTool::new()),
+        ];
+        for tool in writers {
+            assert!(
+                !tool.capabilities().read_only,
+                "`{}` mutates state and must not be read-only",
+                tool.name()
+            );
+        }
+    }
+
     /// `AgentCommand::UpdateConfig` must reach the running agent's runtime
     /// config, not just the display copy on the handle. Otherwise hot-reload /
     /// `config.set agent_overrides.*` would appear to succeed without taking

@@ -226,6 +226,7 @@ impl Tool for PdfTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["file".to_string(), "read".to_string()],

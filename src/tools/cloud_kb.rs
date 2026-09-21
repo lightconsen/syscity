@@ -65,6 +65,7 @@ impl Tool for CloudKbTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["knowledge".to_string(), "cloud".to_string()],

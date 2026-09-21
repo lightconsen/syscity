@@ -286,6 +286,7 @@ Supports regex patterns and can search recursively through directories."#
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Medium,
             categories: vec!["file".to_string(), "search".to_string()],

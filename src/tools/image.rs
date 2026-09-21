@@ -67,6 +67,7 @@ impl Tool for ImageTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["media".to_string(), "image".to_string()],

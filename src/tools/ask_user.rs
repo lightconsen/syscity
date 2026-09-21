@@ -292,6 +292,7 @@ delegated sub-agents or background jobs (goals, cron, heartbeat)."#
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
+            read_only: true,
             requires_approval: false,
             risk_level: crate::tools::approval::RiskLevel::Low,
             categories: vec!["interaction".to_string()],
