@@ -378,6 +378,8 @@ Query 参数：
 | `device.pair.requested` | 新设备等待批准 |
 | `ask.required` | `ask_user` 工具挂起等待人类回答（payload: `ask_id`, `session_id`, `question`, `options`, `required`, `default`） |
 | `ask.resolved` | 问题已被回答或取消（payload: `ask_id`, `cancelled`） |
+| `agent.usage` | 一轮 LLM 调用结束时的 token 用量（payload: `session_id`, `agent_id`, `usage: {prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens}`）；每轮推一次，客户端据此在运行中显示实时 token 计数（credits 计量在 `chat.final` 上） |
+| `delegation.updated` | 委派任务行变更（创建/状态/用量/共享状态/artifact）（payload: `session_id`（树的**根用户会话**，非子任务的 `delegation:<run_id>`）、`task_id`, `root_id`, `parent_id`, `depth`, `agent_id`, `title`, `status`, `created_at`, `updated_at`, `completed_at`, `usage_tokens`, `duration_ms`；终态行带 `duration_ms`，运行中为 `null`）。payload 自足，客户端无需按事件回查 |
 
 ### 6.2 管理 API（仅限 CLI）
 

@@ -19,6 +19,24 @@ Status: **Implemented** — v1 (`wait`) and v2 (wake) both shipped.
 >   (`src/delegation/state.rs`) runs once at gateway startup and marks tasks
 >   left in `running` / `waiting_handoff` by a previous process as `failed`,
 >   so dead executions no longer read as "running" forever.
+> - **Push events (TUI agent rows)**: task changes no longer live only in the
+>   store. `DelegationTaskStore` carries an event sink (task ids only); the
+>   gateway runs `delegation_event_forwarder` (`src/gateway/lifecycle.rs`),
+>   which re-reads each row and publishes `GatewayEvent::DelegationTaskUpdated`
+>   → the WS event `delegation.updated` with a self-sufficient snapshot
+>   (`DelegationTaskSnapshot`). Routing rides a new `parent_session` column:
+>   the row records the session the `delegate` call ran in (the user session
+>   for a tree root, `delegation:<parent_run_id>` for a delegated parent), and
+>   `root_session_for_task` climbs the `parent_id` chain to resolve the ROOT
+>   USER session the client is subscribed to — the registry's own parent key
+>   cannot serve this (a successor's is the handing-off task id, deliberately
+>   not a live session). Rows written before the column existed resolve to
+>   `None` and are skipped (they are swept to `failed` at startup anyway).
+>   Each task's LLM rounds also report usage into the row (`usage_tokens`,
+>   accumulated per round by the child's progress callback — the child
+>   response's own `usage` is only the last round), so the TUI can render
+>   live task rows with `↓ tokens` while they run. Wake semantics are
+>   untouched.
 
 This document is the design for fixing a delegation usability bug observed with
 DeepSeek (and similar models): intermediate agents early-stop instead of

@@ -82,7 +82,14 @@ side, which is what makes the terminal's own scroll and selection work.
 
   The block area also shows the slash-command candidates while a `/command`
   is being typed (windowed around the Tab selection), taking precedence over
-  the stream preview — the typist's attention is on the command.
+  the stream preview — the typist's attention is on the command. Under those
+  (and above the preview) sit the delegated-task rows: one live line per
+  delegation the session spawned — `↳ ⠹ 🔬 Researcher · Fix the flaky test ·
+  1m 12s · ↓3.4k` — fed by `delegation.updated` push events, windowed to the
+  block height with the newest rows winning, and retired to a transcript
+  notice when the task completes or fails. The rows animate on their own
+  clock, so they keep ticking even after the parent turn's reply ends (the
+  parent may finish while children still run).
 
   The composer's prompt is part of the text it wraps, not a marker painted
   over it (`wrap_line_hanging` keeps the first `PROMPT` columns unbreakable).
@@ -94,13 +101,22 @@ side, which is what makes the terminal's own scroll and selection work.
   The row carries the run and nothing else from it: when the turn ends the
   spinner, the word, the elapsed time and the phase all go, leaving the
   connection, agent and session as before. A token meter was tried here and
-  removed — usage only rides on `chat.final` (no delta carries it), so it could
-  only ever describe a turn that had already finished, and it read as a
-  leftover of one.
+  removed — usage only rode on `chat.final` (no delta carried it), so it
+  could only ever describe a turn that had already finished, and it read as a
+  leftover of one. It is back as a live counter: the gateway now emits
+  per-round usage as `agent.usage` events, the TUI accumulates them while a
+  run is in flight (`↓1.2k`), and the count clears with the run — `chat.final`
+  also carries the turn's usage, so counting both would double the total.
 
   While running, the row drops the server version to stay inside 80 columns —
-  the tail it would otherwise push off is the session id. A *disconnected*
-  connection still speaks up mid-run; that is not noise.
+  the tail it would otherwise push off is the session id. Once a token count
+  or a delegated-task row has something to say, the row enters *compact
+  mode*: the whimsical word and the `esc to interrupt` reminder give up
+  their columns (the parenthetical is the truth, and the hints only appear
+  mid-run), leaving room for `· ↓1.2k · ↩2` inside it. `↩N` is the number of
+  delegated tasks in flight; with the run indicator gone it keeps its own
+  slot on the row, so the hint never vanishes while a task is active. A
+  *disconnected* connection still speaks up mid-run; that is not noise.
 - **`ui/blocks.rs`** — transcript lines and gateway history → styled lines.
 - **`gateway_calls.rs`** — every WS call the TUI makes, once, with the payload
   shapes the gateway actually serves, plus parser tests written against real
@@ -127,7 +143,7 @@ side, which is what makes the terminal's own scroll and selection work.
 | `/history [n\|more]` | Reprint this conversation, oldest first (default 200, max 2000); `more` pages backwards |
 | `/rename <name>` | Rename the current session |
 | `/pin` | Pin or unpin the current session |
-| `/agents` | List agents |
+| `/agents` | List agents, plus this session's delegated tasks as learned from push events |
 | `/agent <id>` | Start a session bound to an agent |
 | `/clear` | Clear the conversation context (`sessions.reset`) |
 | `/config [set <path> <value>]` | Show or change configuration |
@@ -256,6 +272,14 @@ behind whatever command is running — the worse trade of the two.
 
 - No markdown rendering: only fenced code blocks are styled; headings, tables
   and lists appear as their source text.
+- Delegated-task rows are learned from live `delegation.updated` events and
+  are lost on reconnect/restart — the events only ever reach a live
+  subscription, so `/agents` lists what the TUI has seen this connection and
+  nothing older. Graduated notices stay in the scrollback only until the
+  session is re-rendered from history.
+- In compact status mode (token count or task rows on the row), the
+  `esc to interrupt` reminder gives up its columns; the Esc affordance itself
+  is unchanged, and the hint was most valuable before the first token anyway.
 - Untested surface: real terminal resize events, exotic emulators, and the
   slow-terminal cases still sit below the seams. `tests/tui_pty.rs` runs the
   real binary under a real pty and pins the rest — the cursor-position query
@@ -343,6 +367,11 @@ that speaks the protocol — handshake, scripted replies, events pushed at the
 client, requests recorded for assertion) and actions injected through the
 `InputSource` seam. They cover the pipe contract, print-once streaming,
 disconnect convergence, the approval decision round-trip, resize repaint, and
-typing while a request is on the wire. The PTY suite (`tests/tui_pty.rs`)
+typing while a request is on the wire — plus the delegation event path:
+`delegation.updated` builds and retires the live rows (and drops another
+session's), `agent.usage` accumulates the run counter and `chat.final` clears
+it. `ui/live.rs` pins the compact status row's 80-column budget and the
+task-row rendering/windowing with `TestBackend`. The PTY suite
+(`tests/tui_pty.rs`)
 covers what those seams cannot: the cursor query, raw-mode entry and restore
 on `/quit`, and a clean exit with a cooked terminal on `SIGTERM`.
