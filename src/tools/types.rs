@@ -86,6 +86,10 @@ pub struct ToolSandbox {
     pub agent_workspace: Option<std::path::PathBuf>,
     /// When true, file operations are restricted to `workspace_root`.
     pub workspace_only: bool,
+    /// When true, the kernel fence around command tools also denies outbound
+    /// network. Carried here (from the agent config) because the fence is
+    /// built per tool call.
+    pub fence_network: bool,
     /// Optional allowlist of plugin tool prefixes/names.
     pub plugin_allowlist: Option<Vec<String>>,
 }
@@ -107,6 +111,7 @@ impl Default for ToolSandbox {
             workspace_root: None,
             agent_workspace: None,
             workspace_only: true,
+            fence_network: false,
             plugin_allowlist: None,
         }
     }
@@ -211,6 +216,10 @@ impl ToolContext {
     pub fn workspace_only(&self) -> bool {
         self.sandbox.workspace_only
     }
+    /// Whether the fence around this agent's command tools denies network.
+    pub fn fence_network(&self) -> bool {
+        self.sandbox.fence_network
+    }
     pub fn memory_limit(&self) -> Option<usize> {
         self.sandbox.memory_limit
     }
@@ -255,6 +264,12 @@ impl ToolContext {
     /// Set workspace-only mode (restrict file ops to workspace_root)
     pub fn with_workspace_only(mut self, enabled: bool) -> Self {
         self.sandbox.workspace_only = enabled;
+        self
+    }
+
+    /// Deny outbound network in the kernel fence for this context's commands.
+    pub fn with_fence_network(mut self, enabled: bool) -> Self {
+        self.sandbox.fence_network = enabled;
         self
     }
 

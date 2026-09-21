@@ -69,6 +69,52 @@ pub struct WriteFence {
     pub workspace_root: std::path::PathBuf,
     /// Additional roots the child may write into (recursively).
     pub allowed_paths: Vec<std::path::PathBuf>,
+    /// Deny outbound network for the fenced process.
+    ///
+    /// Off unless the deployment asked for it (`[security] fence_network`):
+    /// `curl`, `git fetch` and package installs are ordinary work, so the
+    /// network stays reachable by default and the fence constrains writes.
+    pub deny_network: bool,
+    /// Subpaths that stay unwritable even when they sit inside a granted
+    /// root. Computed by [`WriteFence::new`]; see
+    /// [`PROTECTED_WRITE_NAMES`] for why each is here.
+    ///
+    /// Enforced by Seatbelt (its profile is last-match-wins, so a deny after
+    /// an allow wins) and left out on Linux — Landlock grants are additive
+    /// and cannot subtract a subtree from a granted root. Windows enforces
+    /// the roots but not these carve-outs yet.
+    pub protected_paths: Vec<std::path::PathBuf>,
+}
+
+/// Directory names that are never writable, even inside a granted root.
+///
+/// `.git` is the sharp one: writing `.git/hooks/*` or `.git/config` gives code
+/// execution on the next `git` command — which is exactly the escape a fence
+/// exists to prevent. `.syscity` is this runtime's own per-workspace
+/// metadata, which the agent has no business editing through a shell.
+pub const PROTECTED_WRITE_NAMES: &[&str] = &[".git", ".syscity"];
+
+impl WriteFence {
+    /// A fence for one tool call: the granted roots plus every protected name
+    /// that lands inside one of them.
+    pub fn new(
+        workspace_root: std::path::PathBuf,
+        allowed_paths: Vec<std::path::PathBuf>,
+        deny_network: bool,
+    ) -> Self {
+        let mut protected_paths = Vec::new();
+        for root in std::iter::once(&workspace_root).chain(allowed_paths.iter()) {
+            for name in PROTECTED_WRITE_NAMES {
+                protected_paths.push(root.join(name));
+            }
+        }
+        Self {
+            workspace_root,
+            allowed_paths,
+            deny_network,
+            protected_paths,
+        }
+    }
 }
 
 /// A subprocess spawn request, covering the knobs the tools actually use.
@@ -494,7 +540,16 @@ fn seatbelt_profile(fence: &WriteFence) -> String {
         format!("\"{escaped}\"")
     }
 
-    let mut out = String::from("(version 1)(allow default)(deny file-write*)");
+    // `(allow default)` first and denies after: Seatbelt is last-match-wins,
+    // so every deny below carves itself out of the allowances above it.
+    let mut out = String::from("(version 1)(allow default)");
+    if fence.deny_network {
+        // Denies every outbound connection — loopback included, which is why
+        // the sandbox network test can assert denial without touching the
+        // network at all.
+        out.push_str("(deny network*)");
+    }
+    out.push_str("(deny file-write*)");
     out.push_str("(allow file-write* (subpath ");
     out.push_str(&quote(&fence.workspace_root));
     out.push_str("))");
@@ -504,6 +559,14 @@ fn seatbelt_profile(fence: &WriteFence) -> String {
         out.push_str("))");
     }
     out.push_str("(allow file-write* (literal \"/dev/null\"))");
+    // Carve-outs: `.git`/`.syscity` stay unwritable wherever they sit inside a
+    // granted root, so a fenced shell cannot plant a git hook (code execution
+    // on the next git command) or edit the runtime's own metadata.
+    for path in &fence.protected_paths {
+        out.push_str("(deny file-write* (subpath ");
+        out.push_str(&quote(path));
+        out.push_str("))");
+    }
     out
 }
 
@@ -1300,10 +1363,16 @@ mod tests {
         use super::*;
 
         fn fence(workspace_root: &str, allowed: &[&str]) -> WriteFence {
-            WriteFence {
-                workspace_root: std::path::PathBuf::from(workspace_root),
-                allowed_paths: allowed.iter().map(std::path::PathBuf::from).collect(),
-            }
+            WriteFence::new(
+                std::path::PathBuf::from(workspace_root),
+                allowed.iter().map(std::path::PathBuf::from).collect(),
+                false,
+            )
+        }
+
+        /// Same, with the network posture flipped on.
+        fn fence_no_network(workspace_root: &str) -> WriteFence {
+            WriteFence::new(std::path::PathBuf::from(workspace_root), Vec::new(), true)
         }
 
         #[test]
@@ -1320,6 +1389,125 @@ mod tests {
         fn profile_includes_allowed_paths() {
             let p = seatbelt_profile(&fence("/tmp/ws", &["/tmp/extra"]));
             assert!(p.contains("(allow file-write* (subpath \"/tmp/extra\"))"));
+        }
+
+        #[test]
+        fn profile_denies_network_only_when_asked() {
+            // The default posture leaves the network alone: `curl` and
+            // `git fetch` are ordinary work.
+            let permissive = seatbelt_profile(&fence("/tmp/ws", &[]));
+            assert!(
+                !permissive.contains("network"),
+                "no network clause unless the deployment asked: {permissive}"
+            );
+
+            let denied = seatbelt_profile(&fence_no_network("/tmp/ws"));
+            assert!(denied.contains("(deny network*)"), "got {denied}");
+            // Order matters: the deny must come after `(allow default)`.
+            let allow_at = denied.find("(allow default)").expect("allow default");
+            let deny_at = denied.find("(deny network*)").expect("deny network");
+            assert!(allow_at < deny_at, "last match wins, so the deny goes last");
+        }
+
+        #[test]
+        fn profile_carves_git_and_syscity_out_of_the_workspace() {
+            let f = fence("/tmp/ws", &["/tmp/extra"]);
+            assert!(f
+                .protected_paths
+                .contains(&std::path::PathBuf::from("/tmp/ws/.git")));
+            assert!(f
+                .protected_paths
+                .contains(&std::path::PathBuf::from("/tmp/extra/.git")));
+
+            let p = seatbelt_profile(&f);
+            let ws_allow = p
+                .find("(allow file-write* (subpath \"/tmp/ws\"))")
+                .expect("workspace allow");
+            let git_deny = p
+                .find("(deny file-write* (subpath \"/tmp/ws/.git\"))")
+                .expect("git deny");
+            assert!(ws_allow < git_deny, "the carve-out must follow the allow");
+            assert!(p.contains("(deny file-write* (subpath \"/tmp/ws/.syscity\"))"));
+            assert!(p.contains("(deny file-write* (subpath \"/tmp/extra/.git\"))"));
+        }
+
+        /// A fenced command cannot plant a `.git/hooks` payload even though
+        /// the workspace it writes in is granted — that hook would run on the
+        /// next `git` command, which is the escape the carve-out closes.
+        #[tokio::test]
+        async fn seatbelt_blocks_writes_into_git_metadata() {
+            if !can_sandbox() {
+                return;
+            }
+            let dir = tempfile::tempdir().expect("tempdir");
+            let ws = dir.path().join("ws");
+            std::fs::create_dir_all(ws.join(".git/hooks")).expect("mkdir");
+            let target = ws.join(".git/hooks/pre-commit");
+            let ordinary = ws.join("notes.md");
+
+            let runner = MacSeatbeltRunner::default();
+            let req = ProcessRequest {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "echo pwned > {} ; echo fine > {}",
+                        target.display(),
+                        ordinary.display()
+                    ),
+                ],
+                fence: Some(fence(&ws.to_string_lossy(), &[])),
+                ..Default::default()
+            };
+            // The script's exit code is its last command's, so the refusal is
+            // asserted on the file and the stderr rather than on `success()`.
+            let out = runner.run(&req).await.expect("run");
+            assert!(
+                out.stderr_string().contains("not permitted"),
+                "the .git write must be refused: {}",
+                out.stderr_string()
+            );
+            assert!(!target.exists(), "no hook payload may land");
+            assert!(ordinary.exists(), "ordinary workspace writes still work");
+        }
+
+        /// The network posture reaches a real child: with `deny_network` the
+        /// sandbox refuses a loopback connect that succeeds without it.
+        #[tokio::test]
+        async fn seatbelt_denies_network_only_when_asked() {
+            if !can_sandbox() {
+                return;
+            }
+            // A listener makes the control case meaningful: without it both
+            // runs fail and the test would pass for the wrong reason.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+
+            let connect = |port: u16| ProcessRequest {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("exec 3<>/dev/tcp/127.0.0.1/{port}"),
+                ],
+                ..Default::default()
+            };
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runner = MacSeatbeltRunner::default();
+
+            let mut allowed = connect(port);
+            allowed.fence = Some(fence(&dir.path().to_string_lossy(), &[]));
+            let out = runner.run(&allowed).await.expect("run");
+            assert!(out.success(), "network is reachable by default: {out:?}");
+
+            let mut denied = connect(port);
+            denied.fence = Some(fence_no_network(&dir.path().to_string_lossy()));
+            let out = runner.run(&denied).await.expect("run");
+            assert!(!out.success(), "the deny must stop the connect: {out:?}");
+            assert!(
+                out.stderr_string().contains("not permitted"),
+                "expected a denial, got: {}",
+                out.stderr_string()
+            );
         }
 
         #[test]

@@ -270,6 +270,18 @@ struct Capabilities {
     attrs: Vec<SID_AND_ATTRIBUTES>,
 }
 
+/// No capabilities at all: the token gets zero network access.
+///
+/// The AppContainer model is deny-by-default for the network — a token with no
+/// capability SIDs cannot open a socket — so `[security] fence_network` is
+/// expressed by simply not handing over the network capability set.
+fn no_capabilities() -> Capabilities {
+    Capabilities {
+        _sids: Vec::new(),
+        attrs: Vec::new(),
+    }
+}
+
 /// Build the network capability set for the AppContainer token.
 fn network_capabilities() -> Result<Capabilities, WinFenceError> {
     let mut sids = Vec::with_capacity(3);
@@ -836,9 +848,16 @@ pub(crate) fn launch_fenced(
         // --- attribute 1: AppContainer security capabilities ---
         // Build the capability set before touching the attribute list; on
         // failure it must still be deleted, so route through `finish_attr`.
-        let mut caps = match network_capabilities() {
-            Ok(caps) => caps,
-            Err(e) => return finish_attr(Err(e)),
+        // `fence_network` turns the set into the empty one, which is what
+        // removes network access from the token.
+        let deny_network = req.fence.as_ref().is_some_and(|f| f.deny_network);
+        let mut caps = if deny_network {
+            no_capabilities()
+        } else {
+            match network_capabilities() {
+                Ok(caps) => caps,
+                Err(e) => return finish_attr(Err(e)),
+            }
         };
         let sid = profile.sid();
         let mut sec_caps = SECURITY_CAPABILITIES {

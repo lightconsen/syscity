@@ -458,6 +458,7 @@ mod tests {
             compaction_model: Some("claude-haiku".to_string()),
             workspace_dir: None,
             workspace_only: false,
+            fence_network: false,
             heartbeat: Some(crate::heartbeat::HeartbeatConfig {
                 enabled: true,
                 interval_seconds: 120,

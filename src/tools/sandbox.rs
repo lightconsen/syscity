@@ -303,6 +303,7 @@ mod tests {
                 workspace_root: Some(PathBuf::from("/tmp")),
                 agent_workspace: None,
                 workspace_only: false,
+                fence_network: false,
                 plugin_allowlist: None,
             },
             model: crate::tools::ToolModel {

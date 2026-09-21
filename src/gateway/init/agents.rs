@@ -232,6 +232,7 @@ pub async fn configure_acp_agent_builder(
             .as_ref()
             .map(crate::dirs::resolve_tilde);
         default_agent_config.workspace_only = config.workspace_only;
+        default_agent_config.fence_network = config.security.fence_network;
         let provider_clone = default_provider.clone();
         let model_router_clone = model_router.clone();
         let default_model = config.model.clone();

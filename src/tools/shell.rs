@@ -204,9 +204,12 @@ impl Tool for ShellTool {
             env_clear: true,
             env: context.environment().clone(),
             timeout: Some(context.timeout()),
-            fence: context.workspace_only().then(|| WriteFence {
-                workspace_root: context.workspace_root().clone(),
-                allowed_paths: context.allowed_paths().to_vec(),
+            fence: context.workspace_only().then(|| {
+                WriteFence::new(
+                    context.workspace_root().clone(),
+                    context.allowed_paths().to_vec(),
+                    context.fence_network(),
+                )
             }),
             ..Default::default()
         };
@@ -721,10 +724,17 @@ mod tests {
         let target = format!("/tmp/syscity_shell_fence_{}", std::process::id());
         let _ = std::fs::remove_file(&target);
 
+        // An explicit, existing workspace root: under `cfg(test)` the dirs
+        // default is a temp root nothing creates, and the shell's cwd is the
+        // workspace root — a missing cwd fails the spawn for reasons that have
+        // nothing to do with the fence.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+
         // workspace_only defaults to true -> shell runs behind the kernel
         // write fence, so a /tmp write is denied even though the shell tool's
         // parent-process path check only validates the working directory.
-        let fenced = ToolContext::new("user", "conv1");
+        let fenced = ToolContext::new("user", "conv1").with_workspace_root(ws.clone());
         let result = tool
             .execute(serde_json::json!({ "command": format!("echo x > {target}") }), &fenced)
             .await
@@ -733,7 +743,9 @@ mod tests {
         assert!(!std::path::Path::new(&target).exists());
 
         // workspace_only=false -> no fence, the write goes through.
-        let relaxed = ToolContext::new("user", "conv1").with_workspace_only(false);
+        let relaxed = ToolContext::new("user", "conv1")
+            .with_workspace_root(ws)
+            .with_workspace_only(false);
         let result = tool
             .execute(serde_json::json!({ "command": format!("echo x > {target}") }), &relaxed)
             .await
@@ -741,5 +753,46 @@ mod tests {
         assert!(result.success, "non-fenced shell should write freely");
         assert!(std::path::Path::new(&target).exists());
         let _ = std::fs::remove_file(&target);
+    }
+
+    /// The network posture travels with the context into the fence: the same
+    /// command reaches a loopback listener by default and is refused with
+    /// `fence_network` on.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_shell_fence_denies_network_only_when_asked() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        // The listener is what makes the control half meaningful — without it
+        // both runs fail to connect and the test would pass for the wrong
+        // reason.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // `nc` rather than bash's `/dev/tcp`: the shell tool runs `$SHELL`,
+        // and zsh has no `/dev/tcp`. Under the network deny `nc` fails
+        // silently (exit 1, no stderr), so the assertion is on success.
+        let command = format!("nc -z 127.0.0.1 {port}");
+        let tool = ShellTool::new();
+        // Same explicit root as the write test above: the shell needs a cwd
+        // that exists, and the fence needs a root to grant.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+
+        let permissive = ToolContext::new("user", "conv1").with_workspace_root(ws.clone());
+        let result = tool
+            .execute(serde_json::json!({ "command": command }), &permissive)
+            .await
+            .unwrap();
+        assert!(result.success, "the port is reachable by default: {result:?}");
+
+        let denied = ToolContext::new("user", "conv1")
+            .with_workspace_root(ws)
+            .with_fence_network(true);
+        let result = tool
+            .execute(serde_json::json!({ "command": command }), &denied)
+            .await
+            .unwrap();
+        assert!(!result.success, "fence_network must refuse the connect: {result:?}");
     }
 }

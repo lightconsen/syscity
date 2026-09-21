@@ -34,6 +34,12 @@ pub struct AgentConfig {
     /// When true, restrict file operations to `workspace_dir`.
     #[serde(default = "default_true")]
     pub workspace_only: bool,
+    /// When true, the kernel fence around this agent's command tools also
+    /// denies outbound network (see `SecurityConfig::fence_network`, which is
+    /// copied here at spawn — this field exists so the fence, built per tool
+    /// context, can read the posture).
+    #[serde(default)]
+    pub fence_network: bool,
     /// Model to use for LLM-powered context compaction.
     ///
     /// When `None`, the agent's primary model is used.  Set to a cheaper/faster
@@ -119,6 +125,7 @@ Use rich formatting for lists, structured data, and technical content:
             compaction_model: None,
             workspace_dir: None,
             workspace_only: false,
+            fence_network: false,
             heartbeat: None,
             agent_id: None,
             reflection_config: None,

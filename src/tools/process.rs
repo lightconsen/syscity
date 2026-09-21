@@ -237,9 +237,12 @@ impl Tool for ProcessTool {
                         None => context.working_directory().clone(),
                     }),
                     env: env.unwrap_or_default(),
-                    fence: context.workspace_only().then(|| WriteFence {
-                        workspace_root: context.workspace_root().clone(),
-                        allowed_paths: context.allowed_paths().to_vec(),
+                    fence: context.workspace_only().then(|| {
+                        WriteFence::new(
+                            context.workspace_root().clone(),
+                            context.allowed_paths().to_vec(),
+                            context.fence_network(),
+                        )
                     }),
                     ..Default::default()
                 };

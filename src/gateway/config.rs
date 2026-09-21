@@ -1201,6 +1201,20 @@ pub struct SecurityConfig {
     /// Credential source precedence for tokens, API keys, and passwords.
     #[serde(default)]
     pub credential_precedence: CredentialPrecedence,
+
+    /// Deny outbound network to fenced command tools (`shell`, `code_exec`,
+    /// `process`) instead of only fencing their writes.
+    ///
+    /// Off by default: `curl`, `git fetch`, package installs and every other
+    /// networked command are ordinary work, and turning the network off by
+    /// default would break them rather than protect anything the user did
+    /// not ask to protect. When on, the kernel fence grows a network clause
+    /// per platform — Seatbelt `(deny network*)` on macOS, a seccomp socket
+    /// filter on Linux, and no AppContainer network capability SIDs on
+    /// Windows. Nothing about this is per-call: it is a posture for every
+    /// fenced command in the deployment.
+    #[serde(default)]
+    pub fence_network: bool,
 }
 
 fn default_tailscale_ttl() -> u64 {
@@ -1342,6 +1356,7 @@ impl Default for SecurityConfig {
             tailscale_auth_ttl_secs: 300,
             trusted_proxy: crate::security::trusted_proxy::TrustedProxyConfig::default(),
             credential_precedence: CredentialPrecedence::default(),
+            fence_network: false,
         }
     }
 }

@@ -178,9 +178,12 @@ print(json.dumps(result))
         let mut req = ProcessRequest {
             argv: vec!["python3".to_string(), "-c".to_string(), wrapped_code],
             stdio: StdioMode::Piped,
-            fence: context.workspace_only().then(|| WriteFence {
-                workspace_root: context.workspace_root().clone(),
-                allowed_paths: context.allowed_paths().to_vec(),
+            fence: context.workspace_only().then(|| {
+                WriteFence::new(
+                    context.workspace_root().clone(),
+                    context.allowed_paths().to_vec(),
+                    context.fence_network(),
+                )
             }),
             ..Default::default()
         };

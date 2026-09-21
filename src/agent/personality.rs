@@ -369,6 +369,7 @@ impl AgentPersonality {
             compaction_model: None,
             workspace_dir: None,
             workspace_only: true,
+            fence_network: false,
             heartbeat: None,
             agent_id: None,
             reflection_config: None,
