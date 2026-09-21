@@ -301,13 +301,18 @@ Query 参数：
 
 | 作用域 | 可访问接口 |
 |-------|-----------------|
-| `chat` | `chat.send`, `chat.history`, `chat.abort` |
-| `read` | 只读查询: `sessions.list`, `agents.list` 等 |
-| `write` | 创建/修改: `sessions.create`, `sessions.delete` |
+| `chat` | `chat.send`, `chat.abort`, `ask.respond` |
+| `read` | 只读查询: `chat.history`, `sessions.list`, `agents.list` 等 |
+| `write` | 创建/修改: `sessions.create`, `sessions.delete`, `sessions.subscribe` |
 | `admin` | 完全访问（绕过所有作用域检查） |
 | `pairing` | 设备配对管理 |
 
 作用域校验按方法执行。`connect` 请求声明请求的作用域；服务端授予「请求的作用域」与「允许的作用域」的交集。
+
+**权威来源是 `methods.list`。** 网关把它维护的方法表（`src/gateway/protocol.rs` 的
+`METHOD_SCOPES`）直接发布出来——每个方法的名称与所需作用域，一处维护、可被客户端
+程序化读取；一张测试同时保证它与分发器的分支一一对应。下面的接口表是按功能组织的
+导读，可能有滞后，遇到不一致时以 `methods.list` 为准。
 
 ---
 
@@ -316,6 +321,12 @@ Query 参数：
 ### 6.1 普通使用 API（WebSocket）
 
 这些方法对所有客户端（Web、App、CLI）开放，只需具备相应作用域。
+
+#### 协议自省
+
+| 方法 | 作用域 | 说明 |
+|--------|-------|-------------|
+| `methods.list` | `read` | 列出全部 WS 方法及其所需作用域（协议版本、方法与作用域的对照表） |
 
 #### 聊天
 
@@ -334,8 +345,8 @@ Query 参数：
 | `sessions.create` | `write` | 创建新 session |
 | `sessions.delete` | `write` | 删除 session |
 | `sessions.reset` | `write` | 清空 session 上下文 |
-| `sessions.subscribe` | `read` | 订阅 session 事件 |
-| `sessions.unsubscribe` | `read` | 取消订阅 session 事件 |
+| `sessions.subscribe` | `write` | 订阅 session 事件 |
+| `sessions.unsubscribe` | `write` | 取消订阅 session 事件 |
 
 #### Agents
 

@@ -278,223 +278,257 @@ pub fn resolve_scopes(entitled: &[String], requested: &[String]) -> Vec<String> 
         .collect()
 }
 
-/// Check if a method requires a specific scope
+/// Every method the dispatcher handles, with the scope it requires.
+///
+/// The single source of truth for authorization: [`method_scope`] looks up
+/// here, `methods.list` publishes it, and a test holds it against the
+/// dispatcher's arms. `None` means the method needs no scope at all (the
+/// pre-auth handshake pair).
+///
+/// Data rather than a `match` so it can be published and diffed: the table
+/// and the dispatcher used to drift silently, and `subscribe` and friends
+/// spent that time demanding `admin` by falling through the default.
+/// [`method_scope`] scans it linearly — a couple of hundred short compares,
+/// once per request, against work that includes a WebSocket read.
+pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
+    ("chat.send", Some(SCOPE_CHAT)),
+    ("chat.abort", Some(SCOPE_CHAT)),
+    ("ask.respond", Some(SCOPE_CHAT)),
+    ("feedback.vote", Some(SCOPE_CHAT)),
+    // `models.default` genuinely is a read; the rest of the `models.*`
+    // family writes provider config (and API keys) to disk — see the write
+    // group.
+    ("chat.history", Some(SCOPE_READ)),
+    ("sessions.list", Some(SCOPE_READ)),
+    ("agents.list", Some(SCOPE_READ)),
+    ("agents.get", Some(SCOPE_READ)),
+    ("agents.get_config", Some(SCOPE_READ)),
+    ("agents.memory.get", Some(SCOPE_READ)),
+    ("agents.export", Some(SCOPE_READ)),
+    ("agents.registry", Some(SCOPE_READ)),
+    ("health", Some(SCOPE_READ)),
+    ("system.presence", Some(SCOPE_READ)),
+    ("cost.get", Some(SCOPE_READ)),
+    ("commands.list", Some(SCOPE_READ)),
+    ("config.get", Some(SCOPE_READ)),
+    ("methods.list", Some(SCOPE_READ)),
+    ("models.list", Some(SCOPE_READ)),
+    ("models.presets", Some(SCOPE_READ)),
+    ("models.default", Some(SCOPE_READ)),
+    ("cron.list", Some(SCOPE_READ)),
+    ("skills.list", Some(SCOPE_READ)),
+    ("logs.subscribe", Some(SCOPE_READ)),
+    ("logs.unsubscribe", Some(SCOPE_READ)),
+    ("workspace.list", Some(SCOPE_READ)),
+    ("workspace.read", Some(SCOPE_READ)),
+    ("tasks.list", Some(SCOPE_READ)),
+    ("mcp.list", Some(SCOPE_READ)),
+    ("mcp.presets", Some(SCOPE_READ)),
+    ("mcp.tools", Some(SCOPE_READ)),
+    ("mcp.resources", Some(SCOPE_READ)),
+    ("mcp.auth_status", Some(SCOPE_READ)),
+    ("device.capabilities", Some(SCOPE_READ)),
+    ("device.permission.status", Some(SCOPE_READ)),
+    ("device.adb.status", Some(SCOPE_READ)),
+    ("device.shortcut.results", Some(SCOPE_READ)),
+    ("device.shortcut.inbox", Some(SCOPE_READ)),
+    ("eval.trace.list", Some(SCOPE_READ)),
+    ("eval.dashboard", Some(SCOPE_READ)),
+    ("eval.optimizer.status", Some(SCOPE_READ)),
+    ("feedback.ops", Some(SCOPE_READ)),
+    ("connectors.list", Some(SCOPE_READ)),
+    ("connectors.auth_status", Some(SCOPE_READ)),
+    ("connectors.updates", Some(SCOPE_READ)),
+    ("connectors.catalog", Some(SCOPE_READ)),
+    ("onboarding.status", Some(SCOPE_READ)),
+    ("cloud.status", Some(SCOPE_READ)),
+    ("cloud.subscription", Some(SCOPE_READ)),
+    ("cloud.usage", Some(SCOPE_READ)),
+    ("cloud.credits.claims", Some(SCOPE_READ)),
+    ("cloud.credits.packs", Some(SCOPE_READ)),
+    ("cloud.credits.ledger", Some(SCOPE_READ)),
+    ("cloud.credits.invite", Some(SCOPE_READ)),
+    ("update.status", Some(SCOPE_READ)),
+    ("update.progress", Some(SCOPE_READ)),
+    ("plugins.list", Some(SCOPE_READ)),
+    ("plugins.search", Some(SCOPE_READ)),
+    ("providers.list", Some(SCOPE_READ)),
+    ("providers.usage", Some(SCOPE_READ)),
+    ("providers.health", Some(SCOPE_READ)),
+    ("providers.fallback", Some(SCOPE_READ)),
+    ("traces.get", Some(SCOPE_READ)),
+    ("cron.get", Some(SCOPE_READ)),
+    ("cron.logs", Some(SCOPE_READ)),
+    ("skills.get", Some(SCOPE_READ)),
+    ("channels.list", Some(SCOPE_READ)),
+    ("approvals.list", Some(SCOPE_READ)),
+    ("approvals.get", Some(SCOPE_READ)),
+    ("audit.recent", Some(SCOPE_READ)),
+    ("audit.all", Some(SCOPE_READ)),
+    ("memory.search", Some(SCOPE_READ)),
+    ("memory.collections", Some(SCOPE_READ)),
+    ("mention.policy", Some(SCOPE_READ)),
+    ("mention.allowlist", Some(SCOPE_READ)),
+    ("mention.blocklist", Some(SCOPE_READ)),
+    ("auth_profiles.list", Some(SCOPE_READ)),
+    ("auth_profiles.get", Some(SCOPE_READ)),
+    ("security.gate.list", Some(SCOPE_READ)),
+    ("security.allowlist.list", Some(SCOPE_READ)),
+    ("security.status", Some(SCOPE_READ)),
+    ("status.get", Some(SCOPE_READ)),
+    ("kb.collections", Some(SCOPE_READ)),
+    ("kb.docs", Some(SCOPE_READ)),
+    ("kb.doc_content", Some(SCOPE_READ)),
+    ("cloud.kb.list", Some(SCOPE_READ)),
+    ("cloud.kb.docs", Some(SCOPE_READ)),
+    ("cloud.kb.query", Some(SCOPE_READ)),
+    // Pairing-request inspection hands out the pairing code and the device
+    // inventory, so it sits with approve/reject/revoke rather than with the
+    // read-only queries: a `read` client must not be able to mint a code.
+    // These mutate durable state or execute code: models.* writes provider
+    // config (including API keys) to `config.toml`, `models.fetch_remote`
+    // takes the endpoint from the caller, `skills.install` extracts an
+    // archive, and `mcp.call_tool` invokes an arbitrary tool.
+    ("sessions.create", Some(SCOPE_WRITE)),
+    ("sessions.delete", Some(SCOPE_WRITE)),
+    ("agents.create", Some(SCOPE_WRITE)),
+    ("agents.delete", Some(SCOPE_WRITE)),
+    ("agents.purge", Some(SCOPE_WRITE)),
+    ("agents.rename", Some(SCOPE_WRITE)),
+    ("cost.reset", Some(SCOPE_WRITE)),
+    ("sessions.rename", Some(SCOPE_WRITE)),
+    ("sessions.set_pinned", Some(SCOPE_WRITE)),
+    ("sessions.set_model", Some(SCOPE_WRITE)),
+    ("sessions.set_mode", Some(SCOPE_WRITE)),
+    ("sessions.reset", Some(SCOPE_WRITE)),
+    ("sessions.subscribe", Some(SCOPE_WRITE)),
+    ("sessions.unsubscribe", Some(SCOPE_WRITE)),
+    // Legacy aliases of `sessions.subscribe`/`unsubscribe` and the
+    // connection-local subscribe-all. All three are dispatched but were
+    // absent from this table, so they fell through to the `admin` default —
+    // the drift the table/dispatcher check exists to catch.
+    ("subscribe", Some(SCOPE_WRITE)),
+    ("unsubscribe", Some(SCOPE_WRITE)),
+    ("subscribe_all", Some(SCOPE_WRITE)),
+    // Pops the macOS accessibility prompt: a side effect on the user's
+    // machine, so it asks for the same scope as any other write.
+    ("permissions.request_macos_accessibility", Some(SCOPE_WRITE)),
+    ("commands.execute", Some(SCOPE_WRITE)),
+    ("config.set", Some(SCOPE_WRITE)),
+    ("tasks.schedule", Some(SCOPE_WRITE)),
+    ("tasks.delete", Some(SCOPE_WRITE)),
+    ("tasks.enable", Some(SCOPE_WRITE)),
+    ("tasks.disable", Some(SCOPE_WRITE)),
+    ("mcp.add", Some(SCOPE_WRITE)),
+    ("mcp.remove", Some(SCOPE_WRITE)),
+    ("mcp.connect", Some(SCOPE_WRITE)),
+    ("mcp.disconnect", Some(SCOPE_WRITE)),
+    ("mcp.auth_cancel", Some(SCOPE_WRITE)),
+    ("device.permission.request", Some(SCOPE_WRITE)),
+    ("device.adb.pair", Some(SCOPE_WRITE)),
+    ("device.shortcut.run", Some(SCOPE_WRITE)),
+    ("device.pairing.pending", Some(SCOPE_WRITE)),
+    ("device.pairing.authorized", Some(SCOPE_WRITE)),
+    ("device.pairing.qr", Some(SCOPE_WRITE)),
+    ("device.pairing.setup", Some(SCOPE_WRITE)),
+    ("device.pairing.approve", Some(SCOPE_WRITE)),
+    ("device.pairing.reject", Some(SCOPE_WRITE)),
+    ("device.pairing.revoke", Some(SCOPE_WRITE)),
+    ("models.fetch_remote", Some(SCOPE_WRITE)),
+    ("models.add", Some(SCOPE_WRITE)),
+    ("models.remove", Some(SCOPE_WRITE)),
+    ("models.set_default", Some(SCOPE_WRITE)),
+    ("skills.install", Some(SCOPE_WRITE)),
+    ("mcp.call_tool", Some(SCOPE_WRITE)),
+    ("system.reload", Some(SCOPE_WRITE)),
+    ("channels.enable", Some(SCOPE_WRITE)),
+    ("channels.disable", Some(SCOPE_WRITE)),
+    ("agents.update", Some(SCOPE_WRITE)),
+    ("agents.default", Some(SCOPE_WRITE)),
+    ("agents.memory.clear", Some(SCOPE_WRITE)),
+    ("agents.import", Some(SCOPE_WRITE)),
+    ("security.gate.set", Some(SCOPE_WRITE)),
+    ("security.gate.clear", Some(SCOPE_WRITE)),
+    ("security.allowlist.add", Some(SCOPE_WRITE)),
+    ("security.allowlist.remove", Some(SCOPE_WRITE)),
+    ("approvals.approve", Some(SCOPE_WRITE)),
+    ("approvals.deny", Some(SCOPE_WRITE)),
+    ("memory.add", Some(SCOPE_WRITE)),
+    ("mention.policy.set", Some(SCOPE_WRITE)),
+    ("mention.allowlist.add", Some(SCOPE_WRITE)),
+    ("mention.allowlist.remove", Some(SCOPE_WRITE)),
+    ("mention.blocklist.add", Some(SCOPE_WRITE)),
+    ("mention.blocklist.remove", Some(SCOPE_WRITE)),
+    ("auth_profiles.rotate", Some(SCOPE_WRITE)),
+    ("eval.optimizer.run", Some(SCOPE_WRITE)),
+    ("eval.optimizer.resume", Some(SCOPE_WRITE)),
+    ("eval.optimizer.rollback", Some(SCOPE_WRITE)),
+    ("eval.propose", Some(SCOPE_WRITE)),
+    ("connectors.install", Some(SCOPE_WRITE)),
+    ("connectors.enable", Some(SCOPE_WRITE)),
+    ("connectors.disable", Some(SCOPE_WRITE)),
+    ("connectors.uninstall", Some(SCOPE_WRITE)),
+    ("connectors.catalog_install", Some(SCOPE_WRITE)),
+    ("onboarding.apply", Some(SCOPE_WRITE)),
+    ("cloud.token", Some(SCOPE_WRITE)),
+    ("cloud.logout", Some(SCOPE_WRITE)),
+    ("update.trigger", Some(SCOPE_WRITE)),
+    ("plugins.enable", Some(SCOPE_WRITE)),
+    ("plugins.disable", Some(SCOPE_WRITE)),
+    ("plugins.install", Some(SCOPE_WRITE)),
+    ("plugins.sign", Some(SCOPE_WRITE)),
+    ("plugins.unload", Some(SCOPE_WRITE)),
+    ("plugins.reload", Some(SCOPE_WRITE)),
+    ("plugins.reload_all", Some(SCOPE_WRITE)),
+    ("plugins.uninstall", Some(SCOPE_WRITE)),
+    ("providers.enable", Some(SCOPE_WRITE)),
+    ("providers.disable", Some(SCOPE_WRITE)),
+    ("providers.check", Some(SCOPE_WRITE)),
+    ("providers.switch", Some(SCOPE_WRITE)),
+    ("cron.enable", Some(SCOPE_WRITE)),
+    ("cron.disable", Some(SCOPE_WRITE)),
+    ("cron.run", Some(SCOPE_WRITE)),
+    ("cron.add", Some(SCOPE_WRITE)),
+    ("cron.remove", Some(SCOPE_WRITE)),
+    ("skills.enable", Some(SCOPE_WRITE)),
+    ("skills.disable", Some(SCOPE_WRITE)),
+    ("skills.uninstall", Some(SCOPE_WRITE)),
+    ("skills.run", Some(SCOPE_WRITE)),
+    ("kb.ingest", Some(SCOPE_WRITE)),
+    ("kb.delete_doc", Some(SCOPE_WRITE)),
+    ("cloud.kb.create", Some(SCOPE_WRITE)),
+    ("cloud.kb.delete", Some(SCOPE_WRITE)),
+    ("cloud.kb.upload", Some(SCOPE_WRITE)),
+    ("cloud.kb.push", Some(SCOPE_WRITE)),
+    ("cloud.kb.pull", Some(SCOPE_WRITE)),
+    ("cloud.credits.daily_claim", Some(SCOPE_WRITE)),
+    ("cloud.credits.signup_claim", Some(SCOPE_WRITE)),
+    ("cloud.credits.invite_redeem", Some(SCOPE_WRITE)),
+    ("acp.spawn", Some(SCOPE_ACP)),
+    ("acp.terminate", Some(SCOPE_ACP)),
+    ("acp.message", Some(SCOPE_ACP)),
+    ("acp.pause", Some(SCOPE_ACP)),
+    ("acp.resume", Some(SCOPE_ACP)),
+    ("acp.step", Some(SCOPE_ACP)),
+    ("acp.cancel", Some(SCOPE_ACP)),
+    ("acp.execute.session", Some(SCOPE_ACP)),
+    ("acp.execute.run", Some(SCOPE_ACP)),
+    ("acp.list", Some(SCOPE_READ)),
+    ("acp.status", Some(SCOPE_READ)),
+    ("acp.tree", Some(SCOPE_READ)),
+    ("connect", None),
+    ("ping", None),
+    // Admin scope required for unknown methods (default-deny)
+];
+
+/// Check if a method requires a specific scope.
+///
+/// An unknown method requires `admin`: an unrecognized name must not be a way
+/// to reach anything at all, let alone something cheaper than `admin`.
 pub fn method_scope(method: &str) -> Option<&'static str> {
-    match method {
-        "chat.send" | "chat.abort" | "ask.respond" | "feedback.vote" => Some(SCOPE_CHAT),
-        "chat.history"
-        | "sessions.list"
-        | "agents.list"
-        | "agents.get"
-        | "agents.get_config"
-        | "agents.memory.get"
-        | "agents.export"
-        | "agents.registry"
-        | "health"
-        | "system.presence"
-        | "cost.get"
-        | "commands.list"
-        | "config.get"
-        | "models.list"
-        | "models.presets"
-        // `models.default` genuinely is a read; the rest of the `models.*`
-        // family writes provider config (and API keys) to disk — see the write
-        // group.
-        | "models.default"
-        | "cron.list"
-        | "skills.list"
-        | "logs.subscribe"
-        | "logs.unsubscribe"
-        | "workspace.list"
-        | "workspace.read"
-        | "tasks.list"
-        | "mcp.list"
-        | "mcp.presets"
-        | "mcp.tools"
-        | "mcp.resources"
-        | "mcp.auth_status"
-        | "device.capabilities"
-        | "device.permission.status"
-        | "device.adb.status"
-        | "device.shortcut.results"
-        | "device.shortcut.inbox"
-        | "eval.trace.list"
-        | "eval.dashboard"
-        | "eval.optimizer.status"
-        | "feedback.ops"
-        | "connectors.list"
-        | "connectors.auth_status"
-        | "connectors.updates"
-        | "connectors.catalog"
-        | "onboarding.status"
-        | "cloud.status"
-        | "cloud.subscription"
-        | "cloud.usage"
-        | "cloud.credits.claims"
-        | "cloud.credits.packs"
-        | "cloud.credits.ledger"
-        | "cloud.credits.invite"
-        | "update.status"
-        | "update.progress"
-        | "plugins.list"
-        | "plugins.search"
-        | "providers.list"
-        | "providers.usage"
-        | "providers.health"
-        | "providers.fallback"
-        | "traces.get"
-        | "cron.get"
-        | "cron.logs"
-        | "skills.get"
-        | "channels.list"
-        | "approvals.list"
-        | "approvals.get"
-        | "audit.recent"
-        | "audit.all"
-        | "memory.search"
-        | "memory.collections"
-        | "mention.policy"
-        | "mention.allowlist"
-        | "mention.blocklist"
-        | "auth_profiles.list"
-        | "auth_profiles.get"
-        | "security.gate.list"
-        | "security.allowlist.list"
-        | "security.status"
-        | "status.get"
-        | "kb.collections"
-        | "kb.docs"
-        | "kb.doc_content"
-        | "cloud.kb.list"
-        | "cloud.kb.docs"
-        | "cloud.kb.query" => Some(SCOPE_READ),
-        "sessions.create"
-        | "sessions.delete"
-        | "agents.create"
-        | "agents.delete"
-        | "agents.purge"
-        | "agents.rename"
-        | "cost.reset"
-        | "sessions.rename"
-        | "sessions.set_pinned"
-        | "sessions.set_model"
-        | "sessions.set_mode"
-        | "sessions.reset"
-        | "sessions.subscribe"
-        | "sessions.unsubscribe"
-        | "commands.execute"
-        | "config.set"
-        | "tasks.schedule"
-        | "tasks.delete"
-        | "tasks.enable"
-        | "tasks.disable"
-        | "mcp.add"
-        | "mcp.remove"
-        | "mcp.connect"
-        | "mcp.disconnect"
-        | "mcp.auth_cancel"
-        | "device.permission.request"
-        | "device.adb.pair"
-        | "device.shortcut.run"
-        // Pairing-request inspection hands out the pairing code and the device
-        // inventory, so it sits with approve/reject/revoke rather than with the
-        // read-only queries: a `read` client must not be able to mint a code.
-        | "device.pairing.pending"
-        | "device.pairing.authorized"
-        | "device.pairing.qr"
-        | "device.pairing.setup"
-        | "device.pairing.approve"
-        | "device.pairing.reject"
-        | "device.pairing.revoke"
-        // These mutate durable state or execute code: models.* writes provider
-        // config (including API keys) to `config.toml`, `models.fetch_remote`
-        // takes the endpoint from the caller, `skills.install` extracts an
-        // archive, and `mcp.call_tool` invokes an arbitrary tool.
-        | "models.fetch_remote"
-        | "models.add"
-        | "models.remove"
-        | "models.set_default"
-        | "skills.install"
-        | "mcp.call_tool"
-        | "system.reload"
-        | "channels.enable"
-        | "channels.disable"
-        | "agents.update"
-        | "agents.default"
-        | "agents.memory.clear"
-        | "agents.import"
-        | "security.gate.set"
-        | "security.gate.clear"
-        | "security.allowlist.add"
-        | "security.allowlist.remove"
-        | "approvals.approve"
-        | "approvals.deny"
-        | "memory.add"
-        | "mention.policy.set"
-        | "mention.allowlist.add"
-        | "mention.allowlist.remove"
-        | "mention.blocklist.add"
-        | "mention.blocklist.remove"
-        | "auth_profiles.rotate"
-        | "eval.optimizer.run"
-        | "eval.optimizer.resume"
-        | "eval.optimizer.rollback"
-        | "eval.propose"
-        | "connectors.install"
-        | "connectors.enable"
-        | "connectors.disable"
-        | "connectors.uninstall"
-        | "connectors.catalog_install"
-        | "onboarding.apply"
-        | "cloud.token"
-        | "cloud.logout"
-        | "update.trigger"
-        | "plugins.enable"
-        | "plugins.disable"
-        | "plugins.install"
-        | "plugins.sign"
-        | "plugins.unload"
-        | "plugins.reload"
-        | "plugins.reload_all"
-        | "plugins.uninstall"
-        | "providers.enable"
-        | "providers.disable"
-        | "providers.check"
-        | "providers.switch"
-        | "cron.enable"
-        | "cron.disable"
-        | "cron.run"
-        | "cron.add"
-        | "cron.remove"
-        | "skills.enable"
-        | "skills.disable"
-        | "skills.uninstall"
-        | "skills.run"
-        | "kb.ingest"
-        | "kb.delete_doc"
-        | "cloud.kb.create"
-        | "cloud.kb.delete"
-        | "cloud.kb.upload"
-        | "cloud.kb.push"
-        | "cloud.kb.pull"
-        | "cloud.credits.daily_claim"
-        | "cloud.credits.signup_claim"
-        | "cloud.credits.invite_redeem" => Some(SCOPE_WRITE),
-        "acp.spawn"
-        | "acp.terminate"
-        | "acp.message"
-        | "acp.pause"
-        | "acp.resume"
-        | "acp.step"
-        | "acp.cancel"
-        | "acp.execute.session"
-        | "acp.execute.run" => Some(SCOPE_ACP),
-        "acp.list" | "acp.status" | "acp.tree" => Some(SCOPE_READ),
-        "connect" | "ping" => None, // No scope required
-        _ => {
-            // Admin scope required for unknown methods (default-deny)
-            Some(SCOPE_ADMIN)
-        }
+    match METHOD_SCOPES.iter().find(|(name, _)| *name == method) {
+        Some((_, scope)) => *scope,
+        None => Some(SCOPE_ADMIN),
     }
 }
 
@@ -1036,6 +1070,104 @@ pub fn error_version_mismatch(id: impl Into<String>) -> WsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scope table and the dispatcher's arms must describe one surface.
+    ///
+    /// They live in different files and nothing but this test connects them —
+    /// which is how `subscribe`, `unsubscribe`, `subscribe_all` and
+    /// `permissions.request_macos_accessibility` came to be dispatched while
+    /// missing from the table, each silently demanding `admin` by falling
+    /// through the default.
+    #[test]
+    fn method_table_matches_the_dispatcher() {
+        use std::collections::BTreeSet;
+
+        let source = include_str!("ws/core.rs");
+        let start = source
+            .find("match req.method.as_str() {")
+            .expect("the dispatcher's method match");
+        let end = start
+            + source[start..]
+                .find("_ => error_method_not_found")
+                .expect("the dispatcher's default arm");
+        let region = &source[start..end];
+
+        // Same shape as the table's own source: pattern lines accumulate
+        // until the arm's `=>`, so a multi-line alternative list is read
+        // whole. Only lines that begin with a pattern are considered, so a
+        // JSON string value inside a handler body cannot be mistaken for a
+        // method.
+        let mut dispatched: BTreeSet<String> = BTreeSet::new();
+        let mut pending: Vec<String> = Vec::new();
+        for raw in region.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if line.is_empty() || !(line.starts_with('"') || line.starts_with('|')) {
+                continue;
+            }
+            let (head, has_arrow) = match line.split_once("=>") {
+                Some((head, _)) => (head, true),
+                None => (line, false),
+            };
+            for part in head.split('|') {
+                let part = part.trim().trim_end_matches(',').trim();
+                if part.len() > 2 && part.starts_with('"') && part.ends_with('"') {
+                    pending.push(part.trim_matches('"').to_string());
+                }
+            }
+            if has_arrow {
+                dispatched.extend(pending.drain(..));
+            }
+        }
+        assert!(
+            !dispatched.is_empty(),
+            "the dispatcher's arms were not parsed — this test would pass vacuously"
+        );
+
+        let listed: BTreeSet<String> = METHOD_SCOPES
+            .iter()
+            .map(|(method, _)| method.to_string())
+            .collect();
+        let unlisted: Vec<&String> = dispatched.difference(&listed).collect();
+        let undispatched: Vec<&String> = listed.difference(&dispatched).collect();
+        assert!(
+            unlisted.is_empty(),
+            "dispatched but missing from METHOD_SCOPES (they fall through to admin): {unlisted:?}"
+        );
+        assert!(
+            undispatched.is_empty(),
+            "in METHOD_SCOPES but never dispatched: {undispatched:?}"
+        );
+    }
+
+    /// Every entry names a scope the protocol knows, and the pre-auth pair is
+    /// the only scope-free one.
+    #[test]
+    fn method_table_entries_are_well_formed() {
+        let known = [
+            SCOPE_CHAT,
+            SCOPE_READ,
+            SCOPE_WRITE,
+            SCOPE_ADMIN,
+            SCOPE_PAIRING,
+            SCOPE_ACP,
+        ];
+        for (method, scope) in METHOD_SCOPES {
+            assert!(!method.is_empty(), "an empty method name");
+            assert!(!method.contains(char::is_whitespace), "`{method}` contains whitespace");
+            match scope {
+                Some(s) => assert!(known.contains(s), "`{method}` names unknown scope `{s}`"),
+                None => assert!(
+                    matches!(*method, "connect" | "ping"),
+                    "`{method}` needs no scope, but only the pre-auth pair should"
+                ),
+            }
+        }
+        // The list is a set: a duplicate would make lookup order-dependent.
+        let mut seen = std::collections::BTreeSet::new();
+        for (method, _) in METHOD_SCOPES {
+            assert!(seen.insert(*method), "`{method}` is listed twice");
+        }
+    }
 
     #[test]
     fn test_ws_response_ok() {

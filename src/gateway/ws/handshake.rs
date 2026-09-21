@@ -226,6 +226,33 @@ pub(super) fn handle_ping(req: &WsRequest) -> WsResponse {
     WsResponse::ok(&req.id, serde_json::json!({}))
 }
 
+/// `methods.list` — every WS method and the scope it requires.
+///
+/// Published from the same table the dispatcher's authorization reads
+/// (`protocol::METHOD_SCOPES`), so a client can discover the surface without
+/// a hand-written copy of it going stale — and a test holds that table
+/// against the dispatcher's arms.
+pub(super) fn handle_methods_list(req: &WsRequest) -> WsResponse {
+    let methods: Vec<serde_json::Value> = crate::gateway::protocol::METHOD_SCOPES
+        .iter()
+        .map(|(method, scope)| {
+            serde_json::json!({
+                "method": method,
+                // `None` is the pre-auth pair (`connect`/`ping`): no scope.
+                "scope": scope,
+            })
+        })
+        .collect();
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "protocol_version": crate::gateway::protocol::PROTOCOL_VERSION,
+            "count": methods.len(),
+            "methods": methods,
+        }),
+    )
+}
+
 /// Prompt for generating session titles via LLM.
 const SESSION_TITLE_PROMPT: &str = "Summarize the following user message into a very short session title (at most 6 words, no punctuation, no explanation).\n\nMessage: {message}\n\nTitle:";
 
@@ -668,5 +695,49 @@ mod tests {
         let client = cg.client.as_ref().expect("client info stored");
         assert_eq!(client.id, "ios");
         assert_eq!(cg.scopes, vec!["chat".to_string()]);
+    }
+
+    /// `methods.list` publishes the table the dispatcher authorizes from —
+    /// not a copy of it.
+    #[test]
+    fn methods_list_publishes_the_scope_table() {
+        let req = WsRequest {
+            frame_type: "req".into(),
+            id: "r1".into(),
+            method: "methods.list".into(),
+            params: None,
+        };
+        let res = handle_methods_list(&req);
+        assert!(res.ok, "methods.list must succeed: {:?}", res.error);
+        let payload = res.payload.expect("payload");
+        let methods = payload["methods"].as_array().expect("methods array");
+        assert_eq!(
+            methods.len(),
+            crate::gateway::protocol::METHOD_SCOPES.len(),
+            "the payload must carry the whole table"
+        );
+        assert_eq!(payload["protocol_version"], crate::gateway::protocol::PROTOCOL_VERSION);
+
+        let find = |name: &str| {
+            methods
+                .iter()
+                .find(|m| m["method"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from the manifest"))
+                .clone()
+        };
+        assert_eq!(find("chat.send")["scope"], "chat");
+        assert_eq!(find("methods.list")["scope"], "read");
+        // The pre-auth pair carries no scope, and the payload says so rather
+        // than inventing one.
+        assert!(find("ping")["scope"].is_null());
+
+        // Every entry matches the table it came from.
+        for (method, scope) in crate::gateway::protocol::METHOD_SCOPES {
+            let entry = find(method);
+            match scope {
+                Some(s) => assert_eq!(entry["scope"], *s, "scope of {method}"),
+                None => assert!(entry["scope"].is_null(), "{method} should have no scope"),
+            }
+        }
     }
 }

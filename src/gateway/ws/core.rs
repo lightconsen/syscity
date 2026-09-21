@@ -903,6 +903,7 @@ async fn dispatch_method(
 
     match req.method.as_str() {
         "ping" => handshake::handle_ping(req),
+        "methods.list" => handshake::handle_methods_list(req),
         "connect" => {
             WsResponse::err(&req.id, "INVALID_REQUEST", "connect can only be sent as first message")
         }
