@@ -461,6 +461,11 @@ impl DelegateTool {
         let wake = self.wake.clone();
         let root_id_bg = root_id.clone();
         let parent_task_id_bg = parent_task_id.clone();
+        // `parent_id` is the caller's conversation id: the user session for a
+        // tree root, `delegation:<parent_run_id>` for a delegated parent.
+        // Recorded on the row so the gateway can route push events to the
+        // session the operator's client is actually subscribed to.
+        let parent_session_bg = parent_id.clone();
         let agent_id_owned = agent_type.clone();
         let task_fn = move |run_id: String, _task_str: String| {
             let reg_task = reg_task.clone();
@@ -472,6 +477,7 @@ impl DelegateTool {
             let coordinator = coordinator.clone();
             let wake = wake.clone();
             let agent_id = agent_id_owned.clone();
+            let parent_session = parent_session_bg.clone();
             let scope = DelegationScope {
                 root_id: root_id_bg.clone(),
                 task_id: run_id.clone(),
@@ -499,6 +505,7 @@ impl DelegateTool {
                         agent_id,
                         coordinator,
                         wake,
+                        parent_session: Some(parent_session),
                     },
                 )
                 .await;
@@ -562,6 +569,11 @@ pub(crate) struct ChildTaskEnv {
     pub agent_id: String,
     pub coordinator: Option<Arc<DelegationCoordinator>>,
     pub wake: Option<Arc<DelegationWake>>,
+    /// Session the `delegate` call ran in (`parent_id` of `spawn_child`): the
+    /// user session for a tree root, `delegation:<parent_run_id>` for a
+    /// delegated parent. Recorded on the row so push events can be routed to
+    /// the client watching the root conversation.
+    pub parent_session: Option<String>,
 }
 
 pub(crate) fn execute_child_task(
@@ -583,6 +595,7 @@ pub(crate) fn execute_child_task(
             agent_id,
             coordinator,
             wake,
+            parent_session,
         } = env;
 
         tracker.update_status(&child_id, ChildStatus::Running).await;
@@ -605,6 +618,7 @@ pub(crate) fn execute_child_task(
                     depth,
                     agent_id: &agent_id,
                     title: &title,
+                    parent_session: parent_session.as_deref(),
                 })
                 .await
             {
@@ -650,9 +664,14 @@ pub(crate) fn execute_child_task(
 
             // Build a debug-logging progress callback so child tool activity
             // surfaces in logs even though there is no parent callback to forward to.
+            // Per-round usage is also accumulated onto the task row here: the
+            // child's `OutgoingMessage.usage` is only the last round, so the
+            // row total must be built up round by round.
             let child_id_cb = child_id.clone();
+            let store_cb = store.clone();
             let progress_cb: crate::agent::ProgressCallback = Arc::new(move |event| {
                 let cid = child_id_cb.clone();
+                let store_cb = store_cb.clone();
                 Box::pin(async move {
                     match event {
                         crate::agent::ProgressEvent::ToolCalling { name, arguments } => {
@@ -660,6 +679,15 @@ pub(crate) fn execute_child_task(
                         }
                         crate::agent::ProgressEvent::ToolResult { name, result, .. } => {
                             debug!("Child {} tool {} result: {} chars", cid, name, result.len());
+                        }
+                        crate::agent::ProgressEvent::RoundUsage { usage } => {
+                            if let Some(store) = &store_cb {
+                                if let Err(e) =
+                                    store.add_usage(&cid, usage.total_tokens as u64).await
+                                {
+                                    warn!("Child {} usage update failed: {}", cid, e);
+                                }
+                            }
                         }
                         crate::agent::ProgressEvent::Error { message } => {
                             warn!("Child {} progress error: {}", cid, message);
@@ -1872,6 +1900,7 @@ mod tests {
                 depth: 1,
                 agent_id: "manager",
                 title: "Parent task",
+                parent_session: None,
             })
             .await
             .unwrap();
@@ -1890,6 +1919,73 @@ mod tests {
             allowed_tools: None,
             max_iterations: None,
         }
+    }
+
+    /// Even a child that fails before any agent runs records its lineage on
+    /// the row: the forwarder routes events by it, so the row must carry the
+    /// session the delegate call ran in from creation.
+    #[tokio::test]
+    async fn test_execute_child_task_records_parent_session_on_the_row() {
+        let (registry, store, _handler, _wake) = wake_fixture().await;
+        // The parent row carries the user session, as a tree root would; the
+        // child's own session key (`delegation:<run_id>`) is what a delegated
+        // parent records.
+        store
+            .create_task(NewTask {
+                id: "parent-run",
+                root_id: "root-1",
+                parent_id: None,
+                depth: 1,
+                agent_id: "manager",
+                title: "Parent task",
+                parent_session: Some("user-session"),
+            })
+            .await
+            .unwrap();
+        let tool = DelegateTool::root();
+        let child_id = register_child_run(&registry, "delegation:parent-run").await;
+        tool.tracker
+            .register_child(make_child(&child_id, ChildStatus::Running))
+            .await;
+
+        execute_child_task(
+            child_id.clone(),
+            completion_task(),
+            ChildTaskEnv {
+                tracker: tool.tracker.clone(),
+                iterations: Arc::new(AtomicUsize::new(0)),
+                // No agent: the row is created, then the run fails — and the
+                // row must still carry its lineage.
+                agent: None,
+                registry,
+                store: Some(store.clone()),
+                scope: child_scope(&child_id, Some("parent-run".to_string()), 2),
+                agent_id: "worker".to_string(),
+                coordinator: None,
+                wake: None,
+                parent_session: Some("delegation:parent-run".to_string()),
+            },
+        )
+        .await;
+
+        let task = store
+            .get_task(&child_id)
+            .await
+            .unwrap()
+            .expect("row created");
+        assert_eq!(task.status, "failed");
+        assert_eq!(
+            task.parent_session.as_deref(),
+            Some("delegation:parent-run"),
+            "the lineage is on the row from creation"
+        );
+
+        // And it resolves up the chain to the parent row's user session —
+        // the walk the gateway forwarder does.
+        assert_eq!(
+            store.root_session_for_task(&child_id).await.unwrap(),
+            Some("user-session".to_string())
+        );
     }
 
     fn completion_task() -> TaskSpec {
@@ -1935,6 +2031,7 @@ mod tests {
                 agent_id: "worker".to_string(),
                 coordinator: None,
                 wake: Some(wake.clone()),
+                parent_session: None,
             },
         )
         .await;
@@ -1994,6 +2091,7 @@ mod tests {
                 agent_id: "worker".to_string(),
                 coordinator: None,
                 wake: Some(wake.clone()),
+                parent_session: None,
             },
         )
         .await;
@@ -2036,6 +2134,7 @@ mod tests {
                 agent_id: "worker".to_string(),
                 coordinator: None,
                 wake: Some(wake),
+                parent_session: None,
             },
         )
         .await;
@@ -2073,6 +2172,7 @@ mod tests {
                 agent_id: "worker".to_string(),
                 coordinator: None,
                 wake: Some(wake.clone()),
+                parent_session: None,
             },
         )
         .await;

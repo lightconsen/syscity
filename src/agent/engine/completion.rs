@@ -840,6 +840,18 @@ impl Agent {
             guard.record_usage(prompt_tokens, completion_tokens, response.model.as_str());
         }
 
+        // Report the round's usage to progress subscribers (the gateway turns
+        // it into `agent.usage` events). One emission site for every round:
+        // tool rounds, the forced no-tools round, and the final round all pass
+        // through here, and the tool recursion re-enters this function for the
+        // next round. The `turn_token_usage` accumulate sites (completion.rs
+        // and tools.rs) must NOT also emit — the final round's usage already
+        // reaches turn_token_usage twice by design, and a second emission
+        // would double-count the event stream too.
+        if let Some(usage) = response.usage {
+            (progress_cb)(ProgressEvent::RoundUsage { usage }).await;
+        }
+
         // Handle tool calls if present — unless this is the final round, in
         // which case residual tool calls are discarded so the agent cannot loop
         // back into the tool-iteration guard.

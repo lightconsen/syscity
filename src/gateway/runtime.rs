@@ -303,6 +303,20 @@ pub enum GatewayEvent {
     AskRequired(crate::tools::ask_user::AskRequiredEvent),
     /// A question was answered or timed out.
     AskResolved(crate::tools::ask_user::AskResolvedEvent),
+    /// One LLM round's token usage, forwarded so clients can show a live
+    /// counter during a run (`chat.final` carries usage but fires at run end).
+    AgentUsage {
+        session_id: String,
+        agent_id: String,
+        usage: crate::providers::Usage,
+    },
+    /// A delegation task row changed (created / status / usage / state /
+    /// artifact). `session_id` is the tree's ROOT USER session — the session
+    /// clients subscribe to — not the child's `delegation:<run_id>` session.
+    DelegationTaskUpdated {
+        session_id: String,
+        task: crate::delegation::DelegationTaskSnapshot,
+    },
 }
 
 /// Agent status

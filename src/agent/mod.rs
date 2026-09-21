@@ -50,6 +50,14 @@ pub enum ProgressEvent {
         turn_id: String,
         usage: Option<crate::providers::Usage>,
     },
+    /// One LLM round's token usage, emitted as the round closes.
+    ///
+    /// `Completed` fires once per *turn*; a live token counter needs the
+    /// per-round total, which today only lands in
+    /// `Context::turn_token_usage`. Emitted exactly once per round from the
+    /// completion path — accumulate sites must NOT also emit this, or the
+    /// total double counts.
+    RoundUsage { usage: crate::providers::Usage },
     /// Error occurred
     Error { message: String },
 }

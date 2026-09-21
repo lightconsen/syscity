@@ -760,6 +760,15 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
                         debug!("No receivers for Completed event: {}", e);
                     }
                 }
+                crate::agent::ProgressEvent::RoundUsage { usage } => {
+                    if let Err(e) = tx.send(GatewayEvent::AgentUsage {
+                        session_id: sid.clone(),
+                        agent_id: aid.clone(),
+                        usage,
+                    }) {
+                        debug!("No receivers for AgentUsage event: {}", e);
+                    }
+                }
                 crate::agent::ProgressEvent::Error { message } => {
                     if let Err(e) = tx.send(GatewayEvent::ProcessingError {
                         session_id: sid.clone(),

@@ -70,6 +70,80 @@ fn warn_on_secretless_webhook_channels(config: &GatewayConfig) {
     }
 }
 
+/// Forward delegation task changes from the store's sink channel onto the
+/// gateway event bus as `GatewayEvent::DelegationTaskUpdated`.
+///
+/// The sink carries task ids only; each id is re-read here so the event is
+/// built from the row as it exists now (a burst of writes between sends
+/// collapses into one fresh event). A row whose `parent_session` does not
+/// resolve to a user session — rows written before the column existed, or a
+/// broken chain — is skipped: there is no session to route it to, and legacy
+/// rows are swept to `failed` at startup anyway.
+pub(crate) async fn delegation_event_forwarder(
+    store: Arc<crate::delegation::DelegationTaskStore>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    event_tx: tokio::sync::broadcast::Sender<GatewayEvent>,
+    shutdown_token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                info!("Delegation forwarder received shutdown signal, exiting");
+                break;
+            }
+            changed = rx.recv() => {
+                let Some(task_id) = changed else { break };
+                let task = match store.get_task(&task_id).await {
+                    Ok(Some(task)) => task,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("Failed to re-read delegation task '{}': {}", task_id, e);
+                        continue;
+                    }
+                };
+                let session_id = match store.root_session_for_task(&task_id).await {
+                    Ok(Some(sid)) => sid,
+                    Ok(None) => {
+                        debug!(
+                            "Delegation task '{}' has no root user session; not forwarded",
+                            task_id
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Failed to resolve root session for '{}': {}", task_id, e);
+                        continue;
+                    }
+                };
+                let event = crate::gateway::GatewayEvent::DelegationTaskUpdated {
+                    session_id,
+                    task: crate::delegation::DelegationTaskSnapshot::from_task(
+                        &task,
+                        delegation_duration_ms(&task),
+                    ),
+                };
+                if let Err(e) = event_tx.send(event) {
+                    debug!("No receivers for DelegationTaskUpdated event: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// `completed_at − created_at` in milliseconds when the task is terminal.
+/// Unparseable timestamps yield `None` — never a silent zero, which would
+/// read as "finished instantly".
+fn delegation_duration_ms(task: &crate::delegation::DelegationTask) -> Option<u64> {
+    let created = chrono::DateTime::parse_from_rfc3339(&task.created_at).ok()?;
+    let completed = chrono::DateTime::parse_from_rfc3339(task.completed_at.as_deref()?).ok()?;
+    let ms = (completed - created).num_milliseconds();
+    if ms < 0 {
+        None
+    } else {
+        Some(ms as u64)
+    }
+}
+
 /// Start the gateway and all its subsystems.
 pub(crate) async fn start_gateway(
     state: Arc<GatewayState>,
@@ -296,7 +370,16 @@ pub(crate) async fn start_gateway(
 
         let db_url =
             format!("sqlite://{}", state.paths.data_dir().join("delegations.db").display());
-        let delegation_store = Arc::new(DelegationTaskStore::new(&db_url).await?);
+        // Task changes travel store → sink channel → forwarder → gateway event
+        // bus → WS clients. The sink carries task ids only; the forwarder
+        // re-reads each row so events always carry fresh data.
+        let (deleg_tx, deleg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let delegation_store = Arc::new(
+            DelegationTaskStore::new(&db_url)
+                .await?
+                .with_event_sink(deleg_tx),
+        );
+        let delegation_store_for_forwarder = delegation_store.clone();
         // Sweep rows left in-flight by a previous process: they belong to
         // executions that died with it and would otherwise read as "running"
         // forever.
@@ -357,6 +440,23 @@ pub(crate) async fn start_gateway(
             .registry
             .register_dynamic(Arc::new(delegate.with_coordinator(coordinator)));
         info!("DelegateTool registered with agent resolver for target_agent routing");
+
+        // Push delegation task changes onto the gateway event bus so WS
+        // clients (TUI, web) can render live task rows.
+        {
+            let event_tx = state.events.tx.clone();
+            let shutdown_token = shutdown_token.clone();
+            let handle = tokio::spawn(delegation_event_forwarder(
+                delegation_store_for_forwarder,
+                deleg_rx,
+                event_tx,
+                shutdown_token,
+            ));
+            state
+                .task_registry
+                .insert_join("delegation_event_forwarder", handle)
+                .await;
+        }
     }
 
     // Auto-connect MCP servers (non-blocking — HTTP listener starts immediately)
@@ -1087,6 +1187,93 @@ mod tests {
                 .any(|n| n.starts_with("mcp__ghost__")),
             "no MCP tools should be registered without a connected client"
         );
+    }
+
+    /// The store's event sink reaches WS clients as `DelegationTaskUpdated`
+    /// carrying the ROOT USER session — that routing is the whole point of
+    /// the `parent_session` column, so the forwarder is exercised end to end.
+    #[tokio::test]
+    async fn delegation_forwarder_publishes_task_updates_with_the_root_session() {
+        let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let store = Arc::new(
+            crate::delegation::DelegationTaskStore::new("sqlite::memory:")
+                .await
+                .expect("store")
+                .with_event_sink(sink_tx),
+        );
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(16);
+        let shutdown = CancellationToken::new();
+
+        let forwarder = tokio::spawn(delegation_event_forwarder(
+            store.clone(),
+            sink_rx,
+            event_tx,
+            shutdown.clone(),
+        ));
+
+        // A depth-2 child whose parent_session names the parent run: the
+        // resolution must climb to the parent row's user session.
+        store
+            .create_task(crate::delegation::NewTask {
+                id: "parent",
+                root_id: "root",
+                parent_id: None,
+                depth: 1,
+                agent_id: "manager",
+                title: "Plan",
+                parent_session: Some("user-session"),
+            })
+            .await
+            .unwrap();
+        store
+            .create_task(crate::delegation::NewTask {
+                id: "child",
+                root_id: "root",
+                parent_id: Some("parent"),
+                depth: 2,
+                agent_id: "worker",
+                title: "Do",
+                parent_session: Some("delegation:parent"),
+            })
+            .await
+            .unwrap();
+
+        let event = event_rx.recv().await.expect("first event");
+        match event {
+            GatewayEvent::DelegationTaskUpdated { session_id, task } => {
+                assert_eq!(task.task_id, "parent");
+                assert_eq!(session_id, "user-session");
+                assert_eq!(task.status, "running");
+                assert_eq!(task.duration_ms, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let event = event_rx.recv().await.expect("second event");
+        match event {
+            GatewayEvent::DelegationTaskUpdated { session_id, task } => {
+                assert_eq!(task.task_id, "child");
+                assert_eq!(
+                    session_id, "user-session",
+                    "the delegated child resolves to the root user session"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // Terminal status carries the computed duration.
+        store.set_status("child", "completed").await.unwrap();
+        let event = event_rx.recv().await.expect("third event");
+        match event {
+            GatewayEvent::DelegationTaskUpdated { task, .. } => {
+                assert_eq!(task.status, "completed");
+                assert!(task.duration_ms.is_some(), "terminal rows carry a duration");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        shutdown.cancel();
+        forwarder.await.expect("forwarder exits on shutdown");
     }
 }
 

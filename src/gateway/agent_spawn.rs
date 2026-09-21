@@ -805,6 +805,16 @@ async fn process_message_direct(
                         },
                     );
                 }
+                crate::agent::ProgressEvent::RoundUsage { usage } => {
+                    emit_event(
+                        &tx,
+                        super::GatewayEvent::AgentUsage {
+                            session_id: sid.clone(),
+                            agent_id: aid.clone(),
+                            usage,
+                        },
+                    );
+                }
                 crate::agent::ProgressEvent::Error { message } => {
                     emit_event(
                         &tx,

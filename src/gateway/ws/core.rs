@@ -378,7 +378,9 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         | E::AcpSpawned { session_id, .. }
         | E::AcpCompleted { session_id, .. }
         | E::AcpStatusChanged { session_id, .. }
-        | E::AcpRecovered { session_id, .. } => session(session_id),
+        | E::AcpRecovered { session_id, .. }
+        | E::AgentUsage { session_id, .. }
+        | E::DelegationTaskUpdated { session_id, .. } => session(session_id),
         E::AskRequired(e) => session(&e.session_id),
         E::AskResolved(e) => session(&e.session_id),
 
@@ -1578,6 +1580,37 @@ mod tests {
                 session_id: "s1".into(),
                 agent_id: "default".into(),
                 content: Some("t".into()),
+            },
+            // Per-round usage and delegation rows both belong to the session
+            // the client is subscribed to — for delegation that is the tree's
+            // ROOT USER session, never the child's `delegation:<run_id>`.
+            E::AgentUsage {
+                session_id: "s1".into(),
+                agent_id: "default".into(),
+                usage: crate::providers::Usage::default(),
+            },
+            E::DelegationTaskUpdated {
+                session_id: "s1".into(),
+                task: crate::delegation::DelegationTaskSnapshot::from_task(
+                    &crate::delegation::DelegationTask {
+                        id: "run-1".into(),
+                        root_id: "root-1".into(),
+                        parent_id: None,
+                        depth: 1,
+                        agent_id: "a".into(),
+                        title: "t".into(),
+                        status: "running".into(),
+                        state_json: "{}".into(),
+                        artifacts: vec![],
+                        events: vec![],
+                        created_at: "2026-01-01T00:00:00+00:00".into(),
+                        updated_at: "2026-01-01T00:00:00+00:00".into(),
+                        completed_at: None,
+                        parent_session: Some("s1".into()),
+                        usage_tokens: 0,
+                    },
+                    None,
+                ),
             },
         ];
         for event in session_events {

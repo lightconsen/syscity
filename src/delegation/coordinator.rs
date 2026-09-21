@@ -178,6 +178,9 @@ impl DelegationCoordinator {
         let registry = self.registry.clone();
         let resolver = self.resolver.clone();
         let default_agent = self.default_agent.clone();
+        // Cloned outside the spawn closure: the closure outlives this method
+        // and must not borrow `handoff`.
+        let successor_parent_session = handoff.parent_session.clone();
 
         let run_id = self
             .registry
@@ -191,6 +194,7 @@ impl DelegationCoordinator {
                 let resolver = Arc::clone(&resolver);
                 let default_agent = default_agent.clone();
                 let target = target.clone();
+                let successor_parent_session = successor_parent_session.clone();
                 move |run_id, _task_str| {
                     let mut scope = scope_base.clone();
                     scope.task_id = run_id.clone();
@@ -221,6 +225,12 @@ impl DelegationCoordinator {
                                 agent_id: target,
                                 coordinator: Some(coordinator),
                                 wake: None,
+                                // Lineage for push events: the successor
+                                // inherits the handing-off task's session, so
+                                // its row resolves to the same root user
+                                // session (the registry's own parent key above
+                                // is wake-keying only and must not be recorded).
+                                parent_session: successor_parent_session,
                             },
                         )
                         .await;
@@ -342,6 +352,7 @@ mod tests {
                 depth: 1,
                 agent_id: "manager",
                 title: "T",
+                parent_session: None,
             })
             .await
             .unwrap();
@@ -361,6 +372,7 @@ mod tests {
                 depth: 1,
                 agent_id: "manager",
                 title: "T",
+                parent_session: None,
             })
             .await
             .unwrap();
@@ -388,6 +400,7 @@ mod tests {
                 depth: 1,
                 agent_id: "manager",
                 title: "Original task",
+                parent_session: None,
             })
             .await
             .unwrap();
@@ -419,5 +432,52 @@ mod tests {
         let runs = registry.runs_for_session("run-1").await;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].target_agent, "worker");
+    }
+
+    /// The successor's row inherits the handing-off task's `parent_session`,
+    /// so its events resolve to the same root user session. The registry's
+    /// own parent key (the handing-off task's id) is wake-keying only and
+    /// must not be recorded as lineage.
+    #[tokio::test]
+    async fn test_successor_copies_the_handoff_row_parent_session() {
+        let agent = mock_agent();
+        let resolver: Arc<dyn AgentResolver> = Arc::new(FakeResolver { agent: Some(agent) });
+        let (store, _registry, coordinator) = setup(resolver).await;
+        store
+            .create_task(NewTask {
+                id: "run-1",
+                root_id: "root-1",
+                parent_id: None,
+                depth: 1,
+                agent_id: "manager",
+                title: "Original task",
+                parent_session: Some("user-session"),
+            })
+            .await
+            .unwrap();
+        store
+            .set_handoff("run-1", "worker", "finish the parser")
+            .await
+            .unwrap();
+
+        let successor = coordinator
+            .maybe_advance("root-1")
+            .await
+            .unwrap()
+            .expect("successor spawned");
+
+        let succ = wait_for_task(&store, &successor).await;
+        assert_eq!(
+            succ.parent_session.as_deref(),
+            Some("user-session"),
+            "lineage rides the handing-off row, not the registry's wake key"
+        );
+        // Fresh successor work has not spent any tokens yet.
+        assert_eq!(succ.usage_tokens, 0);
+        // And it resolves through the same chain the forwarder uses.
+        assert_eq!(
+            store.root_session_for_task(&succ.id).await.unwrap(),
+            Some("user-session".to_string())
+        );
     }
 }

@@ -958,6 +958,38 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
                 "cancelled": e.cancelled,
             }),
         )),
+        GatewayEvent::AgentUsage { session_id, agent_id, usage } => Some((
+            "agent.usage".to_string(),
+            serde_json::json!({
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "usage": {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                    "cache_creation_tokens": usage.cache_creation_tokens,
+                },
+            }),
+        )),
+        GatewayEvent::DelegationTaskUpdated { session_id, task } => Some((
+            "delegation.updated".to_string(),
+            serde_json::json!({
+                "session_id": session_id,
+                "task_id": task.task_id,
+                "root_id": task.root_id,
+                "parent_id": task.parent_id,
+                "depth": task.depth,
+                "agent_id": task.agent_id,
+                "title": task.title,
+                "status": task.status,
+                "created_at": task.created_at,
+                "updated_at": task.updated_at,
+                "completed_at": task.completed_at,
+                "usage_tokens": task.usage_tokens,
+                "duration_ms": task.duration_ms,
+            }),
+        )),
     }
 }
 
@@ -1235,6 +1267,63 @@ mod tests {
         assert_eq!(name, "ask.resolved");
         assert_eq!(payload["ask_id"], "ask-1");
         assert_eq!(payload["cancelled"], true);
+    }
+
+    #[test]
+    fn test_agent_usage_mapping() {
+        let event = crate::gateway::GatewayEvent::AgentUsage {
+            session_id: "s1".to_string(),
+            agent_id: "secretary".to_string(),
+            usage: crate::providers::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                x_credits_used: Some(5),
+                x_credit_balance: Some(100),
+            },
+        };
+        let (name, payload) = gateway_event_to_ws(&event).expect("mapped event");
+        assert_eq!(name, "agent.usage");
+        assert_eq!(payload["session_id"], "s1");
+        assert_eq!(payload["agent_id"], "secretary");
+        assert_eq!(payload["usage"]["total_tokens"], 150);
+        assert_eq!(payload["usage"]["prompt_tokens"], 100);
+        // Credits are metered on chat.final, not per round.
+        assert!(payload["usage"].get("credits_used").is_none());
+    }
+
+    #[test]
+    fn test_delegation_updated_mapping() {
+        let snapshot = crate::delegation::DelegationTaskSnapshot {
+            task_id: "run-1".to_string(),
+            root_id: "root-1".to_string(),
+            parent_id: None,
+            depth: 1,
+            agent_id: "researcher".to_string(),
+            title: "scan docs".to_string(),
+            status: "running".to_string(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+            updated_at: "2026-01-01T00:01:00+00:00".to_string(),
+            completed_at: None,
+            usage_tokens: 3400,
+            duration_ms: None,
+        };
+        let event = crate::gateway::GatewayEvent::DelegationTaskUpdated {
+            session_id: "s1".to_string(),
+            task: snapshot,
+        };
+        let (name, payload) = gateway_event_to_ws(&event).expect("mapped event");
+        assert_eq!(name, "delegation.updated");
+        assert_eq!(payload["session_id"], "s1", "the gate reads this field");
+        assert_eq!(payload["task_id"], "run-1");
+        assert_eq!(payload["agent_id"], "researcher");
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["usage_tokens"], 3400);
+        // A running row has no duration; the field is present and null.
+        assert_eq!(payload["duration_ms"], serde_json::Value::Null);
+        assert_eq!(payload["completed_at"], serde_json::Value::Null);
     }
 
     #[test]
