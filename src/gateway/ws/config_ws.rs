@@ -45,6 +45,13 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
             "tui": {
                 "theme": config.tui.theme,
             },
+            "permissions": {
+                "mode": config.permissions.mode,
+                "allow_bypass": config.permissions.allow_bypass,
+                "allow": config.permissions.allow,
+                "deny": config.permissions.deny,
+                "ask": config.permissions.ask,
+            },
             "search": {
                 "provider": config.search.provider,
                 "providers": config.search.providers,
@@ -326,6 +333,63 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
                 }
             }
         }
+        "permissions.mode" => {
+            match crate::tools::PermissionMode::parse(params.value.as_str().unwrap_or_default()) {
+                Some(mode) => config.permissions.mode = mode,
+                None => {
+                    return WsResponse::err(
+                        &req.id,
+                        "INVALID_PARAMS",
+                        "Expected one of \"default\", \"accept_edits\", \"plan\" or \"bypass\"",
+                    )
+                }
+            }
+        }
+        "permissions.allow_bypass" => match params.value.as_bool() {
+            Some(flag) => config.permissions.allow_bypass = flag,
+            None => return WsResponse::err(&req.id, "INVALID_PARAMS", "Expected a boolean"),
+        },
+        "permissions.allow" | "permissions.deny" | "permissions.ask" => {
+            let list = match &params.value {
+                serde_json::Value::Array(items) => items,
+                _ => {
+                    return WsResponse::err(
+                        &req.id,
+                        "INVALID_PARAMS",
+                        "Expected an array of rules, each \"tool\" or \"tool:glob\"",
+                    )
+                }
+            };
+            let mut rules = Vec::with_capacity(list.len());
+            for item in list {
+                let Some(rule) = item.as_str() else {
+                    return WsResponse::err(
+                        &req.id,
+                        "INVALID_PARAMS",
+                        "Every rule must be a string: \"tool\" or \"tool:glob\"",
+                    );
+                };
+                let trimmed = rule.trim();
+                let valid = !trimmed.is_empty()
+                    && trimmed
+                        .split_once(':')
+                        .map(|(name, glob)| !name.is_empty() && !glob.is_empty())
+                        .unwrap_or(true);
+                if !valid {
+                    return WsResponse::err(
+                        &req.id,
+                        "INVALID_PARAMS",
+                        format!("Malformed rule \"{trimmed}\": use \"tool\" or \"tool:glob\""),
+                    );
+                }
+                rules.push(trimmed.to_string());
+            }
+            match params.path.as_str() {
+                "permissions.allow" => config.permissions.allow = rules,
+                "permissions.deny" => config.permissions.deny = rules,
+                _ => config.permissions.ask = rules,
+            }
+        }
         "search.provider" => {
             if let Some(v) = params.value.as_str() {
                 config.search.provider = v.to_string();
@@ -402,6 +466,12 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
         }
     }
     let new_revision = crate::gateway::config_revision(&config_guard);
+    let permissions_changed = params.path.starts_with("permissions.");
+    let updated_permissions = if permissions_changed {
+        Some(config_guard.permissions.clone())
+    } else {
+        None
+    };
     drop(config_guard);
 
     // Push the recomputed effective config to running agents so the change
@@ -411,6 +481,11 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     }
     if push_default_agent {
         push_default_agent_update(state).await;
+    }
+    // The permission gate reads the shared runtime, not the config snapshot —
+    // make the change effective on the very next tool call.
+    if let Some(permissions) = updated_permissions {
+        state.tools.registry.permissions().reload(&permissions);
     }
 
     WsResponse::ok(
@@ -573,6 +648,88 @@ mod tests {
         assert!(p["auth_mode"].as_str().is_some());
         assert!(p["tui"]["theme"].as_str().is_some());
         assert!(p["search"]["provider"].as_str().is_some());
+        assert!(p["permissions"]["mode"].as_str().is_some());
+        assert!(p["permissions"]["allow"].is_array());
+        assert!(p["permissions"]["allow_bypass"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn config_set_permissions_mode_roundtrip_and_rejects_junk() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res = set_and_ok(&state, "permissions.mode", serde_json::json!("plan")).await;
+        assert!(res.ok, "plan must set: {:?}", res.error);
+        assert_eq!(state.config.read().await.permissions.mode, crate::tools::PermissionMode::Plan);
+        // The shared runtime sees it too — the gate is effective immediately.
+        assert_eq!(
+            state
+                .tools
+                .registry
+                .permissions()
+                .effective_mode("any-session"),
+            crate::tools::PermissionMode::Plan
+        );
+
+        let res = handle_config_get(&req("g", "config.get", serde_json::json!({})), &state).await;
+        assert_eq!(res.payload.expect("payload")["permissions"]["mode"].as_str(), Some("plan"));
+
+        // Junk is rejected with the four values named, prior value intact.
+        let res = set_and_ok(&state, "permissions.mode", serde_json::json!("neon")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert!(res
+            .error
+            .as_ref()
+            .map(|e| e.message.contains("bypass"))
+            .unwrap_or(false));
+        assert_eq!(
+            state.config.read().await.permissions.mode,
+            crate::tools::PermissionMode::Plan,
+            "the reject must leave the previous value intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_permissions_rules_replace_and_validate() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res = set_and_ok(
+            &state,
+            "permissions.allow",
+            serde_json::json!(["grep", "shell:git status*"]),
+        )
+        .await;
+        assert!(res.ok, "rules must set: {:?}", res.error);
+        assert_eq!(
+            state.config.read().await.permissions.allow,
+            vec!["grep".to_string(), "shell:git status*".to_string()]
+        );
+        assert_eq!(
+            state.tools.registry.permissions().config_projection().allow,
+            vec!["grep".to_string(), "shell:git status*".to_string()],
+            "the runtime must reload after the write"
+        );
+
+        // Malformed rules are refused whole, not applied partially.
+        let res =
+            set_and_ok(&state, "permissions.deny", serde_json::json!(["shell", "shell:"])).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert!(state.config.read().await.permissions.deny.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_set_permissions_allow_bypass_is_a_bool() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let res = set_and_ok(&state, "permissions.allow_bypass", serde_json::json!(true)).await;
+        assert!(res.ok);
+        assert!(state.config.read().await.permissions.allow_bypass);
+        assert!(state.tools.registry.permissions().allow_bypass());
+
+        let res = set_and_ok(&state, "permissions.allow_bypass", serde_json::json!("yes")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert!(state.config.read().await.permissions.allow_bypass);
     }
 
     #[tokio::test]

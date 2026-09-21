@@ -960,6 +960,8 @@ pub(crate) struct ToolRegistryArgs {
     pub tool_hooks: crate::tools::hooks::ToolHooks,
     /// Secret-store instance handle shared with the gateway (cloud tools).
     pub secrets: Arc<crate::secrets::SecretStoreHandle>,
+    /// Shared permission runtime seeded from `[permissions]` config.
+    pub permissions: Arc<crate::tools::PermissionsRuntime>,
     /// Layout root shared with the gateway.
     pub paths: Arc<crate::dirs::SyscityPaths>,
 }
@@ -988,13 +990,15 @@ pub(crate) async fn create_default_tool_registry(
         tool_hooks,
         secrets,
         paths,
+        permissions,
     } = args;
 
     let mut registry = ToolRegistry::new()
         .with_approval_queue(approval_queue)
         .with_ask_queue(ask_queue)
         .with_audit_log(audit_log)
-        .with_hooks(tool_hooks);
+        .with_hooks(tool_hooks)
+        .with_permissions(permissions);
     if let Some(filter) = content_filter {
         registry = registry.with_content_filter(filter);
     }

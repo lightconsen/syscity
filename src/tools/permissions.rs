@@ -136,6 +136,33 @@ pub fn rules_match(rules: &[String], tool: &str, primary: Option<&str>) -> bool 
     })
 }
 
+/// The allow rule a remembered approval ("yes, don't ask again") becomes.
+///
+/// Command- and URL-shaped calls remember the approved invocation and
+/// anything that extends it (`"shell:git status*"`); the file writers
+/// remember the parent directory (`"file_write:/workspace/*"`), because a
+/// follow-up write to the same directory is the useful unit while an exact
+/// path is useless for the next file; every other tool remembers just its
+/// name.
+pub fn remember_rule(tool: &str, args: &Value) -> String {
+    let primary = primary_invocation_arg(tool, args);
+    match tool {
+        "shell" | "process" | "execute_code" | "web_fetch" => primary
+            .map(|arg| format!("{tool}:{arg}*"))
+            .unwrap_or_else(|| tool.to_string()),
+        "file_write" | "file_edit" | "apply_patch" => primary
+            .map(|arg| {
+                let dir = std::path::Path::new(&arg)
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(arg);
+                format!("{tool}:{dir}/*")
+            })
+            .unwrap_or_else(|| tool.to_string()),
+        _ => tool.to_string(),
+    }
+}
+
 /// What the gate consults: config defaults plus the per-session overrides.
 #[derive(Debug, Clone)]
 struct Snapshot {

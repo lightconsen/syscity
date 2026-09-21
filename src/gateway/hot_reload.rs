@@ -453,7 +453,17 @@ pub(crate) async fn register_hot_reload_handlers(
                     config.mcp = new_config.mcp;
                     config.hot_reload = new_config.hot_reload;
                     config.search = new_config.search;
+                    let permissions_changed = config.permissions != new_config.permissions;
+                    if permissions_changed {
+                        config.permissions = new_config.permissions.clone();
+                    }
                     drop(config_guard);
+                    // The permission gate reads the shared runtime — reload it
+                    // here so a file edit takes effect without a restart.
+                    if permissions_changed {
+                        let updated = state.config.read().await.permissions.clone();
+                        state.tools.registry.permissions().reload(&updated);
+                    }
                     info!(
                         "✅ Applied gateway config updates (security, providers, mcp, search \
                          settings)"

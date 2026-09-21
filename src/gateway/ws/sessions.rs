@@ -291,6 +291,67 @@ pub(super) async fn handle_sessions_set_model(
     WsResponse::ok(&req.id, serde_json::json!({ "status": "ok" }))
 }
 
+/// `sessions.set_mode {session_id, mode}` — set this conversation's
+/// permission-mode override. The override is deliberately ephemeral: it dies
+/// with the daemon, and the gateway falls back to the configured
+/// `[permissions].mode` default. `bypass` is refused unless the config
+/// turned `[permissions].allow_bypass` on.
+pub(super) async fn handle_sessions_set_mode(
+    req: &WsRequest,
+    _conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct SetModeParams {
+        session_id: String,
+        mode: String,
+    }
+
+    let params: SetModeParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+
+    let Some(mode) = crate::tools::PermissionMode::parse(&params.mode) else {
+        return WsResponse::err(
+            &req.id,
+            "INVALID_PARAMS",
+            "unknown mode; expected default|accept_edits|plan|bypass",
+        );
+    };
+    if mode == crate::tools::PermissionMode::Bypass
+        && !state.tools.registry.permissions().allow_bypass()
+    {
+        return WsResponse::err(
+            &req.id,
+            "BYPASS_DISABLED",
+            "bypass requires [permissions].allow_bypass = true in gateway config",
+        );
+    }
+
+    state
+        .tools
+        .registry
+        .permissions()
+        .set_session_mode(&params.session_id, Some(mode));
+
+    if let Err(e) = state.events.tx.send(GatewayEvent::SessionModeChanged {
+        session_id: params.session_id.clone(),
+        mode: mode.as_str().to_string(),
+    }) {
+        tracing::debug!("No receivers for SessionModeChanged event: {}", e);
+    }
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "status": "ok",
+            "session_id": params.session_id,
+            "mode": mode.as_str(),
+        }),
+    )
+}
+
 pub(super) async fn handle_sessions_reset(
     req: &WsRequest,
     _conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
@@ -812,5 +873,106 @@ mod tests {
             .and_then(|s| s.as_array().cloned())
             .unwrap_or_default();
         assert!(sessions.is_empty());
+    }
+    #[tokio::test]
+    async fn set_mode_updates_the_runtime_and_emits_the_event() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let mut rx = state.events.tx.subscribe();
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_set_mode(
+            &req(
+                "m",
+                "sessions.set_mode",
+                serde_json::json!({ "session_id": "s1", "mode": "plan" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(res.ok, "set_mode must succeed: {:?}", res.error);
+        assert_eq!(res.payload.expect("payload")["mode"].as_str(), Some("plan"));
+        assert_eq!(
+            state.tools.registry.permissions().effective_mode("s1"),
+            crate::tools::PermissionMode::Plan,
+            "the session override reaches the gate's runtime"
+        );
+
+        // The wire event names the session and the mode.
+        match rx.recv().await.expect("event") {
+            GatewayEvent::SessionModeChanged { session_id, mode } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(mode, "plan");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mode_rejects_an_unknown_mode() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+        let res = handle_sessions_set_mode(
+            &req(
+                "m",
+                "sessions.set_mode",
+                serde_json::json!({ "session_id": "s1", "mode": "neon" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert_eq!(
+            state.tools.registry.permissions().effective_mode("s1"),
+            crate::tools::PermissionMode::Default,
+            "the reject must not touch the runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_mode_bypass_is_refused_until_the_config_flag_turns_on() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        async fn call_bypass(state: &Arc<GatewayState>) -> WsResponse {
+            handle_sessions_set_mode(
+                &req(
+                    "m",
+                    "sessions.set_mode",
+                    serde_json::json!({ "session_id": "s1", "mode": "bypass" }),
+                ),
+                &make_test_conn(&["write"]),
+                state,
+            )
+            .await
+        }
+
+        let res = call_bypass(&state).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("BYPASS_DISABLED"));
+        assert_eq!(
+            state.tools.registry.permissions().effective_mode("s1"),
+            crate::tools::PermissionMode::Default,
+            "a refused bypass must not land in the runtime"
+        );
+
+        // Flip the config flag (through the typed arm, which also reloads the
+        // runtime) and the same call succeeds.
+        let res = super::config_ws::handle_config_set(
+            &req(
+                "c",
+                "config.set",
+                serde_json::json!({ "path": "permissions.allow_bypass", "value": true }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(res.ok, "allow_bypass must set: {:?}", res.error);
+        let res = call_bypass(&state).await;
+        assert!(res.ok, "bypass works once the flag is on: {:?}", res.error);
+        assert_eq!(
+            state.tools.registry.permissions().effective_mode("s1"),
+            crate::tools::PermissionMode::Bypass
+        );
     }
 }

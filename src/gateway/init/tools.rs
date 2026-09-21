@@ -276,6 +276,9 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
     ));
     let approval_queue = Arc::new(ApprovalQueue::new());
     let ask_queue = Arc::new(AskQueue::new());
+    // The permission gate's shared runtime: config defaults now, session
+    // overrides and `permissions.*` config writes later.
+    let permissions = Arc::new(crate::tools::PermissionsRuntime::from_config(&config.permissions));
     let memory_manager_holder: Arc<RwLock<Option<Arc<MemoryManager>>>> =
         Arc::new(RwLock::new(None));
 
@@ -299,6 +302,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 tool_hooks: shell_hooks.tool_hooks(),
                 secrets: secrets.clone(),
                 paths: paths.clone(),
+                permissions,
             },
         )
         .await?,

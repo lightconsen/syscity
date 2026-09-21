@@ -378,6 +378,7 @@ pub fn method_scope(method: &str) -> Option<&'static str> {
         | "sessions.rename"
         | "sessions.set_pinned"
         | "sessions.set_model"
+        | "sessions.set_mode"
         | "sessions.reset"
         | "sessions.subscribe"
         | "sessions.unsubscribe"
@@ -781,6 +782,13 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
             serde_json::json!({
                 "session_id": session_id,
                 "model": model,
+            }),
+        )),
+        GatewayEvent::SessionModeChanged { session_id, mode } => Some((
+            "session.mode_changed".to_string(),
+            serde_json::json!({
+                "session_id": session_id,
+                "mode": mode,
             }),
         )),
         GatewayEvent::AcpSpawned {

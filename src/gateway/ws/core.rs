@@ -374,6 +374,7 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         | E::SessionRenamed { session_id, .. }
         | E::SessionPinned { session_id, .. }
         | E::SessionModelChanged { session_id, .. }
+        | E::SessionModeChanged { session_id, .. }
         | E::AcpSpawned { session_id, .. }
         | E::AcpCompleted { session_id, .. }
         | E::AcpStatusChanged { session_id, .. }
@@ -915,6 +916,7 @@ async fn dispatch_method(
         "sessions.rename" => sessions::handle_sessions_rename(req, conn, state).await,
         "sessions.set_pinned" => sessions::handle_sessions_set_pinned(req, conn, state).await,
         "sessions.set_model" => sessions::handle_sessions_set_model(req, conn, state).await,
+        "sessions.set_mode" => sessions::handle_sessions_set_mode(req, conn, state).await,
         "sessions.reset" => sessions::handle_sessions_reset(req, conn, state).await,
         "sessions.subscribe" => sessions::handle_sessions_subscribe(req, conn, cmd_tx).await,
         "sessions.unsubscribe" => sessions::handle_sessions_unsubscribe(req, conn, cmd_tx).await,

@@ -180,6 +180,8 @@ pub enum GatewayEvent {
         session_id: String,
         model: Option<String>,
     },
+    /// The session's permission mode override changed (see `sessions.set_mode`)
+    SessionModeChanged { session_id: String, mode: String },
     /// ACP subagent spawned
     AcpSpawned {
         session_id: String,

@@ -217,6 +217,101 @@ async fn approvals_submit_then_deny_with_reason() {
     assert_eq!(payload["reason"], "Not authorized");
 }
 
+/// "Yes, don't ask again": the approval resolves, a rule lands in config and
+/// in the gate's runtime, and remembering the same call twice dedupes.
+#[tokio::test]
+async fn approvals_approve_with_remember_appends_one_rule() {
+    let state = state().await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let pa = crate::tools::approval::PendingApproval::new(
+        "app-1",
+        "shell",
+        serde_json::json!({ "command": "git status" }),
+        "alice",
+    )
+    .with_risk_level(crate::tools::approval::RiskLevel::High)
+    .with_message("Run shell")
+    .with_response_tx(tx);
+    state.tools.approval_queue.submit(pa).await;
+
+    let resp = handle_approvals_approve(
+        &req(
+            "r1",
+            "approvals.approve",
+            Some(serde_json::json!({ "id": "app-1", "remember": true })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(resp.ok, "approve failed: {:?}", resp.error);
+    let payload = resp.payload.as_ref().unwrap();
+    assert_eq!(payload["status"], "approved");
+    assert_eq!(payload["remembered_rule"].as_str(), Some("shell:git status*"));
+
+    // The rule is live in the gate and recorded in config.
+    assert_eq!(
+        state.config.read().await.permissions.allow,
+        vec!["shell:git status*".to_string()]
+    );
+    assert_eq!(
+        state.tools.registry.permissions().config_projection().allow,
+        vec!["shell:git status*".to_string()]
+    );
+    // The suspended tool saw the approval.
+    assert_eq!(rx.await.expect("resolution"), crate::tools::approval::ApprovalDecision::Approve);
+
+    // A second remember of the identical call dedupes: no new rule.
+    let (tx2, _rx2) = tokio::sync::oneshot::channel();
+    let pa2 = crate::tools::approval::PendingApproval::new(
+        "app-2",
+        "shell",
+        serde_json::json!({ "command": "git status" }),
+        "alice",
+    )
+    .with_response_tx(tx2);
+    state.tools.approval_queue.submit(pa2).await;
+    let resp = handle_approvals_approve(
+        &req(
+            "r2",
+            "approvals.approve",
+            Some(serde_json::json!({ "id": "app-2", "remember": true })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(resp.ok);
+    assert_eq!(
+        resp.payload.as_ref().unwrap()["remembered_rule"],
+        serde_json::Value::Null,
+        "an existing rule is not reported as new"
+    );
+    assert_eq!(state.config.read().await.permissions.allow.len(), 1);
+}
+
+/// Plain `approvals.approve` (no `remember`) behaves exactly as before.
+#[tokio::test]
+async fn approvals_approve_without_remember_writes_no_rule() {
+    let state = state().await;
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let pa = crate::tools::approval::PendingApproval::new(
+        "app-1",
+        "shell",
+        serde_json::json!({ "command": "ls" }),
+        "alice",
+    )
+    .with_response_tx(tx);
+    state.tools.approval_queue.submit(pa).await;
+
+    let resp = handle_approvals_approve(
+        &req("r1", "approvals.approve", Some(serde_json::json!({ "id": "app-1" }))),
+        &state,
+    )
+    .await;
+    assert!(resp.ok);
+    assert_eq!(resp.payload.as_ref().unwrap()["remembered_rule"], serde_json::Value::Null);
+    assert!(state.config.read().await.permissions.allow.is_empty());
+}
+
 #[tokio::test]
 async fn memory_search_unavailable_without_vector() {
     let state = state().await;

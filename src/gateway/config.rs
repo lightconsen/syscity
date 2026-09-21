@@ -134,6 +134,12 @@ pub struct GatewayConfig {
     /// restore its theme on next launch and share it across machines.
     #[serde(default)]
     pub tui: TuiConfig,
+    /// Claude-Code-style tool permissions: default mode, the bypass flag,
+    /// and allow/deny/ask rules. The registry's gate consults this before
+    /// every tool call; `permissions.*` config arms and the session mode
+    /// override update the shared runtime live.
+    #[serde(default)]
+    pub permissions: crate::tools::PermissionsConfig,
 }
 
 /// Which palette the TUI should render with. `Auto` asks the terminal (an
@@ -1453,6 +1459,7 @@ impl Default for GatewayConfig {
             update: UpdateConfig::default(),
             eval: EvalConfig::default(),
             tui: TuiConfig::default(),
+            permissions: crate::tools::PermissionsConfig::default(),
         }
     }
 }
