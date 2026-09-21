@@ -663,21 +663,6 @@ pub struct CapabilitiesConfig {
     /// Explicitly disable specific set IDs regardless of profile
     #[serde(default)]
     pub disabled_sets: Vec<String>,
-    /// Default minimum role required to invoke tools.
-    #[serde(default)]
-    pub default_required_role: Option<crate::tools::rbac::Role>,
-    /// Default maximum tool risk level allowed.
-    #[serde(default)]
-    pub default_max_risk_level: Option<crate::tools::approval::RiskLevel>,
-    /// Tool names denied by default across all users.
-    #[serde(default)]
-    pub denied_tools: Vec<String>,
-    /// Tool names allowed by default (empty = all allowed).
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
-    /// Tool categories allowed by default (empty = all allowed).
-    #[serde(default)]
-    pub allowed_categories: Vec<String>,
 }
 
 fn default_capability_profile() -> String {
@@ -695,11 +680,6 @@ impl Default for CapabilitiesConfig {
             custom_sets: Vec::new(),
             max_scope: default_capability_max_scope(),
             disabled_sets: Vec::new(),
-            default_required_role: None,
-            default_max_risk_level: None,
-            denied_tools: Vec::new(),
-            allowed_tools: Vec::new(),
-            allowed_categories: Vec::new(),
         }
     }
 }

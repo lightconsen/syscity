@@ -475,7 +475,6 @@ mod tests {
             "requested_at": "2026-09-15T12:00:00Z",
             "requested_by": "secretary",
             "risk_level": "High",
-            "approval_level": "Single",
             "message": "write a file outside the workspace",
             "age_seconds": 3
         });

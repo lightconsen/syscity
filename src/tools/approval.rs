@@ -46,21 +46,6 @@ impl RiskLevel {
     }
 }
 
-/// Who can approve a tool execution request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalLevel {
-    /// The requesting user / conversation participant can approve.
-    #[serde(alias = "ask")]
-    Ask = 0,
-    /// A host or room admin must approve.
-    #[serde(alias = "host")]
-    Host = 1,
-    /// Security-critical — needs designated security approval.
-    #[serde(alias = "security")]
-    Security = 2,
-}
-
 /// Decision from human reviewer
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
@@ -85,8 +70,6 @@ pub struct PendingApproval {
     pub requested_by: String,
     /// Risk level assessment
     pub risk_level: RiskLevel,
-    /// Approval level (who can approve)
-    pub approval_level: ApprovalLevel,
     /// Human-readable message explaining the request
     pub message: String,
     /// The conversation the tool call belongs to, when known — the gateway
@@ -99,8 +82,7 @@ pub struct PendingApproval {
 
 impl PendingApproval {
     /// Create a new pending approval with defaults; chain the `with_*`
-    /// builders to set risk/approval level, message, and the response
-    /// channel.
+    /// builders to set risk level, message, and the response channel.
     pub fn new(
         id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -114,7 +96,6 @@ impl PendingApproval {
             requested_at: Instant::now(),
             requested_by: requested_by.into(),
             risk_level: RiskLevel::Medium,
-            approval_level: ApprovalLevel::Ask,
             message: String::new(),
             session_id: None,
             response_tx: None,
@@ -124,12 +105,6 @@ impl PendingApproval {
     /// Set the risk level assessment.
     pub fn with_risk_level(mut self, risk_level: RiskLevel) -> Self {
         self.risk_level = risk_level;
-        self
-    }
-
-    /// Set who can approve.
-    pub fn with_approval_level(mut self, approval_level: ApprovalLevel) -> Self {
-        self.approval_level = approval_level;
         self
     }
 
@@ -167,7 +142,6 @@ pub struct PendingApprovalSummary {
     pub requested_at: chrono::DateTime<chrono::Utc>,
     pub requested_by: String,
     pub risk_level: RiskLevel,
-    pub approval_level: ApprovalLevel,
     pub message: String,
     /// The conversation that raised it, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,7 +159,6 @@ impl From<&PendingApproval> for PendingApprovalSummary {
                 + chrono::Duration::from_std(pa.requested_at.elapsed()).unwrap_or_default(),
             requested_by: pa.requested_by.clone(),
             risk_level: pa.risk_level,
-            approval_level: pa.approval_level,
             message: pa.message.clone(),
             session_id: pa.session_id.clone(),
             age_seconds: pa.age().as_secs(),
@@ -200,7 +173,6 @@ pub struct ApprovalRequiredEvent {
     pub tool_name: String,
     pub requested_by: String,
     pub risk_level: RiskLevel,
-    pub approval_level: ApprovalLevel,
     pub message: String,
     /// The conversation that raised it; `None` reaches every client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,7 +183,6 @@ pub struct ApprovalRequiredEvent {
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalFilter {
     pub min_risk_level: Option<RiskLevel>,
-    pub min_approval_level: Option<ApprovalLevel>,
     pub tool_name: Option<String>,
     pub requested_by: Option<String>,
     pub max_age: Option<Duration>,
@@ -225,8 +196,6 @@ pub struct ApprovalQueue {
     pub event_tx: broadcast::Sender<ApprovalRequiredEvent>,
     /// Default timeout for approvals
     pub default_timeout: Duration,
-    /// Default approval level
-    pub default_approval_level: ApprovalLevel,
 }
 
 impl ApprovalQueue {
@@ -237,7 +206,6 @@ impl ApprovalQueue {
             pending: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             default_timeout: Duration::from_secs(300), // 5 minutes
-            default_approval_level: ApprovalLevel::Ask,
         }
     }
 
@@ -252,7 +220,6 @@ impl ApprovalQueue {
             tool_name: approval.tool_name.clone(),
             requested_by: approval.requested_by.clone(),
             risk_level: approval.risk_level,
-            approval_level: approval.approval_level,
             message: approval.message.clone(),
             session_id: approval.session_id.clone(),
         };
@@ -325,11 +292,6 @@ impl ApprovalQueue {
             .filter(|pa| {
                 if let Some(min_risk) = filter.min_risk_level {
                     if pa.risk_level < min_risk {
-                        return false;
-                    }
-                }
-                if let Some(min_al) = filter.min_approval_level {
-                    if pa.approval_level < min_al {
                         return false;
                     }
                 }
@@ -474,7 +436,6 @@ mod tests {
             "user123",
         )
         .with_risk_level(RiskLevel::High)
-        .with_approval_level(ApprovalLevel::Ask)
         .with_message("Shell command requires approval")
         .with_response_tx(tx);
 
@@ -504,7 +465,6 @@ mod tests {
             "user456",
         )
         .with_risk_level(RiskLevel::Critical)
-        .with_approval_level(ApprovalLevel::Ask)
         .with_message("File deletion requires approval")
         .with_response_tx(tx);
 
@@ -547,7 +507,6 @@ mod tests {
             } else {
                 RiskLevel::Medium
             })
-            .with_approval_level(ApprovalLevel::Ask)
             .with_message("Test")
             .with_response_tx(tx);
             queue.submit(approval).await;
@@ -584,7 +543,6 @@ mod tests {
             .submit(
                 PendingApproval::new("a1", "tool", serde_json::json!({}), "user1")
                     .with_risk_level(RiskLevel::Low)
-                    .with_approval_level(ApprovalLevel::Ask)
                     .with_message("Test")
                     .with_response_tx(tx1),
             )
@@ -594,7 +552,6 @@ mod tests {
             .submit(
                 PendingApproval::new("a2", "tool", serde_json::json!({}), "user2")
                     .with_risk_level(RiskLevel::Low)
-                    .with_approval_level(ApprovalLevel::Ask)
                     .with_message("Test")
                     .with_response_tx(tx2),
             )
@@ -641,7 +598,6 @@ mod tests {
             .submit(
                 PendingApproval::new("g1", "tool", serde_json::json!({}), "user")
                     .with_risk_level(RiskLevel::Low)
-                    .with_approval_level(ApprovalLevel::Ask)
                     .with_message("msg")
                     .with_response_tx(tx),
             )
@@ -664,7 +620,6 @@ mod tests {
             .submit(
                 PendingApproval::new("id1", "t1", serde_json::json!({}), "u")
                     .with_risk_level(RiskLevel::Low)
-                    .with_approval_level(ApprovalLevel::Ask)
                     .with_message("m")
                     .with_response_tx(tx),
             )
@@ -685,7 +640,6 @@ mod tests {
             .submit(
                 PendingApproval::new("e1", "t", serde_json::json!({}), "u")
                     .with_risk_level(RiskLevel::Low)
-                    .with_approval_level(ApprovalLevel::Ask)
                     .with_message("m")
                     .with_response_tx(tx),
             )
@@ -715,7 +669,6 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         let pa = PendingApproval::new("a1", "tool", serde_json::json!({}), "user")
             .with_risk_level(RiskLevel::Low)
-            .with_approval_level(ApprovalLevel::Ask)
             .with_message("test")
             .with_response_tx(tx);
         // Age should be very small since just created
@@ -729,7 +682,6 @@ mod tests {
             tool_name: "shell".to_string(),
             requested_by: "user".to_string(),
             risk_level: RiskLevel::High,
-            approval_level: ApprovalLevel::Ask,
             message: "Approve?".to_string(),
             session_id: None,
         };
@@ -747,7 +699,6 @@ mod tests {
             .submit(
                 PendingApproval::new("d1", "tool", serde_json::json!({}), "user")
                     .with_risk_level(RiskLevel::Low)
-                    .with_approval_level(ApprovalLevel::Ask)
                     .with_message("test")
                     .with_response_tx(tx),
             )

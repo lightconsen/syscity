@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::tools::approval::{ApprovalLevel, RiskLevel};
+use crate::tools::approval::RiskLevel;
 use crate::tools::hooks::{PolicyHookFn, ToolPolicyDecision};
 use crate::tools::ToolContext;
 
@@ -339,7 +339,6 @@ pub fn shell_safety_policy(safe_bins: SafeBinList) -> PolicyHookFn {
                     tool_name: name,
                     args,
                     risk_level: RiskLevel::High,
-                    approval_level: ApprovalLevel::Host,
                     requested_by: "system".into(),
                     message: format!("Shell command requires host approval: {}", command),
                 },

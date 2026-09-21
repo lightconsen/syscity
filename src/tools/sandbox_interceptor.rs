@@ -390,7 +390,6 @@ impl SandboxInterceptor {
                         tool_name: name.to_string(),
                         args: args.clone(),
                         risk_level: super::RiskLevel::High,
-                        approval_level: super::ApprovalLevel::Ask,
                         requested_by: "sandbox_interceptor".to_string(),
                         message: format!("Sensitive content detected ({}): {}", kind, detail),
                     }

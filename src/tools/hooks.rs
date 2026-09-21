@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use super::{ApprovalLevel, RiskLevel, ToolContext, ToolExecutionResult};
+use super::{RiskLevel, ToolContext, ToolExecutionResult};
 
 // ── Policy decision
 // ───────────────────────────────────────────────────────────
@@ -57,8 +57,6 @@ pub enum ToolPolicyDecision {
         args: Value,
         /// Risk level assessment
         risk_level: RiskLevel,
-        /// Approval level (who can approve)
-        approval_level: ApprovalLevel,
         /// User or agent that requested the tool
         requested_by: String,
         /// Human-readable explanation for why approval is needed
@@ -568,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_policy_hook_needs_approval() {
-        use super::super::{ApprovalLevel, RiskLevel};
+        use super::super::RiskLevel;
 
         let hooks = ToolHooks::new().policy(|name, _args, _ctx| {
             let name = name.to_string();
@@ -579,7 +577,6 @@ mod tests {
                         tool_name: name.clone(),
                         args: serde_json::json!({}),
                         risk_level: RiskLevel::High,
-                        approval_level: ApprovalLevel::Ask,
                         requested_by: "user1".into(),
                         message: format!("Shell command requires approval: {}", name),
                     }
@@ -615,7 +612,6 @@ mod tests {
                     tool_name: "shell".into(),
                     args: serde_json::json!({}),
                     risk_level: RiskLevel::High,
-                    approval_level: ApprovalLevel::Ask,
                     requested_by: "user".into(),
                     message: "Approval required".into(),
                 }

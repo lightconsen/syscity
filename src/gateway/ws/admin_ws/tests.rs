@@ -194,7 +194,6 @@ async fn approvals_submit_then_deny_with_reason() {
         "alice",
     )
     .with_risk_level(crate::tools::approval::RiskLevel::High)
-    .with_approval_level(crate::tools::approval::ApprovalLevel::Ask)
     .with_message("Run bash")
     .with_response_tx(tx);
     state.tools.approval_queue.submit(pa).await;

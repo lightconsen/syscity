@@ -8,22 +8,17 @@ pub mod approval;
 pub mod ask_user;
 pub mod eval;
 pub mod metadata;
-pub mod rbac;
 pub mod target_lock;
 
 // Re-export approval types for convenience
 pub use approval::{
-    ApprovalDecision, ApprovalFilter, ApprovalLevel, ApprovalQueue, ApprovalRequiredEvent,
-    PendingApproval, PendingApprovalSummary, RiskLevel,
+    ApprovalDecision, ApprovalFilter, ApprovalQueue, ApprovalRequiredEvent, PendingApproval,
+    PendingApprovalSummary, RiskLevel,
 };
 // Re-export ask_user types for convenience
 pub use ask_user::{
     background_context_reason, AskEvent, AskQueue, AskRequest, AskRequiredEvent, AskResolvedEvent,
     AskUserTool, PendingQuestion,
-};
-// Re-export RBAC types for convenience
-pub use rbac::{
-    ModelCapabilities, PolicyEvaluationContext, Role, SandboxPolicy, ToolPolicy, UserContext,
 };
 // Re-export tool metadata for convenience
 pub use metadata::ToolDescriptionMeta;
@@ -485,129 +480,8 @@ mod tests {
         assert!(community.contains(&"read".to_string()), "Community context should see read");
     }
 
-    // ── RBAC policy tests ────────────────────────────────────────────────────
-
-    struct HighRiskTool;
-
-    #[async_trait]
-    impl Tool for HighRiskTool {
-        fn name(&self) -> &str {
-            "high_risk"
-        }
-
-        fn description(&self) -> &str {
-            "A high-risk tool"
-        }
-
-        fn parameters_schema(&self) -> Value {
-            create_schema(
-                "A high-risk tool",
-                serde_json::json!({"x": {"type": "string"}}),
-                vec!["x"],
-            )
-        }
-
-        fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
-            crate::tools::sdk::ToolCapabilities {
-                risk_level: crate::tools::approval::RiskLevel::High,
-                categories: vec!["system".to_string()],
-                ..Default::default()
-            }
-        }
-
-        async fn execute(
-            &self,
-            _args: Value,
-            _ctx: &ToolContext,
-        ) -> crate::Result<ToolExecutionResult> {
-            Ok(ToolExecutionResult::success("ok"))
-        }
-    }
-
     #[test]
-    fn test_rbac_policy_denies_by_name() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ShellTool::new()));
-        registry.register(Box::new(ReadTool));
-
-        let policy = crate::tools::rbac::ToolPolicy {
-            denied_tools: vec!["shell".to_string()],
-            ..Default::default()
-        };
-        let ctx = ToolContext::new("user", "conv1")
-            .with_user_context(crate::tools::rbac::UserContext::owner())
-            .with_tool_policy(policy);
-
-        let available: Vec<String> = registry
-            .get_available(&ctx)
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
-
-        assert!(!available.contains(&"shell".to_string()));
-        assert!(available.contains(&"read".to_string()));
-    }
-
-    #[test]
-    fn test_rbac_policy_denies_by_role() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ShellTool::new()));
-
-        let policy = crate::tools::rbac::ToolPolicy {
-            required_role: crate::tools::rbac::Role::Admin,
-            ..Default::default()
-        };
-        let admin_ctx = ToolContext::new("admin", "conv1")
-            .with_user_context(crate::tools::rbac::UserContext {
-                roles: vec![crate::tools::rbac::Role::Admin],
-                ..Default::default()
-            })
-            .with_tool_policy(policy.clone());
-        let user_ctx = ToolContext::new("user", "conv1")
-            .with_user_context(crate::tools::rbac::UserContext::user())
-            .with_tool_policy(policy);
-
-        let admin_available: Vec<String> = registry
-            .get_available(&admin_ctx)
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
-        let user_available: Vec<String> = registry
-            .get_available(&user_ctx)
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
-
-        assert!(admin_available.contains(&"shell".to_string()));
-        assert!(!user_available.contains(&"shell".to_string()));
-    }
-
-    #[test]
-    fn test_rbac_policy_denies_by_risk_level() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(HighRiskTool));
-        registry.register(Box::new(ReadTool));
-
-        let policy = crate::tools::rbac::ToolPolicy {
-            max_risk_level: Some(crate::tools::approval::RiskLevel::Medium),
-            ..Default::default()
-        };
-        let ctx = ToolContext::new("user", "conv1")
-            .with_user_context(crate::tools::rbac::UserContext::owner())
-            .with_tool_policy(policy);
-
-        let available: Vec<String> = registry
-            .get_available(&ctx)
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
-
-        assert!(!available.contains(&"high_risk".to_string()));
-        assert!(available.contains(&"read".to_string()));
-    }
-
-    #[test]
-    fn test_rbac_skill_trust_backward_compatible() {
+    fn test_skill_trust_backward_compatible() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ShellTool::new()));
         registry.register(Box::new(ReadTool));

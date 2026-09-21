@@ -6,10 +6,9 @@ Capabilities the AI assistant can use to interact with the world.
 
 - **`Tool` trait** — `name()`, `description()`, `parameters_schema()`, `execute(args, context)`
 - **`ToolRegistry`** — Registration, lookup, execution with caching, circuit breaker, and trust-level filtering
-- **`ToolContext`** — Execution context grouped into `identity` (user/conversation/sender/RBAC), `sandbox` (working dir, limits, workspace root, `agent_workspace`, sandbox policy), and `model` (provider/model gating, skill trust, tool policy), plus optional `delegation` scope and `ask_queue` handles
+- **`ToolContext`** — Execution context grouped into `identity` (user/conversation/sender), `sandbox` (working dir, limits, workspace root, `agent_workspace`), and `model` (provider/model name, skill trust), plus optional `delegation` scope and `ask_queue` handles
 - **`ToolRegistrar`** — Validation-aware registration with name, schema, and security validators
 - **`ApprovalQueue`** — Human-in-the-loop approval system with risk levels
-- **`RBAC`** — Role-based access control with `Role`, `UserContext`, `ToolPolicy`, `SandboxPolicy`
 
 ### Built-in Tools
 
@@ -69,7 +68,6 @@ Capabilities the AI assistant can use to interact with the world.
 - **Approval queue** — Human-in-the-loop for high-risk tools with `RiskLevel` classification. The announcement is scoped to the conversation that raised it (`PendingApproval.session_id` → `approval.required` routes to that session's subscribers; no conversation means broadcast). This scopes the *prompt*, not the *decision*: any client holding the `write` scope can still answer any pending approval — the premise is a single operator, and owner-checked decisions are deferred until a second identity can connect (see tui.md).
 - **Circuit breaker** — Tools disabled after 3 consecutive failures
 - **Privilege filtering** — Privileged tools hidden when `skill_trust == Community`
-- **Fine-grained RBAC** — Role-based tool access via `Role`, `UserContext`, and `ToolPolicy` with deny/allow lists, required role, max risk level, and category filtering. Evaluated in `ToolRegistry::is_excluded()`. See `src/tools/rbac.rs`.
 - **Content filtering** — Secret scanning and PII detection in tool outputs via `ContentFilter`
 - **Retry declaration** — `ToolCapabilities` carries `idempotent` and `compensation`, because a tool call whose outcome is unknown (a timeout) is exactly when a caller decides whether to try again, and only the tool knows. The default is the careful one — *not* idempotent, no compensation — so a tool that says nothing is never assumed safe to repeat; reads (`file_read`, `grep`, …) declare `idempotent: true`, the file writers name the undo they support ("write the content you read back"), and the one-way ones (`shell`, `send_message`, `delegate`, `mcp__*`) say so explicitly. `ToolRegistry::uncertainty_note` quotes the declaration on the timeout path. There is no rollback machinery for side effects, and the declaration exists so nothing pretends there is.
 
@@ -101,8 +99,6 @@ pub struct ToolIdentity {
     pub user_id: String,
     pub conversation_id: String,
     pub sender_id: Option<String>,
-    pub sender_is_owner: bool,
-    pub user_context: Option<UserContext>,
 }
 
 pub struct ToolSandbox {
@@ -161,7 +157,6 @@ pub enum RiskLevel {
 - Approval queue with risk-level-based filtering
 - Circuit breaker for failing tools
 - Skill trust-based privilege filtering
-- Fine-grained RBAC with role, policy, and category filtering
 - MCP client integration with auto-discovery
 - Dynamic tool registration and deregistration
 - Content filtering with secret scanning and PII detection

@@ -192,20 +192,6 @@ impl Agent {
         }
     }
 
-    fn infer_model_vision(&self) -> bool {
-        self.model
-            .as_deref()
-            .map(|m| {
-                let m = m.to_lowercase();
-                m.contains("vision")
-                    || m.contains("claude-3")
-                    || m.contains("gpt-4o")
-                    || m.contains("gemini-pro-vision")
-                    || m.contains("llava")
-            })
-            .unwrap_or(false)
-    }
-
     /// Build a ToolContext pre-configured with workspace settings from agent
     /// config.
     ///
@@ -223,12 +209,6 @@ impl Agent {
 
         let cfg = self.config_snapshot();
 
-        let model_capabilities = crate::tools::ModelCapabilities {
-            has_vision: self.infer_model_vision(),
-            supports_tool_use: self.provider.supports_tools(),
-            max_context_length: None,
-        };
-
         let agent_workspace = cfg.resolve_workspace_dir(&self.paths);
 
         let mut ctx = ToolContext::new(user_id.clone(), conversation_id)
@@ -239,8 +219,7 @@ impl Agent {
             .with_workspace_only(cfg.workspace_only)
             .with_model_name(self.model.clone().unwrap_or_default())
             .with_provider_name(self.provider.name().to_string())
-            .with_sender_id(user_id)
-            .with_model_capabilities(model_capabilities);
+            .with_sender_id(user_id);
 
         // A delegated child operates inside its delegation tree's shared
         // workspace: relative file paths resolve into this task's scratch dir,

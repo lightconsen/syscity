@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{AskQueue, ModelCapabilities, SandboxPolicy, ToolPolicy, UserContext};
+use super::AskQueue;
 use crate::providers::{FunctionDefinition, ToolResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
@@ -48,10 +48,6 @@ pub struct ToolIdentity {
     pub conversation_id: String,
     /// Identifier of the sender/user that triggered the invocation.
     pub sender_id: Option<String>,
-    /// Whether the sender is the system owner.
-    pub sender_is_owner: bool,
-    /// Optional per-user RBAC context.
-    pub user_context: Option<UserContext>,
 }
 
 /// Sandbox / execution environment: where and how the tool runs.
@@ -90,8 +86,6 @@ pub struct ToolSandbox {
     pub agent_workspace: Option<std::path::PathBuf>,
     /// When true, file operations are restricted to `workspace_root`.
     pub workspace_only: bool,
-    /// Optional sandbox policy applied to tool execution.
-    pub sandbox_policy: Option<SandboxPolicy>,
     /// Optional allowlist of plugin tool prefixes/names.
     pub plugin_allowlist: Option<Vec<String>>,
 }
@@ -113,25 +107,20 @@ impl Default for ToolSandbox {
             workspace_root: None,
             agent_workspace: None,
             workspace_only: true,
-            sandbox_policy: None,
             plugin_allowlist: None,
         }
     }
 }
 
-/// Model / policy metadata: capabilities and access control.
+/// Model metadata carried on the context for gating decisions.
 #[derive(Debug, Clone)]
 pub struct ToolModel {
     /// Name of the LLM model driving the current invocation.
     pub model_name: Option<String>,
     /// Name of the LLM provider driving the current invocation.
     pub provider_name: Option<String>,
-    /// Capabilities of the current model (vision, tool use, etc.).
-    pub model_capabilities: ModelCapabilities,
     /// Minimum trust level from active skills.
     pub skill_trust: SkillTrust,
-    /// Optional per-context RBAC policy.
-    pub tool_policy: Option<ToolPolicy>,
 }
 
 impl Default for ToolModel {
@@ -139,9 +128,7 @@ impl Default for ToolModel {
         Self {
             model_name: None,
             provider_name: None,
-            model_capabilities: ModelCapabilities::default(),
             skill_trust: SkillTrust::Trusted,
-            tool_policy: None,
         }
     }
 }
@@ -236,9 +223,6 @@ impl ToolContext {
     pub fn process_limit(&self) -> Option<u64> {
         self.sandbox.process_limit
     }
-    pub fn sandbox_policy(&self) -> Option<&SandboxPolicy> {
-        self.sandbox.sandbox_policy.as_ref()
-    }
     pub fn plugin_allowlist(&self) -> Option<&[String]> {
         self.sandbox.plugin_allowlist.as_deref()
     }
@@ -280,18 +264,6 @@ impl ToolContext {
         self
     }
 
-    /// Set the RBAC user context for policy evaluation.
-    pub fn with_user_context(mut self, ctx: UserContext) -> Self {
-        self.identity.user_context = Some(ctx);
-        self
-    }
-
-    /// Set the RBAC policy applied to this context.
-    pub fn with_tool_policy(mut self, policy: ToolPolicy) -> Self {
-        self.model.tool_policy = Some(policy);
-        self
-    }
-
     /// Set the model name for model-based tool gating.
     pub fn with_model_name(mut self, model: impl Into<String>) -> Self {
         self.model.model_name = Some(model.into());
@@ -311,20 +283,10 @@ impl ToolContext {
     }
 
     /// Mark the sender as the system owner.
-    pub fn with_sender_is_owner(mut self, is_owner: bool) -> Self {
-        self.identity.sender_is_owner = is_owner;
-        self
-    }
 
     /// Set an allowlist of plugin tool prefixes/names.
     pub fn with_plugin_allowlist(mut self, allowlist: Vec<String>) -> Self {
         self.sandbox.plugin_allowlist = Some(allowlist);
-        self
-    }
-
-    /// Set the model capabilities for model-based tool gating.
-    pub fn with_model_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
-        self.model.model_capabilities = capabilities;
         self
     }
 
@@ -337,12 +299,6 @@ impl ToolContext {
     /// Attach the ask queue so `ask_user` can suspend for a human answer.
     pub fn with_ask_queue(mut self, queue: Arc<AskQueue>) -> Self {
         self.ask_queue = Some(queue);
-        self
-    }
-
-    /// Set the sandbox policy applied to tool execution.
-    pub fn with_sandbox_policy(mut self, policy: SandboxPolicy) -> Self {
-        self.sandbox.sandbox_policy = Some(policy);
         self
     }
 

@@ -9,9 +9,9 @@ use tracing::{info, warn};
 
 use super::util::consume_stream;
 use super::{
-    ApprovalDecision, ApprovalQueue, AskQueue, BoxedTool, PendingApproval, PolicyEvaluationContext,
-    PostExecuteDecision, SharedTool, SkillTrust, Tool, ToolContext, ToolExecutionChunk,
-    ToolExecutionResult, ToolHooks, ToolPolicyDecision,
+    ApprovalDecision, ApprovalQueue, AskQueue, BoxedTool, PendingApproval, PostExecuteDecision,
+    SharedTool, SkillTrust, Tool, ToolContext, ToolExecutionChunk, ToolExecutionResult, ToolHooks,
+    ToolPolicyDecision,
 };
 use crate::providers::{FunctionCall, FunctionDefinition};
 
@@ -288,8 +288,8 @@ impl ToolRegistry {
     }
 
     /// Returns `true` if the tool should be excluded from availability checks,
-    /// considering blocked prefixes, circuit-breaker state, trust level,
-    /// plugin allowlists, and any RBAC/gating policy attached to the context.
+    /// considering blocked prefixes, circuit-breaker state, trust level, and
+    /// plugin allowlists.
     fn is_excluded(&self, name: &str, context: &ToolContext) -> bool {
         if self.is_blocked(name) {
             return true;
@@ -303,7 +303,6 @@ impl ToolRegistry {
 
         // Determine registration provenance for source gating.
         let is_dynamic = self.is_dynamic_tool(name);
-        let is_mcp = name.starts_with("mcp__");
 
         // Plugin allowlist at the context level (runtime restriction).
         if is_dynamic && Self::is_plugin_like_name(name) {
@@ -317,33 +316,6 @@ impl ToolRegistry {
             }
         }
 
-        // Sandbox policy: require sandboxed tools.
-        if let Some(sandbox_policy) = context.sandbox_policy() {
-            if sandbox_policy.require_sandboxed {
-                let caps = self.tool_capabilities(name);
-                if !caps.sandboxed {
-                    return true;
-                }
-            }
-        }
-
-        if let (Some(user_ctx), Some(policy)) = (&context.user_context, &context.model.tool_policy)
-        {
-            let capabilities = self.tool_capabilities(name);
-            let eval_ctx = PolicyEvaluationContext {
-                model_name: context.model.model_name.clone(),
-                provider_name: context.model.provider_name.clone(),
-                sender_id: context.sender_id.clone(),
-                sender_is_owner: context.sender_is_owner,
-                plugin_allowlist: context.plugin_allowlist().map(|s| s.to_vec()),
-                model_capabilities: context.model.model_capabilities.clone(),
-                is_dynamic,
-                is_mcp,
-            };
-            if !policy.evaluate_with_context(user_ctx, name, &capabilities, &eval_ctx) {
-                return true;
-            }
-        }
         false
     }
 
@@ -904,7 +876,6 @@ impl ToolRegistry {
             tool_name: name.to_string(),
             args: args.clone(),
             risk_level: crate::tools::approval::RiskLevel::High,
-            approval_level: crate::tools::approval::ApprovalLevel::Ask,
             requested_by: "system".to_string(),
             message: format!("Tool '{}' requires approval", name),
         }
@@ -1008,7 +979,6 @@ impl ToolRegistry {
                 tool_name,
                 args: approval_args,
                 risk_level,
-                approval_level,
                 requested_by,
                 message,
             } => {
@@ -1029,7 +999,6 @@ impl ToolRegistry {
                 let approval =
                     PendingApproval::new(&approval_id, &tool_name, approval_args, requested_by)
                         .with_risk_level(risk_level)
-                        .with_approval_level(approval_level)
                         .with_message(message)
                         .with_session(Some(context.conversation_id.clone()))
                         .with_response_tx(tx);
@@ -2033,7 +2002,6 @@ mod tests {
                             tool_name: name,
                             args: serde_json::json!({}),
                             risk_level: crate::tools::approval::RiskLevel::High,
-                            approval_level: crate::tools::approval::ApprovalLevel::Ask,
                             requested_by: "user1".into(),
                             message: "needs approval".into(),
                         }
@@ -2075,7 +2043,6 @@ mod tests {
                     tool_name: "spy".into(),
                     args: serde_json::json!({}),
                     risk_level: crate::tools::approval::RiskLevel::High,
-                    approval_level: crate::tools::approval::ApprovalLevel::Ask,
                     requested_by: "user1".into(),
                     message: "needs approval".into(),
                 }

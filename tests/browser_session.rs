@@ -30,8 +30,6 @@ fn tool_context() -> ToolContext {
             user_id: "e2e".to_string(),
             conversation_id: "e2e".to_string(),
             sender_id: None,
-            sender_is_owner: true,
-            user_context: None,
         },
         sandbox: ToolSandbox::default(),
         model: ToolModel::default(),

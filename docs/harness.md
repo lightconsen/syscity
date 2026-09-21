@@ -67,7 +67,7 @@ Design goals that shape every decision in this document:
    ▼                  ▼              ▼                 ▼                    ▼
 ┌────────────┐   ┌────────────┐ ┌──────────────┐  ┌─────────────┐   ┌─────────────┐
 │ tools 40+  │   │ memory     │ │ model routing│  │ sandbox/security│ │ reflection │
-│ shell      │   │ vector+FTS │ │ cost-aware   │  │ rbac        │   │ retrospect  │
+│ shell      │   │ vector+FTS │ │ cost-aware   │  │ command_gate│   │ retrospect  │
 │ browser    │   │ dreaming   │ │ fallback     │  │ shell_safety│   │ critic      │
 │ file/grep  │   │ session    │ │ circuit-brk  │  │ sandbox     │   │ trajectory  │
 │ computer…  │   │            │ │ quota/class  │  │ command_gate│   │             │

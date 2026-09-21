@@ -83,7 +83,6 @@ pub mod webchat;
 pub mod wechatmp;
 
 pub mod acp_bridge;
-pub mod authorization;
 pub mod command_gate;
 pub mod envelope;
 pub mod extension;

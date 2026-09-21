@@ -25,7 +25,7 @@ use crate::hooks::executor::{
 };
 use crate::hooks::matcher::matching_hooks;
 use crate::security::runtime_audit::{AuditEventType, AuditLogger};
-use crate::tools::approval::{ApprovalLevel, RiskLevel};
+use crate::tools::approval::RiskLevel;
 use crate::tools::hooks::{PostExecuteDecision, ToolHooks, ToolPolicyDecision};
 use crate::tools::{ToolContext, ToolExecutionResult};
 
@@ -163,7 +163,6 @@ impl ShellHookBridge {
                 tool_name: name.to_string(),
                 args: args.clone(),
                 risk_level: RiskLevel::High,
-                approval_level: ApprovalLevel::Ask,
                 requested_by: ctx.user_id.clone(),
                 message: reason,
             },
