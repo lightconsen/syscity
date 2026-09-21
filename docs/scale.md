@@ -171,50 +171,46 @@ B 方案"像重写"的构成大致是：
 
 ## 8. 不做路线 B 也值得做的任务（Backlog）
 
-这些任务的**本地理由各自独立**（真 bug / 测试密闭 / 审计正确 / 运维灵活），不依赖"将来要做多租户"。按优先级排列；每项都标注了**触发条件**——不到触发条件就不做，避免 speculative generality。
+这些任务的**本地理由各自独立**（真 bug / 测试密闭 / 审计正确 / 运维灵活），不依赖"将来要做多租户"。每项都标注了**触发条件**——不到触发条件就不做，避免 speculative generality。
 
-| # | 任务 | 本地理由（与多租户无关） | 成本 | 触发条件 |
-|---|---|---|---|---|
-| **T1** | 会话与设备配对持久化 | 真 bug：重启即丢登录态与配对 | 小 | **已满足，立做** |
-| **T2** | 贯穿请求生命周期的 RequestContext | 审计 `actor` 准确、按用户限流、测试可注入 | 中 | **已满足，排期** |
-| **T3** | 路径显式化（注入 root，替代隐式全局 home） | 测试密闭性：不再污染真实 `~/.syscity` | 中偏大（机械） | 测试开始互相干扰时 |
-| **T4** | SecretStore / MasterKey 去全局单例 | 多实例嵌入、测试隔离 | 中（安全敏感） | 出现"一进程多实例"或并发隔离需求 |
-| **T5** | 存储接缝接线（VectorStore 可切 pgvector） | 托管/规模化时的运维灵活性与集中备份 | 小（接线）｜大（运维） | 需要集中存储/HA/横向扩展时 |
+> **状态更新（2026-09-21）**：T1–T4 已实施完毕（commit 见下），T5 未实施且**明确不实施**——
+> 驱动条件（集中存储 / HA / 横向扩展）未出现，保持"非必需不要开"。本节留作已实施记录与
+> 路线 A 的遗留事实；再次动这里的前提是路线 B 的触发条件真的出现。
 
-### T1｜会话与设备配对持久化
+| # | 任务 | 状态 | 落点 |
+|---|---|---|---|
+| **T1** | 会话与设备配对持久化 | ✅ **已实施** | `AuthStore`（`src/security/auth_store.rs:193` 的 `auth_devices` 表）+ `AuthManager::with_persistence`（`src/security/mod.rs:134`） |
+| **T2** | 贯穿请求生命周期的 RequestContext | ✅ **已实施** | `src/security/request_context.rs`，握手处构造（`src/gateway/ws/core.rs:879`）、审计 actor 来自 context（`src/gateway/ws/acp.rs:666` 有断言测试） |
+| **T3** | 路径显式化（注入 root） | ✅ **主体完成** | `SyscityPaths` 注入式 root（`src/dirs.rs:65`），未安装时 `dirs::paths()` panic；全量 lib 测试前后 `~/.syscity` 条目 diff 一致 |
+| **T4** | SecretStore / MasterKey 去全局单例 | ✅ **已实施** | `SecretStoreHandle`（`src/secrets/store.rs:249`）替代进程级 `OnceLock`，每实例独立 root/master key，经 `GatewayState` 传递 |
+| **T5** | 存储接缝接线（VectorStore 可切 pgvector） | ❌ **未实施，不实施** | `PgVectorStore`（`src/rag/pgvector_store.rs`）仍无运行时接线；两处初始化硬编码 `SqliteVecStore`（`src/gateway/init/storage.rs:86`、`src/gateway/init/services.rs:565`） |
 
-- **现状**：`AuthManager` 的 users/sessions 是纯内存 `HashMap`（`src/security/mod.rs:77,79`），进程重启后全部失效——本地单用户场景下表现为"重启就要重新登录/重新配对"。
-- **改动面**：`src/security/mod.rs`、`src/security/device_pairing.rs`，落盘到既有 sqlite（沿用 `src/agent/session_store/schema.rs` 的迁移机制新增表）。
-- **验收**：重启 gateway 后，已登录会话与已配对设备仍然有效；撤销（revoke）语义与过期时间可控。
-- **注意**：token/配对凭据属敏感信息，落盘需走既有 `SecretStore` 的加密路径（`docs/secret-storage.md`）。
+### T1｜会话与设备配对持久化 ✅
 
-### T2｜贯穿请求生命周期的 RequestContext
+已按原方案落盘到 sqlite（`auth_devices` 等表）；重启后登录态与已配对设备保持有效。
+原"改动面/验收"描述保留在下方作为设计记录。
 
-- **现状**：身份只在 WS 握手处解析一次（`src/gateway/ws/handshake.rs:141` 的 `UserId::new("shared")`），之后散落各处、下游重新推导；审计表的 `actor` 因此不可靠，也无法按用户做配额/限流。
-- **改动面**：`src/gateway/ws/core.rs` 的分发处构造 context → 传入 agent engine → tools → `src/security/persistent_audit.rs` 写入。
-- **验收**：审计记录里的 `actor` 直接来自 context；不同用户/设备有独立的限流与配额计数；单测可直接构造 context 而不必伪造全局 auth。
-- **注意**：热路径 plumbing 会触及较多函数签名，建议一次性完成、避免半途混用两种来源。
+### T2｜贯穿请求生命周期的 RequestContext ✅
 
-### T3｜路径显式化（注入 root）
+`RequestContext`（`src/security/request_context.rs`）在连接上下文构造并贯穿到审计写入；
+审计 `actor` 由测试锁定来自 context 而非重推导。
 
-- **现状**：`src/dirs.rs` 是一组自由函数，隐式读进程全局 home；调用点约 **201** 处（2026-09-10 实测）。好处是布局集中在一个模块，坏处是"隐式"——任何代码路径都可能悄悄写真实 `~/.syscity`，测试必须先设 `SYSCITY_HOME`（进程级、并发时互相干扰）。
-- **改动面**：`src/dirs.rs` + 调用点。**建议渐进**：先包一层访问器（`Paths`/`WorkspaceRoot` 对象），新代码只用访问器，旧调用点按模块逐步迁移。
-- **验收**：测试可在临时目录下完整运行，不再触碰真实 home；去掉对环境变量的依赖。
-- **注意**：**不要**一次性重写 201 处；每迁一个模块都要能独立通过测试。
+### T3｜路径显式化（注入 root）✅（主体完成，残余有意保留）
 
-### T4｜SecretStore / MasterKey 去全局单例
+残余约 67 处生产调用点仍用 `dirs::` 自由函数：约 44 处在 CLI 区与启动前代码（每进程一次
+调用，入口安装 root 后进程级语义正确），其余是"每进程一份"的单例语义（日志文件、turns
+目录、device_id、token 目录等），强行注入反而是错误建模。**这是有意保留，非遗漏**；
+"悄悄写真 home"的原始动机已由 panic-on-uninstalled 从结构上关闭。
 
-- **现状**：`static STORE: OnceLock<Arc<dyn SecretStore>>`（`src/secrets/store.rs:284`）与 `static KEY: OnceLock<Arc<MasterKey>>`（`src/secrets/file_store.rs:348`）使"每实例一份"在设计上不可能；同类还有 `LazyLock` 的各类 cache。
-- **改动面**：挂到已有的 `GatewayState`（`src/gateway/state.rs`）逐层传递——该模式仓库里已有先例，不需要发明新机制。
-- **验收**：同进程内构造两个 `GatewayState`，secrets 与 cache 互不共享（集成测试覆盖）。
-- **注意**：触及加密主密钥的初始化，属安全敏感改动；不做则路线 A（每进程一实例）完全够用。
+### T4｜SecretStore / MasterKey 去全局单例 ✅
 
-### T5｜存储接缝接线（VectorStore 可切 pgvector）
+`SecretStoreHandle` 实例持有全部后端与主密钥，进程内可多实例（测试密闭），单实例行为不变。
 
-- **现状**：`PgVectorStore` 已完整实现（`src/rag/pgvector_store.rs`）却**未接运行时**——运行时在两处硬编码 `SqliteVecStore`（`src/gateway/init/storage.rs:75`、`src/gateway/init/services.rs:542`）。典型"留了缝没缝针"。
-- **改动面**：在初始化处按 config 选择后端，trait 已存在（`VectorStore`）。
-- **验收**：config 切到 Postgres 时服务正常启动并走 `PgVectorStore`；sqlite 仍是默认且行为不变。
-- **注意**：接线本身很小，真正成本在**运维与特性矩阵测试**（`pgvector` 是独立 feature）。本地单人场景 SQLite 更优，**非必需不要开**。
+### T5｜存储接缝接线（VectorStore 可切 pgvector）❌ 不实施
+
+缝已留（`PgVectorStore` 完整实现、trait 存在），针未缝——运行时仍硬编码 `SqliteVecStore`。
+**决策：不接。** 本地单人场景 SQLite 更优；运维成本（pgvector 特性矩阵测试、Postgres
+部署）在出现集中存储/HA 需求前不划算。触发条件出现时接线很小（trait 已存在）。
 
 ### 明确不做的
 
@@ -226,9 +222,8 @@ B 方案"像重写"的构成大致是：
 ## 9. 落地顺序
 
 1. **起步走路线 A**：headless feature profile（仿 `mobile`）+ 每租户独立 `SYSCITY_HOME` + 每租户独立容器，前面加控制面（账户、编排、配额、计量、反代 + TLS）。这条不需要 §8 的任何一项。
-2. **顺路做 T1**（真 bug，成本最小、收益立现）。
-3. **排期 T2**（审计/限流正确性）。
-4. **按触发条件等 T3/T4/T5**：路径显式化、单例 DI 化、pgvector 接线——驱动出现前不做。
+2. **T1–T4 已完成**（2026-09-21，见 §8 状态表）——路径注入、审计 actor、会话持久化、secrets 实例化都已是运行时事实。
+3. **T5 明确不做**：pgvector 接线的触发条件（集中存储/HA）未出现，缝留着、针不缝。
 
 ---
 
@@ -240,9 +235,9 @@ B 方案"像重写"的构成大致是：
 | 全库唯一用户维度 | `src/memory/db.rs:174,202`（`user_id TEXT NOT NULL`） |
 | 全局单 home 与布局 | `src/dirs.rs`（agents / `data/syscity.db`；`SYSCITY_HOME` 覆盖） |
 | 运行时为 SqliteVecStore；PgVectorStore 未接线 | `src/gateway/init/storage.rs:75`、`src/gateway/init/services.rs:542`、`src/rag/pgvector_store.rs`（仅自测引用） |
-| AuthManager 纯内存 | `src/security/mod.rs:77,79` |
+| AuthManager 纯内存（历史；现为 `AuthStore` 持久化） | `src/security/mod.rs`（`with_persistence`）、`src/security/auth_store.rs` |
 | shared / tailscale 单一主体 | `src/gateway/ws/handshake.rs:141,49` |
-| secrets 进程级单例 | `src/secrets/store.rs:284`、`src/secrets/file_store.rs:348` |
+| secrets 曾为进程级单例（现为实例化 `SecretStoreHandle`） | `src/secrets/store.rs:249` |
 | scope 体系与默认拒 | `src/gateway/protocol.rs`（method_scope，兜底 admin） |
 | 审计表无 tenant 列 | `src/security/persistent_audit.rs`（`audit_log`） |
 | 沙箱为白名单 + advisory 网络 | `src/tools/sandbox.rs`（Landlock / AppContainer 仅写围栏） |
