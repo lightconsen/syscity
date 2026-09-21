@@ -120,11 +120,38 @@ fn input_rows(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'static>>
 }
 
 /// `1m 23s` past a minute, bare seconds below it.
-fn format_elapsed(secs: u64) -> String {
+pub(crate) fn format_elapsed(secs: u64) -> String {
     if secs >= 60 {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+/// Compact token count for a status hint: `234`, `1.2k`, `12k`, `340k`, `2.3M`.
+///
+/// Below 10k one decimal keeps the order of magnitude legible; past that the
+/// decimal adds nothing a human reads.
+pub(crate) fn format_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    if tokens < 10_000 {
+        return format!("{:.1}k", tokens as f64 / 1_000.0);
+    }
+    if tokens < 1_000_000 {
+        return format!("{}k", tokens / 1_000);
+    }
+    format!("{:.1}M", tokens as f64 / 1_000_000.0)
+}
+
+/// The phase hint inside the status parenthetical (` · thinking`, …).
+fn phase_suffix(phase: &RunPhase) -> String {
+    match phase {
+        RunPhase::Waiting => String::new(),
+        RunPhase::Thinking => " · thinking".to_string(),
+        RunPhase::Responding => " · responding".to_string(),
+        RunPhase::ToolCall(name) => format!(" · ⚙ {name}"),
     }
 }
 
@@ -147,19 +174,39 @@ fn status_line(state: &AppState, theme: &Theme) -> (Line<'static>, bool) {
         if !spans.is_empty() {
             spans.push(sep());
         }
+        // Compact mode: once a token count or a delegated task row has
+        // something to say, the whimsical word and the esc reminder give up
+        // their columns. The parenthetical is the truth; the word is whimsy,
+        // and the hints only ever appear mid-run (see the 80-column budget
+        // test).
+        let tokens_shown = state.run_tokens.filter(|t| *t > 0);
+        let compact = tokens_shown.is_some() || !state.delegation_tasks.is_empty();
         spans.push(Span::styled(format!("{} ", state.spinner_frame()), theme.spinner_style()));
-        spans.push(Span::styled(format!("{}…", state.spinner_word()), theme.spinner_style()));
-        // The word is whimsy; the parenthetical is the truth.
         let mut detail = format_elapsed(secs);
-        match &state.run_phase {
-            RunPhase::Waiting => {}
-            RunPhase::Thinking => detail.push_str(" · thinking"),
-            RunPhase::Responding => detail.push_str(" · responding"),
-            RunPhase::ToolCall(name) => {
-                detail.push_str(&format!(" · ⚙ {name}"));
-            }
+        detail.push_str(&phase_suffix(&state.run_phase));
+        if let Some(tokens) = tokens_shown {
+            detail.push_str(&format!(" · ↓{}", format_token_count(tokens)));
         }
-        spans.push(Span::styled(format!(" ({detail}) — esc stops"), theme.status_style()));
+        if !state.delegation_tasks.is_empty() {
+            detail.push_str(&format!(" · ↩{}", state.delegation_tasks.len()));
+        }
+        if compact {
+            spans.push(Span::styled(format!(" ({detail})"), theme.status_style()));
+        } else {
+            spans.push(Span::styled(format!("{}…", state.spinner_word()), theme.spinner_style()));
+            spans.push(Span::styled(format!(" ({detail}) — esc stops"), theme.status_style()));
+        }
+    }
+    // Delegated tasks can outlive the turn that spawned them (the parent
+    // finishes its reply while children still run, or a handoff waits). With
+    // the run indicator gone, the count gets its own slot so the hint never
+    // disappears while a task is still active.
+    if state.run_elapsed_secs().is_none() && !state.delegation_tasks.is_empty() {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans
+            .push(Span::styled(format!("↩{}", state.delegation_tasks.len()), theme.status_style()));
     }
     let agent = state
         .current_agent_info()
@@ -405,6 +452,66 @@ fn completion_lines(
     Some(lines)
 }
 
+/// Live rows for delegated tasks: one line per running task, newest visible.
+///
+/// Rendered only when nothing owns the keyboard (no approval, no ask, no
+/// completion list). They take precedence over the stream preview because the
+/// preview is recoverable prose — it lands in scrollback a moment later —
+/// while these rows are the only place running delegations are visible.
+fn task_row_lines(
+    state: &AppState,
+    theme: &Theme,
+    max_rows: usize,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if state.delegation_tasks.is_empty() || max_rows == 0 {
+        return None;
+    }
+    let window = max_rows.min(state.delegation_tasks.len());
+    // When the list outgrows the block, the newest rows win: the finished ones
+    // graduate to the transcript, so only the running tail is unrepresented
+    // anywhere else.
+    let start = state.delegation_tasks.len() - window;
+    let lines = state.delegation_tasks[start..]
+        .iter()
+        .map(|row| {
+            let marker = if row.status == "waiting_handoff" {
+                "⏸"
+            } else {
+                state.spinner_frame()
+            };
+            let agent = state
+                .agents
+                .iter()
+                .find(|a| a.id == row.agent_id)
+                .map(|a| format!("{} {}", a.emoji, a.display_name))
+                .unwrap_or_else(|| row.agent_id.clone());
+            let title: String = {
+                let trimmed = row.title.trim();
+                let chars: String = trimmed.chars().take(48).collect();
+                if trimmed.chars().count() > 48 {
+                    format!("{chars}…")
+                } else {
+                    chars
+                }
+            };
+            let elapsed = row
+                .started
+                .map(|t| format_elapsed(t.elapsed().as_secs()))
+                .unwrap_or_else(|| "0s".to_string());
+            let tokens = if row.usage_tokens > 0 {
+                format!(" · ↓{}", format_token_count(row.usage_tokens))
+            } else {
+                String::new()
+            };
+            let text = format!("↳ {marker} {agent} · {title} · {elapsed}{tokens}");
+            Span::styled(truncate_to_width(&text, width.saturating_sub(2)), theme.status_style())
+        })
+        .map(|span| Line::from(vec![Span::raw("  "), span]))
+        .collect();
+    Some(lines)
+}
+
 /// Render the whole live region.
 pub fn render(f: &mut Frame, state: &AppState) {
     let theme = &state.active_theme;
@@ -418,12 +525,15 @@ pub fn render(f: &mut Frame, state: &AppState) {
 
     // Block area: a blocking prompt takes precedence over the stream preview,
     // and a completion list takes precedence while a `/command` is being
-    // typed — the typist's attention is on the command, not the stream.
+    // typed — the typist's attention is on the command, not the stream. The
+    // delegated-task rows sit under those and above the preview.
     let block_lines = match state.live_mode {
         LiveMode::Approval => approval_lines(state, theme),
         LiveMode::Ask => ask_lines(state, theme),
         LiveMode::Composer => {
-            completion_lines(state, theme, l.block.height as usize, l.block.width as usize)
+            completion_lines(state, theme, l.block.height as usize, l.block.width as usize).or_else(
+                || task_row_lines(state, theme, l.block.height as usize, l.block.width as usize),
+            )
         }
     };
     let block_lines = match block_lines {
@@ -686,6 +796,148 @@ mod tests {
         );
     }
 
+    /// Token counts and the task-row count enter the status row in compact
+    /// mode: the whimsical word and the esc reminder give up their columns,
+    /// and the row still fits 80 with the elapsed time past a minute, a tool
+    /// in flight and the session id at its longest.
+    #[test]
+    fn the_compact_running_row_fits_an_eighty_column_terminal() {
+        let mut state = AppState {
+            connection: ConnectionState::Connected {
+                features: vec![],
+                scopes_granted: vec![],
+                server_version: "0.3.6".into(),
+            },
+            current_session: Some("tui:1234567890abcdef".into()),
+            current_agent: Some("secretary".into()),
+            ..AppState::default()
+        };
+        state.begin_run();
+        state.run_phase = RunPhase::ToolCall("file_read".into());
+        state.run_tokens = Some(1_200);
+        state
+            .delegation_tasks
+            .push(test_row("run-1", "researcher", "running"));
+        state
+            .delegation_tasks
+            .push(test_row("run-2", "writer", "running"));
+        let (line, _) = status_line(&state, &Theme::dark());
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("↓1.2k"), "the token hint: {text}");
+        assert!(text.contains("↩2"), "the task count: {text}");
+        assert!(!text.contains("esc stops"), "compact mode drops the esc reminder: {text}");
+        assert!(
+            UnicodeWidthStr::width(text.as_str()) <= 80,
+            "the compact row is {} columns: {text}",
+            UnicodeWidthStr::width(text.as_str())
+        );
+
+        // Idle again: nothing of the run, and no token count, survives.
+        state.end_run();
+        let (text, _) = status_text(&state, &Theme::dark());
+        assert!(!text.contains("tokens") && !text.contains("↓"), "idle: {text}");
+    }
+
+    /// With the parent turn over but children still running, the task count
+    /// stays visible on its own — the hint must not vanish with the run
+    /// indicator.
+    #[test]
+    fn the_task_count_survives_the_end_of_the_run() {
+        let mut state = AppState {
+            connection: ConnectionState::Connected {
+                features: vec![],
+                scopes_granted: vec![],
+                server_version: "0.3.6".into(),
+            },
+            ..AppState::default()
+        };
+        state.begin_run();
+        state.end_run();
+        state
+            .delegation_tasks
+            .push(test_row("run-1", "researcher", "running"));
+        let (text, _) = status_text(&state, &Theme::dark());
+        assert!(text.contains("↩1"), "the count is still on the row: {text}");
+    }
+
+    /// A helper for task rows the status/row tests share.
+    fn test_row(task_id: &str, agent_id: &str, status: &str) -> crate::tui::state::DelegationRow {
+        crate::tui::state::DelegationRow {
+            task_id: task_id.to_string(),
+            root_id: "root-1".to_string(),
+            agent_id: agent_id.to_string(),
+            title: "Fix the flaky test".to_string(),
+            status: status.to_string(),
+            started: Some(std::time::Instant::now()),
+            usage_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn format_token_count_compacts_each_order_of_magnitude() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(234), "234");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_200), "1.2k");
+        assert_eq!(format_token_count(9_999), "10.0k");
+        assert_eq!(format_token_count(12_000), "12k");
+        assert_eq!(format_token_count(340_000), "340k");
+        assert_eq!(format_token_count(2_300_000), "2.3M");
+    }
+
+    /// One live row per delegated task, windowed to the block height, newest
+    /// last — with the agent label, the title, the elapsed time and the token
+    /// count.
+    #[test]
+    fn task_rows_render_running_waiting_and_windowing() {
+        let mut state = AppState::default();
+        state.agents.push(crate::tui::gateway_calls::AgentInfo {
+            id: "researcher".into(),
+            display_name: "Researcher".into(),
+            emoji: "🔬".into(),
+            ..Default::default()
+        });
+        state
+            .delegation_tasks
+            .push(test_row("run-1", "researcher", "running"));
+        state
+            .delegation_tasks
+            .push(test_row("run-2", "writer", "waiting_handoff"));
+
+        let lines = task_row_lines(&state, &Theme::dark(), 5, 80).expect("rows render");
+        assert_eq!(lines.len(), 2);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            texts[0].contains("🔬 Researcher") && texts[0].contains("Fix the flaky test"),
+            "the agent resolves through the registry: {}",
+            texts[0]
+        );
+        assert!(!texts[0].contains("↓0"), "a zero token count is not shown: {}", texts[0]);
+        assert!(texts[1].contains("⏸"), "a handoff wait is not a spinner: {}", texts[1]);
+
+        // Windowing: the newest rows win when the list outgrows the block.
+        state
+            .delegation_tasks
+            .push(test_row("run-3", "writer", "running"));
+        let lines = task_row_lines(&state, &Theme::dark(), 2, 80).expect("rows render");
+        assert_eq!(lines.len(), 2);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("🔬 Researcher")),
+            "the oldest row scrolled off: {texts:?}"
+        );
+
+        // No rows: the block area falls back to the stream preview.
+        state.delegation_tasks.clear();
+        assert!(task_row_lines(&state, &Theme::dark(), 5, 80).is_none());
+    }
+
     #[test]
     fn status_row_reports_connection_and_session() {
         let mut state = AppState {
@@ -748,6 +1000,18 @@ mod tests {
             terminal
                 .draw(|f| render(f, &state))
                 .unwrap_or_else(|e| panic!("draw failed at {w}x{h}: {e}"));
+
+            // Delegated-task rows render too — a wide CJK title at a tiny
+            // terminal is the case that has to survive truncation.
+            let mut row = test_row("run-1", "研究任务", "running");
+            row.title = "定位沙箱策略的定义并整理边界".to_string();
+            row.usage_tokens = 3_400;
+            state.delegation_tasks.push(row);
+            state.pending_ask = None;
+            state.live_mode = LiveMode::Composer;
+            terminal
+                .draw(|f| render(f, &state))
+                .unwrap_or_else(|e| panic!("draw with task rows failed at {w}x{h}: {e}"));
         }
     }
 }

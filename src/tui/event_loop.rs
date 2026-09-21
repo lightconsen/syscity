@@ -33,7 +33,8 @@ use crate::tui::resume;
 use crate::tui::retry::Backoff;
 use crate::tui::scrollback;
 use crate::tui::state::{
-    AppState, ApprovalChoice, AskPrompt, ConnectionState, Interruption, LiveMode, RunPhase,
+    AppState, ApprovalChoice, AskPrompt, ConnectionState, DelegationRow, Interruption, LiveMode,
+    RunPhase,
 };
 use crate::tui::transcript::{LineKind, TranscriptLine};
 use crate::tui::ui::{blocks, live};
@@ -1266,6 +1267,55 @@ async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState>>, ws: &Ws
             // mid-call) should still be expandable.
             s.last_tool_name = Some(tool);
             s.last_tool_result = result;
+            s.dirty = true;
+        }
+        "delegation.updated" => {
+            let Some(row) = DelegationRow::from_payload(&payload) else {
+                return;
+            };
+            let mut s = state.write().await;
+            // A first "running" sighting starts the row's local clock; an
+            // update keeps the clock it already has.
+            let started = match s.delegation_tasks.iter().find(|t| t.task_id == row.task_id) {
+                Some(existing) => existing.started,
+                None if row.status == "running" => Some(Instant::now()),
+                None => None,
+            };
+            let row = DelegationRow { started, ..row };
+            let position = s
+                .delegation_tasks
+                .iter()
+                .position(|t| t.task_id == row.task_id);
+            let terminal = row.is_terminal();
+            let task_id = row.task_id.clone();
+            if terminal {
+                // The notice is the durable record: the live row is about to
+                // be retired, and the transcript survives it.
+                s.transcript.push_notice(row.graduation_line());
+            }
+            match position {
+                Some(i) => s.delegation_tasks[i] = row,
+                None if !terminal => s.delegation_tasks.push(row),
+                None => {
+                    // A task that went straight to terminal (events lost
+                    // before the TUI subscribed): nothing to keep, the
+                    // notice above carries it.
+                }
+            }
+            if terminal {
+                s.delegation_tasks.retain(|t| t.task_id != task_id);
+            }
+            s.dirty = true;
+        }
+        "agent.usage" => {
+            let Some(total) = payload["usage"]["total_tokens"].as_u64() else {
+                return;
+            };
+            let mut s = state.write().await;
+            // Per-round events already cover every round of the turn —
+            // including the final one, which `chat.final`'s own usage also
+            // counts. Adding that here would double the total.
+            s.run_tokens = Some(s.run_tokens.unwrap_or(0) + total);
             s.dirty = true;
         }
         "chat.final" => {
@@ -3710,6 +3760,134 @@ mod tests {
         let s = state.read().await;
         assert!(s.current_session.is_none(), "and it does not get adopted");
         assert!(s.transcript.preview(10).is_empty());
+    }
+
+    /// Delegation updates build a live row, update it in place, and graduate
+    /// it to a transcript notice on terminal status.
+    #[tokio::test]
+    async fn delegation_updates_build_and_retire_rows() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let running = serde_json::json!({
+            "session_id": "s1",
+            "task_id": "run-1",
+            "root_id": "root-1",
+            "agent_id": "researcher",
+            "title": "scan docs",
+            "status": "running",
+            "usage_tokens": 0,
+        });
+        handle_event(event("delegation.updated", running.clone()), &state, &mut client).await;
+        {
+            let s = state.read().await;
+            assert_eq!(s.delegation_tasks.len(), 1);
+            assert_eq!(s.delegation_tasks[0].task_id, "run-1");
+            assert!(s.delegation_tasks[0].started.is_some(), "the local clock started");
+        }
+
+        // A usage bump updates the row in place instead of stacking a second.
+        let mut bump = running.clone();
+        bump["usage_tokens"] = serde_json::json!(3400);
+        handle_event(event("delegation.updated", bump), &state, &mut client).await;
+        {
+            let s = state.read().await;
+            assert_eq!(s.delegation_tasks.len(), 1, "the slot is reused");
+            assert_eq!(s.delegation_tasks[0].usage_tokens, 3400);
+            assert!(s.delegation_tasks[0].started.is_some(), "the clock survives the update");
+        }
+
+        // Terminal status graduates the row to a notice and retires it.
+        let done = serde_json::json!({
+            "session_id": "s1",
+            "task_id": "run-1",
+            "root_id": "root-1",
+            "agent_id": "researcher",
+            "title": "scan docs",
+            "status": "completed",
+            "usage_tokens": 5100,
+            "duration_ms": 188_000,
+        });
+        handle_event(event("delegation.updated", done), &state, &mut client).await;
+
+        let mut s = state.write().await;
+        assert!(s.delegation_tasks.is_empty(), "the terminal row is retired");
+        let notices: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            notices
+                .iter()
+                .any(|l| l.contains("✓ researcher: scan docs") && l.contains("5.1k tokens")),
+            "the notice carries the outcome: {notices:?}"
+        );
+    }
+
+    /// Another session's delegation update never reaches this task board.
+    #[tokio::test]
+    async fn delegation_updates_for_another_session_are_dropped() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("mine".to_string());
+
+        handle_event(
+            event(
+                "delegation.updated",
+                serde_json::json!({
+                    "session_id": "theirs",
+                    "task_id": "run-9",
+                    "root_id": "r",
+                    "agent_id": "worker",
+                    "title": "theirs",
+                    "status": "running",
+                    "usage_tokens": 0,
+                }),
+            ),
+            &state,
+            &mut client,
+        )
+        .await;
+        assert!(
+            state.read().await.delegation_tasks.is_empty(),
+            "another session's task is dropped"
+        );
+    }
+
+    /// Per-round usage accumulates into the run counter and clears with the
+    /// run. `chat.final` also carries the turn's usage; counting both would
+    /// double the total, which is why the counter only ever reads the
+    /// per-round events.
+    #[tokio::test]
+    async fn agent_usage_accumulates_and_clears_with_the_run() {
+        let gateway = TestGateway::start().await;
+        let (state, mut client) = state_and_client(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+        state.write().await.begin_run();
+
+        for total in [1_200u64, 1_800] {
+            handle_event(
+                event(
+                    "agent.usage",
+                    serde_json::json!({ "session_id": "s1", "agent_id": "a", "usage": { "total_tokens": total } }),
+                ),
+                &state,
+                &mut client,
+            )
+            .await;
+        }
+        assert_eq!(state.read().await.run_tokens, Some(3_000));
+
+        handle_event(
+            event("chat.final", serde_json::json!({ "session_id": "s1", "response": "done" })),
+            &state,
+            &mut client,
+        )
+        .await;
+        assert_eq!(state.read().await.run_tokens, None, "the run ended; the counter with it");
     }
 
     /// A session list that could not be refreshed says so.

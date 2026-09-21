@@ -90,6 +90,111 @@ pub enum RunPhase {
     ToolCall(String),
 }
 
+/// One delegated task row, as learned from `delegation.updated` push events.
+///
+/// Kept in insertion order so the live rows don't jump around. The TUI renders
+/// these while they run and retires them on a terminal status with a notice in
+/// the transcript. Lost on reconnect/restart by design (v1): the events only
+/// ever reach a live subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationRow {
+    /// Task id (registry run id).
+    pub task_id: String,
+    /// Root of the delegation tree.
+    pub root_id: String,
+    /// Agent id responsible for the task.
+    pub agent_id: String,
+    /// Short human title (what the task is for).
+    pub title: String,
+    /// `running | waiting_handoff` while displayed here.
+    pub status: String,
+    /// Local start time: the first "running" sighting. Elapsed per row is
+    /// computed from this, not from the payload's RFC3339 stamps.
+    pub started: Option<Instant>,
+    /// Total tokens the task's LLM rounds have reported so far.
+    pub usage_tokens: u64,
+}
+
+impl DelegationRow {
+    /// Parse a `delegation.updated` payload into a row. `None` when the
+    /// payload lacks the fields every row needs.
+    pub fn from_payload(payload: &Value) -> Option<Self> {
+        Some(Self {
+            task_id: payload["task_id"].as_str()?.to_string(),
+            root_id: payload["root_id"].as_str().unwrap_or_default().to_string(),
+            agent_id: payload["agent_id"].as_str().unwrap_or_default().to_string(),
+            title: payload["title"].as_str().unwrap_or_default().to_string(),
+            status: payload["status"].as_str()?.to_string(),
+            started: None,
+            usage_tokens: payload["usage_tokens"].as_u64().unwrap_or(0),
+        })
+    }
+
+    /// The one-line transcript notice a terminal status graduates to.
+    pub fn graduation_line(&self) -> String {
+        let title = self.compact_title();
+        let elapsed = self
+            .started
+            .map(|t| crate::tui::ui::live::format_elapsed(t.elapsed().as_secs()))
+            .unwrap_or_else(|| "?".to_string());
+        match self.status.as_str() {
+            "completed" => {
+                let tokens = if self.usage_tokens > 0 {
+                    format!(
+                        " · {} tokens",
+                        crate::tui::ui::live::format_token_count(self.usage_tokens)
+                    )
+                } else {
+                    String::new()
+                };
+                format!("✓ {agent}: {title} — {elapsed}{tokens}", agent = self.agent_id)
+            }
+            other => {
+                format!("✘ {agent}: {title} — {other} after {elapsed}", agent = self.agent_id)
+            }
+        }
+    }
+
+    /// The one-line `/agents` listing entry for a row, whatever its status.
+    pub fn listing_line(&self) -> String {
+        let agent = &self.agent_id;
+        let title = self.compact_title();
+        let elapsed = self
+            .started
+            .map(|t| crate::tui::ui::live::format_elapsed(t.elapsed().as_secs()))
+            .unwrap_or_else(|| "?".to_string());
+        let tokens = if self.usage_tokens > 0 {
+            format!(" · ↓{}", crate::tui::ui::live::format_token_count(self.usage_tokens))
+        } else {
+            String::new()
+        };
+        match self.status.as_str() {
+            "completed" => format!("✓ {agent}: {title} — {elapsed}{tokens}"),
+            "failed" => format!("✘ {agent}: {title} — failed after {elapsed}"),
+            "waiting_handoff" => format!("⏸ {agent}: {title} · waiting for handoff"),
+            _ => format!("⠋ {agent}: {title} · {elapsed}{tokens}"),
+        }
+    }
+
+    /// The title, trimmed to a display length with an ellipsis when cut.
+    fn compact_title(&self) -> String {
+        let title = self.title.trim();
+        if title.is_empty() {
+            return "(no title)".to_string();
+        }
+        let mut out: String = title.chars().take(60).collect();
+        if title.chars().count() > 60 {
+            out.push('…');
+        }
+        out
+    }
+
+    /// Whether the row has reached a terminal status and must be retired.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed")
+    }
+}
+
 /// Whimsical verbs for the running status row. The word rotates slowly so the
 /// row feels alive without flickering; the *phase* next to it carries the
 /// real information.
@@ -267,6 +372,13 @@ pub struct AppState {
     pub word_offset: usize,
     /// Spinner frame counter.
     pub spinner: u8,
+    /// Tokens accumulated from `agent.usage` events during the current run,
+    /// shown next to the elapsed time. Reset when a run ends — an idle row
+    /// never carries a token count.
+    pub run_tokens: Option<u64>,
+    /// Delegation task rows currently running (or handing off), oldest first.
+    /// Fed by `delegation.updated` push events; retired on terminal status.
+    pub delegation_tasks: Vec<DelegationRow>,
     /// Transient status text + when it was set (expires on its own).
     pub status: Option<(String, Instant)>,
     /// Set when a redraw is needed.
@@ -316,6 +428,8 @@ impl Default for AppState {
             run_phase: RunPhase::default(),
             word_offset: 0,
             spinner: 0,
+            run_tokens: None,
+            delegation_tasks: Vec::new(),
             status: None,
             dirty: true,
             interrupted: None,
@@ -552,6 +666,7 @@ impl AppState {
         self.is_running = true;
         self.run_started = Some(Instant::now());
         self.run_phase = RunPhase::Waiting;
+        self.run_tokens = None;
         // Re-roll the word each run, without pulling in an RNG for it.
         self.word_offset = now_millis() as usize % SPINNER_WORDS.len();
     }
@@ -560,6 +675,7 @@ impl AppState {
     pub fn end_run(&mut self) {
         self.is_running = false;
         self.run_started = None;
+        self.run_tokens = None;
     }
 
     /// The whimsical verb for the running status row, rotating slowly.
@@ -613,6 +729,9 @@ impl AppState {
         self.ask_input.clear();
         self.live_mode = LiveMode::Composer;
         let dropped_queue = self.clear_queue();
+        let dropped_tasks = self.delegation_tasks.len();
+        self.delegation_tasks.clear();
+        self.run_tokens = None;
 
         // Remember what we lost, so the reconnect can check what became of it
         // rather than leaving "interrupted" as the answer.
@@ -640,6 +759,12 @@ impl AppState {
                 "⚠ {dropped_queue} queued message(s) dropped — the gateway cannot take them yet"
             ));
         }
+        if dropped_tasks > 0 {
+            self.transcript.push_notice(format!(
+                "⚠ {dropped_tasks} delegated task row(s) dropped — the gateway may have \
+                 advanced them while offline"
+            ));
+        }
     }
 
     /// Seconds the current run has been going, if any.
@@ -651,7 +776,10 @@ impl AppState {
     /// live region needs repainting.
     pub fn advance_animations(&mut self) -> bool {
         let mut changed = false;
-        if self.is_running {
+        // Delegated tasks animate too: their elapsed counters tick even while
+        // the parent turn is idle (the parent may have ended its reply while
+        // children are still running, or a handoff is waiting).
+        if self.is_running || !self.delegation_tasks.is_empty() {
             self.spinner = self.spinner.wrapping_add(1);
             changed = true;
         }
@@ -837,6 +965,38 @@ mod tests {
         assert!(s.advance_animations() || s.status.is_some());
     }
 
+    /// Delegated task rows animate on their own clock: the parent turn may
+    /// have ended its reply while children still run, or a handoff may be
+    /// waiting, and the row's elapsed counter must not freeze either way.
+    #[test]
+    fn task_rows_animate_even_when_the_parent_is_idle() {
+        let mut s = AppState::default();
+        assert!(!s.advance_animations(), "nothing at all: no repaint");
+        s.delegation_tasks.push(DelegationRow {
+            task_id: "run-1".to_string(),
+            root_id: "r".to_string(),
+            agent_id: "researcher".to_string(),
+            title: "scan".to_string(),
+            status: "running".to_string(),
+            started: Some(Instant::now()),
+            usage_tokens: 0,
+        });
+        assert!(s.advance_animations(), "the spinner advances while a task row is on the board");
+    }
+
+    /// The run token counter belongs to the run: it is empty when a run
+    /// starts and gone when it ends, so an idle status row never carries a
+    /// stale count.
+    #[test]
+    fn the_run_token_counter_lives_and_dies_with_the_run() {
+        let mut s = AppState::default();
+        s.begin_run();
+        assert_eq!(s.run_tokens, None, "a fresh run starts with no count");
+        s.run_tokens = Some(1_200);
+        s.end_run();
+        assert_eq!(s.run_tokens, None, "ending the run clears the count");
+    }
+
     /// Losing the connection converges the run state, and says what it dropped.
     #[test]
     fn a_lost_connection_clears_the_run_and_the_prompts() {
@@ -870,6 +1030,108 @@ mod tests {
             "a dropped prompt is said out loud: {flushed:?}"
         );
         assert!(s.transcript.preview(10).is_empty(), "nothing is left live");
+    }
+
+    /// Task rows the TUI was holding go with the connection: the gateway may
+    /// have advanced them while it was away, and a stale row lies.
+    #[test]
+    fn a_lost_connection_drops_the_task_rows_say_what_it_dropped() {
+        let mut s = AppState::default();
+        s.delegation_tasks.push(DelegationRow {
+            task_id: "run-1".to_string(),
+            root_id: "r".to_string(),
+            agent_id: "researcher".to_string(),
+            title: "scan".to_string(),
+            status: "running".to_string(),
+            started: Some(Instant::now()),
+            usage_tokens: 0,
+        });
+
+        s.connection_lost("gateway gone");
+
+        assert!(s.delegation_tasks.is_empty(), "the rows do not survive");
+        let flushed: Vec<String> = s
+            .transcript
+            .take_flushable()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert!(
+            flushed.iter().any(|l| l.contains("task row")),
+            "the drop is said out loud: {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn delegation_rows_parse_from_the_payload() {
+        let row = DelegationRow::from_payload(&serde_json::json!({
+            "session_id": "s1",
+            "task_id": "run-1",
+            "root_id": "root-1",
+            "agent_id": "researcher",
+            "title": "scan docs",
+            "status": "running",
+            "usage_tokens": 3_400,
+        }))
+        .expect("a row");
+        assert_eq!(row.task_id, "run-1");
+        assert_eq!(row.agent_id, "researcher");
+        assert_eq!(row.usage_tokens, 3_400);
+        assert!(!row.is_terminal());
+
+        // A payload missing a required field parses to nothing.
+        assert!(
+            DelegationRow::from_payload(&serde_json::json!({ "task_id": "run-1" })).is_none(),
+            "no status, no row"
+        );
+    }
+
+    #[test]
+    fn terminal_rows_graduate_to_a_notice() {
+        let mut row = DelegationRow {
+            task_id: "run-1".to_string(),
+            root_id: "r".to_string(),
+            agent_id: "researcher".to_string(),
+            title: "scan docs".to_string(),
+            status: "completed".to_string(),
+            started: Some(Instant::now()),
+            usage_tokens: 5_100,
+        };
+        assert!(row.is_terminal());
+        let line = row.graduation_line();
+        assert!(line.contains("✓ researcher: scan docs"), "{line}");
+        assert!(line.contains("5.1k tokens"), "{line}");
+
+        // A long title is cut to one line's worth.
+        row.title = "x".repeat(200);
+        assert!(row.graduation_line().chars().count() < 120);
+
+        row.status = "failed".to_string();
+        let line = row.graduation_line();
+        assert!(line.contains("✘ researcher"), "the failure is named: {line}");
+        assert!(line.contains("failed after"), "{line}");
+    }
+
+    #[test]
+    fn listing_lines_read_the_row_status() {
+        let base = |status: &str| DelegationRow {
+            task_id: "run-1".to_string(),
+            root_id: "r".to_string(),
+            agent_id: "writer".to_string(),
+            title: "draft email".to_string(),
+            status: status.to_string(),
+            started: Some(Instant::now()),
+            usage_tokens: 0,
+        };
+        assert!(base("running")
+            .listing_line()
+            .starts_with("⠋ writer: draft email"));
+        assert_eq!(
+            base("waiting_handoff").listing_line(),
+            "⏸ writer: draft email · waiting for handoff"
+        );
+        assert!(base("completed").listing_line().starts_with("✓ writer:"));
+        assert!(base("failed").listing_line().starts_with("✘ writer:"));
     }
 
     /// The loss records what it interrupted, so a reconnect can check on it.

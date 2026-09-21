@@ -517,7 +517,8 @@ async fn command_pin(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), 
     Ok(())
 }
 
-/// `/agents` — list the agents the gateway knows.
+/// `/agents` — list the agents the gateway knows, plus this session's
+/// delegated tasks as the TUI has learned them from push events.
 async fn command_agents(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
     let agents = gw::agents_registry(ws).await?;
     let mut s = state.write().await;
@@ -533,8 +534,33 @@ async fn command_agents(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(
         }
         s.transcript.push_notice("start one with /agent <id>");
     }
+    let tasks = delegation_task_lines(&s.delegation_tasks);
+    if tasks.is_empty() {
+        s.transcript.push_notice("no delegated tasks running");
+    } else {
+        for line in tasks {
+            s.transcript.push_notice(line);
+        }
+        s.transcript.push_notice(
+            "delegated task rows are learned from live events; finished ones graduate to \
+             notices above",
+        );
+    }
     s.agents = agents;
     Ok(())
+}
+
+/// The `/agents` section for delegated tasks: one line per row the TUI is
+/// holding, running first in insertion order.
+fn delegation_task_lines(rows: &[crate::tui::state::DelegationRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("delegated tasks ({}):", rows.len())];
+    for row in rows {
+        lines.push(format!("  {}", row.listing_line()));
+    }
+    lines
 }
 
 /// `/agent <id>` — start a session bound to an agent.
