@@ -52,6 +52,18 @@ impl ConnectionState {
     }
 }
 
+/// The three decisions an approval prompt offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalChoice {
+    /// Run the tool once.
+    #[default]
+    Approve,
+    /// Run it and remember a `[permissions].allow` rule for next time.
+    ApproveRemember,
+    /// Refuse the call.
+    Deny,
+}
+
 /// Which prompt owns the input area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LiveMode {
@@ -210,8 +222,11 @@ pub struct AppState {
     pub live_mode: LiveMode,
     /// Approvals awaiting a decision, oldest first.
     pub approvals: VecDeque<ApprovalDetail>,
+    /// This conversation's permission-mode override, as the gateway last
+    /// reported it. `Default` means the gateway config decides.
+    pub permission_mode: crate::tools::PermissionMode,
     /// Which decision is highlighted in the approval prompt.
-    pub approval_approve_selected: bool,
+    pub approval_selection: ApprovalChoice,
     /// An unanswered `ask_user` question.
     pub pending_ask: Option<AskPrompt>,
     /// Free-text answer being typed for the ask prompt.
@@ -282,7 +297,8 @@ impl Default for AppState {
             history_oldest_ms: None,
             live_mode: LiveMode::default(),
             approvals: VecDeque::new(),
-            approval_approve_selected: true,
+            permission_mode: crate::tools::PermissionMode::Default,
+            approval_selection: ApprovalChoice::Approve,
             pending_ask: None,
             ask_input: String::new(),
             config_cache: None,
@@ -592,7 +608,7 @@ impl AppState {
 
         let dropped_approvals = self.approvals.len();
         self.approvals.clear();
-        self.approval_approve_selected = true;
+        self.approval_selection = ApprovalChoice::Approve;
         let dropped_ask = self.pending_ask.take().is_some();
         self.ask_input.clear();
         self.live_mode = LiveMode::Composer;
@@ -656,7 +672,7 @@ impl AppState {
     /// Retire the approval at the front of the queue and return to typing.
     pub fn pop_approval(&mut self) {
         self.approvals.pop_front();
-        self.approval_approve_selected = true;
+        self.approval_selection = ApprovalChoice::Approve;
         if self.approvals.is_empty() {
             self.live_mode = if self.pending_ask.is_some() {
                 LiveMode::Ask

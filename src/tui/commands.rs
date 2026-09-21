@@ -23,7 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy", "retry", "expand",
-    "theme",
+    "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -104,6 +104,7 @@ async fn handle_local_command(
             Ok(())
         }
         "theme" => command_theme(args, &state, ws).await,
+        "mode" => command_mode(args, &state, ws).await,
         _ => {
             state
                 .write()
@@ -245,6 +246,11 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("retry", "", "resend the last prompt"),
         ("expand", "", "print the last tool call in full"),
         ("theme", "[dark|light|auto]", "switch the palette, persisted in config"),
+        (
+            "mode",
+            "[default|accept-edits|plan|bypass]",
+            "switch this session's permission mode",
+        ),
         ("help", "", "this help"),
         ("quit", "", "leave the TUI"),
         ("exit", "", "alias of /quit"),
@@ -749,6 +755,61 @@ async fn command_config_show(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Res
     Ok(())
 }
 
+/// `/mode [default|accept-edits|plan|bypass]` — switch this session's
+/// permission mode. No argument reports the current mode. The override is
+/// ephemeral: it lives on the gateway until restart, which falls back to the
+/// configured `[permissions].mode` default. The gateway is the authority —
+/// `bypass` without `[permissions].allow_bypass` comes back as an error the
+/// notice shows verbatim.
+async fn command_mode(
+    args: &str,
+    state: &Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let requested = args.trim();
+    if requested.is_empty() {
+        let current = state.read().await.permission_mode;
+        state.write().await.transcript.push_notice(match current {
+            crate::tools::PermissionMode::Default => {
+                "mode: default (the gateway config decides; /mode plan switches this session)"
+                    .to_string()
+            }
+            other => format!(
+                "mode: {} (this session; restart falls back to the configured default)",
+                other.as_str()
+            ),
+        });
+        return Ok(());
+    }
+    let Some(mode) = crate::tools::PermissionMode::parse(requested) else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ /mode is one of default, accept-edits, plan or bypass".to_string());
+        return Ok(());
+    };
+    let session_id = state.read().await.current_session.clone();
+    match gw::sessions_set_mode(ws, session_id.as_deref().unwrap_or(""), mode.as_str()).await {
+        Ok(()) => {
+            {
+                let mut s = state.write().await;
+                s.permission_mode = mode;
+                s.transcript.push_notice(format!(
+                    "✔ permission mode: {} (this session; restart falls back to the configured \
+                     default)",
+                    mode.as_str()
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            state.write().await.transcript.push_notice(format!("✘ {e}"));
+            Ok(())
+        }
+    }
+}
+
 /// `/theme [dark|light|auto]` — switch the palette now and persist it.
 ///
 /// The setting lives in gateway config (`tui.theme`), so the next launch
@@ -1200,6 +1261,52 @@ mod tests {
             lines.iter().any(|l| l.contains("↳ finder:")),
             "missing the result marker row, got {lines:?}"
         );
+    }
+
+    /// `/mode` with no argument reports the current mode; a valid argument
+    /// switches the session; a junk argument is refused before any wire call.
+    #[tokio::test]
+    async fn mode_reports_switches_and_refuses() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        // No argument: the current (default) mode, no wire call.
+        let _ = command_mode("", &state, &client).await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("default"), "got {lines:?}");
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|r| r.method == "sessions.set_mode"),
+            "reporting the mode must not touch the wire"
+        );
+
+        // A valid argument switches the session.
+        let _ = command_mode("plan", &state, &client).await;
+        let requests = gateway.requests();
+        let set = requests
+            .iter()
+            .find(|r| r.method == "sessions.set_mode")
+            .expect("the switch on the wire");
+        assert_eq!(set.params["session_id"], "s1");
+        assert_eq!(set.params["mode"], "plan");
+        drop(requests);
+        let lines = output(&state).await;
+        assert!(lines[0].contains("permission mode: plan"), "got {lines:?}");
+        assert_eq!(state.read().await.permission_mode, crate::tools::PermissionMode::Plan);
+
+        // A junk argument is refused locally.
+        let _ = command_mode("neon", &state, &client).await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("one of default"), "got {lines:?}");
+        let set_calls = gateway
+            .requests()
+            .iter()
+            .filter(|r| r.method == "sessions.set_mode")
+            .count();
+        assert_eq!(set_calls, 1, "a refused /mode must not hit the wire again");
     }
 
     /// `/theme light` writes `tui.theme` and flips the palette now.

@@ -312,17 +312,33 @@ pub async fn approvals_decide(
     ws: &WsClient,
     id: &str,
     approve: bool,
+    remember: bool,
     reason: Option<&str>,
-) -> Result<(), TuiError> {
+) -> Result<Option<String>, TuiError> {
     let (method, params) = if approve {
-        ("approvals.approve", json!({ "id": id }))
+        ("approvals.approve", json!({ "id": id, "remember": remember }))
     } else {
         (
             "approvals.deny",
             json!({ "id": id, "reason": reason.unwrap_or("Denied by user") }),
         )
     };
-    ws.request(method, Some(params)).await.map(|_| ())
+    let response = ws.request(method, Some(params)).await?;
+    Ok(response
+        .get("remembered_rule")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// `sessions.set_mode` — this conversation's permission-mode override.
+pub async fn sessions_set_mode(
+    ws: &WsClient,
+    session_id: &str,
+    mode: &str,
+) -> Result<(), TuiError> {
+    ws.request("sessions.set_mode", Some(json!({ "session_id": session_id, "mode": mode })))
+        .await
+        .map(|_| ())
 }
 
 /// Answer an `ask_user` question.

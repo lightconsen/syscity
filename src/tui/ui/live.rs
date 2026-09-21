@@ -14,7 +14,7 @@ use ratatui::Frame;
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::tui::state::{AppState, LiveMode, RunPhase};
+use crate::tui::state::{AppState, ApprovalChoice, LiveMode, RunPhase};
 use crate::tui::ui::blocks;
 use crate::tui::ui::wrap as wrapmod;
 use crate::tui::ui::Theme;
@@ -177,6 +177,17 @@ fn status_line(state: &AppState, theme: &Theme) -> (Line<'static>, bool) {
         }
         spans.push(Span::styled(short_session(session), theme.status_style()));
     }
+    // A non-default permission mode is a thing the operator should never
+    // forget is on: it sits in the status line until it is switched off.
+    if state.permission_mode != crate::tools::PermissionMode::Default {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(
+            format!("⨿ {}", state.permission_mode.as_str()),
+            theme.status_error_style(),
+        ));
+    }
     if let Some((status, _)) = &state.status {
         let is_error = status.starts_with('⚠') || status.starts_with('✘');
         if !spans.is_empty() {
@@ -260,23 +271,17 @@ fn approval_lines(state: &AppState, theme: &Theme) -> Option<Vec<Line<'static>>>
         args_preview(approval.args.as_ref()),
         theme.dim_style(),
     )));
+    let pick = |choice: ApprovalChoice| {
+        if state.approval_selection == choice {
+            theme.highlight_style()
+        } else {
+            theme.dim_style()
+        }
+    };
     lines.push(Line::from(vec![
-        Span::styled(
-            "  y approve  ",
-            if state.approval_approve_selected {
-                theme.highlight_style()
-            } else {
-                theme.dim_style()
-            },
-        ),
-        Span::styled(
-            "  n deny  ",
-            if state.approval_approve_selected {
-                theme.dim_style()
-            } else {
-                theme.highlight_style()
-            },
-        ),
+        Span::styled("  y approve  ", pick(ApprovalChoice::Approve)),
+        Span::styled("  a approve+remember  ", pick(ApprovalChoice::ApproveRemember)),
+        Span::styled("  n deny", pick(ApprovalChoice::Deny)),
     ]));
     Some(lines)
 }
