@@ -602,6 +602,160 @@ fn can_sandbox() -> bool {
     *AVAILABLE
 }
 
+/// The `[security] fence_network` seccomp filter: the program builder here is
+/// platform-free so it can be simulated by tests, while only the installer is
+/// Linux-only. `cfg`-gated to Linux *and* tests so the program stays
+/// verifiable on the host it is authored on.
+#[cfg(any(target_os = "linux", test))]
+mod seccomp {
+    /// One classic-BPF instruction, in the shape the kernel takes but free of
+    /// libc types so the program can be built and simulated on any platform.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct BpfInsn {
+        pub(super) code: u16,
+        pub(super) jt: u8,
+        pub(super) jf: u8,
+        pub(super) k: u32,
+    }
+
+    // Classic-BPF encoding (linux/bpf_common.h, linux/filter.h).
+    pub(super) const BPF_LD: u16 = 0x00;
+    pub(super) const BPF_W: u16 = 0x00;
+    pub(super) const BPF_ABS: u16 = 0x20;
+    pub(super) const BPF_JMP: u16 = 0x05;
+    pub(super) const BPF_JEQ: u16 = 0x10;
+    pub(super) const BPF_K: u16 = 0x00;
+    pub(super) const BPF_RET: u16 = 0x06;
+    // seccomp return values (linux/seccomp.h).
+    pub(super) const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    pub(super) const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    pub(super) const SECCOMP_EPERM: u32 = 1;
+    // struct seccomp_data offsets: nr at 0, arch at 4, args[0] at 16.
+    pub(super) const SECCOMP_OFF_NR: u32 = 0;
+    pub(super) const SECCOMP_OFF_ARCH: u32 = 4;
+    pub(super) const SECCOMP_OFF_ARG0: u32 = 16;
+    pub(super) const AF_INET_NR: u32 = 2;
+    pub(super) const AF_INET6_NR: u32 = 10;
+
+    /// The `[security] fence_network` filter, as an instruction list.
+    ///
+    /// Denies `socket(2)` for `AF_INET`/`AF_INET6` with `EPERM` and allows
+    /// everything else — in particular `AF_UNIX`, because unix sockets are how a
+    /// great deal of ordinary local tooling talks (dbus, systemd, docker) and a
+    /// network posture is not a reason to break them. Denying the socket's
+    /// creation is enough on its own: the child inherits only its stdio
+    /// descriptors, so there is no pre-existing internet socket to fall back on.
+    ///
+    /// `audit_arch` and `nr_socket` are parameters because both are
+    /// architecture-specific and the filter validates them: a program built for
+    /// one architecture must not be interpreted as another.
+    pub(super) fn network_filter_program(audit_arch: u32, nr_socket: u32) -> Vec<BpfInsn> {
+        let stmt = |code: u16, jt: u8, jf: u8, k: u32| BpfInsn { code, jt, jf, k };
+        // Jump offsets resolved by hand against this exact list:
+        //   arch != ours                   -> allow
+        //   nr != socket                   -> allow
+        //   domain == AF_INET || AF_INET6  -> EPERM
+        //   otherwise                      -> allow
+        vec![
+            stmt(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_OFF_ARCH),
+            // wrong architecture: not our syscall numbers, so allow — six slots
+            // down, landing on the final allow (not the EPERM before it)
+            stmt(BPF_JMP | BPF_JEQ | BPF_K, 0, 6, audit_arch),
+            stmt(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_OFF_NR),
+            // not socket(2): allow, four slots down
+            stmt(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, nr_socket),
+            stmt(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_OFF_ARG0),
+            // AF_INET: skip the AF_INET6 test, landing on the EPERM
+            stmt(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, AF_INET_NR),
+            // AF_INET6: EPERM; anything else: the allow below
+            stmt(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, AF_INET6_NR),
+            stmt(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ERRNO | SECCOMP_EPERM),
+            stmt(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// `(AUDIT_ARCH, __NR_socket)` for a target architecture, or `None` when the
+    /// filter has no numbers for it.
+    ///
+    /// A function rather than a `cfg`-gated constant so every entry can be
+    /// asserted from any host: the architecture this runs on and the architecture
+    /// the test runs on are rarely the same machine.
+    pub(super) fn seccomp_constants(arch: &str) -> Option<(u32, u32)> {
+        match arch {
+            // EM_X86_64 (62) | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE, and
+            // `__NR_socket` from asm/unistd_64.h.
+            "x86_64" => Some((0xC000_003E, 41)),
+            // EM_AARCH64 (183) | the same two flags, and `__NR_socket` from
+            // asm-generic/unistd.h.
+            "aarch64" => Some((0xC000_00B7, 198)),
+            _ => None,
+        }
+    }
+}
+
+/// Linux: install [`network_filter_program`] on the calling thread.
+///
+/// Runs in the child after the Landlock restrict, which has already set
+/// `no_new_privs` — the kernel refuses a filter without it.
+#[cfg(target_os = "linux")]
+fn install_network_seccomp() -> std::io::Result<()> {
+    use libc::{sock_filter, sock_fprog};
+
+    const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+
+    // Fail closed rather than install a filter whose syscall numbers are
+    // guesses: a network posture that silently does nothing is worse than one
+    // that refuses to start. `consts::ARCH` is the compile-time target, so
+    // this cannot mismatch the binary.
+    let Some((audit_arch, nr_socket)) = seccomp::seccomp_constants(std::env::consts::ARCH) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no seccomp network filter for this architecture",
+        ));
+    };
+
+    {
+        let filter: Vec<sock_filter> = seccomp::network_filter_program(audit_arch, nr_socket)
+            .into_iter()
+            .map(|i| sock_filter {
+                code: i.code,
+                jt: i.jt,
+                jf: i.jf,
+                k: i.k,
+            })
+            .collect();
+        let mut prog = sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut sock_filter,
+        };
+
+        // `no_new_privs` is set by the Landlock restrict before this runs;
+        // repeating it is idempotent and keeps the filter installable if the
+        // order ever changes.
+        #[allow(unsafe_code)] // prctl has no safe wrapper in libc; no memory is touched
+        let prctl_rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if prctl_rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: `prog` points at `filter`, which outlives this call, and the
+        // kernel copies the program during the syscall — nothing is retained.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                0u64,
+                &mut prog as *mut sock_fprog,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// Linux: enforces the write fence in-place with Landlock, the kernel LSM.
 ///
 /// Unlike macOS (which rewrites `argv` behind `sandbox-exec`), Landlock
@@ -635,6 +789,7 @@ impl LandlockRunner {
             });
         }
         let mut fenced = req.clone();
+        let deny_network = fence.deny_network;
         fenced.fence = None;
         let fence = fence.clone();
         let existing_pre = req.pre_exec.clone();
@@ -642,7 +797,13 @@ impl LandlockRunner {
             if let Some(pre) = &existing_pre {
                 pre()?;
             }
-            landlock_restrict(&fence)
+            landlock_restrict(&fence)?;
+            if deny_network {
+                // After Landlock: the restrict is what sets `no_new_privs`,
+                // which the kernel requires before it will take a filter.
+                install_network_seccomp()?;
+            }
+            Ok(())
         }));
         Ok(fenced)
     }
@@ -1359,6 +1520,98 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    /// The seccomp filter's deny logic, simulated.
+    ///
+    /// Jump arithmetic is the easiest thing in this file to get wrong by one
+    /// slot, and the platform it actually runs on is not the platform this
+    /// test runs on — so the program is interpreted here rather than trusted.
+    mod seccomp_program {
+        use super::super::seccomp::{
+            network_filter_program, seccomp_constants, BpfInsn, AF_INET6_NR, AF_INET_NR,
+            SECCOMP_EPERM, SECCOMP_OFF_ARCH, SECCOMP_OFF_ARG0, SECCOMP_OFF_NR, SECCOMP_RET_ALLOW,
+            SECCOMP_RET_ERRNO,
+        };
+
+        /// Walk the program the way the kernel would, for one syscall.
+        fn simulate(prog: &[BpfInsn], arch: u32, nr: u32, arg0: u32) -> u32 {
+            let mut a = 0u32;
+            let mut pc = 0usize;
+            loop {
+                let insn = prog[pc];
+                match insn.code & 0x07 {
+                    0x00 => {
+                        a = match insn.k {
+                            SECCOMP_OFF_ARCH => arch,
+                            SECCOMP_OFF_NR => nr,
+                            SECCOMP_OFF_ARG0 => arg0,
+                            other => panic!("unexpected load offset {other}"),
+                        };
+                        pc += 1;
+                    }
+                    0x05 => {
+                        pc += 1 + if a == insn.k {
+                            insn.jt as usize
+                        } else {
+                            insn.jf as usize
+                        };
+                    }
+                    0x06 => return insn.k,
+                    other => panic!("unexpected instruction class {other}"),
+                }
+            }
+        }
+
+        const X86_64_ARCH: u32 = 0xC000_003E;
+        const X86_64_SOCKET: u32 = 41;
+        const NR_READ: u32 = 0;
+
+        #[test]
+        fn internet_sockets_are_denied_and_unix_sockets_are_not() {
+            let prog = network_filter_program(X86_64_ARCH, X86_64_SOCKET);
+            let run = |arch: u32, nr: u32, arg0: u32| simulate(&prog, arch, nr, arg0);
+            let denied = SECCOMP_RET_ERRNO | SECCOMP_EPERM;
+
+            assert_eq!(run(X86_64_ARCH, X86_64_SOCKET, AF_INET_NR), denied);
+            assert_eq!(run(X86_64_ARCH, X86_64_SOCKET, AF_INET6_NR), denied);
+
+            // A network posture is not a reason to break local IPC.
+            assert_eq!(run(X86_64_ARCH, X86_64_SOCKET, 1), SECCOMP_RET_ALLOW);
+            // Other syscalls are untouched — this is a network clause, not a jail.
+            assert_eq!(run(X86_64_ARCH, NR_READ, AF_INET_NR), SECCOMP_RET_ALLOW);
+            // A filter built for another architecture must not match ours.
+            assert_eq!(run(0xDEAD_BEEF, X86_64_SOCKET, AF_INET_NR), SECCOMP_RET_ALLOW);
+        }
+
+        /// The per-architecture constants are the whole reason the filter takes
+        /// them as parameters; a wrong `__NR_socket` would silently deny (or
+        /// not deny) the wrong syscall. `libc` only carries the AUDIT_ARCH
+        /// constants on Linux and this test only runs on macOS, so the table
+        /// is asserted against its documented derivation instead.
+        #[test]
+        fn architecture_constants_are_the_documented_ones() {
+            const EM_X86_64: u32 = 62;
+            const EM_AARCH64: u32 = 183;
+            const AUDIT_FLAGS: u32 = 0x8000_0000 | 0x4000_0000; // 64BIT | LE
+
+            assert_eq!(seccomp_constants("x86_64"), Some((EM_X86_64 | AUDIT_FLAGS, 41)));
+            assert_eq!(seccomp_constants("aarch64"), Some((EM_AARCH64 | AUDIT_FLAGS, 198)));
+            // An architecture the filter has no numbers for must refuse to
+            // install rather than guess.
+            assert_eq!(seccomp_constants("riscv64"), None);
+            assert_eq!(seccomp_constants(""), None);
+
+            let (aarch64_arch, aarch64_socket) = seccomp_constants("aarch64").expect("aarch64");
+            assert_eq!(X86_64_ARCH, EM_X86_64 | AUDIT_FLAGS);
+            assert_eq!(X86_64_SOCKET, 41);
+
+            let aarch64 = network_filter_program(aarch64_arch, aarch64_socket);
+            assert_eq!(
+                simulate(&aarch64, aarch64_arch, aarch64_socket, AF_INET_NR),
+                SECCOMP_RET_ERRNO | SECCOMP_EPERM
+            );
+        }
+    }
+
     mod seatbelt {
         use super::*;
 
