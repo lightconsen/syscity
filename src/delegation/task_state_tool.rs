@@ -349,6 +349,7 @@ mod tests {
                 depth: 1,
                 agent_id: "worker",
                 title: "Test task",
+                parent_session: None,
             })
             .await
             .unwrap();
@@ -360,6 +361,7 @@ mod tests {
                 depth: 2,
                 agent_id: "sibling",
                 title: "Sibling task",
+                parent_session: None,
             })
             .await
             .unwrap();
@@ -371,6 +373,7 @@ mod tests {
                 depth: 1,
                 agent_id: "stranger",
                 title: "Unrelated task",
+                parent_session: None,
             })
             .await
             .unwrap();

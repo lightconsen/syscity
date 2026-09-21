@@ -27,7 +27,10 @@ pub mod wake;
 
 pub use coordinator::DelegationCoordinator;
 pub use scope::{DelegationScope, DELEGATION_SCOPE_KEY};
-pub use state::{ArtifactRef, DelegationEvent, DelegationTask, DelegationTaskStore, NewTask};
+pub use state::{
+    ArtifactRef, DelegationEvent, DelegationTask, DelegationTaskSnapshot, DelegationTaskStore,
+    NewTask,
+};
 pub use task_state_tool::TaskStateTool;
 pub use wake::{
     child_completion_message, child_failure_message, notify_parent, parent_active_for_wake,

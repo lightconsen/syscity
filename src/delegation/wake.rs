@@ -437,6 +437,7 @@ mod tests {
                     depth: 1,
                     agent_id: "manager",
                     title: "T",
+                    parent_session: None,
                 })
                 .await
                 .unwrap();
