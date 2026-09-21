@@ -361,8 +361,10 @@ covers the writer's contract (wrapping, styles, scrolling off the top);
 `transcript.rs`, `wrap.rs`, `state.rs`, `actions.rs`, `retry.rs` and
 `gateway_calls.rs` are pure unit tests.
 
-`src/tui/event_loop.rs` also holds loop-level tests: the real `run` and the
-real `run_plain`, against `src/tui/test_gateway.rs` (an in-process stand-in
+`src/tui/event_loop/` — the loop itself, with `keys`, `send`, `prompts`,
+`events`, `reconnect`, `startup` and `plain` split out beside `mod.rs` — holds
+its loop-level tests in the `tests/` subdirectory, grouped the same way: the
+real `run` and the real `run_plain`, against `src/tui/test_gateway.rs` (an in-process stand-in
 that speaks the protocol — handshake, scripted replies, events pushed at the
 client, requests recorded for assertion) and actions injected through the
 `InputSource` seam. They cover the pipe contract, print-once streaming,
