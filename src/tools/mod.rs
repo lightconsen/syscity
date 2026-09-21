@@ -8,6 +8,7 @@ pub mod approval;
 pub mod ask_user;
 pub mod eval;
 pub mod metadata;
+pub mod permissions;
 pub mod target_lock;
 
 // Re-export approval types for convenience
@@ -20,6 +21,8 @@ pub use ask_user::{
     background_context_reason, AskEvent, AskQueue, AskRequest, AskRequiredEvent, AskResolvedEvent,
     AskUserTool, PendingQuestion,
 };
+// Re-export permission types for convenience
+pub use permissions::{EngineDecision, PermissionMode, PermissionsConfig, PermissionsRuntime};
 // Re-export tool metadata for convenience
 pub use metadata::ToolDescriptionMeta;
 

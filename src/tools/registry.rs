@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use super::permissions::{EngineDecision, PermissionMode, PermissionsRuntime};
 use super::util::consume_stream;
 use super::{
     ApprovalDecision, ApprovalQueue, AskQueue, BoxedTool, PendingApproval, PostExecuteDecision,
@@ -61,6 +62,10 @@ pub struct ToolRegistry {
     /// Ask queue for the `ask_user` clarification tool. When set, the tool
     /// can suspend a turn and wait for a human answer.
     ask_queue: Option<Arc<AskQueue>>,
+    /// Permission modes and allow/deny/ask rules, consulted before every
+    /// tool execution and before the toolset is advertised. Shared with the
+    /// gateway, which seeds it from config and applies session overrides.
+    permissions: Arc<PermissionsRuntime>,
     /// Content filter for scanning tool outputs for PII and secrets.
     content_filter: Option<Arc<crate::security::content_filter::ContentFilter>>,
     /// Audit logger for recording tool invocations and security events.
@@ -97,6 +102,7 @@ impl Default for ToolRegistry {
             hooks_override: std::sync::Mutex::new(None),
             approval_queue: None,
             ask_queue: None,
+            permissions: Arc::new(PermissionsRuntime::default()),
             content_filter: None,
             audit_log: None,
             web_search_providers: None,
@@ -147,6 +153,7 @@ impl ToolRegistry {
             hooks_override: std::sync::Mutex::new(None),
             approval_queue: None,
             ask_queue: None,
+            permissions: Arc::new(PermissionsRuntime::default()),
             content_filter: None,
             audit_log: None,
             web_search_providers: None,
@@ -171,6 +178,7 @@ impl ToolRegistry {
             hooks_override: std::sync::Mutex::new(None),
             approval_queue: None,
             ask_queue: None,
+            permissions: Arc::new(PermissionsRuntime::default()),
             content_filter: None,
             audit_log: None,
             web_search_providers: None,
@@ -298,6 +306,18 @@ impl ToolRegistry {
             return true;
         }
         if context.model.skill_trust < SkillTrust::Trusted && self.is_privileged(name) {
+            return true;
+        }
+
+        // Plan mode hides non-read-only tools from the advertised toolset;
+        // the per-call gate below is the backstop for anything that was
+        // advertised before the mode flipped mid-turn.
+        if self
+            .permissions
+            .effective_mode(&context.identity.conversation_id)
+            == PermissionMode::Plan
+            && !self.tool_capabilities(name).read_only
+        {
             return true;
         }
 
@@ -580,6 +600,19 @@ impl ToolRegistry {
             .unwrap_or_else(|| self.hooks.clone())
     }
 
+    /// Install the shared permission runtime (modes + rules). The gateway
+    /// seeds it from `[permissions]` config and keeps it updated on
+    /// `config.set` / hot reload.
+    pub fn with_permissions(mut self, permissions: Arc<PermissionsRuntime>) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// The shared permission runtime, for gateway-side updates and reads.
+    pub fn permissions(&self) -> &Arc<PermissionsRuntime> {
+        &self.permissions
+    }
+
     /// Set the approval queue for human-in-the-loop execution.
     ///
     /// When set, tool calls that return `ToolPolicyDecision::NeedsApproval`
@@ -843,19 +876,7 @@ impl ToolRegistry {
         args: &Value,
         ctx: &ToolContext,
     ) -> ToolPolicyDecision {
-        let mut decision = self.active_hooks().run_policy(name, args, ctx).await;
-
-        // requires_approval fallback — only when no policy hook exists, so
-        // an explicitly-configured policy hook is always authoritative.
-        if matches!(decision, ToolPolicyDecision::Allow)
-            && !self.active_hooks().has_policy_hooks()
-            && self.get_capabilities(name).requires_approval
-        {
-            decision = self.approval_fallback(name, args);
-        }
-
-        self.audit_policy_decision(name, ctx, &decision).await;
-        decision
+        self.run_gate(name, args, ctx, false).await
     }
 
     /// The approval a tool advertising `requires_approval` needs.
@@ -863,6 +884,26 @@ impl ToolRegistry {
     /// One constructor for both policy paths, so what a caller sees cannot
     /// depend on which of them asked.
     fn approval_fallback(&self, name: &str, args: &Value) -> ToolPolicyDecision {
+        let risk_level = self.tool_capabilities(name).risk_level;
+        self.needs_approval(name, args, risk_level, format!("Tool '{}' requires approval", name))
+    }
+
+    /// A `[permissions].ask` rule matched: route to approval with the rule's
+    /// reason and the tool's real risk level.
+    fn force_ask(&self, name: &str, args: &Value, reason: String) -> ToolPolicyDecision {
+        let risk_level = self.tool_capabilities(name).risk_level;
+        self.needs_approval(name, args, risk_level, reason)
+    }
+
+    /// The one `NeedsApproval` constructor, so every ask path looks the same
+    /// to the approval queue and the audit log.
+    fn needs_approval(
+        &self,
+        name: &str,
+        args: &Value,
+        risk_level: crate::tools::approval::RiskLevel,
+        message: String,
+    ) -> ToolPolicyDecision {
         ToolPolicyDecision::NeedsApproval {
             approval_id: format!(
                 "fallback-{}-{}",
@@ -875,10 +916,94 @@ impl ToolRegistry {
             ),
             tool_name: name.to_string(),
             args: args.clone(),
-            risk_level: crate::tools::approval::RiskLevel::High,
+            risk_level,
             requested_by: "system".to_string(),
-            message: format!("Tool '{}' requires approval", name),
+            message,
         }
+    }
+
+    /// The permission engine: rules + mode, evaluated before any hook.
+    ///
+    /// Reads the true (post-wrapper-fix) capabilities, so plan mode and the
+    /// `write` category see what the tool really is.
+    fn evaluate_permissions(&self, name: &str, args: &Value, ctx: &ToolContext) -> EngineDecision {
+        let caps = self.tool_capabilities(name);
+        self.permissions.evaluate(
+            name,
+            args,
+            &ctx.identity.conversation_id,
+            caps.read_only,
+            &caps.categories,
+        )
+    }
+
+    /// The one policy gate both execution paths share: permission engine,
+    /// then hooks, then the `requires_approval` fallback.
+    ///
+    /// Order is locked: a `deny` rule blocks before hooks can even speak; a
+    /// hook `Deny` beats every pre-approval; a hook `NeedsApproval` is
+    /// honoured as explicit configuration except under `bypass`, where it is
+    /// downgraded to allow (and audited); an `allow` rule or mode
+    /// pre-approval skips the fallback; an `ask` rule forces the fallback
+    /// with the rule's reason. `hooks_only_fallback` preserves the two
+    /// paths' existing difference: the buffered path additionally requires
+    /// [`can_ask_a_human`](crate::tools::ask_user::can_ask_a_human) before
+    /// the fallback fires.
+    async fn run_gate(
+        &self,
+        name: &str,
+        args: &Value,
+        ctx: &ToolContext,
+        hooks_only_fallback: bool,
+    ) -> ToolPolicyDecision {
+        let engine = self.evaluate_permissions(name, args, ctx);
+
+        let decision = if let EngineDecision::Deny(reason) = engine {
+            // A deny rule blocks before hooks can speak.
+            ToolPolicyDecision::Deny { reason }
+        } else {
+            let hook = self.active_hooks().run_policy(name, args, ctx).await;
+            match hook {
+                ToolPolicyDecision::Deny { reason } => ToolPolicyDecision::Deny { reason },
+                ToolPolicyDecision::NeedsApproval { .. }
+                    if engine == EngineDecision::AllowNow
+                        && self
+                            .permissions
+                            .effective_mode(&ctx.identity.conversation_id)
+                            == PermissionMode::Bypass =>
+                {
+                    // bypass skips approval prompts; an explicit hook ask is
+                    // downgraded with it and audited below.
+                    ToolPolicyDecision::Allow
+                }
+                other => match (other, engine) {
+                    (ToolPolicyDecision::Allow, EngineDecision::Ask(reason)) => {
+                        self.force_ask(name, args, reason)
+                    }
+                    (ToolPolicyDecision::Allow, EngineDecision::AllowNow) => {
+                        ToolPolicyDecision::Allow
+                    }
+                    (ToolPolicyDecision::Allow, EngineDecision::PassThrough) => {
+                        // requires_approval fallback — only when no policy hook
+                        // exists, so an explicitly-configured policy hook is
+                        // always authoritative.
+                        if !self.active_hooks().has_policy_hooks()
+                            && self.get_capabilities(name).requires_approval
+                            && (!hooks_only_fallback
+                                || crate::tools::ask_user::can_ask_a_human(ctx))
+                        {
+                            self.approval_fallback(name, args)
+                        } else {
+                            ToolPolicyDecision::Allow
+                        }
+                    }
+                    (other, _) => other,
+                },
+            }
+        };
+
+        self.audit_policy_decision(name, ctx, &decision).await;
+        decision
     }
 
     /// Evaluate the registered policy hooks, plus the `requires_approval`
@@ -897,18 +1022,7 @@ impl ToolRegistry {
         args: &Value,
         ctx: &ToolContext,
     ) -> ToolPolicyDecision {
-        let mut decision = self.active_hooks().run_policy(name, args, ctx).await;
-
-        if matches!(decision, ToolPolicyDecision::Allow)
-            && !self.active_hooks().has_policy_hooks()
-            && self.get_capabilities(name).requires_approval
-            && crate::tools::ask_user::can_ask_a_human(ctx)
-        {
-            decision = self.approval_fallback(name, args);
-        }
-
-        self.audit_policy_decision(name, ctx, &decision).await;
-        decision
+        self.run_gate(name, args, ctx, true).await
     }
 
     /// Audit a non-allow policy decision as a `ToolDeny` event so a denied or
@@ -1723,6 +1837,7 @@ mod tests {
 
     use super::*;
     use crate::tools::sdk::ToolCapabilities;
+    use crate::tools::PermissionsConfig;
 
     /// A tool whose only job is to declare retry semantics.
     struct DeclaredTool {
@@ -1868,6 +1983,253 @@ mod tests {
             name: name.to_string(),
             arguments: "{}".to_string(),
         }
+    }
+
+    // ── permission gate tests ─────────────────────────────────────────────
+
+    fn shell_call(command: &str) -> FunctionCall {
+        FunctionCall {
+            name: "spy".to_string(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        }
+    }
+
+    fn perms(mode: PermissionMode, allow_bypass: bool) -> Arc<PermissionsRuntime> {
+        Arc::new(PermissionsRuntime::from_config(&PermissionsConfig {
+            mode,
+            allow_bypass,
+            ..Default::default()
+        }))
+    }
+
+    fn read_only_declared(name: &'static str) -> Box<dyn Tool> {
+        Box::new(DeclaredTool {
+            name: name.to_string(),
+            caps: ToolCapabilities {
+                read_only: true,
+                ..Default::default()
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_deny_rule_blocks_before_hooks_and_the_tool_body() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry =
+            ToolRegistry::new().with_permissions(perms(PermissionMode::Default, false));
+        registry.register(spy("spy", ran.clone()));
+        registry.permissions().reload(&PermissionsConfig {
+            deny: vec!["spy".to_string()],
+            ..Default::default()
+        });
+
+        // Even a hook that would deny "more loudly" must not matter: the
+        // engine blocks first.
+        registry.set_hooks(
+            ToolHooks::new().policy(|_, _, _| async {
+                ToolPolicyDecision::Deny { reason: "hook denial".into() }
+            }),
+        );
+
+        let err = registry
+            .execute_call(&call("spy"), &ToolContext::new("u", "conv1"))
+            .await
+            .expect_err("deny rule blocks");
+        assert!(err.to_string().contains("deny rule"), "got {err}");
+        assert!(!ran.load(Ordering::SeqCst), "the tool body must not run");
+    }
+
+    #[tokio::test]
+    async fn an_allow_rule_suppresses_the_requires_approval_fallback() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_permissions(perms(PermissionMode::Default, false));
+        registry.register(approval_spy("spy", ran.clone()));
+        registry.permissions().reload(&PermissionsConfig {
+            allow: vec!["spy".to_string()],
+            ..Default::default()
+        });
+
+        let result = registry
+            .execute_call(&call("spy"), &ToolContext::new("u", "conv1"))
+            .await
+            .expect("allowed call executes without approval");
+        assert!(result.success);
+        assert!(ran.load(Ordering::SeqCst));
+        assert!(
+            approval_queue.is_empty().await,
+            "an allow rule is the don't-ask-again: nothing submitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_routes_to_the_approval_queue() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let queue = approval_queue.clone();
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_permissions(perms(PermissionMode::Default, false));
+        registry.register(spy("spy", ran.clone()));
+        registry.permissions().reload(&PermissionsConfig {
+            ask: vec!["spy".to_string()],
+            ..Default::default()
+        });
+
+        let mut rx = approval_queue.event_tx.subscribe();
+        let approver = tokio::spawn(async move {
+            let event = rx.recv().await.expect("approval event");
+            queue
+                .resolve(&event.approval_id, ApprovalDecision::Approve)
+                .await;
+        });
+
+        let result = registry
+            .execute_call(&call("spy"), &ToolContext::new("u", "conv1"))
+            .await
+            .expect("ask rule suspends, then approval releases");
+        assert!(result.success);
+        assert!(ran.load(Ordering::SeqCst));
+        approver.await.expect("approver task");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_hides_and_refuses_everything_not_read_only() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new().with_permissions(perms(PermissionMode::Plan, false));
+        registry.register(spy("mutator", ran.clone()));
+        registry.register(read_only_declared("reader"));
+
+        let ctx = ToolContext::new("u", "conv1");
+
+        // Advertisement: the mutator is gone from the offered toolset.
+        let offered: Vec<String> = registry
+            .get_available(&ctx)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(!offered.contains(&"mutator".to_string()), "got {offered:?}");
+        assert!(offered.contains(&"reader".to_string()));
+
+        // Backstop: a call that slips through is denied with the plan message.
+        let err = registry
+            .execute_call(&call("mutator"), &ctx)
+            .await
+            .expect_err("plan mode denies a mutating call");
+        assert!(err.to_string().contains("plan mode"), "got {err}");
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // And the read-only tool still runs.
+        let result = registry
+            .execute_call(&call("reader"), &ctx)
+            .await
+            .expect("read-only tools run in plan mode");
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn accept_edits_pre_approves_write_category_tools() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_permissions(perms(PermissionMode::AcceptEdits, false));
+        registry.register(Box::new(DeclaredTool {
+            name: "writer_declared".to_string(),
+            caps: ToolCapabilities {
+                requires_approval: true,
+                categories: vec!["file".to_string(), "write".to_string()],
+                ..Default::default()
+            },
+        }));
+
+        let ctx = ToolContext::new("u", "conv1");
+        let result = registry
+            .execute_call(&call("writer_declared"), &ctx)
+            .await
+            .expect("accept_edits pre-approves write-category tools");
+        assert!(result.success);
+        assert!(approval_queue.is_empty().await, "nothing submitted under accept_edits");
+    }
+
+    #[tokio::test]
+    async fn bypass_needs_the_config_flag_and_hooks_still_win() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        // allow_bypass = false: bypass behaves as default.
+        let runtime = Arc::new(PermissionsRuntime::from_config(&PermissionsConfig {
+            mode: PermissionMode::Bypass,
+            allow_bypass: false,
+            ..Default::default()
+        }));
+        runtime.set_session_mode("conv1", Some(PermissionMode::Bypass));
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_permissions(runtime);
+        registry.register(approval_spy("spy", ran.clone()));
+        let ctx = ToolContext::new("u", "conv1")
+            .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()));
+
+        let mut rx = approval_queue.event_tx.subscribe();
+        let queue = approval_queue.clone();
+        let approver = tokio::spawn(async move {
+            let event = rx.recv().await.expect("fallback still asks");
+            queue
+                .resolve(&event.approval_id, ApprovalDecision::Approve)
+                .await;
+        });
+        let result = registry
+            .execute_call(&call("spy"), &ctx)
+            .await
+            .expect("without allow_bypass, bypass == default: approval flow runs");
+        assert!(result.success);
+        approver.await.expect("approver task");
+
+        // Flip the flag: now the same call runs without any approval.
+        registry.permissions().reload(&PermissionsConfig {
+            mode: PermissionMode::Bypass,
+            allow_bypass: true,
+            ..Default::default()
+        });
+        let result = registry
+            .execute_call(&call("spy"), &ctx)
+            .await
+            .expect("bypass skips the approval flow once allowed");
+        assert!(result.success);
+        assert!(approval_queue.is_empty().await, "bypass must not submit approvals");
+
+        // But an explicit hook Deny still blocks under bypass.
+        registry.set_hooks(
+            ToolHooks::new().policy(|_, _, _| async {
+                ToolPolicyDecision::Deny { reason: "hook denial".into() }
+            }),
+        );
+        let err = registry
+            .execute_call(&call("spy"), &ctx)
+            .await
+            .expect_err("hook deny wins under bypass");
+        assert!(err.to_string().contains("hook denial"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn a_session_mode_override_drives_the_gate() {
+        let ran = Arc::new(AtomicBool::new(false));
+        // Gateway default plan; this session overridden to default mode.
+        let runtime = Arc::new(PermissionsRuntime::from_config(&PermissionsConfig {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        }));
+        runtime.set_session_mode("conv1", Some(PermissionMode::Default));
+        let mut registry = ToolRegistry::new().with_permissions(runtime);
+        registry.register(spy("mutator", ran.clone()));
+
+        let result = registry
+            .execute_call(&call("mutator"), &ToolContext::new("u", "conv1"))
+            .await
+            .expect("the session override exits plan mode for this session");
+        assert!(result.success);
     }
 
     /// A `Deny` from a policy hook must block a buffered `execute_call`

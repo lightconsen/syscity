@@ -14,21 +14,30 @@ pub struct MatchedHook {
     pub command: String,
 }
 
-/// Match a single alternative glob against a tool name.
-fn single_match(pattern: &str, name: &str) -> bool {
+/// Match a single glob against arbitrary text.
+///
+/// `*` may sit at the start, the end, or both; without one the match is
+/// exact. Case-sensitive. Shared by hook matchers and `[permissions]` rule
+/// globs.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
     if let Some(rest) = pattern.strip_prefix('*') {
         if let Some(needle) = rest.strip_suffix('*') {
-            return name.contains(needle);
+            return text.contains(needle);
         }
-        return name.ends_with(rest);
+        return text.ends_with(rest);
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
-        return name.starts_with(prefix);
+        return text.starts_with(prefix);
     }
-    name == pattern
+    text == pattern
+}
+
+/// Match a single alternative glob against a tool name.
+fn single_match(pattern: &str, name: &str) -> bool {
+    glob_match(pattern, name)
 }
 
 /// Return `true` when `name` matches the (possibly `|`-separated) pattern.
