@@ -127,7 +127,11 @@ impl Tool for ShellTool {
     fn description(&self) -> &str {
         "Execute a shell command for file operations, running scripts, or system commands. \
          Commands are executed with safety restrictions. Note: For scheduling or recurring tasks, \
-         use the 'cron' tool instead — do NOT use shell commands with 'at', 'cron', or 'schedule'."
+         use the 'cron' tool instead — do NOT use shell commands with 'at', 'cron', or 'schedule'. \
+         A command that the workspace fence refuses comes back as a permission error; if it \
+         genuinely needs to write outside the workspace (or otherwise leave the fence), say so in \
+         the call with \"permissions\": {\"require_escalated\": true, \"justification\": \"why\"} \
+         and a human is asked before it runs — do not try to work around the fence."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -285,7 +289,31 @@ impl Tool for ShellTool {
             }
         }
 
-        let result = crate::tools::process_runner::run_collect(&req).await;
+        let mut escalated = false;
+        let result = match crate::tools::process_runner::run_collect(&req).await {
+            // A command the fence refused fails like any other command; ask a
+            // human whether to run it again outside the fence. Declining (or
+            // having nobody to ask) leaves the refusal exactly as it was.
+            Ok(output) if !output.success() && !output.timed_out => {
+                match crate::tools::escalation::fence_denial_reason(&output.stderr_string()) {
+                    Some(reason) => {
+                        match crate::tools::escalation::escalate_and_rerun(
+                            context, "shell", &args, &req, reason,
+                        )
+                        .await
+                        {
+                            Some(retry) => {
+                                escalated = true;
+                                Ok(retry)
+                            }
+                            None => Ok(output),
+                        }
+                    }
+                    None => Ok(output),
+                }
+            }
+            other => other,
+        };
 
         let duration = start_time.elapsed();
 
@@ -294,11 +322,18 @@ impl Tool for ShellTool {
                 let stdout = output.stdout_string();
                 let stderr = output.stderr_string();
 
-                let combined_output = if stderr.is_empty() {
+                let mut combined_output = if stderr.is_empty() {
                     stdout
                 } else {
                     format!("{}{}", stdout, stderr)
                 };
+                if escalated {
+                    // Say so in the result the model reads: the command ran,
+                    // but not under the rules the rest of the turn runs under.
+                    combined_output = format!(
+                        "(ran outside the workspace fence, approved by the operator)\n{combined_output}"
+                    );
+                }
 
                 let total_bytes = combined_output.len();
                 let truncated = self.truncate_output(combined_output);
@@ -307,6 +342,7 @@ impl Tool for ShellTool {
                     "signal": output.signal,
                     "timed_out": output.timed_out,
                     "duration_ms": duration.as_millis() as u64,
+                    "escalated": escalated,
                 });
 
                 if output.timed_out {
@@ -753,6 +789,141 @@ mod tests {
         assert!(result.success, "non-fenced shell should write freely");
         assert!(std::path::Path::new(&target).exists());
         let _ = std::fs::remove_file(&target);
+    }
+
+    /// A refusal by the fence can be escalated: the operator is asked, and on
+    /// approval the command runs again without the fence.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_fence_refusal_can_be_escalated_to_an_unfenced_rerun() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = format!("/tmp/syscity_escalation_{}", std::process::id());
+        let _ = std::fs::remove_file(&target);
+
+        let queue = Arc::new(crate::tools::approval::ApprovalQueue::new());
+        let mut events = queue.event_tx.subscribe();
+        let approver_queue = Arc::clone(&queue);
+        let approver = tokio::spawn(async move {
+            let event = events.recv().await.expect("an escalation request");
+            assert!(
+                event.message.contains("outside the workspace fence"),
+                "the prompt must name what is being asked: {}",
+                event.message
+            );
+            approver_queue
+                .resolve(&event.approval_id, crate::tools::approval::ApprovalDecision::Approve)
+                .await;
+        });
+
+        let ctx = ToolContext::new("user", "conv1")
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()))
+            .with_approval_queue(Arc::clone(&queue));
+
+        let tool = ShellTool::new();
+        let result = tool
+            .execute(serde_json::json!({ "command": format!("echo x > {target}") }), &ctx)
+            .await
+            .unwrap();
+        approver.await.expect("approver");
+
+        assert!(result.success, "the approved re-run must succeed: {result:?}");
+        assert!(
+            std::path::Path::new(&target).exists(),
+            "the unfenced re-run writes where the fence refused"
+        );
+        assert!(
+            result.output.contains("outside the workspace fence"),
+            "the result must say the run left the fence: {}",
+            result.output
+        );
+        assert_eq!(result.data.as_ref().expect("data")["escalated"], true);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    /// Declining leaves the refusal exactly as it was.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_declined_escalation_keeps_the_refusal() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = format!("/tmp/syscity_escalation_denied_{}", std::process::id());
+        let _ = std::fs::remove_file(&target);
+
+        let queue = Arc::new(crate::tools::approval::ApprovalQueue::new());
+        let mut events = queue.event_tx.subscribe();
+        let denier_queue = Arc::clone(&queue);
+        let denier = tokio::spawn(async move {
+            let event = events.recv().await.expect("an escalation request");
+            denier_queue
+                .resolve(
+                    &event.approval_id,
+                    crate::tools::approval::ApprovalDecision::Deny {
+                        reason: "not this time".into(),
+                    },
+                )
+                .await;
+        });
+
+        let ctx = ToolContext::new("user", "conv1")
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()))
+            .with_approval_queue(Arc::clone(&queue));
+
+        let tool = ShellTool::new();
+        let result = tool
+            .execute(serde_json::json!({ "command": format!("echo x > {target}") }), &ctx)
+            .await
+            .unwrap();
+        denier.await.expect("denier");
+
+        assert!(!result.success, "the refusal stands: {result:?}");
+        assert!(!std::path::Path::new(&target).exists());
+        assert!(
+            !result.output.contains("outside the workspace fence"),
+            "a declined escalation must not claim to have run unfenced"
+        );
+    }
+
+    /// A context with nobody to ask (no ask queue) is never prompted: cron,
+    /// goals and delegated children keep the refusal and get no approval.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_context_with_no_human_keeps_the_refusal_silently() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = format!("/tmp/syscity_escalation_silent_{}", std::process::id());
+        let _ = std::fs::remove_file(&target);
+
+        let queue = Arc::new(crate::tools::approval::ApprovalQueue::new());
+        let mut events = queue.event_tx.subscribe();
+
+        // An approval queue but no ask queue: `can_ask_a_human` is false.
+        let ctx = ToolContext::new("system", "cron:job")
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_approval_queue(Arc::clone(&queue));
+
+        let tool = ShellTool::new();
+        let result = tool
+            .execute(serde_json::json!({ "command": format!("echo x > {target}") }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.success, "the refusal stands: {result:?}");
+        assert!(!std::path::Path::new(&target).exists());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "no approval may be submitted when there is nobody to answer it"
+        );
     }
 
     /// The network posture travels with the context into the fence: the same

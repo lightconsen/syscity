@@ -161,6 +161,9 @@ pub struct ToolContext {
     /// Ask queue for the `ask_user` clarification tool. `None` in contexts
     /// with no interactive human (goals build their own context and skip it).
     pub ask_queue: Option<Arc<AskQueue>>,
+    /// Approval queue, so a command the fence refused can ask whether to run
+    /// outside it. Attached wherever the ask queue is.
+    pub approval_queue: Option<Arc<crate::tools::approval::ApprovalQueue>>,
 }
 
 /// Allowed environment variables that are safe to forward to child processes.
@@ -315,6 +318,21 @@ impl ToolContext {
     pub fn with_ask_queue(mut self, queue: Arc<AskQueue>) -> Self {
         self.ask_queue = Some(queue);
         self
+    }
+
+    /// Attach the approval queue so a command the fence refused can ask
+    /// whether to run outside it (see `tools::escalation`).
+    pub fn with_approval_queue(
+        mut self,
+        queue: Arc<crate::tools::approval::ApprovalQueue>,
+    ) -> Self {
+        self.approval_queue = Some(queue);
+        self
+    }
+
+    /// The approval queue, when this context has one.
+    pub fn approval_queue(&self) -> Option<&Arc<crate::tools::approval::ApprovalQueue>> {
+        self.approval_queue.as_ref()
     }
 
     /// Set the working directory

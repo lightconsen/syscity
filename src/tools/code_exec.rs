@@ -289,14 +289,7 @@ print(json.dumps(result))
             let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
 
-            // Parse PTC result if present
-            let ptc_result = if let Some(idx) = stdout_str.find("__PTC_RESULT__") {
-                let json_part = &stdout_str[idx + "__PTC_RESULT__".len()..];
-                serde_json::from_str(json_part.trim())
-                    .unwrap_or_else(|_| json!({"success": status.success(), "error": null}))
-            } else {
-                json!({"success": status.success(), "error": null})
-            };
+            let ptc_result = ptc_result_from(&stdout_str, status.success());
 
             Ok(CodeResult {
                 stdout: stdout_str,
@@ -308,6 +301,42 @@ print(json.dumps(result))
         .await;
 
         match result {
+            // A fenced command the fence refused fails like any other failure;
+            // ask a human whether to run it again outside the fence, exactly
+            // as `shell` does. Declining leaves the original result alone.
+            Ok(Ok(result)) if result.exit_code != 0 => {
+                let Some(reason) = crate::tools::escalation::fence_denial_reason(&result.stderr)
+                else {
+                    return Ok(result);
+                };
+                let args = json!({ "code": code });
+                match crate::tools::escalation::escalate_and_rerun(
+                    context,
+                    "execute_code",
+                    &args,
+                    &req,
+                    reason,
+                )
+                .await
+                {
+                    Some(retry) => {
+                        let stdout = retry.stdout_string();
+                        let stderr = retry.stderr_string();
+                        let exit_code = retry.exit_code().unwrap_or(-1);
+                        Ok(CodeResult {
+                            result: ptc_result_from(&stdout, retry.success()),
+                            // The model reads this: say the run happened, but
+                            // not under the rules the rest of the turn uses.
+                            stdout: format!(
+                                "(ran outside the workspace fence, approved by the operator)\n{stdout}"
+                            ),
+                            stderr,
+                            exit_code,
+                        })
+                    }
+                    None => Ok(result),
+                }
+            }
             Ok(Ok(result)) => Ok(result),
             Ok(Err(e)) => Err(e),
             Err(_) => {
@@ -464,6 +493,19 @@ print(json.dumps(result))
 }
 
 /// Result of code execution
+/// Parse the `__PTC_RESULT__` trailer the Python wrapper prints, if present.
+///
+/// Absent or unparseable, the answer is `{"success": <process succeeded>}`:
+/// the caller asked for a result object and gets one that says nothing more
+/// than the exit code did.
+fn ptc_result_from(stdout: &str, success: bool) -> serde_json::Value {
+    match stdout.find("__PTC_RESULT__") {
+        Some(idx) => serde_json::from_str(stdout[idx + "__PTC_RESULT__".len()..].trim())
+            .unwrap_or_else(|_| json!({ "success": success, "error": null })),
+        None => json!({ "success": success, "error": null }),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeResult {
     /// Standard output
@@ -503,6 +545,11 @@ The code runs in a restricted environment with:
 
 The code output is returned as stdout. For structured results,
 you can print JSON at the end of your script.
+
+If the code needs to write outside the workspace, the fence refuses it and
+the run fails with a permission error; say so in the call with
+"permissions": {"require_escalated": true, "justification": "why"} and a
+human is asked before it runs.
 
 Example:
 ```python

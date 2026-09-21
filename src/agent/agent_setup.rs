@@ -241,6 +241,13 @@ impl Agent {
         // answer.  `None` (unit tests, goal runner's own context) means the
         // tool refuses via its guard.
         let ctx = ctx.with_delegation(delegation);
+        // The approval queue rides along with the ask queue: both mean "there
+        // is a human who can answer", and the fence escalation needs the
+        // former to ask whether a refused command may run outside the fence.
+        let ctx = match self.tools.approval_queue() {
+            Some(queue) => ctx.with_approval_queue(Arc::clone(queue)),
+            None => ctx,
+        };
         match self.tools.ask_queue() {
             Some(queue) => ctx.with_ask_queue(Arc::clone(queue)),
             None => ctx,

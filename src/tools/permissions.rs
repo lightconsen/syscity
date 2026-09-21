@@ -334,6 +334,19 @@ fn evaluate(
     if rules_match(&snapshot.deny, name, primary.as_deref()) {
         return EngineDecision::Deny(format!("denied by a [permissions].deny rule for '{name}'"));
     }
+    // The call itself can say it needs to run outside the fence. That is an
+    // ask by construction, and it lands before the rules so an `allow` rule
+    // cannot silently grant the escape — a rule is "stop asking", not "leave
+    // the fence". Bypass skips it like every other prompt.
+    if let Some(escalation) = super::escalation::declared_escalation(args) {
+        if mode == PermissionMode::Bypass {
+            return EngineDecision::AllowNow;
+        }
+        return EngineDecision::Ask(format!(
+            "asked to run outside the workspace fence: {}",
+            escalation.justification
+        ));
+    }
     if rules_match(&snapshot.ask, name, primary.as_deref()) {
         return EngineDecision::Ask(format!("matched a [permissions].ask rule for '{name}'"));
     }
@@ -481,6 +494,46 @@ mod tests {
             evaluate(&snapshot, "shell", &json!({"command": "rm -rf /"}), "s1", false, &[]),
             EngineDecision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn a_declared_escalation_is_an_ask_that_allow_rules_cannot_silence() {
+        let snapshot = Snapshot {
+            default_mode: PermissionMode::Default,
+            allow_bypass: true,
+            // An allow rule for the very command, to prove the declaration
+            // wins: "stop asking" is not "leave the fence".
+            allow: vec!["shell:git status*".to_string()].into(),
+            deny: Vec::new().into(),
+            ask: Vec::new().into(),
+            per_session: Arc::new(HashMap::new()),
+        };
+        let args = json!({
+            "command": "git status",
+            "permissions": { "require_escalated": true, "justification": "sees the host clock" }
+        });
+        let decision = evaluate(&snapshot, "shell", &args, "s1", false, &[]);
+        assert!(
+            matches!(decision, EngineDecision::Ask(ref why) if why.contains("sees the host clock")),
+            "got {decision:?}"
+        );
+
+        // A deny rule still wins over the declaration.
+        let denied = Snapshot {
+            deny: vec!["shell".to_string()].into(),
+            ..snapshot.clone()
+        };
+        assert!(matches!(
+            evaluate(&denied, "shell", &args, "s1", false, &[]),
+            EngineDecision::Deny(_)
+        ));
+
+        // Bypass is "no prompts", so it skips the ask rather than queueing one.
+        let bypass = Snapshot {
+            default_mode: PermissionMode::Bypass,
+            ..snapshot
+        };
+        assert_eq!(evaluate(&bypass, "shell", &args, "s1", false, &[]), EngineDecision::AllowNow);
     }
 
     #[test]

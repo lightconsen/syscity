@@ -35,6 +35,7 @@ fn tool_context() -> ToolContext {
         model: ToolModel::default(),
         delegation: None,
         ask_queue: None,
+        approval_queue: None,
     }
 }
 

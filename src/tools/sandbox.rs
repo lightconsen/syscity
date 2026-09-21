@@ -313,6 +313,7 @@ mod tests {
             },
             delegation: None,
             ask_queue: None,
+            approval_queue: None,
         }
     }
 
