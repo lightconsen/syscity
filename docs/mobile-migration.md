@@ -110,7 +110,7 @@ exactly what Tauri mobile needs — it is the mobile path's starting point.
 ### 2.3 Existing mechanisms we reuse (do not reinvent)
 
 - **`is_available()`** — `Tool` trait method (`src/tools/types.rs:769`),
-  already implemented per tool (`shell.rs:330`, `delegate_tool.rs:828`,
+  already implemented per tool (`shell.rs:330`, `delegate_tool/tool.rs`,
   `gateway.rs:296`, `planner.rs:80`, `cron_tool.rs:392`, `acp_tool.rs:265`,
   `computer.rs:139`). This is the platform capability probe: add a
   `#[cfg(target_os = "...")]` branch and the agent loop automatically skips
@@ -538,7 +538,7 @@ Goal: turn "Syscity on a phone" into "a phone-native Syscity".
 - In-process cron scheduler: `src/cron/cron/scheduler.rs`
 - Desktop shell embeds gateway: `desktop/src/lib.rs`
 - Desktop bundle targets (no mobile): `desktop/tauri.conf.json`
-- SPA serving: `src/gateway/lifecycle.rs` (`/assets/*path` route)
+- SPA serving: `build_router` in `src/gateway/lifecycle/router.rs` (`/assets/*path` route)
 - Web UI Tauri bridge (mobile-ready): `web/src/SyscityWebSocketTransport.ts`
   (`__TAURI__` detection, `get_api_url`, `gateway-ready` event)
 - Delegation is process-internal: `src/agent/subagent_registry.rs`,

@@ -12,7 +12,7 @@ The control plane for Syscity, managing channels, agents, and the HTTP/WebSocket
 - **`GatewayConfig`** — Comprehensive runtime configuration with all subsystem fields
 - **Auth** (`auth.rs`) — JWT-based authentication, API key validation
 - **Rate Limiting** (`rate_limit.rs`) — Token bucket rate limiter per client
-- **Webhooks** (`webhooks.rs`) — Incoming webhook handlers
+- **Webhooks** (`webhooks/`) — Incoming webhook handlers, one module per provider
 - **Middleware** (`middleware.rs`) — CORS, auth, logging, trusted proxy auth
 - **Protocol** (`protocol.rs`) — ACP protocol handlers
 - **Commands** (`commands.rs`) — Gateway control commands
@@ -25,11 +25,16 @@ The control plane for Syscity, managing channels, agents, and the HTTP/WebSocket
 ### Module Layout
 
 `gateway/mod.rs` was split into focused submodules (2026-06-20) to keep the
-control-plane core readable. The entry point (`mod.rs`) now holds `GatewayState`
-access checks and the `Gateway` struct shell; behavior lives in:
+control-plane core readable, and two of those submodules — `lifecycle/` and
+`config/` — grew into directory modules of their own (2026-09-22). The entry
+point (`mod.rs`) now holds `GatewayState` access checks and the `Gateway`
+struct shell; behavior lives in:
 
-- **`lifecycle.rs`** — `start_gateway` / `stop_gateway` / `build_router` free
-  functions (startup sequence, graceful shutdown, Axum router assembly).
+- **`lifecycle/`** — `start_gateway` / `stop_gateway` / `build_router` free
+  functions (startup sequence, graceful shutdown, Axum router assembly), in
+  `start.rs`, `shutdown.rs` and `router.rs`, with the helpers they share
+  (agent spawning, the quality-gate check, MCP tool registration) in
+  `helpers.rs`.
 - **`dispatch.rs`** — inbound message entry worker and routed message dispatch.
 - **`hot_reload.rs`** — config-change handlers for Main / Agent / Channel /
   Plugin / Gateway file types.
@@ -39,8 +44,11 @@ access checks and the `Gateway` struct shell; behavior lives in:
 - **`runtime.rs`** — runtime event/command types (`BufferedMessage`,
   `AgentHandle`, `AgentCommand`, `AgentQuery`, `GatewayEvent`, `AgentStatus`).
 - **`agent_spawn.rs`** — `spawn_agent_inner` and adapter wiring.
-- **`config.rs`** / **`state.rs`** / **`types.rs`** / **`watchdog.rs`** —
-  configuration, shared state, request/response DTOs, repair/watchdog logic.
+- **`config/`** — the `GatewayConfig` tree: `mod.rs` holds `GatewayConfig`
+  itself and the `*Config` structs are grouped by area across `memory.rs`,
+  `misc.rs`, `optimizer.rs`, `plugins.rs`, `security.rs` and `tui.rs`.
+- **`state.rs`** / **`types.rs`** / **`watchdog.rs`** — shared state,
+  request/response DTOs, repair/watchdog logic.
 
 ### Startup Flow
 

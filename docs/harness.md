@@ -94,7 +94,7 @@ statistics are computed.
 | Context | Where | What runs | Implementation |
 |---------|-------|-----------|----------------|
 | ① Inline (response path) | per-turn hook in the daemon | deterministic `GoalCondition`, programmatic metrics (token/latency/cost), `RiskSignalChecker` risk scan, suspicious-badcase tagging | post-turn hooks: `scan_turn_for_badcase` (risk coarse filter → LLM judge deep review on high risk → pending pool) and `sample_turn` (production sampling) |
-| ② Process gate | startup / cron | full eval harness + thresholds (`min_pass_rate` / `require_zero_p0` / `max_degradation`) → `Proceed` / `Rollback` / `Degrade` | `gateway/quality_gate.rs`, `lifecycle.rs` |
+| ② Process gate | startup / cron | full eval harness + thresholds (`min_pass_rate` / `require_zero_p0` / `max_degradation`) → `Proceed` / `Rollback` / `Degrade` | `gateway/quality_gate.rs`, `run_quality_gate_check` in `gateway/lifecycle/helpers.rs` |
 | ③ Offline batch | `syscity eval` (separate process, or daemon background job) | multi-trial + Wilson CI, LLM judge (critic / multi-judge), paired bootstrap significance, RCA, calibration | `standalone.rs` + `eval/harness.rs` |
 
 **Boundary discipline (a core design rule):**
@@ -450,7 +450,7 @@ Key sections in `EvalConfig` / `QualityGateConfig`:
 | Structural proposer | `eval/proposer.rs` | LLM variants as data samples |
 | Online shadow replay (N=1) | `gateway/shadow_replay.rs`, `eval/guardrail.rs` (`RealTurnCandidateVerifier`) | `replay_shadow` default off |
 | Compression low-retention gate | `eval/compression_gate.rs` (`compression_criterion`), `quality_gate.rs` Step 2b | default off |
-| Release gate + governance + baseline rollback | `gateway/quality_gate.rs`, `gateway/lifecycle.rs` | `Proceed`/`Rollback`/`Degrade` |
+| Release gate + governance + baseline rollback | `gateway/quality_gate.rs`, `run_quality_gate_check` in `gateway/lifecycle/helpers.rs` | `Proceed`/`Rollback`/`Degrade` |
 | Reflection engine | `agent/reflection/` | background trajectory self-critique |
 | Eval dashboard trends | WS `eval.dashboard` (14-day), web Eval page | |
 
@@ -592,7 +592,7 @@ src/gateway/shadow_replay.rs        N=1 online replay shadow
 src/gateway/quality_gate.rs         release gate
 src/gateway/feedback.rs             feedback store (turn_feedback)
 src/gateway/ws/feedback.rs          feedback.vote / feedback.ops WS handlers
-src/gateway/lifecycle.rs            daemon lifecycle, gate wiring
+src/gateway/lifecycle/              daemon lifecycle, gate wiring
 evals/                              capability / adversarial / regression /
                                     calibration / skills / badcases / suites
 ```

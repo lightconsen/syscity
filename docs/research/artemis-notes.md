@@ -115,7 +115,7 @@ LangGraph 状态机（`graph/graph.py`）：`planner → convergence ⇄ {operat
 | | Artemis | Syscity |
 |---|---|---|
 | 运行位置 | 宿主机 Python 控制手机 | **网关可跑在手机上的 APK 内**（`MainActivity.kt` + `SYSCITY_NATIVE_LIB_DIR` / `process_runner.rs:1040`） |
-| 层级获取 | 自研无障碍服务（默认）/ uiautomator2 | `adb shell uiautomator dump /sdcard/window_dump.xml` 再 pull（`platform/mobile/android.rs:403,464`） |
+| 层级获取 | 自研无障碍服务（默认）/ uiautomator2 | `adb shell uiautomator dump /sdcard/window_dump.xml` 再 pull（`pull_ui_xml` in `platform/mobile/android/mod.rs`） |
 | 动作 | `adb shell input` + 助手 `dispatchGesture` | `adb` 命令（`AndroidToolset`） |
 | iOS | 无 | 有（`IosToolset`，走 libimobiledevice） |
 
