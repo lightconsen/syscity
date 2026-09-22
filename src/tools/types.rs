@@ -300,8 +300,6 @@ impl ToolContext {
         self
     }
 
-    /// Mark the sender as the system owner.
-
     /// Set an allowlist of plugin tool prefixes/names.
     pub fn with_plugin_allowlist(mut self, allowlist: Vec<String>) -> Self {
         self.sandbox.plugin_allowlist = Some(allowlist);

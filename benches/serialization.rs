@@ -1,5 +1,4 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use serde_json;
 use syscity::providers::{Message, Role, ToolCall};
 
 fn bench_message_serialization(c: &mut Criterion) {
@@ -14,6 +13,8 @@ fn bench_message_serialization(c: &mut Criterion) {
             name: "shell".to_string(),
             arguments: "{\"command\":\"ls -la\"}".to_string(),
         },
+        index: None,
+        result: None,
     }]);
 
     c.bench_function("message_serialize", |b| {

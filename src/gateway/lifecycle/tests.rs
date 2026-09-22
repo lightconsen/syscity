@@ -184,7 +184,7 @@ async fn stop_gateway_aborts_tasks_that_ignore_the_shutdown_token() {
 #[tokio::test]
 async fn stop_gateway_does_not_wait_on_socket_lifetime_tasks() {
     let state = state().await;
-    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let _ = rx.await;
     });
@@ -193,13 +193,27 @@ async fn stop_gateway_does_not_wait_on_socket_lifetime_tasks() {
         .insert_join("ws:conn:test:recv", handle)
         .await;
 
-    let started = tokio::time::Instant::now();
     stop_gateway(&state.shutdown_token, &state).await.unwrap();
 
-    assert!(
-        started.elapsed() < BACKGROUND_DRAIN_TIMEOUT,
-        "a socket-lifetime task must not consume the drain window"
-    );
+    // The task holds the receiving end of this channel, so `is_closed()` turning
+    // true means the future — and the receiver with it — was dropped: the pump was
+    // aborted, not left running. Polled rather than checked once because `abort()`
+    // only *requests* cancellation; the task is dropped at its next scheduling
+    // point.
+    //
+    // Deliberately not a wall-clock bound. The previous assertion here was
+    // `elapsed() < BACKGROUND_DRAIN_TIMEOUT`, which measures machine load as much
+    // as behaviour: `stop_gateway` does plugin shutdown, a pending-writes wait and
+    // a storage close after the drain, and all of that counts against that budget.
+    // That the skip happens *before* the window is not separately observable — the
+    // aborted/drained split is local to `stop_gateway`. The sibling test above
+    // covers the other side (a task that is given the window) from below.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !tx.is_closed() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(tx.is_closed(), "the socket-lifetime task must be aborted, not left running");
+
     assert!(is_socket_lifetime_task("ws:conn:1:send"));
     assert!(is_socket_lifetime_task("openai:sse:abc"));
     assert!(!is_socket_lifetime_task("hooks:after:x:0"));

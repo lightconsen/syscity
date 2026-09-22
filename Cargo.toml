@@ -360,10 +360,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 chromiumoxide = { version = "0.9" }
 
 [[bench]]
-name = "message_routing"
-harness = false
-
-[[bench]]
 name = "serialization"
 harness = false
 

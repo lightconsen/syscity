@@ -286,7 +286,11 @@ impl PermissionsRuntime {
     }
 
     /// Take a cheap snapshot for the gate's hot path.
-    pub(crate) fn snapshot(&self) -> Snapshot {
+    ///
+    /// Private to this module: `Snapshot` is an internal shape, and the only
+    /// caller is `evaluate_for` below. Keeping the method private is what keeps
+    /// the type out of a public interface.
+    fn snapshot(&self) -> Snapshot {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 

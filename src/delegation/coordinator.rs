@@ -472,8 +472,11 @@ mod tests {
             Some("user-session"),
             "lineage rides the handing-off row, not the registry's wake key"
         );
-        // Fresh successor work has not spent any tokens yet.
-        assert_eq!(succ.usage_tokens, 0);
+        // No `usage_tokens` assertion: `maybe_advance` spawns the successor, so this
+        // counter is written concurrently by the child's own progress callback
+        // (`add_usage`) while `wait_for_task` only waits for the row to *exist*.
+        // Asserting it is zero asserted that the child had not finished its first
+        // round yet — a property of the scheduler, not of this code.
         // And it resolves through the same chain the forwarder uses.
         assert_eq!(
             store.root_session_for_task(&succ.id).await.unwrap(),

@@ -111,6 +111,9 @@ check "fmt" cargo fmt -- --check
 check "clippy" cargo +stable clippy --all-features -- -D warnings
 check "static-analysis" ./scripts/static-analysis.sh
 check "cargo check (all-features)" cargo check --all-features
+# Benches, examples and test targets are not built by `cargo check`/`clippy`, so
+# this is the only local step that catches a bench rotting against a moved API.
+check "cargo check (all-targets)" cargo check --all-targets
 check "cargo doc" cargo doc --no-deps --all-features
 
 # ── Job: msrv (ci.yml `msrv`) ───────────────────────────────────────────────

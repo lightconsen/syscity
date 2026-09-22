@@ -96,6 +96,13 @@ jobs:
       - name: Check build
         run: cargo check --all-features
 
+      - name: Check every target compiles
+        # `cargo check`/`clippy` do not build bench, example or test targets, so a
+        # bench can rot against a moved API for weeks with CI fully green — which
+        # is exactly what happened to `benches/message_routing.rs` when
+        # `core::Engine` was deleted. This is the only step that compiles them.
+        run: cargo check --all-targets
+
       - name: Check docs build
         run: cargo doc --no-deps --all-features
 
