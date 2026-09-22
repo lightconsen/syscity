@@ -172,7 +172,7 @@ async fn a_lost_connection_converges_the_running_loop() {
 async fn a_failing_command_does_not_end_the_session() {
     let gateway = TestGateway::start().await;
     gateway.fail_with("system.presence", "INTERNAL");
-    let (state, mut client) = state_and_client(&gateway).await;
+    let (state, client) = state_and_client(&gateway).await;
 
     let err = handle_action(TuiAction::RunSlashCommand("/status".to_string()), &state, &client)
         .await

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::super::{WsRequest, WsResponse};
+use super::super::WsRequest;
 use crate::gateway::GatewayState;
 
 use super::*;

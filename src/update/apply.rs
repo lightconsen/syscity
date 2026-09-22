@@ -80,7 +80,6 @@ fn extract_binary_from_tarball(pkg: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn make_tarball(dir: &Path, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
         let path = dir.join("pkg.tar.gz");

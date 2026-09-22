@@ -1,5 +1,4 @@
 use super::super::*;
-use super::monitor::{judge_summary, should_deep_judge};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -270,7 +269,7 @@ impl Provider for MarkupThenOk {
 #[tokio::test]
 async fn test_get_completion_forces_a_summary_round_on_markup_only_reply() {
     let provider = Arc::new(MarkupThenOk { calls: AtomicUsize::new(0) });
-    let store = Arc::new(crate::memory::DatabaseStore::new_in_memory().await.unwrap());
+    let _store = Arc::new(crate::memory::DatabaseStore::new_in_memory().await.unwrap());
     let agent = crate::agent::Agent::new(
         crate::agent::AgentConfig::default(),
         provider.clone(),

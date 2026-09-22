@@ -14,7 +14,6 @@ use syscity::computer::headless::HeadlessComputerAdapter;
 use syscity::computer::types::{MouseButton, Point, Screenshot};
 use syscity::computer::use_loop::{ComputerUseLoop, LoopConfig, LoopDecision, LoopState};
 use syscity::computer::{ComputerAdapter, ComputerError, DesktopAction};
-use syscity::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
 // Helpers

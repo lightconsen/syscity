@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_sync_from_tool_registry_removes_stale_tools() {
-        let reg = ToolRegistry::new();
+        let _reg = ToolRegistry::new();
 
         let mut sdk = ToolSdk::new();
         sdk.register_pack(ToolPack {

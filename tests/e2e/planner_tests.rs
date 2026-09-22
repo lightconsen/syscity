@@ -7,9 +7,6 @@
 //! Run:
 //!   cargo test --test e2e_test goal_planner -- --nocapture
 
-use syscity::tools::hooks::{ToolHooks, ToolPolicyDecision};
-use syscity::tools::ToolRegistry;
-
 use super::*;
 
 // ── Mock Provider for GoalPlanner E2E ───────────────────────────────────────

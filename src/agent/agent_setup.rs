@@ -793,7 +793,6 @@ impl Agent {
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
     use crate::agent::{Agent, AgentConfig};
     use crate::delegation::DelegationScope;
     use crate::providers::mock::MockProvider;

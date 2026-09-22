@@ -404,8 +404,6 @@ async fn target_agent_cannot_select_another_agent() {
 
 #[tokio::test]
 async fn test_spawn_uses_registry_for_routing_limits() {
-    use std::time::Duration;
-
     let tool = DelegateTool::new(0);
     let registry = Arc::clone(tool.registry());
     let context = ToolContext::new("user", "parent-session");

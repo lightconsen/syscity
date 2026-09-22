@@ -495,12 +495,8 @@ async fn resolve_action_standalone(
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use serde_json::json;
-
     use super::*;
     use crate::planner::{Plan, Task, TaskStatus};
-    use crate::tools::{Tool, ToolContext, ToolExecutionResult, ToolRegistry};
 
     // ── Config default test ───────────────────────────────────────────────
 

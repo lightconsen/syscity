@@ -1022,7 +1022,7 @@ mod tests {
     #[tokio::test]
     async fn history_prints_the_conversation_in_order() {
         let gateway = TestGateway::start().await;
-        let (state, mut client) = connect(&gateway).await;
+        let (state, client) = connect(&gateway).await;
         state.write().await.current_session = Some("s1".to_string());
         gateway.with_history(
             (0..5)
@@ -1059,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn history_more_walks_backwards_to_the_beginning() {
         let gateway = TestGateway::start().await;
-        let (state, mut client) = connect(&gateway).await;
+        let (state, client) = connect(&gateway).await;
         state.write().await.current_session = Some("s1".to_string());
         gateway.with_history(
             (0..10)
@@ -1112,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn history_more_without_a_cursor_asks_for_a_first_page() {
         let gateway = TestGateway::start().await;
-        let (state, mut client) = connect(&gateway).await;
+        let (state, client) = connect(&gateway).await;
         state.write().await.current_session = Some("s1".to_string());
 
         command_history("more", Arc::clone(&state), &client)
@@ -1156,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn history_rejects_a_count_it_cannot_read() {
         let gateway = TestGateway::start().await;
-        let (state, mut client) = connect(&gateway).await;
+        let (state, client) = connect(&gateway).await;
         state.write().await.current_session = Some("s1".to_string());
 
         command_history("banana", Arc::clone(&state), &client)
@@ -1178,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn history_needs_a_session() {
         let gateway = TestGateway::start().await;
-        let (state, mut client) = connect(&gateway).await;
+        let (state, client) = connect(&gateway).await;
 
         command_history("", Arc::clone(&state), &client)
             .await
@@ -1366,7 +1366,9 @@ mod tests {
         let gateway = TestGateway::start().await;
         let (state, client) = connect(&gateway).await;
 
-        command_theme("banana", &state, &client).await;
+        command_theme("banana", &state, &client)
+            .await
+            .expect("a refused /theme is still Ok");
 
         let lines = output(&state).await;
         assert!(lines[0].contains("one of dark, light or auto"), "got {lines:?}");
@@ -1389,7 +1391,9 @@ mod tests {
         let (state, client) = connect(&gateway).await;
         state.write().await.startup_bg = Some(crate::tui::ui::ThemeId::Light);
 
-        command_theme("auto", &state, &client).await;
+        command_theme("auto", &state, &client)
+            .await
+            .expect("/theme auto succeeds against the test gateway");
 
         let mode = osc11::color_mode();
         assert_eq!(

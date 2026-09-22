@@ -949,7 +949,6 @@ mod tests {
     use super::*;
     use crate::eval::harness::TrialResult;
     use crate::eval::rca::CandidateModule;
-    use crate::goal::condition::Comparison;
 
     #[test]
     fn test_sanitize_id() {

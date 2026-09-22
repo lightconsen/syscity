@@ -4,7 +4,6 @@
 
 pub use std::collections::VecDeque;
 pub use std::path::Path;
-use std::sync::Arc;
 pub use std::time::Duration;
 
 pub use futures_util::{SinkExt, StreamExt};

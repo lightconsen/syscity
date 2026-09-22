@@ -232,7 +232,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_chunk_content_max_len_zero() {
         let chunks = chunk_content("hello", 0);
         assert_eq!(chunks, vec!["hello"]);

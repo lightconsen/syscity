@@ -296,7 +296,7 @@ async fn plan_mode_hides_and_refuses_everything_not_read_only() {
 
 #[tokio::test]
 async fn accept_edits_pre_approves_write_category_tools() {
-    let ran = Arc::new(AtomicBool::new(false));
+    let _ran = Arc::new(AtomicBool::new(false));
     let approval_queue = Arc::new(ApprovalQueue::new());
     let mut registry = ToolRegistry::new()
         .with_approval_queue(approval_queue.clone())

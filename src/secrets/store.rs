@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
 use tracing::warn;
 use zeroize::Zeroize;
 

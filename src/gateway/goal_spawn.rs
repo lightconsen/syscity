@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(messages.len(), 2, "only terminal events write back");
         // Both messages land within the same millisecond, so ordering between
         // them is not guaranteed — assert by content, not position.
-        for (_, role, content, ..) in &messages {
+        for (_, role, _, ..) in &messages {
             assert_eq!(role, "assistant");
         }
         let aborted = messages

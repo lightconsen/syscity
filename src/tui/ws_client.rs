@@ -474,7 +474,7 @@ mod tests {
         let gateway = TestGateway::start().await;
         let auth = AuthConfig::None;
         let url = auth.ws_url("127.0.0.1", gateway.port, None, "tui");
-        let (mut client, _) = WsClient::connect(&url, &auth, &["chat"])
+        let (client, _) = WsClient::connect(&url, &auth, &["chat"])
             .await
             .expect("connect");
 

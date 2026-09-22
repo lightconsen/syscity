@@ -344,7 +344,7 @@ mod tests {
 
         // Compute checksum: sum of all bytes in hdr, treating
         // bytes 148-155 (the checksum field) as spaces.
-        let saved_chk = hdr[148..156].to_vec();
+        let _saved_chk = hdr[148..156].to_vec();
         hdr[148..156].copy_from_slice(b"        ");
         let cksum: u32 = hdr.iter().map(|&b| b as u32).sum();
         let cksum_str = format!("{:06o}\0 ", cksum);

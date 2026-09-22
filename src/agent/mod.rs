@@ -809,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_skill_manager_injection_into_build_fresh_context() {
         // Create skill manager and load built-in skills
-        let mut skill_manager = crate::skills::SkillManager::new(crate::dirs::paths())
+        let skill_manager = crate::skills::SkillManager::new(crate::dirs::paths())
             .await
             .unwrap();
         let loaded = skill_manager.load_all().await.unwrap();
@@ -850,7 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_skill_catalog_stable_regardless_of_message() {
-        let mut skill_manager = crate::skills::SkillManager::new(crate::dirs::paths())
+        let skill_manager = crate::skills::SkillManager::new(crate::dirs::paths())
             .await
             .unwrap();
         skill_manager.load_all().await.unwrap();

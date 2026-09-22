@@ -10,7 +10,6 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Position;
 use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use unicode_width::UnicodeWidthStr;
 
 use syscity::tui::scrollback;
 use syscity::tui::state::{AppState, ConnectionState, LiveMode};

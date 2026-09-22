@@ -266,7 +266,6 @@ pub fn shared_store() -> SharedGoalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goal::condition::Comparison;
     use crate::goal::runner::RoundResult;
 
     fn sample_state(goal_id: &str) -> PersistedGoalState {

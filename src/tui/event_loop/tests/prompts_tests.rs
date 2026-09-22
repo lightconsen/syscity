@@ -21,7 +21,7 @@ use super::support::*;
 async fn a_refused_decision_keeps_the_prompt() {
     let gateway = TestGateway::start().await;
     gateway.fail_with("approvals.approve", "INTERNAL");
-    let (state, mut client) = state_with_approval(&gateway).await;
+    let (state, client) = state_with_approval(&gateway).await;
 
     handle_approval_action(TuiAction::InputChar('y'), &state, &client)
         .await
@@ -51,7 +51,7 @@ async fn a_refused_decision_keeps_the_prompt() {
 async fn a_decision_for_a_resolved_approval_retires_the_prompt() {
     let gateway = TestGateway::start().await;
     gateway.fail_with("approvals.approve", "NOT_FOUND");
-    let (state, mut client) = state_with_approval(&gateway).await;
+    let (state, client) = state_with_approval(&gateway).await;
 
     handle_approval_action(TuiAction::InputChar('y'), &state, &client)
         .await
@@ -79,7 +79,7 @@ async fn a_decision_for_a_resolved_approval_retires_the_prompt() {
 #[tokio::test]
 async fn ctrl_c_dismisses_the_prompt_without_answering_it() {
     let gateway = TestGateway::start().await;
-    let (state, mut client) = state_with_approval(&gateway).await;
+    let (state, client) = state_with_approval(&gateway).await;
 
     handle_approval_action(TuiAction::Abort, &state, &client)
         .await
