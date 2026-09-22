@@ -21,7 +21,7 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: |
@@ -110,7 +110,7 @@ jobs:
     name: MSRV Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: |
@@ -135,7 +135,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: |
@@ -202,7 +202,7 @@ jobs:
     name: Test local-embeddings feature
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: |
@@ -260,7 +260,7 @@ jobs:
     name: Test (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: brew install protobuf
@@ -313,7 +313,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         features: [default, all-features]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies (Ubuntu)
         if: runner.os == 'Linux'
@@ -374,7 +374,7 @@ jobs:
     name: Frontend Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pnpm
         uses: pnpm/action-setup@v3
@@ -415,7 +415,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -438,7 +438,7 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         run: |
@@ -511,7 +511,7 @@ jobs:
     name: Plugin SDK Boundary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check plugin SDK boundary
         run: |
           chmod +x scripts/check-plugin-boundary.sh
