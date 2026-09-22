@@ -287,7 +287,7 @@ num_variations = 3
 ### VectorMemoryConfig 新增字段
 
 ```rust
-// src/gateway/config.rs
+// src/gateway/config/memory.rs
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorMemoryConfig {
@@ -345,7 +345,7 @@ if mqc.enabled && mqc.num_variations > 0 {
 | `src/rag/multi_query.rs` | **新增** | `expand_query()` + `merge_results()` + `MultiQueryConfig` |
 | `src/rag/mod.rs` | 修改 | 添加 `pub mod multi_query;` |
 | `src/memory/vector.rs` | 修改 | 添加 `multi_query_provider`、`multi_query_config` 字段、`with_multi_query()`、`search_multi_query()` |
-| `src/gateway/config.rs` | 修改 | `VectorMemoryConfig` 添加 `multi_query: MultiQueryConfig` 字段 |
+| `src/gateway/config/memory.rs` | 修改 | `VectorMemoryConfig` 添加 `multi_query: MultiQueryConfig` 字段 |
 | `src/gateway/init/services.rs` | 修改 | 注入 Multi-Query provider |
 
 ## 8. 注意事项

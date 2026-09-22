@@ -263,7 +263,7 @@ Surfaces:
   `202 Accepted`), `GET /api/v1/update/progress` (phase/percent). The daemon
   restarts itself via a detached `syscity restart --pid <old>` helper that
   waits for the old process to exit before starting the new binary. The
-  endpoints are registered in `src/gateway/lifecycle.rs` and governed by
+  endpoints are registered in `build_router` in `src/gateway/lifecycle/router.rs` and governed by
   `[update]` in the config.
 - **Desktop** — the Tauri updater plugin with minisign-signed bundles
   (pubkey in `desktop/tauri.conf.json`; the private key lives in the

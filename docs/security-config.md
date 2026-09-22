@@ -4,7 +4,7 @@ This guide covers how to configure Syscity's security: authentication modes,
 rate limiting, CORS/CSP headers, device pairing, and trusted proxies.
 
 All settings live under the `[security]` table in `~/.syscity/syscity.toml`.
-The implementation lives in `src/gateway/config.rs` (`SecurityConfig`) and
+The implementation lives in `SecurityConfig` in `src/gateway/config/security.rs` and
 `src/security/`. For the module-level design, see
 [modules/security.md](modules/security.md).
 

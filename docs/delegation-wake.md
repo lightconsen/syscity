@@ -4,12 +4,12 @@ Status: **Implemented** — v1 (`wait`) and v2 (wake) both shipped.
 
 > Implementation notes (the sections below remain the original design record):
 >
-> - `wait` lives in `src/tools/delegate_tool.rs` with `MAX_WAIT_SECONDS = 60`
+> - `wait` lives in `DelegateTool::execute_inner` in `src/tools/delegate_tool/tool.rs`, with `MAX_WAIT_SECONDS = 60` in `src/tools/delegate_tool/mod.rs`
 >   and returns `Ok("still running …")` on timeout — never `Err`, so the
 >   circuit breaker is untouched. The shipped timeout text is the v2 wording:
 >   *"End your turn — you will be woken with its result when it completes."*
 > - Wake lives in `src/delegation/wake.rs` (`DelegationWake`), wired in
->   `src/gateway/lifecycle.rs`. Instead of a retry loop it uses a **coalescing
+>   `start_gateway` in `src/gateway/lifecycle/start.rs`. Instead of a retry loop it uses a **coalescing
 >   drain**: near-simultaneous child completions are buffered per parent
 >   session and joined into a single wake turn; completions that land while a
 >   wake turn is running are picked up by the next drain pass, so no
@@ -21,7 +21,7 @@ Status: **Implemented** — v1 (`wait`) and v2 (wake) both shipped.
 >   so dead executions no longer read as "running" forever.
 > - **Push events (TUI agent rows)**: task changes no longer live only in the
 >   store. `DelegationTaskStore` carries an event sink (task ids only); the
->   gateway runs `delegation_event_forwarder` (`src/gateway/lifecycle.rs`),
+>   gateway runs `delegation_event_forwarder` in `src/gateway/lifecycle/start.rs`,
 >   which re-reads each row and publishes `GatewayEvent::DelegationTaskUpdated`
 >   → the WS event `delegation.updated` with a self-sufficient snapshot
 >   (`DelegationTaskSnapshot`). Routing rides a new `parent_session` column:
@@ -61,7 +61,7 @@ description.
 
 ## 1. Problem
 
-Current delegation flow (see `src/tools/delegate_tool.rs`):
+Current delegation flow (see `src/tools/delegate_tool/`):
 
 ```
 parent turn:  delegate spawn(child)
@@ -81,11 +81,13 @@ parent turn:  already ended — nobody collects the result
 ### 1.1 Root causes
 
 1. **The tool contract pushes polling onto the model.** `delegate spawn`
-   returns only `child_id` (`delegate_tool.rs:811-903`); there is no
+   returns only `child_id` (`DelegateTool::execute_inner` in
+   `src/tools/delegate_tool/tool.rs`); there is no
    synchronous way to wait for the outcome, so the model must decide how many
    times to poll `status`.
 2. **Misleading description.** `delegate`'s description claims *"Progress and
-   results are relayed to the parent"* (`delegate_tool.rs:705-722`) — results
+   results are relayed to the parent"* (`DelegateTool::description` in
+   `src/tools/delegate_tool/tool.rs`) — results
    are **not** auto-relayed; the parent must poll.
 3. **`status` output gives no next-step guidance.** The model sees
    `Child <id> status: Running` with no instruction on what to do.
@@ -117,7 +119,7 @@ code changes when wake lands; only the timeout message wording and the
 ### 3.1 The 120 s tool-call hard ceiling
 
 Every tool call is wrapped in `tokio::time::timeout(context.timeout(), …)`
-(`src/tools/registry.rs:1132-1148`); the turn engine applies
+(`ToolRegistry::execute_call` in `src/tools/registry/streaming.rs`); the turn engine applies
 `with_timeout(Duration::from_secs(120))` (`src/agent/agent_engine.rs:1437` and
 `:1894`), and the HTTP/SSE layer has a matching 120 s window
 (`src/gateway/handlers/openai.rs:106/174`).
@@ -128,8 +130,9 @@ fails.
 
 ### 3.2 The circuit breaker
 
-`CIRCUIT_BREAKER_THRESHOLD = 3` (`src/tools/registry.rs:110`). An `Err` from a
-tool call triggers `record_failure` (`registry.rs:169-183`); three consecutive
+`CIRCUIT_BREAKER_THRESHOLD = 3` (the associated const on `ToolRegistry` in
+`src/tools/registry/mod.rs`). An `Err` from a
+tool call triggers `ToolRegistry::record_failure` in `src/tools/registry/mod.rs`; three consecutive
 failures degrade the tool and disable **all** `delegate` actions.
 
 **Consequence:** `wait` must never return `Err` on timeout. Its timeout returns
@@ -141,21 +144,21 @@ the model, not a tool fault.
 ### 3.3 Deadlock red line
 
 The `DelegationTracker` is `Arc<RwLock<HashMap<String, ChildAgent>>>`
-(`delegate_tool.rs:112`). A poll loop must **never hold the lock across a
+(the `DelegationTracker` struct in `src/tools/delegate_tool/mod.rs`). A poll loop must **never hold the lock across a
 sleep/await**: snapshot → release lock → sleep → snapshot.
 
 ### 3.4 The tracker is shared between parent and child
 
 `spawn_child` clones the parent's tracker into the child task
-(`delegate_tool.rs:409`); the child's `execute_child_task` writes status via
-`tracker.set_result` (`delegate_tool.rs:613`) into the **same** map the
+(`DelegateTool::spawn_child` in `src/tools/delegate_tool/tool.rs`); the child's `execute_child_task` writes status via
+`DelegationTracker::set_result` in `src/tools/delegate_tool/mod.rs` into the **same** map the
 parent's tool instance reads. So `wait` can poll `tracker.get_child(id)` and
 reliably observe transitions to `Completed`/`Failed`.
 
 ### 3.5 Who a child may run as (`target_agent`)
 
 `TaskSpec.target_agent` is parsed out of the **model's** tool arguments (the
-`task_json` handling in `delegate_tool.rs`), which makes it a privilege
+`task_json` handling in `DelegateTool::execute_inner` in `src/tools/delegate_tool/tool.rs`), which makes it a privilege
 selector rather than a routing hint from the operator: the child runs as the
 agent that name resolves to, and therefore with that agent's workspace, secrets
 and skill trust.
@@ -207,7 +210,7 @@ wait(child_id, [seconds]):
 
 ### 4.3 Supporting changes (v1)
 
-- **Fix the `delegate` description** (`delegate_tool.rs:705-722`): remove the
+- **Fix the `delegate` description** (`DelegateTool::description` in `src/tools/delegate_tool/tool.rs`): remove the
   false "Progress and results are relayed to the parent" claim. State instead:
   *spawn returns a child id; call `wait` to block for the result; if it reports
   still running, do not blindly poll — follow the timeout guidance.*
@@ -228,7 +231,7 @@ and the snapshot/sleep loop are identical in both phases.
 
 | Need | Source |
 |---|---|
-| Trigger point | child completion paths in `execute_child_task` (`delegate_tool.rs:613-658`), alongside `coordinator.maybe_advance` |
+| Trigger point | child completion paths in `execute_child_task` in `src/tools/delegate_tool/child_task.rs`, alongside `coordinator.maybe_advance` |
 | Parent session key | `registry.get_run(child_id).parent_session` (`subagent_registry.rs:364`, field at `:38`); recorded at spawn as `context.user_id` — for the root it is the user session, for a delegated parent it is `delegation:<parent_id>` (already a full session key) |
 | Parent `Arc<Agent>` | **the one structural gap** — needs a session → agent bridge (§5.2) |
 
@@ -247,7 +250,7 @@ The parent's agent resolves one of two ways:
   `delegation_tasks.agent_id` for the parent task, then `AgentResolver.resolve(agent_id)`.
 
 Inject a resolver into the delegation layer, assembled in
-`src/gateway/lifecycle.rs`:
+`start_gateway` in `src/gateway/lifecycle/start.rs`:
 
 ```
 type WakeResolver = Arc<dyn Fn(&str) -> Option<Arc<Agent>> + Send + Sync>;
@@ -256,7 +259,7 @@ type WakeResolver = Arc<dyn Fn(&str) -> Option<Arc<Agent>> + Send + Sync>;
 ```
 
 This is the same seam where the existing `AgentResolver` is injected today
-(`lifecycle.rs:208`, "Register delegation tool with agent resolver").
+(in `start_gateway`, `src/gateway/lifecycle/start.rs`, "Register delegation tool with agent resolver").
 
 ### 5.3 Wake action
 
@@ -318,10 +321,10 @@ woken-turn completion is a UX decision, not a mechanism blocker.
 
 | # | Task | File(s) |
 |---|---|---|
-| 1.1 | Add `wait` action: budgeted poll on the shared tracker; `Ok`-not-`Err` on timeout; clamp ≤ 60 s | `src/tools/delegate_tool.rs` |
-| 1.2 | Fix `delegate` description (remove false relay claim; document `wait`) | `src/tools/delegate_tool.rs:705-722` |
-| 1.3 | `status` output: one-line next-step hint | `src/tools/delegate_tool.rs` |
-| 1.4 | Unit tests (§8) | `src/tools/delegate_tool.rs` |
+| 1.1 | Add `wait` action: budgeted poll on the shared tracker; `Ok`-not-`Err` on timeout; clamp ≤ 60 s | `DelegateTool::execute_inner` in `src/tools/delegate_tool/tool.rs` |
+| 1.2 | Fix `delegate` description (remove false relay claim; document `wait`) | `DelegateTool::description` in `src/tools/delegate_tool/tool.rs` |
+| 1.3 | `status` output: one-line next-step hint | `src/tools/delegate_tool/tool.rs` |
+| 1.4 | Unit tests (§8) | `src/tools/delegate_tool/tests.rs` |
 
 **Acceptance:** the model can get an in-turn result for children that complete
 within ~60 s; on timeout the model receives a clear "still running" result and
@@ -332,9 +335,9 @@ the circuit breaker is never tripped by a `wait`.
 | # | Task | File(s) |
 |---|---|---|
 | 2.1 | `DelegationWake` module: notify + busy retry + pending-buffer merge | `src/delegation/wake.rs` (new) |
-| 2.2 | Hook notify into `execute_child_task` completion/error paths | `src/tools/delegate_tool.rs:613-658` |
-| 2.3 | Session → agent bridge (root via router, delegated via `delegation_tasks.agent_id`) | `src/gateway/lifecycle.rs` |
-| 2.4 | Flip timeout text + description to v2 wording | `src/tools/delegate_tool.rs` |
+| 2.2 | Hook notify into `execute_child_task` completion/error paths | `execute_child_task` in `src/tools/delegate_tool/child_task.rs` |
+| 2.3 | Session → agent bridge (root via router, delegated via `delegation_tasks.agent_id`) | `start_gateway` in `src/gateway/lifecycle/start.rs` |
+| 2.4 | Flip timeout text + description to v2 wording | `src/tools/delegate_tool/tool.rs` |
 | 2.5 | Wake condition (root still has non-completed children); unit tests | `src/delegation/wake.rs` |
 
 **Acceptance:** child completes after the parent's turn ended → the parent is
@@ -355,9 +358,9 @@ wake loop; no duplicate concurrent turns.
 
 | File | v1 | v2 |
 |---|---|---|
-| `src/tools/delegate_tool.rs` | `wait` action, description fix, status hint | notify hook, resolver field |
+| `src/tools/delegate_tool/` | `wait` action, description fix, status hint | notify hook, resolver field |
 | `src/delegation/wake.rs` (new) | — | notify + busy retry + merge |
-| `src/gateway/lifecycle.rs` | — | session → agent closure assembly |
+| `src/gateway/lifecycle/start.rs` | — | session → agent closure assembly |
 | `src/agent/agent_engine.rs` | — | none (turns reuse `process_message_with_progress`) |
 
 ---
@@ -408,11 +411,11 @@ cargo test --lib delegation::
 
 ## 10. References
 
-- Delegate tool + tracker: `src/tools/delegate_tool.rs`
-  - description overpromise: `:705-722`; completion/error paths: `:613-658`;
-    tracker clone into child: `:409`; `set_result`: `:179`
-- Registry / timeouts / breaker: `src/tools/registry.rs`
-  - `execute_call` timeout wrap: `:1132-1148`; `CIRCUIT_BREAKER_THRESHOLD = 3`: `:110`
+- Delegate tool + tracker: `src/tools/delegate_tool/`
+  - description overpromise: `DelegateTool::description` in `tool.rs`; completion/error paths: `execute_child_task` in `child_task.rs`;
+    tracker clone into child: `DelegateTool::spawn_child` in `tool.rs`; `set_result`: `DelegationTracker::set_result` in `mod.rs`
+- Registry / timeouts / breaker: `src/tools/registry/`
+  - `execute_call` timeout wrap: `ToolRegistry::execute_call` in `streaming.rs`; `CIRCUIT_BREAKER_THRESHOLD = 3`: the associated const in `mod.rs`
 - Agent turn engine: `src/agent/agent_engine.rs` (`with_timeout(120 s)`: `:1437`/`:1894`)
 - Subagent registry: `src/agent/subagent_registry.rs` (`get_run`: `:364`,
   `parent_session`: `:38`, detached `tokio::spawn`: `:249`)

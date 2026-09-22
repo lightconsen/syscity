@@ -18,7 +18,7 @@ P2（有规避方案的功能/可靠性缺陷）、P3+（维护性）。
 | **SEC-003** | P1 | session 对象所有权 | 🔒 **按设计关闭** | 单主体模型成立：不支持一实例多主体，"多用户是设计变更不是配置项"（`docs/security-config.md` "Deployment model" 一节）。原"owner middleware"建议作废 |
 | **SEC-004** | P1 | artifact 路由 / symlink | ✅ **已修** | 路由挂 essential 公共层（项目规则有明文豁免段，`CLAUDE.md` "File/static download"）；symlink 防护已做：canonicalize 根与文件的**父目录**、final component 刻意不 canonicalize（macOS NFC/NFD，`src/gateway/handlers/artifacts.rs:182`）；404 而非 403 语义保留 |
 | **SEC-005** | P1 | agent_id / 导入路径边界 | ⏳ **未清账** | 原判"中高，待 E3"未复核；若 agent id 构造与 import 参数已过 `AgentId`/canonical 约束请补充证据并改状态 |
-| **SEC-006** | P1 | webhook fail-open | ✅ **已修** | `src/gateway/webhooks.rs` 全线 fail-closed：WhatsApp HMAC secret **必需**（缺失/缺头/错签一律拒，:236-258）、Lark challenge 无 secret 拒绝（:188-203）；secretless 渠道启动时统一警告（`lifecycle.rs:40 warn_on_secretless_webhook_channels`）。**时间窗防重放（Slack/Feishu）仍未确认**——登记保留 |
+| **SEC-006** | P1 | webhook fail-open | ✅ **已修** | `src/gateway/webhooks/` 全线 fail-closed：WhatsApp HMAC secret **必需**（缺失/缺头/错签一律拒，`whatsapp_webhook_handler` in `whatsapp.rs`）、Lark challenge 无 secret 拒绝（`feishu_webhook_handler` in `feishu.rs`）；secretless 渠道启动时统一警告（`warn_on_secretless_webhook_channels` in `lifecycle/start.rs`）。**时间窗防重放（Slack/Feishu）仍未确认**——登记保留 |
 | **SEC-007** | P1 | CORS `*` + credentials | ⏳ **未清账** | `CorsConfig` 已是 allowlist 形状（`allowed_origins` 列表），但"默认值是否仍 `*` + mirror origin + credentials 组合"未复核。启用 cookie/session 前必须清掉这条 |
 | **SEC-008** | P1/P2 | 事件广播越主体 | ⏳ **部分未清** | 按会话分发已做（WS `audience_of`：ApprovalRequired/AgentResponse/Thinking 等路由到 session）；**设备、渠道、MCP、AgentStatus 级事件仍广播全体连接**——单主体下是元数据噪音，多主体部署前必须收紧 |
 | **SEC-009** | P2 | 凭据暴露 | ⏳ **未清账** | 短时 ticket 已有（`/api/v1/ws-ticket` + `?ticket=`，升级 URL 长期 token 有一次性警告）；localStorage 长期 token 与日志脱敏未复核 |

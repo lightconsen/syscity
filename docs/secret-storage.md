@@ -368,8 +368,9 @@ src/secrets/
   connect.
 - `src/gateway/ws.rs`: mcp.add env writes to `route_store("mcp-env")`; list
   reads `has_entity`.
-- `src/gateway/webhooks.rs:438`: `resolve_channel_credential(..,
-  "webhook_secret", ..)`.
+- `src/gateway/webhooks/`: `resolve_channel_credential(..,
+  "webhook_secret", ..)`, called from `feishu.rs`, `generic.rs` and
+  `wechatmp.rs`.
 - `src/gateway/handlers/plugins.rs:279`: signing key read via
   `route_store("plugin")`.
 - `src/mcp/oauth.rs`: access memory-only, refresh persisted, metadata 0600
