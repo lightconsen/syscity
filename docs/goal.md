@@ -226,7 +226,7 @@ Gateway 集成：
 - `src/gateway/commands/agents.rs` — `/goal` 命令处理（start / cancel / list / resume）
 - `src/gateway/goal_spawn.rs` — suspended goal 列表、从 checkpoint 重建 runner（runner 注册为
   `goal:{id}`、事件 relay 注册为 `goal-relay:{id}`，停机统一排空）、终态回写父会话
-- `src/gateway/lifecycle.rs` — 启动时记录 suspended goals（不自动恢复）；停机时以 abort
+- `src/gateway/lifecycle/`（`start_gateway` / `stop_gateway`）— 启动时记录 suspended goals（不自动恢复）；停机时以 abort
   语义排空所有 goal 任务
 - `src/gateway/protocol.rs` — `gateway.progress` 事件序列化
 - `src/gateway/ws.rs` — WebSocket 路由到订阅 session
