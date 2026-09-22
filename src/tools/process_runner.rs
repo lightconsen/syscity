@@ -1380,6 +1380,32 @@ mod tests {
         }
     }
 
+    /// The fence descriptor is platform-neutral (`WriteFence::new` computes
+    /// the protected carve-outs for every runner), so its shape is asserted
+    /// here rather than only in the per-platform fence modules.
+    #[test]
+    fn write_fence_new_computes_protected_paths() {
+        let f = WriteFence::new(
+            std::path::PathBuf::from("/tmp/ws"),
+            vec![std::path::PathBuf::from("/tmp/extra")],
+            false,
+        );
+        for root in ["/tmp/ws", "/tmp/extra"] {
+            for name in PROTECTED_WRITE_NAMES {
+                assert!(
+                    f.protected_paths
+                        .contains(&std::path::PathBuf::from(format!("{root}/{name}"))),
+                    "protected path {root}/{name} missing from {:?}",
+                    f.protected_paths
+                );
+            }
+        }
+        assert!(!f.deny_network, "the default posture leaves the network alone");
+
+        let denied = WriteFence::new(std::path::PathBuf::from("/tmp/ws"), Vec::new(), true);
+        assert!(denied.deny_network, "the requested posture is carried through");
+    }
+
     #[tokio::test]
     async fn test_run_captures_stdout() {
         let out = StdProcessRunner
@@ -1612,6 +1638,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     mod seatbelt {
         use super::*;
 
@@ -1906,10 +1933,11 @@ mod tests {
         use super::*;
 
         fn fence(workspace_root: &str, allowed: &[&str]) -> WriteFence {
-            WriteFence {
-                workspace_root: std::path::PathBuf::from(workspace_root),
-                allowed_paths: allowed.iter().map(std::path::PathBuf::from).collect(),
-            }
+            WriteFence::new(
+                std::path::PathBuf::from(workspace_root),
+                allowed.iter().map(std::path::PathBuf::from).collect(),
+                false,
+            )
         }
 
         #[test]
@@ -2024,10 +2052,11 @@ mod tests {
         use super::*;
 
         fn fence(workspace_root: &str, allowed: &[&str]) -> WriteFence {
-            WriteFence {
-                workspace_root: std::path::PathBuf::from(workspace_root),
-                allowed_paths: allowed.iter().map(std::path::PathBuf::from).collect(),
-            }
+            WriteFence::new(
+                std::path::PathBuf::from(workspace_root),
+                allowed.iter().map(std::path::PathBuf::from).collect(),
+                false,
+            )
         }
 
         fn win_argv(cmd: &str) -> ProcessRequest {

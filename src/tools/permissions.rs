@@ -286,7 +286,7 @@ impl PermissionsRuntime {
     }
 
     /// Take a cheap snapshot for the gate's hot path.
-    pub(crate) fn snapshot(&self) -> Snapshot {
+    fn snapshot(&self) -> Snapshot {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 

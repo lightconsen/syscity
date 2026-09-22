@@ -104,7 +104,7 @@ async fn remember_allow_rule(state: &Arc<GatewayState>, rule: &str) -> crate::Re
     let config = Arc::make_mut(&mut guard);
     config.permissions.allow.push(rule.to_string());
     if let Some(config_path) = state.config_path.clone() {
-        crate::gateway::handlers::config::persist_config_atomic(&config, &config_path)
+        crate::gateway::handlers::config::persist_config_atomic(config, &config_path)
             .await
             .map_err(|e| crate::SyscityError::Validation(format!("persist failed: {e}")))?;
     }
