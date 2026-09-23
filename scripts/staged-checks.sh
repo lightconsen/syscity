@@ -116,7 +116,9 @@ else
         local out
         out=$(git grep --cached -I -n -E "$@" -e "$pattern" -- "${STAGED[@]}" 2>/dev/null || true)
         if [ -n "$out" ]; then
-            out=$(printf '%s\n' "$out" | grep -vE '# secret-scan-ok[[:space:]]*$' || true)
+            # Suppression markers are language-aware: `#` for shell/config,
+        # `//` for Rust/C-style sources, `--` for SQL.
+        out=$(printf '%s\n' "$out" | grep -vE '(#|//|--)[[:space:]]*secret-scan-ok[[:space:]]*$' || true)
         fi
         printf '%s' "$out"
     }
