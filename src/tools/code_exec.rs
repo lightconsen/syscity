@@ -183,6 +183,7 @@ print(json.dumps(result))
                     context.workspace_root().clone(),
                     context.allowed_paths().to_vec(),
                     context.fence_network(),
+                    context.fence_namespaces(),
                 )
             }),
             ..Default::default()

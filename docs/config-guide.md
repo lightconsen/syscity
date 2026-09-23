@@ -179,6 +179,16 @@ auth_required = true
 auth_mode = "jwt"           # jwt, none, tailscale, trusted_proxy
 # shared_token = "..."      # simple shared secret auth
 
+# Kernel fence postures for workspace-only command tools (shell, execute_code,
+# process). fence_network denies outbound network to fenced commands (default
+# off — networked commands are ordinary work). fence_namespaces controls the
+# Linux namespace view (read-only root, private /tmp): auto builds it when the
+# kernel allows unprivileged user namespaces and degrades with a warning
+# otherwise, off never builds it, require refuses to run a fenced command the
+# view cannot be built for. Linux only; changes affect agents spawned after.
+# fence_network = false
+# fence_namespaces = "auto"  # auto, off, require
+
 [security.rate_limit]
 enabled = true
 capacity = 60               # max requests per window

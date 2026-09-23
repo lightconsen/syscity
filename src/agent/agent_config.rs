@@ -40,6 +40,11 @@ pub struct AgentConfig {
     /// context, can read the posture).
     #[serde(default)]
     pub fence_network: bool,
+    /// Whether the Linux runner builds a namespace view (read-only root,
+    /// private `/tmp`) around this agent's fenced command tools (see
+    /// `SecurityConfig::fence_namespaces`, which is copied here at spawn).
+    #[serde(default)]
+    pub fence_namespaces: crate::tools::process_runner::NamespacePosture,
     /// Model to use for LLM-powered context compaction.
     ///
     /// When `None`, the agent's primary model is used.  Set to a cheaper/faster
@@ -126,6 +131,7 @@ Use rich formatting for lists, structured data, and technical content:
             workspace_dir: None,
             workspace_only: false,
             fence_network: false,
+            fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             heartbeat: None,
             agent_id: None,
             reflection_config: None,

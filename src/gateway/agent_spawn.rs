@@ -97,10 +97,12 @@ pub(crate) async fn spawn_agent_inner(
     mut config: AgentConfig,
 ) -> crate::Result<()> {
     config.agent_id = Some(id.clone());
-    // The fence network posture is a deployment-level security setting; every
-    // spawn path funnels through here, so applying it here is what keeps a
-    // named agent (whose config comes from its own file) from missing it.
-    config.fence_network = state.config.read().await.security.fence_network;
+    // The fence postures are deployment-level security settings; every spawn
+    // path funnels through here, so applying them here is what keeps a named
+    // agent (whose config comes from its own file) from missing them.
+    let security = &state.config.read().await.security;
+    config.fence_network = security.fence_network;
+    config.fence_namespaces = security.fence_namespaces;
     info!("Spawning agent: {}", id);
 
     // Capture the base config before merging per-agent overrides so a later

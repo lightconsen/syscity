@@ -459,6 +459,7 @@ mod tests {
             workspace_dir: None,
             workspace_only: false,
             fence_network: false,
+            fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             heartbeat: Some(crate::heartbeat::HeartbeatConfig {
                 enabled: true,
                 interval_seconds: 120,

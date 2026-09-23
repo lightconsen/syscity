@@ -218,6 +218,7 @@ impl Agent {
             .with_agent_workspace(agent_workspace.clone())
             .with_workspace_only(cfg.workspace_only)
             .with_fence_network(cfg.fence_network)
+            .with_fence_namespaces(cfg.fence_namespaces)
             .with_model_name(self.model.clone().unwrap_or_default())
             .with_provider_name(self.provider.name().to_string())
             .with_sender_id(user_id);
@@ -816,6 +817,22 @@ mod tests {
     fn test_agent_id_populated_from_config() {
         let agent = named_agent();
         assert_eq!(agent.agent_id, "worker");
+    }
+
+    /// The fence postures ride from the agent config into every tool context
+    /// — this is the last hop of the `[security]` → agent → tool wiring, and
+    /// `fence_network` never had a test for it.
+    #[test]
+    fn test_fence_postures_reach_the_tool_context() {
+        let agent = named_agent();
+        let mut config = agent.config_snapshot();
+        config.fence_network = true;
+        config.fence_namespaces = crate::tools::process_runner::NamespacePosture::Require;
+        agent.update_config(config);
+
+        let ctx = agent.build_tool_context("user", "conv-1", None);
+        assert!(ctx.fence_network());
+        assert_eq!(ctx.fence_namespaces(), crate::tools::process_runner::NamespacePosture::Require);
     }
 
     #[tokio::test]

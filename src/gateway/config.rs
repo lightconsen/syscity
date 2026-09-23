@@ -1215,6 +1215,20 @@ pub struct SecurityConfig {
     /// fenced command in the deployment.
     #[serde(default)]
     pub fence_network: bool,
+    /// Whether the Linux runner builds a namespace view (read-only root,
+    /// private `/tmp`, working trees re-bound on top) around fenced command
+    /// tools, in addition to the Landlock write rules.
+    ///
+    /// `auto` (default) builds the view when the kernel allows unprivileged
+    /// user namespaces and degrades with a `warn!` when it does not — a
+    /// container or hardened sysctl is an environment fact, not an attack.
+    /// `off` never builds it (Landlock and seccomp still apply); `require`
+    /// refuses to run a fenced command the view cannot be built for. Applies
+    /// to Linux only; macOS (Seatbelt) and Windows (AppContainer) already
+    /// confine their own views. Changing this only affects agents spawned
+    /// afterwards.
+    #[serde(default)]
+    pub fence_namespaces: crate::tools::process_runner::NamespacePosture,
 }
 
 fn default_tailscale_ttl() -> u64 {
@@ -1357,6 +1371,7 @@ impl Default for SecurityConfig {
             trusted_proxy: crate::security::trusted_proxy::TrustedProxyConfig::default(),
             credential_precedence: CredentialPrecedence::default(),
             fence_network: false,
+            fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
         }
     }
 }
@@ -1973,6 +1988,31 @@ shared_token = "abc"
         assert!(!parsed.security.auth_required);
         assert_eq!(parsed.host, "127.0.0.1");
         assert_eq!(parsed.port, 18080);
+    }
+
+    /// `[security] fence_namespaces` parses all three postures, defaults to
+    /// `auto` when the key is absent, and rejects unknown spellings — a
+    /// typo'd posture silently meaning "off" would be a fence with a hole.
+    #[test]
+    fn fence_namespaces_posture_parses_and_defaults() {
+        assert_eq!(
+            SecurityConfig::default().fence_namespaces,
+            crate::tools::NamespacePosture::Auto,
+            "the default posture is auto"
+        );
+        for (text, expected) in [
+            ("auto", crate::tools::NamespacePosture::Auto),
+            ("off", crate::tools::NamespacePosture::Off),
+            ("require", crate::tools::NamespacePosture::Require),
+        ] {
+            let toml_str = format!("[security]\nfence_namespaces = \"{text}\"\n");
+            let parsed: GatewayConfig = toml::from_str(&toml_str).expect(text);
+            assert_eq!(parsed.security.fence_namespaces, expected, "posture {text}");
+        }
+        assert!(
+            toml::from_str::<GatewayConfig>("[security]\nfence_namespaces = \"yes\"\n").is_err(),
+            "an unknown posture must fail the parse, not fall back"
+        );
     }
 
     #[test]

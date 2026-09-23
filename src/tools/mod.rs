@@ -114,7 +114,9 @@ pub use nodes::NodesTool;
 pub use patch::ApplyPatchTool;
 pub use pdf::PdfTool;
 pub use process::ProcessTool;
-pub use process_runner::{CommandOutput, ProcessError, ProcessRequest, ProcessRunner, StdioMode};
+pub use process_runner::{
+    CommandOutput, NamespacePosture, ProcessError, ProcessRequest, ProcessRunner, StdioMode,
+};
 pub use report::WriteReportTool;
 pub use sandbox::{SandboxConfig, SandboxedTool};
 pub use sdk::{

@@ -20,6 +20,7 @@ use std::time::Duration;
 use std::os::unix::process::ExitStatusExt;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
@@ -54,6 +55,30 @@ pub enum StdioMode {
     Piped,
 }
 
+/// When to build the Linux namespace view (read-only root, private `/tmp`)
+/// around a fenced command, in addition to the Landlock write rules and the
+/// seccomp escape-vector deny list.
+///
+/// Serialized into `[security]` and per-agent config; carried on
+/// [`WriteFence`] so the per-call fence builder can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NamespacePosture {
+    /// Build the view when the kernel allows unprivileged user namespaces;
+    /// degrade to the rules alone (with a `warn!`) when it does not — a
+    /// container or a hardened sysctl is an environment fact, not an attack.
+    /// The default.
+    #[default]
+    Auto,
+    /// Never build the view. Landlock and seccomp still apply; only the
+    /// read-only root and the private `/tmp` are given up. For deployments
+    /// where the view gets in the way (shared bind mounts, `/tmp` handoffs).
+    Off,
+    /// Refuse to run the command at all when the view cannot be built —
+    /// fail closed rather than run with less than the deployment asked for.
+    Require,
+}
+
 /// Write-fence descriptor, platform-neutral.
 ///
 /// When present on a [`ProcessRequest`], the platform runner confines the
@@ -84,6 +109,10 @@ pub struct WriteFence {
     /// and cannot subtract a subtree from a granted root. Windows enforces
     /// the roots but not these carve-outs yet.
     pub protected_paths: Vec<std::path::PathBuf>,
+    /// Whether the Linux runner builds a private filesystem view (read-only
+    /// root, private `/tmp`) around the command. Linux-only; every other
+    /// runner ignores it. See [`NamespacePosture`].
+    pub namespaces: NamespacePosture,
 }
 
 /// Directory names that are never writable, even inside a granted root.
@@ -101,6 +130,7 @@ impl WriteFence {
         workspace_root: std::path::PathBuf,
         allowed_paths: Vec<std::path::PathBuf>,
         deny_network: bool,
+        namespaces: NamespacePosture,
     ) -> Self {
         let mut protected_paths = Vec::new();
         for root in std::iter::once(&workspace_root).chain(allowed_paths.iter()) {
@@ -113,6 +143,7 @@ impl WriteFence {
             allowed_paths,
             deny_network,
             protected_paths,
+            namespaces,
         }
     }
 }
@@ -691,6 +722,325 @@ mod seccomp {
             _ => None,
         }
     }
+
+    // The escape-vector filter's return errnos. EACCES, not EPERM: the
+    // escalation classifier (`escalation::fence_denial_reason`) deliberately
+    // treats "Operation not permitted" as *the fence refused, offer to re-run
+    // outside it* — the right recovery for a blocked network connect, but the
+    // wrong recovery for `ptrace`/`mount`, which are never legitimate work for
+    // a fenced command and must stay silently refused. EACCES ("Permission
+    // denied") is unclassified for exactly that reason (see the Landlock note
+    // there). ENOSYS for `clone3` makes libc fall back to filterable `clone`.
+    pub(super) const SECCOMP_EACCES: u32 = 13;
+    pub(super) const SECCOMP_ENOSYS: u32 = 38;
+    // Classic-BPF jump opcodes (linux/bpf_common.h): the op field is bits
+    // 4-6 (0x70) — JEQ 0x10, JSET 0x40 — and bit 3 (0x08) is the K/X source
+    // selector, not an opcode.
+    pub(super) const BPF_JSET: u16 = 0x40;
+
+    /// Every syscall number the escape filter needs, per architecture.
+    ///
+    /// Hardcoded for the same reason [`seccomp_constants`] is: the numbers must
+    /// be visible to the simulator on the host the tests run on. On Linux a
+    /// contract test (`escape_syscall_table_matches_libc`) asserts every entry
+    /// against the `libc::SYS_*` constant of the same name, so a typo here
+    /// fails CI rather than silently denying the wrong syscall.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct EscapeTable {
+        pub(super) audit_arch: u32,
+        /// `(name, __NR_*)` pairs denied with EACCES.
+        pub(super) denied: &'static [(&'static str, u32)],
+        pub(super) nr_clone: u32,
+        pub(super) nr_clone3: u32,
+    }
+
+    /// The one mask that means "this clone is a namespace escape attempt".
+    ///
+    /// `NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET`
+    /// (linux/sched.h) — values are architecture-independent.
+    pub(super) const CLONE_NEW_MASK: u32 = 0x7E02_0000;
+
+    /// `None` on architectures the filter has no numbers for — the installer
+    /// fails closed rather than guess.
+    pub(super) fn escape_constants(arch: &str) -> Option<EscapeTable> {
+        match arch {
+            // asm/unistd_64.h. `ioperm`/`iopl` are x86-only — no I/O ports on
+            // ARM64, so they are simply absent from this table.
+            "x86_64" => Some(EscapeTable {
+                audit_arch: 0xC000_003E,
+                denied: &[
+                    ("ptrace", 101),
+                    ("process_vm_readv", 310),
+                    ("process_vm_writev", 311),
+                    ("kcmp", 312),
+                    ("process_madvise", 440),
+                    ("bpf", 321),
+                    ("perf_event_open", 298),
+                    ("userfaultfd", 323),
+                    ("kexec_load", 246),
+                    ("kexec_file_load", 320),
+                    ("open_by_handle_at", 304),
+                    ("name_to_handle_at", 303),
+                    ("lookup_dcookie", 212),
+                    ("ioperm", 173),
+                    ("iopl", 172),
+                    ("swapon", 167),
+                    ("swapoff", 168),
+                    ("quotactl", 179),
+                    ("acct", 163),
+                    ("reboot", 169),
+                    ("keyctl", 250),
+                    ("add_key", 248),
+                    ("request_key", 249),
+                    ("init_module", 175),
+                    ("finit_module", 313),
+                    ("delete_module", 176),
+                    ("mount", 165),
+                    ("umount2", 166),
+                    ("pivot_root", 155),
+                    ("unshare", 272),
+                    ("setns", 308),
+                    ("fsopen", 430),
+                    ("fsconfig", 431),
+                    ("fsmount", 432),
+                    ("fspick", 433),
+                    ("move_mount", 429),
+                    ("open_tree", 428),
+                    ("mount_setattr", 442),
+                    ("remap_file_pages", 216),
+                ],
+                nr_clone: 56,
+                nr_clone3: 435,
+            }),
+            // asm-generic/unistd.h.
+            "aarch64" => Some(EscapeTable {
+                audit_arch: 0xC000_00B7,
+                denied: &[
+                    ("ptrace", 117),
+                    ("process_vm_readv", 270),
+                    ("process_vm_writev", 271),
+                    ("kcmp", 272),
+                    ("process_madvise", 440),
+                    ("bpf", 280),
+                    ("perf_event_open", 241),
+                    ("userfaultfd", 282),
+                    ("kexec_load", 104),
+                    ("kexec_file_load", 294),
+                    ("open_by_handle_at", 265),
+                    ("name_to_handle_at", 264),
+                    ("lookup_dcookie", 18),
+                    ("swapon", 224),
+                    ("swapoff", 225),
+                    ("quotactl", 60),
+                    ("acct", 89),
+                    ("reboot", 142),
+                    ("keyctl", 219),
+                    ("add_key", 217),
+                    ("request_key", 218),
+                    ("init_module", 105),
+                    ("finit_module", 273),
+                    ("delete_module", 106),
+                    ("mount", 40),
+                    ("umount2", 39),
+                    ("pivot_root", 41),
+                    ("unshare", 97),
+                    ("setns", 268),
+                    ("fsopen", 430),
+                    ("fsconfig", 431),
+                    ("fsmount", 432),
+                    ("fspick", 433),
+                    ("move_mount", 429),
+                    ("open_tree", 428),
+                    ("mount_setattr", 442),
+                    ("remap_file_pages", 234),
+                ],
+                nr_clone: 220,
+                nr_clone3: 435,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Named fixup targets for the two-pass assembler below. Jump offsets in a
+    /// ~50-instruction deny chain are unmanageable by hand — each conditional
+    /// jump names the label it jumps to and the builder patches real offsets at
+    /// `resolve`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Label {
+        DenyEacces,
+        DenyEnosys,
+        /// Wrong-architecture lane.
+        Allow,
+        /// A syscall that matched no chain entry.
+        ChainAllow,
+        /// A `clone` whose flags carry no `CLONE_NEW*` bit.
+        FlagAllow,
+        CloneFlags,
+    }
+
+    /// Tiny classic-BPF assembler: emit instructions, name forward jumps,
+    /// resolve on build. Classic-BPF jump offsets are unsigned — every jump
+    /// must land *after* its source — so the program below is laid out with
+    /// its decision points behind the chain, and `resolve` fails loudly on a
+    /// distance that does not fit.
+    struct ProgramBuilder {
+        program: Vec<BpfInsn>,
+        jt_fixups: Vec<(usize, Label)>,
+        jf_fixups: Vec<(usize, Label)>,
+        labels: Vec<(Label, usize)>,
+    }
+
+    impl ProgramBuilder {
+        fn new() -> Self {
+            Self {
+                program: Vec::new(),
+                jt_fixups: Vec::new(),
+                jf_fixups: Vec::new(),
+                labels: Vec::new(),
+            }
+        }
+
+        fn emit(&mut self, code: u16, jt: u8, jf: u8, k: u32) -> usize {
+            self.program.push(BpfInsn { code, jt, jf, k });
+            self.program.len() - 1
+        }
+
+        fn mark(&mut self, label: Label) {
+            self.labels.push((label, self.program.len()));
+        }
+
+        /// `JEQ K`: jump to `target` when the accumulator equals `k`, fall
+        /// through to the next instruction otherwise.
+        fn jeq(&mut self, k: u32, target: Label) {
+            let at = self.emit(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, k);
+            self.jt_fixups.push((at, target));
+        }
+
+        /// `JEQ K` that falls through when equal and jumps when not — the
+        /// architecture gate, whose mismatch lane is the exception.
+        fn jeq_else(&mut self, k: u32, not_equal: Label) {
+            let at = self.emit(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, k);
+            self.jf_fixups.push((at, not_equal));
+        }
+
+        /// `JSET K`: jump to `hit` when `accumulator & k` is non-zero, jump to
+        /// `miss` otherwise.
+        fn jset(&mut self, k: u32, hit: Label, miss: Label) {
+            let at = self.emit(BPF_JMP | BPF_JSET | BPF_K, 0, 0, k);
+            self.jt_fixups.push((at, hit));
+            self.jf_fixups.push((at, miss));
+        }
+
+        fn position(&self, label: Label) -> usize {
+            self.labels
+                .iter()
+                .find(|(l, _)| *l == label)
+                .map(|(_, at)| *at)
+                .expect("label marked")
+        }
+
+        fn resolve(mut self) -> Vec<BpfInsn> {
+            let jt_fixups = std::mem::take(&mut self.jt_fixups);
+            let jf_fixups = std::mem::take(&mut self.jf_fixups);
+            for (at, label) in jt_fixups {
+                let off = u8::try_from(self.position(label) - at - 1)
+                    .expect("jump distance exceeds one byte");
+                self.program[at].jt = off;
+            }
+            for (at, label) in jf_fixups {
+                let off = u8::try_from(self.position(label) - at - 1)
+                    .expect("jump distance exceeds one byte");
+                self.program[at].jf = off;
+            }
+            self.program
+        }
+    }
+
+    /// The escape-vector filter, as an instruction list.
+    ///
+    /// Architecture gate → linear syscall chain (one `JEQ` per denied call,
+    /// hit = EACCES) → allow. `clone` is pulled out of the chain: its denial
+    /// is conditional on carrying a `CLONE_NEW*` flag, checked with `JSET` on
+    /// `args[0]`; `clone3` is denied with `ENOSYS` outright so libc falls back
+    /// to a `clone` whose flags this filter can actually see. Ordinary work —
+    /// `execve`, `openat`, an un-namespaced `clone` — passes untouched: this
+    /// is an escape-vector deny list, not a jail. (There are three allow
+    /// returns rather than one because classic-BPF jumps only go forward.)
+    pub(super) fn escape_filter_program(table: &EscapeTable) -> Vec<BpfInsn> {
+        let mut b = ProgramBuilder::new();
+        // Load and check the audit architecture first: a program built for one
+        // architecture must not deny another's syscalls (same argument as
+        // [`network_filter_program`]; at runtime the numbers come from
+        // `std::env::consts::ARCH`, so the mismatch lane is unreachable and
+        // errs toward allowing).
+        b.emit(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_OFF_ARCH);
+        b.jeq_else(table.audit_arch, Label::Allow);
+        b.emit(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_OFF_NR);
+        for (_, nr) in table.denied {
+            b.jeq(*nr, Label::DenyEacces);
+        }
+        b.jeq(table.nr_clone3, Label::DenyEnosys);
+        b.jeq(table.nr_clone, Label::CloneFlags);
+        // No chain entry matched: an ordinary syscall.
+        b.mark(Label::ChainAllow);
+        b.emit(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+        b.mark(Label::CloneFlags);
+        // clone: the decision rides on the flags, args[0] in seccomp_data.
+        b.emit(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_OFF_ARG0);
+        b.jset(CLONE_NEW_MASK, Label::DenyEacces, Label::FlagAllow);
+        b.mark(Label::DenyEacces);
+        b.emit(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ERRNO | SECCOMP_EACCES);
+        b.mark(Label::DenyEnosys);
+        b.emit(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ERRNO | SECCOMP_ENOSYS);
+        b.mark(Label::Allow);
+        b.emit(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+        b.mark(Label::FlagAllow);
+        b.emit(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+        b.resolve()
+    }
+
+    /// Walk the program the way the kernel would, for one syscall.
+    ///
+    /// Test-only: jump arithmetic is the easiest thing in this file to get
+    /// wrong by one slot, so the programs are interpreted here rather than
+    /// trusted. Lives in this module (not in a per-platform test module) so
+    /// both the network and the escape program can be simulated on any host.
+    #[cfg(test)]
+    pub(super) fn simulate(prog: &[BpfInsn], arch: u32, nr: u32, arg0: u32) -> u32 {
+        let mut a = 0u32;
+        let mut pc = 0usize;
+        loop {
+            let insn = prog[pc];
+            match insn.code & 0x07 {
+                0x00 => {
+                    a = match insn.k {
+                        SECCOMP_OFF_ARCH => arch,
+                        SECCOMP_OFF_NR => nr,
+                        SECCOMP_OFF_ARG0 => arg0,
+                        other => panic!("unexpected load offset {other}"),
+                    };
+                    pc += 1;
+                }
+                0x05 => {
+                    // The op field is bits 4-6: JEQ (0x10) and JSET (0x40)
+                    // both live in the JMP class and differ by op bits.
+                    let taken = match insn.code & 0x70 {
+                        BPF_JSET => a & insn.k != 0,
+                        // BPF_JEQ (and every other jump, which the programs
+                        // here do not emit).
+                        _ => a == insn.k,
+                    };
+                    pc += 1 + if taken {
+                        insn.jt as usize
+                    } else {
+                        insn.jf as usize
+                    };
+                }
+                0x06 => return insn.k,
+                other => panic!("unexpected instruction class {other}"),
+            }
+        }
+    }
 }
 
 /// Linux: install [`network_filter_program`] on the calling thread.
@@ -699,10 +1049,6 @@ mod seccomp {
 /// `no_new_privs` — the kernel refuses a filter without it.
 #[cfg(target_os = "linux")]
 fn install_network_seccomp() -> std::io::Result<()> {
-    use libc::{sock_filter, sock_fprog};
-
-    const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
-
     // Fail closed rather than install a filter whose syscall numbers are
     // guesses: a network posture that silently does nothing is worse than one
     // that refuses to start. `consts::ARCH` is the compile-time target, so
@@ -713,10 +1059,37 @@ fn install_network_seccomp() -> std::io::Result<()> {
             "no seccomp network filter for this architecture",
         ));
     };
+    install_seccomp_program(&seccomp::network_filter_program(audit_arch, nr_socket))
+}
+
+/// Linux: install [`escape_filter_program`] on the calling thread.
+///
+/// Unlike the network posture this is not optional: every fenced run gets the
+/// escape-vector deny list, because `ptrace` and friends are not work a fenced
+/// command has any legitimate use for. Unknown architectures fail closed,
+/// matching the network filter.
+#[cfg(target_os = "linux")]
+fn install_escape_seccomp() -> std::io::Result<()> {
+    let Some(table) = seccomp::escape_constants(std::env::consts::ARCH) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no seccomp escape filter for this architecture",
+        ));
+    };
+    install_seccomp_program(&seccomp::escape_filter_program(&table))
+}
+
+/// Convert a `BpfInsn` program to the kernel's `sock_fprog` shape and load it
+/// with `seccomp(SECCOMP_SET_MODE_FILTER)`.
+#[cfg(target_os = "linux")]
+fn install_seccomp_program(program: &[seccomp::BpfInsn]) -> std::io::Result<()> {
+    use libc::{sock_filter, sock_fprog};
+
+    const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 
     {
-        let filter: Vec<sock_filter> = seccomp::network_filter_program(audit_arch, nr_socket)
-            .into_iter()
+        let filter: Vec<sock_filter> = program
+            .iter()
             .map(|i| sock_filter {
                 code: i.code,
                 jt: i.jt,
@@ -740,11 +1113,12 @@ fn install_network_seccomp() -> std::io::Result<()> {
 
         // SAFETY: `prog` points at `filter`, which outlives this call, and the
         // kernel copies the program during the syscall — nothing is retained.
+        // Variadic args are widened explicitly (see the mount_setattr note).
         #[allow(unsafe_code)]
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_seccomp,
-                SECCOMP_SET_MODE_FILTER,
+                SECCOMP_SET_MODE_FILTER as libc::c_long,
                 0u64,
                 &mut prog as *mut sock_fprog,
             )
@@ -790,6 +1164,7 @@ impl LandlockRunner {
         }
         let mut fenced = req.clone();
         let deny_network = fence.deny_network;
+        let namespaces_posture = fence.namespaces;
         fenced.fence = None;
         let fence = fence.clone();
         let existing_pre = req.pre_exec.clone();
@@ -797,7 +1172,17 @@ impl LandlockRunner {
             if let Some(pre) = &existing_pre {
                 pre()?;
             }
+            // The view first: it needs capabilities in a fresh user namespace
+            // and mount writes, both of which are gone once Landlock
+            // restricts. Its /proc writes (the identity maps) likewise must
+            // precede the restriction, which handles file writes.
+            namespaces::setup(namespaces_posture, &fence)?;
             landlock_restrict(&fence)?;
+            // The escape-vector deny list rides along on every fenced run:
+            // Landlock fences writes but says nothing about `ptrace`, and a
+            // "seccomp only when denying network" rule would leave the whole
+            // process-memory attack surface open in the default posture.
+            install_escape_seccomp()?;
             if deny_network {
                 // After Landlock: the restrict is what sets `no_new_privs`,
                 // which the kernel requires before it will take a filter.
@@ -875,6 +1260,17 @@ fn landlock_build(fence: &WriteFence) -> std::io::Result<RulesetCreated> {
             std::io::Error::other(format!("landlock rule for '{}': {e}", path.display()))
         })?;
     }
+    // `/dev/null` is granted exactly the way the Seatbelt profile allows it
+    // literally: the ubiquitous `2>/dev/null` idiom is ordinary work, not a
+    // fence escape (a bit bucket accepts nothing but bits). The namespace
+    // view, when present, re-binds `/dev` read-write on top of the read-only
+    // root so the mount layer allows what Landlock grants here.
+    let fd = PathFd::new("/dev/null")
+        .map_err(|e| std::io::Error::other(format!("cannot open /dev/null: {e}")))?;
+    let rule = PathBeneath::new(fd, landlock_write_rights());
+    ruleset = ruleset
+        .add_rule(rule)
+        .map_err(|e| std::io::Error::other(format!("landlock rule for /dev/null: {e}")))?;
     Ok(ruleset)
 }
 
@@ -901,6 +1297,407 @@ fn landlock_restrict(fence: &WriteFence) -> std::io::Result<()> {
     match status.landlock {
         LandlockStatus::Available { .. } => Ok(()),
         other => Err(std::io::Error::other(format!("landlock not enforced: {other:?}"))),
+    }
+}
+
+/// Linux: build a private filesystem view around a fenced command — a
+/// read-only root with the working trees re-bound on top — and deny the
+/// syscalls that could escape it.
+///
+/// Three layers now protect a fenced run, strongest first:
+///
+/// 1. **The view** (this module, [`NamespacePosture`]-gated). An unprivileged
+///    user namespace plus a private mount namespace: the root is re-bound and
+///    marked read-only recursively, `/tmp` is covered with a fresh tmpfs (no
+///    more reading other sessions' leftovers — the fence has no read rules,
+///    so a shared `/tmp` was an information leak), and the working trees plus
+///    `/dev`, `/run` and `/proc` are re-bound read-write on top. The IPC
+///    re-binds matter: an `AF_UNIX` connect needs write access to the socket
+///    file, so a wholesale read-only root would break dbus/systemd/docker,
+///    which the network posture deliberately leaves alone. There is
+///    deliberately **no PID namespace**: `pre_exec` runs once between fork
+///    and exec, and `unshare(CLONE_NEWPID)` only affects the *next* fork —
+///    putting the command itself into a new PID namespace would take a second
+///    fork (a sandbox-binary shape) and break the runner's wait/kill
+///    semantics. Same-uid `/proc` entries therefore stay visible; their
+///    memory does not (the deny list below).
+/// 2. **Landlock** (`landlock_restrict`): the write rules, unchanged.
+/// 3. **seccomp** (`install_escape_seccomp`): the escape-vector deny list.
+///
+/// Failures degrade per [`NamespacePosture`]: `Off` skips the view entirely,
+/// `Auto` warns and continues with layers 2–3 (the common failure is
+/// unprivileged user namespaces switched off — a container or a hardened
+/// sysctl is an environment fact, not an attack), and `Require` fails the
+/// spawn. A failure *while* the view is half-built rolls the mounts back; if
+/// even the rollback fails the spawn fails closed rather than exec into a
+/// mangled filesystem.
+#[cfg(target_os = "linux")]
+mod namespaces {
+    use std::ffi::CString;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::RawFd;
+    use std::path::Path;
+
+    use super::{NamespacePosture, WriteFence};
+
+    /// fcntl.h: apply `mount_setattr` to the whole mount subtree. Not yet in
+    /// libc; a local constant keeps the raw call honest, same practice as the
+    /// local `SECCOMP_SET_MODE_FILTER`. Needs kernel ≥ 5.12.
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+
+    /// Why the view could not be built, and how bad that is.
+    enum BuildError {
+        /// Nothing (or a fully torn-down view) is left mounted; the shared
+        /// host view is intact and the run can safely continue without it.
+        Failed(io::Error),
+        /// A half-built view could not be torn down — the process must not
+        /// exec into it, whatever the posture.
+        Mangled(io::Error),
+    }
+
+    /// Entry point from the runner's `pre_exec` hook. See the module docs for
+    /// the posture semantics.
+    pub(super) fn setup(posture: NamespacePosture, fence: &WriteFence) -> io::Result<()> {
+        if posture == NamespacePosture::Off {
+            return Ok(());
+        }
+        match build_view(fence) {
+            Ok(()) => Ok(()),
+            Err(BuildError::Mangled(e)) => Err(e),
+            Err(BuildError::Failed(e)) => {
+                if posture == NamespacePosture::Require {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    error = %e,
+                    "namespace view unavailable; continuing with Landlock + seccomp only"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// A tree to re-bind read-write once the root is read-only, held open so
+    /// the read-only flip and the `/tmp` cover cannot hide it.
+    struct Rebind {
+        target: &'static Path,
+        /// O_PATH fd taken before any mount changed. The bind source is
+        /// `/proc/self/fd/<fd>`, which `/proc` — itself re-bound RW below —
+        /// serves.
+        fd: RawFd,
+    }
+
+    /// A working tree (workspace root, allowed path, cwd) to re-bind onto its
+    /// own absolute path once `/tmp` is covered.
+    struct WorkingRebind {
+        target: std::path::PathBuf,
+        fd: RawFd,
+    }
+
+    fn build_view(fence: &WriteFence) -> Result<(), BuildError> {
+        // Open everything that must survive the read-only flip or the /tmp
+        // cover *before* any mount changes.
+        let mut working: Vec<WorkingRebind> = Vec::new();
+        push_unique(&mut working, fence.workspace_root.clone()).map_err(BuildError::Failed)?;
+        for allowed in &fence.allowed_paths {
+            push_unique(&mut working, allowed.clone()).map_err(BuildError::Failed)?;
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            push_unique(&mut working, cwd).map_err(BuildError::Failed)?;
+        }
+        let ipc: Vec<Rebind> = ["/dev", "/run", "/proc"]
+            .iter()
+            .map(|t| open_o_path(Path::new(t)).map(|fd| Rebind { target: Path::new(t), fd }))
+            .collect::<io::Result<_>>()
+            .map_err(BuildError::Failed)?;
+
+        // ②③ The namespaces themselves. Both fail before anything is mounted,
+        // so they are clean degradations (the common one: unprivileged user
+        // namespaces switched off).
+        user_namespace().map_err(BuildError::Failed)?;
+        mount_namespace().map_err(BuildError::Failed)?;
+
+        // Past this point we are inside our own mount namespace and a failure
+        // must not leave a half-built view behind to exec into.
+        let mut stacked = false;
+        let outcome = (|| -> io::Result<()> {
+            // ④ Read-only root. Kernel ≥ 5.12 for the recursive setattr; on
+            // older kernels this degrades to the plain copy and Landlock
+            // carries the write fence alone.
+            match root_read_only() {
+                Ok(()) => stacked = true,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "read-only root unavailable; relying on Landlock for outside writes"
+                ),
+            }
+            // ⑤ IPC trees back on top, read-write.
+            for h in &ipc {
+                bind_back(h.target, h.fd).map_err(|e| {
+                    io::Error::other(format!("re-bind {}: {e}", h.target.display()))
+                })?;
+            }
+            // ⑥ Private /tmp, then the working trees back onto their own
+            // paths — a workspace under /tmp survives the cover.
+            private_tmp().map_err(|e| io::Error::other(format!("private /tmp: {e}")))?;
+            for w in &working {
+                bind_back(&w.target, w.fd).map_err(|e| {
+                    io::Error::other(format!("re-bind {}: {e}", w.target.display()))
+                })?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => Ok(()),
+            // Nothing was stacked at "/": the shared view is untouched.
+            Err(e) if !stacked => Err(BuildError::Failed(e)),
+            Err(e) => match umount_slash() {
+                Ok(()) => Err(BuildError::Failed(e)),
+                Err(rb) => {
+                    tracing::warn!(error = %rb, "namespace view rollback failed");
+                    Err(BuildError::Mangled(e))
+                }
+            },
+        }
+    }
+
+    /// Hold one O_PATH reference per distinct tree; a path already held is
+    /// kept (binding the same tree twice is pointless, and two fds to one
+    /// tree are wasteful).
+    fn push_unique(list: &mut Vec<WorkingRebind>, target: std::path::PathBuf) -> io::Result<()> {
+        if target == Path::new("/") {
+            // A workspace/cwd of `/` would re-bind the whole tree read-write
+            // on top of the read-only root, undoing it. Skip the re-bind —
+            // Landlock still fences writes, and `/` is not a workspace.
+            tracing::warn!("workspace or cwd is `/`; skipping its view re-bind");
+            return Ok(());
+        }
+        if list.iter().any(|w| w.target == target) {
+            return Ok(());
+        }
+        let fd = open_o_path(&target)?;
+        list.push(WorkingRebind { target, fd });
+        Ok(())
+    }
+
+    /// `unshare(CLONE_NEWUSER)` plus the single-identity map that gives us
+    /// capabilities in the new namespace (and nobody else anything).
+    fn user_namespace() -> io::Result<()> {
+        // Read the identity BEFORE the unshare: inside the new (empty)
+        // namespace `getuid()` reports the overflow uid (65534), and a map
+        // written from that reading would be refused.
+        // SAFETY: plain uid/gid reads; libc marks them unsafe (they can be
+        // overridden), but they touch no memory.
+        #[allow(unsafe_code)]
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        // SAFETY: `unshare` has no invariant beyond the flags; on failure it
+        // leaves the caller untouched.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        write_id_maps(uid, gid)
+    }
+
+    /// Map our own uid/gid 1:1 — an unprivileged process may map exactly its
+    /// own identity, which is all the view needs (files we own stay ours;
+    /// everyone else's stay inaccessible).
+    fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
+        // The kernel requires `setgroups` to be denied before an unprivileged
+        // gid_map write; the file is absent on kernels old enough that the
+        // restriction predates it.
+        if let Err(e) = std::fs::write("/proc/self/setgroups", "deny") {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+        std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
+        std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))?;
+        Ok(())
+    }
+
+    /// `unshare(CLONE_NEWNS)` plus private propagation, so nothing the view
+    /// mounts leaks back to the host's peer groups (or inherits their events).
+    fn mount_namespace() -> io::Result<()> {
+        // SAFETY: as with the user namespace — flags only, self-contained.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Cut shared propagation so nothing the view mounts leaks back to the
+        // host's peer groups. Recursive first; some container runtimes refuse
+        // the recursive form over their locked submounts (EINVAL), and the
+        // plain form still makes *our* mounts private — anything mounted
+        // under the private root inherits it.
+        // SAFETY: mount with null src/fstype/data flips propagation only.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            let plain = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_PRIVATE as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            };
+            if plain != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind `/` onto itself recursively and mark the copy read-only.
+    fn root_read_only() -> io::Result<()> {
+        // SAFETY: bind of an existing path onto itself; kernel copies the
+        // path strings during the call.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::mount(
+                c"/".as_ptr(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let attrs = libc::mount_attr {
+            attr_set: (libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV)
+                as u64,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        // SAFETY: `attr` outlives the call; the kernel copies it during the
+        // syscall. Variadic args are widened to `c_long` explicitly — an int
+        // left to C's default promotions leaves the register's upper half
+        // undefined, and the kernel reads each syscall argument as 64 bits.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                libc::AT_FDCWD as libc::c_long,
+                c"/".as_ptr(),
+                AT_RECURSIVE as libc::c_long,
+                &attrs as *const libc::mount_attr,
+                std::mem::size_of::<libc::mount_attr>(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Cover `/tmp` with a fresh tmpfs. `1777` keeps the sticky semantics
+    /// mktemp expects; no `noexec` — extracting a binary into /tmp is
+    /// ordinary tooling work.
+    fn private_tmp() -> io::Result<()> {
+        // SAFETY: string constants and flags; the kernel copies the data blob.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                c"/tmp".as_ptr(),
+                c"tmpfs".as_ptr(),
+                (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+                c"mode=1777".as_ptr().cast(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Re-bind a pre-opened tree onto its own absolute path. Under the fresh
+    /// `/tmp` the path has to be re-created first; anywhere else the
+    /// read-only view preserved it — and creating it is impossible, which is
+    /// the point.
+    fn bind_back(target: &Path, fd: RawFd) -> io::Result<()> {
+        if target.starts_with("/tmp") {
+            std::fs::create_dir_all(target)?;
+        }
+        let src = CString::new(format!("/proc/self/fd/{fd}"))?;
+        let dst = CString::new(target.as_os_str().as_bytes())?;
+        // Recursive first (the tree's own submounts come along); container
+        // runtimes lock their submounts and refuse the recursive form, and a
+        // plain bind of the top mount still re-exposes what matters
+        // (`/dev/null` lives on `/dev` itself). Submounts left behind stay on
+        // the read-only layer — reads are unaffected and writes there were
+        // Landlock-denied regardless.
+        // SAFETY: both paths outlive the call; a plain bind, no data.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            let plain = unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND as libc::c_ulong,
+                    std::ptr::null(),
+                )
+            };
+            if plain != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Detach whatever is stacked at `/` — with `MNT_DETACH` the read-only
+    /// copy and everything mounted on top of it go together, restoring the
+    /// untouched host-view copy the mount namespace started with. Harmless
+    /// (EINVAL) when nothing is stacked.
+    fn umount_slash() -> io::Result<()> {
+        // SAFETY: a flag-only umount of a fixed path.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::umount2(c"/".as_ptr(), libc::MNT_DETACH) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn open_o_path(path: &Path) -> io::Result<RawFd> {
+        let c = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: open of a caller-owned path; the fd is closed with the
+        // process at exec (O_CLOEXEC) — nothing to leak or double-close.
+        #[allow(unsafe_code)]
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
     }
 }
 
@@ -1389,6 +2186,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/ws"),
             vec![std::path::PathBuf::from("/tmp/extra")],
             false,
+            NamespacePosture::Auto,
         );
         for root in ["/tmp/ws", "/tmp/extra"] {
             for name in PROTECTED_WRITE_NAMES {
@@ -1401,9 +2199,16 @@ mod tests {
             }
         }
         assert!(!f.deny_network, "the default posture leaves the network alone");
+        assert_eq!(f.namespaces, NamespacePosture::Auto);
 
-        let denied = WriteFence::new(std::path::PathBuf::from("/tmp/ws"), Vec::new(), true);
+        let denied = WriteFence::new(
+            std::path::PathBuf::from("/tmp/ws"),
+            Vec::new(),
+            true,
+            NamespacePosture::Require,
+        );
         assert!(denied.deny_network, "the requested posture is carried through");
+        assert_eq!(denied.namespaces, NamespacePosture::Require);
     }
 
     #[tokio::test]
@@ -1553,39 +2358,9 @@ mod tests {
     /// test runs on — so the program is interpreted here rather than trusted.
     mod seccomp_program {
         use super::super::seccomp::{
-            network_filter_program, seccomp_constants, BpfInsn, AF_INET6_NR, AF_INET_NR,
-            SECCOMP_EPERM, SECCOMP_OFF_ARCH, SECCOMP_OFF_ARG0, SECCOMP_OFF_NR, SECCOMP_RET_ALLOW,
-            SECCOMP_RET_ERRNO,
+            network_filter_program, seccomp_constants, simulate, AF_INET6_NR, AF_INET_NR,
+            SECCOMP_EPERM, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
         };
-
-        /// Walk the program the way the kernel would, for one syscall.
-        fn simulate(prog: &[BpfInsn], arch: u32, nr: u32, arg0: u32) -> u32 {
-            let mut a = 0u32;
-            let mut pc = 0usize;
-            loop {
-                let insn = prog[pc];
-                match insn.code & 0x07 {
-                    0x00 => {
-                        a = match insn.k {
-                            SECCOMP_OFF_ARCH => arch,
-                            SECCOMP_OFF_NR => nr,
-                            SECCOMP_OFF_ARG0 => arg0,
-                            other => panic!("unexpected load offset {other}"),
-                        };
-                        pc += 1;
-                    }
-                    0x05 => {
-                        pc += 1 + if a == insn.k {
-                            insn.jt as usize
-                        } else {
-                            insn.jf as usize
-                        };
-                    }
-                    0x06 => return insn.k,
-                    other => panic!("unexpected instruction class {other}"),
-                }
-            }
-        }
 
         const X86_64_ARCH: u32 = 0xC000_003E;
         const X86_64_SOCKET: u32 = 41;
@@ -1638,6 +2413,216 @@ mod tests {
         }
     }
 
+    /// The escape-vector filter's deny logic, simulated (see
+    /// [`seccomp::simulate`] for why). Ungated on purpose: unlike the network
+    /// posture — whose tests live behind the macOS-authored `seccomp_program`
+    /// module — this filter rides on every fenced Linux run, so CI's ubuntu
+    /// runner must exercise it too, not just the dev mac.
+    mod escape_program {
+        use super::super::seccomp::{
+            escape_constants, escape_filter_program, simulate, EscapeTable, CLONE_NEW_MASK,
+            SECCOMP_EACCES, SECCOMP_ENOSYS, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
+        };
+
+        const NR_EXECVE_X86: u32 = 59;
+        const NR_EXECVE_AARCH64: u32 = 221;
+        const NR_OPENAT_X86: u32 = 257;
+        const SIGCHLD: u32 = 17;
+        const CLONE_FS: u32 = 0x0000_0200;
+
+        fn table(arch: &str) -> EscapeTable {
+            escape_constants(arch).unwrap_or_else(|| panic!("{arch} must have an escape table"))
+        }
+
+        #[test]
+        fn every_deny_list_entry_is_denied_with_eacces() {
+            for arch in ["x86_64", "aarch64"] {
+                let table = table(arch);
+                let prog = escape_filter_program(&table);
+                let denied = SECCOMP_RET_ERRNO | SECCOMP_EACCES;
+                for (name, nr) in table.denied {
+                    assert_eq!(
+                        simulate(&prog, table.audit_arch, *nr, 0),
+                        denied,
+                        "{arch}: {name} ({nr}) must be denied"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn ordinary_work_passes_untouched() {
+            let t = table("x86_64");
+            let prog = escape_filter_program(&t);
+            let run = |nr: u32, arg0: u32| simulate(&prog, t.audit_arch, nr, arg0);
+
+            assert_eq!(run(NR_EXECVE_X86, 0), SECCOMP_RET_ALLOW);
+            assert_eq!(run(NR_OPENAT_X86, 0), SECCOMP_RET_ALLOW);
+            assert_eq!(run(0, 0), SECCOMP_RET_ALLOW, "read");
+            // clone without any CLONE_NEW* flag is just a fork.
+            assert_eq!(run(t.nr_clone, SIGCHLD), SECCOMP_RET_ALLOW);
+            assert_eq!(run(t.nr_clone, SIGCHLD | CLONE_FS), SECCOMP_RET_ALLOW);
+
+            let a = table("aarch64");
+            let prog = escape_filter_program(&a);
+            assert_eq!(simulate(&prog, a.audit_arch, NR_EXECVE_AARCH64, 0), SECCOMP_RET_ALLOW);
+        }
+
+        #[test]
+        fn clone3_is_refused_so_libc_falls_back_to_filterable_clone() {
+            for arch in ["x86_64", "aarch64"] {
+                let t = table(arch);
+                let prog = escape_filter_program(&t);
+                assert_eq!(
+                    simulate(&prog, t.audit_arch, t.nr_clone3, 0),
+                    SECCOMP_RET_ERRNO | SECCOMP_ENOSYS,
+                    "{arch}: clone3"
+                );
+            }
+        }
+
+        #[test]
+        fn namespaced_clone_is_denied_by_flags_not_number() {
+            for arch in ["x86_64", "aarch64"] {
+                let t = table(arch);
+                let prog = escape_filter_program(&t);
+                let run = |flags: u32| simulate(&prog, t.audit_arch, t.nr_clone, flags);
+                let denied = SECCOMP_RET_ERRNO | SECCOMP_EACCES;
+
+                assert_eq!(run(CLONE_NEW_MASK), denied, "{arch}: full mask");
+                // Each namespace bit on its own — a single wrong constant in
+                // the mask must not hide behind the rest of the mask.
+                for bit in [
+                    0x0002_0000u32,
+                    0x0200_0000,
+                    0x0400_0000,
+                    0x0800_0000,
+                    0x1000_0000,
+                    0x2000_0000,
+                    0x4000_0000,
+                ] {
+                    assert_eq!(run(bit), denied, "{arch}: CLONE_NEW bit {bit:#x}");
+                }
+            }
+        }
+
+        #[test]
+        fn wrong_architecture_lane_allows() {
+            let t = table("x86_64");
+            let prog = escape_filter_program(&t);
+            let (_, nr) = t.denied[0];
+            assert_eq!(
+                simulate(&prog, 0xDEAD_BEEF, nr, 0),
+                SECCOMP_RET_ALLOW,
+                "a program built for one arch must not deny another's syscalls"
+            );
+        }
+
+        #[test]
+        fn tables_are_well_formed() {
+            for arch in ["x86_64", "aarch64"] {
+                let t = table(arch);
+                assert!(t.denied.len() >= 35, "{arch}: deny list suspiciously short");
+                let mut seen = Vec::new();
+                for (name, nr) in t.denied {
+                    assert!(!seen.contains(nr), "{arch}: duplicate number for {name}");
+                    seen.push(*nr);
+                }
+                assert_ne!(t.nr_clone, t.nr_clone3, "{arch}");
+            }
+            // An architecture the table has no numbers for must come back
+            // None so the installer fails closed.
+            assert!(escape_constants("riscv64").is_none());
+            assert!(escape_constants("").is_none());
+        }
+    }
+
+    /// The escape table's hardcoded numbers against the `libc` constants of
+    /// the same name. A typo'd number denies the wrong syscall, which no
+    /// simulation can catch — the simulator trusts the table it is given — so
+    /// this contract test is the real guard. Linux-only because that is where
+    /// the constants exist.
+    #[cfg(target_os = "linux")]
+    mod escape_contract {
+        use super::super::seccomp::escape_constants;
+
+        fn libc_nr(name: &str) -> libc::c_long {
+            match name {
+                "ptrace" => libc::SYS_ptrace,
+                "process_vm_readv" => libc::SYS_process_vm_readv,
+                "process_vm_writev" => libc::SYS_process_vm_writev,
+                "kcmp" => libc::SYS_kcmp,
+                "process_madvise" => libc::SYS_process_madvise,
+                "bpf" => libc::SYS_bpf,
+                "perf_event_open" => libc::SYS_perf_event_open,
+                "userfaultfd" => libc::SYS_userfaultfd,
+                "kexec_load" => libc::SYS_kexec_load,
+                "kexec_file_load" => libc::SYS_kexec_file_load,
+                "open_by_handle_at" => libc::SYS_open_by_handle_at,
+                "name_to_handle_at" => libc::SYS_name_to_handle_at,
+                "lookup_dcookie" => libc::SYS_lookup_dcookie,
+                // x86-only port I/O: the syscalls (and libc's constants for
+                // them) do not exist on ARM64, where the escape table does
+                // not list them either.
+                #[cfg(target_arch = "x86_64")]
+                "ioperm" => libc::SYS_ioperm,
+                #[cfg(target_arch = "x86_64")]
+                "iopl" => libc::SYS_iopl,
+                "swapon" => libc::SYS_swapon,
+                "swapoff" => libc::SYS_swapoff,
+                "quotactl" => libc::SYS_quotactl,
+                "acct" => libc::SYS_acct,
+                "reboot" => libc::SYS_reboot,
+                "keyctl" => libc::SYS_keyctl,
+                "add_key" => libc::SYS_add_key,
+                "request_key" => libc::SYS_request_key,
+                "init_module" => libc::SYS_init_module,
+                "finit_module" => libc::SYS_finit_module,
+                "delete_module" => libc::SYS_delete_module,
+                "mount" => libc::SYS_mount,
+                "umount2" => libc::SYS_umount2,
+                "pivot_root" => libc::SYS_pivot_root,
+                "unshare" => libc::SYS_unshare,
+                "setns" => libc::SYS_setns,
+                "fsopen" => libc::SYS_fsopen,
+                "fsconfig" => libc::SYS_fsconfig,
+                "fsmount" => libc::SYS_fsmount,
+                "fspick" => libc::SYS_fspick,
+                "move_mount" => libc::SYS_move_mount,
+                "open_tree" => libc::SYS_open_tree,
+                "mount_setattr" => libc::SYS_mount_setattr,
+                "remap_file_pages" => libc::SYS_remap_file_pages,
+                other => unreachable!("escape-table entry without a libc mapping: {other}"),
+            }
+        }
+
+        #[test]
+        fn escape_syscall_tables_match_libc() {
+            // libc's SYS_* constants describe the architecture this test
+            // compiles for, so only the running arch's table can be checked
+            // against them; the other tables are covered by the simulator's
+            // documented-derivation tests.
+            let arch = std::env::consts::ARCH;
+            let t = escape_constants(arch).expect("the compiling arch must have a table");
+            for (name, nr) in t.denied {
+                assert_eq!(*nr as libc::c_long, libc_nr(name), "{arch}: {name}");
+            }
+            assert_eq!(t.nr_clone as libc::c_long, libc::SYS_clone, "{arch}");
+            assert_eq!(t.nr_clone3 as libc::c_long, libc::SYS_clone3, "{arch}");
+        }
+    }
+
+    /// The kernel's seccomp verifier enforces structural rules the simulator
+    /// does not model (instruction whitelist, jump-shape checks), so the real
+    /// programs must be installed on the real kernel once. seccomp filters
+    /// apply to the calling thread only — sibling tests are untouched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_programs_pass_the_kernel_verifier() {
+        install_escape_seccomp().expect("kernel must accept the escape-vector filter");
+        install_network_seccomp().expect("kernel must accept the network filter");
+    }
+
     #[cfg(target_os = "macos")]
     mod seatbelt {
         use super::*;
@@ -1647,12 +2632,19 @@ mod tests {
                 std::path::PathBuf::from(workspace_root),
                 allowed.iter().map(std::path::PathBuf::from).collect(),
                 false,
+                // The namespace view is Linux-only; Seatbelt ignores it.
+                NamespacePosture::Off,
             )
         }
 
         /// Same, with the network posture flipped on.
         fn fence_no_network(workspace_root: &str) -> WriteFence {
-            WriteFence::new(std::path::PathBuf::from(workspace_root), Vec::new(), true)
+            WriteFence::new(
+                std::path::PathBuf::from(workspace_root),
+                Vec::new(),
+                true,
+                NamespacePosture::Off,
+            )
         }
 
         #[test]
@@ -1932,11 +2924,16 @@ mod tests {
     mod landlock {
         use super::*;
 
+        /// Landlock in isolation (`Off`): the namespace view's private /tmp
+        /// would swallow writes aimed at host /tmp and the read-only root
+        /// would deny them for the wrong reason. The view itself has its own
+        /// test module below.
         fn fence(workspace_root: &str, allowed: &[&str]) -> WriteFence {
             WriteFence::new(
                 std::path::PathBuf::from(workspace_root),
                 allowed.iter().map(std::path::PathBuf::from).collect(),
                 false,
+                NamespacePosture::Off,
             )
         }
 
@@ -2047,6 +3044,348 @@ mod tests {
         }
     }
 
+    /// The namespace view end to end against the real kernel: user namespace,
+    /// read-only root, private `/tmp`, the working trees re-bound on top, and
+    /// the seccomp escape deny list beneath it all. Skips when the
+    /// environment cannot build the view — unprivileged user namespaces
+    /// switched off is a legitimate deployment, and the guard is exactly the
+    /// degradation the posture promises.
+    #[cfg(target_os = "linux")]
+    mod namespace_view {
+        use super::*;
+
+        fn fence_auto(workspace_root: &str, allowed: &[&str]) -> WriteFence {
+            WriteFence::new(
+                std::path::PathBuf::from(workspace_root),
+                allowed.iter().map(std::path::PathBuf::from).collect(),
+                false,
+                NamespacePosture::Auto,
+            )
+        }
+
+        fn fence_off(workspace_root: &str) -> WriteFence {
+            WriteFence::new(
+                std::path::PathBuf::from(workspace_root),
+                Vec::new(),
+                false,
+                NamespacePosture::Off,
+            )
+        }
+
+        /// Whether this environment can create an unprivileged user namespace
+        /// at all. `unshare` ships in util-linux on every test platform; a
+        /// missing binary counts as unavailable.
+        /// Whether the FULL namespace view builds end to end in this
+        /// environment: a `Require`-posture run only spawns when every step —
+        /// user namespace, private mount namespace, read-only root, re-binds —
+        /// succeeds. Container runtimes lock their `/dev` submounts, which the
+        /// re-bind cannot cross, so there the view degrades to Landlock-only
+        /// and these assertions skip rather than test a degraded environment.
+        async fn full_view_available() -> bool {
+            let tmp = match tempfile::tempdir() {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let ws = match std::fs::canonicalize(tmp.path()) {
+                Ok(w) => w,
+                Err(_) => return false,
+            };
+            let req = ProcessRequest {
+                argv: vec!["/bin/true".to_string()],
+                fence: Some(WriteFence::new(ws, Vec::new(), false, NamespacePosture::Require)),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            LandlockRunner::default()
+                .run(&req)
+                .await
+                .map(|out| out.success())
+                .unwrap_or(false)
+        }
+
+        fn runner() -> LandlockRunner {
+            LandlockRunner::default()
+        }
+
+        /// An outside write must be refused by the read-only root — saying
+        /// "Read-only file system" (EROFS), not Landlock's EACCES, is what
+        /// distinguishes the view from the rules beneath it.
+        #[tokio::test]
+        async fn outside_writes_hit_the_read_only_root() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let target = format!("/etc/syscity_ns_view_{}", std::process::id());
+            let _ = std::fs::remove_file(&target);
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo x > {target}"),
+                ],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                !out.success(),
+                "write outside the workspace must hit the read-only root: {}",
+                out.stderr_string()
+            );
+            assert!(
+                out.stderr_string()
+                    .to_lowercase()
+                    .contains("read-only file system"),
+                "expected EROFS from the view, got: {}",
+                out.stderr_string()
+            );
+            assert!(!std::path::Path::new(&target).exists());
+        }
+
+        /// `/tmp` is a fresh tmpfs: the host's leftovers are invisible to the
+        /// child. (The other direction is fenced by Landlock itself — the
+        /// child cannot write host `/tmp` at all, so there is nothing to
+        /// leak.)
+        #[tokio::test]
+        async fn host_tmp_is_invisible_under_the_view() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let host_marker = format!("/tmp/syscity_ns_host_{}", std::process::id());
+            std::fs::write(&host_marker, "host").unwrap();
+            let script = format!("test -e {host_marker} && echo LEAK; echo done");
+            let req = ProcessRequest {
+                argv: vec!["/bin/sh".to_string(), "-c".to_string(), script],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                out.success(),
+                "the view must not break ordinary work: {}",
+                out.stderr_string()
+            );
+            assert!(
+                !out.stdout_string().contains("LEAK"),
+                "the child must not see the host's /tmp: {}",
+                out.stdout_string()
+            );
+            let _ = std::fs::remove_file(&host_marker);
+        }
+
+        /// `2>/dev/null` is the ubiquitous idiom: the `/dev/null` grant
+        /// (Landlock) plus the `/dev` re-bind (mount layer) together keep it
+        /// working across the read-only flip.
+        #[tokio::test]
+        async fn dev_null_still_swallows_output() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo stdout-ok; echo hidden 2>/dev/null; cat /dev/null; echo done".to_string(),
+                ],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                out.success(),
+                "/dev/null must stay usable under the view: {}",
+                out.stderr_string()
+            );
+            assert!(out.stdout_string().contains("stdout-ok"));
+            assert!(
+                !out.stderr_string().contains("hidden"),
+                "the redirect to /dev/null must swallow stderr"
+            );
+        }
+
+        /// A workspace under `/tmp` survives the tmpfs cover: the write lands
+        /// in the real workspace, visible to the host.
+        #[tokio::test]
+        async fn workspace_under_tmp_survives_the_cover() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let file = ws.join("f");
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo x > '{}'", file.display()),
+                ],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                out.success(),
+                "workspace writes must work under the view: {}",
+                out.stderr_string()
+            );
+            assert!(file.exists(), "the re-bound workspace must be the real directory");
+        }
+
+        /// Landlock still fences beneath the view: `/tmp` is writable again
+        /// (a fresh tmpfs the view owns), so the ONLY thing that can refuse a
+        /// write to a `/tmp` path outside the grant is Landlock.
+        #[tokio::test]
+        async fn landlock_holds_beneath_the_view() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let target = format!("/tmp/syscity_ns_other_{}", std::process::id());
+            let _ = std::fs::remove_file(&target);
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo x > {target}"),
+                ],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                !out.success(),
+                "the view must not widen the workspace grant: {}",
+                out.stderr_string()
+            );
+            assert!(!std::path::Path::new(&target).exists());
+        }
+
+        /// The seccomp deny list is real at runtime: `unshare` is on it, and
+        /// the util-linux CLI hits exactly that syscall.
+        #[tokio::test]
+        async fn seccomp_denies_unshare_at_runtime() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            if !std::path::Path::new("/usr/bin/unshare").is_file() {
+                eprintln!("skipping: no unshare binary");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let req = ProcessRequest {
+                argv: vec!["unshare".to_string(), "-m".to_string(), "true".to_string()],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                !out.success(),
+                "unshare must be denied inside the fence: {}",
+                out.stderr_string()
+            );
+        }
+
+        /// `Off` is the regression baseline: the shared /tmp is back (host
+        /// markers visible) and Landlock alone fences outside writes.
+        #[tokio::test]
+        async fn off_keeps_landlock_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            let host_marker = format!("/tmp/syscity_ns_off_{}", std::process::id());
+            std::fs::write(&host_marker, "host").unwrap();
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("test -e {host_marker}"),
+                ],
+                fence: Some(fence_off(ws.to_str().unwrap())),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(out.success(), "Off must keep the shared /tmp: {}", out.stderr_string());
+            let _ = std::fs::remove_file(&host_marker);
+
+            let target = format!("/tmp/syscity_ns_off_write_{}", std::process::id());
+            let _ = std::fs::remove_file(&target);
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo x > {target}"),
+                ],
+                fence: Some(fence_off(ws.to_str().unwrap())),
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let out = runner().run(&req).await.unwrap();
+            assert!(
+                !out.success(),
+                "Landlock must still deny outside writes with Off: {}",
+                out.stderr_string()
+            );
+            assert!(!std::path::Path::new(&target).exists());
+        }
+
+        /// The timeout group kill works through the view: the sandboxed child
+        /// and its descendants die promptly, partial output survives.
+        #[tokio::test]
+        async fn run_collect_timeout_kills_through_the_view() {
+            if !full_view_available().await {
+                eprintln!("skipping: full namespace view unavailable here");
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = std::fs::canonicalize(tmp.path()).unwrap();
+            // `sleep 5` is backgrounded by sh; without the group kill the
+            // orphan keeps the shared stdout pipe open and the drain below
+            // blocks ~5s past the 300ms timeout.
+            let req = ProcessRequest {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo partial-out; sleep 5 & wait".to_string(),
+                ],
+                fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
+                timeout: Some(Duration::from_millis(300)),
+                ..Default::default()
+            };
+            let started = std::time::Instant::now();
+            let out = runner().run_collect(&req).await.unwrap();
+            assert!(out.timed_out, "run_collect should report the timeout");
+            assert!(
+                out.stdout_string().contains("partial-out"),
+                "partial output must survive the timeout: {:?}",
+                out.stdout_string()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "timeout must not wait for the orphaned sleep"
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     mod appcontainer {
         use super::*;
@@ -2056,6 +3395,8 @@ mod tests {
                 std::path::PathBuf::from(workspace_root),
                 allowed.iter().map(std::path::PathBuf::from).collect(),
                 false,
+                // The namespace view is Linux-only; AppContainer ignores it.
+                NamespacePosture::Off,
             )
         }
 

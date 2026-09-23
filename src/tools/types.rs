@@ -90,6 +90,11 @@ pub struct ToolSandbox {
     /// network. Carried here (from the agent config) because the fence is
     /// built per tool call.
     pub fence_network: bool,
+    /// Whether the Linux runner builds a private filesystem view (read-only
+    /// root, private `/tmp`) around fenced command tools. Carried here (from
+    /// the agent config) because the fence is built per tool call; every
+    /// non-Linux runner ignores it.
+    pub fence_namespaces: crate::tools::process_runner::NamespacePosture,
     /// Optional allowlist of plugin tool prefixes/names.
     pub plugin_allowlist: Option<Vec<String>>,
 }
@@ -112,6 +117,7 @@ impl Default for ToolSandbox {
             agent_workspace: None,
             workspace_only: true,
             fence_network: false,
+            fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             plugin_allowlist: None,
         }
     }
@@ -223,6 +229,11 @@ impl ToolContext {
     pub fn fence_network(&self) -> bool {
         self.sandbox.fence_network
     }
+    /// Whether the Linux runner builds a namespace view around fenced
+    /// command tools.
+    pub fn fence_namespaces(&self) -> crate::tools::process_runner::NamespacePosture {
+        self.sandbox.fence_namespaces
+    }
     pub fn memory_limit(&self) -> Option<usize> {
         self.sandbox.memory_limit
     }
@@ -273,6 +284,16 @@ impl ToolContext {
     /// Deny outbound network in the kernel fence for this context's commands.
     pub fn with_fence_network(mut self, enabled: bool) -> Self {
         self.sandbox.fence_network = enabled;
+        self
+    }
+
+    /// Set the namespace-view posture for the Linux fence (carried through to
+    /// `WriteFence`; ignored by every other runner).
+    pub fn with_fence_namespaces(
+        mut self,
+        posture: crate::tools::process_runner::NamespacePosture,
+    ) -> Self {
+        self.sandbox.fence_namespaces = posture;
         self
     }
 

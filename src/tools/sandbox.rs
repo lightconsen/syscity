@@ -304,6 +304,7 @@ mod tests {
                 agent_workspace: None,
                 workspace_only: false,
                 fence_network: false,
+                fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
                 plugin_allowlist: None,
             },
             model: crate::tools::ToolModel {
