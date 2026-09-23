@@ -53,6 +53,7 @@ pub mod canvas;
 #[cfg(feature = "cloud")]
 pub mod cloud_kb;
 pub mod code_exec;
+pub mod command_chain;
 pub mod command_detector;
 pub mod command_gate;
 pub mod computer;

@@ -59,9 +59,9 @@ pub(crate) async fn handle_approvals_approve(
     };
 
     // Capture the call identity before resolution removes the request.
-    let remember_rule = if p.remember {
+    let remember_rules = if p.remember {
         state.tools.approval_queue.get(&p.id).await.map(|summary| {
-            crate::tools::permissions::remember_rule(&summary.tool_name, &summary.args)
+            crate::tools::permissions::remember_rules(&summary.tool_name, &summary.args)
         })
     } else {
         None
@@ -73,45 +73,59 @@ pub(crate) async fn handle_approvals_approve(
         .resolve(&p.id, crate::tools::approval::ApprovalDecision::Approve)
         .await
     {
-        // Best-effort: an approval must not fail because the rule could not
-        // be recorded.
-        let mut remembered_rule = None;
-        if let Some(rule) = remember_rule {
-            match remember_allow_rule(state, &rule).await {
-                Ok(true) => remembered_rule = Some(rule),
-                Ok(false) => {}
-                Err(e) => warn!("Failed to remember allow rule '{}': {}", rule, e),
+        // Best-effort: an approval must not fail because a rule could not be
+        // recorded. A compound command remembers one rule per segment, so the
+        // list can be longer than one.
+        let mut remembered_rules = Vec::new();
+        if let Some(rules) = remember_rules {
+            match remember_allow_rules(state, &rules).await {
+                Ok(newly) => remembered_rules = newly,
+                Err(e) => warn!("Failed to remember allow rules {rules:?}: {e}"),
             }
         }
         WsResponse::ok(
             &req.id,
-            serde_json::json!({ "id": p.id, "status": "approved", "remembered_rule": remembered_rule }),
+            serde_json::json!({ "id": p.id, "status": "approved", "remembered_rules": remembered_rules }),
         )
     } else {
         WsResponse::err(&req.id, "NOT_FOUND", format!("Approval '{}' not found", p.id))
     }
 }
 
-/// Append `rule` to `[permissions].allow` under the config write lock and
-/// persist to disk. Returns `Ok(false)` when the rule already existed. The
-/// gateway's own internal write: no CAS — external clients keep using
-/// `base_revision` on `config.set`.
-async fn remember_allow_rule(state: &Arc<GatewayState>, rule: &str) -> crate::Result<bool> {
+/// Append `rules` to `[permissions].allow` under the config write lock and
+/// persist to disk. Returns the rules that were actually new (an approval of
+/// a compound command remembers one rule per chain segment, most of which
+/// may already be present). The gateway's own internal write: no CAS —
+/// external clients keep using `base_revision` on `config.set`.
+async fn remember_allow_rules(
+    state: &Arc<GatewayState>,
+    rules: &[String],
+) -> crate::Result<Vec<String>> {
     let mut guard = state.config.write().await;
-    if guard.permissions.allow.iter().any(|r| r == rule) {
-        return Ok(false);
+    let mut newly = Vec::new();
+    {
+        let config = Arc::make_mut(&mut guard);
+        for rule in rules {
+            if config.permissions.allow.iter().any(|r| r == rule) {
+                continue;
+            }
+            config.permissions.allow.push(rule.to_string());
+            newly.push(rule.to_string());
+        }
     }
-    let config = Arc::make_mut(&mut guard);
-    config.permissions.allow.push(rule.to_string());
+    if newly.is_empty() {
+        return Ok(newly);
+    }
     if let Some(config_path) = state.config_path.clone() {
+        let config = Arc::make_mut(&mut guard);
         crate::gateway::handlers::config::persist_config_atomic(config, &config_path)
             .await
             .map_err(|e| crate::SyscityError::Validation(format!("persist failed: {e}")))?;
     }
-    let updated = config.permissions.clone();
+    let updated = guard.permissions.clone();
     drop(guard);
     state.tools.registry.permissions().reload(&updated);
-    Ok(true)
+    Ok(newly)
 }
 
 /// `approvals.deny` — deny a pending tool call (`{ id, reason? }`).

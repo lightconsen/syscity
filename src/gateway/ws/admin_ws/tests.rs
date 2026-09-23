@@ -246,7 +246,7 @@ async fn approvals_approve_with_remember_appends_one_rule() {
     assert!(resp.ok, "approve failed: {:?}", resp.error);
     let payload = resp.payload.as_ref().unwrap();
     assert_eq!(payload["status"], "approved");
-    assert_eq!(payload["remembered_rule"].as_str(), Some("shell:git status*"));
+    assert_eq!(payload["remembered_rules"], serde_json::json!(["shell:git status*"]));
 
     // The rule is live in the gate and recorded in config.
     assert_eq!(
@@ -281,8 +281,8 @@ async fn approvals_approve_with_remember_appends_one_rule() {
     .await;
     assert!(resp.ok);
     assert_eq!(
-        resp.payload.as_ref().unwrap()["remembered_rule"],
-        serde_json::Value::Null,
+        resp.payload.as_ref().unwrap()["remembered_rules"],
+        serde_json::json!([]),
         "an existing rule is not reported as new"
     );
     assert_eq!(state.config.read().await.permissions.allow.len(), 1);
@@ -308,7 +308,7 @@ async fn approvals_approve_without_remember_writes_no_rule() {
     )
     .await;
     assert!(resp.ok);
-    assert_eq!(resp.payload.as_ref().unwrap()["remembered_rule"], serde_json::Value::Null);
+    assert_eq!(resp.payload.as_ref().unwrap()["remembered_rules"], serde_json::json!([]));
     assert!(state.config.read().await.permissions.allow.is_empty());
 }
 
