@@ -51,6 +51,8 @@ pub enum AuditEventType {
     Logout,
     /// Token validation attempt
     TokenValidation,
+    /// Network-allowlist proxy refused a connection
+    NetworkPolicy,
 }
 
 /// A single audit log entry.

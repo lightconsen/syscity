@@ -204,6 +204,7 @@ impl PersistentAuditLog {
                             "ConfigChange" => AuditEventType::ConfigChange,
                             "ToolInvocation" => AuditEventType::ToolInvocation,
                             "ToolDeny" => AuditEventType::ToolDeny,
+                            "NetworkPolicy" => AuditEventType::NetworkPolicy,
                             _ => AuditEventType::Security,
                         };
 

@@ -1204,7 +1204,7 @@ mod tests {
             .await
             .unwrap();
 
-        let token = "manually-planted-token";
+        let token = "manually-planted-token"; // secret-scan-ok
         store
             .upsert_session(
                 &auth_store::hash_session_token(token),
@@ -1419,13 +1419,13 @@ pub mod secrets {
             },
             SecretPattern {
                 name: "SSH Private Key",
-                regex: Regex::new(r"-----BEGIN OPENSSH PRIVATE KEY-----").unwrap(),
+                regex: Regex::new(r"-----BEGIN OPENSSH PRIVATE KEY-----").unwrap(), // secret-scan-ok
                 severity: Severity::Critical,
                 description: "SSH private key detected",
             },
             SecretPattern {
                 name: "PGP Private Key",
-                regex: Regex::new(r"-----BEGIN PGP PRIVATE KEY BLOCK-----").unwrap(),
+                regex: Regex::new(r"-----BEGIN PGP PRIVATE KEY BLOCK-----").unwrap(), // secret-scan-ok
                 severity: Severity::Critical,
                 description: "PGP private key detected",
             },
@@ -1680,7 +1680,7 @@ mod secret_tests {
     #[test]
     fn test_detect_openai_key() {
         let scanner = SecretScanner::with_default_patterns();
-        let text = "sk-abcdefghijklmnopqrstuvwxyz123456789012345678901234567";
+        let text = "sk-abcdefghijklmnopqrstuvwxyz123456789012345678901234567"; // secret-scan-ok
         let findings = scanner.scan(text);
         assert!(!findings.is_empty());
         assert!(findings.iter().any(|f| f.pattern == "OpenAI API Key"));
@@ -1689,7 +1689,7 @@ mod secret_tests {
     #[test]
     fn test_detect_aws_key() {
         let scanner = SecretScanner::with_default_patterns();
-        let text = "AKIAIOSFODNN7EXAMPLE";
+        let text = "AKIAIOSFODNN7EXAMPLE"; // secret-scan-ok
         let findings = scanner.scan(text);
         assert!(!findings.is_empty());
         assert!(findings.iter().any(|f| f.pattern == "AWS Access Key ID"));
@@ -1698,7 +1698,7 @@ mod secret_tests {
     #[test]
     fn test_detect_private_key() {
         let scanner = SecretScanner::with_default_patterns();
-        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...";
+        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA..."; // secret-scan-ok
         let findings = scanner.scan(text);
         assert!(!findings.is_empty());
         assert!(findings.iter().any(|f| f.pattern == "RSA Private Key"));
@@ -1725,7 +1725,7 @@ mod secret_tests {
 
     #[test]
     fn test_redaction() {
-        let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz123456"; // secret-scan-ok
         let redacted = super::secrets::DetectedSecret::redact(secret);
         // For long strings, redact shows first 4 and last 4 chars with ... in between
         assert!(redacted.starts_with("sk-a"));
@@ -1743,6 +1743,9 @@ pub mod audit;
 
 /// Runtime audit log for security-relevant events
 pub mod runtime_audit;
+
+/// Network-allowlist policy proxy for fenced children
+pub mod network_proxy;
 
 /// Persistent SQLite-backed audit log
 pub mod persistent_audit;
