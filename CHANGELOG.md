@@ -11,6 +11,35 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-09-23
+
+### Highlights
+
+- **A permission rules engine in front of every tool call.** A `[permissions]` config block carries the gateway-wide mode (`default` / `accept_edits` / `plan` / `bypass`), an `allow_bypass` switch (bypass is refused without it), and `allow` / `deny` / `ask` rule lists — each `"tool"` or `"tool:glob"` matched against the call's primary argument (shell → command, file tools → path, `web_fetch` → URL), evaluated in a locked order: deny → ask → allow → mode → hooks. A session can override its mode (`sessions.set_mode`, ephemeral until restart), the TUI gets `/mode` plus a status-line mode tag, and approvals offer approve / approve-and-remember (the invocation or its parent directory becomes a persistent allow rule) / deny. Plan mode hides and refuses every tool that has not declared itself read-only.
+- **The Linux fence grows two layers and the macOS one grows an escape hatch.** A fenced command may ask to run outside its fence — declared up front via a reserved `permissions` block on the call, or failure-driven when the output says the fence refused it — with a human approving before the unfenced re-run, which is announced in the result. On Linux, the Landlock write fence is now stacked with a **seccomp escape-vector deny list** installed on every fenced run (`ptrace`, `process_vm_*`, `bpf`, keyring, module, mount and namespace syscalls are refused; a `clone` carrying any `CLONE_NEW*` flag is refused; `clone3` is forced back to a filterable `clone`), and an optional **namespace view** (`[security] fence_namespaces`, default `auto`): a user namespace plus a private mount namespace with a read-only root and a private `/tmp`, the working trees and `/dev`/`/run`/`/proc` re-bound read-write on top so `2>/dev/null` and AF_UNIX IPC keep working. The network posture (`[security] fence_network`) is a three-platform clause: Seatbelt `(deny network*)`, a Linux seccomp socket filter that leaves `AF_UNIX` alone, and withheld Windows capability SIDs. The `.git` and `.syscity` directories are unwritable inside any granted root on macOS.
+- **Delegation is visible while it runs.** Task rows carry `parent_session` and `usage_tokens`; the gateway pushes `agent.usage` and `delegation.updated`; the TUI renders live delegation task rows, a run token counter, and an `/agents` view.
+
+### Added
+
+- The gateway publishes the WS method table and the dispatcher is held to it — every registered method must be in the table and every table entry must dispatch.
+- TUI: `/theme` switches the palette and persists it in config; the palette is a `Theme` struct ported to Claude Code's dark theme; the terminal's background is detected via OSC 11 and the palette degrades to the terminal's color depth.
+- TUI markdown rendering: inline code spans, consecutive pipe rows aligned as tables, block quotes with a dim gutter, OSC 8 hyperlinks for URLs in scrollback, list items with an accented marker, and ATX headings rendered as bold titles without the marker.
+- TUI: multi-line paste inserts content one character at a time (no bracketed-paste surprises), `OSC 52` copies the last answer to the clipboard, `/retry` resends the last prompt through the send gate, and `/expand` reprints the last tool call in full.
+- `read_only` is a declared tool capability, and `SandboxedTool` stops masking the capabilities of the tool it wraps.
+
+### Changed
+
+- Multi-user RBAC scaffolding that nothing wired up is removed; `requires_approval` now gates a call where there is someone to ask.
+- The TUI event loop is a module directory rather than one file.
+- The app version is 0.3.8 across the workspace, the desktop crate, and the web client.
+
+### Fixed
+
+- A reply that was only markup (no text after formatting) no longer completes the turn early.
+- Browser: pages are reused across tool calls instead of pooled and abandoned; the empty-object argument shape the schema advertises is accepted; keys reach the page in a form the browser recognizes.
+- The planner database URL had a space in it.
+- The CORS example in the config guide taught a pairing the gateway refuses; the permissions system is documented in the tools module doc.
+
 ## [0.3.7] - 2026-09-20
 
 ### Highlights
