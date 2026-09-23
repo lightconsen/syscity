@@ -931,6 +931,10 @@ mod seccomp {
             self.jf_fixups.push((at, miss));
         }
 
+        /// Position of a marked label. Every label used by a jump is marked
+        /// before `resolve`; an unmarked one is an assembler bug the
+        /// simulator tests catch, so panicking is the correct behavior.
+        #[allow(clippy::expect_used)] // assembler invariant, not input validation
         fn position(&self, label: Label) -> usize {
             self.labels
                 .iter()
@@ -939,6 +943,11 @@ mod seccomp {
                 .expect("label marked")
         }
 
+        /// Classic-BPF jump offsets are single bytes; a distance that does
+        /// not fit means the program layout grew past what one filter can
+        /// express, and panicking here is the point (the tests would catch
+        /// it long before a kernel sees the program).
+        #[allow(clippy::expect_used)] // layout bug, not input validation
         fn resolve(mut self) -> Vec<BpfInsn> {
             let jt_fixups = std::mem::take(&mut self.jt_fixups);
             let jf_fixups = std::mem::take(&mut self.jf_fixups);
@@ -1580,8 +1589,7 @@ mod namespaces {
             return Err(io::Error::last_os_error());
         }
         let attrs = libc::mount_attr {
-            attr_set: (libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV)
-                as u64,
+            attr_set: libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV,
             attr_clr: 0,
             propagation: 0,
             userns_fd: 0,
