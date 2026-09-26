@@ -290,7 +290,17 @@ impl ModelRouter {
                         return Ok((response, rec));
                     }
                     Err(ref e) => {
-                        let class = FailureClass::from_error(e, None);
+                        let mut class = FailureClass::from_error(e, None);
+                        // The cloud provider's credential IS the login-bound
+                        // session token: a 401 from the relay means the login
+                        // itself expired, not that a key should rotate (there
+                        // is only one). Reclassify so the failure fails fast
+                        // and surfaces a re-login prompt instead of being
+                        // retried every few seconds.
+                        #[cfg(feature = "cloud")]
+                        if entry.provider == "cloud" && class == FailureClass::AuthTemporary {
+                            class = FailureClass::CloudAuthExpired;
+                        }
                         warn!(
                             "Provider {} failed with {}: {}",
                             entry.provider,

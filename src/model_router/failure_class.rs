@@ -25,6 +25,11 @@ pub enum FailureClass {
     /// (the credential stays valid; only the balance is exhausted)
     #[cfg(feature = "cloud")]
     InsufficientCredits,
+    /// The cloud relay rejected the login-bound session token itself
+    /// (401) — no rotation can fix an expired login; fail fast and
+    /// surface a re-login prompt
+    #[cfg(feature = "cloud")]
+    CloudAuthExpired,
     /// Service overloaded (502, 503) — retry with backoff
     Overloaded,
     /// Request timeout — retry
@@ -67,6 +72,9 @@ impl FailureClass {
                 | Self::ConnectionError
                 | Self::ServerError
         )
+        // `CloudAuthExpired` is deliberately not retryable: the credential
+        // is a login-bound session token, and retrying a dead login just
+        // hammers the relay every few seconds (daemon log, 2026-09-26).
     }
 
     /// Whether the current API key should be rotated to the next available key.
@@ -93,6 +101,8 @@ impl FailureClass {
             Self::Timeout => 10,
             Self::AuthTemporary => 5,
             Self::ConnectionError => 5,
+            #[cfg(feature = "cloud")]
+            Self::CloudAuthExpired => 0,
             _ => 0,
         }
     }
@@ -106,6 +116,8 @@ impl FailureClass {
             Self::Billing => "billing or quota exceeded",
             #[cfg(feature = "cloud")]
             Self::InsufficientCredits => "insufficient credit balance",
+            #[cfg(feature = "cloud")]
+            Self::CloudAuthExpired => "cloud session expired — re-login required",
             Self::Overloaded => "service overloaded",
             Self::Timeout => "request timeout",
             Self::ConnectionError => "connection error",
@@ -278,6 +290,25 @@ mod tests {
         assert!(class.should_rotate_key());
         assert!(!class.should_disable_key());
         assert!(class.is_retryable());
+    }
+
+    /// The cloud relay's 401 is reclassified: its credential is the login's
+    /// own session token, so retry-and-rotate is a hammer on a dead login.
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn cloud_auth_expired_is_not_retryable_and_does_not_rotate() {
+        assert!(!FailureClass::CloudAuthExpired.is_retryable());
+        assert!(!FailureClass::CloudAuthExpired.should_rotate_key());
+        assert!(
+            !FailureClass::CloudAuthExpired.should_disable_key(),
+            "the session token stays valid — only the login expired"
+        );
+        assert!(!FailureClass::CloudAuthExpired.should_cooldown_provider());
+        assert_eq!(FailureClass::CloudAuthExpired.default_backoff_secs(), 0);
+        assert_eq!(
+            FailureClass::CloudAuthExpired.description(),
+            "cloud session expired — re-login required"
+        );
     }
 
     #[test]

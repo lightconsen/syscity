@@ -210,6 +210,21 @@ impl ModelRouter {
             });
         }
 
+        // The cloud login itself expired: rotation cannot help (the
+        // credential is the login), so fail fast with a message the gateway
+        // can map to `cloud_login_required` and the UI can render as a
+        // re-login prompt.
+        #[cfg(feature = "cloud")]
+        if class == FailureClass::CloudAuthExpired {
+            self.record_failure(provider_name, Some(class)).await;
+            return Err(crate::error::SyscityError::ExternalService {
+                source: format!(
+                    "cloud login expired — re-login required (provider {provider_name}: {error})"
+                ),
+                cause: None,
+            });
+        }
+
         if class.should_rotate_key() {
             let cooldown = self.cooldown_for_failure(provider_name, class).await;
             match self

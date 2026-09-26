@@ -888,11 +888,21 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
         }
         Err(e) => {
             error!("ACP execution failed for agent {} session {}: {}", agent_id, session_id, e);
+            let code = extract_error_code(&e);
+            // The cloud relay 401 means the stored session token is dead:
+            // drop it so the global cloud status flips to logged-out and the
+            // UI's cloud-dependent surfaces update instead of silently
+            // retrying with a credential no rotation can revive.
+            if code.as_deref() == Some("cloud_login_required") {
+                if let Err(clear_err) = crate::cloud::session::clear_token(&state.secrets).await {
+                    warn!("Failed to clear the expired cloud session token: {clear_err}");
+                }
+            }
             if let Err(e) = state.events.tx.send(GatewayEvent::ProcessingError {
                 session_id: session_id.to_string(),
                 agent_id: agent_id.to_string(),
                 message: format!("Execution failed: {}", e),
-                code: extract_error_code(&e),
+                code,
             }) {
                 debug!("No receivers for ProcessingError event: {}", e);
             }
@@ -925,6 +935,8 @@ fn extract_error_code(e: &crate::error::SyscityError) -> Option<String> {
         crate::error::SyscityError::ExternalService { source, .. } => {
             if source.contains("insufficient_credits") {
                 Some("insufficient_credits".to_string())
+            } else if source.contains("cloud login expired") {
+                Some("cloud_login_required".to_string())
             } else {
                 None
             }
