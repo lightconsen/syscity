@@ -18,9 +18,10 @@ import {
   ThumbsUp,
   ThumbsDown,
   Coins,
+  LogIn,
 } from "lucide-react";
 import { formatDuration } from "@/lib/utils";
-import { cloudStatus } from "@/lib/cloud";
+import { cloudLoginUrl, cloudStatus } from "@/lib/cloud";
 import type { ChatMessage, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
@@ -80,6 +81,32 @@ function InsufficientCreditsCard() {
           {t("MessageBubble.recharge")}
         </a>
       )}
+    </div>
+  );
+}
+
+/** Dedicated card when the cloud relay rejected the turn because the cloud
+ * login itself expired: a 401 on the session token is not something key
+ * rotation can fix, so the card sends the operator straight to re-login. */
+function CloudLoginRequiredCard() {
+  const { t } = useTranslation("chat");
+  return (
+    <div className="mt-1 rounded-lg border border-amber-300/60 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-900/20 px-3 py-2.5 max-w-xl">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+        <LogIn className="w-3.5 h-3.5" />
+        {t("MessageBubble.cloudLoginExpired")}
+      </div>
+      <p className="mt-1 text-xs text-secondary">
+        {t("MessageBubble.cloudLoginExpiredHint")}
+      </p>
+      <button
+        type="button"
+        onClick={() => window.open(cloudLoginUrl("github"), "_blank")}
+        className="mt-2 inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-primary-500 hover:bg-primary-600 text-white text-xs font-medium transition"
+      >
+        <LogIn className="w-3 h-3" />
+        {t("MessageBubble.relogin")}
+      </button>
     </div>
   );
 }
@@ -415,6 +442,8 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
           )}
           {message.errorCode === "insufficient_credits" ? (
             <InsufficientCreditsCard />
+          ) : message.errorCode === "cloud_login_required" ? (
+            <CloudLoginRequiredCard />
           ) : hasParts ? (
             <div className="space-y-1">
               {/* Internals panel: reasoning + tool-calls with Collapse button */}

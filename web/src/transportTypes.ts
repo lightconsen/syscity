@@ -49,7 +49,7 @@ export interface ChatMessage {
   /** Cloud credit balance after this turn (`usage.credit_balance`). */
   balanceAfter?: number;
   /** Machine-readable error code from `chat.error` (e.g.
-   * `insufficient_credits`). */
+   * `insufficient_credits`, `cloud_login_required`). */
   errorCode?: string;
 }
 
