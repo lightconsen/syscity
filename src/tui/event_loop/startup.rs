@@ -18,6 +18,29 @@ pub(super) async fn startup(
     client: &WsClient,
     session: &SessionChoice,
 ) {
+    // The welcome banner is the first thing in scrollback. The version comes
+    // from the handshake, which run_app records in state before this task
+    // starts; the cwd is the TUI process's own — for the common local-daemon
+    // case that is also where the gateway's workspace work happens.
+    {
+        let s = state.read().await;
+        let version = match &s.connection {
+            crate::tui::state::ConnectionState::Connected { server_version, .. } => {
+                server_version.clone()
+            }
+            _ => String::new(),
+        };
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string());
+        drop(s);
+        state
+            .write()
+            .await
+            .transcript
+            .push(welcome_lines(&version, cwd));
+    }
+
     // Resolve the theme before the first paint: `tui.theme` in the gateway
     // config, `auto` consulting the OSC 11 result from the setup window. A
     // silent failure anywhere just keeps the dark default — the theme is a
@@ -90,4 +113,53 @@ pub(super) async fn startup(
         }
     };
     state.write().await.transcript.push_notice(greeting);
+}
+
+/// The startup banner: branding, the three hints a first-time user needs, and
+/// the working directory. Pushed as the first thing in scrollback, in the
+/// Claude-Code manner — a quiet "who am I talking to" block rather than a
+/// full-screen takeover, because this TUI lives inline and the transcript
+/// below it is the product.
+fn welcome_lines(version: &str, cwd: Option<String>) -> Vec<TranscriptLine> {
+    use LineKind::{Heading, Notice};
+    let mut lines = vec![
+        TranscriptLine::separator(),
+        TranscriptLine::new(Heading, format!("# ✻ Syscity v{version}")),
+        TranscriptLine::new(
+            Notice,
+            "/help for commands · /resume <n> to switch sessions · /theme for the palette",
+        ),
+    ];
+    if let Some(cwd) = cwd {
+        lines.push(TranscriptLine::new(Notice, format!("cwd: {cwd}")));
+    }
+    lines.push(TranscriptLine::separator());
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn welcome_carries_branding_hints_and_cwd() {
+        let lines = welcome_lines("0.3.8", Some("/Users/x/work".to_string()));
+        // blank / heading / tips / cwd / blank
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].text.is_empty());
+        assert_eq!(lines[1].text, "# ✻ Syscity v0.3.8");
+        assert_eq!(lines[1].kind, LineKind::Heading);
+        assert!(lines[2].text.contains("/help for commands"));
+        assert!(lines[2].text.contains("/resume <n>"));
+        assert!(lines[2].text.contains("/theme"));
+        assert_eq!(lines[3].text, "cwd: /Users/x/work");
+        assert!(lines[4].text.is_empty());
+    }
+
+    #[test]
+    fn welcome_omits_the_cwd_line_when_none() {
+        let lines = welcome_lines("0.3.8", None);
+        assert_eq!(lines.len(), 4);
+        assert!(lines.iter().all(|l| !l.text.starts_with("cwd:")));
+    }
 }
