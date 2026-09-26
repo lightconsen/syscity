@@ -894,9 +894,7 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
             // UI's cloud-dependent surfaces update instead of silently
             // retrying with a credential no rotation can revive.
             if code.as_deref() == Some("cloud_login_required") {
-                if let Err(clear_err) = crate::cloud::session::clear_token(&state.secrets).await {
-                    warn!("Failed to clear the expired cloud session token: {clear_err}");
-                }
+                clear_expired_cloud_token(state).await;
             }
             if let Err(e) = state.events.tx.send(GatewayEvent::ProcessingError {
                 session_id: session_id.to_string(),
@@ -949,6 +947,20 @@ fn extract_error_code(e: &crate::error::SyscityError) -> Option<String> {
 fn extract_error_code(_e: &crate::error::SyscityError) -> Option<String> {
     None
 }
+
+/// The cloud relay 401 means the stored session token is dead: drop it so
+/// the global cloud status flips to logged-out and the UI's
+/// cloud-dependent surfaces update instead of silently retrying with a
+/// credential no rotation can revive.
+#[cfg(feature = "cloud")]
+async fn clear_expired_cloud_token(state: &Arc<GatewayState>) {
+    if let Err(clear_err) = crate::cloud::session::clear_token(&state.secrets).await {
+        warn!("Failed to clear the expired cloud session token: {clear_err}");
+    }
+}
+
+#[cfg(not(feature = "cloud"))]
+async fn clear_expired_cloud_token(_state: &Arc<GatewayState>) {}
 
 #[cfg(test)]
 mod tests {

@@ -290,6 +290,7 @@ impl ModelRouter {
                         return Ok((response, rec));
                     }
                     Err(ref e) => {
+                        #[cfg_attr(not(feature = "cloud"), allow(unused_mut))]
                         let mut class = FailureClass::from_error(e, None);
                         // The cloud provider's credential IS the login-bound
                         // session token: a 401 from the relay means the login
