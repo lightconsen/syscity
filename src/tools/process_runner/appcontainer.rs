@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use crate::tools::win_appcontainer;
 
 use super::{
-    CommandOutput, NamespacePosture, ProcessChild, ProcessError, ProcessRequest, ProcessRunner,
-    StdProcessRunner, WriteFence,
+    spawn_err, CommandOutput, NamespacePosture, ProcessChild, ProcessError, ProcessRequest,
+    ProcessRunner, StdProcessRunner, StdioMode, WriteFence,
 };
 
 /// The fence direction is inverted vs. Unix: an AppContainer token denies
