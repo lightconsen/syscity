@@ -47,8 +47,20 @@ def main():
                                     "message": {"type": "string"}
                                 },
                             },
+                            "annotations": {"readOnlyHint": True},
                         }
                     ]
+                },
+            }
+        elif method == "tools/call":
+            args = (req.get("params") or {}).get("arguments") or {}
+            message = args.get("message", "")
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": f"echo:{message}"}],
+                    "isError": False,
                 },
             }
         else:

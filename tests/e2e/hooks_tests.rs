@@ -56,6 +56,17 @@ fn shell_cmd_mock(command: &str) -> MockProvider {
 /// Build a gateway loaded with `hooks_file`, register the mock provider as
 /// `mock-model`, and start it.
 async fn start_hooked_gateway(port: u16, hooks: PathBuf, mock: MockProvider) {
+    start_hooked_gateway_opts(port, hooks, mock, true).await;
+}
+
+/// Same, with control over the auto-approver. The ask case needs it off:
+/// the test resolves the raised approval itself.
+async fn start_hooked_gateway_opts(
+    port: u16,
+    hooks: PathBuf,
+    mock: MockProvider,
+    auto_approve: bool,
+) {
     let mut config = test_config(port, false);
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
@@ -74,10 +85,8 @@ async fn start_hooked_gateway(port: u16, hooks: PathBuf, mock: MockProvider) {
     let router = gateway.model_router();
     register_mock_provider_with_model(&router, mock, "mock-model").await;
 
-    start_gateway_and_wait(port, gateway).await;
+    start_gateway_and_wait_opts(port, gateway, auto_approve).await;
 }
-
-/// Case 1 — PreToolUse deny 挡 shell: a hook matching `*` denying every tool
 /// must surface the denial to the model and keep the tool body from running.
 #[tokio::test]
 #[serial]
@@ -313,4 +322,67 @@ async fn broken_pre_hook_fails_open() {
     let content =
         std::fs::read_to_string(&sentinel).expect("shell body must run despite broken hook");
     assert_eq!(content.trim(), "open-ran");
+}
+
+/// Case 6 — PreToolUse ask 升级审批: a hook returning `{"permission":"ask"}`
+/// suspends the turn on the approval queue; the tool body runs only after
+/// the operator approves through the WS methods.
+#[tokio::test]
+#[serial]
+async fn pre_tool_use_ask_suspends_until_approved() {
+    let port = free_port();
+    let sentinel = sentinel_path("ask", port);
+    let _ = std::fs::remove_file(&sentinel);
+
+    let hooks = write_hooks_file(
+        port,
+        json!({
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [ {
+                    "type": "command",
+                    "command": "printf '{\"permission\":\"ask\",\"reason\":\"hook-asks\"}'"
+                } ] }
+            ]
+        }),
+    );
+    let mock = shell_cmd_mock(&format!("echo asked-ran > '{}'", sentinel.display()));
+    start_hooked_gateway_opts(port, hooks, mock.clone(), false).await;
+
+    let mut client = FrontendSimulator::connect(port).await;
+    let sid = client.create_session().await;
+    client.subscribe(vec![sid.clone()]).await;
+    client
+        .send_chat(&sid, "Use the shell tool to write a sentinel file.")
+        .await;
+
+    // The hook's ask becomes an approval request citing the hook reason…
+    let payload = client
+        .wait_for_event("approval.required", 30)
+        .await
+        .expect("the hook's ask must raise an approval request");
+    let message = payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        message.contains("hook-asks"),
+        "the approval must carry the hook's reason, got: {message}"
+    );
+    assert!(!sentinel.exists(), "tool body must not run while pending");
+
+    // …approving resumes the turn and the tool body runs.
+    client
+        .request("approvals.approve", json!({ "id": payload["approval_id"] }))
+        .await;
+    client
+        .wait_for_event("chat.final", 30)
+        .await
+        .expect("turn must complete after approval");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel)
+            .expect("approved body must have run")
+            .trim(),
+        "asked-ran"
+    );
 }

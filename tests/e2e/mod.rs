@@ -345,6 +345,14 @@ fn spawn_auto_approver(port: u16) {
 }
 
 pub async fn start_gateway_and_wait(port: u16, gateway: Gateway) {
+    start_gateway_and_wait_opts(port, gateway, true).await;
+}
+
+/// Start a gateway and wait for the WS listener, optionally spawning the
+/// auto-approver. Tests that assert on the approval flow itself (the
+/// `approval.required` event, deny blocking the turn) must pass `false` —
+/// an auto-approver would resolve the request before the test sees it.
+pub async fn start_gateway_and_wait_opts(port: u16, gateway: Gateway, auto_approve: bool) {
     init_test_tracing();
 
     let url = format!("ws://127.0.0.1:{}/ws", port);
@@ -361,7 +369,9 @@ pub async fn start_gateway_and_wait(port: u16, gateway: Gateway) {
             Ok(Ok(_)) => {
                 // Every test gateway gets one, so a chat that needs an approval
                 // to keep going is not mistaken for a hang.
-                spawn_auto_approver(port);
+                if auto_approve {
+                    spawn_auto_approver(port);
+                }
                 return;
             }
             Ok(Err(e)) => last_connect_err = Some(e.to_string()),
@@ -901,6 +911,7 @@ pub async fn run_tool_chat_test(
 }
 
 mod agent_tests;
+mod approval_journey_tests;
 mod ask_user_tests;
 #[cfg(feature = "browser")]
 mod browser_chat_tests;
@@ -913,6 +924,7 @@ mod goal_tests;
 mod health_tests;
 mod hooks_tests;
 mod llm_chat_tests;
+mod mcp_chat_tests;
 mod mock_chat_tests;
 mod planner_tests;
 mod post_execute_tests;
