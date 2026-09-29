@@ -44,7 +44,7 @@ pub use types::{
     McpEvent, McpGetPromptResult, McpHealth, McpHealthStatus, McpNotification, McpPrompt,
     McpPromptArgument, McpPromptMessage, McpPromptsCapability, McpResource, McpResourceContent,
     McpResourcesCapability, McpSamplingMessage, McpSamplingResult, McpServerCapabilities,
-    McpToolDefinition, McpToolsCapability,
+    McpToolAnnotations, McpToolDefinition, McpToolsCapability,
 };
 pub(crate) use types::{McpInitializeResult, McpRequest, McpResponse, McpServerInfo};
 
@@ -126,6 +126,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
             parameters: json!({}),
+            annotations: None,
         };
         let wrapper = McpToolWrapper::new(client, "filesystem", &def);
         assert_eq!(wrapper.name(), "mcp__filesystem__read_file");
@@ -190,7 +191,8 @@ mod tests {
                         "tools": [{
                             "name": "echo",
                             "description": "Echo text",
-                            "inputSchema": { "type": "object" }
+                            "inputSchema": { "type": "object" },
+                            "annotations": { "readOnlyHint": true }
                         }]
                     })),
                     error: None,
@@ -252,6 +254,10 @@ mod tests {
         let tools = client.get_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
+        // The fake server declares readOnlyHint on its echo tool; the
+        // annotation must survive the in-process round trip.
+        let ann = tools[0].annotations.as_ref().expect("annotations present");
+        assert_eq!(ann.read_only_hint, Some(true));
 
         let result = client
             .call_tool("echo", json!({ "text": "hi" }))

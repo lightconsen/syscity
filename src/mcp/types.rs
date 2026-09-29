@@ -160,6 +160,26 @@ pub(crate) struct McpInitializeResult {
 // Tool definition
 // ─────────────────────────────────────────────
 
+/// MCP `ToolAnnotations` from the spec (camelCase on the wire).
+///
+/// Each hint is `Option<bool>` rather than `bool` so the wrapper can tell
+/// "the server said nothing" apart from "the server said false" — the
+/// conservative default posture only applies when the server is silent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpToolAnnotations {
+    /// `readOnlyHint`: the tool only observes state and never mutates anything.
+    #[serde(default, rename = "readOnlyHint")]
+    pub read_only_hint: Option<bool>,
+    /// `destructiveHint`: the tool may irreversibly destroy or overwrite
+    /// state. Per the MCP spec it defaults to `true` when `readOnlyHint` is
+    /// false, so `None` from a non-read-only tool is treated as destructive.
+    #[serde(default, rename = "destructiveHint")]
+    pub destructive_hint: Option<bool>,
+    /// `idempotentHint`: calling the tool twice has the same effect as once.
+    #[serde(default, rename = "idempotentHint")]
+    pub idempotent_hint: Option<bool>,
+}
+
 /// MCP tool definition discovered from `tools/list`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDefinition {
@@ -167,6 +187,9 @@ pub struct McpToolDefinition {
     pub description: String,
     #[serde(default)]
     pub parameters: serde_json::Value,
+    /// Server-declared tool annotations, absent when the server is silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
 }
 
 // ─────────────────────────────────────────────
@@ -352,5 +375,39 @@ impl McpHealth {
 impl Default for McpHealth {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn annotations_deserialize_camel_case_hints() {
+        let def: McpToolDefinition = serde_json::from_value(json!({
+            "name": "send_email",
+            "description": "Send an email",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false
+            }
+        }))
+        .expect("deserialize");
+        let a = def.annotations.expect("annotations present");
+        assert_eq!(a.read_only_hint, Some(false));
+        assert_eq!(a.destructive_hint, Some(true));
+        assert_eq!(a.idempotent_hint, Some(false));
+    }
+
+    #[test]
+    fn absent_annotations_deserialize_to_none() {
+        let def: McpToolDefinition = serde_json::from_value(json!({
+            "name": "read_file",
+            "description": "Read a file"
+        }))
+        .expect("deserialize");
+        assert!(def.annotations.is_none());
     }
 }

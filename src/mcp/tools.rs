@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::mcp::{
     McpClient, McpManager, McpNotification, McpPrompt, McpSamplingMessage, McpServerConfig,
-    McpToolDefinition, McpTransport,
+    McpToolAnnotations, McpToolDefinition, McpTransport,
 };
 use crate::tools::approval::RiskLevel;
 use crate::tools::sdk::ToolCapabilities;
@@ -32,6 +32,8 @@ pub struct McpToolWrapper {
     tool_name: String,
     tool_description: String,
     parameters_schema: serde_json::Value,
+    /// Server-declared annotations, used to derive `ToolCapabilities`.
+    annotations: Option<McpToolAnnotations>,
 }
 
 impl McpToolWrapper {
@@ -44,7 +46,59 @@ impl McpToolWrapper {
             tool_name: tool.name.clone(),
             tool_description: tool.description.clone(),
             parameters_schema: tool.parameters.clone(),
+            annotations: tool.annotations.clone(),
         }
+    }
+}
+
+/// Classify a tool by the verbs in its name when the server published no
+/// annotations. Returns `Some(caps)` only when a destructive verb is
+/// recognized; otherwise `None` and the caller keeps the conservative
+/// default. This fallback can only escalate or restate the default posture —
+/// it never loosens it — because a silent server is not a claim of safety.
+///
+/// The verbs are matched against snake/kebab/camel tokens of the tool name
+/// (split on `_`, `-`, and case boundaries) so `send_email`, `sendEmail`, and
+/// `send-email` all classify the same way.
+fn classify_by_name(tool_name: &str) -> Option<ToolCapabilities> {
+    const DESTRUCTIVE_VERBS: &[&str] = &[
+        "send", "delete", "trash", "remove", "destroy", "purge", "drop", "modify", "update",
+        "patch", "put", "write", "create", "post", "publish", "archive", "move", "rename",
+        "invite", "upload", "execute", "run",
+    ];
+    // Split on `_` and `-` first, then on case boundaries within each token,
+    // so `sendEmail` yields ["send", "email"] and `send-email` the same.
+    let tokens: Vec<String> = tool_name
+        .split(['_', '-'])
+        .flat_map(|part| {
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            for ch in part.chars() {
+                if ch.is_uppercase() && !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                cur.push(ch.to_ascii_lowercase());
+            }
+            if !cur.is_empty() {
+                out.push(cur);
+            }
+            out
+        })
+        .collect();
+    if tokens
+        .iter()
+        .any(|t| DESTRUCTIVE_VERBS.contains(&t.as_str()))
+    {
+        Some(ToolCapabilities {
+            requires_approval: true,
+            risk_level: RiskLevel::High,
+            categories: vec!["system".to_string(), "mcp".to_string()],
+            idempotent: false,
+            compensation: None,
+            ..Default::default()
+        })
+    } else {
+        None
     }
 }
 
@@ -63,17 +117,49 @@ impl Tool for McpToolWrapper {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
+        let base_categories = vec!["system".to_string(), "mcp".to_string()];
+        // What an MCP tool does with a retry is the server's business, so the
+        // conservative default — written out because this is the tool family
+        // callers reach for when they want to act on an external system — is
+        // the floor the annotation and name-fallback paths restate or loosen.
+        let conservative = ToolCapabilities {
             requires_approval: true,
             risk_level: RiskLevel::High,
-            categories: vec!["system".to_string(), "mcp".to_string()],
-            // What an MCP tool does with a retry is the server's business, so
-            // the honest declaration is the careful one — the default, written
-            // out because this is the tool family callers reach for when they
-            // want to act on an external system.
+            categories: base_categories.clone(),
             idempotent: false,
             compensation: None,
             ..Default::default()
+        };
+        match &self.annotations {
+            // The server declared its tool read-only: no approval, and it
+            // stays visible in plan mode.
+            Some(a) if a.read_only_hint == Some(true) => ToolCapabilities {
+                requires_approval: false,
+                risk_level: RiskLevel::Low,
+                categories: base_categories,
+                read_only: true,
+                idempotent: true,
+                ..Default::default()
+            },
+            // The server published annotations but not read-only: keep the
+            // approval, with risk set by destructiveHint (defaulting to true
+            // per the MCP spec when readOnlyHint is false).
+            Some(a) => ToolCapabilities {
+                requires_approval: true,
+                risk_level: if a.destructive_hint.unwrap_or(true) {
+                    RiskLevel::High
+                } else {
+                    RiskLevel::Medium
+                },
+                idempotent: a.idempotent_hint.unwrap_or(false),
+                read_only: false,
+                categories: base_categories,
+                compensation: None,
+                ..Default::default()
+            },
+            // Silent server: fall back to the verb-in-name classifier, then
+            // to the conservative default.
+            None => classify_by_name(&self.tool_name).unwrap_or(conservative),
         }
     }
 
@@ -850,5 +936,94 @@ Actions:
             }
             _ => Err(crate::error::SyscityError::Validation(format!("Unknown action: {}", action))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrapper(tool_name: &str, annotations: Option<McpToolAnnotations>) -> McpToolWrapper {
+        let client = Arc::new(RwLock::new(McpClient::new()));
+        let def = McpToolDefinition {
+            name: tool_name.to_string(),
+            description: String::new(),
+            parameters: json!({}),
+            annotations,
+        };
+        McpToolWrapper::new(client, "test", &def)
+    }
+
+    fn annotations(
+        read_only: Option<bool>,
+        destructive: Option<bool>,
+        idempotent: Option<bool>,
+    ) -> Option<McpToolAnnotations> {
+        Some(McpToolAnnotations {
+            read_only_hint: read_only,
+            destructive_hint: destructive,
+            idempotent_hint: idempotent,
+        })
+    }
+
+    #[test]
+    fn read_only_hint_yields_low_risk_no_approval() {
+        let caps = wrapper("read_email", annotations(Some(true), None, None)).capabilities();
+        assert!(!caps.requires_approval);
+        assert!(caps.read_only);
+        assert_eq!(caps.risk_level, RiskLevel::Low);
+        assert!(caps.idempotent);
+    }
+
+    #[test]
+    fn destructive_hint_keeps_approval() {
+        let caps =
+            wrapper("delete_user", annotations(Some(false), Some(true), None)).capabilities();
+        assert!(caps.requires_approval);
+        assert!(!caps.read_only);
+        assert_eq!(caps.risk_level, RiskLevel::High);
+    }
+
+    #[test]
+    fn non_destructive_write_is_medium() {
+        // readOnlyHint false + destructiveHint false: a write that is not
+        // destructive. Approval stays; risk drops to Medium.
+        let caps = wrapper("update_settings", annotations(Some(false), Some(false), Some(false)))
+            .capabilities();
+        assert!(caps.requires_approval);
+        assert!(!caps.read_only);
+        assert_eq!(caps.risk_level, RiskLevel::Medium);
+        assert!(!caps.idempotent);
+    }
+
+    #[test]
+    fn absent_annotations_keep_the_conservative_default() {
+        let caps = wrapper("fetch_messages", None).capabilities();
+        assert!(caps.requires_approval);
+        assert!(!caps.read_only);
+        assert_eq!(caps.risk_level, RiskLevel::High);
+        assert!(!caps.idempotent);
+    }
+
+    #[test]
+    fn absent_annotations_destructive_name_classifies_high() {
+        for name in ["send_email", "sendEmail", "send-email", "delete_user"] {
+            let caps = wrapper(name, None).capabilities();
+            assert!(
+                caps.requires_approval,
+                "{name} should keep the approval via the name fallback"
+            );
+            assert_eq!(caps.risk_level, RiskLevel::High);
+        }
+    }
+
+    #[test]
+    fn annotations_beat_the_name_fallback() {
+        // A tool named like a destructive verb but declared read-only by the
+        // server is trusted: the server is the authority on its own tools.
+        let caps = wrapper("delete_all", annotations(Some(true), None, None)).capabilities();
+        assert!(!caps.requires_approval);
+        assert!(caps.read_only);
+        assert_eq!(caps.risk_level, RiskLevel::Low);
     }
 }
