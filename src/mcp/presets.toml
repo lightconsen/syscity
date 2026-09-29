@@ -28,8 +28,11 @@ description = "GitHub Personal Access Token (repo, read:org scopes)"
 display_name = "Gmail"
 description = "Read, search and send emails"
 logo_url = "https://cdn.simpleicons.org/gmail"
+# The previous preset pointed at @modelcontextprotocol/server-gmail, which is
+# not a published package (npm 404). This community server is maintained and
+# exposes read/search/draft/send tools over the Gmail API.
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-gmail"]
+args = ["-y", "@gongrzhe/server-gmail-autoauth-mcp"]
 transport = "stdio"
 
 [gmail.env.GOOGLE_OAUTH_CLIENT_ID]
