@@ -39,7 +39,8 @@ const iconBtnCls =
  *
  * - The leading zone mirrors the sidebar's width (w-64 expanded / w-16
  *   collapsed, same 300ms transition) and hosts the sidebar's former
- *   header on md+: logo + "Syscity" + the collapse toggle. The agent
+ *   header on md+: logo + the app name ("Syscity Desktop" in the desktop
+ *   shells, "Syscity" on mobile/browser) + the collapse toggle. The agent
  *   identity strip's left edge therefore tracks the sidebar's right edge
  *   — the titlebar "follows" the pane split below it. On macOS the
  *   native traffic lights overlay this zone (titleBarStyle Overlay);
@@ -81,6 +82,13 @@ export function Titlebar({
   const rightPanelOpen = inKbPage ? kbPanelOpen : workspacePanelOpen;
 
   const isMac = platform === "tauri-macos";
+  // Desktop shells carry the fuller name; mobile keeps the short one — the
+  // same rule as the native window title (`desktop/tauri.conf.json`). Plain
+  // browsers count as neither, so they keep the short name too.
+  const appTitle =
+    platform === "tauri-macos" || platform === "tauri-desktop"
+      ? "Syscity Desktop"
+      : "Syscity";
   const showSafeAreaTop = platform === "tauri-mobile" || (isMobile && !isMac);
 
   const collapseBtn = (
@@ -138,8 +146,8 @@ export function Titlebar({
               className="w-6 h-6 shrink-0"
               draggable={false}
             />
-            <span className="text-sm font-semibold text-primary whitespace-nowrap">
-              Syscity
+            <span className="text-sm font-semibold text-primary min-w-0 truncate">
+              {appTitle}
             </span>
             <div className="flex-1" />
             {collapseBtn}
@@ -168,7 +176,7 @@ export function Titlebar({
               draggable={false}
             />
             <span className="md:hidden text-sm font-semibold text-primary whitespace-nowrap">
-              Syscity
+              {appTitle}
             </span>
           </>
         )}
