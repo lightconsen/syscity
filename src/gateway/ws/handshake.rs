@@ -39,7 +39,29 @@ pub(super) async fn handle_connect(
             (Some(pre_validated_auth.user_id.clone()), scopes)
         }
         crate::gateway::protocol::AuthMode::Token => {
-            resolve_token_auth(req, state, &params, conn).await
+            let from_frame = resolve_token_auth(req, state, &params, conn).await;
+            if from_frame.0.is_some() {
+                from_frame
+            } else if pre_validated_auth.scopes.is_empty() {
+                // Nothing was validated at the upgrade either: an
+                // unauthenticated handshake, refused below by the caller's
+                // scope check.
+                from_frame
+            } else {
+                // The upgrade already authenticated this connection — a
+                // ticket (the preferred flow), a Bearer header, or `?token=`
+                // — and the middleware refuses the upgrade outright without
+                // one under this mode. Re-deriving identity from the frame
+                // alone discarded that: a ticket-authenticated client lands
+                // with no token to repeat and used to end up with zero
+                // scopes. The frame may only *narrow* what the upgrade
+                // granted, exactly as in `AuthMode::None`.
+                let scopes = crate::gateway::protocol::resolve_scopes(
+                    &pre_validated_auth.scopes,
+                    &params.scopes,
+                );
+                (Some(pre_validated_auth.user_id.clone()), scopes)
+            }
         }
         crate::gateway::protocol::AuthMode::Device => {
             return handle_device_auth(req, state, &params, conn).await;
@@ -339,17 +361,34 @@ mod tests {
         Arc::new(make_test_state(GatewayConfig::default()).await)
     }
 
+    /// A `WsAuthResult` as the upgrade middleware builds one for a
+    /// **validated** credential.
+    fn validated_upgrade() -> WsAuthResult {
+        WsAuthResult {
+            user_id: UserId::new("u1"),
+            scopes: vec!["chat".to_string()],
+        }
+    }
+
     async fn dispatch_connect(
         conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
         state: &Arc<GatewayState>,
         auth_mode: AuthMode,
         params: Option<serde_json::Value>,
     ) -> WsResponse {
+        dispatch_connect_pre(conn, state, auth_mode, params, validated_upgrade()).await
+    }
+
+    /// Same, with an explicit upgrade result — for the case where the upgrade
+    /// validated nothing.
+    async fn dispatch_connect_pre(
+        conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+        state: &Arc<GatewayState>,
+        auth_mode: AuthMode,
+        params: Option<serde_json::Value>,
+        pre: WsAuthResult,
+    ) -> WsResponse {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCommand>(1);
-        let pre = WsAuthResult {
-            user_id: UserId::new("u1"),
-            scopes: vec!["chat".to_string()],
-        };
         handle_connect(&req("r1", params), conn, state, &auth_mode, &cmd_tx, &pre).await
     }
 
@@ -359,7 +398,7 @@ mod tests {
         let conn = make_test_conn(&[]);
         let resp = dispatch_connect(&conn, &state, AuthMode::None, None).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -370,7 +409,7 @@ mod tests {
             dispatch_connect(&conn, &state, AuthMode::None, Some(serde_json::json!({"nope": 1})))
                 .await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -597,8 +636,15 @@ mod tests {
             .contains(&"read".into()));
     }
 
+    /// Under token auth the upgrade is the gate: the middleware refuses an
+    /// upgrade without a credential outright, so a connection that reaches
+    /// the handshake was authenticated — by a ticket (the preferred flow), a
+    /// Bearer header, or `?token=`. A frame carrying no token must therefore
+    /// inherit that grant (narrowed by what it asks for), not be reduced to
+    /// an anonymous, scope-less client: a ticket-authenticated client has no
+    /// token to repeat.
     #[tokio::test]
-    async fn connect_token_invalid_anonymous_ok() {
+    async fn connect_token_without_a_frame_token_inherits_the_upgrade_grant() {
         let mut config = GatewayConfig::default();
         config.security.auth_mode = AuthMode::Token;
         config.security.shared_token = Some("secret-token".to_string());
@@ -606,6 +652,37 @@ mod tests {
         let conn = make_test_conn(&[]);
         let resp =
             dispatch_connect(&conn, &state, AuthMode::Token, params(serde_json::json!({}))).await;
+        assert!(resp.ok);
+        let payload = resp.payload.as_ref().unwrap();
+        assert_eq!(payload["session_key"], "ws:u1");
+        assert_eq!(
+            payload["scopes_granted"].as_array().unwrap(),
+            &vec![serde_json::json!("chat")],
+            "the upgrade's entitlement carries through"
+        );
+    }
+
+    /// …and when the upgrade validated nothing (empty scopes), the handshake
+    /// stays anonymous with no scopes rather than inventing an identity.
+    #[tokio::test]
+    async fn connect_token_without_any_credential_is_anonymous() {
+        let mut config = GatewayConfig::default();
+        config.security.auth_mode = AuthMode::Token;
+        config.security.shared_token = Some("secret-token".to_string());
+        let state = Arc::new(make_test_state(config).await);
+        let conn = make_test_conn(&[]);
+        let no_upgrade = WsAuthResult {
+            user_id: UserId::new("anonymous"),
+            scopes: Vec::new(),
+        };
+        let resp = dispatch_connect_pre(
+            &conn,
+            &state,
+            AuthMode::Token,
+            params(serde_json::json!({})),
+            no_upgrade,
+        )
+        .await;
         assert!(resp.ok);
         let payload = resp.payload.as_ref().unwrap();
         assert_eq!(payload["session_key"], "ws:anonymous");
@@ -637,7 +714,7 @@ mod tests {
         let resp =
             dispatch_connect(&conn, &state, AuthMode::Device, params(serde_json::json!({}))).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[test]

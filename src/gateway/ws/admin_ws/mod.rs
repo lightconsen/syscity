@@ -6,6 +6,9 @@
 //! artifact/file downloads, and health/metrics probes.
 
 use super::{WsRequest, WsResponse};
+
+/// Shared parameter helpers from the `ws` module (used by every submodule).
+pub(crate) use super::required_str_param;
 use crate::gateway::GatewayState;
 
 mod agents;

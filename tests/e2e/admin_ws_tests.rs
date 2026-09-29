@@ -11,7 +11,7 @@
 //! called with no arguments against a real gateway):
 //!   1. parameterless methods that must answer `ok`;
 //!   2. methods with required parameters that must refuse with
-//!      `INVALID_REQUEST` — a structured refusal, never a panic or a silent
+//!      `INVALID_PARAMS` — a structured refusal, never a panic or a silent
 //!      `ok`;
 //!   3. methods whose parameters were accepted and whose *resource* is absent
 //!      in a bare test gateway (`NOT_FOUND` / `UNAVAILABLE`) — proof the
@@ -55,7 +55,6 @@ async fn parameterless_admin_methods_answer_over_ws() {
         // models + providers
         "providers.list",
         "providers.usage",
-        "providers.fallback",
         // skills / plugins
         "skills.list",
         "plugins.list",
@@ -88,7 +87,7 @@ async fn parameterless_admin_methods_answer_over_ws() {
 }
 
 /// Case 2 — methods with required parameters refuse a bare call with
-/// `INVALID_REQUEST`, not a crash and not a silent success.
+/// `INVALID_PARAMS`, not a crash and not a silent success.
 #[tokio::test]
 #[serial]
 async fn parameterized_admin_methods_refuse_a_bare_call() {
@@ -102,6 +101,7 @@ async fn parameterized_admin_methods_refuse_a_bare_call() {
         ("approvals.get", "id"),
         ("cron.get", "id"),
         ("memory.search", "query"),
+        ("providers.fallback", "model_id"),
         ("traces.get", "turn_id"),
     ] {
         let frame = client.request(method, json!({})).await;
@@ -115,14 +115,13 @@ async fn parameterized_admin_methods_refuse_a_bare_call() {
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        // Which refusal a handler gives depends on whether it declares the
-        // field as required (`INVALID_REQUEST`) or defaults it and fails the
-        // lookup (`NOT_FOUND`) — handlers differ today. Both are structured
-        // refusals; what must never happen is a silent `ok`, an
-        // `UNKNOWN_METHOD` (unwired route) or an `INTERNAL_ERROR`.
-        assert!(
-            matches!(code, "INVALID_REQUEST" | "NOT_FOUND"),
-            "{method} must refuse a bare call (missing `{missing}`) with a structured error; \
+        // One refusal shape for one caller mistake. Handlers used to differ —
+        // a missing `id` read as `""` and surfaced as `NOT_FOUND` from some,
+        // `INVALID_PARAMS` from others — so a client could not tell a bad
+        // call from a missing resource.
+        assert_eq!(
+            code, "INVALID_PARAMS",
+            "{method} must refuse a bare call (missing `{missing}`) with INVALID_PARAMS; \
              got {frame}"
         );
     }

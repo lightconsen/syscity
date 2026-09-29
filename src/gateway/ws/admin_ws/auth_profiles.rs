@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::super::{parse_params, WsRequest, WsResponse};
+use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 
 // ── Auth profiles (provider API-key state) ──────────────────────────────
@@ -21,8 +21,8 @@ pub(crate) async fn handle_auth_profiles_get(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.infra.model_router.get_auth_profile_status(&id).await {
@@ -40,8 +40,8 @@ pub(crate) async fn handle_auth_profiles_rotate(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.infra.model_router.rotate_auth_key(&id).await {

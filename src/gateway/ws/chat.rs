@@ -370,7 +370,7 @@ mod tests {
         let conn = make_test_conn(&[]);
         let resp = handle_chat_send(&req("r1", None), &conn, &state, &ctx()).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -433,7 +433,7 @@ mod tests {
         let conn = make_test_conn(&[]);
         let resp = handle_chat_history(&req("r1", None), &conn, &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -466,7 +466,7 @@ mod tests {
         let conn = make_test_conn(&[]);
         let resp = handle_chat_abort(&req("r1", None), &conn, &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]

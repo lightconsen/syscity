@@ -102,8 +102,8 @@ pub(crate) async fn handle_agents_create(req: &WsRequest, state: &Arc<GatewaySta
 /// registry entry are left alone, so a disk-backed agent comes back on the
 /// next discovery. `agents.purge` is the one that removes it for good.
 pub(crate) async fn handle_agents_delete(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     if !unload_runtime_agent(state, &id).await {
@@ -119,8 +119,8 @@ pub(crate) async fn handle_agents_delete(req: &WsRequest, state: &Arc<GatewaySta
 /// `agent_overrides` entries, and removes `agents/<id>/` — personality files,
 /// workspace, data and memory included. This is irreversible.
 pub(crate) async fn handle_agents_purge(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     if let Err(msg) = validate_mutable_agent_id(&id) {

@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use super::super::{parse_params, WsRequest, WsResponse};
+use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 
 // ── Skills ──────────────────────────────────────────────────────────────
 
 /// `skills.get` — one skill (`{ name }`).
 pub(crate) async fn handle_skills_get(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let name = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["name"].as_str().unwrap_or("").to_string(),
+    let name = match super::required_str_param(req, "name") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sm = state.tools.skills_manager.read().await;
@@ -26,8 +26,8 @@ pub(crate) async fn handle_skills_set_enabled(
     state: &Arc<GatewayState>,
     enabled: bool,
 ) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let mut sm = state.tools.skills_manager.write().await;
@@ -42,8 +42,8 @@ pub(crate) async fn handle_skills_uninstall(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let name = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["name"].as_str().unwrap_or("").to_string(),
+    let name = match super::required_str_param(req, "name") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sm = state.tools.skills_manager.read().await;
@@ -55,8 +55,8 @@ pub(crate) async fn handle_skills_uninstall(
 
 /// `skills.run` — activate a skill (`{ id }`).
 pub(crate) async fn handle_skills_run(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sm = state.tools.skills_manager.read().await;

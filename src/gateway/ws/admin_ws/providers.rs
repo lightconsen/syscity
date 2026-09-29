@@ -14,8 +14,8 @@ pub(crate) async fn handle_providers_health(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.infra.model_router.get_provider_health(&id).await {
@@ -29,8 +29,8 @@ pub(crate) async fn handle_providers_check(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.infra.model_router.check_provider_health(&id).await {
@@ -44,8 +44,8 @@ pub(crate) async fn handle_providers_switch(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let model = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["model"].as_str().unwrap_or("").to_string(),
+    let model = match super::required_str_param(req, "model") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.infra.model_router.switch_default_model(&model).await {
@@ -68,8 +68,8 @@ pub(crate) async fn handle_providers_fallback(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let model_id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["model_id"].as_str().unwrap_or("").to_string(),
+    let model_id = match super::required_str_param(req, "model_id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let chain = state.infra.model_router.get_fallback_chain(&model_id).await;

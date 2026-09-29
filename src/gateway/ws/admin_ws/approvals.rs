@@ -25,8 +25,8 @@ pub(crate) async fn handle_approvals_list(
 
 /// `approvals.get` — a single pending approval (`{ id }`).
 pub(crate) async fn handle_approvals_get(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.tools.approval_queue.get(&id).await {

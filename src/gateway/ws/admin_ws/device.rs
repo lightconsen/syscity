@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::super::{parse_params, WsRequest, WsResponse};
+use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 
 // ── Device pairing ──────────────────────────────────────────────────────
@@ -30,8 +30,8 @@ pub(crate) async fn handle_device_pairing_approve(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let code = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["code"].as_str().unwrap_or("").to_string(),
+    let code = match super::required_str_param(req, "code") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state
@@ -50,8 +50,8 @@ pub(crate) async fn handle_device_pairing_reject(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let code = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["code"].as_str().unwrap_or("").to_string(),
+    let code = match super::required_str_param(req, "code") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.auth.device_pairing_store.reject(&code).await {
@@ -65,8 +65,8 @@ pub(crate) async fn handle_device_pairing_revoke(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let device_id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["device_id"].as_str().unwrap_or("").to_string(),
+    let device_id = match super::required_str_param(req, "device_id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.auth.device_pairing_store.revoke(&device_id).await {
@@ -82,8 +82,8 @@ pub(crate) async fn handle_device_pairing_qr(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let code = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["code"].as_str().unwrap_or("").to_string(),
+    let code = match super::required_str_param(req, "code") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let pending = state.auth.device_pairing_store.list_pending().await;
@@ -105,8 +105,8 @@ pub(crate) async fn handle_device_pairing_setup(
     state: &Arc<GatewayState>,
 ) -> WsResponse {
     use std::time::SystemTime;
-    let setup_code = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["setup_code"].as_str().unwrap_or("").to_string(),
+    let setup_code = match super::required_str_param(req, "setup_code") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let code =

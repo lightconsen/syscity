@@ -511,20 +511,24 @@ pub async fn auth_middleware(
 
     // Check if auth is required.
     //
-    // A configured `auth_mode` is itself a statement that credentials are
-    // required: `auth_required` defaults to false, so keying only off it left
+    // `auth_required` defaults to false, and keying only off it left
     // `auth_mode = "token"` deployments with an open REST surface that the WS
     // side already gates. That surface includes `/v1/chat/completions` (which
     // spends the operator's provider key) and `POST /api/v1/ws-ticket` — and a
     // ticket minted anonymously clears the WS upgrade gate, so the hole was a
-    // full bypass of the mode, not just a leak. `auth_mode = None` deployments
-    // are unaffected, and an explicit `auth_required = true` still works on
-    // its own.
+    // full bypass of the mode, not just a leak.
+    //
+    // Only `Token` is added here, deliberately. `Tailscale` and
+    // `trusted_proxy` are authenticated by *their own* middlewares, which run
+    // ahead of this one and pass the request through without a Bearer token —
+    // demanding one here would 401 every tailnet/proxy caller. `Device`
+    // authenticates at the WS handshake with a device token. For those modes
+    // this middleware keeps its historical `auth_required`-only behaviour.
     let (auth_required, auth_mode) = {
         let config = state.config.read().await;
         (config.security.auth_required, config.security.auth_mode)
     };
-    let auth_required = auth_required || auth_mode != crate::gateway::protocol::AuthMode::None;
+    let auth_required = auth_required || auth_mode == crate::gateway::protocol::AuthMode::Token;
 
     if !auth_required {
         debug!("Auth not required, allowing request");

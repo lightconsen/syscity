@@ -294,7 +294,7 @@ mod tests {
         let state = state().await;
         let resp = handle_skills_install(&req("r1", None), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]

@@ -246,7 +246,7 @@ pub(super) async fn handle_kb_doc_content(
         Err(e) => return WsResponse::err(&req.id, "NOT_FOUND", format!("stat failed: {e}")),
     };
     if meta.is_dir() {
-        return WsResponse::err(&req.id, "INVALID_REQUEST", "Source path is a directory");
+        return WsResponse::err(&req.id, "INVALID_PARAMS", "Source path is a directory");
     }
 
     let handle = match tokio::fs::File::open(&file).await {

@@ -153,7 +153,7 @@ pub(super) async fn handle_workspace_list(
         Err(e) => return WsResponse::err(&req.id, "READ_FAILED", format!("stat failed: {e}")),
     };
     if !meta.is_dir() {
-        return WsResponse::err(&req.id, "INVALID_REQUEST", "Path is not a directory");
+        return WsResponse::err(&req.id, "INVALID_PARAMS", "Path is not a directory");
     }
 
     let mut rd = match tokio::fs::read_dir(&dir).await {
@@ -239,7 +239,7 @@ pub(super) async fn handle_workspace_read(
         Err(e) => return WsResponse::err(&req.id, "READ_FAILED", format!("stat failed: {e}")),
     };
     if meta.is_dir() {
-        return WsResponse::err(&req.id, "INVALID_REQUEST", "Path is a directory");
+        return WsResponse::err(&req.id, "INVALID_PARAMS", "Path is a directory");
     }
     let size = meta.len();
 

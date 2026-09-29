@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use super::super::{parse_params, WsRequest, WsResponse};
+use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 
 // ── MCP ─────────────────────────────────────────────────────────────────
 
 /// `mcp.tools` — list a server's tools (`{ server_id }`).
 pub(crate) async fn handle_mcp_tools(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let server_id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["server_id"].as_str().unwrap_or("").to_string(),
+    let server_id = match super::required_str_param(req, "server_id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.tools.mcp_manager.get_client(&server_id).await {
@@ -46,12 +46,12 @@ pub(crate) async fn handle_mcp_call_tool(
     state: &Arc<GatewayState>,
     ctx: &crate::security::request_context::RequestContext,
 ) -> WsResponse {
-    let server_id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["server_id"].as_str().unwrap_or("").to_string(),
+    let server_id = match super::required_str_param(req, "server_id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
-    let tool_name = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["tool"].as_str().unwrap_or("").to_string(),
+    let tool_name = match super::required_str_param(req, "tool") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let args = req
@@ -105,8 +105,8 @@ pub(crate) async fn handle_mcp_call_tool(
 
 /// `mcp.resources` — list a server's resources (`{ server_id }`).
 pub(crate) async fn handle_mcp_resources(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let server_id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["server_id"].as_str().unwrap_or("").to_string(),
+    let server_id = match super::required_str_param(req, "server_id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     match state.tools.mcp_manager.get_client(&server_id).await {
@@ -128,8 +128,8 @@ pub(crate) async fn handle_mcp_auth_status(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let server_id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["server_id"].as_str().unwrap_or("").to_string(),
+    let server_id = match super::required_str_param(req, "server_id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let authorized = state.tools.mcp_manager.has_stored_token(&server_id).await;

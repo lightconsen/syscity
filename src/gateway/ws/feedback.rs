@@ -198,7 +198,7 @@ mod tests {
         )
         .await;
         assert!(!res.ok);
-        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -210,7 +210,7 @@ mod tests {
         )
         .await;
         assert!(!res.ok);
-        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]

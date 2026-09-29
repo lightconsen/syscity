@@ -259,7 +259,7 @@ mod tests {
         let state = state().await;
         let resp = handle_tasks_schedule(&req("r1", None), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -304,7 +304,7 @@ mod tests {
         let state = state().await;
         let resp = handle_tasks_delete(&req("r1", None), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -370,6 +370,6 @@ mod tests {
         let state = state().await;
         let resp = handle_tasks_enable(&req("r1", None), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 }

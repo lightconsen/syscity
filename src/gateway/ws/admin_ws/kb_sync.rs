@@ -556,7 +556,7 @@ mod tests {
         // Missing field → the params deserializer rejects it as malformed.
         let resp = handle_cloud_kb_push(&req("r1", Some(serde_json::json!({}))), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[cfg(feature = "cloud")]

@@ -173,7 +173,7 @@ pub(super) async fn handle_sessions_rename(
 
     let trimmed = params.name.trim();
     if trimmed.is_empty() {
-        return WsResponse::err(&req.id, "INVALID_REQUEST", "session name cannot be empty");
+        return WsResponse::err(&req.id, "INVALID_PARAMS", "session name cannot be empty");
     }
 
     if let Some(ref store) = state.agents.store {
@@ -776,7 +776,7 @@ mod tests {
         )
         .await;
         assert!(!res.ok);
-        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
     }
 
     #[tokio::test]

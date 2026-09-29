@@ -630,6 +630,10 @@ async fn handle_websocket(
                                     } else {
                                         let res = WsResponse::err(
                                             req.id,
+                                            // Protocol ordering, not a bad
+                                            // argument: the frame is
+                                            // well-formed, the connection is
+                                            // in the wrong state.
                                             "INVALID_REQUEST",
                                             "First message must be connect",
                                         );
@@ -1377,6 +1381,7 @@ mod tests {
         let conn = make_test_conn(&[]);
         let resp = dispatch(&conn, &req("r1", "connect", None)).await;
         assert!(!resp.ok);
+        // Protocol ordering, not a bad argument — this one keeps its own code.
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
     }
 
@@ -1698,6 +1703,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The REST credential gate, layered the way `build_router` layers it.
+    async fn rest_auth_app(state: Arc<GatewayState>) -> axum::Router {
+        axum::Router::new()
+            .route("/v1/models", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::gateway::middleware::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    /// A configured `auth_mode = token` must gate REST on its own:
+    /// `auth_required` defaults to false, and keying only off it left the
+    /// surface open — including the ticket mint that clears the WS upgrade
+    /// gate.
+    #[tokio::test]
+    async fn rest_auth_requires_credentials_under_token_mode() {
+        let state = token_state().await;
+        let resp = rest_auth_app(state)
+            .await
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// …but only Token mode. Tailscale and trusted-proxy deployments are
+    /// authenticated by their *own* middlewares, which run ahead of this one
+    /// and pass the request through without a Bearer token — requiring one
+    /// here would 401 every tailnet proxied caller. This is the regression
+    /// guard for exactly that mistake.
+    #[tokio::test]
+    async fn rest_auth_does_not_demand_a_token_under_tailscale_mode() {
+        let mut config = GatewayConfig::default();
+        config.security.auth_mode = AuthMode::Tailscale;
+        let state = Arc::new(make_test_state(config).await);
+        let resp = rest_auth_app(state)
+            .await
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "tailscale-authenticated traffic carries no Bearer token"
+        );
     }
 
     #[tokio::test]

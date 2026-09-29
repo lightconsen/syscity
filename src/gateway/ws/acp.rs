@@ -651,7 +651,7 @@ mod tests {
         let state = state().await;
         let resp = handle_acp_spawn(&req("r1", None), &state, &ctx()).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -683,7 +683,7 @@ mod tests {
         let state = state().await;
         let resp = handle_acp_message(&req("r1", None), &state, &ctx()).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -700,7 +700,7 @@ mod tests {
         let state = state().await;
         let resp = handle_acp_status(&req("r1", None), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]
@@ -758,7 +758,7 @@ mod tests {
         let state = state().await;
         let resp = handle_acp_execute_session(&req("r1", None), &state).await;
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 
     #[tokio::test]

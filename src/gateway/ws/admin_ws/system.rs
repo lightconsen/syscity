@@ -53,13 +53,10 @@ pub(crate) async fn handle_channels_enable(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let name = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["name"].as_str().unwrap_or("").to_string(),
+    let name = match super::required_str_param(req, "name") {
+        Ok(v) => v,
         Err(res) => return res,
     };
-    if name.is_empty() {
-        return WsResponse::err(&req.id, "INVALID_PARAMS", "missing channel name");
-    }
     {
         let mut config_guard = state.config.write().await;
         let config = Arc::make_mut(&mut config_guard);
@@ -93,13 +90,10 @@ pub(crate) async fn handle_channels_disable(
     req: &WsRequest,
     state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let name = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["name"].as_str().unwrap_or("").to_string(),
+    let name = match super::required_str_param(req, "name") {
+        Ok(v) => v,
         Err(res) => return res,
     };
-    if name.is_empty() {
-        return WsResponse::err(&req.id, "INVALID_PARAMS", "missing channel name");
-    }
     {
         let mut config_guard = state.config.write().await;
         let config = Arc::make_mut(&mut config_guard);

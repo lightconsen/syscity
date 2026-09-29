@@ -92,13 +92,32 @@ pub struct WsAuthResult {
 }
 
 #[allow(clippy::result_large_err)]
-fn parse_params<T: serde::de::DeserializeOwned>(req: &WsRequest) -> Result<T, WsResponse> {
+pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(
+    req: &WsRequest,
+) -> Result<T, WsResponse> {
     match &req.params {
         Some(p) => match serde_json::from_value::<T>(p.clone()) {
             Ok(v) => Ok(v),
             Err(e) => Err(error_invalid_request(&req.id, format!("Invalid params: {}", e))),
         },
         None => Err(error_invalid_request(&req.id, "Missing params")),
+    }
+}
+
+/// Extract a required string parameter, refusing an absent, non-string or
+/// empty one with `INVALID_REQUEST`.
+///
+/// Handlers that read `params["id"].as_str().unwrap_or("")` turned a missing
+/// parameter into an empty lookup key and reported `NOT_FOUND` — the same
+/// caller mistake answered with a different code depending on which handler
+/// took the call. This is the one refusal shape; it matches what a typed
+/// `#[derive(Deserialize)]` params struct produces for a missing field.
+#[allow(clippy::result_large_err)]
+pub(crate) fn required_str_param(req: &WsRequest, field: &str) -> Result<String, WsResponse> {
+    let value = parse_params::<serde_json::Value>(req)?;
+    match value.get(field).and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(error_invalid_request(&req.id, format!("Missing required parameter `{field}`"))),
     }
 }
 
@@ -556,7 +575,7 @@ mod tests {
         let req = make_req("r1", "device.adb.pair", serde_json::json!({}));
         let res = device_ws::handle_device_adb_pair(&req, &state).await;
         assert!(!res.ok);
-        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_PARAMS");
 
         let req = make_req(
             "r1",

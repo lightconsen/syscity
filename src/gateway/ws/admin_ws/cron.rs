@@ -21,8 +21,8 @@ async fn cron_scheduler(
 
 /// `cron.get` — one job (`{ id }`).
 pub(crate) async fn handle_cron_get(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sched = match cron_scheduler(state).await {
@@ -42,8 +42,8 @@ pub(crate) async fn handle_cron_set_enabled(
     state: &Arc<GatewayState>,
     enabled: bool,
 ) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sched = match cron_scheduler(state).await {
@@ -62,8 +62,8 @@ pub(crate) async fn handle_cron_set_enabled(
 
 /// `cron.run` — trigger a job immediately (`{ id }`).
 pub(crate) async fn handle_cron_run(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sched = match cron_scheduler(state).await {
@@ -135,8 +135,8 @@ pub(crate) async fn handle_cron_add(req: &WsRequest, state: &Arc<GatewayState>) 
 
 /// `cron.remove` — remove a job (`{ id }`).
 pub(crate) async fn handle_cron_remove(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let id = match parse_params::<serde_json::Value>(req) {
-        Ok(v) => v["id"].as_str().unwrap_or("").to_string(),
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
         Err(res) => return res,
     };
     let sched = match cron_scheduler(state).await {

@@ -1039,8 +1039,14 @@ pub fn error_forbidden(id: impl Into<String>, missing: &str) -> WsResponse {
     WsResponse::err(id, "FORBIDDEN", format!("Missing required scope: {}", missing))
 }
 
+/// A malformed call: missing, non-string or otherwise unusable parameters.
+///
+/// The code is `INVALID_PARAMS` — the spelling the rest of the WS surface
+/// already used (config, channels, device pairing). The two spellings
+/// (`INVALID_REQUEST` here, `INVALID_PARAMS` elsewhere) meant a client could
+/// not branch on one code for one mistake.
 pub fn error_invalid_request(id: impl Into<String>, msg: impl Into<String>) -> WsResponse {
-    WsResponse::err(id, "INVALID_REQUEST", msg)
+    WsResponse::err(id, "INVALID_PARAMS", msg)
 }
 
 pub fn error_method_not_found(id: impl Into<String>, method: &str) -> WsResponse {

@@ -103,6 +103,6 @@ mod tests {
             make_req("r3", "ask.respond", serde_json::json!({ "ask_id": "ask-1", "response": "" }));
         let res = handle_ask_respond(&req, &state).await;
         assert!(!res.ok);
-        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_REQUEST");
+        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
 }
