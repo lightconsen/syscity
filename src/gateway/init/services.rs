@@ -320,6 +320,9 @@ pub async fn init_cron(config: &GatewayConfig, state: &Arc<GatewayState>) -> cra
         // `None`; without the token this task would be parked until shutdown
         // aborted it.
         let announce_shutdown = state.shutdown_token.clone();
+        // Cloned out before the spawn: the loop needs the dispatcher to reach
+        // channels, and `state` itself is not moved in.
+        let announce_reply_dispatcher = state.channels.reply_dispatcher.clone();
         let announce_handle = tokio::spawn(async move {
             loop {
                 let delivery = tokio::select! {
@@ -330,6 +333,36 @@ pub async fn init_cron(config: &GatewayConfig, state: &Arc<GatewayState>) -> cra
                     _ = announce_shutdown.cancelled() => break,
                 };
                 info!("Cron announce → {}:{}", delivery.channel, delivery.to);
+
+                // Deliver to the channel the job named. The event below is
+                // WS-only (operator surfaces); a job addressed at a channel
+                // used to reach nobody, because nothing bridged the announce
+                // into the reply dispatcher. Same gate as the inbound reply
+                // leg: only dispatch when the channel is actually registered.
+                let channels = announce_reply_dispatcher.list_channels().await;
+                if channels.iter().any(|c| c == &delivery.channel) {
+                    let msg = crate::channels::OutgoingMessage {
+                        conversation_id: crate::channels::ConversationId::new(&delivery.to),
+                        content: delivery.message.clone(),
+                        reasoning_content: None,
+                        tool_calls: None,
+                        formatted_content: None,
+                        attachments: vec![],
+                        reply_to: None,
+                        options: crate::channels::MessageOptions::default(),
+                        usage: None,
+                    };
+                    if let Err(e) = announce_reply_dispatcher
+                        .dispatch(&delivery.channel, msg)
+                        .await
+                    {
+                        warn!(
+                            "Cron announce dispatch to channel '{}' failed: {}",
+                            delivery.channel, e
+                        );
+                    }
+                }
+
                 match event_tx_announce.send(GatewayEvent::CronAnnounce {
                     channel: delivery.channel,
                     to: delivery.to,
