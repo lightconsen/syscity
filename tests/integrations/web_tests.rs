@@ -32,22 +32,45 @@ async fn web_fetch_tool_fetches_example_com() {
     }
 }
 
+/// A live DuckDuckGo search.
+///
+/// The tool reports provider failures **in band**: `execute` returns
+/// `Ok(ToolExecutionResult { success: false, .. })` carrying a classified code
+/// (NOT_CONFIGURED / CONFIGURED_MISSING / UNAVAILABLE), not an `Err`. A test
+/// that only checked `Err` therefore read every network failure as a
+/// successful-but-empty search. This test needs the public internet, so it
+/// distinguishes: a successful search (assert non-empty results), a
+/// classified failure (skip — unreachable host, rate limit, bot check), and a
+/// success with empty output, which would be a scraper regression and fails.
 #[tokio::test]
 async fn web_search_tool_duckduckgo() {
     let tool = WebSearchTool::new();
     let result = tool
         .execute(json!({"query": "Rust programming language", "limit": 3}), &test_context())
-        .await;
+        .await
+        .expect("search tool must not error out of band");
 
-    match result {
-        Ok(output) => {
-            assert!(!output.output.is_empty(), "Expected search results, got empty output");
-            println!("WebSearch results: {}", output.output);
-        }
-        Err(e) => {
-            println!("WebSearchTool failed (network may be unavailable): {}", e);
-        }
+    if !result.success {
+        let code = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("code"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("UNKNOWN");
+        println!(
+            "WebSearch skipped ({} — network unavailable or the endpoint refused us): {}",
+            code,
+            result.error.unwrap_or_default()
+        );
+        return;
     }
+
+    assert!(
+        !result.output.is_empty(),
+        "a successful search must carry results — an empty success means the scraper \
+         no longer matches DuckDuckGo's markup"
+    );
+    println!("WebSearch results: {}", result.output);
 }
 
 #[tokio::test]

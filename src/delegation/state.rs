@@ -1303,4 +1303,61 @@ mod tests {
             .unwrap();
         assert_eq!(store.root_session_for_task("orphan").await.unwrap(), None);
     }
+
+    /// An in-memory store must serve concurrent readers the row it was just
+    /// given: several of these tests (and the coordinator's background
+    /// successor) read through a pool, and a `sqlite::memory:` pool that
+    /// handed out a fresh per-connection database would lose the write
+    /// instead of failing loudly.
+    #[tokio::test]
+    async fn memory_store_serves_concurrent_readers() {
+        let store = std::sync::Arc::new(
+            DelegationTaskStore::new("sqlite::memory:")
+                .await
+                .expect("in-memory store"),
+        );
+        store
+            .create_task(NewTask {
+                id: "probe-1",
+                root_id: "root-1",
+                parent_id: None,
+                depth: 1,
+                agent_id: "manager",
+                title: "probe",
+                parent_session: None,
+            })
+            .await
+            .expect("create");
+
+        // Hammer the pool: several concurrent readers force it to open more
+        // than the connection the schema was created on.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                let mut misses = 0;
+                let mut errors = Vec::new();
+                for _ in 0..25 {
+                    match s.get_task("probe-1").await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => misses += 1,
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+                (misses, errors)
+            }));
+        }
+        let mut total_misses = 0usize;
+        let mut all_errors = Vec::new();
+        for h in handles {
+            let (misses, errors) = h.await.expect("join");
+            total_misses += misses;
+            all_errors.extend(errors);
+        }
+        assert_eq!(
+            (total_misses, all_errors.len()),
+            (0, 0),
+            "in-memory store lost data under concurrency: misses={total_misses}, errors={all_errors:?}"
+        );
+    }
 }

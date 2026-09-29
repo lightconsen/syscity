@@ -329,14 +329,21 @@ mod tests {
     }
 
     /// Wait for the background successor task to create its row.
+    ///
+    /// The row is written by the task `SubagentRegistry::spawn` started, which
+    /// runs concurrently with the caller — `maybe_advance` returns the run id
+    /// as soon as the spawn is scheduled, not when the row lands. The budget
+    /// is therefore generous: a saturated CI runner (a whole test binary on
+    /// fewer cores than tests) used to blow a 1-second one and fail here,
+    /// which looked like a lineage bug rather than a slow scheduler.
     async fn wait_for_task(store: &DelegationTaskStore, id: &str) -> DelegationTask {
-        for _ in 0..100 {
+        for _ in 0..400 {
             if let Some(task) = store.get_task(id).await.expect("read task") {
                 return task;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("task {} was never created", id);
+        panic!("task {} was never created within 10s", id);
     }
 
     #[tokio::test]
@@ -459,6 +466,12 @@ mod tests {
             .set_handoff("run-1", "worker", "finish the parser")
             .await
             .unwrap();
+        // A total the mock child cannot plausibly reach, so "did not inherit"
+        // is distinguishable from "has not run yet". The successor starts
+        // executing the moment it is spawned, so asserting a transient `== 0`
+        // raced its own work under load; the invariant is that usage is not
+        // *copied* from the handing-off row.
+        store.add_usage("run-1", 999_999).await.unwrap();
 
         let successor = coordinator
             .maybe_advance("root-1")
@@ -472,8 +485,11 @@ mod tests {
             Some("user-session"),
             "lineage rides the handing-off row, not the registry's wake key"
         );
-        // Fresh successor work has not spent any tokens yet.
-        assert_eq!(succ.usage_tokens, 0);
+        assert_eq!(
+            succ.usage_tokens, 0,
+            "the successor starts with no spend of its own and inherits none \
+             (the handing-off row is at 999_999)"
+        );
         // And it resolves through the same chain the forwarder uses.
         assert_eq!(
             store.root_session_for_task(&succ.id).await.unwrap(),

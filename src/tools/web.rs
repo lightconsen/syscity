@@ -770,7 +770,37 @@ impl WebSearchTool {
         // Parse results from HTML
         let results = Self::parse_duckduckgo_results(&html, limit);
 
+        // Zero results is ambiguous: the query may simply have no matches, or
+        // DuckDuckGo may have served a bot-check page / changed its markup. The
+        // second case must be an error — a caller (or a model) that reads
+        // "no results" as a fact about the world is being misled, and a
+        // scraper breakage must not look like an empty web.
+        if results.is_empty() && Self::looks_like_a_block_page(&html) {
+            return Err(crate::error::SyscityError::Internal(
+                "DuckDuckGo returned a bot-check page instead of results; the search \
+                 endpoint is rate-limiting or blocking this host"
+                    .to_string(),
+            ));
+        }
+
         Ok(results)
+    }
+
+    /// Whether an empty parse is explained by the page not being a results
+    /// page at all. Markers are DDG's own anti-bot copy; matching them only
+    /// matters when no results were parsed, so a false positive costs nothing
+    /// for a page that did return results.
+    fn looks_like_a_block_page(html: &str) -> bool {
+        let lower = html.to_lowercase();
+        [
+            "unfortunately, bots use duckduckgo",
+            "anomaly",
+            "challenge",
+            "captcha",
+            "if this error persists",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
     }
 
     /// Parse DuckDuckGo HTML results
@@ -1871,6 +1901,25 @@ mod tests {
         assert!(!WebFetchTool::is_followable_redirect(StatusCode::MULTIPLE_CHOICES));
         assert!(!WebFetchTool::is_followable_redirect(StatusCode::NOT_MODIFIED));
         assert!(!WebFetchTool::is_followable_redirect(StatusCode::OK));
+    }
+
+    #[test]
+    fn block_pages_are_recognised_and_results_pages_are_not() {
+        // DDG's bot-check copy.
+        assert!(WebSearchTool::looks_like_a_block_page(
+            "<html><body>Unfortunately, bots use DuckDuckGo too.</body></html>"
+        ));
+        assert!(WebSearchTool::looks_like_a_block_page(
+            "<form action='/html/' name='challenge'></form>"
+        ));
+        // A real results page carries none of those markers.
+        assert!(!WebSearchTool::looks_like_a_block_page(
+            "<html><div class=\"result\"><a rel=\"nofollow\" href=\"https://example.com\">x</a></div></html>"
+        ));
+        // Nor does a legitimate "no results" page.
+        assert!(!WebSearchTool::looks_like_a_block_page(
+            "<html><body>No results found for that query.</body></html>"
+        ));
     }
 
     #[test]
