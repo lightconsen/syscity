@@ -13,10 +13,12 @@
 //! - The **handshake** re-validates under this mode: the `connect` frame must
 //!   carry the token in `params.auth.token`.
 //!
-//! Known gap (not pinned by a test, reported instead): a client that
-//! authenticated with `?ticket=` cannot satisfy the frame-level check — the
-//! handshake discards the upgrade's `pre_validated_auth` outside
-//! `AuthMode::None`, so the ticket flow lands with zero scopes.
+//! The ticket flow is the preferred one (a URL outlives the request, so the
+//! long-lived token should not ride in it). The handshake used to re-derive
+//! identity from the frame alone, discarding what the upgrade had already
+//! validated — a ticket-authenticated client has no token to repeat and
+//! landed with zero scopes. The frame now narrows the upgrade's grant
+//! instead of replacing it, and the journey below pins that.
 
 use super::*;
 use syscity::gateway::protocol::AuthMode;
@@ -223,4 +225,44 @@ async fn token_auth_refuses_an_anonymous_ticket_exchange() {
         body["ticket"].as_str().is_some_and(|t| !t.is_empty()),
         "the ticket field must be populated"
     );
+}
+
+/// Case 5 — the preferred credential flow works end to end: mint a ticket
+/// over authenticated HTTP, connect with `?ticket=` and **no** token in the
+/// handshake frame, and run a turn. This is the flow the REST endpoint exists
+/// for, and it used to land with zero scopes because the handshake discarded
+/// the upgrade's validated identity.
+#[tokio::test]
+#[serial]
+async fn ticket_authenticated_client_clears_the_handshake_and_works() {
+    let port = free_port();
+    start_token_gateway(port).await;
+    let client = reqwest::Client::new();
+
+    let body: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{}/api/v1/ws-ticket", port))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("mint ticket")
+        .json()
+        .await
+        .expect("ticket JSON");
+    let ticket = body["ticket"].as_str().expect("ticket").to_string();
+
+    // Connect with the ticket and *no* credential in the frame: the upgrade
+    // validated this connection, and that must be enough.
+    let mut ws =
+        FrontendSimulator::connect_url(format!("ws://127.0.0.1:{}/ws?ticket={}", port, ticket))
+            .await;
+
+    let sid = ws.create_session().await;
+    ws.subscribe(vec![sid.clone()]).await;
+    ws.send_chat(&sid, "Say exactly 'pong-from-llm' and nothing else.")
+        .await;
+    let payload = ws
+        .wait_for_event("chat.final", 30)
+        .await
+        .expect("a ticket-authenticated client must be able to run a turn");
+    assert!(payload.get("response").is_some());
 }
