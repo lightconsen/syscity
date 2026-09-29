@@ -938,6 +938,7 @@ pub async fn run_tool_chat_test(
     tool_results
 }
 
+mod admin_ws_tests;
 mod agent_tests;
 mod approval_journey_tests;
 mod ask_user_tests;
