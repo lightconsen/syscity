@@ -1008,7 +1008,15 @@ impl MemoryStore for DatabaseStore {
             sql.push_str(" AND user_id = ?");
         }
         if query.conversation_id.is_some() {
-            sql.push_str(" AND conversation_id = ?");
+            // A memory with no conversation binding is a *user-level* fact:
+            // it belongs to its user, not to any one conversation. The strict
+            // `conversation_id = ?` form silently excluded every such memory
+            // (NULL never equals anything), which made `observe` — the path
+            // that stores facts without a conversation — unreachable from
+            // `session_context`, i.e. the manager's observe → context loop
+            // never closed. Conversation-bound memories (compaction markers)
+            // stay scoped.
+            sql.push_str(" AND (conversation_id IS NULL OR conversation_id = ?)");
         }
         if query.memory_type.is_some() {
             sql.push_str(" AND memory_type = ?");

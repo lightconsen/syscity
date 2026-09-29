@@ -892,8 +892,13 @@ impl MemoryStore for CompressedJsonlStore {
         let mut results: Vec<Memory> = candidates
             .into_iter()
             .filter(|m| {
+                // An unbound memory is user-level and matches any
+                // conversation (mirrors `DatabaseStore`).
                 if let Some(ref conv_id) = query.conversation_id {
-                    if m.conversation_id.as_ref() != Some(conv_id) {
+                    if m.conversation_id
+                        .as_ref()
+                        .is_some_and(|bound| bound != conv_id)
+                    {
                         return false;
                     }
                 }
@@ -1282,5 +1287,38 @@ mod tests {
                 .unwrap();
             assert_eq!(out, vec![line.as_str()]);
         }
+    }
+
+    /// Same rule as `DatabaseStore`/`InMemoryStore`: an unbound memory is
+    /// user-level and matches any conversation; a bound one stays scoped.
+    #[tokio::test]
+    async fn unbound_memories_match_any_conversation() {
+        let dir = tempdir().unwrap();
+        let store = CompressedJsonlStore::new(dir.path());
+
+        store
+            .store(Memory::new("u1", "user-level fact", "fact"))
+            .await
+            .unwrap();
+        store
+            .store(
+                Memory::new("u1", "bound elsewhere", "compaction").with_conversation("conv-other"),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(MemoryQuery::new().for_user("u1").for_conversation("conv-1"))
+            .await
+            .unwrap();
+        let contents: Vec<&str> = hits.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            contents.contains(&"user-level fact"),
+            "an unbound memory must match any conversation, got {contents:?}"
+        );
+        assert!(
+            !contents.contains(&"bound elsewhere"),
+            "a memory bound elsewhere must stay scoped, got {contents:?}"
+        );
     }
 }

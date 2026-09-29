@@ -68,63 +68,70 @@ async fn forget_removes_the_memory_from_recall() {
     assert!(hits.is_empty(), "a forgotten memory must not be recalled: {hits:?}");
 }
 
-/// Case 3 — the session context splits into two halves.
+/// Case 3 — the observe → session_context loop closes, and conversation
+/// scoping still holds for memories that *are* bound.
 ///
-/// Episodic turns come back in `messages`. The *injectable* text
-/// (`format_for_injection`) carries only semantic memories — and retrieval is
-/// **conversation-scoped** (`MemoryQuery::for_conversation` becomes
-/// `AND conversation_id = ?`), while `observe` stores a memory without
-/// binding it to any conversation. The consequence, pinned here: a memory
-/// observed with `observe` is recallable by `retrieve` with no conversation
-/// filter, but never surfaces through `session_context` for a specific
-/// conversation. The manager's own observe → session_context loop does not
-/// close.
+/// `observe` stores a user-level fact with no conversation binding. Recall is
+/// conversation-scoped (`MemoryQuery::for_conversation`), and the strict
+/// `conversation_id = ?` filter used to exclude every unbound memory (NULL
+/// equals nothing), so a fact the manager had observed could never reach a
+/// session's context. Retrieval now treats an unbound memory as belonging to
+/// its user — recallable from any conversation — while a memory bound to
+/// another conversation stays scoped to that one.
 #[tokio::test]
-async fn session_context_is_conversation_scoped_while_observe_is_not() {
-    let mm = manager().await;
+async fn session_context_injects_unbound_memories_but_respects_bound_ones() {
+    use syscity::memory::{Memory, MemoryStore};
 
-    mm.remember_message("user-1", "conv-1", "user", "what is the deploy status?")
-        .await
-        .expect("remember user turn");
-    mm.remember_message("user-1", "conv-1", "assistant", "the deploy is green")
-        .await
-        .expect("remember assistant turn");
+    let store = Arc::new(
+        DatabaseStore::new_in_memory()
+            .await
+            .expect("in-memory store"),
+    );
+    let mm = MemoryManager::new(store.clone(), store.clone(), MemoryManagerConfig::default());
+
+    // A user-level fact, observed without a conversation.
     mm.observe("user-1", "the deploy pipeline requires a green build", "fact", 0.9)
         .await
         .expect("observe");
 
-    // Episodic half: both turns are retrieved for the conversation.
+    // A memory bound to a *different* conversation (the shape compaction
+    // produces) must not leak into this one.
+    store
+        .store(
+            Memory::new("user-1", "other conversation marker zzz-unique", "compaction")
+                .with_conversation("conv-other"),
+        )
+        .await
+        .expect("store bound memory");
+
+    let ctx = mm
+        .session_context("user-1", "conv-1", Some("deploy pipeline"), None)
+        .await
+        .expect("session context");
+    let injected = ctx.format_for_injection();
+
+    assert!(
+        injected.contains("green build"),
+        "an observed user-level fact must reach the session context: {injected:?}"
+    );
+    assert!(
+        !injected.contains("zzz-unique"),
+        "a memory bound to another conversation must stay out of this one: {injected:?}"
+    );
+
+    // Episodic half still works alongside it.
+    mm.remember_message("user-1", "conv-1", "user", "what is the deploy status?")
+        .await
+        .expect("remember turn");
     let ctx = mm
         .session_context("user-1", "conv-1", None::<String>, None)
         .await
         .expect("session context");
-    assert_eq!(ctx.messages.len(), 2, "both turns: {:?}", ctx.messages);
+    assert_eq!(ctx.messages.len(), 1, "the remembered turn: {:?}", ctx.messages);
     assert!(
-        ctx.messages
-            .iter()
-            .any(|m| m.content.contains("deploy is green")),
-        "the assistant turn must be present: {:?}",
-        ctx.messages
-    );
-
-    // Injectable half: no conversation-bound memory exists, so nothing is
-    // injected — turns alone are episodic, not injected.
-    let injected = ctx.format_for_injection();
-    assert!(
-        injected.is_empty(),
-        "an observed (unbound) memory must not surface for a specific conversation; \
-         got {injected:?}"
-    );
-
-    // The same memory *is* recallable without a conversation filter — the
-    // contrast that isolates the scoping rule.
-    let hits = mm
-        .retrieve("user-1", None, "green build", Some(5), None)
-        .await
-        .expect("retrieve");
-    assert!(
-        hits.iter().any(|m| m.content.contains("green build")),
-        "the observed memory must be recallable without a conversation filter: {hits:?}"
+        ctx.format_for_injection().contains("green build"),
+        "the query-less path injects user-level memories too: {:?}",
+        ctx.format_for_injection()
     );
 }
 

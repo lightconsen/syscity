@@ -133,9 +133,13 @@ impl MemoryStore for InMemoryStore {
                         return false;
                     }
                 }
-                // conversation_id filter
+                // conversation_id filter — an unbound memory is user-level
+                // and matches any conversation (mirrors `DatabaseStore`).
                 if let Some(ref conv_id) = query.conversation_id {
-                    if m.conversation_id.as_ref() != Some(conv_id) {
+                    if m.conversation_id
+                        .as_ref()
+                        .is_some_and(|bound| bound != conv_id)
+                    {
                         return false;
                     }
                 }
@@ -299,4 +303,35 @@ mod tests {
             .collect();
         assert_eq!(remaining, vec![0.8_f32, 0.6]);
     }
+}
+
+/// A memory stored without a conversation is user-level: it must match a
+/// `for_conversation` query for *any* conversation, while a memory bound
+/// to a different conversation stays out. (Mirrors `DatabaseStore`'s
+/// `conversation_id IS NULL OR conversation_id = ?`.)
+#[tokio::test]
+async fn unbound_memories_match_any_conversation() {
+    let store = InMemoryStore::new();
+    store
+        .store(Memory::new("u1", "user-level fact", "fact"))
+        .await
+        .unwrap();
+    store
+        .store(Memory::new("u1", "bound elsewhere", "compaction").with_conversation("conv-other"))
+        .await
+        .unwrap();
+
+    let hits = store
+        .search(MemoryQuery::new().for_user("u1").for_conversation("conv-1"))
+        .await
+        .unwrap();
+    let contents: Vec<&str> = hits.iter().map(|m| m.content.as_str()).collect();
+    assert!(
+        contents.contains(&"user-level fact"),
+        "an unbound memory must match any conversation, got {contents:?}"
+    );
+    assert!(
+        !contents.contains(&"bound elsewhere"),
+        "a memory bound elsewhere must stay scoped, got {contents:?}"
+    );
 }

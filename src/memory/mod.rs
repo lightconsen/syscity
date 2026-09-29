@@ -406,7 +406,13 @@ impl MemoryQuery {
         self
     }
 
-    /// Filter by conversation ID
+    /// Filter by conversation ID.
+    ///
+    /// Matches memories bound to this conversation **plus unbound ones** —
+    /// a memory stored without a conversation is a user-level fact that
+    /// belongs to its user rather than to any single conversation, so it is
+    /// recallable from all of them. Memories bound to a *different*
+    /// conversation (compaction markers) stay scoped to theirs.
     pub fn for_conversation(mut self, conversation_id: impl Into<String>) -> Self {
         self.conversation_id = Some(conversation_id.into());
         self
