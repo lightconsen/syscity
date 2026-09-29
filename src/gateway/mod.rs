@@ -773,6 +773,17 @@ impl Gateway {
         self.state.infra.model_router.clone()
     }
 
+    /// Return a clone of the shared gateway state.
+    ///
+    /// This is the seam for hosts and tests that need to reach a subsystem
+    /// without going through the public methods above — e.g. registering a
+    /// channel into the reply dispatcher, or feeding a message through the
+    /// inbound pipeline. Clone it *before* [`Gateway::start`] moves the
+    /// gateway into its runtime task.
+    pub fn state(&self) -> Arc<GatewayState> {
+        self.state.clone()
+    }
+
     /// Return a clone of the internal `ToolRegistry` arc.
     pub fn tool_registry(&self) -> Arc<crate::tools::ToolRegistry> {
         self.state.tools.registry.clone()

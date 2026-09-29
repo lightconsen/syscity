@@ -904,6 +904,7 @@ mod agent_tests;
 mod ask_user_tests;
 #[cfg(feature = "browser")]
 mod browser_chat_tests;
+mod channel_roundtrip_tests;
 mod command_tests;
 mod compaction_tests;
 mod computer_tests;

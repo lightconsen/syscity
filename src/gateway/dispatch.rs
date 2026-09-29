@@ -878,12 +878,50 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
             if let Err(e) = state.events.tx.send(GatewayEvent::AgentResponse {
                 session_id: session_id.to_string(),
                 agent_id: agent_id.to_string(),
-                content: outgoing.content,
+                content: outgoing.content.clone(),
                 channel: channel.to_string(),
                 conversation_id: session_id.to_string(),
                 usage: outgoing.usage,
             }) {
                 debug!("No receivers for AgentResponse event: {}", e);
+            }
+
+            // Channel reply leg: hand the final answer to the outbound
+            // pipeline so it reaches the channel the message came from
+            // (canvas → sse → reply dispatch → side effects). Without this,
+            // a channel user's message is processed but the reply never
+            // leaves the gateway — WS clients receive it only as the
+            // AgentResponse event above.
+            //
+            // Gated on the channel actually being registered in the reply
+            // dispatcher: WS-originated conversations carry channel "web"
+            // and have no such channel — their reply is the event above, and
+            // dispatching would only log ChannelNotFound per turn.
+            let channels = state.channels.reply_dispatcher.list_channels().await;
+            if channels.iter().any(|c| c == &channel.to_string()) {
+                let outbound_ctx = {
+                    let cfg = state.config.read().await;
+                    crate::outbound::OutboundContext {
+                        session_id: session_id.to_string(),
+                        channel: channel.to_string(),
+                        agent_id: agent_id.to_string(),
+                        raw_output: outgoing.content,
+                        tool_calls: outgoing.tool_calls.unwrap_or_default(),
+                        usage: outgoing.usage,
+                        side_effects: vec![],
+                        model_name: Some(cfg.model.clone()),
+                        model_provider: Some(cfg.model_provider.clone()),
+                        reasoning_content: outgoing.reasoning_content,
+                    }
+                };
+                let outbound_result = state.pipelines.outbound.process(outbound_ctx).await;
+                if let Some(canvas_update) = outbound_result.canvas_update {
+                    state
+                        .tools
+                        .canvas_manager
+                        .apply_update(session_id, canvas_update)
+                        .await;
+                }
             }
         }
         Err(e) => {
