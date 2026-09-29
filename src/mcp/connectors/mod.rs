@@ -101,6 +101,9 @@ pub struct ConnectorManager {
     cloud_api_base: Option<String>,
     /// Secret-store handle for reading the cloud session token during catalog
     /// sync (attached to the request as a Bearer token).
+    /// Feature-gated reads (`sync_catalog` under feature `cloud`), hence
+    /// `#[allow(dead_code)]` to suppress the warning when the feature is off.
+    #[allow(dead_code)]
     secrets: Arc<crate::secrets::SecretStoreHandle>,
     /// Layout root the connector's sibling directories resolve against.
     paths: Arc<crate::dirs::SyscityPaths>,
