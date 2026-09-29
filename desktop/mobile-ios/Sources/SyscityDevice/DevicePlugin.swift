@@ -355,6 +355,36 @@ class DevicePlugin: Plugin {
     }
   }
 
+  /// `openUrl` — hand a URL to the OS (`UIApplication.open`); the user
+  /// confirms in the target app. Rust-side validation restricts schemes to
+  /// tel/mailto/sms/https/http; this side re-checks and reports whether the
+  /// system accepted the handoff.
+  @objc public func openUrl(_ invoke: Invoke) throws {
+    struct OpenArgs: Decodable {
+      var url: String?
+    }
+    let args = try invoke.parseArgs(OpenArgs.self)
+    guard let url = args.url, !url.isEmpty,
+      url.rangeOfCharacter(from: .controlCharacters) == nil
+    else {
+      invoke.reject("Malformed URL", code: "INVALID_ARGUMENTS")
+      return
+    }
+    let scheme = url.split(separator: ":", maxSplits: 1).first.map(String.init)?.lowercased() ?? ""
+    guard ["tel", "mailto", "sms", "https", "http"].contains(scheme), let target = URL(string: url) else {
+      invoke.reject("Unsupported URL scheme", code: "INVALID_ARGUMENTS")
+      return
+    }
+    DispatchQueue.main.async {
+      UIApplication.shared.open(target) { ok in
+        var out = JsonObject()
+        out["opened"] = ok
+        out["url"] = url
+        invoke.resolve(JsonValue.dictionary(out))
+      }
+    }
+  }
+
   /// `shortcutResults` — list + delete-read outputs from `SyscityOutputIntent`.
   ///
   /// Each entry is `{output, at_ms, file}`. Reading a result consumes it (the

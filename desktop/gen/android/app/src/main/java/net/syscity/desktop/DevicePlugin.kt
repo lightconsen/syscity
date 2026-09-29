@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.location.Location
@@ -289,6 +290,40 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
     val out = JSObject()
     out.put("duration_ms", durationMs)
     invoke.resolve(out)
+  }
+
+  // ─────────────────────────────────────────────
+  // URL handoff (dialer / mail / messages / browser)
+  // ─────────────────────────────────────────────
+
+  /** `openUrl` — hand a URL to the OS (`ACTION_VIEW`); the user confirms in
+   *  the target app. Rust-side validation restricts schemes to
+   *  tel/mailto/sms/https/http; this side re-checks and reports whether any
+   *  application accepted the handoff. */
+  @Command
+  fun openUrl(invoke: Invoke) {
+    val url = invoke.getArgs().getString("url", "")
+    val scheme = url.substringBefore(':').lowercase(Locale.US)
+    if (url.isEmpty() ||
+      url.any { it.isISOControl() } ||
+      scheme !in setOf("tel", "mailto", "sms", "https", "http")
+    ) {
+      invoke.reject("Unsupported or malformed URL", code = "INVALID_ARGUMENTS")
+      return
+    }
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+    try {
+      appActivity.startActivity(intent)
+      val out = JSObject()
+      out.put("opened", true)
+      out.put("url", url)
+      invoke.resolve(out)
+    } catch (_: ActivityNotFoundException) {
+      val out = JSObject()
+      out.put("opened", false)
+      out.put("url", url)
+      invoke.resolve(out)
+    }
   }
 
   // ─────────────────────────────────────────────

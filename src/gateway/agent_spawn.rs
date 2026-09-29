@@ -1188,6 +1188,7 @@ pub(crate) async fn create_default_tool_registry(
     registry.register(Box::new(crate::device::DeviceGeolocateTool::new(device_bridge.clone())));
     registry.register(Box::new(crate::device::DeviceNotifyTool::new(device_bridge.clone())));
     registry.register(Box::new(crate::device::DeviceHapticTool::new(device_bridge.clone())));
+    registry.register(Box::new(crate::device::DeviceOpenUrlTool::new(device_bridge.clone())));
     registry.register(Box::new(crate::device::DevicePickFileTool::new(device_bridge.clone())));
     registry.register(Box::new(crate::device::DeviceShortcutRunTool::new(device_bridge.clone())));
     registry

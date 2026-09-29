@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{
-    DeviceBridge, CMD_CAPTURE_CAMERA, CMD_GET_LOCATION, CMD_HAPTIC, CMD_NOTIFY, CMD_PICK_FILE,
-    CMD_RUN_SHORTCUT, CMD_SHORTCUT_INBOX, CMD_SHORTCUT_RESULTS,
+    DeviceBridge, CMD_CAPTURE_CAMERA, CMD_GET_LOCATION, CMD_HAPTIC, CMD_NOTIFY, CMD_OPEN_URL,
+    CMD_PICK_FILE, CMD_RUN_SHORTCUT, CMD_SHORTCUT_INBOX, CMD_SHORTCUT_RESULTS,
 };
 use crate::tools::{
     approval::RiskLevel, create_schema, sdk::ToolCapabilities, Tool, ToolContext,
@@ -289,6 +289,126 @@ impl Tool for DeviceHapticTool {
             .unwrap_or(200);
         run(&b, CMD_HAPTIC, json!({ "duration_ms": duration_ms })).await?;
         Ok(ToolExecutionResult::success(format!("Vibrated for {duration_ms} ms")))
+    }
+}
+
+/// Device URL-handoff tool — `device_open_url`.
+///
+/// Hands a URL to the operating system: `tel:` opens the dialer with the
+/// number pre-filled, `mailto:` the mail composer, `sms:` the messages
+/// composer, `https?` the browser. This is a handoff, not automation — the
+/// user reviews and confirms inside the target app, so the tool cannot know
+/// whether the call connected or the message was sent, only that the OS
+/// accepted the handoff.
+pub struct DeviceOpenUrlTool {
+    bridge: Option<Arc<dyn DeviceBridge>>,
+}
+
+/// Schemes the OS may hand off for the agent. Deliberately excludes
+/// `intent:`, `file:`, `content:`, and app-specific schemes: this allowlist
+/// is the whole defense against a crafted URL reaching an unexpected handler
+/// (validated again natively, since bridge commands are a JNI surface).
+const OPEN_URL_SCHEMES: &[&str] = &["tel", "mailto", "sms", "https", "http"];
+
+impl DeviceOpenUrlTool {
+    pub fn new(bridge: Option<Arc<dyn DeviceBridge>>) -> Self {
+        Self { bridge }
+    }
+
+    /// Validate the URL before it ever leaves the process: non-empty, no
+    /// control characters, and an allowlisted scheme.
+    fn validate_url(url: &str) -> crate::Result<()> {
+        if url.is_empty() {
+            return Err(crate::error::SyscityError::Validation(
+                "device_open_url requires a non-empty `url`".to_string(),
+            ));
+        }
+        if url.chars().any(char::is_control) {
+            return Err(crate::error::SyscityError::Validation(
+                "device_open_url rejects URLs containing control characters".to_string(),
+            ));
+        }
+        let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
+        if !OPEN_URL_SCHEMES.contains(&scheme.as_str()) {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "device_open_url scheme '{scheme}' is not allowlisted ({})",
+                OPEN_URL_SCHEMES.join(", ")
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Tool for DeviceOpenUrlTool {
+    fn name(&self) -> &str {
+        "device_open_url"
+    }
+
+    fn description(&self) -> &str {
+        "Hand a URL to the operating system: tel: opens the dialer with the number pre-filled, \
+         mailto: the mail composer, sms: the messages composer, https:/http: the browser. \
+         The user confirms the action in the target app. Only available on mobile devices."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Hand a URL to the OS for the user to confirm in the target app",
+            json!({
+                "url": {
+                    "type": "string",
+                    "description": "URL with an allowlisted scheme: tel:, mailto:, sms:, \
+                                    https: or http: (e.g. tel:+15551234567, \
+                                    mailto:a@b.c?subject=Hi)"
+                }
+            }),
+            vec!["url"],
+        )
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            // The approval prompt shows the exact URL before the OS shows
+            // its own confirmation — two chances to catch a crafted tel: to
+            // a premium number or a mailto: to an attacker.
+            requires_approval: true,
+            risk_level: RiskLevel::Medium,
+            categories: vec!["device".to_string(), "communication".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn is_available(&self, _context: &ToolContext) -> bool {
+        self.bridge.is_some()
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let b = bridge(&self.bridge)?;
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        Self::validate_url(url)?;
+        let data = run(&b, CMD_OPEN_URL, json!({ "url": url })).await?;
+        let opened = data
+            .get("opened")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if opened {
+            Ok(ToolExecutionResult::success(format!(
+                "Handed off to the OS; the user confirms in the target app: {url}"
+            ))
+            .with_data(data))
+        } else {
+            Ok(ToolExecutionResult::error(format!(
+                "No application accepted the handoff for: {url}"
+            )))
+        }
     }
 }
 
@@ -586,6 +706,7 @@ mod tests {
         let geolocate = DeviceGeolocateTool::new(None);
         let notify = DeviceNotifyTool::new(None);
         let haptic = DeviceHapticTool::new(None);
+        let open_url = DeviceOpenUrlTool::new(None);
         let pick = DevicePickFileTool::new(None);
         let shortcut = DeviceShortcutRunTool::new(None);
         let results = DeviceShortcutResultsTool::new(None);
@@ -594,6 +715,7 @@ mod tests {
         assert!(!geolocate.is_available(&context()));
         assert!(!notify.is_available(&context()));
         assert!(!haptic.is_available(&context()));
+        assert!(!open_url.is_available(&context()));
         assert!(!pick.is_available(&context()));
         assert!(!shortcut.is_available(&context()));
         assert!(!results.is_available(&context()));
@@ -607,6 +729,7 @@ mod tests {
         assert!(DeviceGeolocateTool::new(bridge.clone()).is_available(&context()));
         assert!(DeviceNotifyTool::new(bridge.clone()).is_available(&context()));
         assert!(DeviceHapticTool::new(bridge.clone()).is_available(&context()));
+        assert!(DeviceOpenUrlTool::new(bridge.clone()).is_available(&context()));
         assert!(DevicePickFileTool::new(bridge.clone()).is_available(&context()));
         assert!(DeviceShortcutRunTool::new(bridge.clone()).is_available(&context()));
         assert!(DeviceShortcutResultsTool::new(bridge.clone()).is_available(&context()));
@@ -665,6 +788,64 @@ mod tests {
             .unwrap();
         assert!(result.output.contains("500"));
         assert_eq!(b.calls()[0].1["duration_ms"], 500);
+    }
+
+    #[tokio::test]
+    async fn test_open_url_forwards_and_succeeds() {
+        let b: Arc<MockDeviceBridge> = Arc::new(MockDeviceBridge::new(json!({ "opened": true })));
+        let tool = DeviceOpenUrlTool::new(Some(b.clone()));
+        let result = tool
+            .execute(json!({ "url": "tel:+15551234567" }), &context())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(b.calls()[0].0, CMD_OPEN_URL);
+        assert_eq!(b.calls()[0].1["url"], "tel:+15551234567");
+    }
+
+    #[tokio::test]
+    async fn test_open_url_reports_a_rejected_handoff() {
+        // No app accepted the handoff (e.g. no mail account configured):
+        // the tool fails honestly instead of claiming success.
+        let b: Arc<MockDeviceBridge> = Arc::new(MockDeviceBridge::new(json!({ "opened": false })));
+        let tool = DeviceOpenUrlTool::new(Some(b));
+        let result = tool
+            .execute(json!({ "url": "mailto:a@b.c" }), &context())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("No application"));
+    }
+
+    #[test]
+    fn test_open_url_scheme_allowlist() {
+        for url in [
+            "tel:+1555",
+            "TEL:+1555",
+            "mailto:a@b.c",
+            "sms:+1555",
+            "https://x.y",
+            "http://x.y",
+        ] {
+            DeviceOpenUrlTool::validate_url(url)
+                .unwrap_or_else(|e| panic!("{url} should pass: {e}"));
+        }
+        for url in [
+            "ftp://x",
+            "intent://x",
+            "file:///etc/passwd",
+            "content://media",
+            "javascript:alert(1)",
+        ] {
+            assert!(DeviceOpenUrlTool::validate_url(url).is_err(), "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_open_url_rejects_empty_and_control_chars() {
+        assert!(DeviceOpenUrlTool::validate_url("").is_err());
+        assert!(DeviceOpenUrlTool::validate_url("tel:+1555\nand more").is_err());
+        assert!(DeviceOpenUrlTool::validate_url("tel:+1\u{0}555").is_err());
     }
 
     #[tokio::test]

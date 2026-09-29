@@ -5,8 +5,10 @@
 //! window system, restricted file access). The [`DeviceBridge`] trait is the
 //! single seam through which the Rust runtime reaches the platform's native
 //! APIs — camera, geolocation, notifications, haptics, SAF file picking,
-//! loopback-ADB pairing (mobile-migration §4.1/§4.2/§4.5), and the
-//! Shortcuts/AppIntents bus (§4.6).
+//! loopback-ADB pairing (mobile-migration §4.1/§4.2/§4.5), the
+//! Shortcuts/AppIntents bus (§4.6), and URL handoff to the OS (`tel:`,
+//! `mailto:`, `sms:`, `https?` — the dialer/mail/messages/browser route,
+//! where the user confirms in the target app).
 //!
 //! Desktop builds never construct a bridge: `GatewayState.device.bridge`
 //! stays `None`, every `device_*` tool reports unavailable, and each
@@ -18,8 +20,8 @@ mod tools;
 
 pub(crate) use tools::NO_BRIDGE_MSG;
 pub use tools::{
-    DeviceCameraTool, DeviceGeolocateTool, DeviceHapticTool, DeviceNotifyTool, DevicePickFileTool,
-    DeviceShortcutInboxTool, DeviceShortcutResultsTool, DeviceShortcutRunTool,
+    DeviceCameraTool, DeviceGeolocateTool, DeviceHapticTool, DeviceNotifyTool, DeviceOpenUrlTool,
+    DevicePickFileTool, DeviceShortcutInboxTool, DeviceShortcutResultsTool, DeviceShortcutRunTool,
 };
 
 use std::sync::Arc;
@@ -70,6 +72,9 @@ pub const CMD_RUN_SHORTCUT: &str = "runShortcut";
 pub const CMD_SHORTCUT_RESULTS: &str = "shortcutResults";
 /// List and consume the AskSyscity prompt inbox (4.6).
 pub const CMD_SHORTCUT_INBOX: &str = "shortcutInbox";
+/// Hand a URL to the OS (`tel:`/`mailto:`/`sms:`/`https?` → dialer, mail
+/// composer, messages, browser). The user confirms in the target app.
+pub const CMD_OPEN_URL: &str = "openUrl";
 
 /// The native device bridge.
 ///
