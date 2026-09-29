@@ -8,10 +8,12 @@
 //! - [`ShellHookBridge::fire_stop`] — the `Stop` fire-and-forget fan-out.
 //!
 //! When no hooks are configured, `tool_hooks()` returns an empty
-//! [`ToolHooks`]; this is deliberate — `ToolRegistry` uses
-//! `has_policy_hooks()` to decide whether the `requires_approval` fallback
-//! applies, so a no-op policy hook would silently disable approval for
-//! high-risk tools that rely on it.
+//! [`ToolHooks`]. And per call, the bridge reports whether any hook
+//! *matched*: matched-and-allowed comes back as
+//! [`ToolPolicyDecision::AllowByHook`] (authoritative — the registry's
+//! `requires_approval` fallback yields), while no-match comes back as plain
+//! `Allow` and the fallback still applies. A hook configured for an
+//! unrelated tool therefore never disables approval for this one.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,6 +36,16 @@ use crate::tools::{ToolContext, ToolExecutionResult};
 pub struct ShellHookBridge {
     config: Arc<ShellHooksConfig>,
     audit: Option<Arc<dyn AuditLogger>>,
+}
+
+/// The folded outcome of the `PreToolUse` hooks that matched one call.
+enum PreOutcome {
+    /// No hook matched — the bridge has no opinion on this call.
+    NoOpinion,
+    /// Hooks matched and every one allowed — the bridge claims the call.
+    Allowed,
+    /// A hook denied or asked.
+    Decided(ToolPolicyDecision),
 }
 
 /// Rank used to fold multiple `PreToolUse` decisions: deny(2) > ask(1) >
@@ -102,8 +114,13 @@ impl ShellHookBridge {
                 let ctx = (*ctx).clone();
                 async move {
                     match this.run_pre(&name, &args, &ctx).await {
-                        Some(decision) => decision,
-                        None => ToolPolicyDecision::Allow,
+                        // No hook matched — the bridge has no opinion, so the
+                        // registry's `requires_approval` fallback still applies.
+                        PreOutcome::NoOpinion => ToolPolicyDecision::Allow,
+                        // Hooks matched and every one allowed — authoritative,
+                        // the fallback is skipped for this call.
+                        PreOutcome::Allowed => ToolPolicyDecision::AllowByHook,
+                        PreOutcome::Decided(decision) => decision,
                     }
                 }
             })
@@ -119,17 +136,14 @@ impl ShellHookBridge {
 
     /// Run every matching `PreToolUse` hook and fold the results.
     ///
-    /// Returns `Some(decision)` when the call must not proceed, `None` when
-    /// it is allowed. A non-`Allow` outcome is mirrored to the audit log.
-    async fn run_pre(
-        &self,
-        name: &str,
-        args: &Value,
-        ctx: &ToolContext,
-    ) -> Option<ToolPolicyDecision> {
+    /// `NoOpinion` when no hook matched (the bridge stays out of the call's
+    /// way), `Allowed` when hooks matched and every one allowed, `Decided`
+    /// when a hook denied or asked. A non-`Allow` outcome is mirrored to the
+    /// audit log.
+    async fn run_pre(&self, name: &str, args: &Value, ctx: &ToolContext) -> PreOutcome {
         let hits = matching_hooks(&self.config.pre_tool_use, name);
         if hits.is_empty() {
-            return None;
+            return PreOutcome::NoOpinion;
         }
         let mut acc = PreDecision::Allow;
         let mut winner_matcher: Option<&str> = None;
@@ -156,7 +170,7 @@ impl ShellHookBridge {
         }
         let matcher = winner_matcher.map(str::to_string);
         let decision = match acc {
-            PreDecision::Allow => return None,
+            PreDecision::Allow => return PreOutcome::Allowed,
             PreDecision::Deny(reason) => ToolPolicyDecision::Deny { reason },
             PreDecision::Ask(reason) => ToolPolicyDecision::NeedsApproval {
                 approval_id: Uuid::new_v4().to_string(),
@@ -168,7 +182,7 @@ impl ShellHookBridge {
             },
         };
         self.audit_policy_deny(ctx, &decision, matcher).await;
-        Some(decision)
+        PreOutcome::Decided(decision)
     }
 
     /// Run every matching `PostToolUse` hook, folding each decision with the
@@ -288,7 +302,7 @@ impl ShellHookBridge {
         let (kind, description) = match decision {
             ToolPolicyDecision::Deny { reason } => ("deny", reason.as_str()),
             ToolPolicyDecision::NeedsApproval { message, .. } => ("ask", message.as_str()),
-            ToolPolicyDecision::Allow => return,
+            ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook => return,
         };
         let mut details = serde_json::Map::new();
         details.insert("kind".to_string(), kind.into());

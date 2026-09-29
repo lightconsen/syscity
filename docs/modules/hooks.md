@@ -51,7 +51,7 @@ Hook commands receive a JSON context on stdin: `hook_event_name`, `user_id`, and
 
 ### Empty Config Preservation
 
-When no hooks are configured, `tool_hooks()` returns a **truly empty** `ToolHooks`. This is deliberate: `ToolRegistry` uses `has_policy_hooks()` to decide whether the `requires_approval` fallback applies, so registering a no-op policy hook would silently disable approval for high-risk tools that rely on the fallback.
+When no hooks are configured, `tool_hooks()` returns a **truly empty** `ToolHooks`. Per call, the bridge also reports whether any hook *matched*: matched-and-allowed becomes `ToolPolicyDecision::AllowByHook` (authoritative — the `requires_approval` fallback yields to it), while no-match becomes plain `Allow` and the fallback still applies. A hook configured for one tool therefore never disables approval for another.
 
 ## Key Types
 
@@ -94,4 +94,4 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 - Hook stdin context with session/cwd/workspace identity
 - Audit mirroring of deny/ask/block decisions as `ToolDeny`
 - Startup-only load with explicit-option / config-sibling / `~/.syscity/hooks.json` resolution
-- Empty config yields a truly empty `ToolHooks`, preserving the `requires_approval` fallback
+- Empty config yields a truly empty `ToolHooks`, and an unmatched call reports `Allow` (not `AllowByHook`), so the `requires_approval` fallback survives both cases

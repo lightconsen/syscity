@@ -39,8 +39,16 @@ use super::{RiskLevel, ToolContext, ToolExecutionResult};
 /// The outcome of a policy hook evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolPolicyDecision {
-    /// The tool call is permitted — continue with execution.
+    /// The tool call is permitted — continue with execution. Carries no
+    /// authority: either no hook spoke for this call, or a hand-registered
+    /// policy hook fn returned a plain allow without claiming the call.
     Allow,
+    /// A policy hook actually matched this call and explicitly allowed it.
+    /// Authoritative: the registry's built-in `requires_approval` fallback is
+    /// skipped, because the hook claimed the call. `[permissions]` deny/ask
+    /// rules still take precedence — a rule is an operator override, not an
+    /// opinion.
+    AllowByHook,
     /// The tool call is denied.
     Deny {
         /// Human-readable reason returned to the caller.
@@ -67,7 +75,7 @@ pub enum ToolPolicyDecision {
 impl ToolPolicyDecision {
     /// Return `true` if this decision allows the call immediately.
     pub fn is_allow(&self) -> bool {
-        matches!(self, ToolPolicyDecision::Allow)
+        matches!(self, ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook)
     }
 
     /// Return `true` if this decision requires human approval.
@@ -291,21 +299,32 @@ impl ToolHooks {
 
     /// Run all registered policy hooks for the given tool call.
     ///
-    /// Returns `Allow` if all hooks allow, or the first `Deny` or
-    /// `NeedsApproval` encountered.
+    /// Returns the first `Deny` or `NeedsApproval` encountered. Otherwise
+    /// returns `AllowByHook` when at least one hook claimed the call with an
+    /// authoritative allow, and plain `Allow` when no hook claimed it — the
+    /// registry's `requires_approval` fallback keys off that distinction.
     pub async fn run_policy(
         &self,
         name: &str,
         args: &Value,
         ctx: &ToolContext,
     ) -> ToolPolicyDecision {
+        let mut claimed = false;
         for hook in &self.policy_hooks {
             let decision = hook(name, args, ctx).await;
-            if !decision.is_allow() {
-                return decision;
+            match decision {
+                // Deny/ask short-circuit and win.
+                decision @ (ToolPolicyDecision::Deny { .. }
+                | ToolPolicyDecision::NeedsApproval { .. }) => return decision,
+                ToolPolicyDecision::AllowByHook => claimed = true,
+                ToolPolicyDecision::Allow => {}
             }
         }
-        ToolPolicyDecision::Allow
+        if claimed {
+            ToolPolicyDecision::AllowByHook
+        } else {
+            ToolPolicyDecision::Allow
+        }
     }
 
     /// Run all registered before-hooks for the given tool call.
@@ -446,6 +465,28 @@ mod tests {
             .run_policy("shell", &serde_json::json!({}), &ToolContext::default())
             .await;
         assert_eq!(decision, ToolPolicyDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_policy_fold_propagates_allow_by_hook() {
+        // Plain Allow + AllowByHook folds to AllowByHook: one hook claiming
+        // the call is enough for the authoritative allow to survive.
+        let hooks = ToolHooks::new()
+            .policy(|_, _, _| async { ToolPolicyDecision::Allow })
+            .policy(|_, _, _| async { ToolPolicyDecision::AllowByHook });
+        let decision = hooks
+            .run_policy("any", &serde_json::json!({}), &ToolContext::default())
+            .await;
+        assert_eq!(decision, ToolPolicyDecision::AllowByHook);
+
+        // Deny still short-circuits past an earlier authoritative allow.
+        let hooks = ToolHooks::new()
+            .policy(|_, _, _| async { ToolPolicyDecision::AllowByHook })
+            .policy(|_, _, _| async { ToolPolicyDecision::Deny { reason: "veto".into() } });
+        let decision = hooks
+            .run_policy("any", &serde_json::json!({}), &ToolContext::default())
+            .await;
+        assert!(matches!(decision, ToolPolicyDecision::Deny { .. }));
     }
 
     #[tokio::test]

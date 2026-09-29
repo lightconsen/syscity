@@ -32,10 +32,15 @@ pub(crate) async fn handle_mcp_tools(req: &WsRequest, state: &Arc<GatewayState>)
 /// enough to run it, past every policy the operator had set — the registry's
 /// classification of the same tool was simply never consulted.
 ///
-/// The context carries no ask channel, so a tool that merely advertises
-/// `requires_approval` does not stop to ask a human: the caller here *is* the
-/// operator who asked for it. A policy hook that returns `NeedsApproval` is
-/// still honoured — `execute_call` routes that through the full flow.
+/// The context carries no ask channel, and that is now load-bearing: a tool
+/// that advertises `requires_approval` fails closed here with a deny that
+/// names the pre-approval path (`[permissions].allow`). The playground has
+/// no wired approval prompt — approval events route to the *conversation*
+/// that raised them, and a one-off request id subscribes nobody, so grafting
+/// the queues would not prompt the operator, it would hang the call for the
+/// five-minute approval timeout. Denying immediately with a remediation is
+/// the honest failure mode; exercising an approval-gated tool interactively
+/// belongs to a chat session, where a human can answer.
 pub(crate) async fn handle_mcp_call_tool(
     req: &WsRequest,
     state: &Arc<GatewayState>,

@@ -866,17 +866,19 @@ impl ToolRegistry {
     ///
     /// Run policy hooks and the built-in `requires_approval` fallback.
     ///
-    /// If no explicit policy hooks are configured but the tool advertises
-    /// `requires_approval`, this synthesises a `NeedsApproval` decision
-    /// automatically so that high-risk tools (device access, etc.) are
-    /// never executed silently without the caller going through approval.
+    /// When the tool advertises `requires_approval` and no hook claimed the
+    /// call with an authoritative allow, this synthesises a `NeedsApproval`
+    /// decision so high-risk tools (device access, etc.) are never executed
+    /// silently. With no human present to answer (background contexts), the
+    /// fallback fails closed instead: `Deny`, with the `[permissions].allow`
+    /// rule pointed out as the pre-approval path.
     async fn evaluate_policy(
         &self,
         name: &str,
         args: &Value,
         ctx: &ToolContext,
     ) -> ToolPolicyDecision {
-        self.run_gate(name, args, ctx, false).await
+        self.run_gate(name, args, ctx).await
     }
 
     /// The approval a tool advertising `requires_approval` needs.
@@ -943,19 +945,13 @@ impl ToolRegistry {
     /// Order is locked: a `deny` rule blocks before hooks can even speak; a
     /// hook `Deny` beats every pre-approval; a hook `NeedsApproval` is
     /// honoured as explicit configuration except under `bypass`, where it is
-    /// downgraded to allow (and audited); an `allow` rule or mode
-    /// pre-approval skips the fallback; an `ask` rule forces the fallback
-    /// with the rule's reason. `hooks_only_fallback` preserves the two
-    /// paths' existing difference: the buffered path additionally requires
-    /// [`can_ask_a_human`](crate::tools::ask_user::can_ask_a_human) before
-    /// the fallback fires.
-    async fn run_gate(
-        &self,
-        name: &str,
-        args: &Value,
-        ctx: &ToolContext,
-        hooks_only_fallback: bool,
-    ) -> ToolPolicyDecision {
+    /// downgraded to allow (and audited); an authoritative hook allow
+    /// (`AllowByHook` — a hook that matched *this* call) skips the fallback;
+    /// an `allow` rule or mode pre-approval skips the fallback; an `ask` rule
+    /// forces the fallback with the rule's reason; otherwise the
+    /// `requires_approval` fallback asks a present human and fails closed
+    /// (deny) when there is nobody to ask.
+    async fn run_gate(&self, name: &str, args: &Value, ctx: &ToolContext) -> ToolPolicyDecision {
         let engine = self.evaluate_permissions(name, args, ctx);
 
         let decision = if let EngineDecision::Deny(reason) = engine {
@@ -977,6 +973,14 @@ impl ToolRegistry {
                     ToolPolicyDecision::Allow
                 }
                 other => match (other, engine) {
+                    // deny/ask rules are operator overrides: they beat even
+                    // an authoritative hook allow.
+                    (ToolPolicyDecision::AllowByHook, EngineDecision::Ask(reason)) => {
+                        self.force_ask(name, args, reason)
+                    }
+                    // A hook that matched this call and allowed it is
+                    // authoritative — the `requires_approval` fallback yields.
+                    (ToolPolicyDecision::AllowByHook, _) => ToolPolicyDecision::Allow,
                     (ToolPolicyDecision::Allow, EngineDecision::Ask(reason)) => {
                         self.force_ask(name, args, reason)
                     }
@@ -984,15 +988,23 @@ impl ToolRegistry {
                         ToolPolicyDecision::Allow
                     }
                     (ToolPolicyDecision::Allow, EngineDecision::PassThrough) => {
-                        // requires_approval fallback — only when no policy hook
-                        // exists, so an explicitly-configured policy hook is
-                        // always authoritative.
-                        if !self.active_hooks().has_policy_hooks()
-                            && self.get_capabilities(name).requires_approval
-                            && (!hooks_only_fallback
-                                || crate::tools::ask_user::can_ask_a_human(ctx))
-                        {
-                            self.approval_fallback(name, args)
+                        // The `requires_approval` fallback. A human answers
+                        // when one is present; with nobody to ask (cron,
+                        // heartbeat, goals, delegated sub-agents) the call
+                        // fails closed instead of running ungated — the
+                        // pre-approval path is a `[permissions].allow` rule
+                        // (name globs reach MCP tools).
+                        if self.get_capabilities(name).requires_approval {
+                            if crate::tools::ask_user::can_ask_a_human(ctx) {
+                                self.approval_fallback(name, args)
+                            } else {
+                                ToolPolicyDecision::Deny {
+                                    reason: format!(
+                                        "Tool '{name}' requires approval and no human is present \
+                                         to grant it; pre-approve it with a [permissions].allow rule"
+                                    ),
+                                }
+                            }
                         } else {
                             ToolPolicyDecision::Allow
                         }
@@ -1004,25 +1016,6 @@ impl ToolRegistry {
 
         self.audit_policy_decision(name, ctx, &decision).await;
         decision
-    }
-
-    /// Evaluate the registered policy hooks, plus the `requires_approval`
-    /// fallback when there is a human to answer it — auditing any non-allow
-    /// decision.
-    ///
-    /// Used by the buffered [`execute_call`](Self::execute_call) path. With no
-    /// policy hooks installed, a tool that advertises `requires_approval` is
-    /// now gated **and only where the question can be put to someone**: see
-    /// [`can_ask_a_human`]. A policy hook that returns `NeedsApproval` is
-    /// honoured either way (the caller routes it through the full approval
-    /// flow).
-    async fn evaluate_policy_hooks_only(
-        &self,
-        name: &str,
-        args: &Value,
-        ctx: &ToolContext,
-    ) -> ToolPolicyDecision {
-        self.run_gate(name, args, ctx, true).await
     }
 
     /// Audit a non-allow policy decision as a `ToolDeny` event so a denied or
@@ -1043,7 +1036,7 @@ impl ToolRegistry {
         let (kind, description) = match decision {
             ToolPolicyDecision::Deny { reason } => ("deny", reason.clone()),
             ToolPolicyDecision::NeedsApproval { message, .. } => ("ask", message.clone()),
-            ToolPolicyDecision::Allow => return,
+            ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook => return,
         };
         let details = serde_json::json!({ "kind": kind });
         audit
@@ -1079,7 +1072,7 @@ impl ToolRegistry {
         let policy_decision = self.evaluate_policy(name, &args, context).await;
 
         match policy_decision {
-            ToolPolicyDecision::Allow => {
+            ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook => {
                 // Proceed with execution
             }
             ToolPolicyDecision::Deny { reason } => {
@@ -1482,7 +1475,7 @@ impl ToolRegistry {
         // Run policy evaluation (approval, denials, hooks all handled here).
         let policy_decision = self.evaluate_policy(name, &args, context).await;
         match policy_decision {
-            ToolPolicyDecision::Allow => { /* proceed */ }
+            ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook => { /* proceed */ }
             ToolPolicyDecision::Deny { reason } => {
                 return Some(Err(crate::error::SyscityError::Validation(format!(
                     "Tool '{}' denied: {}",
@@ -1593,15 +1586,11 @@ impl ToolRegistry {
         let tool_name = call.name.clone();
         let timeout = context.timeout();
 
-        // Pre-execute gate: policy hooks run for every buffered tool call.
-        // Uses the hooks-only variant so the built-in `requires_approval`
-        // fallback is NOT activated here — without installed policy hooks a
-        // `requires_approval` tool keeps its historical ungated behaviour.
-        let policy_decision = self
-            .evaluate_policy_hooks_only(&tool_name, &args, context)
-            .await;
+        // Pre-execute gate: policy hooks + the `requires_approval` fallback
+        // run for every buffered tool call, same as the streaming path.
+        let policy_decision = self.evaluate_policy(&tool_name, &args, context).await;
         match policy_decision {
-            ToolPolicyDecision::Allow => {}
+            ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook => {}
             ToolPolicyDecision::Deny { reason } => {
                 return Err(crate::error::SyscityError::Validation(format!(
                     "Tool '{}' denied: {}",
@@ -1732,7 +1721,7 @@ impl ToolRegistry {
         let policy_decision = self.evaluate_policy(&tool_name, &args, context).await;
         match policy_decision {
             // Allow → proceed to execution below.
-            ToolPolicyDecision::Allow => {}
+            ToolPolicyDecision::Allow | ToolPolicyDecision::AllowByHook => {}
             ToolPolicyDecision::Deny { reason } => {
                 return Err(crate::error::SyscityError::Validation(format!(
                     "Tool '{}' denied: {}",
@@ -2260,35 +2249,36 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst), "tool body must not run when denied");
     }
 
-    /// A `requires_approval` tool with no policy hooks and nobody to ask runs
-    /// ungated through `execute_call`.
+    /// A `requires_approval` tool with no policy hooks and nobody to ask
+    /// fails closed through `execute_call`: denied, with the body never run.
     ///
-    /// This is the half that keeps unattended work moving: with no channel to
-    /// put the question on, a submitted prompt could only be waited on for five
-    /// minutes and then fail. The other half is
+    /// The pre-approval path for unattended work is a `[permissions].allow`
+    /// rule — the tool must not silently run just because the question has
+    /// no one to put to. The other half is
     /// [`test_execute_call_requires_approval_asks_when_someone_can_answer`].
     #[tokio::test]
-    async fn test_execute_call_requires_approval_without_a_human_runs() {
+    async fn test_execute_call_requires_approval_without_a_human_denies() {
         let ran = Arc::new(AtomicBool::new(false));
         let mut registry = ToolRegistry::new(); // no hooks
         registry.register(approval_spy("spy", ran.clone()));
 
-        let result = registry
+        let err = registry
             .execute_call(&call("spy"), &ToolContext::default())
             .await
-            .expect("requires_approval tool must run ungated through execute_call");
-        assert!(result.success);
-        assert!(ran.load(Ordering::SeqCst));
+            .expect_err("requires_approval with no human present must fail closed");
+        assert!(err.to_string().contains("no human is present"), "err: {err}");
+        assert!(
+            err.to_string().contains("[permissions].allow"),
+            "the deny must name the pre-approval path, err: {err}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "the tool body must not run");
     }
 
-    /// The same tool, in a context that has a question channel but nobody on the
-    /// other end of it, still runs ungated — and submits nothing.
-    ///
-    /// A cron run, a heartbeat or a delegation carries an `ask_queue` in some
-    /// wiring but is explicitly not an interactive human; asking there would
-    /// stall the very work that has no one to answer.
+    /// The same tool, in a background context (cron/heartbeat/delegation),
+    /// fails closed too — fast, not after the five-minute approval timeout —
+    /// and submits nothing to the approval queue.
     #[tokio::test]
-    async fn test_execute_call_requires_approval_runs_ungated_in_a_background_context() {
+    async fn test_execute_call_requires_approval_denies_in_a_background_context() {
         let ran = Arc::new(AtomicBool::new(false));
         let approval_queue = Arc::new(ApprovalQueue::new());
         let mut registry = ToolRegistry::new().with_approval_queue(approval_queue.clone());
@@ -2297,17 +2287,17 @@ mod tests {
         let ctx = ToolContext::new("system", "cron:job-1")
             .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()));
 
-        // A five-second cap: an ungated call returns at once, and a regression
-        // that submits instead would otherwise sit on the five-minute approval
-        // timeout and look like a hang.
-        let result =
+        // A five-second cap: the deny returns at once; a regression that
+        // submits instead would sit on the five-minute approval timeout and
+        // look like a hang.
+        let err =
             tokio::time::timeout(Duration::from_secs(5), registry.execute_call(&call("spy"), &ctx))
                 .await
                 .expect("a background context must not wait on an approval")
-                .expect("requires_approval tool must run ungated where nobody can answer");
+                .expect_err("background contexts fail closed for requires_approval tools");
 
-        assert!(result.success);
-        assert!(ran.load(Ordering::SeqCst));
+        assert!(err.to_string().contains("no human is present"), "err: {err}");
+        assert!(!ran.load(Ordering::SeqCst), "the tool body must not run");
         assert!(
             approval_queue.is_empty().await,
             "no approval should have been submitted for a background context"
@@ -2342,6 +2332,104 @@ mod tests {
             .expect("approved call should execute");
         assert!(result.success);
         assert!(ran.load(Ordering::SeqCst), "the tool must run once the approval is given");
+        approver.await.expect("approver task");
+    }
+
+    /// A policy hook that returns plain `Allow` carries no authority: it did
+    /// not claim the call, so the `requires_approval` fallback still gates.
+    /// (Before the AllowByHook split, *any* installed policy hook silently
+    /// disabled the fallback for *every* tool.)
+    #[tokio::test]
+    async fn a_plain_allow_hook_does_not_disarm_the_fallback() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_hooks(ToolHooks::new().policy(|_, _, _| async { ToolPolicyDecision::Allow }));
+        registry.register(approval_spy("spy", ran.clone()));
+        let ctx = ToolContext::new("user1", "conv1")
+            .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()));
+
+        let mut rx = approval_queue.event_tx.subscribe();
+        let queue = approval_queue.clone();
+        let approver = tokio::spawn(async move {
+            let event = rx.recv().await.expect("the fallback must still ask");
+            queue
+                .resolve(&event.approval_id, ApprovalDecision::Approve)
+                .await;
+        });
+
+        let result = registry
+            .execute_call(&call("spy"), &ctx)
+            .await
+            .expect("approved call runs");
+        assert!(result.success);
+        approver.await.expect("approver task");
+    }
+
+    /// A hook that matched the call and explicitly allowed it
+    /// (`AllowByHook`) is authoritative: the fallback yields and the tool
+    /// runs without an approval round-trip.
+    #[tokio::test]
+    async fn an_authoritative_hook_allow_disarms_the_fallback() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_hooks(
+                ToolHooks::new().policy(|_, _, _| async { ToolPolicyDecision::AllowByHook }),
+            );
+        registry.register(approval_spy("spy", ran.clone()));
+
+        let result = registry
+            .execute_call(&call("spy"), &ToolContext::new("user1", "conv1"))
+            .await
+            .expect("an authoritative hook allow runs the tool directly");
+        assert!(result.success);
+        assert!(ran.load(Ordering::SeqCst));
+        assert!(
+            approval_queue.is_empty().await,
+            "no approval should be requested when a hook claimed the call"
+        );
+    }
+
+    /// An authoritative hook allow yields to an operator `ask` rule: the
+    /// rule is an override, not an opinion.
+    #[tokio::test]
+    async fn an_ask_rule_beats_an_authoritative_hook_allow() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_hooks(
+                ToolHooks::new().policy(|_, _, _| async { ToolPolicyDecision::AllowByHook }),
+            );
+        registry.register(approval_spy("spy", ran.clone()));
+        registry.permissions().reload(&PermissionsConfig {
+            ask: vec!["spy".to_string()],
+            ..Default::default()
+        });
+        let ctx = ToolContext::new("user1", "conv1")
+            .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()));
+
+        let mut rx = approval_queue.event_tx.subscribe();
+        let queue = approval_queue.clone();
+        let approver = tokio::spawn(async move {
+            let event = rx
+                .recv()
+                .await
+                .expect("the ask rule must route to approval");
+            assert!(event.message.contains("ask rule"), "got: {}", event.message);
+            queue
+                .resolve(&event.approval_id, ApprovalDecision::Approve)
+                .await;
+        });
+
+        let result = registry
+            .execute_call(&call("spy"), &ctx)
+            .await
+            .expect("approved call runs");
+        assert!(result.success);
         approver.await.expect("approver task");
     }
 
