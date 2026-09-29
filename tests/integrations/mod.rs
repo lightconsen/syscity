@@ -46,6 +46,7 @@ pub fn test_context() -> ToolContext {
         .with_workspace_only(false)
 }
 
+mod acp_lifecycle_tests;
 mod acp_tests;
 #[cfg(feature = "browser")]
 mod browser_tests;
@@ -56,6 +57,7 @@ mod delegate_mcp_plan_tests;
 mod execution_tests;
 mod file_tests;
 mod media_tests;
+mod memory_manager_tests;
 mod memory_tests;
 mod message_tool_tests;
 mod network_tests;

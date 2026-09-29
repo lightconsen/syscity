@@ -961,6 +961,7 @@ mod mock_chat_tests;
 mod planner_tests;
 mod post_execute_tests;
 mod protocol_tests;
+mod scheduler_journey_tests;
 mod screen_recorder_tests;
 mod session_tests;
 mod skill_catalog_tests;
