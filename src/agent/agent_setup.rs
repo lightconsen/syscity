@@ -153,13 +153,13 @@ impl Agent {
                 }
             }
             crate::providers::stream_wrappers::ProviderStreamFamily::Anthropic
-            | crate::providers::stream_wrappers::ProviderStreamFamily::AnthropicThinking => {
+            | crate::providers::stream_wrappers::ProviderStreamFamily::AnthropicThinking
                 // Anthropic thinking models (claude-3-7-sonnet-thinking, etc.)
-                if model.contains("thinking") || model.contains("-extended-thinking") {
-                    request.extra = Some(serde_json::json!({
-                        "thinking": { "type": "enabled", "budget_tokens": 16000 }
-                    }));
-                }
+                if model.contains("thinking") || model.contains("-extended-thinking") =>
+            {
+                request.extra = Some(serde_json::json!({
+                    "thinking": { "type": "enabled", "budget_tokens": 16000 }
+                }));
             }
             crate::providers::stream_wrappers::ProviderStreamFamily::GoogleThinking
                 if model.contains("thinking") || model.contains("-exp") =>

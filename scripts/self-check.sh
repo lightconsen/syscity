@@ -4,7 +4,7 @@
 #
 # By default it runs the full CI mirror inside a Linux container
 # (scripts/ci-check-docker.sh) — the same checks as every job in
-# .github/workflows/ci.yml, including msrv 1.94, coverage (llvm-cov), and
+# .github/workflows/ci.yml, including msrv 1.95, coverage (llvm-cov), and
 # the ubuntu platform. Add --local to run on the macOS host instead
 # (scripts/ci-check.sh): faster, but skips msrv/coverage and runs on macOS
 # rather than Linux.
@@ -30,7 +30,7 @@ for arg in "$@"; do
             echo "Usage: $0 [--local] [--quick] [--skip-tests] [--backend]"
             echo ""
             echo "  (default)  Full CI parity: runs ci-check-docker.sh (ubuntu:24.04"
-            echo "             container, all ci.yml jobs incl. msrv 1.94, coverage,"
+            echo "             container, all ci.yml jobs incl. msrv 1.95, coverage,"
             echo "             plugin-boundary). Requires a running Docker daemon"
             echo "             (OrbStack on macOS); the image builds on first run."
             echo "  --local    Run ci-check.sh on the macOS host instead — faster,"

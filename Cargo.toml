@@ -2,7 +2,7 @@
 name = "syscity"
 version = "0.3.8"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 authors = ["Syscity Contributors"]
 description = "Syscity - A Rust application"
 license = "Apache-2.0"
@@ -217,8 +217,8 @@ llama-cpp-2 = { version = "0.1", optional = true }
 hf-hub = { version = "0.5", optional = true, features = ["tokio"] }
 
 # Plugin system (WASM runtime)
-wasmtime = { version = "46.0", optional = true }
-wasmtime-wasi = { version = "46.0", optional = true }
+wasmtime = { version = "48.0", optional = true }
+wasmtime-wasi = { version = "48.0", optional = true }
 
 # Hot reload - file watching
 notify-debouncer-full = { version = "0.3", optional = true }

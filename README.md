@@ -17,7 +17,7 @@
     <img src="https://img.shields.io/discord/1342803221369724929?logo=discord&label=Discord" alt="Discord" />
   </a>
   <a href="https://github.com/lightconsen/syscity#requirements">
-    <img src="https://img.shields.io/badge/MSRV-1.75-orange.svg" alt="MSRV" />
+    <img src="https://img.shields.io/badge/MSRV-1.95-orange.svg" alt="MSRV" />
   </a>
 </p>
 

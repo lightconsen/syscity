@@ -114,10 +114,10 @@ pub async fn openai_chat_completions_handler(
                 match tokio::time::timeout(tokio::time::Duration::from_millis(100), event_rx.recv())
                     .await
                 {
-                    Ok(Ok(GatewayEvent::AgentResponse { session_id: sid, content, .. })) => {
-                        if sid == sse_session_id {
-                            break content;
-                        }
+                    Ok(Ok(GatewayEvent::AgentResponse { session_id: sid, content, .. }))
+                        if sid == sse_session_id =>
+                    {
+                        break content;
                     }
                     Ok(Err(_)) | Err(_) => {}
                     _ => {}
@@ -197,16 +197,14 @@ pub async fn openai_chat_completions_handler(
                     content,
                     usage,
                     ..
-                })) => {
-                    if sid == session_id {
-                        response_content = Some(content);
-                        if let Some(ref u) = usage {
-                            prompt_tokens = u.prompt_tokens;
-                            completion_tokens = u.completion_tokens;
-                            total_tokens = u.total_tokens;
-                        }
-                        break;
+                })) if sid == session_id => {
+                    response_content = Some(content);
+                    if let Some(ref u) = usage {
+                        prompt_tokens = u.prompt_tokens;
+                        completion_tokens = u.completion_tokens;
+                        total_tokens = u.total_tokens;
                     }
+                    break;
                 }
                 Ok(Err(_)) | Err(_) => {}
                 _ => {}
