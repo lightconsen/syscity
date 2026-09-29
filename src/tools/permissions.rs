@@ -154,8 +154,14 @@ pub(crate) fn rules_match_quantified(
     primary: Option<&str>,
     quantifier: RuleQuantifier,
 ) -> bool {
-    // A bare `"tool"` rule approves/refuses the tool outright, primary or not.
-    if rules.iter().any(|rule| !rule.contains(':') && rule == tool) {
+    // A bare rule matches the tool name itself: exact names behave as before
+    // (`glob_match` is exact without a `*`), and a `*` makes it a name glob,
+    // so `ask = ["mcp__gmail__send*"]` reaches MCP tools, which have no
+    // primary invocation arg and would otherwise be unreachable by glob.
+    if rules
+        .iter()
+        .any(|rule| !rule.contains(':') && glob_match(rule, tool))
+    {
         return true;
     }
     let Some(primary) = primary else {
@@ -498,6 +504,82 @@ mod tests {
         assert!(rules_match(&rules, "shell", Some("git status -s")));
         assert!(!rules_match(&rules, "shell", Some("rm -rf")));
         assert!(!rules_match(&rules, "shellx", Some("git status")));
+    }
+
+    #[test]
+    fn mcp_name_globs_match_without_a_primary_arg() {
+        // MCP tools have no primary invocation arg, so a `tool:glob` rule can
+        // never reach them; the bare-name glob path is how an operator writes
+        // per-MCP-server rules. `glob_match` is exact without a `*`.
+        let ask = vec!["mcp__gmail__send*".to_string()];
+        assert!(rules_match_quantified(
+            &ask,
+            "mcp__gmail__send_email",
+            None,
+            RuleQuantifier::AnySegment
+        ));
+        assert!(!rules_match_quantified(
+            &ask,
+            "mcp__gmail__read_email",
+            None,
+            RuleQuantifier::AnySegment
+        ));
+        let star = vec!["mcp__gmail__*".to_string()];
+        assert!(rules_match_quantified(
+            &star,
+            "mcp__gmail__read_email",
+            None,
+            RuleQuantifier::AnySegment
+        ));
+    }
+
+    #[test]
+    fn deny_name_glob_beats_everything() {
+        // A name glob on the deny list refuses an MCP tool outright, primary
+        // or not.
+        let deny = vec!["mcp__linear__delete*".to_string()];
+        assert!(rules_match_quantified(
+            &deny,
+            "mcp__linear__delete_issue",
+            None,
+            RuleQuantifier::AnySegment
+        ));
+        assert!(!rules_match_quantified(
+            &deny,
+            "mcp__linear__get_issue",
+            None,
+            RuleQuantifier::AnySegment
+        ));
+    }
+
+    #[test]
+    fn colon_globs_still_require_a_primary() {
+        // The invariant at the top of `rules_match_quantified`: a `tool:glob`
+        // rule matches on the primary argument, and a call with no primary
+        // never matches one — matching on nothing would mean matching
+        // everything. The bare-name glob path above does not change this.
+        let rules = vec!["mcp__gmail__send_email:*".to_string()];
+        assert!(!rules_match_quantified(
+            &rules,
+            "mcp__gmail__send_email",
+            None,
+            RuleQuantifier::AnySegment
+        ));
+        assert!(rules_match_quantified(
+            &rules,
+            "mcp__gmail__send_email",
+            Some("anything"),
+            RuleQuantifier::AnySegment
+        ));
+    }
+
+    #[test]
+    fn exact_bare_names_unchanged() {
+        // A bare rule with no `*` still matches only the exact name — the
+        // glob path must not widen it into a prefix match.
+        let rules = vec!["mcp__gmail__send_email".to_string()];
+        assert!(rules_match(&rules, "mcp__gmail__send_email", None));
+        assert!(!rules_match(&rules, "mcp__gmail__send_email_v2", None));
     }
 
     /// The asymmetry: deny/ask fire on ANY chain segment (a benign prefix
