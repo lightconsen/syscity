@@ -509,11 +509,22 @@ pub async fn auth_middleware(
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Check if auth is required
-    let auth_required = {
+    // Check if auth is required.
+    //
+    // A configured `auth_mode` is itself a statement that credentials are
+    // required: `auth_required` defaults to false, so keying only off it left
+    // `auth_mode = "token"` deployments with an open REST surface that the WS
+    // side already gates. That surface includes `/v1/chat/completions` (which
+    // spends the operator's provider key) and `POST /api/v1/ws-ticket` — and a
+    // ticket minted anonymously clears the WS upgrade gate, so the hole was a
+    // full bypass of the mode, not just a leak. `auth_mode = None` deployments
+    // are unaffected, and an explicit `auth_required = true` still works on
+    // its own.
+    let (auth_required, auth_mode) = {
         let config = state.config.read().await;
-        config.security.auth_required
+        (config.security.auth_required, config.security.auth_mode)
     };
+    let auth_required = auth_required || auth_mode != crate::gateway::protocol::AuthMode::None;
 
     if !auth_required {
         debug!("Auth not required, allowing request");

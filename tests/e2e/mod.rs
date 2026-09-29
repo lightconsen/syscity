@@ -558,8 +558,26 @@ impl FrontendSimulator {
         Self::connect_url(format!("ws://127.0.0.1:{}/ws?ticket={}", port, ticket)).await
     }
 
+    /// Connect to an explicit WS URL with the shared token in **both** the
+    /// upgrade query string and the handshake frame — under `AuthMode::Token`
+    /// the gateway validates the upgrade and then re-validates the frame
+    /// (`ws/handshake.rs::resolve_token_auth`), so a token-mode client must
+    /// present it twice.
+    pub async fn connect_token(port: u16, token: &str) -> Self {
+        Self::connect_url_with_auth(
+            format!("ws://127.0.0.1:{}/ws?token={}", port, token),
+            json!({ "token": token }),
+        )
+        .await
+    }
+
     /// Connect to an explicit WS URL and complete the `connect` handshake.
     pub async fn connect_url(url: String) -> Self {
+        Self::connect_url_with_auth(url, json!({})).await
+    }
+
+    /// Connect with an explicit `auth` payload in the handshake frame.
+    async fn connect_url_with_auth(url: String, auth: serde_json::Value) -> Self {
         let config = WebSocketConfig {
             max_frame_size: Some(128 << 20), // 128 MB — large enough for screenshot base64
             max_message_size: Some(128 << 20),
@@ -577,7 +595,7 @@ impl FrontendSimulator {
             "params": {
                 "protocol_version": 1,
                 "scopes": ["chat", "read", "write", "admin"],
-                "auth": {}
+                "auth": auth
             }
         });
         write
@@ -924,6 +942,7 @@ mod agent_tests;
 mod approval_journey_tests;
 mod ask_user_tests;
 #[cfg(feature = "browser")]
+mod auth_tests;
 mod browser_chat_tests;
 mod channel_roundtrip_tests;
 mod command_tests;
