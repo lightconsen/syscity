@@ -344,6 +344,12 @@ libc = "0.2"
 # Testing
 wiremock = "0.6"
 futures-util = "0.3"
+# HTTP-level e2e (webhooks, OpenAI-compat endpoints, probes, ws-ticket)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# Slack webhook signature computation in the HTTP e2e (matches the gateway's own)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 # Read-back verification of generated xlsx in converter tests
 calamine = "0.36"
 

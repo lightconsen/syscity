@@ -549,7 +549,17 @@ pub struct FrontendSimulator {
 
 impl FrontendSimulator {
     pub async fn connect(port: u16) -> Self {
-        let url = format!("ws://127.0.0.1:{}/ws", port);
+        Self::connect_url(format!("ws://127.0.0.1:{}/ws", port)).await
+    }
+
+    /// Connect with a short-lived upgrade ticket in the query string — the
+    /// flow the REST `/api/v1/ws-ticket` endpoint exists for.
+    pub async fn connect_with_ticket(port: u16, ticket: &str) -> Self {
+        Self::connect_url(format!("ws://127.0.0.1:{}/ws?ticket={}", port, ticket)).await
+    }
+
+    /// Connect to an explicit WS URL and complete the `connect` handshake.
+    pub async fn connect_url(url: String) -> Self {
         let config = WebSocketConfig {
             max_frame_size: Some(128 << 20), // 128 MB — large enough for screenshot base64
             max_message_size: Some(128 << 20),
@@ -923,6 +933,7 @@ mod delegation_push_tests;
 mod goal_tests;
 mod health_tests;
 mod hooks_tests;
+mod http_tests;
 mod llm_chat_tests;
 mod mcp_chat_tests;
 mod mock_chat_tests;
