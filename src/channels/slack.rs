@@ -195,16 +195,6 @@ impl SlackChannel {
         }
     }
 
-    /// Check if user is allowed (legacy; prefer `check_access` for policy-aware
-    /// checks)
-    #[allow(dead_code)]
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        if self.config.allowed_user_ids.is_empty() {
-            return true;
-        }
-        self.config.allowed_user_ids.contains(&user_id.to_string())
-    }
-
     /// Convert markdown to Slack mrkdwn format
     fn markdown_to_mrkdwn(text: &str) -> String {
         let mut result = text.to_string();
@@ -1028,11 +1018,11 @@ mod tests {
 
     #[test]
     fn test_slack_config() {
-        let config = SlackConfig::new("xoxb-test-token")
+        let config = SlackConfig::new("xoxb-short")
             .with_app_token("xapp-test-token")
             .allow_user_ids(vec!["U123".to_string()]);
 
-        assert_eq!(config.bot_token, "xoxb-test-token");
+        assert_eq!(config.bot_token, "xoxb-short");
         assert_eq!(config.app_token, Some("xapp-test-token".to_string()));
         assert_eq!(config.allowed_user_ids.len(), 1);
     }

@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::channels::{
     Channel, ChannelCapabilities, ChatType, ConversationId, FormattedContent, IncomingMessage,
-    MessageMetadata, OutgoingMessage,
+    OutgoingMessage,
 };
 use crate::core::models::Id;
 use crate::security::pairing::{DmPolicy, PairingStore, RequestAccessResult};
@@ -226,15 +226,6 @@ impl SignalChannel {
         }
     }
 
-    /// Check if phone number is allowed (legacy)
-    #[allow(dead_code)]
-    fn is_number_allowed(&self, number: &str) -> bool {
-        if self.config.allowed_numbers.is_empty() {
-            return true;
-        }
-        self.config.allowed_numbers.contains(&number.to_string())
-    }
-
     /// Make JSON-RPC call to signal-cli
     async fn rpc_call(
         &self,
@@ -297,44 +288,6 @@ impl SignalChannel {
             .unwrap_or_default();
 
         Ok(timestamp)
-    }
-
-    #[allow(dead_code)]
-    /// Poll for incoming messages (simplified)
-    async fn poll_messages(&self) -> crate::Result<Vec<IncomingMessage>> {
-        let params = serde_json::json!({
-            "account": self.config.account,
-        });
-
-        let result = self.rpc_call("receive", params).await?;
-        let mut messages = Vec::new();
-
-        if let Some(envelopes) = result.as_array() {
-            for envelope in envelopes {
-                if let Some(source) = envelope.get("source").and_then(|s| s.as_str()) {
-                    if let Some(data_msg) = envelope.get("dataMessage") {
-                        if let Some(text) = data_msg.get("message").and_then(|m| m.as_str()) {
-                            let timestamp = envelope
-                                .get("timestamp")
-                                .and_then(|t| t.as_i64())
-                                .unwrap_or(0)
-                                .to_string();
-
-                            let incoming = IncomingMessage::new(source, source, text)
-                                .with_metadata(
-                                    MessageMetadata::new()
-                                        .with_extra("signal_timestamp", timestamp.clone())
-                                        .with_extra("signal_account", self.config.account.clone()),
-                                );
-
-                            messages.push(incoming);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(messages)
     }
 
     /// Format content for Signal (basic markdown stripping)

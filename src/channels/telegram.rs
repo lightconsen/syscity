@@ -122,31 +122,6 @@ impl TelegramChannel {
         *af = allow_from;
     }
 
-    #[allow(dead_code)]
-    /// Get or create a session UUID for a chat
-    async fn get_or_create_session(&self, chat_id: i64) -> String {
-        {
-            let sessions = self.session_map.read().await;
-            if let Some(session_id) = sessions.get(&chat_id) {
-                return session_id.clone();
-            }
-        }
-        // Create new session
-        let new_session = uuid::Uuid::new_v4().to_string();
-        let mut sessions = self.session_map.write().await;
-        sessions.insert(chat_id, new_session.clone());
-        new_session
-    }
-
-    #[allow(dead_code)]
-    /// Reset session for a chat (when /new is used)
-    async fn reset_session(&self, chat_id: i64) -> String {
-        let new_session = uuid::Uuid::new_v4().to_string();
-        let mut sessions = self.session_map.write().await;
-        sessions.insert(chat_id, new_session.clone());
-        new_session
-    }
-
     /// Set the message queue sender for routing incoming messages
     pub async fn set_message_sender(&self, sender: mpsc::UnboundedSender<IncomingMessage>) {
         let mut tx = self.message_tx.write().await;

@@ -670,9 +670,6 @@ impl Channel for QqChannel {
 // ── QQ Guild Bot WebSocket Gateway
 // ─────────────────────────────────────────────
 
-/// QQ WebSocket opcodes
-#[allow(dead_code)]
-const QQ_OP_DISPATCH: u64 = 0;
 const QQ_OP_HEARTBEAT: u64 = 1;
 const QQ_OP_IDENTIFY: u64 = 2;
 const QQ_OP_HELLO: u64 = 10;

@@ -240,7 +240,6 @@ pub(crate) async fn extract_zip(
 /// Check whether an extracted package directory contains a `connector.json`
 /// directly or inside a single top-level wrapper directory (common when a
 /// tarball is built from a folder). Returns the effective package root.
-#[allow(dead_code)]
 pub(crate) fn locate_package_root(extract_dir: &std::path::Path, marker: &str) -> PathBuf {
     if extract_dir.join(marker).exists() {
         return extract_dir.to_path_buf();

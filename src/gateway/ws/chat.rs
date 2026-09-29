@@ -8,7 +8,6 @@ pub(crate) async fn handle_chat_send(
     ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
-    #[allow(dead_code)]
     struct ChatSendParams {
         #[serde(alias = "content")]
         message: String,
@@ -242,7 +241,6 @@ pub(super) async fn handle_chat_history(
     state: &Arc<GatewayState>,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
-    #[allow(dead_code)]
     struct HistoryParams {
         session_id: String,
         #[serde(default = "default_limit")]

@@ -436,7 +436,6 @@ mod tests {
             }
         }
 
-        #[allow(dead_code)]
         async fn set_should_fail_start(&self, value: bool) {
             *self.should_fail_start.write().await = value;
         }

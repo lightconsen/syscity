@@ -28,12 +28,9 @@ pub struct HostState {
 }
 
 /// A WASM-based channel plugin
-#[allow(dead_code)]
 pub struct PluginChannel {
     /// Plugin name
     name: String,
-    /// Plugin ID
-    id: String,
     /// Cached capabilities (fetched during load)
     capabilities: ChannelCapabilities,
     /// WASM store
@@ -42,8 +39,6 @@ pub struct PluginChannel {
     init_fn: TypedFunc<(i32, i32), i64>,
     start_fn: TypedFunc<(), i32>,
     stop_fn: TypedFunc<(), i32>,
-    get_name_fn: TypedFunc<(), (i32, i32)>,
-    get_capabilities_fn: TypedFunc<(), i64>,
     send_fn: TypedFunc<(i32, i32), i64>,
     send_typing_fn: TypedFunc<(i32, i32), i32>,
     edit_message_fn: TypedFunc<(i32, i32, i32, i32), i32>,
@@ -367,7 +362,6 @@ impl PluginChannel {
             init_fn,
             start_fn,
             stop_fn,
-            get_name_fn,
             get_capabilities_fn,
             send_fn,
             send_typing_fn,
@@ -386,10 +380,6 @@ impl PluginChannel {
             let stop_fn = instance
                 .get_typed_func::<(), i32>(&mut store, "stop")
                 .map_err(|e| crate::error::SyscityError::Plugin(format!("No stop: {}", e)))?;
-
-            let get_name_fn = instance
-                .get_typed_func::<(), (i32, i32)>(&mut store, "get_name")
-                .map_err(|e| crate::error::SyscityError::Plugin(format!("No get_name: {}", e)))?;
 
             let get_capabilities_fn = instance
                 .get_typed_func::<(), i64>(&mut store, "get_capabilities")
@@ -429,7 +419,6 @@ impl PluginChannel {
                 init_fn,
                 start_fn,
                 stop_fn,
-                get_name_fn,
                 get_capabilities_fn,
                 send_fn,
                 send_typing_fn,
@@ -507,14 +496,11 @@ impl PluginChannel {
 
         Ok(Self {
             name: plugin_name,
-            id: plugin_id,
             capabilities,
             store: Arc::new(Mutex::new(store)),
             init_fn,
             start_fn,
             stop_fn,
-            get_name_fn,
-            get_capabilities_fn,
             send_fn,
             send_typing_fn,
             edit_message_fn,

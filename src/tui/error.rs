@@ -6,7 +6,6 @@ use thiserror::Error;
 
 /// Errors that can occur inside the TUI client.
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub enum TuiError {
     /// Terminal I/O failure.
     #[error("terminal error: {0}")]
@@ -71,7 +70,6 @@ impl TuiError {
     }
 
     /// Build a gateway error from code and message.
-    #[allow(dead_code)]
     pub fn gateway(code: impl fmt::Display, message: impl fmt::Display) -> Self {
         Self::Gateway {
             code: code.to_string(),

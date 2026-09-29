@@ -69,13 +69,11 @@ impl AuthConfig {
     }
 
     /// Build the HTTP base URL.
-    #[allow(dead_code)]
     pub fn http_url(&self, host: &str, port: u16) -> String {
         format!("http://{}:{}", host, port)
     }
 
     /// Return the configured auth mode for protocol handshake.
-    #[allow(dead_code)]
     pub fn auth_mode(&self) -> AuthMode {
         match self {
             Self::None => AuthMode::None,

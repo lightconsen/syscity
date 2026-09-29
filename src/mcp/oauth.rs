@@ -107,10 +107,6 @@ pub(crate) enum OAuthCommand {
     ClearToken {
         server_id: String,
     },
-    /// Request the actor to shut down (currently unused, available for
-    /// graceful teardown).
-    #[allow(dead_code)]
-    Shutdown,
 }
 
 // ─────────────────────────────────────────────
@@ -244,7 +240,6 @@ impl OAuthManagerActor {
                         Some(OAuthCommand::ClearToken { server_id }) => {
                             self.handle_clear_token(&server_id).await;
                         }
-                        Some(OAuthCommand::Shutdown) => break,
                     }
                 }
                 _ = refresh_interval.tick() => {

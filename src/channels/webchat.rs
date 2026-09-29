@@ -107,9 +107,7 @@ pub enum WebchatMessage {
 
 /// Active WebSocket connection info
 #[derive(Debug)]
-#[allow(dead_code)]
 struct WebchatConnection {
-    session_id: String,
     sender: mpsc::UnboundedSender<String>,
 }
 
@@ -599,13 +597,7 @@ async fn handle_websocket(
     // Register this connection for outbound messages
     {
         let mut conns = connections.write().await;
-        conns.insert(
-            session_id.clone(),
-            WebchatConnection {
-                session_id: session_id.clone(),
-                sender: outbound_tx,
-            },
-        );
+        conns.insert(session_id.clone(), WebchatConnection { sender: outbound_tx });
     }
 
     // Send a Ready message to acknowledge the connection

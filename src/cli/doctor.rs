@@ -138,19 +138,6 @@ fn deprecation_rules() -> Vec<DeprecationRule> {
     ]
 }
 
-/// Extension point for plugin-provided diagnostics.
-pub trait DoctorPlugin: Send + Sync {
-    /// Plugin name
-    #[allow(dead_code)]
-    fn name(&self) -> &str;
-    /// Run plugin-specific diagnostics against a provider
-    #[allow(dead_code)]
-    fn diagnose(
-        &self,
-        provider: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DiagnosticHint>> + Send + '_>>;
-}
-
 /// A single diagnostic hint from a plugin or built-in checker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticHint {

@@ -7,7 +7,6 @@
 use serde_json::Value;
 
 use crate::client::DaemonClient;
-use crate::error::SyscityError;
 
 /// Fallback endpoint when no configuration can be read.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -85,15 +84,4 @@ fn gateway_token() -> Option<String> {
         .security
         .shared_token
         .filter(|token| !token.is_empty())
-}
-
-/// Convenience: invoke a WS method and parse the payload into `T`.
-#[allow(dead_code)]
-pub async fn call_typed<T: serde::de::DeserializeOwned>(
-    method: &str,
-    params: Value,
-) -> crate::Result<T> {
-    let payload = call(method, params).await?;
-    serde_json::from_value(payload)
-        .map_err(|e| SyscityError::Internal(format!("Invalid WS response: {}", e)))
 }

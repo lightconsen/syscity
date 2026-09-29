@@ -68,7 +68,6 @@ pub struct BrowserTool {
     /// Default timeout for browser operations (feature-gated: only used when
     /// `browser` feature is enabled, hence `#[allow(dead_code)]` to suppress
     /// warnings when feature is off).
-    #[allow(dead_code)]
     default_timeout: Duration,
     /// Optional browser pool for persistent sessions
     #[cfg(feature = "browser")]

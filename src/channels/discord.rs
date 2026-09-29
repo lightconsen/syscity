@@ -144,33 +144,6 @@ impl DiscordChannel {
         *af = allow_from;
     }
 
-    #[cfg(feature = "discord")]
-    #[allow(dead_code)]
-    /// Get or create a session UUID for a channel
-    async fn get_or_create_session(&self, channel_id: u64) -> String {
-        {
-            let sessions = self.session_map.read().await;
-            if let Some(session_id) = sessions.get(&channel_id) {
-                return session_id.clone();
-            }
-        }
-        // Create new session
-        let new_session = uuid::Uuid::new_v4().to_string();
-        let mut sessions = self.session_map.write().await;
-        sessions.insert(channel_id, new_session.clone());
-        new_session
-    }
-
-    #[cfg(feature = "discord")]
-    #[allow(dead_code)]
-    /// Reset session for a channel (when /new is used)
-    async fn reset_session(&self, channel_id: u64) -> String {
-        let new_session = uuid::Uuid::new_v4().to_string();
-        let mut sessions = self.session_map.write().await;
-        sessions.insert(channel_id, new_session.clone());
-        new_session
-    }
-
     /// Track a message ID to channel ID mapping
     #[cfg(feature = "discord")]
     async fn track_message(&self, syscity_id: Id, discord_msg_id: u64, channel_id: u64) {
@@ -183,16 +156,6 @@ impl DiscordChannel {
     async fn get_message_info(&self, syscity_id: Id) -> Option<(u64, u64)> {
         let map = self.message_map.read().await;
         map.get(&syscity_id).copied()
-    }
-
-    /// Safely convert a Duration to milliseconds, saturating at u64::MAX.
-    /// Check if user is allowed
-    #[allow(dead_code)]
-    fn is_user_allowed(&self, user_id: u64) -> bool {
-        if self.config.allowed_user_ids.is_empty() {
-            return true;
-        }
-        self.config.allowed_user_ids.contains(&user_id)
     }
 
     /// Convert markdown to Discord markdown (Discord uses standard markdown
