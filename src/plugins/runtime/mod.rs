@@ -76,6 +76,13 @@ impl PluginRuntime {
             let mut config = wasmtime::Config::default();
             config.consume_fuel(true);
             config.max_wasm_stack(512 * 1024);
+            // No signal-based traps: on macOS they make wasmtime register a
+            // Mach exception port whose handler thread calls `libc::abort()`
+            // when a receive comes back `MACH_RCV_INTERRUPTED` — and in this
+            // process any stray signal (SIGCHLD from every child spawn, most
+            // of all) can interrupt that receive. Explicit bounds checks are
+            // marginally slower but cannot take the daemon down with them.
+            config.signals_based_traps(false);
             let engine = wasmtime::Engine::new(&config)
                 .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?;
             let mut linker = wasmtime::Linker::new(&engine);

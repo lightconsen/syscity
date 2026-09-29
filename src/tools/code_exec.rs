@@ -399,6 +399,12 @@ print(json.dumps(result))
         let mut config = wasmtime::Config::default();
         config.consume_fuel(true);
         config.max_wasm_stack(512 * 1024);
+        // Signal-based traps are off for the same reason as the plugin
+        // runtime (`plugins/runtime/mod.rs`): on macOS they install a Mach
+        // exception-port thread that aborts the whole process when any stray
+        // signal (SIGCHLD from child spawns, above all) interrupts its
+        // receive. Explicit bounds checks are the robust trade.
+        config.signals_based_traps(false);
         let engine = wasmtime::Engine::new(&config).map_err(|e| {
             crate::error::SyscityError::Internal(format!("WASM engine init failed: {}", e))
         })?;
