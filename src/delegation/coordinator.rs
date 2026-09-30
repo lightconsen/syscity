@@ -485,10 +485,16 @@ mod tests {
             Some("user-session"),
             "lineage rides the handing-off row, not the registry's wake key"
         );
-        assert_eq!(
-            succ.usage_tokens, 0,
-            "the successor starts with no spend of its own and inherits none \
-             (the handing-off row is at 999_999)"
+        // The successor records its own spend as its rounds report usage
+        // (`execute_child_task`'s RoundUsage callback), concurrently with this
+        // read — so its exact total is not stable. The deterministic invariant
+        // is inheritance: the handing-off row sits at 999_999 (far above
+        // anything the mock child spends, ~5k prompt tokens), so "less than
+        // the parent" holds whether the callback has fired yet or not.
+        assert!(
+            succ.usage_tokens < 999_999,
+            "the successor must not inherit the handing-off row's usage, got {}",
+            succ.usage_tokens
         );
         // And it resolves through the same chain the forwarder uses.
         assert_eq!(
