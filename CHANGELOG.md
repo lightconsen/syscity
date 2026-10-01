@@ -11,6 +11,45 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-10-02
+
+### Highlights
+
+- **Channel replies reach the channel.** A message that arrived over Telegram, Slack, WhatsApp, Discord or any other channel was processed end to end — pipeline, agent turn, history, `AgentResponse` — and then stopped: nothing bridged that event into the reply dispatcher, so the answer never left the gateway. Every configured channel user got silence. The inbound dispatch path now runs the final answer through the outbound pipeline like the queue path does, and cron's `Announce` delivery — which had the same shape of hole — now dispatches to the channel it names instead of only emitting an event.
+- **Authentication was two switches, and only one of them was enforced.** `auth_mode = "token"` gated WebSocket upgrades but left the REST surface open, because the REST middleware keyed solely off `security.auth_required` (default false). That surface includes `/v1/chat/completions` — the operator's provider key — and `POST /api/v1/ws-ticket`, whose ticket clears the WebSocket gate: an unauthenticated caller could mint one and connect. A configured auth mode now requires credentials on both transports, and the preferred ticket flow works end to end (the handshake used to re-derive identity from the `connect` frame alone, discarding what the upgrade had already validated, so ticket-authenticated clients landed with zero scopes).
+- **MCP tools describe themselves.** A server's `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`) now drive a tool's capability: read-only tools stop prompting for approval and stay visible in plan mode, destructive ones keep it. Servers that publish nothing keep the conservative default, and tools whose names carry destructive verbs are classified when annotations are absent. Alongside: `[permissions]` rules can target MCP tools by name (`ask = ["mcp__gmail__send*"]`), and the Gmail preset — which pointed at a package that does not exist on npm — now names one that does.
+
+### Added
+
+- **`device_open_url`**: hand a `tel:`, `mailto:`, `sms:`, `https:` or `http:` URL to the operating system on mobile — the dialer opens pre-filled, the mail composer opens with the recipient, and the user confirms in the target app. Schemes are allowlisted in Rust and again natively.
+- MCP tool capabilities are derived from the server's own annotations, with a name-based fallback for servers that publish none.
+- `[permissions]` bare-name glob rules reach tools with no primary invocation argument, which is what MCP tools are: `ask = ["mcp__gmail__send*"]` now works.
+- The desktop window title is "Syscity Desktop"; mobile keeps "Syscity".
+
+### Changed
+
+- **MSRV is 1.95** (from 1.94), pinned by `rust-toolchain.toml` as well as `rust-version`, and every CI job follows.
+- Every WS refusal for a missing or unusable parameter answers `INVALID_PARAMS` — handlers previously read a missing `id` as `""` and reported `NOT_FOUND`, indistinguishable from a resource that does not exist.
+- An approval-gated tool in a context with nobody to ask (cron, heartbeat, standing orders, goal runs, delegated sub-agents) now fails closed with a deny naming the `[permissions].allow` pre-approval path, instead of running silently on one path and hanging five minutes on another.
+- A policy hook that matched a call and allowed it is authoritative; a hook configured for other tools no longer disables the approval fallback for every MCP and high-risk tool.
+- Tests: the e2e tree gains journey coverage for the HTTP surface (probes, OpenAI-compatible endpoints, the ticket exchange, signed webhooks), approval and permission rules, MCP tools, hooks `ask`, channel round trips, heartbeat and standing orders, the admin WS method surface, plus integration coverage for the model router, RAG ingestion, the planner DAG, office conversion, attachments and the eval harness.
+
+### Fixed
+
+- **wasmtime 46 → 48.0.3** (RUSTSEC-2026-0314, a guest-triggerable host panic reachable from the `code_exec` wasm path, and RUSTSEC-2026-0316). The old version has no backport except an LTS line three majors back, which is why the MSRV moved.
+- **A signal could abort the daemon on macOS.** wasmtime's default signal-based traps install a Mach exception port whose handler calls `libc::abort()` when a receive is interrupted — and any stray `SIGCHLD` from a child spawn can interrupt it. Signal-based traps are off for both the plugin runtime and `code_exec`.
+- **A memory the agent observed was invisible to every conversation.** Recall is conversation-scoped, and all three memory stores filtered with strict equality, so an unbound (user-level) memory — which is what `observe` stores — was excluded by `NULL != ?`. The manager's own observe → session-context loop could not close.
+- A reply reaching the channel is the assistant's answer, not an echo of the prompt — pinned by test.
+
+## [0.3.9] - 2026-09-28
+
+Released without a changelog entry (auto-generated notes). Its changes, from
+the commits between v0.3.8 and its tag: TUI welcome banner; a chat re-login
+card for an expired Syscity Cloud session; the cloud token clear gated behind
+the `cloud` feature; permission rules judging each command-chain segment; a
+network-allowlist policy proxy for fenced children; language-aware markers in
+the fallback secret scanner; the process runner split into a module directory.
+
 ## [0.3.8] - 2026-09-23
 
 ### Highlights
