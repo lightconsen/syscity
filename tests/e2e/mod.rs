@@ -217,16 +217,50 @@ pub fn test_config(port: u16, with_provider: bool) -> GatewayConfig {
 /// wait and read as a spurious "did not start" failure.
 pub const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ports the e2e tree still hands out by hand (the `40xxx` literals in
+/// `computer_tests`, `tool_chat_tests`, `browser_chat_tests`, `planner_tests`).
+///
+/// `free_port()` binds `:0`, and the OS's ephemeral range contains these
+/// numbers — so a dynamic port could land on one a test hardcodes. Since the
+/// tests run serially, the loser is whoever binds second: CI saw
+/// `tool_linux_multi_system_and_process` (port 40142) fail with "Failed to
+/// bind gateway" after another test's `free_port()` had been handed 40142.
+/// Excluding the band here keeps both schemes working without rewriting 68
+/// call sites (several of which reuse one number across calls).
+const HANDWRITTEN_PORT_RANGE: std::ops::RangeInclusive<u16> = 40_000..=41_000;
+
 /// Ask the OS for a free TCP port (bind to :0, read the assignment, release).
 ///
 /// E2E tests used to hardcode ports in the 41xxx range; on shared CI runners
 /// those collide with whatever else is bound there ("Failed to bind gateway"
-/// flakes). The brief release-then-rebind race beats certain collision.
+/// flakes). The brief release-then-rebind race beats certain collision — and
+/// the assignment is rejected if it lands in [`HANDWRITTEN_PORT_RANGE`], which
+/// is what made the two port schemes collide with each other.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or(41391) // last-resort fixed port if :0 is unavailable
+    for _ in 0..32 {
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            break;
+        };
+        if let Ok(addr) = listener.local_addr() {
+            if !HANDWRITTEN_PORT_RANGE.contains(&addr.port()) {
+                return addr.port();
+            }
+        }
+    }
+    41391 // last-resort fixed port if :0 is unavailable or always in the band
+}
+
+/// The band above must keep matching the literals the tree actually writes;
+/// a new hardcoded port outside it would silently reintroduce the collision.
+#[test]
+fn free_port_never_returns_a_handwritten_port() {
+    for _ in 0..16 {
+        let port = free_port();
+        assert!(
+            !HANDWRITTEN_PORT_RANGE.contains(&port),
+            "free_port returned {port}, which a hardcoded test may also want"
+        );
+    }
 }
 
 /// Cap on captured log bytes. Bounds memory in long-running chat tests while
