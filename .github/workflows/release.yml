@@ -69,8 +69,15 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # Pinned like every other workflow, and it must be pinned *here*
+          # too: `rust-toolchain.toml` redirects any `cargo` invocation in
+          # this repo to its channel, so an unpinned `@stable` installs the
+          # matrix target onto whatever stable happens to be and the build
+          # then runs on an auto-installed toolchain that lacks it —
+          # "Target x86_64-apple-darwin is not installed".
+          toolchain: "1.95"
           targets: ${{ matrix.target }}
 
       - name: Install system dependencies
@@ -258,8 +265,15 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # Pinned like every other workflow, and it must be pinned *here*
+          # too: `rust-toolchain.toml` redirects any `cargo` invocation in
+          # this repo to its channel, so an unpinned `@stable` installs the
+          # matrix target onto whatever stable happens to be and the build
+          # then runs on an auto-installed toolchain that lacks it —
+          # "Target x86_64-apple-darwin is not installed".
+          toolchain: "1.95"
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
