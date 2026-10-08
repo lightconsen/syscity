@@ -106,9 +106,7 @@ async fn request_tail_has_state_snapshot_and_system_prompt_lacks_current_time() 
     config.model = "mock-model".to_string();
     config.default_agent.workspace_dir = Some(ws.clone());
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     let mock = llm_mock_provider_for_streaming();
     register_mock_provider_with_model(&router, mock.clone(), "mock-model").await;

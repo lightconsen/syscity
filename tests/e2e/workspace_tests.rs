@@ -20,9 +20,7 @@ async fn start_workspace_gateway(port: u16) -> std::path::PathBuf {
 
     let mut config = test_config(port, false);
     config.default_agent.workspace_dir = Some(dir.clone());
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     start_gateway_and_wait(port, gateway).await;
     dir
 }

@@ -98,11 +98,7 @@ async fn start_gateway_with_mock_on_db(
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = Arc::new(
-        Gateway::new(config, None)
-            .await
-            .expect("Failed to create test gateway"),
-    );
+    let gateway = Arc::new(new_test_gateway(config).await);
     let router = gateway.model_router();
     register_mock_provider_with_model(&router, mock, "mock-model").await;
 

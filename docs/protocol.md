@@ -322,6 +322,12 @@ Query 参数：
 
 这些方法对所有客户端（Web、App、CLI）开放，只需具备相应作用域。
 
+**本节的表格只覆盖面向客户端的核心**（自省 / 聊天 / Sessions / Agents / Workspace /
+状态 / 事件）。管理族——`models.*`、`providers.*`、`channels.*`、`mcp.*`、`skills.*`、
+`plugins.*`、`cron.*`、`security.*`、`device.*`——**在此不逐个列举**：它们由
+`methods.list` 枚举（权威表 `METHOD_SCOPES`），此处补一份只会多一个会滞后的副本。
+（§6.2 是这些命令的 CLI 形态。）
+
 #### 协议自省
 
 | 方法 | 作用域 | 说明 |

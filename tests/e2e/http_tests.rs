@@ -24,9 +24,7 @@ async fn start_http_gateway(port: u16, mock: MockProvider, extra: impl FnOnce(&m
     config.model = "mock-model".to_string();
     extra(&mut config);
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     register_mock_provider_with_model(&router, mock, "mock-model").await;
     start_gateway_and_wait_opts(port, gateway, true).await;
@@ -250,9 +248,7 @@ async fn slack_webhook_round_trip_replies_to_the_channel() {
         c
     });
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     // Register the recording adapter before start, under the name the webhook
     // provenance carries ("slack").
     let state = gateway.state();

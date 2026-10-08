@@ -43,9 +43,7 @@ async fn test_oversized_tool_output_spills_to_workspace_file() {
     config.model = "mock-model".to_string();
     config.default_agent.workspace_dir = Some(ws.clone());
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     let mock = big_output_mock_provider();
     register_mock_provider_with_model(&router, mock.clone(), "mock-model").await;
@@ -185,9 +183,7 @@ async fn test_large_file_read_spills_and_reread_breaks_loop() {
     config.model = "mock-model".to_string();
     config.default_agent.workspace_dir = Some(ws.clone());
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     let mock = file_read_spill_mock(big_path.clone(), ws.clone());
     register_mock_provider_with_model(&router, mock.clone(), "mock-model").await;

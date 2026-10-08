@@ -52,9 +52,7 @@ async fn start_gatekeeperless_gateway(port: u16, mock: MockProvider) {
     let mut config = test_config(port, false);
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     register_mock_provider_with_model(&router, mock, "mock-model").await;
     start_gateway_and_wait_opts(port, gateway, false).await;
@@ -67,9 +65,7 @@ async fn start_rules_gateway(port: u16, mock: MockProvider, permissions: Permiss
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
     config.permissions = permissions;
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     register_mock_provider_with_model(&router, mock, "mock-model").await;
     start_gateway_and_wait_opts(port, gateway, false).await;

@@ -79,9 +79,7 @@ async fn start_goal_test_gateway(port: u16) {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
 
     let router = gateway.model_router();
     // Register the mock provider and its owned model; the default is already

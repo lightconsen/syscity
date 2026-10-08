@@ -37,9 +37,7 @@ async fn test_post_execute_block_feedback_reaches_model() {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     let mock = time_mock_provider();
     register_mock_provider_with_model(&router, mock.clone(), "mock-model").await;

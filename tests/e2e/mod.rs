@@ -10,8 +10,9 @@ pub use std::time::Duration;
 pub use futures_util::{SinkExt, StreamExt};
 pub use serde_json::json;
 pub use serial_test::serial;
+pub use syscity::dirs::SyscityPaths;
 pub use syscity::gateway::protocol::AuthMode;
-pub use syscity::gateway::{Gateway, GatewayConfig};
+pub use syscity::gateway::{Gateway, GatewayConfig, GatewayOptions};
 pub use syscity::model_router::{ProviderConfig, ProviderType};
 pub use syscity::providers::{
     mock::MockProvider, FunctionCall, Message as ProviderMessage, Role, ToolCall,
@@ -448,11 +449,54 @@ fn panic_gateway_start(
     panic!("{msg}");
 }
 
+/// Layout root every e2e gateway gets: a temp dir, created once per process.
+///
+/// Without it a gateway derives its layout from `SYSCITY_HOME` / `~/.syscity`,
+/// so the suite writes into the developer's real state — sessions, memory, and
+/// anything a test persists. CI cannot catch that (a fresh container has no real
+/// `~/.syscity` to damage); locally it surfaces as the *next* run behaving
+/// differently, which is how a provider credential written by one run kept
+/// authorizing the provider in the following one.
+///
+/// Shared across tests rather than per-test: every test already shares a
+/// process, and per-test roots would mean threading a handle through each
+/// helper. The cost is that a persisted value outlives its test, so tests
+/// asserting "nothing stored yet" must key on a name only they use (see
+/// `provider_oauth_tests`).
+pub fn test_paths_root() -> Arc<SyscityPaths> {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| tempfile::tempdir().expect("temp layout root for e2e"));
+    let paths = Arc::new(SyscityPaths::from_root(root.path()));
+
+    // Publish it as the process default as well, so tools calling the `dirs::…`
+    // free functions (rather than taking the gateway's paths) agree with it.
+    // Another test target may have installed one already; the gateways below get
+    // theirs explicitly either way.
+    let _already_installed = syscity::dirs::set_default_paths(paths.clone());
+
+    paths
+}
+
+/// Build a gateway that cannot touch the real `~/.syscity`.
+///
+/// Every e2e gateway goes through here — `Gateway::new` would resolve the real
+/// home (see [`test_paths_root`]).
+pub async fn new_test_gateway(config: GatewayConfig) -> Gateway {
+    Gateway::with_options(
+        config,
+        None,
+        GatewayOptions {
+            paths: Some(test_paths_root()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to create test gateway")
+}
+
 pub async fn start_test_gateway(port: u16, with_provider: bool) {
     let config = test_config(port, with_provider);
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     start_gateway_and_wait(port, gateway).await;
 }
 
@@ -487,9 +531,7 @@ pub async fn start_test_gateway_with_mock(port: u16, mock: MockProvider) {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
 
     let router = gateway.model_router();
     // Register the mock provider and its owned model so routing resolves
@@ -986,6 +1028,7 @@ mod computer_tests;
 mod cron_journey_tests;
 mod delegation_push_tests;
 mod goal_tests;
+mod harness_isolation_tests;
 mod health_tests;
 mod hooks_tests;
 mod http_tests;

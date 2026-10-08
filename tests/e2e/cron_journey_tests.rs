@@ -99,9 +99,7 @@ async fn triggered_cron_job_runs_its_prompt_through_the_agent() {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let state = gateway.state();
     let mock = llm_mock_provider_for_streaming();
     let router = gateway.model_router();
@@ -160,9 +158,7 @@ async fn cron_announce_delivers_to_the_named_channel() {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let state = gateway.state();
     let (channel, sent) = CronTestChannel::new("fakecron");
     state

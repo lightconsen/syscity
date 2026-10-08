@@ -79,9 +79,7 @@ async fn chat_invokes_a_registered_mcp_tool_and_replies() {
         },
     );
 
-    let gateway = syscity::gateway::Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     // Grab the state handle before start moves the gateway into its task.
     let state = gateway.state();
     let router = gateway.model_router();

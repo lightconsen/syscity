@@ -24,9 +24,7 @@ async fn goal_planner_fallback_when_no_adapter() {
     config.model = "mock-model".to_string();
     config.computer.enabled = false;
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
 
     let router = gateway.model_router();
     let mock = llm_mock_provider_for_streaming();

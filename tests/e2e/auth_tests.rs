@@ -44,9 +44,7 @@ async fn start_token_gateway(port: u16) {
         "admin".to_string(),
     ];
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let router = gateway.model_router();
     register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
         .await;

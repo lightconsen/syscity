@@ -94,9 +94,7 @@ async fn channel_message_round_trip_reaches_the_channel() {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = syscity::gateway::Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
 
     // Grab the state handle before `start_gateway_and_wait` moves the
     // gateway into its runtime task.
@@ -166,9 +164,7 @@ async fn channel_round_trip_sends_the_assistant_answer_not_the_prompt() {
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
 
-    let gateway = syscity::gateway::Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let state = gateway.state();
 
     let mock = llm_mock_provider_for_streaming();

@@ -124,9 +124,7 @@ async fn heartbeat_wake_runs_the_agent_with_the_custom_prompt() {
     config.model = "mock-model".to_string();
     config.heartbeat = always_on_heartbeat();
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let state = gateway.state();
     let mock = llm_mock_provider_for_streaming();
     let router = gateway.model_router();
@@ -168,9 +166,7 @@ async fn heartbeat_runner_is_absent_when_disabled() {
         ..always_on_heartbeat()
     };
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let state = gateway.state();
     let mock = llm_mock_provider_for_streaming();
     let router = gateway.model_router();
@@ -219,9 +215,7 @@ async fn standing_order_prompt_reaches_the_agent_and_its_reply_the_channel() {
         }],
     };
 
-    let gateway = Gateway::new(config, None)
-        .await
-        .expect("Failed to create test gateway");
+    let gateway = new_test_gateway(config).await;
     let state = gateway.state();
     let (channel, sent) = SchedTestChannel::new("schedchan");
     state
