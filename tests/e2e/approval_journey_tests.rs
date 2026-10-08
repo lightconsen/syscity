@@ -235,7 +235,23 @@ async fn permissions_deny_rule_blocks_without_an_approval_prompt() {
 async fn permissions_ask_rule_forces_approval_for_a_readonly_tool() {
     let port = free_port();
 
-    let mock = journey_mock("grep", json!({ "pattern": "anything", "path": "/tmp" }));
+    // A fixture of its own rather than the machine's `/tmp`. The journey is
+    // about an ask rule gating a read-only tool; pointing it at `/tmp` made the
+    // test's runtime depend on whatever a developer's temp directory happens to
+    // hold. On one such machine that was a browser profile's caches — a few
+    // megabytes of matches, which the result filter scans at ~7s/MB, past the
+    // 30s the assertion below allows. Held for the test's lifetime because the
+    // mock only carries the path string.
+    let fixture = tempfile::tempdir().expect("fixture dir");
+    std::fs::write(fixture.path().join("notes.txt"), "anything goes here\n").expect("fixture file");
+
+    let mock = journey_mock(
+        "grep",
+        json!({
+            "pattern": "anything",
+            "path": fixture.path().to_str().expect("fixture path is UTF-8"),
+        }),
+    );
     start_rules_gateway(
         port,
         mock,
