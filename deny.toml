@@ -15,16 +15,10 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
     { id = "RUSTSEC-2026-0099", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
     { id = "RUSTSEC-2026-0104", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
-    # `paste` is unmaintained but used by several transitive dependencies.
-    { id = "RUSTSEC-2024-0436", reason = "transitive unmaintained dependency; no actionable upgrade path" },
     # `proc-macro-error2` is unmaintained but used by transitive proc-macro crates.
     { id = "RUSTSEC-2026-0173", reason = "transitive unmaintained dependency; no actionable upgrade path" },
-    # `serde_yml` is unsound/unmaintained but currently used for YAML config/tool output.
-    { id = "RUSTSEC-2025-0068", reason = "transitive unsound dependency; migrating to serde_yaml_ng is planned" },
     # lopdf 0.34 (via pdf-extract 0.7.12) stack overflow; fixed version needs a major bump no released pdf-extract pulls in yet.
     { id = "RUSTSEC-2026-0187", reason = "transitive via pdf-extract 0.7.12 -> lopdf 0.34; fix requires lopdf >=0.42 major bump" },
-    # wasmtime 45.x type-index mixup; fix requires a major version jump incompatible with the pinned WASI plugin stack.
-    { id = "RUSTSEC-2026-0222", reason = "transitive via wiggle/wasmtime-wasi; low severity, upgrade blocked by WASI plugin stack pin" },
     # The three below all flow through ppt-rs 0.2.25's default `pdf-native`
     # feature (pdfrs -> syntect/bincode/yaml-rust, pdfrs -> ttf-parser). We do
     # not use pptx→pdf export, and ppt-rs's default-features=false build is
@@ -64,6 +58,8 @@ highlight = "all"
 
 # Skip duplicate detection for transitive dependency trees that are out of our control.
 # These are pulled in by different upstream crates locking different semver ranges.
+# Each entry names a crate version that must exist in Cargo.lock; one left behind by
+# an upgrade silently stops matching anything, so the list is re-checked on each bump.
 skip-tree = [
     # serenity 0.12.5 locks tokio-tungstenite 0.21 -> rustls 0.22 -> rustls-webpki 0.102
     { crate = "serenity@0.12.5", depth = 10 },
@@ -72,7 +68,7 @@ skip-tree = [
     # config 0.14 uses toml 0.8; other crates pull toml 0.9
     { crate = "config@0.14.1", depth = 5 },
     # wasmtime ecosystem pulls in multiple versions of wasm-encoder, wasmparser, hashbrown, etc.
-    { crate = "wasmtime@45.0.2", depth = 10 },
+    { crate = "wasmtime@48.0.5", depth = 10 },
     # dialoguer pulls console 0.16 alongside our console 0.15 (via other deps)
     { crate = "dialoguer@0.11.0", depth = 5 },
     # itertools duplicates from different upstream crates

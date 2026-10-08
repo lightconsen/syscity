@@ -12,8 +12,13 @@ ignore = [
     "RUSTSEC-2023-0071",
 
     # rustls-webpki certificate parsing vulnerabilities.
-    # These are transitive dependencies via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4 -> rustls-webpki 0.102.8.
-    # serenity upstream has not released a version that upgrades tokio-tungstenite yet.
+    # Transitive via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls
+    # 0.22.4 -> rustls-webpki 0.102.8. Patches were only ever released on the
+    # webpki 0.103.x/0.104.x lines — 0.102.8 is the last 0.102 release — so
+    # this cannot be fixed in place.
+    # Checked 2026-10-08: serenity's newest release is still 0.12.5 and still
+    # pins tokio-tungstenite ^0.21. Exposure is limited to builds with the
+    # `discord` feature, since `serenity` is an optional dependency.
     "RUSTSEC-2026-0049",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
@@ -24,10 +29,4 @@ ignore = [
     # version needs lopdf >=0.42.0, a major API break no released pdf-extract
     # pulls in yet. Syscity only extracts PDFs on explicit user request.
     "RUSTSEC-2026-0187",
-
-    # RUSTSEC-2026-0222: wasmtime stores can mix up type indices between engines.
-    # Transitive via wiggle/wasmtime-wasi for the WASM plugin runtime; the fix
-    # requires jumping wasmtime across major versions incompatible with the
-    # pinned WASI plugin stack. Low severity, no public API exposure.
-    "RUSTSEC-2026-0222",
 ]
