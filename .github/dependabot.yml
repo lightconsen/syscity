@@ -32,6 +32,25 @@ updates:
       prefix: "chore(deps)"
       include: "scope"
 
+  # Marketing site (site/) dependencies
+  # Missing until now, which is why the site lockfile could raise a security
+  # alert (alerts scan every manifest in the repo) while never getting an
+  # automated bump: version updates only run for the directories listed here.
+  - package-ecosystem: "npm"
+    directory: "/site"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    assignees:
+      - "lightconsen"
+    labels:
+      - "dependencies"
+      - "frontend"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
   # Desktop (Tauri) dependencies
   - package-ecosystem: "cargo"
     directory: "/desktop"
