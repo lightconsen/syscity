@@ -10,7 +10,7 @@
     "optimize-assets": "./scripts/optimize-assets.sh"
   },
   "dependencies": {
-    "lucide-react": "^1.17.0",
+    "lucide-react": "^1.52.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
