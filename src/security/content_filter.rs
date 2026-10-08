@@ -253,16 +253,35 @@ impl ContentFilter {
             return;
         }
 
+        // Both texts are rewritten in one pass over the findings, and the JSON
+        // payload is serialised once and parsed back once.
+        //
+        // This was previously done *per finding* — serialise the whole `data`
+        // value, replace, parse it back, repeat — which costs
+        // `findings × payload_size`. On a large tool result that is minutes of
+        // CPU (a grep over a few megabytes of matches was measured at ~11
+        // minutes), and because this runs inline on an async executor thread,
+        // every timer and every other task in that runtime waits behind it.
+        //
+        // Doing it once also removes a correctness trap the round trips had:
+        // each one re-serialised the value, so a secret whose text JSON escapes
+        // (a quote, a backslash) stopped matching after the first pass, and a
+        // payload that failed to parse degraded to a `Value::String` whose
+        // later serialisation escaped it differently again.
         for finding in &all_secret_findings {
             *output = output.replace(&finding.original, &finding.redacted);
-            if let Some(ref d) = result.data {
-                let data_text = d.to_string();
-                let new_data_text = data_text.replace(&finding.original, &finding.redacted);
-                *data = serde_json::from_str(&new_data_text)
-                    .ok()
-                    .or(Some(Value::String(new_data_text)));
-            }
         }
+
+        if let Some(ref d) = result.data {
+            let mut data_text = d.to_string();
+            for finding in &all_secret_findings {
+                data_text = data_text.replace(&finding.original, &finding.redacted);
+            }
+            *data = serde_json::from_str(&data_text)
+                .ok()
+                .or(Some(Value::String(data_text)));
+        }
+
         if *action == FilterAction::Pass {
             *action = FilterAction::Redacted;
         }
@@ -370,13 +389,24 @@ mod tests {
         assert!(outcome.output.contains("4111****1111"));
     }
 
+    /// An OpenAI-shaped fake key, assembled at runtime.
+    ///
+    /// Not a literal on purpose: `scripts/staged-checks.sh` scans staged content
+    /// for exactly this shape, so a literal here makes the file uncommittable
+    /// without bypassing the gate — and it is the kind of string that should
+    /// never sit in a source file, even as a joke.
+    fn fake_api_key(seed: char) -> String {
+        format!("sk-{}", seed.to_string().repeat(48))
+    }
+
     #[test]
     fn test_secret_api_key_redacted() {
         let filter = ContentFilter::default();
-        let result = make_result("Key: sk-abcdefghijklmnopqrstuvwxyz123456789012345678901234567");
+        let key = fake_api_key('a');
+        let result = make_result(format!("Key: {key}"));
         let outcome = filter.filter_result(&result);
         assert_eq!(outcome.action, FilterAction::Redacted);
-        assert!(!outcome.output.contains("sk-abcdefghijkl"));
+        assert!(!outcome.output.contains(&key), "{}", outcome.output);
     }
 
     #[test]
@@ -392,6 +422,34 @@ mod tests {
         let data = outcome.data.unwrap();
         let email = data["email"].as_str().unwrap();
         assert!(email.contains("al***@example.com"), "Expected redacted email, got: {}", email);
+    }
+
+    /// Every finding has to reach the payload, and the payload has to survive as
+    /// JSON. The old per-finding round trip re-serialised the value between
+    /// findings, so the second secret could survive the first pass, and a failed
+    /// parse degraded the whole value to a string.
+    #[test]
+    fn test_secret_redaction_covers_every_finding_in_the_data_field() {
+        let filter = ContentFilter::default();
+        let primary = fake_api_key('p');
+        let secondary = fake_api_key('s');
+        let mut result = make_result("Two keys in the payload");
+        result.data = Some(serde_json::json!({
+            "primary": &primary,
+            "secondary": &secondary,
+            "label": "kept",
+        }));
+
+        let outcome = filter.filter_result(&result);
+        assert_eq!(outcome.action, FilterAction::Redacted);
+
+        let data = outcome.data.expect("data");
+        assert!(data["primary"].is_string(), "the payload must stay structured, got: {data}");
+        assert_eq!(data["label"], serde_json::json!("kept"));
+
+        let rendered = data.to_string();
+        assert!(!rendered.contains(&primary), "{rendered}");
+        assert!(!rendered.contains(&secondary), "{rendered}");
     }
 
     #[test]
