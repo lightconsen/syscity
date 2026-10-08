@@ -2,7 +2,12 @@ import { MessageSquare, FileText } from "lucide-react";
 import GithubMark from "./GithubMark";
 import { cloudUrl, useLanguage } from "../i18n";
 
-const base = import.meta.env.BASE_URL;
+import syscityLogo from "../assets/syscity.webp";
+
+/** The logo's encoded size (192×172); the CSS sets the displayed size, these
+ * reserve the box so the header does not shift when it decodes. */
+const LOGO_W = 192;
+const LOGO_H = 172;
 
 export default function Footer() {
   const { t, lang } = useLanguage();
@@ -14,8 +19,10 @@ export default function Footer() {
           <div>
             <div className="flex items-center gap-2.5">
               <img
-                src={`${base}syscity.png`}
+                src={syscityLogo}
                 alt="Syscity logo"
+                width={LOGO_W}
+                height={LOGO_H}
                 className="h-7 w-7 rounded-md object-contain"
               />
               <span className="text-sm font-bold">Syscity</span>

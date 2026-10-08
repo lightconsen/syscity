@@ -3,7 +3,13 @@ import { Check, Copy, ArrowRight } from "lucide-react";
 import GithubMark from "./GithubMark";
 import { useLanguage } from "../i18n";
 
-const base = import.meta.env.BASE_URL;
+import syscityLogo from "../assets/syscity.webp";
+
+/** The logo's encoded size (192×172); the CSS sets the displayed size, these
+ * reserve the box so the header does not shift when it decodes. */
+const LOGO_W = 192;
+const LOGO_H = 172;
+
 const INSTALL_CMD_UNIX = "curl -sSL https://syscity.net/install.sh | bash";
 const INSTALL_CMD_WINDOWS = "irm https://syscity.net/install.ps1 | iex";
 
@@ -76,8 +82,10 @@ export default function Hero() {
         <div className="animate-fade-up mb-8">
           <div className="animate-float">
             <img
-              src={`${base}syscity.png`}
+              src={syscityLogo}
               alt="Syscity logo"
+              width={LOGO_W}
+              height={LOGO_H}
               className="h-20 w-20 rounded-2xl object-contain shadow-[0_12px_32px_rgba(178,42,194,0.25)]"
             />
           </div>

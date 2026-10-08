@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "build": "tsc -b && vite build && node scripts/postbuild.mjs",
+    "preview": "vite preview",
+    "optimize-assets": "./scripts/optimize-assets.sh"
   },
   "dependencies": {
     "lucide-react": "^1.17.0",

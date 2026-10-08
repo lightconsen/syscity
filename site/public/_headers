@@ -1,0 +1,38 @@
+# Cache policy for the landing page.
+#
+# Honoured by the Cloudflare deploy (`wrangler.jsonc` serves `dist/` as
+# assets); Vite copies this file into `dist/` verbatim.
+#
+# Before this the site served everything with `max-age=14400` and no
+# `immutable`, so a returning visitor revalidated the fingerprinted bundle
+# every four hours. The rule below splits by *whether the name can change*:
+#
+#   /assets/*   Vite fingerprints every file it emits (index-<hash>.js,
+#               demo-light-<hash>.webm, …), so the bytes behind a URL never
+#               change and the browser may keep them for a year without
+#               asking. This is where almost all of the page's weight lives.
+#   public/*    Files copied verbatim keep their plain names
+#               (favicon-32.png, apple-touch-icon.png, syscity.png) — a name
+#               that can be replaced by a new upload must stay revalidatable,
+#               so they get a day rather than a year.
+#   the page    The HTML is the one document that must not go stale; it
+#               carries the hashed URLs of everything else. Ten minutes is
+#               what it had, kept deliberately short.
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.png
+  Cache-Control: public, max-age=86400
+
+/*.svg
+  Cache-Control: public, max-age=86400
+
+/*.ico
+  Cache-Control: public, max-age=86400
+
+/
+  Cache-Control: public, max-age=600
+
+/index.html
+  Cache-Control: public, max-age=600

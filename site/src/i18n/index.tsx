@@ -346,7 +346,21 @@ const LangContext = createContext<LangContextValue>({
 });
 
 export function LangProvider({ children }: { children: ReactNode }) {
-  const [lang, setLangState] = useState<Lang>(detectInitialLang);
+  // The page is prerendered at build time in English, so the first client
+  // render must also be English: picking the visitor's language here (from
+  // storage or `navigator`) would make the hydrated tree disagree with the
+  // server's HTML for every Chinese visitor, and React answers a mismatch by
+  // throwing the subtree away. The real language is resolved in the effect
+  // below instead — one frame of English for a zh visitor, against a blank
+  // page until the bundle loads as it was before prerendering.
+  const [lang, setLangState] = useState<Lang>("en");
+
+  useEffect(() => {
+    setLangState((current) => {
+      const detected = detectInitialLang();
+      return detected === current ? current : detected;
+    });
+  }, []);
 
   useEffect(() => {
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
