@@ -115,6 +115,7 @@ pub async fn make_test_state_parts(
         start_time: std::time::Instant::now(),
         config_path: None,
         mcps_path: None,
+        provider_oauth: Arc::new(crate::model_router::ProviderOAuthFlows::new(secrets.clone())),
         secrets: secrets.clone(),
         // Hermetic layout root: every derived path lives under the temp dir,
         // never the real `~/.syscity`.
@@ -267,6 +268,33 @@ pub async fn make_test_state_parts(
 /// [`make_test_state`] leaves the harness stores as `None`; handlers that need
 /// real persistence use this variant, which injects session, feedback and
 /// pending-badcase stores all backed by ONE shared in-memory SQLite pool
+/// A test state whose credential storage is hermetic — a fresh temp root per
+/// call, and the provider-OAuth manager wired to it.
+///
+/// `make_test_state` uses the process-wide test root
+/// (`temp_dir()/syscity-test-<pid>`), which every test in this binary shares:
+/// a credential one test stores is visible to the next. Harmless for tests that
+/// never touch secrets, wrong for any test that does. Only these two handles
+/// are swapped — anything the state built earlier still holds the old one, so
+/// reach for this when the test is about OAuth credentials, not as a general
+/// hermetic fixture.
+///
+/// The returned `TempDir` must be held for as long as the state is used; dropping
+/// it deletes the store underneath.
+pub async fn make_test_state_with_hermetic_oauth_store(
+    config: GatewayConfig,
+) -> (GatewayState, tempfile::TempDir) {
+    let mut state = make_test_state(config).await;
+    let dir = tempfile::tempdir().expect("temp dir for hermetic secrets");
+    let secrets = Arc::new(
+        crate::secrets::SecretStoreHandle::with_root(dir.path().to_path_buf())
+            .expect("hermetic secret store"),
+    );
+    state.secrets = secrets.clone();
+    state.provider_oauth = Arc::new(crate::model_router::ProviderOAuthFlows::new(secrets));
+    (state, dir)
+}
+
 /// (`:memory:` pools are per-connection, so every store must share the pool).
 pub async fn make_test_state_with_store(config: GatewayConfig) -> GatewayState {
     let mut state = make_test_state(config).await;

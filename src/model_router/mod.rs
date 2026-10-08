@@ -7,7 +7,12 @@
 //! - Health checking and load balancing
 //! - Auth profile rotation with cooldown
 //! - Cost-aware routing with pluggable task classification
-// INVARIANTS-NONE: provider selection is stateless per request; failures carry stable codes (see resolver/web).
+// Invariants: `provider_oauth::provider_oauth_invariant_checks` — an OAuth access
+// token is never persisted, only the refresh token is. Registered from
+// `core::invariants::register_builtins`.
+//
+// Provider *selection* is still stateless per request and failures still carry
+// stable codes (see resolver/web); what holds state is the OAuth flow manager.
 
 pub mod auth_profile;
 pub mod auth_profile_store;
@@ -16,10 +21,10 @@ pub mod config;
 pub mod failure_class;
 pub mod gateway_client;
 pub mod model_catalog;
-pub mod oauth_callback;
 pub mod oauth_credential;
 pub mod oauth_flow;
 pub mod pkce;
+pub mod provider_oauth;
 pub mod router;
 pub mod usage_fetcher;
 pub mod usage_formatter;
@@ -41,12 +46,12 @@ pub use config::{
     ProviderType, TaskRoutingRule, TaskType,
 };
 pub use failure_class::FailureClass;
-pub use gateway_client::{GatewayClient, HttpGatewayClient};
+pub use gateway_client::{GatewayClient, HttpGatewayClient, OAuthRefreshTarget};
 pub use model_catalog::{ModelCatalog, ModelCatalogEntry, ModelDiscoverySource, ModelPricing};
-pub use oauth_callback::wait_for_callback;
-pub use oauth_credential::Credential;
+pub use oauth_credential::{Credential, RefreshOutcome};
 pub use oauth_flow::OAuthFlow;
 pub use pkce::{challenge_from_verifier, generate_verifier};
+pub use provider_oauth::{AuthStatus, ProviderOAuthFlows, StartedFlow, CALLBACK_PATH};
 pub use router::ModelRouter;
 pub use usage_fetcher::{
     LocalBudgetFetcher, OpenAiUsageFetcher, UsageFetcher, UsageFetcherRegistry,

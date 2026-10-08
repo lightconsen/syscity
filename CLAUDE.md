@@ -11,7 +11,11 @@
 - REST is reserved for cases that genuinely require HTTP:
   - OpenAI-compatible wire protocol (`/v1/chat/completions`, `/v1/models`) —
     external tools hardcode these paths.
-  - OAuth browser redirects (`/api/v1/cloud/login`).
+  - OAuth browser redirects (`/api/v1/cloud/login`, and the provider OAuth
+    callback `/oauth/provider/callback` — a provider's server redirects the
+    browser here, so it can carry no token; it is authenticated by the
+    single-use `state` we issued, and sits on the essential tier next to
+    `/webhooks/*`).
   - Inbound webhooks from external platforms (`/webhooks/*`).
   - The WebSocket upgrade-ticket exchange (`/api/v1/ws-ticket`) — the caller has
     no WS connection yet and a browser cannot set headers on a WebSocket

@@ -444,6 +444,7 @@ impl Gateway {
             start_time: Instant::now(),
             config_path: config_path.clone(),
             mcps_path: Some(paths.config_dir().join("mcp.toml")),
+            provider_oauth: Arc::new(crate::model_router::ProviderOAuthFlows::new(secrets.clone())),
             secrets: secrets.clone(),
             paths: paths.clone(),
             task_registry: task_registry.clone(),

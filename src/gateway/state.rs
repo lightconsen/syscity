@@ -304,6 +304,12 @@ pub struct GatewayState {
     /// Path to the MCP presets file (~/.syscity/mcp.toml)
     pub mcps_path: Option<PathBuf>,
 
+    /// In-flight provider OAuth authorizations.
+    ///
+    /// On the state (rather than built per request) because the flow is shared
+    /// between two entries: `providers.auth_start` remembers it, and the
+    /// `/oauth/provider/callback` route completes it.
+    pub provider_oauth: Arc<crate::model_router::ProviderOAuthFlows>,
     /// Secret-store instance handle (file backend + master key + memory cache).
     ///
     /// Constructed exactly once at gateway startup and threaded through the

@@ -5,11 +5,17 @@
 //! 2. Build authorization URL
 //! 3. Exchange authorization code for tokens
 //!
+//! The redirect URI is always supplied by the caller: the gateway's own callback
+//! route completes provider authorizations (`provider_oauth`). There used to be
+//! a loopback-listener variant for the CLI, which the gateway-hosted callback
+//! replaced — a listener can only work when the browser and the gateway share a
+//! host, which is the case the design does not want to be limited to.
+//!
 //! ```rust,ignore
 //! let flow = OAuthFlow::new();
-//! let url = flow.authorization_url(&config);
-//! // ... redirect user to url, receive code ...
-//! let credential = flow.exchange_code("code", &config).await?;
+//! let url = flow.authorization_url_with_redirect(&config, redirect_uri);
+//! // ... the provider redirects the browser to redirect_uri ...
+//! let credential = flow.exchange_code_with_redirect("code", &config, redirect_uri).await?;
 //! ```
 
 use base64::Engine as _;
@@ -48,17 +54,23 @@ impl OAuthFlow {
         &self.state
     }
 
-    /// Build the authorization URL to send the user to.
-    pub fn authorization_url(&self, config: &OAuthConfig) -> String {
+    /// Build the authorization URL for an explicit redirect URI.
+    ///
+    /// The URI is the one registered with the provider; the gateway passes its
+    /// own callback (`OAuthConfig::redirect_uri`).
+    pub fn authorization_url_with_redirect(
+        &self,
+        config: &OAuthConfig,
+        redirect_uri: &str,
+    ) -> String {
         let challenge = pkce::challenge_from_verifier(&self.verifier);
-        let redirect_uri = format!("http://127.0.0.1:{}/callback", config.redirect_port);
 
         let mut url = format!(
             "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&\
              code_challenge_method=S256&state={}",
             urlencoding::encode(&config.auth_url),
             urlencoding::encode(&config.client_id),
-            urlencoding::encode(&redirect_uri),
+            urlencoding::encode(redirect_uri),
             urlencoding::encode(&challenge),
             urlencoding::encode(&self.state),
         );
@@ -70,20 +82,21 @@ impl OAuthFlow {
         url
     }
 
-    /// Exchange an authorization code for an access token (and optional refresh
-    /// token).
-    pub async fn exchange_code(
+    /// Exchange an authorization code using an explicit redirect URI.
+    ///
+    /// It must be the same string that was sent in the authorization request —
+    /// providers compare them and reject a mismatch.
+    pub async fn exchange_code_with_redirect(
         &self,
         code: &str,
         config: &OAuthConfig,
+        redirect_uri: &str,
     ) -> crate::Result<Credential> {
-        let redirect_uri = format!("http://127.0.0.1:{}/callback", config.redirect_port);
-
         let mut params: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("client_id", config.client_id.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
+            ("redirect_uri", redirect_uri),
             ("code_verifier", self.verifier.as_str()),
         ];
 
@@ -164,6 +177,10 @@ mod tests {
 
     use super::*;
 
+    /// The redirect URI a caller would hand in; the exchange must echo it back
+    /// verbatim, so the tests pass the same string to both calls.
+    const REDIRECT_URI: &str = "https://gw.example.com/oauth/provider/callback";
+
     fn test_oauth_config(token_url: String, client_secret: Option<String>) -> OAuthConfig {
         OAuthConfig {
             client_id: "test-client".to_string(),
@@ -171,7 +188,8 @@ mod tests {
             token_url,
             scope: None,
             client_secret,
-            redirect_port: 18081,
+            redirect_base: None,
+            refresh_token: None,
         }
     }
 
@@ -194,7 +212,10 @@ mod tests {
         let config =
             test_oauth_config(format!("{}/token", server.uri()), Some("super-secret".to_string()));
         let flow = OAuthFlow::new();
-        let credential = flow.exchange_code("auth-code", &config).await.unwrap();
+        let credential = flow
+            .exchange_code_with_redirect("auth-code", &config, REDIRECT_URI)
+            .await
+            .unwrap();
 
         match credential {
             Credential::OAuth2 {
@@ -227,7 +248,10 @@ mod tests {
 
         let config = test_oauth_config(format!("{}/token", server.uri()), None);
         let flow = OAuthFlow::new();
-        let credential = flow.exchange_code("auth-code", &config).await.unwrap();
+        let credential = flow
+            .exchange_code_with_redirect("auth-code", &config, REDIRECT_URI)
+            .await
+            .unwrap();
 
         match credential {
             Credential::OAuth2 { client_secret, .. } => {

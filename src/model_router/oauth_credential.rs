@@ -98,10 +98,18 @@ impl Credential {
     ///
     /// For `OAuth2`, performs a client-credentials token refresh.
     /// For other variants this is a no-op.
-    pub async fn refresh_if_needed(&mut self, client: &reqwest::Client) -> crate::Result<()> {
+    ///
+    /// Returns what actually happened, so the caller can persist a refresh
+    /// token the server rotated. Servers that rotate invalidate the previous
+    /// token, so dropping the new one means the next process start presents a
+    /// dead credential.
+    pub async fn refresh_if_needed(
+        &mut self,
+        client: &reqwest::Client,
+    ) -> crate::Result<RefreshOutcome> {
         let needs_refresh = self.is_expired() || self.is_expiring_soon(Duration::minutes(5));
         if !needs_refresh {
-            return Ok(());
+            return Ok(RefreshOutcome::default());
         }
 
         if let Credential::OAuth2 {
@@ -152,11 +160,41 @@ impl Credential {
 
             *access_token = data.access_token;
             *expires_at = Utc::now() + Duration::seconds(data.expires_in as i64);
-            if let Some(new_refresh) = data.refresh_token {
-                *refresh = new_refresh;
+            let rotated = data.refresh_token;
+            if let Some(new_refresh) = &rotated {
+                *refresh = new_refresh.clone();
             }
+            return Ok(RefreshOutcome {
+                refreshed: true,
+                rotated_refresh_token: rotated,
+            });
         }
-        Ok(())
+        Ok(RefreshOutcome::default())
+    }
+}
+
+/// What a [`Credential::refresh_if_needed`] call actually did.
+///
+/// `Debug` is written by hand: the derived one would print a live refresh
+/// token, and this crate's rule is that debug output never carries a secret
+/// (`docs/secret-storage.md` §1.4.8).
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    /// True when a token exchange actually happened.
+    pub refreshed: bool,
+    /// The new refresh token, when the server returned one.
+    pub rotated_refresh_token: Option<String>,
+}
+
+impl fmt::Debug for RefreshOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RefreshOutcome")
+            .field("refreshed", &self.refreshed)
+            .field(
+                "rotated_refresh_token",
+                &self.rotated_refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
     }
 }
 
@@ -219,6 +257,9 @@ fn default_expires_in() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
 
     #[test]
@@ -318,9 +359,104 @@ mod tests {
         rt.block_on(async {
             let client = reqwest::Client::new();
             let mut cred = Credential::api_key("sk-test");
-            // Should not panic or error
-            let result = cred.refresh_if_needed(&client).await;
-            assert!(result.is_ok());
+            let outcome = cred.refresh_if_needed(&client).await.unwrap();
+            // An API key has nothing to refresh — and reports no rotation,
+            // which is what keeps the write-back from firing on every request.
+            assert_eq!(outcome, RefreshOutcome::default());
         });
+    }
+
+    /// An OAuth2 credential that is already expired, pointed at `token_url`.
+    ///
+    /// Expired on purpose: `refresh_if_needed` only acts when the token is gone
+    /// or within five minutes of going.
+    fn expired_oauth2(token_url: String, refresh_token: &str) -> Credential {
+        Credential::OAuth2 {
+            access_token: String::new(),
+            refresh_token: Some(refresh_token.to_string()),
+            expires_at: Utc::now() - Duration::seconds(1),
+            token_url,
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scope: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_a_rotated_refresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cred = expired_oauth2(format!("{}/token", server.uri()), "original-refresh");
+        let outcome = cred
+            .refresh_if_needed(&reqwest::Client::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.refreshed);
+        assert_eq!(outcome.rotated_refresh_token.as_deref(), Some("rotated-refresh"));
+
+        match &cred {
+            Credential::OAuth2 {
+                access_token, refresh_token, ..
+            } => {
+                assert_eq!(access_token, "new-access");
+                assert_eq!(refresh_token.as_deref(), Some("rotated-refresh"));
+            }
+            other => panic!("expected an OAuth2 credential, got {other:?}"),
+        }
+    }
+
+    /// Servers that do not rotate send no `refresh_token`. Nothing must be
+    /// reported as rotated, or every request would rewrite the stored token.
+    #[tokio::test]
+    async fn refresh_without_rotation_reports_nothing_to_persist() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cred = expired_oauth2(format!("{}/token", server.uri()), "original-refresh");
+        let outcome = cred
+            .refresh_if_needed(&reqwest::Client::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.refreshed);
+        assert_eq!(outcome.rotated_refresh_token, None);
+
+        match &cred {
+            Credential::OAuth2 { refresh_token, .. } => {
+                assert_eq!(refresh_token.as_deref(), Some("original-refresh"));
+            }
+            other => panic!("expected an OAuth2 credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_outcome_debug_does_not_print_the_token() {
+        let outcome = RefreshOutcome {
+            refreshed: true,
+            rotated_refresh_token: Some("super-secret-refresh".to_string()),
+        };
+        let rendered = format!("{outcome:?}");
+        assert!(!rendered.contains("super-secret-refresh"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
     }
 }

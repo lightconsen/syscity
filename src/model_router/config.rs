@@ -17,7 +17,21 @@ use crate::secrets::{SecretStoreHandle, StoreRef};
 // ------------------------------------------------------------------
 
 /// OAuth 2.0 configuration for a provider
+///
+/// Flow parameters only — plus a *reference* to the refresh token, never its
+/// value. `docs/secret-storage.md` principle 1 is explicit: "config never
+/// stores values, only references". The refresh token lives in the encrypted
+/// secret store under `llm-oauth/{provider}/refresh_token`; the access token
+/// and its expiry are memory-only, since a restart re-acquires them from the
+/// refresh token.
+///
+/// Unknown keys are rejected rather than ignored. Every other config struct in
+/// the crate silently drops what it does not recognise, which is precisely how
+/// a `provider auth` block that could never be read back went unnoticed — the
+/// fields deserialized "successfully" and vanished. A hard error here names the
+/// offending key instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthConfig {
     /// OAuth2 client ID
     pub client_id: String,
@@ -31,13 +45,38 @@ pub struct OAuthConfig {
     /// OAuth2 client secret (required by some providers for token exchange)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
-    /// Local redirect callback port (default: 18081)
-    #[serde(default = "default_redirect_port")]
-    pub redirect_port: u16,
+    /// Public base the provider redirects the browser back to, e.g.
+    /// `https://gw.example.com`. The gateway appends its own callback path
+    /// ([`crate::model_router::provider_oauth::CALLBACK_PATH`]) to it.
+    ///
+    /// Unset means "derive from the address this gateway is bound to", which is
+    /// right for a desktop install talking to a provider that accepts
+    /// `http://127.0.0.1:…` redirect URIs. A gateway behind a proxy, or a
+    /// provider with a strict registered-URI list, has to say so explicitly —
+    /// the value must match what was registered with the provider, and only the
+    /// operator knows that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_base: Option<String>,
+    /// Reference to the stored refresh token, e.g.
+    /// `{ namespace = "llm-oauth", entity = "grok", kind = "refresh_token" }`.
+    ///
+    /// `StoreRef` only: there is deliberately no inline-string variant, because
+    /// accepting one would mean config could hold a live credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<StoreRef>,
 }
 
-fn default_redirect_port() -> u16 {
-    18081
+impl OAuthConfig {
+    /// The redirect URI for the gateway-hosted callback: `redirect_base` when
+    /// configured, otherwise the gateway's own address.
+    pub fn redirect_uri(&self, gateway_base: &str) -> String {
+        let base = self.redirect_base.as_deref().unwrap_or(gateway_base);
+        format!(
+            "{}{}",
+            base.trim_end_matches('/'),
+            crate::model_router::provider_oauth::CALLBACK_PATH
+        )
+    }
 }
 
 // ------------------------------------------------------------------

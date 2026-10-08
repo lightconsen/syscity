@@ -86,6 +86,24 @@ pub struct HttpGatewayClient {
     /// Static headers injected on every request (User-Agent, version headers,
     /// etc.).
     pub(crate) extra_headers: HeaderMap,
+    /// Where a rotated OAuth refresh token belongs. `None` unless the router
+    /// registered one — see `set_oauth_refresh_target`.
+    oauth_refresh_target: RwLock<Option<OAuthRefreshTarget>>,
+}
+
+/// Where a server-rotated OAuth refresh token is written back.
+///
+/// The `id` is the reference the *user* wrote in
+/// `[providers.<name>.oauth] refresh_token = { … }`, not something derived from
+/// the provider's internal name: the config key and the preset name differ for
+/// aliased providers (e.g. a `[providers.openrouter]` entry of type `open_ai`),
+/// and the write-back must land on the reference the reader will look at.
+#[derive(Clone)]
+pub struct OAuthRefreshTarget {
+    /// Backend for `id`, resolved through the handle the router already has.
+    pub store: Arc<dyn crate::secrets::SecretStore>,
+    /// The refresh token's location.
+    pub id: crate::secrets::SecretId,
 }
 
 impl std::fmt::Debug for HttpGatewayClient {
@@ -123,7 +141,15 @@ impl HttpGatewayClient {
             rate_limiter: None,
             api_key_header: None,
             extra_headers: HeaderMap::new(),
+            oauth_refresh_target: RwLock::new(None),
         })
+    }
+
+    /// Register where a server-rotated OAuth refresh token must be written
+    /// back. Set by the router for OAuth2-backed providers; unset for API-key
+    /// providers, whose credentials never rotate.
+    pub async fn set_oauth_refresh_target(&self, target: OAuthRefreshTarget) {
+        *self.oauth_refresh_target.write().await = Some(target);
     }
 
     /// Builder: set max retries.
@@ -175,10 +201,51 @@ impl HttpGatewayClient {
     }
 
     /// Refresh the credential if it's an OAuth2 token that is expired or
-    /// expiring soon.
+    /// expiring soon, and persist a refresh token the server rotated.
     pub(crate) async fn refresh_credential_if_needed(&self) -> crate::Result<()> {
-        let mut cred = self.credential.write().await;
-        cred.refresh_if_needed(&self.inner).await
+        // The write lock covers only the refresh itself — the store write below
+        // is I/O and has no business holding it.
+        let outcome = {
+            let mut cred = self.credential.write().await;
+            cred.refresh_if_needed(&self.inner).await?
+        };
+
+        if let Some(new_token) = outcome.rotated_refresh_token {
+            self.persist_rotated_refresh_token(&new_token).await;
+        }
+        Ok(())
+    }
+
+    /// Write a rotated refresh token back to the store.
+    ///
+    /// Failure is logged, not propagated: the request that triggered the
+    /// refresh can still proceed with the new in-memory token, and refusing to
+    /// serve traffic because a secret could not be persisted would be the worse
+    /// trade. The cost of losing a rotation is a stale token on the next start,
+    /// which is why it is worth a warning.
+    async fn persist_rotated_refresh_token(&self, new_token: &str) {
+        let target = self.oauth_refresh_target.read().await.clone();
+        let Some(target) = target else {
+            warn!(
+                "OAuth refresh rotated the refresh token but no store target is registered; \
+                 the new token lives in this process's memory only"
+            );
+            return;
+        };
+
+        // `target.id` is a location (`llm-oauth/<provider>/refresh_token`), not
+        // a value, so naming it in a log line leaks nothing.
+        if let Err(e) = target
+            .store
+            .set(&target.id, new_token, crate::secrets::SecretOrigin::SystemGenerated)
+            .await
+        {
+            warn!(
+                "Failed to persist the rotated OAuth refresh token at {}: {e}. \
+                 This process keeps working; the next start will present the old token",
+                target.id
+            );
+        }
     }
 
     /// Build the full URL for a path.
@@ -466,7 +533,7 @@ impl GatewayClient for HttpGatewayClient {
 #[cfg(test)]
 mod tests {
     use serde::Serialize;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -640,5 +707,90 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    /// The whole point of `RefreshOutcome`: a refresh token the server rotated
+    /// must reach the store, because the server has just invalidated the old
+    /// one. Dropping it means the next process start presents a dead token.
+    #[tokio::test]
+    async fn rotated_refresh_token_is_written_back_to_the_store() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // A hermetic file-backed store: no keyring, no `~/.syscity`.
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(crate::secrets::FileStore::with_root("llm-oauth", dir.path().to_path_buf()));
+        let id = crate::secrets::SecretId::new("llm-oauth", "grok", "refresh_token");
+        store
+            .set(&id, "original-refresh", crate::secrets::SecretOrigin::SystemGenerated)
+            .await
+            .unwrap();
+
+        let credential = Credential::OAuth2 {
+            access_token: String::new(),
+            refresh_token: Some("original-refresh".to_string()),
+            // Expired on purpose so the refresh runs on the next request.
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            token_url: format!("{}/token", server.uri()),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scope: None,
+        };
+        let client =
+            HttpGatewayClient::new("http://unused.invalid", credential, Duration::from_secs(5))
+                .unwrap();
+        client
+            .set_oauth_refresh_target(OAuthRefreshTarget {
+                store: store.clone(),
+                id: id.clone(),
+            })
+            .await;
+
+        client.refresh_credential_if_needed().await.unwrap();
+
+        assert_eq!(store.get(&id).await.unwrap().as_deref(), Some("rotated-refresh"));
+    }
+
+    /// Without a registered target the refresh must still succeed — the
+    /// write-back is an optimisation for the next start, not a request-path
+    /// dependency.
+    #[tokio::test]
+    async fn refresh_succeeds_without_a_registered_target() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+
+        let credential = Credential::OAuth2 {
+            access_token: String::new(),
+            refresh_token: Some("original-refresh".to_string()),
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            token_url: format!("{}/token", server.uri()),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scope: None,
+        };
+        let client =
+            HttpGatewayClient::new("http://unused.invalid", credential, Duration::from_secs(5))
+                .unwrap();
+
+        client.refresh_credential_if_needed().await.unwrap();
     }
 }

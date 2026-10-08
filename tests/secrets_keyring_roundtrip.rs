@@ -26,6 +26,7 @@ use syscity::secrets::{probe_keyring, SecretId, SecretOrigin, SecretStoreHandle,
 /// One row per design-doc storage namespace: `(namespace, entity, kind)`.
 const NAMESPACES: &[(&str, &str, &str)] = &[
     ("llm", "rt-llm-provider", "api_key"),
+    ("llm-oauth", "rt-llm-oauth", "refresh_token"),
     ("mcp-env", "rt-mcp-server", "env"),
     ("mcp-oauth", "rt-mcp-oauth", "refresh_token"),
     ("channel", "rt-channel", "access_token"),

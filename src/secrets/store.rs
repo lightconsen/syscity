@@ -55,7 +55,13 @@ impl fmt::Display for SecretId {
     }
 }
 
-/// Secret origin — influences backend routing (see [`SecretStoreHandle::choose`]).
+/// Secret origin — what kind of writer produced the value.
+///
+/// Classification only. No backend branches on it today: every `SecretStore`
+/// implementation takes it as `_origin`, and routing is decided by namespace and
+/// kind in [`SecretStoreHandle::choose`]. It exists for the tier policy in
+/// `docs/secret-storage.md` §4, so callers should pass the accurate value rather
+/// than the convenient one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretOrigin {
     /// Entered by the user (UI / config) → high-value, persistent → keyring
@@ -347,10 +353,16 @@ impl SecretStoreHandle {
 
     /// Like `choose` but with an explicit keyring preference (test hook).
     pub fn choose_with(&self, id: &SecretId, prefer_keyring: bool) -> Arc<dyn SecretStore> {
-        // MCP OAuth access tokens are short-lived → memory only. This is scoped
-        // to the `mcp-oauth` namespace: channel credentials may also use the
+        // OAuth access tokens are short-lived → memory only. This is scoped to
+        // the OAuth namespaces: channel credentials may also use the
         // `access_token` kind but are long-lived and must persist.
-        if id.namespace == "mcp-oauth" && id.kind == "access_token" {
+        //
+        // For both, only the refresh token is persisted; the access token is
+        // re-acquired from it on the next start. `llm-oauth` mirrors
+        // `mcp-oauth` here — without this arm an `llm-oauth/.../access_token`
+        // would be written to the encrypted file store instead.
+        if (id.namespace == "mcp-oauth" || id.namespace == "llm-oauth") && id.kind == "access_token"
+        {
             return self.memory_store();
         }
         self.route_with(&id.namespace, prefer_keyring)
@@ -672,6 +684,48 @@ mod tests {
             store.delete_entity("whatsapp").await.unwrap();
             assert!(!store.has_entity("whatsapp").await);
         });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_llm_oauth_access_token_is_memory_only() {
+        // Provider OAuth mirrors MCP: the access token is short-lived and must
+        // not reach disk. Only the refresh token is persisted.
+        let id = SecretId::new("llm-oauth", "grok", "access_token");
+        let (handle, root) = temp_handle("llm_oauth_access_token");
+        let store = handle.choose_with(&id, false);
+
+        store
+            .set(&id, "at", SecretOrigin::SystemGenerated)
+            .await
+            .unwrap();
+        assert_eq!(store.get(&id).await.unwrap().as_deref(), Some("at"));
+
+        // A file backend would have written `llm-oauth/grok.toml` under the root.
+        assert!(
+            !root.join("llm-oauth").exists(),
+            "an access token must not be written to the file store"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_llm_oauth_refresh_token_is_persistent() {
+        // The long-lived half of the pair: it has to survive a restart, so it
+        // deliberately does not take the memory route.
+        let id = SecretId::new("llm-oauth", "grok", "refresh_token");
+        let (handle, root) = temp_handle("llm_oauth_refresh_token");
+        let store = handle.choose_with(&id, false);
+
+        store
+            .set(&id, "rt", SecretOrigin::SystemGenerated)
+            .await
+            .unwrap();
+
+        assert!(
+            root.join("llm-oauth").join("grok.toml").exists(),
+            "a refresh token must be persisted to the file store"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

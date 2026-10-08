@@ -633,3 +633,155 @@ async fn mcp_call_tool_unknown_server_not_found() {
     assert!(!resp.ok);
     assert_eq!(resp.error.as_ref().unwrap().code, "NOT_FOUND");
 }
+
+// ── Provider OAuth ───────────────────────────────────────────────────────
+
+/// A provider entry with an `[providers.<name>.oauth]` block.
+fn oauth_provider() -> crate::model_router::ProviderConfig {
+    crate::model_router::ProviderConfig {
+        provider_type: crate::model_router::ProviderType::OpenAi,
+        models: vec!["test-model".to_string()],
+        default_model: "test-model".to_string(),
+        api_key: "unused-for-oauth".to_string().into(),
+        api_keys: vec![],
+        auth_profile: None,
+        oauth: Some(crate::model_router::OAuthConfig {
+            client_id: "test-client".to_string(),
+            auth_url: "https://provider.example/authorize".to_string(),
+            token_url: "https://provider.example/token".to_string(),
+            scope: None,
+            client_secret: None,
+            redirect_base: None,
+            refresh_token: None,
+        }),
+        base_url: None,
+        timeout: std::time::Duration::from_secs(30),
+        max_retries: 3,
+        retry_delay_ms: 1000,
+    }
+}
+
+/// A state whose config carries one OAuth-capable provider named `grok`.
+async fn oauth_state() -> Arc<GatewayState> {
+    let mut config = GatewayConfig::default();
+    config
+        .providers
+        .insert("grok".to_string(), oauth_provider());
+    Arc::new(make_test_state(config).await)
+}
+
+#[tokio::test]
+async fn providers_auth_start_hands_out_a_gateway_hosted_url() {
+    let state = oauth_state().await;
+
+    let resp = handle_providers_auth_start(
+        &req("r1", "providers.auth_start", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+
+    assert!(resp.ok, "{:?}", resp.error);
+    let payload = resp.payload.expect("payload");
+    let auth_url = payload["auth_url"].as_str().expect("auth_url");
+    // The redirect is the gateway's own route, which is what lets a deployment
+    // set a public `redirect_base` instead of relying on loopback.
+    let expected = urlencoding::encode(&format!(
+        "http://127.0.0.1:{}{}",
+        GatewayConfig::default().port,
+        crate::model_router::provider_oauth::CALLBACK_PATH
+    ))
+    .to_string();
+    assert!(auth_url.contains(&expected), "{auth_url}");
+    assert!(!payload["flow_id"].as_str().unwrap_or_default().is_empty());
+}
+
+#[tokio::test]
+async fn providers_auth_start_refuses_a_provider_without_oauth_config() {
+    let mut config = GatewayConfig::default();
+    config.providers.insert(
+        "plain".to_string(),
+        crate::model_router::ProviderConfig {
+            oauth: None,
+            ..oauth_provider()
+        },
+    );
+    let state = Arc::new(make_test_state(config).await);
+
+    let resp = handle_providers_auth_start(
+        &req("r1", "providers.auth_start", Some(serde_json::json!({ "id": "plain" }))),
+        &state,
+    )
+    .await;
+
+    assert!(!resp.ok);
+    assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
+}
+
+#[tokio::test]
+async fn providers_auth_start_refuses_an_unknown_provider() {
+    let state = oauth_state().await;
+
+    let resp = handle_providers_auth_start(
+        &req("r1", "providers.auth_start", Some(serde_json::json!({ "id": "nope" }))),
+        &state,
+    )
+    .await;
+
+    assert!(!resp.ok);
+    assert_eq!(resp.error.as_ref().unwrap().code, "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn providers_auth_status_tracks_pending_and_cancel_clears_it() {
+    let state = oauth_state().await;
+
+    let started = handle_providers_auth_start(
+        &req("r1", "providers.auth_start", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+    let flow_id = started.payload.expect("payload")["flow_id"]
+        .as_str()
+        .expect("flow_id")
+        .to_string();
+
+    let status = handle_providers_auth_status(
+        &req("r2", "providers.auth_status", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+    let payload = status.payload.expect("payload");
+    // Only the flow half is asserted here. `authorized` is read from the secret
+    // store, which every test in this binary shares (the cfg(test) root is
+    // per-process), so asserting it would make this test depend on run order;
+    // `provider_oauth`'s unit tests cover it with hermetic stores.
+    assert_eq!(payload["pending"], serde_json::json!(flow_id));
+
+    let cancelled = handle_providers_auth_cancel(
+        &req("r3", "providers.auth_cancel", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+    assert_eq!(cancelled.payload.expect("payload")["cancelled"], serde_json::json!(true));
+
+    let after = handle_providers_auth_status(
+        &req("r4", "providers.auth_status", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+    assert_eq!(after.payload.expect("payload")["pending"], serde_json::json!(null));
+}
+
+#[tokio::test]
+async fn providers_auth_cancel_reports_when_nothing_was_pending() {
+    let state = oauth_state().await;
+
+    let resp = handle_providers_auth_cancel(
+        &req("r1", "providers.auth_cancel", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+
+    assert!(resp.ok);
+    assert_eq!(resp.payload.expect("payload")["cancelled"], serde_json::json!(false));
+}

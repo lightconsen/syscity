@@ -97,6 +97,9 @@ pub fn register_builtins() {
     for inv in crate::cron::cron_invariant_checks() {
         register(inv);
     }
+    for inv in crate::model_router::provider_oauth::provider_oauth_invariant_checks() {
+        register(inv);
+    }
     // Cloud ships behind a feature: its checks register only when the module
     // exists in this build.
     #[cfg(feature = "cloud")]

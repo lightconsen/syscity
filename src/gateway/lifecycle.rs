@@ -1607,7 +1607,17 @@ pub(crate) async fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/ready", get(super::ready_handler))
         .route("/live", get(super::live_handler))
         .route("/metrics", get(super::metrics_handler))
-        .route("/api/v1/artifacts/*path", get(super::artifact_handler));
+        .route("/api/v1/artifacts/*path", get(super::artifact_handler))
+        // Provider OAuth callback. A browser is redirected here by the
+        // provider's server, so it can carry no token; the `state` we issued
+        // authenticates it (single-use, bound to a pending flow, rejected
+        // otherwise). Same tier as the other routes above: rate limiting and
+        // security headers, no token middleware. See
+        // `handlers::provider_oauth`.
+        .route(
+            crate::model_router::provider_oauth::CALLBACK_PATH,
+            get(super::handlers::provider_oauth::callback_handler),
+        );
 
     // Authenticated essential APIs (auth required)
     let essential_auth_router = Router::new()

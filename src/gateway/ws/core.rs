@@ -413,6 +413,8 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         | E::McpAuthComplete { .. }
         | E::McpAuthFailed { .. }
         | E::McpTokenRefreshed { .. }
+        | E::ProviderAuthComplete { .. }
+        | E::ProviderAuthFailed { .. }
         | E::AcpThreadSwitched { .. } => Audience::All,
 
         // ── One channel's traffic ───────────────────────────────────────────
@@ -1101,6 +1103,9 @@ async fn dispatch_method(
         "security.status" => admin_ws::handle_security_status(req, state).await,
         "providers.check" => admin_ws::handle_providers_check(req, state).await,
         "providers.switch" => admin_ws::handle_providers_switch(req, state).await,
+        "providers.auth_start" => admin_ws::handle_providers_auth_start(req, state).await,
+        "providers.auth_status" => admin_ws::handle_providers_auth_status(req, state).await,
+        "providers.auth_cancel" => admin_ws::handle_providers_auth_cancel(req, state).await,
         "models.default" => admin_ws::handle_models_default(req, state).await,
         "traces.get" => admin_ws::handle_traces_get(req, state).await,
         "cost.get" => admin_ws::handle_cost_get(req, state).await,
@@ -1305,6 +1310,8 @@ mod tests {
             ("sessions.create", SCOPE_WRITE),
             ("sessions.delete", SCOPE_WRITE),
             ("channels.enable", SCOPE_WRITE),
+            // Starting a provider authorization arms a stored credential.
+            ("providers.auth_start", SCOPE_WRITE),
             // The pairing code is the key to a device: taking it must not be
             // something a read-only client can do.
             ("device.pairing.qr", SCOPE_WRITE),
@@ -1313,6 +1320,7 @@ mod tests {
             // Reads.
             ("sessions.list", SCOPE_READ),
             ("models.default", SCOPE_READ),
+            ("providers.auth_status", SCOPE_READ),
             ("health", SCOPE_READ),
             // Chat.
             ("chat.send", SCOPE_CHAT),

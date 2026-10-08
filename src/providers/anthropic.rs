@@ -826,6 +826,10 @@ impl Provider for AnthropicProvider {
         self.gateway_client.set_credential(credential).await;
         Ok(())
     }
+
+    async fn set_oauth_refresh_target(&self, target: crate::model_router::OAuthRefreshTarget) {
+        self.gateway_client.set_oauth_refresh_target(target).await;
+    }
 }
 
 #[cfg(test)]

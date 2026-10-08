@@ -100,12 +100,15 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             .expect("skill manager"),
     ));
 
+    let secrets = Arc::new(syscity::secrets::SecretStoreHandle::new());
+
     GatewayState {
         config: Arc::new(RwLock::new(Arc::new(config))),
         start_time: std::time::Instant::now(),
         config_path: None,
         mcps_path: None,
-        secrets: Arc::new(syscity::secrets::SecretStoreHandle::new()),
+        provider_oauth: Arc::new(syscity::model_router::ProviderOAuthFlows::new(secrets.clone())),
+        secrets,
         paths: Arc::new(syscity::dirs::SyscityPaths::from_root(tmp.path())),
         auth: syscity::gateway::state::AuthState {
             manager: Arc::new(syscity::security::AuthManager::new()),

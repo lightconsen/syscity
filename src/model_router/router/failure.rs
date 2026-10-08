@@ -19,7 +19,7 @@ impl ModelRouter {
 
         use crate::providers::resolver::{resolve_from_config, ProviderOverrides};
 
-        resolve_from_config(
+        let provider = resolve_from_config(
             provider_type,
             Some(api_key),
             ProviderOverrides {
@@ -33,8 +33,79 @@ impl ModelRouter {
                 model: (!config.default_model.is_empty()).then(|| config.default_model.clone()),
                 ..ProviderOverrides::default()
             },
-        )
-        .map(|p| p as Arc<dyn Provider + Send + Sync>)
+        )? as Arc<dyn Provider + Send + Sync>;
+
+        // An OAuth-backed provider takes its credential from the secret store
+        // rather than from `effective_key`: config holds only a *reference* to
+        // the refresh token (`docs/secret-storage.md` principle 1). The factory
+        // above built it with an API-key credential, which the override below
+        // replaces before any request is made.
+        if let Some((credential, refresh_target)) = self.oauth_credential(config).await? {
+            provider.set_credential(credential).await?;
+            // Without this, a refresh that rotates the token would keep the new
+            // one in memory only, and the next start would present the token the
+            // server just invalidated.
+            provider.set_oauth_refresh_target(refresh_target).await;
+        }
+
+        Ok(provider)
+    }
+
+    /// Build the OAuth2 credential for a provider from config plus the secret
+    /// store, and the place a rotated refresh token must be written back to.
+    ///
+    /// `Ok(None)` means "this provider is not OAuth-backed". An error means the
+    /// config *does* name a refresh token that cannot be read — the alternative
+    /// would be falling back to an empty bearer token, which fails later, at the
+    /// provider, with a 401 instead of here with a sentence.
+    async fn oauth_credential(
+        &self,
+        config: &ProviderConfig,
+    ) -> crate::Result<Option<(Credential, crate::model_router::OAuthRefreshTarget)>> {
+        let Some(oauth) = config.oauth.as_ref() else {
+            return Ok(None);
+        };
+        let Some(reference) = oauth.refresh_token.as_ref() else {
+            return Ok(None);
+        };
+
+        let secrets =
+            self.secrets
+                .as_ref()
+                .ok_or_else(|| crate::error::ConfigError::InvalidValue {
+                    key: "oauth.refresh_token".to_string(),
+                    message: "the config references a refresh token, but no secret store is \
+                          available in this context"
+                        .to_string(),
+                })?;
+
+        let id = reference.to_secret_id();
+        let store = secrets.choose(&id);
+        let refresh_token =
+            store
+                .get(&id)
+                .await?
+                .ok_or_else(|| crate::error::ConfigError::InvalidValue {
+                    key: "oauth.refresh_token".to_string(),
+                    message: format!(
+                        "no refresh token is stored at {id}; authorize this provider first \
+                         (`syscity provider auth`)"
+                    ),
+                })?;
+
+        let credential = Credential::OAuth2 {
+            // Deliberately empty and already expired: the first request refreshes
+            // and obtains a real access token, rather than sending `Bearer ` once.
+            access_token: String::new(),
+            refresh_token: Some(refresh_token),
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            token_url: oauth.token_url.clone(),
+            client_id: oauth.client_id.clone(),
+            client_secret: oauth.client_secret.clone(),
+            scope: oauth.scope.clone(),
+        };
+
+        Ok(Some((credential, crate::model_router::OAuthRefreshTarget { store, id })))
     }
 
     /// Rotate the active credential for a provider in place.

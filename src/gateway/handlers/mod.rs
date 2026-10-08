@@ -5,6 +5,7 @@ pub mod cloud;
 pub mod config;
 pub mod health;
 pub mod openai;
+pub mod provider_oauth;
 pub mod update;
 pub mod web_ui;
 pub mod ws_ticket;

@@ -28,6 +28,8 @@ subsystem. Every value belongs to a `(namespace, entity, kind)` triple (see
 | Subsystem | Value | SecretId (ns/entity/kind) | Lifecycle | Direction |
 |-----------|-------|---------------------------|-----------|-----------|
 | LLM | provider API key | `llm/{provider}/api_key` | static | outbound |
+| LLM | OAuth refresh token | `llm-oauth/{provider}/refresh_token` | rotating | outbound |
+| LLM | OAuth access token | `llm-oauth/{provider}/access_token` | ephemeral | outbound |
 | MCP | OAuth refresh token | `mcp-oauth/{server_id}/refresh_token` | rotating | outbound |
 | MCP | OAuth access token | `mcp-oauth/{server_id}/access_token` | ephemeral | outbound |
 | MCP | env token (user input) | `mcp-env/{server_id}/{key}` | static | outbound |
@@ -237,6 +239,8 @@ turns the reference into a value.
 | Category | Lifecycle | Scope | Storage |
 |----------|-----------|-------|---------|
 | LLM api key | static | per-provider | Tier 1 (primary) / Tier 2 (fallback); env override wins |
+| LLM OAuth **refresh** | rotating | per-provider | Tier 1 (primary) / Tier 2 (fallback) |
+| LLM OAuth **access** | ephemeral | per-provider | **Tier 3 memory only** |
 | MCP env token | static | per-server | Tier 1 (primary) / Tier 2 (fallback) |
 | MCP OAuth **refresh** | rotating | per-server | Tier 1 (primary) / Tier 2 (fallback) |
 | MCP OAuth **access** | ephemeral | per-server | **Tier 3 memory only** |
@@ -252,6 +256,28 @@ turns the reference into a value.
 `api_keys` > single `api_key`. Each provider has its own keyring entry
 (`syscity/llm` / `{provider}`), so routing switches by name and resolves the
 matching key. Inline plaintext values remain backwards-compatible.
+
+**OAuth instead of an API key.** A provider may be authorized through an
+authorization-code + PKCE flow rather than configured with a key:
+
+- `[providers.<name>.oauth]` holds the *non-secret* flow parameters — `client_id`,
+  `auth_url`, `token_url`, `scope` — plus a **reference** to the refresh token
+  (`refresh_token = { namespace = "llm-oauth", entity = "<name>", kind = "refresh_token" }`).
+  Config never carries the token itself (principle 1).
+- The refresh token persists in the `llm-oauth` namespace (Tier 1/2). The access
+  token and its expiry are **memory-only**: they are re-acquired from the refresh
+  token on the next start, so there is nothing to keep on disk and, deliberately,
+  no metadata sidecar — `token_url` and `client_id` already have a home in config,
+  unlike the MCP case.
+- The flow runs on the gateway: `providers.auth_start` hands out the authorization
+  URL, and the browser is redirected back to `GET /oauth/provider/callback`, which
+  exchanges the code and stores the refresh token under the provider's name.
+- When a provider **rotates** the refresh token during a refresh, the new value is
+  written back to the store (`HttpGatewayClient::persist_rotated_refresh_token`).
+  A server that rotates invalidates the old token, so losing the new one would
+  break the provider at the next start. Write-back failure is logged, not fatal.
+- The invariant `model_router/llm_oauth_persists_no_access_token` asserts the
+  memory-only half of this over the stored files.
 
 ### 4.2 MCP (OAuth lifecycle)
 
@@ -324,7 +350,7 @@ src/secrets/
 
 ### 6.2 Namespaces
 
-`llm`, `mcp-env`, `mcp-oauth`, `channel`, `webhook`, `security`, `plugin`.
+`llm`, `llm-oauth`, `mcp-env`, `mcp-oauth`, `channel`, `webhook`, `security`, `plugin`.
 
 ### 6.3 Key Entry Points
 
@@ -337,7 +363,11 @@ src/secrets/
 - CLI: `syscity secrets list` (names and locations only) / `migrate` /
   `purge {namespace}`.
 - OAuth persistence: `persist_refresh_token` / `load_refresh_token` /
-  `delete_refresh_token` (mcp-oauth) plus `persist_metadata` (0600 sidecar).
+  `delete_refresh_token` (mcp-oauth) plus `persist_metadata` (0600 sidecar). For
+  LLM providers: `ProviderOAuthFlows::complete` (stores the refresh token on
+  `llm-oauth`) and `HttpGatewayClient::persist_rotated_refresh_token` (writes a
+  rotated one back). `ProviderOAuthFlows::refresh_token_id` is the single place
+  that names the location.
 - Masking: `mask_json_value` / `mask_secret` / `is_secret_key` (mask.rs),
   applied by every config-describe surface (§6.6).
 

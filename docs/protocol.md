@@ -392,9 +392,13 @@ Query 参数：
 | `agent.usage` | 一轮 LLM 调用结束时的 token 用量（payload: `session_id`, `agent_id`, `usage: {prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens}`）；每轮推一次，客户端据此在运行中显示实时 token 计数（credits 计量在 `chat.final` 上） |
 | `delegation.updated` | 委派任务行变更（创建/状态/用量/共享状态/artifact）（payload: `session_id`（树的**根用户会话**，非子任务的 `delegation:<run_id>`）、`task_id`, `root_id`, `parent_id`, `depth`, `agent_id`, `title`, `status`, `created_at`, `updated_at`, `completed_at`, `usage_tokens`, `duration_ms`；终态行带 `duration_ms`，运行中为 `null`）。payload 自足，客户端无需按事件回查 |
 
-### 6.2 管理 API（仅限 CLI）
+### 6.2 管理命令（CLI 前端）
 
-这些操作从 WebSocket 协议和 HTTP 面中 **移除**。仅通过 `syscity` CLI 二进制可用。
+管理操作**没有独立的 API 面**：REST 管理端点确已移除，但这些命令并不是第二份实现——它们
+是 WS 方法的 CLI 前端（`syscity provider list` 调的就是 `providers.list`），因此和任何
+WS 客户端一样受作用域保护（`write` / `admin`；权威表是 `METHOD_SCOPES`，由 `methods.list`
+发布）。少数几条是**本地运维命令**，直接读写本机文件、不经过网关：`syscity setup`、
+`syscity config …`、`syscity secrets …`。
 
 ```bash
 # Agent 管理
@@ -459,12 +463,12 @@ syscity security pairing list
 syscity security pairing approve <channel> <code>
 ```
 
-**理由**: 管理操作仅限管理员、频率低、需要严格校验。保留在 CLI 中可确保：
+**为什么以 CLI 为主**：管理操作频率低、需要严格校验，且要求 `write` / `admin` 作用域。
 
-- Web UI 不会误触管理操作。
-- 前端代码更简洁（无需管理后台）。
+- 内置 Web UI 不含管理后台，前端面更小。
 - 便于通过 shell 脚本自动化。
-- 降低 Web 面的攻击面。
+- 但这些方法**在 WS 面上是可达的**——闸门是作用域，而不是"只能在 CLI 里做"。任何持有
+  相应作用域的客户端都能调用它们。
 
 ---
 

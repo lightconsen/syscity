@@ -40,29 +40,20 @@ pub enum ProviderCommands {
         /// Provider ID (omit for all providers)
         id: Option<String>,
     },
-    /// Authenticate a provider via OAuth 2.0 + PKCE
+    /// Authorize a provider via OAuth 2.0 (authorization code + PKCE)
+    ///
+    /// The flow runs on the gateway: the authorization URL comes from
+    /// `providers.auth_start`, the provider redirects the browser to the
+    /// gateway's own `/oauth/provider/callback`, and the refresh token is
+    /// stored in the secret store — it is never printed. The flow parameters
+    /// come from `[providers.<id>.oauth]` in the config.
     Auth {
-        /// Provider ID (for labeling the resulting credential)
+        /// Provider ID (must have an `[providers.<id>.oauth]` block)
         id: String,
-        /// OAuth client ID
-        #[arg(short, long)]
-        client_id: String,
-        /// Authorization endpoint URL
-        #[arg(short = 'a', long)]
-        auth_url: String,
-        /// Token endpoint URL
-        #[arg(short = 't', long)]
-        token_url: String,
-        /// Optional OAuth scope
-        #[arg(short, long)]
-        scope: Option<String>,
-        /// Local redirect callback port (default: 18081)
-        #[arg(short = 'p', long, default_value = "18081")]
-        redirect_port: u16,
-        /// Timeout in seconds for the callback (default: 300)
+        /// Seconds to wait for the authorization to complete (default: 300)
         #[arg(long, default_value = "300")]
         timeout: u64,
-        /// Don't open browser automatically
+        /// Don't open a browser automatically
         #[arg(long)]
         no_browser: bool,
     },
@@ -172,106 +163,89 @@ pub async fn run_provider_command(
             }
             Ok(())
         }
-        ProviderCommands::Auth {
-            id,
-            client_id,
-            auth_url,
-            token_url,
-            scope,
-            redirect_port,
-            timeout,
-            no_browser,
-        } => {
-            let oauth = crate::model_router::OAuthConfig {
-                client_id: client_id.clone(),
-                auth_url: auth_url.clone(),
-                token_url: token_url.clone(),
-                scope: scope.clone(),
-                client_secret: None,
-                redirect_port: *redirect_port,
-            };
-            run_auth_command(id, &oauth, *timeout, *no_browser).await
+        ProviderCommands::Auth { id, timeout, no_browser } => {
+            run_auth_command(id, *timeout, *no_browser).await
         }
     }
 }
 
-async fn run_auth_command(
-    provider_id: &str,
-    oauth: &crate::model_router::OAuthConfig,
-    timeout_secs: u64,
-    no_browser: bool,
-) -> Result<()> {
-    use crate::model_router::{oauth_callback, OAuthFlow};
+/// Authorize a provider, driving the gateway's OAuth flow.
+///
+/// Everything happens on the gateway: this asks for the URL, opens it, and
+/// waits for `providers.auth_status` to report the result. No token comes back
+/// through here — the credential is stored on the gateway side, which is also
+/// what makes the flow work when the browser and the gateway are not on the
+/// same machine (a loopback listener cannot).
+async fn run_auth_command(provider_id: &str, timeout_secs: u64, no_browser: bool) -> Result<()> {
+    let started = ws::call("providers.auth_start", json!({ "id": provider_id })).await?;
+    let authorization_url = started
+        .get("auth_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            crate::error::SyscityError::Internal(
+                "providers.auth_start returned no auth_url".to_string(),
+            )
+        })?
+        .to_string();
 
-    let flow = OAuthFlow::new();
-    let authorization_url = flow.authorization_url(oauth);
-
-    println!("\n🔐  OAuth Authorization for '{}'\n", provider_id);
+    println!("\n🔐  OAuth authorization for '{provider_id}'\n");
     println!("Open this URL in your browser:\n");
-    println!("  {}\n", authorization_url);
+    println!("  {authorization_url}\n");
 
     if !no_browser {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open")
-                .arg(&authorization_url)
-                .spawn();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&authorization_url)
-                .spawn();
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", &authorization_url])
-                .spawn();
-        }
+        open_in_browser(&authorization_url);
     }
 
-    println!(
-        "Waiting for callback on port {} (timeout: {}s)...\n",
-        oauth.redirect_port, timeout_secs
-    );
+    println!("Waiting for the authorization to complete (timeout: {timeout_secs}s)...\n");
 
-    let code =
-        oauth_callback::wait_for_callback(oauth.redirect_port, timeout_secs, flow.state()).await?;
-
-    println!("Exchanging authorization code for tokens...\n");
-
-    let credential = flow.exchange_code(&code, oauth).await?;
-
-    println!("✅  Authorization successful for '{}'\n", provider_id);
-    println!("Credential (add to your config):\n");
-
-    match credential {
-        crate::model_router::Credential::OAuth2 {
-            access_token,
-            refresh_token,
-            expires_at,
-            token_url,
-            client_id,
-            scope,
-            ..
-        } => {
-            println!("[providers.{}.auth_profile]", provider_id);
-            if let Some(ref rt) = refresh_token {
-                println!("refresh_token = \"{}\"", rt);
-            }
-            println!("access_token  = \"{}\"", access_token);
-            println!("expires_at    = \"{}\"", expires_at.to_rfc3339());
-            println!("token_url     = \"{}\"", token_url);
-            println!("client_id     = \"{}\"", client_id);
-            if let Some(ref s) = scope {
-                println!("scope         = \"{}\"", s);
-            }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(crate::error::SyscityError::Timeout(format!(
+                "'{provider_id}' was not authorized within {timeout_secs}s. The pending flow \
+                 expires on its own — run this again when you are ready"
+            )));
         }
-        _ => {
-            println!("{:?}", credential);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let status = ws::call("providers.auth_status", json!({ "id": provider_id })).await?;
+        if status
+            .get("authorized")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            println!("✅  '{provider_id}' is now authorized.\n");
+            return Ok(());
+        }
+        // `pending` goes null when the flow is gone. Success is handled above,
+        // so this means it was refused or expired on the gateway.
+        if status.get("pending").map(|v| v.is_null()).unwrap_or(false) {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "the authorization for '{provider_id}' did not complete (refused, or the flow \
+                 expired). Run this again to retry"
+            )));
         }
     }
+}
 
-    Ok(())
+/// Hand the authorization URL to the desktop's browser opener.
+///
+/// Best effort: the URL is printed either way, and a browser running somewhere
+/// else (a headless gateway host) has to open it by hand.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if let Err(e) = spawned {
+        println!("(could not open a browser automatically: {e})");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let _ = url;
 }

@@ -356,6 +356,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("providers.usage", Some(SCOPE_READ)),
     ("providers.health", Some(SCOPE_READ)),
     ("providers.fallback", Some(SCOPE_READ)),
+    ("providers.auth_status", Some(SCOPE_READ)),
     ("traces.get", Some(SCOPE_READ)),
     ("cron.get", Some(SCOPE_READ)),
     ("cron.logs", Some(SCOPE_READ)),
@@ -485,6 +486,10 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("providers.disable", Some(SCOPE_WRITE)),
     ("providers.check", Some(SCOPE_WRITE)),
     ("providers.switch", Some(SCOPE_WRITE)),
+    // Both touch a credential: starting one hands out an authorization URL and
+    // arms a stored refresh token; cancelling discards it.
+    ("providers.auth_start", Some(SCOPE_WRITE)),
+    ("providers.auth_cancel", Some(SCOPE_WRITE)),
     ("cron.enable", Some(SCOPE_WRITE)),
     ("cron.disable", Some(SCOPE_WRITE)),
     ("cron.run", Some(SCOPE_WRITE)),
@@ -940,6 +945,19 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
             "mcp.token_refreshed".to_string(),
             serde_json::json!({
                 "server_id": server_id,
+            }),
+        )),
+        GatewayEvent::ProviderAuthComplete { provider } => Some((
+            "providers.auth_complete".to_string(),
+            serde_json::json!({
+                "provider": provider,
+            }),
+        )),
+        GatewayEvent::ProviderAuthFailed { provider, reason } => Some((
+            "providers.auth_failed".to_string(),
+            serde_json::json!({
+                "provider": provider,
+                "reason": reason,
             }),
         )),
         GatewayEvent::ConnectorChanged { id, state, summary } => Some((

@@ -170,6 +170,46 @@ gemini = { type = "gemini", api_key = "$GEMINI_API_KEY" }
 openrouter = { type = "openai", api_key = "$OPENROUTER_API_KEY", base_url = "https://openrouter.ai/api/v1" }
 ```
 
+### Providers authorized by OAuth
+
+A provider can take its credential from an OAuth 2.0 authorization (authorization
+code + PKCE) instead of an API key. The flow parameters live in config; the token
+does not — config holds a **reference** to the refresh token, and the value goes
+to the encrypted secret store (see `secret-storage.md`).
+
+```toml
+[providers.grok]
+type = "open_ai"
+base_url = "https://api.example.com/v1"
+default_model = "grok-4"
+
+[providers.grok.oauth]
+client_id = "your-registered-client-id"
+auth_url  = "https://provider.example/authorize"
+token_url = "https://provider.example/token"
+scope     = "openid offline_access"
+# Optional. The base the provider redirects the browser back to; the gateway
+# appends its own callback path. Defaults to this gateway's loopback origin,
+# which works for a provider that accepts http://127.0.0.1:… URIs. Reaching the
+# gateway by any other name means setting this, and it must match the redirect
+# URI you registered with the provider.
+# redirect_base = "https://gw.example.com"
+
+# Written by the callback when the authorization completes — a location, never a
+# value. Do not fill this in by hand.
+# refresh_token = { namespace = "llm-oauth", entity = "grok", kind = "refresh_token" }
+```
+
+Authorize it once over WS with `providers.auth_start` (`{ "id": "grok" }`), which
+returns the URL to open. The provider redirects the browser to this gateway's
+`/oauth/provider/callback`, which exchanges the code and stores the refresh token;
+`providers.auth_status` reports whether a provider is authorized, and
+`providers.auth_complete` / `providers.auth_failed` events announce the outcome.
+
+From then on requests refresh the access token automatically — including writing
+back a refresh token the provider rotates, so a rotation is not lost across a
+restart.
+
 ## `[security]` — Authentication & Rate Limiting
 
 ```toml

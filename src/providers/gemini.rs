@@ -286,6 +286,11 @@ impl Provider for GeminiProvider {
 
     #[instrument(skip(self, request))]
     async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+        // An OAuth2 credential needs refreshing before it is used; openai and
+        // anthropic do this here too. Without it a Gemini provider configured
+        // with OAuth would keep presenting an expired bearer token.
+        self.gateway_client.refresh_credential_if_needed().await?;
+
         let model = request
             .model
             .clone()
@@ -330,6 +335,10 @@ impl Provider for GeminiProvider {
     }
 
     async fn stream(&self, request: CompletionRequest) -> crate::Result<CompletionStream> {
+        // See `complete` — same reason, and openai/anthropic stream() does this
+        // too.
+        self.gateway_client.refresh_credential_if_needed().await?;
+
         debug!("Starting streaming completion from Gemini");
 
         let model = request
@@ -391,6 +400,10 @@ impl Provider for GeminiProvider {
     ) -> crate::Result<()> {
         self.gateway_client.set_credential(credential).await;
         Ok(())
+    }
+
+    async fn set_oauth_refresh_target(&self, target: crate::model_router::OAuthRefreshTarget) {
+        self.gateway_client.set_oauth_refresh_target(target).await;
     }
 }
 

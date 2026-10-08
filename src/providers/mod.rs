@@ -477,6 +477,14 @@ pub trait Provider: Send + Sync {
         credential: crate::model_router::Credential,
     ) -> crate::Result<()>;
 
+    /// Register where a refresh token the server rotates must be written back.
+    ///
+    /// Only OAuth2-backed providers have anything to do here — API-key
+    /// credentials never rotate — so the default is a no-op. The router calls
+    /// this right after building a provider whose config carries an OAuth
+    /// refresh-token reference.
+    async fn set_oauth_refresh_target(&self, _target: crate::model_router::OAuthRefreshTarget) {}
+
     /// Optional per-request timeout in seconds.
     ///
     /// Return `None` (the default) to use the system-wide timeout.

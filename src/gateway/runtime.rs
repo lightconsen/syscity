@@ -234,6 +234,11 @@ pub enum GatewayEvent {
     McpAuthFailed { server_id: String, reason: String },
     /// MCP OAuth token was silently refreshed
     McpTokenRefreshed { server_id: String },
+    /// An LLM provider's OAuth authorization completed and its refresh token is
+    /// now stored.
+    ProviderAuthComplete { provider: String },
+    /// An LLM provider's OAuth authorization failed.
+    ProviderAuthFailed { provider: String, reason: String },
     /// A connector's lifecycle state changed (installed/enabled/disabled/updated).
     ConnectorChanged {
         id: String,
