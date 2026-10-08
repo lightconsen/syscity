@@ -83,6 +83,12 @@ lcov.info
 !.dev.vars.example
 !.env.example
 
+# Cloudflare CLI (`cf`) project-local state. Created by any `cf` run in this
+# directory; holds a cached account id/name (`cache/cloudflare-account.json`),
+# which is machine- and account-specific and must not be committed. Credentials
+# live outside the repo (~/.config/cloudflare/).
+.cloudflare/
+
 *.secret
 .e2e-tmp/
 
