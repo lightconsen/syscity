@@ -1,1 +1,0 @@
-/Users/lando/work/syscity/syscity/examples/wasm-plugins/base64-tool/target/wasm32-unknown-unknown/release/base64_tool.wasm: /Users/lando/work/syscity/syscity/examples/wasm-plugins/base64-tool/src/lib.rs
