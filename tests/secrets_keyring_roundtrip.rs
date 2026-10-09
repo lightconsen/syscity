@@ -21,7 +21,7 @@
 
 use serial_test::serial;
 
-use syscity::secrets::{probe_keyring, SecretId, SecretOrigin, SecretStoreHandle, StoreRef};
+use syscity::secrets::{probe_keyring, SecretId, SecretStoreHandle, StoreRef};
 
 /// One row per design-doc storage namespace: `(namespace, entity, kind)`.
 const NAMESPACES: &[(&str, &str, &str)] = &[
@@ -57,7 +57,7 @@ async fn keyring_roundtrip_per_namespace() {
         assert!(!store.has(&id).await, "{namespace}: should start absent");
 
         store
-            .set(&id, &value, SecretOrigin::SystemGenerated)
+            .set(&id, &value)
             .await
             .unwrap_or_else(|e| panic!("{namespace}: set failed: {e}"));
 
@@ -92,10 +92,7 @@ async fn llm_provider_keys_route_independently() {
     for (entity, key) in PROVIDERS {
         let id = SecretId::new("llm", entity, "api_key");
         let _ = store.delete(&id).await;
-        store
-            .set(&id, key, SecretOrigin::SystemGenerated)
-            .await
-            .unwrap();
+        store.set(&id, key).await.unwrap();
     }
 
     for (entity, key) in PROVIDERS {
