@@ -33,7 +33,6 @@ impl SkillManager {
             watcher: None,
             reload_tx,
             reload_rx: Arc::new(RwLock::new(reload_rx)),
-            paths,
         };
 
         Ok(manager)
@@ -457,6 +456,14 @@ impl SkillManager {
             )));
         }
 
+        // An agentskills.io-standard SKILL.md carries no triggers — the standard
+        // has none. Synthesise a slash command from the name, so the skill loads
+        // and can be invoked explicitly, without teaching it to fire on keywords
+        // it never declared.
+        if skill.triggers.is_empty() && !skill.name.is_empty() {
+            skill.triggers.push(SkillTrigger::command(&skill.name));
+        }
+
         // Every route into the manager passes through here or `reload_skill`:
         // discovery at startup, the watcher's hot reload, and `skills.install`'s
         // download (which reloads). Neither check used to run on any of them —
@@ -484,31 +491,6 @@ impl SkillManager {
         }
 
         Ok(skill)
-    }
-
-    /// Install a skill from the remote registry and reload.
-    ///
-    /// Uses `SkillRegistry` to download the skill into
-    /// `~/.syscity/skills/{name}/`, then calls `reload()` so the new skill
-    /// is picked up without a restart.
-    pub async fn install_from_registry(
-        &self,
-        name: &str,
-        registry_url: Option<&str>,
-    ) -> crate::Result<()> {
-        let registry = match registry_url {
-            Some(url) => registry::SkillRegistry::new(url, self.paths.clone())?,
-            None => registry::SkillRegistry::default_registry(self.paths.clone())?,
-        };
-
-        info!("Installing skill '{}' from registry", name);
-        registry.install(name).await?;
-
-        // Reload to pick up the newly installed skill
-        self.reload().await?;
-
-        info!("Skill '{}' installed and loaded", name);
-        Ok(())
     }
 
     /// Uninstall a skill and reload.
@@ -855,17 +837,22 @@ mod tests {
             "refusal should name the pattern: {err}"
         );
 
-        // One that cannot route (no trigger) is refused too.
-        let path = dir.join("unroutable.md");
+        // A triggerless skill is an agentskills.io-standard shape, not an
+        // error: it loads with a synthesized slash command (`/<name>`) as its
+        // only trigger, so a user can invoke it and nothing keyword-matches it
+        // out of the blue.
+        let path = dir.join("standard.md");
         std::fs::write(
             &path,
-            "---\nname: unroutable\ndescription: \"No triggers\"\nversion: \"1.0.0\"\n---\n\nbody\n",
+            "---\nname: standard\ndescription: \"A standard skill\"\nversion: \"1.0.0\"\n---\n\nbody\n",
         )
         .unwrap();
-        let err = SkillManager::load_skill_from_file_inner(&path)
+        let skill = SkillManager::load_skill_from_file_inner(&path)
             .await
-            .expect_err("a skill with no trigger cannot be routed and must not load");
-        assert!(err.to_string().contains("trigger"), "refusal should say why: {err}");
+            .expect("a standard SKILL.md with no triggers must load");
+        assert_eq!(skill.triggers.len(), 1);
+        assert_eq!(skill.triggers[0].trigger_type, TriggerType::Command);
+        assert_eq!(skill.triggers[0].pattern, "standard");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -62,6 +62,22 @@ impl SkillTrigger {
             model_invocable,
         })
     }
+
+    /// A slash-command trigger for the given name: user-invocable, and never
+    /// keyword-matched against conversation text.
+    ///
+    /// Used to make an agentskills.io-standard skill (which declares no
+    /// triggers at all) loadable: it must not start firing on conversation
+    /// keywords it never claimed, but a user typing `/<name>` expects it.
+    pub fn command(name: impl Into<String>) -> Self {
+        Self {
+            trigger_type: TriggerType::Command,
+            pattern: name.into(),
+            priority: 0,
+            user_invocable: true,
+            model_invocable: true,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for SkillTrigger {

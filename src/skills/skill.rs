@@ -47,6 +47,19 @@ pub struct Skill {
     /// Skills to chain after this one in execution pipeline
     #[serde(default)]
     pub chain: Vec<String>,
+    /// agentskills.io `license:` field — optional per the standard, surfaced for
+    /// display so a skill's provenance is visible without opening the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// agentskills.io `compatibility:` field — e.g. which runtimes the skill
+    /// needs. Informational only: syscity does not gate on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    /// agentskills.io `metadata:` block (author, version, …). Free-form per the
+    /// standard, so kept as a map; the canonical top-level `version` is
+    /// [`Skill::version`].
+    #[serde(rename = "metadata", default, skip_serializing_if = "Option::is_none")]
+    pub standard_metadata: Option<HashMap<String, serde_norway::Value>>,
     /// Source file path
     #[serde(skip)]
     pub source_path: PathBuf,
@@ -95,6 +108,9 @@ impl Skill {
             depends_on: HashMap::new(),
             provides: Vec::new(),
             chain: Vec::new(),
+            license: None,
+            compatibility: None,
+            standard_metadata: None,
             source_path: PathBuf::new(),
             is_eligible: true,
             eligibility_errors: Vec::new(),

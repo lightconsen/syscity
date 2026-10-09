@@ -23,6 +23,12 @@ pub(super) async fn handle_skills_list(req: &WsRequest, state: &Arc<GatewayState
                 "depends_on": s.depends_on,
                 "provides": s.provides,
                 "chain": s.chain,
+                // agentskills.io fields, plus the trust level the skill loads
+                // with — so a UI can tell catalog/community content apart from
+                // what the operator wrote.
+                "license": s.license,
+                "compatibility": s.compatibility,
+                "trust": s.metadata.trust,
             })
         })
         .collect();

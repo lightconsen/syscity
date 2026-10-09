@@ -33,7 +33,6 @@ pub mod guard;
 mod install;
 pub mod learn;
 mod manager;
-pub mod registry;
 pub mod semver;
 mod skill;
 mod storage;
@@ -44,10 +43,10 @@ pub use chain::{DependencyCheckResult, SkillChain, VersionMismatch};
 pub use config::{SkillConfig, SkillEntryConfig};
 pub use dependencies::{resolve_skill_chain, DependencyGraph, DependencySpec};
 pub use frontmatter::{
-    parse_skill_md, InstallSpec as SkillInstallSpec, SkillFile, SkillFrontmatter, SkillTriggerItem,
+    parse_skill_md, stamp_community_trust, InstallSpec as SkillInstallSpec, SkillFile,
+    SkillFrontmatter, SkillTriggerItem,
 };
 pub use install::{install_all, install_binary, InstallResult};
-pub use registry::{SkillListing, SkillRegistry, SkillUpdate};
 pub use semver::{Version, VersionReq};
 pub use skill::Skill;
 pub use storage::SkillStorage;
@@ -68,8 +67,6 @@ pub struct SkillManager {
     /// Reload channel
     reload_tx: mpsc::Sender<String>,
     reload_rx: Arc<RwLock<mpsc::Receiver<String>>>,
-    /// Layout root the user skills directory resolves against.
-    paths: Arc<crate::dirs::SyscityPaths>,
 }
 
 #[cfg(test)]

@@ -400,6 +400,44 @@ pub fn parse_skill_md(content: &str) -> crate::Result<(String, String)> {
     }
 }
 
+/// Mark a SKILL.md as community-trusted in its frontmatter.
+///
+/// The loader reads trust from the `syscity:` block (`SkillMetadata.trust`), so
+/// provenance has to be written into the file itself for it to survive a
+/// reload. An existing `syscity: trust:` wins — content that declares a trust
+/// level keeps it; this only fills the blank for content that says nothing.
+pub fn stamp_community_trust(content: &str) -> crate::Result<String> {
+    let (frontmatter, body) = parse_skill_md(content)?;
+    let mut doc: serde_norway::Mapping = serde_norway::from_str(&frontmatter).map_err(|e| {
+        crate::error::SyscityError::Validation(format!(
+            "SKILL.md frontmatter is not a YAML mapping: {e}"
+        ))
+    })?;
+
+    let key = |k: &str| serde_norway::Value::String(k.to_string());
+    let block = doc
+        .entry(key("syscity"))
+        .or_insert_with(|| serde_norway::Value::Mapping(serde_norway::Mapping::new()));
+
+    let Some(block) = block.as_mapping_mut() else {
+        // A `syscity:` key that is not a mapping cannot carry trust; rewriting
+        // it would destroy someone else's data, so refuse instead.
+        return Err(crate::error::SyscityError::Validation(
+            "SKILL.md has a non-mapping `syscity:` block; not stamping trust".to_string(),
+        ));
+    };
+    block
+        .entry(key("trust"))
+        .or_insert_with(|| serde_norway::Value::String("community".to_string()));
+
+    let yaml = serde_norway::to_string(&doc).map_err(|e| {
+        crate::error::SyscityError::Validation(format!(
+            "could not re-emit SKILL.md frontmatter: {e}"
+        ))
+    })?;
+    Ok(format!("---\n{yaml}---\n\n{body}"))
+}
+
 /// Format a skill as SKILL.md content.
 /// Note: This is a simplified version that formats based on the Skill struct
 /// from mod.rs. The actual implementation would need access to the Skill struct
@@ -408,6 +446,45 @@ pub fn parse_skill_md(content: &str) -> crate::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_community_trust_fills_the_blank() {
+        let content = "---\nname: demo\ndescription: \"d\"\n---\n\nbody\n";
+        let stamped = stamp_community_trust(content).unwrap();
+        let (frontmatter, body) = parse_skill_md(&stamped).unwrap();
+        let skill: SkillFrontmatter = serde_norway::from_str(&frontmatter).unwrap();
+        assert_eq!(body.trim(), "body");
+        // The stamp landed in the nested block the loader reads trust from.
+        let syscity = frontmatter.clone();
+        assert!(syscity.contains("trust") && syscity.contains("community"), "{frontmatter}");
+        let _ = skill;
+    }
+
+    #[test]
+    fn stamp_community_trust_keeps_a_declared_level() {
+        let content =
+            "---\nname: demo\ndescription: \"d\"\nsyscity:\n  trust: trusted\n---\n\nbody\n";
+        let stamped = stamp_community_trust(content).unwrap();
+        assert!(stamped.contains("trust: trusted"), "{stamped}");
+        assert!(!stamped.contains("community"), "{stamped}");
+    }
+
+    #[test]
+    fn stamp_community_trust_refuses_a_non_mapping_syscity_block() {
+        let content = "---\nname: demo\ndescription: \"d\"\nsyscity: just-a-string\n---\n\nbody\n";
+        assert!(stamp_community_trust(content).is_err());
+    }
+
+    #[test]
+    fn stamped_content_still_loads_as_a_skill() {
+        // The stamp rewrites YAML through serde — this is the regression test
+        // that the round trip stays a valid frontmatter document.
+        let content = "---\nname: demo\ndescription: \"d\"\nversion: \"1.0.0\"\n---\n\nbody\n";
+        let stamped = stamp_community_trust(content).unwrap();
+        let (frontmatter, _) = parse_skill_md(&stamped).unwrap();
+        let skill: SkillFrontmatter = serde_norway::from_str(&frontmatter).unwrap();
+        assert_eq!(skill.name, "demo");
+    }
 
     #[test]
     fn parsed_frontmatter_deserializes() {

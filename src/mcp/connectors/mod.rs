@@ -357,7 +357,30 @@ impl ConnectorManager {
                 format!("skill-{}-{leaf}", entry.id)
             };
             match self.skill_storage.install_to_user(skill_dir, &name).await {
-                Ok(_) => installed_skills.push(name),
+                Ok(_) => {
+                    // A skill the marketplace ships is third-party content that
+                    // passed review, not something the operator wrote — stamp it
+                    // `community` (read-only tool access, see `SkillTrust`)
+                    // unless the package declares a level itself. The stamp goes
+                    // into the copy's frontmatter so it survives every reload.
+                    let installed_md = self.skill_storage.user_dir().join(&name).join("SKILL.md");
+                    match tokio::fs::read_to_string(&installed_md).await {
+                        Ok(content) => match crate::skills::stamp_community_trust(&content) {
+                            Ok(stamped) => {
+                                if let Err(e) = tokio::fs::write(&installed_md, stamped).await {
+                                    warn!("could not stamp community trust on skill '{name}': {e}");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("could not stamp community trust on skill '{name}': {e}");
+                            }
+                        },
+                        Err(e) => {
+                            warn!("installed skill '{name}' has no readable SKILL.md: {e}");
+                        }
+                    }
+                    installed_skills.push(name)
+                }
                 Err(e) => {
                     rollback_skills(&self.skill_storage, &installed_skills).await;
                     let _ = tokio::fs::remove_dir_all(&dest).await;
