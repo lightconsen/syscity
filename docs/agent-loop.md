@@ -90,7 +90,7 @@ gh workflow run agent-nightly.yml -f issue=123
 | Name | Kind | Purpose |
 |---|---|---|
 | `EVAL_API_KEY` | secret | DeepSeek key, passed as `ANTHROPIC_AUTH_TOKEN`; the agent talks to DeepSeek's Anthropic-compatible endpoint. |
-| `AGENT_PAT` | secret | Fine-grained PAT with **Contents + Issues + Pull requests** (all read/write). It is also `GH_TOKEN`, so Issues write is needed for the label/comment steps. With it, the PR triggers `ci.yml`; without it the PR is opened by `GITHUB_TOKEN` and CI does not run on it automatically. |
+| `AGENT_PAT` | secret (optional) | Fine-grained PAT with **Pull requests: read and write** and read access to the repository. It is used for `gh pr create` alone — the branch push and every issue/label call run on `GITHUB_TOKEN`, which already carries `contents: write` and `issues: write` from the workflow's `permissions:` block. The PAT is only there so the PR is created by a non-`GITHUB_TOKEN` event and therefore triggers `ci.yml`. Without it (or if it cannot create PRs) the PR is opened by `GITHUB_TOKEN` with a warning, and CI has to be re-run by hand. |
 | `AGENT_ANTHROPIC_BASE_URL`, `AGENT_MODEL`, `AGENT_HAIKU_MODEL` | variables (optional) | Override the endpoint and models. Defaults: `https://api.deepseek.com/anthropic`, `deepseek-v4-pro[1m]`, `deepseek-v4-flash`. |
 | `MAX_OPEN_AGENT_PRS` | env in the workflow | Cap on agent PRs open at once (default `1`). |
 | `AGENT_MAX_BUDGET_USD` | env in the workflow | Client-side cost ceiling per run (default `5`; it is an estimate, so leave headroom). |
