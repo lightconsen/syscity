@@ -135,28 +135,28 @@ jobs:
           echo "No claim, no agent, no PR. Re-run without dry_run to actually work it."
 
       - name: Install system build dependencies
-        if: steps.select.outputs.skip != 'true'
+        if: steps.select.outputs.skip != 'true' && inputs.dry_run != true
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler pkg-config libssl-dev libasound2-dev libdbus-1-dev
 
       - name: Install Rust
-        if: steps.select.outputs.skip != 'true'
+        if: steps.select.outputs.skip != 'true' && inputs.dry_run != true
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95"
           components: clippy, rustfmt
 
       - name: Cache Rust dependencies
-        if: steps.select.outputs.skip != 'true'
+        if: steps.select.outputs.skip != 'true' && inputs.dry_run != true
         uses: Swatinem/rust-cache@v2
 
       - name: Install the agent
-        if: steps.select.outputs.skip != 'true'
+        if: steps.select.outputs.skip != 'true' && inputs.dry_run != true
         run: npm i -g @anthropic-ai/claude-code
 
       - name: Prepare branch
-        if: steps.select.outputs.skip != 'true'
+        if: steps.select.outputs.skip != 'true' && inputs.dry_run != true
         id: branch
         run: |
           set -euo pipefail
@@ -259,7 +259,7 @@ jobs:
           gh issue comment "$num" --body "🤖 The nightly agent ran but produced no changes (the tree is identical to \`main\`). Needs a human."
 
       - name: Report an unexpected failure
-        if: failure() && steps.select.outputs.skip != 'true'
+        if: failure() && steps.select.outputs.skip != 'true' && inputs.dry_run != true
         run: |
           num="${{ steps.select.outputs.number }}"
           gh issue edit "$num" --add-label agent:blocked --remove-label agent:in-progress || true
