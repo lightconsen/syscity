@@ -233,7 +233,18 @@ impl SkillManager {
 
         // Runtime verification - re-check requirements at activation
         match skill.verify_requirements() {
-            Ok(()) => Ok(skill),
+            Ok(()) => {
+                // One activation = one use. Best-effort: a state file that
+                // cannot be written must not block the skill itself.
+                if !skill.source_path.as_os_str().is_empty() {
+                    if let Some(dir) = skill.source_path.parent() {
+                        if let Err(e) = install_state::record_use(dir).await {
+                            warn!("could not record usage for skill '{name}': {e}");
+                        }
+                    }
+                }
+                Ok(skill)
+            }
             Err(errors) => {
                 warn!("Skill '{}' activation blocked: requirements not met: {:?}", name, errors);
                 Err(crate::error::SyscityError::Validation(format!(
@@ -491,6 +502,52 @@ impl SkillManager {
         }
 
         Ok(skill)
+    }
+
+    /// A skill's install record: provenance, pinning, history, usage.
+    pub async fn skill_install_state(
+        &self,
+        name: &str,
+    ) -> crate::Result<(install_state::InstallState, Vec<String>)> {
+        if self.get_skill(name).await.is_none() {
+            return Err(crate::error::SyscityError::NotFound {
+                resource: format!("Skill: {name}"),
+            });
+        }
+        let dir = self.storage.user_dir().join(name);
+        let state = install_state::load(&dir).await;
+        let history = install_state::history_versions(&dir).await;
+        Ok((state, history))
+    }
+
+    /// Pin or unpin a skill: a pinned skill refuses replacement on install.
+    pub async fn pin_skill(&self, name: &str, pinned: bool) -> crate::Result<()> {
+        if self.get_skill(name).await.is_none() {
+            return Err(crate::error::SyscityError::NotFound {
+                resource: format!("Skill: {name}"),
+            });
+        }
+        let dir = self.storage.user_dir().join(name);
+        let mut state = install_state::load(&dir).await;
+        // A skill with no record yet gets one carrying its on-disk version, so
+        // the pin is durable across restarts.
+        if state.version.is_none() {
+            state.version = self.get_skill(name).await.map(|s| s.version);
+        }
+        state.pinned = pinned;
+        install_state::save(&dir, &state).await
+    }
+
+    /// Roll a skill back to a version kept under `.history/`, then reload.
+    pub async fn rollback_skill(&self, name: &str, version: &str) -> crate::Result<()> {
+        if self.get_skill(name).await.is_none() {
+            return Err(crate::error::SyscityError::NotFound {
+                resource: format!("Skill: {name}"),
+            });
+        }
+        let dir = self.storage.user_dir().join(name);
+        install_state::rollback(&dir, version).await?;
+        self.reload().await.map(|_| ())
     }
 
     /// Uninstall a skill and reload.

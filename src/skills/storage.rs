@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
+use super::install_state;
+
 /// Skill storage levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum StorageLevel {
@@ -280,6 +282,20 @@ impl SkillStorage {
         let dest = self.user_dir.join(name);
 
         info!("Installing skill '{}' from {:?} to {:?}", name, source_dir, dest);
+
+        // A pinned skill is a deliberate hold on a version; replacing it has to
+        // be an explicit choice (unpin first), not a side effect of an update.
+        if dest.exists() && install_state::load(&dest).await.pinned {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "Skill '{name}' is pinned to its current version; unpin it first"
+            )));
+        }
+
+        // Back up the copy being replaced so `rollback` has something to put
+        // back. A first install has nothing to back up.
+        if dest.exists() {
+            install_state::backup_current(&dest).await?;
+        }
 
         // Remove existing if present
         if dest.exists() {
@@ -686,6 +702,83 @@ mod tests {
             std::fs::read_to_string(dst.join("subdir").join("nested.txt")).unwrap(),
             "world"
         );
+    }
+
+    /// Write `content` as a v`version` skill named `name` under `root`.
+    fn write_skill(root: &Path, name: &str, version: &str, content: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: \"d\"\nversion: \"{version}\"\n---\n\n{content}\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn install_to_user_backs_up_the_replaced_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = SkillStorage {
+            bundled_dir: None,
+            user_dir: temp.path().join("user"),
+            project_dir: None,
+            workspace_dir: None,
+        };
+
+        let v1_src = write_skill(temp.path(), "demo-src", "1.0.0", "first body");
+        storage.install_to_user(&v1_src, "demo").await.unwrap();
+
+        // v2 replaces it: the installed copy lands in history before the new
+        // content overwrites it.
+        let v2_src = write_skill(temp.path(), "demo-src2", "2.0.0", "second body");
+        storage.install_to_user(&v2_src, "demo").await.unwrap();
+
+        let installed = storage.user_dir().join("demo");
+        assert!(std::fs::read_to_string(installed.join("SKILL.md"))
+            .unwrap()
+            .contains("second body"));
+        // History lives outside the skill directory (see `install_state`), so
+        // the removal that precedes the replacement cannot take it with it.
+        let backup = storage.user_dir().join(".history/demo/1.0.0/SKILL.md");
+        assert!(backup.exists(), "the replaced version must be restorable");
+        assert!(std::fs::read_to_string(backup)
+            .unwrap()
+            .contains("first body"));
+    }
+
+    #[tokio::test]
+    async fn install_to_user_refuses_to_replace_a_pinned_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = SkillStorage {
+            bundled_dir: None,
+            user_dir: temp.path().join("user"),
+            project_dir: None,
+            workspace_dir: None,
+        };
+
+        let v1_src = write_skill(temp.path(), "demo-src", "1.0.0", "pinned body");
+        storage.install_to_user(&v1_src, "demo").await.unwrap();
+        let installed = storage.user_dir().join("demo");
+        install_state::save(
+            &installed,
+            &install_state::InstallState {
+                version: Some("1.0.0".to_string()),
+                pinned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let v2_src = write_skill(temp.path(), "demo-src2", "2.0.0", "new body");
+        let err = storage.install_to_user(&v2_src, "demo").await.unwrap_err();
+        assert!(format!("{err}").contains("pinned"), "{err}");
+        assert!(std::fs::read_to_string(installed.join("SKILL.md"))
+            .unwrap()
+            .contains("pinned body"));
     }
 
     #[tokio::test]

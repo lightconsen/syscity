@@ -379,7 +379,24 @@ impl ConnectorManager {
                             warn!("installed skill '{name}' has no readable SKILL.md: {e}");
                         }
                     }
-                    installed_skills.push(name)
+                    installed_skills.push(name.clone());
+
+                    // Provenance for the lifecycle commands (`skills.versions`,
+                    // `skills.pin`, `skills.rollback`): which catalog entry this
+                    // copy came from, so pin/rollback have a version to work
+                    // with and `skills.list` can say where a skill came from.
+                    let installed_dir = self.skill_storage.user_dir().join(&name);
+                    let state = crate::skills::install_state::InstallState {
+                        version: Some(entry.version.clone()),
+                        source: Some(format!("catalog:{}", entry.id)),
+                        sha256: entry.sha256.clone(),
+                        installed_at: Some(chrono::Utc::now()),
+                        ..Default::default()
+                    };
+                    if let Err(e) = crate::skills::install_state::save(&installed_dir, &state).await
+                    {
+                        warn!("could not record install state for skill '{name}': {e}");
+                    }
                 }
                 Err(e) => {
                     rollback_skills(&self.skill_storage, &installed_skills).await;

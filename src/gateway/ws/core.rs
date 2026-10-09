@@ -1141,6 +1141,9 @@ async fn dispatch_method(
         "skills.disable" => admin_ws::handle_skills_set_enabled(req, state, false).await,
         "skills.uninstall" => admin_ws::handle_skills_uninstall(req, state).await,
         "skills.run" => admin_ws::handle_skills_run(req, state).await,
+        "skills.versions" => admin_ws::handle_skills_versions(req, state).await,
+        "skills.pin" => admin_ws::handle_skills_pin(req, state).await,
+        "skills.rollback" => admin_ws::handle_skills_rollback(req, state).await,
         _ => error_method_not_found(&req.id, &req.method),
     }
 }
@@ -1303,6 +1306,8 @@ mod tests {
             ("models.set_default", SCOPE_WRITE),
             ("models.fetch_remote", SCOPE_WRITE),
             ("skills.install", SCOPE_WRITE),
+            ("skills.pin", SCOPE_WRITE),
+            ("skills.rollback", SCOPE_WRITE),
             ("skills.uninstall", SCOPE_WRITE),
             ("mcp.call_tool", SCOPE_WRITE),
             ("sessions.create", SCOPE_WRITE),

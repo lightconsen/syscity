@@ -26,17 +26,18 @@ pub enum SkillCommands {
         /// Skill name
         name: String,
     },
-    /// Install a skill from a directory, git repo, or registry
+    /// Install a skill from a directory or git repo (fetches locally)
     Install {
-        /// Path to skill directory or git URL, or skill name when --registry is
-        /// set
+        /// Path to skill directory or git URL
         source: String,
         /// Skill name (optional, defaults to directory name)
         #[arg(short, long)]
         name: Option<String>,
-        /// Install from the remote skill registry instead of local/git
-        #[arg(short, long)]
-        registry: bool,
+    },
+    /// Install a skill from the marketplace catalog (by id)
+    CatalogInstall {
+        /// Skill id as it appears in the catalog
+        id: String,
     },
     /// Uninstall a skill
     Uninstall {
@@ -83,6 +84,26 @@ pub enum SkillCommands {
         #[arg(short, long, default_value = "basic")]
         template: String,
     },
+    /// Show a skill's install record (version, source, pin, usage, history)
+    Versions {
+        /// Skill name/ID
+        id: String,
+    },
+    /// Pin a skill to its current version (or unpin with --unpin)
+    Pin {
+        /// Skill name/ID
+        id: String,
+        /// Release the pin instead of setting it
+        #[arg(long)]
+        unpin: bool,
+    },
+    /// Roll a skill back to a version kept in its history
+    Rollback {
+        /// Skill name/ID
+        id: String,
+        /// Version to restore (see `skill versions`)
+        version: String,
+    },
 }
 
 /// Run skill commands (over WebSocket).
@@ -103,18 +124,21 @@ pub async fn run_skill_command(command: &SkillCommands) -> Result<()> {
             let payload = ws::call("skills.get", json!({ "name": name })).await?;
             println!("{}", payload);
         }
-        SkillCommands::Install { source, name, registry } => {
-            if *registry {
-                // Install from remote registry via WS
-                match ws::call("skills.install", json!({ "name": name.clone().unwrap_or_else(|| source.clone()), "registry_url": null })).await {
-                    Ok(_) => println!("Skill '{}' installed from registry", source),
-                    Err(e) => {
-                        eprintln!("Failed to install skill: {}", e);
-                        return Err(e);
-                    }
+        SkillCommands::Install { source, name } => {
+            install_skill_local(source, name.as_deref()).await?;
+        }
+        SkillCommands::CatalogInstall { id } => {
+            // The marketplace is the catalog: the gateway downloads, verifies
+            // and installs the skill in one call (type routing happens there).
+            match ws::call("connectors.catalog_install", json!({ "id": id })).await {
+                Ok(payload) => {
+                    let version = payload["version"].as_str().unwrap_or("?");
+                    println!("Skill '{}' v{version} installed.", id);
                 }
-            } else {
-                install_skill_local(source, name.as_deref()).await?;
+                Err(e) => {
+                    eprintln!("Failed to install skill: {e}");
+                    return Err(e);
+                }
             }
         }
         SkillCommands::Uninstall { name, force } => {
@@ -153,6 +177,55 @@ pub async fn run_skill_command(command: &SkillCommands) -> Result<()> {
         }
         SkillCommands::Init { name, path, template } => {
             init_skill_template(name, path.as_deref(), template).await?;
+        }
+        SkillCommands::Versions { id } => {
+            let payload = ws::call("skills.versions", json!({ "id": id })).await?;
+            println!(
+                "{} v{} {} (source: {})",
+                payload["id"].as_str().unwrap_or(id),
+                payload["version"].as_str().unwrap_or("?"),
+                if payload["pinned"].as_bool().unwrap_or(false) {
+                    "[pinned]"
+                } else {
+                    ""
+                },
+                payload["source"].as_str().unwrap_or("authored"),
+            );
+            if let Some(usage) = payload.get("usage") {
+                println!(
+                    "  used {}×, last at {}",
+                    usage["count"].as_u64().unwrap_or(0),
+                    usage["last_used"].as_str().unwrap_or("never"),
+                );
+            }
+            let history = payload["history"].as_array().cloned().unwrap_or_default();
+            if !history.is_empty() {
+                println!(
+                    "  history: {}",
+                    history
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        SkillCommands::Pin { id, unpin } => {
+            let pinned = !unpin;
+            ws::call("skills.pin", json!({ "id": id, "pinned": pinned })).await?;
+            println!(
+                "Skill '{}' {}.",
+                id,
+                if pinned {
+                    "pinned to its current version"
+                } else {
+                    "unpinned"
+                }
+            );
+        }
+        SkillCommands::Rollback { id, version } => {
+            ws::call("skills.rollback", json!({ "id": id, "version": version })).await?;
+            println!("Skill '{}' rolled back to {version}.", id);
         }
         SkillCommands::Run { id, input, context } => {
             let body = json!({

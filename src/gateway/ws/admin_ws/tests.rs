@@ -785,3 +785,83 @@ async fn providers_auth_cancel_reports_when_nothing_was_pending() {
     assert!(resp.ok);
     assert_eq!(resp.payload.expect("payload")["cancelled"], serde_json::json!(false));
 }
+
+// ── Skill install lifecycle ──────────────────────────────────────────────
+
+/// Plant a skill named `name` into the test manager's user skills dir and
+/// reload, so the WS handlers have something to act on.
+async fn plant_skill(state: &Arc<GatewayState>, name: &str, version: &str) {
+    let dir = crate::dirs::skills_dir().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: \"planted\"\nversion: \"{version}\"\n---\n\nbody\n"
+        ),
+    )
+    .unwrap();
+    state
+        .tools
+        .skills_manager
+        .write()
+        .await
+        .reload()
+        .await
+        .expect("reload picks up the planted skill");
+}
+
+#[tokio::test]
+async fn skills_versions_pin_and_rollback_cover_the_lifecycle() {
+    let state = state().await;
+    let name = format!("lifecycle-{}", std::process::id());
+
+    // Not found until the skill exists.
+    let missing = handle_skills_versions(
+        &req("r0", "skills.versions", Some(serde_json::json!({ "id": name }))),
+        &state,
+    )
+    .await;
+    assert!(!missing.ok);
+    assert_eq!(missing.error.as_ref().unwrap().code, "NOT_FOUND");
+
+    plant_skill(&state, &name, "1.0.0").await;
+
+    // Replace the on-disk copy — the update path (install_to_user) must have
+    // backed the old one up, which is what rollback restores from.
+    let dir = crate::dirs::skills_dir().join(&name);
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: \"planted\"\nversion: \"2.0.0\"\n---\n\nnew\n"),
+    )
+    .unwrap();
+
+    let pinned = handle_skills_pin(
+        &req("r1", "skills.pin", Some(serde_json::json!({ "id": name, "pinned": true }))),
+        &state,
+    )
+    .await;
+    assert!(pinned.ok, "{:?}", pinned.error);
+    assert_eq!(pinned.payload.expect("payload")["pinned"], serde_json::json!(true));
+
+    let versions = handle_skills_versions(
+        &req("r2", "skills.versions", Some(serde_json::json!({ "id": name }))),
+        &state,
+    )
+    .await;
+    let payload = versions.payload.expect("payload");
+    assert_eq!(payload["pinned"], serde_json::json!(true));
+    assert_eq!(payload["version"], serde_json::json!("1.0.0"));
+
+    let rolled = handle_skills_rollback(
+        &req(
+            "r3",
+            "skills.rollback",
+            Some(serde_json::json!({ "id": name, "version": "9.9.9" })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(!rolled.ok, "rolling back to a version with no history must fail");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
