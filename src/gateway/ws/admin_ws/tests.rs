@@ -786,6 +786,195 @@ async fn providers_auth_cancel_reports_when_nothing_was_pending() {
     assert_eq!(resp.payload.expect("payload")["cancelled"], serde_json::json!(false));
 }
 
+// ── Plugin install from a catalog (hermetic) ─────────────────────────────
+
+/// A gzipped tar holding a plugin package, and its sha256 — the two things a
+/// catalog entry points at.
+fn plugin_package() -> (Vec<u8>, String) {
+    use sha2::{Digest, Sha256};
+
+    let manifest = serde_json::json!({
+        "id": "base64-tool",
+        "name": "base64-tool",
+        "version": "1.0.0",
+        "description": "Base64 encode/decode",
+        "main": "base64-tool.wasm",
+        "capabilities": [{
+            "type": "tools",
+            "tools": [{
+                "name": "base64",
+                "description": "Encode or decode base64",
+                "parameters": { "type": "object" }
+            }]
+        }],
+        "permissions": []
+    });
+    let wasm = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/base64-tool.wasm"),
+    )
+    .expect("the plugin fixture");
+
+    let mut tar_builder = tar::Builder::new(Vec::new());
+    let mut add = |path: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder.append(&header, bytes).unwrap();
+    };
+    add("base64-tool/plugin.json", manifest.to_string().as_bytes());
+    add("base64-tool/base64-tool.wasm", &wasm);
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, &tar_bytes).unwrap();
+    let archive = gz.finish().unwrap();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&archive);
+    (archive, format!("{:x}", hasher.finalize()))
+}
+
+/// The wiring a published plugin depends on, on a mock catalog instead of the
+/// live one: `connectors.catalog_install` must route `type: "plugin"` through
+/// the connector cache (download → sha256 → unpack) into the plugin manager,
+/// which is where the first real attempt failed — the cache only recognised
+/// connector/skill/expert markers, so every plugin archive was rejected with
+/// "contains no connector.json" before the plugin code ever ran.
+#[cfg(feature = "plugins")]
+#[tokio::test]
+async fn installs_a_plugin_through_the_catalog_handler() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (archive, sha256) = plugin_package();
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/archives/base64-tool/1.0.0/base64-tool.tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/catalog.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "connectors": [{
+                "id": "base64-tool", "version": "1.0.0", "display_name": "Base64 Tool",
+                "type": "plugin", "kind": "byoa", "visibility": "public",
+                "source": { "type": "tar.gz", "url": format!("{}/archives/base64-tool/1.0.0/base64-tool.tar.gz", server.uri()) },
+                "sha256": sha256,
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = state().await;
+    state
+        .tools
+        .connector_manager
+        .sync_catalog(&format!("{}/catalog.json", server.uri()), None)
+        .await
+        .expect("sync the mock catalog");
+
+    let resp = handle_connectors_catalog_install(
+        &req(
+            "r1",
+            "connectors.catalog_install",
+            Some(serde_json::json!({ "id": "base64-tool" })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(resp.ok, "{:?}", resp.error);
+
+    let payload = resp.payload.expect("payload");
+    assert_eq!(payload["type"], serde_json::json!("plugin"));
+    assert_eq!(payload["installed"], serde_json::json!(true));
+    let plugin_id = payload["plugin_id"]
+        .as_str()
+        .expect("plugin_id")
+        .to_string();
+
+    // Placed where the loader scans, and loaded — not merely downloaded.
+    let dir = state.paths.config_dir().join("plugins").join("base64-tool");
+    assert!(dir.join("plugin.json").exists(), "{}", dir.display());
+    assert!(dir.join("base64-tool.wasm").exists());
+
+    let out = state
+        .infra
+        .plugin_manager
+        .runtime()
+        .call_tool(&plugin_id, "base64", serde_json::json!({ "mode": "decode", "text": "aGk=" }))
+        .await
+        .expect("the installed plugin answers");
+    assert_eq!(out["result"], serde_json::json!("hi"));
+}
+
+// ── Live marketplace round trip ──────────────────────────────────────────
+
+/// Install a plugin from the *published* catalog and call its tool, in one
+/// process: sync → `connectors.catalog_install` (the real handler) → the plugin
+/// lands in the test's plugins dir → its wasm answers.
+///
+/// `#[ignore]`d because it talks to `api.syscity.net`: not hermetic, so it does
+/// not belong in CI. Run it deliberately, with the proxy the machine needs:
+///
+/// ```text
+/// cargo test --features plugins \
+///   --  installs_a_plugin_from_the_live_catalog_and_calls_it --ignored --nocapture
+/// ```
+///
+/// Everything it touches is under the test's own temp root — syncing a catalog
+/// and installing a plugin write to the state's paths, not the real home.
+#[cfg(feature = "plugins")]
+#[ignore]
+#[tokio::test]
+async fn installs_a_plugin_from_the_live_catalog_and_calls_it() {
+    let state = state().await;
+
+    let manager = state.tools.connector_manager.clone();
+    manager
+        .sync_catalog("https://api.syscity.net/catalog.json", None)
+        .await
+        .expect("sync the live catalog");
+
+    let resp = handle_connectors_catalog_install(
+        &req(
+            "r1",
+            "connectors.catalog_install",
+            Some(serde_json::json!({ "id": "base64-tool" })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(resp.ok, "{:?}", resp.error);
+
+    let payload = resp.payload.expect("payload");
+    assert_eq!(payload["type"], serde_json::json!("plugin"));
+    let plugin_id = payload["plugin_id"]
+        .as_str()
+        .expect("plugin_id")
+        .to_string();
+
+    // It landed where the loader scans, with the manifest the archive carried.
+    let dir = state.paths.config_dir().join("plugins").join("base64-tool");
+    assert!(dir.join("plugin.json").exists(), "{}", dir.display());
+    assert!(dir.join("base64-tool.wasm").exists());
+
+    // And the module answers, through the same entry point the tool registry
+    // uses when the model calls it.
+    let out = state
+        .infra
+        .plugin_manager
+        .runtime()
+        .call_tool(&plugin_id, "base64", serde_json::json!({ "mode": "encode", "text": "live" }))
+        .await
+        .expect("call the published plugin's tool");
+    assert_eq!(out["result"], serde_json::json!("bGl2ZQ=="));
+}
+
 // ── Skill install lifecycle ──────────────────────────────────────────────
 
 /// Plant a skill named `name` into the test manager's user skills dir and

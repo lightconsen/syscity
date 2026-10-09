@@ -447,18 +447,21 @@ impl CatalogCache {
         entry: &CatalogEntry,
         cache_root: &Path,
     ) -> crate::Result<PathBuf> {
-        // Only connectors ship a connector.json manifest: skills are bare
-        // SKILL.md folders and experts are SOUL.md role packages, so the
-        // marker selects what counts as the package root for each type.
+        // The marker is the file that defines a package root for each type:
+        // connectors ship a connector.json manifest, skills are bare SKILL.md
+        // folders, experts are SOUL.md role packages, and plugins carry the
+        // `plugin.json` the plugin manager loads.
         let marker = match entry.entry_type.as_str() {
             "skill" => "SKILL.md",
             "expert" => "SOUL.md",
+            "plugin" => "plugin.json",
             _ => "connector.json",
         };
         let dest = cache_root.join(&entry.id).join(&entry.version);
         let already_cached = match entry.entry_type.as_str() {
             "skill" => dest.join("SKILL.md").exists(),
             "expert" => dest.join("SOUL.md").exists() || dest.join("agents").is_dir(),
+            "plugin" => dest.join("plugin.json").exists(),
             _ => dest.join("connector.json").exists(),
         };
         if already_cached {
@@ -523,14 +526,16 @@ impl CatalogCache {
             // free-form (SKILL.md folders / SOUL.md role layouts, possibly
             // multi-agent) — their installers validate the shape and error
             // with a precise message, so hand the whole unpacked tree over.
+            // Plugins get the check: a plugin package without its plugin.json
+            // cannot be loaded, so saying so here beats a load failure later.
             let root = locate_package_root(&unpacked, marker);
             if entry.entry_type != "skill"
                 && entry.entry_type != "expert"
                 && !root.join(marker).exists()
             {
                 return Err(crate::error::SyscityError::Validation(format!(
-                    "Archive for connector {} contains no connector.json",
-                    entry.id
+                    "Archive for {} {} contains no {}",
+                    entry.entry_type, entry.id, marker
                 )));
             }
             if let Some(parent) = dest.parent() {
