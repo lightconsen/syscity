@@ -1324,6 +1324,9 @@ mod tests {
             },
             sha256: None,
             auto_update: false,
+            downloads: 0,
+            rating: None,
+            rating_count: 0,
         };
 
         let summary = fx.manager.upgrade(&entry).await.unwrap();
@@ -1377,6 +1380,9 @@ mod tests {
             },
             sha256: None,
             auto_update: false,
+            downloads: 0,
+            rating: None,
+            rating_count: 0,
         };
 
         let summary = fx.manager.upgrade(&entry).await.unwrap();

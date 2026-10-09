@@ -58,7 +58,8 @@ fn default_catalog_version() -> u32 {
 }
 
 /// One published marketplace entry (connector / skill / expert).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `PartialEq` only: a `rating` is an `f32`, which has no total equality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogEntry {
     /// Connector id (must match the package manifest id).
     pub id: String,
@@ -103,6 +104,18 @@ pub struct CatalogEntry {
     /// without an explicit per-entry confirmation.
     #[serde(default)]
     pub auto_update: bool,
+    /// How many times the package archive has been fetched. Runtime-owned by
+    /// the catalog service; a generator that does not know better reports 0.
+    #[serde(default)]
+    pub downloads: u64,
+    /// Mean community rating (1–5), or `None` when nobody has rated the entry —
+    /// which is not the same as a rating of zero, so it stays absent rather
+    /// than defaulting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f32>,
+    /// How many ratings the mean is over. Zero means `rating` is meaningless.
+    #[serde(default)]
+    pub rating_count: u64,
 }
 
 fn default_entry_type() -> String {
@@ -207,7 +220,8 @@ pub(crate) fn catalog_version_key(v: &str) -> (u64, u64, u64, String) {
 // ─────────────────────────────────────────────
 
 /// An installed connector whose catalog version differs from the local one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq` only, via the entry it carries.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingUpdate {
     /// Connector id.
     pub id: String,
@@ -570,7 +584,32 @@ mod tests {
             },
             sha256: None,
             auto_update: false,
+            downloads: 0,
+            rating: None,
+            rating_count: 0,
         }
+    }
+
+    #[test]
+    fn usage_fields_are_optional_and_distinguish_unrated_from_zero() {
+        // Absent (an older or hand-made catalog): the entry still loads.
+        let bare: CatalogEntry = serde_json::from_str(
+            r#"{"id":"x","version":"1.0.0","source":{"type":"tar.gz","url":"https://x/a.tgz"}}"#,
+        )
+        .expect("an entry without usage fields must parse");
+        assert_eq!(bare.downloads, 0);
+        assert_eq!(bare.rating, None, "unrated is not the same as rated zero");
+        assert_eq!(bare.rating_count, 0);
+
+        // Present: the numbers survive the round trip.
+        let rated: CatalogEntry = serde_json::from_str(
+            r#"{"id":"x","version":"1.0.0","source":{"type":"tar.gz","url":"https://x/a.tgz"},
+                "downloads":4211,"rating":4.5,"rating_count":38}"#,
+        )
+        .expect("a rated entry must parse");
+        assert_eq!(rated.downloads, 4211);
+        assert_eq!(rated.rating, Some(4.5));
+        assert_eq!(rated.rating_count, 38);
     }
 
     #[test]
