@@ -1,15 +1,15 @@
 //! Plugin Installer
 //!
-//! Handles downloading plugins from a registry and installing them
-//! into the local plugins directory.  Also supports uninstalling.
+//! Places plugin packages into the local plugins directory, and uninstalls
+//! them. Packages themselves come from the marketplace catalog, which hands
+//! over an already-downloaded-and-verified package root (see
+//! `src/mcp/connectors`), or from the CLI's local install.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use tracing::{debug, info};
+use tracing::info;
 
-use crate::plugins::registry::RegistryClient;
-
-/// Installs and uninstalls plugins from remote registries.
+/// Installs and uninstalls plugins in the local plugins directory.
 pub struct PluginInstaller {
     plugins_dir: PathBuf,
 }
@@ -19,47 +19,35 @@ impl PluginInstaller {
         Self { plugins_dir }
     }
 
-    /// Install a plugin by name from a registry.
+    /// Copy a plugin package into `plugins_dir/<name>` and return the
+    /// destination.
     ///
-    /// Looks up the plugin in the registry index, downloads the archive,
-    /// and extracts it into `plugins_dir/{name}`.
-    pub async fn install(&self, name: &str, registry_url: Option<&str>) -> crate::Result<()> {
-        let url = registry_url.unwrap_or("https://plugins.syscity.dev");
-        let client = RegistryClient::new(url);
-        let index = client.fetch_index().await?;
+    /// The copy lands in a staging sibling first and is renamed over the
+    /// destination, so a failed copy never leaves an installed plugin
+    /// truncated — the previous one stays until the new one is complete.
+    pub async fn stage_directory(&self, src: &Path, name: &str) -> crate::Result<PathBuf> {
+        // The name becomes a directory component; the catalog's own id rules
+        // are not this module's to trust.
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "'{name}' is not a usable plugin directory name"
+            )));
+        }
 
-        let entry = index
-            .plugins
-            .iter()
-            .find(|p| p.id == name || p.name == name)
-            .ok_or_else(|| {
-                crate::error::SyscityError::Internal(format!(
-                    "Plugin '{}' not found in registry",
-                    name
-                ))
-            })?;
+        let dest = self.plugins_dir.join(name);
+        let staging = self.plugins_dir.join(format!(".staging-{name}"));
+        tokio::fs::create_dir_all(&self.plugins_dir).await?;
+        if staging.exists() {
+            tokio::fs::remove_dir_all(&staging).await?;
+        }
+        copy_dir_all(src, &staging).await?;
 
-        info!("Downloading plugin '{}' v{}...", entry.name, entry.version);
-        let archive = client.download(entry).await?;
-
-        let plugin_dir = self.plugins_dir.join(&entry.name);
-        tokio::fs::create_dir_all(&plugin_dir).await?;
-
-        // Write the downloaded archive to a temp file
-        let archive_name = format!("{}-{}.tar.gz", entry.name, entry.version);
-        let archive_path = plugin_dir.join(&archive_name);
-        tokio::fs::write(&archive_path, &archive).await?;
-        debug!("Plugin archive saved to {:?}", archive_path);
-
-        // Extract tar.gz using tar + flate2
-        Self::extract_archive(&archive_path, &plugin_dir).await?;
-
-        // Remove the archive after successful extraction
-        tokio::fs::remove_file(&archive_path).await?;
-        debug!("Removed archive {:?} after extraction", archive_path);
-
-        info!("Plugin '{}' installed to {:?}", entry.name, plugin_dir);
-        Ok(())
+        if dest.exists() {
+            tokio::fs::remove_dir_all(&dest).await?;
+        }
+        tokio::fs::rename(&staging, &dest).await?;
+        info!("Plugin package staged at {:?}", dest);
+        Ok(dest)
     }
 
     /// Extract an archive into the target directory.
@@ -253,6 +241,28 @@ pub(crate) fn locate_package_root(extract_dir: &std::path::Path, marker: &str) -
     extract_dir.to_path_buf()
 }
 
+/// Copy a directory tree recursively.
+///
+/// The repository has several private copies of this (connectors, skills,
+/// computer, two CLI modules); this one exists so the plugin install path does
+/// not add another, and so the marketplace and local-install paths share one
+/// implementation.
+pub(crate) async fn copy_dir_all(src: &Path, dst: &Path) -> crate::Result<()> {
+    tokio::fs::create_dir_all(dst).await?;
+    let mut entries = tokio::fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            // Boxed: the recursion has to be nameable to be a future.
+            Box::pin(copy_dir_all(&from, &to)).await?;
+        } else {
+            tokio::fs::copy(&from, &to).await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -266,6 +276,72 @@ mod tests {
         let tmp = tempdir().unwrap();
         let installer = PluginInstaller::new(tmp.path().to_path_buf());
         assert_eq!(installer.plugins_dir, tmp.path());
+    }
+
+    #[tokio::test]
+    async fn stage_directory_places_a_package_under_its_name() {
+        let plugins = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("nested")).unwrap();
+        std::fs::write(src.path().join("plugin.json"), "{}").unwrap();
+        std::fs::write(src.path().join("nested/data.txt"), "x").unwrap();
+
+        let installer = PluginInstaller::new(plugins.path().to_path_buf());
+        let dest = installer.stage_directory(src.path(), "demo").await.unwrap();
+
+        assert_eq!(dest, plugins.path().join("demo"));
+        assert!(dest.join("plugin.json").exists());
+        assert!(dest.join("nested/data.txt").exists(), "copy must recurse");
+        assert!(
+            !plugins.path().join(".staging-demo").exists(),
+            "the staging directory must not survive the rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_directory_replaces_an_installed_package() {
+        let plugins = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("plugin.json"), "new").unwrap();
+
+        let installer = PluginInstaller::new(plugins.path().to_path_buf());
+        let first = tempdir().unwrap();
+        std::fs::write(first.path().join("plugin.json"), "old").unwrap();
+        std::fs::write(first.path().join("stale.txt"), "gone").unwrap();
+        installer
+            .stage_directory(first.path(), "demo")
+            .await
+            .unwrap();
+
+        installer.stage_directory(src.path(), "demo").await.unwrap();
+
+        // The new package replaces the old one wholesale — a leftover file from
+        // the previous version would be loaded alongside the new manifest.
+        assert_eq!(
+            std::fs::read_to_string(plugins.path().join("demo/plugin.json")).unwrap(),
+            "new"
+        );
+        assert!(!plugins.path().join("demo/stale.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn stage_directory_refuses_a_name_that_escapes_the_directory() {
+        let plugins = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        std::fs::write(src.path().join("plugin.json"), "{}").unwrap();
+        let installer = PluginInstaller::new(plugins.path().to_path_buf());
+
+        for name in ["../escape", "a/b", "", ".."] {
+            assert!(
+                installer.stage_directory(src.path(), name).await.is_err(),
+                "'{name}' must be refused"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(plugins.path()).unwrap().count(),
+            0,
+            "a refused name must leave nothing behind"
+        );
     }
 
     #[tokio::test]

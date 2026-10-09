@@ -15,12 +15,11 @@ pub mod installer;
 pub mod manifest;
 pub mod metrics;
 pub mod provider_extension;
-pub mod registry;
 pub mod runtime;
 pub mod sqlite_registry;
 pub mod verification;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
@@ -37,7 +36,6 @@ pub use manifest::{
 };
 pub use metrics::{MetricsSnapshot, PluginMetrics, PluginMetricsRegistry};
 pub use provider_extension::{PluginProvider, PluginProviderRegistry};
-pub use registry::{RegistryClient, RegistryIndex, RegistryPluginEntry};
 pub use runtime::{PluginInstance, PluginRuntime};
 pub use sqlite_registry::{PluginDbEntry, PluginSqliteRegistry};
 use tracing::{debug, info, warn};
@@ -763,31 +761,36 @@ Edit `config.json` to customize settings.
         Ok(plugin_dir)
     }
 
-    /// Install a plugin from a remote registry.
-    pub async fn install_plugin(
-        &self,
-        name: &str,
-        registry_url: Option<&str>,
-    ) -> crate::Result<()> {
+    /// Install a plugin from a package directory and load it.
+    ///
+    /// The package root comes from the marketplace (the catalog downloads and
+    /// verifies a plugin entry — see `src/mcp/connectors`) or from a local
+    /// directory. Loading here, rather than leaving it to the next restart, is
+    /// the difference between "installed" and "usable": the previous shape
+    /// reported success and left the plugin invisible until the daemon was
+    /// restarted.
+    pub async fn install_from_directory(&self, src: &Path, name: &str) -> crate::Result<String> {
         let installer = PluginInstaller::new(self.plugins_dir.clone());
-        installer.install(name, registry_url).await
+        let dest = installer.stage_directory(src, name).await?;
+
+        match self.load_plugin(&dest).await {
+            Ok(plugin_id) => Ok(plugin_id),
+            Err(e) => {
+                // A package that cannot load must not stay on disk pretending to
+                // be installed: every later start would try it again and fail
+                // again. Install is all-or-nothing.
+                if let Err(cleanup) = tokio::fs::remove_dir_all(&dest).await {
+                    warn!("Failed to remove the rejected plugin package at {:?}: {cleanup}", dest);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Uninstall a plugin (remove from disk).
     pub async fn uninstall_plugin(&self, name: &str) -> crate::Result<()> {
         let installer = PluginInstaller::new(self.plugins_dir.clone());
         installer.uninstall(name).await
-    }
-
-    /// Search for plugins in a remote registry.
-    pub async fn search_registry(
-        &self,
-        query: &str,
-        registry_url: Option<&str>,
-    ) -> crate::Result<Vec<registry::RegistryPluginEntry>> {
-        let url = registry_url.unwrap_or("https://plugins.syscity.dev");
-        let client = registry::RegistryClient::new(url);
-        client.search(query).await
     }
 }
 
@@ -817,6 +820,54 @@ mod tests {
         assert!(path.join("plugin.json").exists());
         assert!(path.join("config.json").exists());
         assert!(path.join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn install_from_directory_places_and_loads_the_plugin() {
+        let plugins = tempdir().unwrap();
+        let manager = PluginManager::new(plugins.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // A package sitting elsewhere on disk, as the marketplace hands it over
+        // (the catalog unpacks into its own cache; the plugin manager owns
+        // where a plugin finally lives).
+        let elsewhere = tempdir().unwrap();
+        let source = PluginManager::new(elsewhere.path().to_path_buf())
+            .await
+            .unwrap();
+        let package = source
+            .create_template("from-market", "From market")
+            .await
+            .unwrap();
+
+        let id = manager
+            .install_from_directory(&package, "from-market")
+            .await
+            .unwrap();
+
+        assert_eq!(id, "com.example.from-market");
+        assert!(plugins.path().join("from-market/plugin.json").exists());
+        assert_eq!(manager.list_plugins().await.len(), 1, "the load is the point");
+    }
+
+    #[tokio::test]
+    async fn install_from_directory_leaves_nothing_behind_when_load_fails() {
+        let plugins = tempdir().unwrap();
+        let manager = PluginManager::new(plugins.path().to_path_buf())
+            .await
+            .unwrap();
+        let bogus = tempdir().unwrap();
+        std::fs::write(bogus.path().join("notes.txt"), "not a plugin").unwrap();
+
+        // Reporting success for a package that cannot load is what the old
+        // install path did; a rejected package must not stay on disk either,
+        // or every later start retries and fails again.
+        assert!(manager
+            .install_from_directory(bogus.path(), "broken")
+            .await
+            .is_err());
+        assert!(!plugins.path().join("broken").exists());
     }
 
     #[tokio::test]

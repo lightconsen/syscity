@@ -53,21 +53,15 @@ pub enum PluginCommands {
     /// Reload plugins (lists current state; full reload requires daemon
     /// restart)
     Reload,
-    /// Install a plugin from a remote registry
-    RegistryInstall {
-        /// Plugin name or ID
-        name: String,
-        /// Registry URL (defaults to https://plugins.syscity.dev)
-        #[arg(short, long)]
-        registry: Option<String>,
+    /// Install a plugin from the marketplace catalog (by id)
+    CatalogInstall {
+        /// Plugin id as it appears in the catalog
+        id: String,
     },
-    /// Search for plugins in the registry
+    /// Search the marketplace catalog (client-side filter, like the UI)
     Search {
         /// Search query
         query: String,
-        /// Registry URL (defaults to https://plugins.syscity.dev)
-        #[arg(short, long)]
-        registry: Option<String>,
     },
     /// Sign a plugin manifest with an ed25519 key
     Sign {
@@ -128,7 +122,18 @@ pub async fn run_plugin_command(command: &PluginCommands) -> Result<()> {
             }
 
             println!("Plugin installed to {:?}", dest);
-            println!("Restart the daemon (syscity restart) to load it.");
+            // Load it now instead of waiting for the next restart:
+            // `plugins.reload_all` re-scans the plugins directory, so the
+            // directory just copied is discovered and loaded. A failure here is
+            // not fatal — the files are in place and the next start picks them
+            // up — so it only tells the user what still has to happen.
+            match ws::call("plugins.reload_all", json!({})).await {
+                Ok(_) => println!("Loaded."),
+                Err(e) => println!(
+                    "Not loaded yet ({e}). The daemon will pick it up on its next start \
+                     (or run `syscity plugin reload`)."
+                ),
+            }
         }
 
         PluginCommands::Uninstall { name, force } => {
@@ -197,38 +202,53 @@ pub async fn run_plugin_command(command: &PluginCommands) -> Result<()> {
             }
         },
 
-        PluginCommands::RegistryInstall { name, registry } => {
-            let body = json!({ "name": name, "registry": registry });
-            match ws::call("plugins.install", body).await {
+        PluginCommands::CatalogInstall { id } => {
+            // The marketplace is the catalog: the gateway downloads, verifies
+            // and loads the plugin in one call (route by `type` happens there).
+            match ws::call("connectors.catalog_install", json!({ "id": id })).await {
                 Ok(payload) => {
-                    println!("Plugin '{}' installed successfully.", name);
-                    if !payload.is_null() && !payload["message"].is_null() {
-                        println!("{}", payload["message"].as_str().unwrap_or(""));
-                    }
+                    let version = payload["version"].as_str().unwrap_or("?");
+                    let plugin_id = payload["plugin_id"].as_str().unwrap_or(id);
+                    println!("Plugin '{}' v{version} installed and loaded ({}).", id, plugin_id);
                 }
                 Err(e) => {
-                    eprintln!("Failed to install plugin: {}", e);
+                    eprintln!("Failed to install plugin: {e}");
                     return Err(e);
                 }
             }
         }
 
-        PluginCommands::Search { query, registry } => {
-            match ws::call("plugins.search", json!({ "q": query, "registry": registry })).await {
+        PluginCommands::Search { query } => {
+            // No server-side search exists: `connectors.catalog` hands over the
+            // whole document and the UI filters it locally. Same here, so the
+            // two surfaces agree on what "search" means.
+            match ws::call("connectors.catalog", json!({})).await {
                 Ok(payload) => {
-                    let empty = vec![];
-                    let plugins = payload["results"].as_array().unwrap_or(&empty);
-                    println!("Search results for '{}' ({}):", query, plugins.len());
-                    for p in plugins {
-                        let id = p["id"].as_str().unwrap_or("?");
-                        let name = p["name"].as_str().unwrap_or("?");
-                        let version = p["version"].as_str().unwrap_or("?");
-                        let desc = p["description"].as_str().unwrap_or("");
-                        println!("  {} ({}) v{} - {}", name, id, version, desc);
+                    let query = query.to_lowercase();
+                    let entries = payload["entries"].as_array().cloned().unwrap_or_default();
+                    let matches: Vec<_> = entries
+                        .iter()
+                        .filter(|e| {
+                            ["id", "display_name", "description"].iter().any(|key| {
+                                e[*key]
+                                    .as_str()
+                                    .is_some_and(|v| v.to_lowercase().contains(&query))
+                            })
+                        })
+                        .collect();
+                    println!("Catalog matches for '{query}' ({}):", matches.len());
+                    for e in matches {
+                        println!(
+                            "  {} [{}] v{} — {}",
+                            e["display_name"].as_str().unwrap_or("?"),
+                            e["type"].as_str().unwrap_or("?"),
+                            e["version"].as_str().unwrap_or("?"),
+                            e["id"].as_str().unwrap_or("?"),
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!("Search failed: {}", e);
+                    eprintln!("Search failed: {e}");
                     return Err(e);
                 }
             }

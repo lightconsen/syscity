@@ -182,6 +182,33 @@ pub(crate) async fn handle_connectors_catalog_install(
             }
             Err(e) => WsResponse::err(&req.id, "INTERNAL", e.to_string()),
         }
+    } else if entry.entry_type == "plugin" {
+        // A WASM plugin: the catalog downloads and verifies the package, and
+        // the plugin manager owns where it lands on disk and the load. The load
+        // is the point — without it the command reports success and the plugin
+        // stays invisible until the daemon restarts.
+        let root = match manager.fetch_package(&entry).await {
+            Ok(root) => root,
+            Err(e) => return WsResponse::err(&req.id, "INTERNAL", e.to_string()),
+        };
+        match state
+            .infra
+            .plugin_manager
+            .install_from_directory(&root, &entry.id)
+            .await
+        {
+            Ok(plugin_id) => WsResponse::ok(
+                &req.id,
+                serde_json::json!({
+                    "id": entry.id,
+                    "type": "plugin",
+                    "plugin_id": plugin_id,
+                    "version": entry.version,
+                    "installed": true,
+                }),
+            ),
+            Err(e) => WsResponse::err(&req.id, "INTERNAL", e.to_string()),
+        }
     } else {
         match manager.upgrade(&entry).await {
             Ok(summary) => {

@@ -694,6 +694,23 @@ impl ConnectorManager {
         Ok(catalog::diff_updates(installed, &doc.connectors))
     }
 
+    /// Fetch and unpack a catalog entry into this manager's cache, returning the
+    /// effective package root, without installing anything.
+    ///
+    /// For entry types another subsystem owns: WASM plugins share this
+    /// download, the sha256 gate, the staged extraction and the atomic rename,
+    /// then hand the verified tree to their own installer. The package lands
+    /// under the connector cache, so a caller that needs it elsewhere copies it
+    /// out — and should do so before the next `upgrade`, which prunes
+    /// superseded versions.
+    pub async fn fetch_package(
+        &self,
+        entry: &catalog::CatalogEntry,
+    ) -> crate::Result<std::path::PathBuf> {
+        let cache_root = self.cache_root();
+        self.catalog_cache().install_entry(entry, &cache_root).await
+    }
+
     /// Upgrade or fresh-install a single connector from a catalog entry.
     ///
     /// An `Enabled` connector is disabled before the swap and re-enabled after.

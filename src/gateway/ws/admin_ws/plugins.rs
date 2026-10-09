@@ -155,59 +155,6 @@ pub(crate) async fn handle_plugins_set_enabled(
     }
 }
 
-/// `plugins.install` — install a plugin by name.
-pub(crate) async fn handle_plugins_install(
-    req: &WsRequest,
-    state: &Arc<GatewayState>,
-) -> WsResponse {
-    #[derive(Deserialize)]
-    struct Params {
-        name: String,
-        registry: Option<String>,
-    }
-    let p: Params = match parse_params(req) {
-        Ok(p) => p,
-        Err(res) => return res,
-    };
-    match state
-        .infra
-        .plugin_manager
-        .install_plugin(&p.name, p.registry.as_deref())
-        .await
-    {
-        Ok(()) => WsResponse::ok(
-            &req.id,
-            serde_json::json!({ "success": true, "message": format!("Plugin '{}' installed", p.name) }),
-        ),
-        Err(e) => WsResponse::err(&req.id, "INTERNAL", format!("Failed to install plugin: {}", e)),
-    }
-}
-
-/// `plugins.search` — search the plugin registry.
-pub(crate) async fn handle_plugins_search(
-    req: &WsRequest,
-    state: &Arc<GatewayState>,
-) -> WsResponse {
-    #[derive(Deserialize)]
-    struct Params {
-        q: String,
-        registry: Option<String>,
-    }
-    let p: Params = match parse_params(req) {
-        Ok(p) => p,
-        Err(res) => return res,
-    };
-    match state
-        .infra
-        .plugin_manager
-        .search_registry(&p.q, p.registry.as_deref())
-        .await
-    {
-        Ok(results) => WsResponse::ok(&req.id, serde_json::json!({ "results": results })),
-        Err(e) => WsResponse::err(&req.id, "INTERNAL", e.to_string()),
-    }
-}
-
 /// `plugins.unload` — unload a plugin (disable at runtime, keep on disk).
 pub(crate) async fn handle_plugins_unload(
     req: &WsRequest,
