@@ -10,9 +10,10 @@ name: Agent Nightly
 # Required configuration:
 #   secrets.EVAL_API_KEY — DeepSeek key, used as the agent credential over
 #                          DeepSeek's Anthropic-compatible endpoint
-#   secrets.AGENT_PAT    — fine-grained PAT (Contents + Issues + Pull requests,
-#                          all read/write). Also used as GH_TOKEN, so it needs
-#                          Issues write for the label/comment steps.
+#   secrets.AGENT_PAT    — fine-grained PAT with Contents (read/write) and
+#                          Pull requests (read/write). It is used only to push
+#                          the branch and open the PR, so that ci.yml runs on
+#                          that PR; issue and label calls use GITHUB_TOKEN.
 # Optional variables (override the defaults in `env`):
 #   vars.AGENT_ANTHROPIC_BASE_URL, vars.AGENT_MODEL, vars.AGENT_HAIKU_MODEL
 #
@@ -45,7 +46,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  GH_TOKEN: ${{ secrets.AGENT_PAT || github.token }}
+  # Issue and label operations use the workflow's own token, which carries
+  # `issues: write` from the `permissions:` block above. This keeps those very
+  # common calls off the PAT, so the PAT only needs Contents + Pull requests.
+  GH_TOKEN: ${{ github.token }}
+  # Pushing a branch and opening the PR use the PAT when present — a PR opened
+  # by GITHUB_TOKEN does not trigger ci.yml (GitHub suppresses that by design).
+  PAT_TOKEN: ${{ secrets.AGENT_PAT || github.token }}
   # The agent runs on the same provider as the eval harness — DeepSeek, over its
   # Anthropic-compatible endpoint (the wire format `claude` speaks). Endpoint and
   # model are overridable with repository variables so they can be pinned
@@ -230,8 +237,13 @@ jobs:
             echo
             echo "_Opened by the nightly agent loop. A human must review and merge._"
           } > /tmp/pr-body.md
-          gh pr create --base main --head "$branch" \
-            --title "$subject" --body-file /tmp/pr-body.md --label agent-pr
+          # Create with the PAT (so ci.yml runs on the PR), then label with the
+          # workflow token — labels go through the Issues API, which the PAT
+          # does not have to be granted.
+          pr_url=$(GH_TOKEN="$PAT_TOKEN" gh pr create --base main --head "$branch" \
+            --title "$subject" --body-file /tmp/pr-body.md)
+          echo "$pr_url"
+          gh pr edit "$pr_url" --add-label agent-pr
           gh issue edit "$num" --add-label agent:review --remove-label agent:in-progress
 
       - name: Report a change that could not be verified
