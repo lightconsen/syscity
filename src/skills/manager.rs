@@ -452,6 +452,33 @@ impl SkillManager {
         Ok(count)
     }
 
+    /// Check a skill package the way the loader would, without installing it.
+    ///
+    /// For import paths (`skills.install_source`): a package that cannot load —
+    /// no SKILL.md, too large, or tripping the guard — must be rejected before
+    /// anything lands on disk. Otherwise it installs and is silently inert,
+    /// which is worse than a refusal that says why.
+    ///
+    /// Accepts `SKILL.md` at the root or in a single wrapper directory, the
+    /// shape an upstream repository usually has.
+    pub(crate) async fn precheck_skill_package(dir: &Path) -> crate::Result<()> {
+        let mut candidates = vec![dir.join("SKILL.md")];
+        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().is_dir() {
+                    candidates.push(entry.path().join("SKILL.md"));
+                }
+            }
+        }
+        let Some(skill_md) = candidates.iter().find(|p| p.exists()) else {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "no SKILL.md in the package at {}",
+                dir.display()
+            )));
+        };
+        Self::load_skill_from_file_inner(skill_md).await.map(|_| ())
+    }
+
     /// Load a skill from file (static helper for reload).
     async fn load_skill_from_file_inner(path: &Path) -> crate::Result<Skill> {
         let content = tokio::fs::read_to_string(path).await?;
@@ -502,6 +529,24 @@ impl SkillManager {
         }
 
         Ok(skill)
+    }
+
+    /// The user skills directory this manager installs into.
+    pub fn user_dir(&self) -> &Path {
+        self.storage.user_dir()
+    }
+
+    /// Install a skill package directory into the user skills dir.
+    ///
+    /// Does not reload — callers record provenance first, then
+    /// [`SkillManager::reload`], so a skill is never live before its install
+    /// record exists.
+    pub async fn install_from_directory(
+        &self,
+        src: &Path,
+        name: &str,
+    ) -> crate::Result<std::path::PathBuf> {
+        self.storage.install_to_user(src, name).await
     }
 
     /// A skill's install record: provenance, pinning, history, usage.

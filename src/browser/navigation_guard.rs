@@ -148,8 +148,12 @@ pub async fn assert_navigation_allowed(url: &str, policy: &NavigationPolicy) -> 
     Ok(())
 }
 
-/// Check if an IP address is in a private range
-fn is_private_ip(ip: IpAddr) -> bool {
+/// Check if an IP address is in a private range.
+///
+/// `pub(crate)` so other outbound-fetch paths (e.g. skill install from a URL)
+/// share one definition of "not a public address" instead of growing a second,
+/// subtly different one.
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()

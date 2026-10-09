@@ -440,6 +440,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("models.remove", Some(SCOPE_WRITE)),
     ("models.set_default", Some(SCOPE_WRITE)),
     ("skills.install", Some(SCOPE_WRITE)),
+    ("skills.install_source", Some(SCOPE_WRITE)),
     ("mcp.call_tool", Some(SCOPE_WRITE)),
     ("system.reload", Some(SCOPE_WRITE)),
     ("channels.enable", Some(SCOPE_WRITE)),

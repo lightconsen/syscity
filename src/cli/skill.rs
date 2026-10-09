@@ -125,7 +125,7 @@ pub async fn run_skill_command(command: &SkillCommands) -> Result<()> {
             println!("{}", payload);
         }
         SkillCommands::Install { source, name } => {
-            install_skill_local(source, name.as_deref()).await?;
+            install_skill_source(source, name.as_deref()).await?;
         }
         SkillCommands::CatalogInstall { id } => {
             // The marketplace is the catalog: the gateway downloads, verifies
@@ -253,71 +253,19 @@ pub async fn run_skill_command(command: &SkillCommands) -> Result<()> {
     Ok(())
 }
 
-/// Install a skill from a local path or git URL into the user skills directory.
-async fn install_skill_local(source: &str, name: Option<&str>) -> Result<()> {
-    let skills_dir = crate::dirs::skills_dir();
-
-    // Determine skill name from source or explicit override
-    let skill_name = if let Some(n) = name {
-        n.to_string()
-    } else {
-        // Derive name from last path/URL component, strip .git suffix
-        source
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(source)
-            .trim_end_matches(".git")
-            .to_string()
-    };
-
-    let dest = skills_dir.join(&skill_name);
-
-    // Detect git URL vs local path
-    if source.starts_with("http://") || source.starts_with("https://") || source.ends_with(".git") {
-        println!("Cloning skill '{}' from {}", skill_name, source);
-        let status = tokio::process::Command::new("git")
-            .args([
-                "clone",
-                "--depth=1",
-                source,
-                dest.to_str().unwrap_or_default(),
-            ])
-            .status()
-            .await
-            .map_err(|e| SyscityError::Internal(format!("Failed to run git clone: {}", e)))?;
-        if !status.success() {
-            return Err(SyscityError::Internal(format!("git clone failed for '{}'", source)));
-        }
-    } else {
-        // Local directory copy
-        let src_path = std::path::Path::new(source);
-        if !src_path.exists() {
-            return Err(SyscityError::Internal(format!("Source path does not exist: {}", source)));
-        }
-        copy_dir_recursive(src_path, &dest).await.map_err(|e| {
-            SyscityError::Internal(format!("Failed to copy skill directory: {}", e))
-        })?;
-    }
-
-    println!("Skill '{}' installed to {:?}", skill_name, dest);
-    println!("Run 'syscity skill setup {}' to install its dependencies.", skill_name);
-    Ok(())
-}
-
-/// Recursively copy a directory tree.
-async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(dst).await?;
-    let mut entries = tokio::fs::read_dir(src).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let file_type = entry.file_type().await?;
-        let dst_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            Box::pin(copy_dir_recursive(&entry.path(), &dst_path)).await?;
-        } else {
-            tokio::fs::copy(entry.path(), &dst_path).await?;
-        }
-    }
+/// Install a skill from a local path or git URL.
+///
+/// Goes through the daemon (`skills.install_source`) rather than copying here:
+/// the guard runs before anything lands, the install is recorded, and the
+/// running daemon reloads instead of waiting on a filesystem watcher event.
+async fn install_skill_source(source: &str, name: Option<&str>) -> Result<()> {
+    let payload =
+        ws::call("skills.install_source", json!({ "source": source, "name": name })).await?;
+    println!(
+        "Skill '{}' installed and loaded ({} skills).",
+        payload["id"].as_str().unwrap_or(source),
+        payload["skills_loaded"].as_u64().unwrap_or(0),
+    );
     Ok(())
 }
 
