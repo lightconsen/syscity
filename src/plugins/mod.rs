@@ -870,6 +870,102 @@ mod tests {
         assert!(!plugins.path().join("broken").exists());
     }
 
+    /// A plugin that is not a template: a real WASM module built from
+    /// `examples/wasm-plugins/base64-tool`, driven through the same entry point
+    /// the tool registry uses.
+    ///
+    /// The template-based tests above only prove the loader handles a manifest
+    /// with no wasm (`main: None`). This one covers the whole path a published
+    /// plugin takes: manifest → instantiate → `call_tool` → JSON result.
+    ///
+    /// The fixture is committed rather than built here (rustc cannot produce a
+    /// wasm at test time); rebuild it with:
+    ///   cd examples/wasm-plugins/base64-tool && cargo build --release --target wasm32-unknown-unknown
+    ///   cp target/wasm32-unknown-unknown/release/base64_tool.wasm ../syscity/tests/fixtures/base64-tool.wasm
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn a_real_wasm_plugin_answers_a_tool_call() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("base64-tool");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+
+        let manifest = serde_json::json!({
+            "id": "com.syscity.base64",
+            "name": "base64-tool",
+            "version": "1.0.0",
+            "description": "Base64 encode/decode",
+            "main": "base64-tool.wasm",
+            "capabilities": [{
+                "type": "tools",
+                "tools": [{
+                    "name": "base64",
+                    "description": "Encode or decode base64",
+                    "parameters": { "type": "object" }
+                }]
+            }],
+            "permissions": []
+        });
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/base64-tool.wasm"),
+            plugin_dir.join("base64-tool.wasm"),
+        )
+        .unwrap();
+
+        let manager = PluginManager::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(manager.initialize().await.unwrap(), 1, "the plugin must load");
+
+        // The manifest's declared tool is what gets registered for the model.
+        let plugin = manager
+            .get_plugin("com.syscity.base64")
+            .await
+            .expect("plugin instance");
+        let tools = plugin.manifest.get_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "base64");
+
+        let call = |params: serde_json::Value| {
+            let runtime = manager.runtime.clone();
+            async move {
+                runtime
+                    .call_tool("com.syscity.base64", "base64", params)
+                    .await
+            }
+        };
+
+        // Encode, then decode what came back: a round trip through the guest's
+        // allocator and the host's buffers.
+        let encoded = call(serde_json::json!({ "mode": "encode", "text": "hello world" }))
+            .await
+            .expect("encode");
+        assert_eq!(encoded["result"], serde_json::json!("aGVsbG8gd29ybGQ="));
+
+        let decoded = call(serde_json::json!({
+            "mode": "decode",
+            "text": encoded["result"].as_str().unwrap()
+        }))
+        .await
+        .expect("decode");
+        assert_eq!(decoded["result"], serde_json::json!("hello world"));
+
+        // Failures come back as data, not as a transport error: the guest ran
+        // and said no.
+        let bad = call(serde_json::json!({ "mode": "decode", "text": "not base64!!" }))
+            .await
+            .expect("a guest-level rejection is still a successful call");
+        assert!(bad.get("error").is_some(), "{bad}");
+
+        let missing = call(serde_json::json!({ "mode": "encode" }))
+            .await
+            .expect("missing param");
+        assert!(missing["error"].as_str().unwrap_or("").contains("text"));
+    }
+
     #[tokio::test]
     async fn initialize_loads_plugins_from_disk() {
         let tmp = tempdir().unwrap();
