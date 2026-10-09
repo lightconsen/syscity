@@ -505,7 +505,7 @@ pub enum SearchProvider {
     #[default]
     DuckDuckGo,
     /// Brave Search API (requires key)
-    /// https://brave.com/search/api/
+    /// <https://brave.com/search/api/>
     Brave { api_key: String },
     /// Custom search provider
     Custom {
@@ -515,22 +515,22 @@ pub enum SearchProvider {
         result_parser: Option<fn(&str, usize) -> Vec<SearchResult>>,
     },
     /// Tavily AI Search API (requires key)
-    /// https://docs.tavily.com/
+    /// <https://docs.tavily.com/>
     Tavily { api_key: String },
     /// SerpAPI Google Search API (requires key)
-    /// https://serpapi.com/
+    /// <https://serpapi.com/>
     SerpApi { api_key: String },
     /// Exa (formerly Metaphor) AI Search API (requires key)
-    /// https://docs.exa.ai/
+    /// <https://docs.exa.ai/>
     Exa { api_key: String },
     /// Firecrawl Search API (requires key)
-    /// https://docs.firecrawl.dev/
+    /// <https://docs.firecrawl.dev/>
     Firecrawl { api_key: String },
     /// Serper Google Search API (requires key)
-    /// https://serper.dev/
+    /// <https://serper.dev/>
     Serper { api_key: String },
     /// Bocha AI Web Search API (requires key)
-    /// https://bochaai.com/
+    /// <https://bochaai.com/>
     Bocha { api_key: String },
     /// Syscity Cloud web search (`/v1/search`, session-token auth; feature
     /// `cloud`). Normalized results identical in shape to the local providers.
