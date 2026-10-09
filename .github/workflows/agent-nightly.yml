@@ -10,10 +10,12 @@ name: Agent Nightly
 # Required configuration:
 #   secrets.EVAL_API_KEY — DeepSeek key, used as the agent credential over
 #                          DeepSeek's Anthropic-compatible endpoint
-#   secrets.AGENT_PAT    — fine-grained PAT with Contents (read/write) and
-#                          Pull requests (read/write). It is used only to push
-#                          the branch and open the PR, so that ci.yml runs on
-#                          that PR; issue and label calls use GITHUB_TOKEN.
+#   secrets.AGENT_PAT    — OPTIONAL fine-grained PAT with Pull requests
+#                          (read and write) and read access to the repo. Used
+#                          only to open the PR, so that ci.yml runs on it; the
+#                          branch push and every issue call use GITHUB_TOKEN.
+#                          Without it the PR is opened by GITHUB_TOKEN and CI
+#                          must be re-run by hand.
 # Optional variables (override the defaults in `env`):
 #   vars.AGENT_ANTHROPIC_BASE_URL, vars.AGENT_MODEL, vars.AGENT_HAIKU_MODEL
 #
@@ -83,7 +85,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.AGENT_PAT || github.token }}
+          # Default token: the branch push below needs only `contents: write`,
+          # which this workflow already declares. The PAT is reserved for
+          # opening the PR (see Publish), which is the one call that must not
+          # come from GITHUB_TOKEN.
           fetch-depth: 0
 
       - name: Ensure labels exist
@@ -237,11 +242,16 @@ jobs:
             echo
             echo "_Opened by the nightly agent loop. A human must review and merge._"
           } > /tmp/pr-body.md
-          # Create with the PAT (so ci.yml runs on the PR), then label with the
-          # workflow token — labels go through the Issues API, which the PAT
-          # does not have to be granted.
-          pr_url=$(GH_TOKEN="$PAT_TOKEN" gh pr create --base main --head "$branch" \
-            --title "$subject" --body-file /tmp/pr-body.md)
+          # Open the PR with the PAT so it triggers ci.yml (a PR opened by
+          # GITHUB_TOKEN does not). If the PAT cannot create PRs, fall back to
+          # GITHUB_TOKEN — the PR still lands, it just needs CI re-run by hand.
+          if ! pr_url=$(GH_TOKEN="$PAT_TOKEN" gh pr create --base main --head "$branch" \
+                --title "$subject" --body-file /tmp/pr-body.md 2>/tmp/pr-err); then
+            echo "::warning::PR creation with AGENT_PAT failed; falling back to GITHUB_TOKEN."
+            cat /tmp/pr-err
+            pr_url=$(gh pr create --base main --head "$branch" \
+              --title "$subject" --body-file /tmp/pr-body.md)
+          fi
           echo "$pr_url"
           gh pr edit "$pr_url" --add-label agent-pr
           gh issue edit "$num" --add-label agent:review --remove-label agent:in-progress
