@@ -27,7 +27,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::error::SyscityError;
-use crate::secrets::store::{SecretId, SecretOrigin, SecretStore};
+use crate::secrets::store::{SecretId, SecretStore};
 
 /// Max time a single keyring operation may take before it is treated as
 /// failed. macOS dark wake can hang `SecKeychainFindGenericPassword` on a
@@ -189,7 +189,7 @@ impl SecretStore for KeyringStore {
             .map(|map| map.get(&kind).cloned())
     }
 
-    async fn set(&self, id: &SecretId, value: &str, _origin: SecretOrigin) -> crate::Result<()> {
+    async fn set(&self, id: &SecretId, value: &str) -> crate::Result<()> {
         let store = self.clone();
         let entity = id.entity.clone();
         let kind = id.kind.clone();
@@ -551,19 +551,13 @@ mod tests {
         assert!(!store.has(&id).await);
         assert_eq!(store.get(&id).await.unwrap(), None);
 
-        store
-            .set(&id, "at_secret", SecretOrigin::UserEntered)
-            .await
-            .unwrap();
+        store.set(&id, "at_secret").await.unwrap();
         assert!(store.has(&id).await);
         assert_eq!(store.get(&id).await.unwrap(), Some("at_secret".to_string()));
 
         // A second kind on the same entity shares the same entry.
         let id2 = SecretId::new("channel", "whatsapp", "app_secret");
-        store
-            .set(&id2, "app_sec", SecretOrigin::UserEntered)
-            .await
-            .unwrap();
+        store.set(&id2, "app_sec").await.unwrap();
         assert_eq!(store.get(&id2).await.unwrap(), Some("app_sec".to_string()));
         assert_eq!(store.get(&id).await.unwrap(), Some("at_secret".to_string()));
         assert!(store.has_entity("whatsapp").await);
@@ -609,7 +603,7 @@ mod tests {
         let a = KeyringStore::with_backend("channel", backend.clone());
         let b = KeyringStore::with_backend("llm", backend);
 
-        a.set(&SecretId::new("channel", "whatsapp", "token"), "v", SecretOrigin::UserEntered)
+        a.set(&SecretId::new("channel", "whatsapp", "token"), "v")
             .await
             .unwrap();
         // The same account name in a different namespace must not collide.

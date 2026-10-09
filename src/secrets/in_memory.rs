@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::secrets::store::{SecretId, SecretOrigin, SecretStore};
+use crate::secrets::store::{SecretId, SecretStore};
 
 /// A single in-memory secret (value zeroized on drop).
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -56,7 +56,7 @@ impl SecretStore for MemoryStore {
         Ok(inner.get(&id.to_string()).map(|e| e.value.clone()))
     }
 
-    async fn set(&self, id: &SecretId, value: &str, _origin: SecretOrigin) -> crate::Result<()> {
+    async fn set(&self, id: &SecretId, value: &str) -> crate::Result<()> {
         let mut inner = self.inner.lock().map_err(|_| {
             crate::error::SyscityError::Internal("memory store poisoned".to_string())
         })?;
@@ -88,7 +88,7 @@ impl SecretStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::store::{SecretId, SecretOrigin};
+    use crate::secrets::store::SecretId;
 
     #[tokio::test]
     async fn test_memory_store_roundtrip() {
@@ -96,10 +96,7 @@ mod tests {
         let id = SecretId::new("mcp", "server-a", "access_token");
 
         assert!(!store.has(&id).await);
-        store
-            .set(&id, "at_secret", SecretOrigin::SystemGenerated)
-            .await
-            .unwrap();
+        store.set(&id, "at_secret").await.unwrap();
         assert!(store.has(&id).await);
         assert_eq!(store.get(&id).await.unwrap(), Some("at_secret".to_string()));
 
@@ -113,10 +110,7 @@ mod tests {
         let store = MemoryStore::new();
         let a = SecretId::new("mcp", "a", "access_token");
         let b = SecretId::new("mcp", "b", "access_token");
-        store
-            .set(&a, "x", SecretOrigin::SystemGenerated)
-            .await
-            .unwrap();
+        store.set(&a, "x").await.unwrap();
         assert!(!store.has(&b).await);
     }
 

@@ -53,11 +53,7 @@ pub(crate) async fn handle_plugins_sign(req: &WsRequest, state: &Arc<GatewayStat
         if let Err(e) = state
             .secrets
             .route("plugin")
-            .set(
-                &crate::secrets::SecretId::new("plugin", &p.name, "secret_key"),
-                &p.secret_key,
-                crate::secrets::SecretOrigin::UserEntered,
-            )
+            .set(&crate::secrets::SecretId::new("plugin", &p.name, "secret_key"), &p.secret_key)
             .await
         {
             eprintln!("Failed to store plugin secret_key for '{}' ({:?})", p.name, e);

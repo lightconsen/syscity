@@ -422,10 +422,17 @@ syscity provider switch <alias>
 syscity plugin list
 syscity plugin reload
 syscity plugin enable/disable <id>
+syscity plugin catalog-install <id>   # 从市场目录安装并加载
+syscity plugin search <query>         # 目录取回后本地过滤（无服务端搜索）
 
 # Skill 管理
 syscity skill list
 syscity skill run <id>
+syscity skill install <git-url|dir>     # 经守护进程抓取、过 guard、记录来源
+syscity skill catalog-install <id>      # 从市场目录安装
+syscity skill versions <id>             # 版本 / 来源 / 固定状态 / 使用次数 / 历史
+syscity skill pin <id> [--unpin]        # 固定当前版本，update 不再替换
+syscity skill rollback <id> <version>   # 回滚到历史版本
 
 # Cron 管理
 syscity cron list

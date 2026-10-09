@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serial_test::serial;
 use syscity::gateway::protocol::AuthMode;
-use syscity::gateway::{Gateway, GatewayConfig};
+use syscity::gateway::{Gateway, GatewayConfig, GatewayOptions};
 use tokio::net::TcpStream;
 
 /// Budget for every "the TUI should have done X by now" wait. Generous: a
@@ -325,7 +325,25 @@ async fn start_gateway() -> u16 {
     config.channels.clear();
     config.vector_memory.enabled = false;
 
-    let gateway = Gateway::new(config, None).await.expect("gateway");
+    // A private layout root. `Gateway::new` derives one from `SYSCITY_HOME` /
+    // `~/.syscity` via `from_env`, which does not consult the `cfg(test)`
+    // default — so without this the gateway writes sessions, memory,
+    // transcripts and secrets into the developer's real config directory.
+    // Held for the process's lifetime: the gateway outlives this call.
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| tempfile::tempdir().expect("temp layout root"));
+    let paths = Arc::new(syscity::dirs::SyscityPaths::from_root(root.path()));
+
+    let gateway = Gateway::with_options(
+        config,
+        None,
+        GatewayOptions {
+            paths: Some(paths),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("gateway");
     tokio::spawn(async move {
         let _ = gateway.start().await;
     });

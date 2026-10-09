@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::cloud::client::CloudClient;
 use crate::cloud::config::CloudConfig;
-use crate::secrets::{SecretId, SecretOrigin, SecretStoreHandle};
+use crate::secrets::{SecretId, SecretStoreHandle};
 
 /// Secret-store entity for the device token.
 pub const ENTITY_DEVICE_TOKEN: &str = "device_token";
@@ -88,7 +88,7 @@ pub async fn bind(cfg: &CloudConfig, secrets: Arc<SecretStoreHandle>) -> crate::
     if let Some(device_token) = resp.get("device_token").and_then(|v| v.as_str()) {
         secrets
             .choose(&token_id())
-            .set(&token_id(), device_token, SecretOrigin::SystemGenerated)
+            .set(&token_id(), device_token)
             .await?;
     }
     Ok(())

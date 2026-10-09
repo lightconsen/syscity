@@ -30,7 +30,7 @@ use zeroize::Zeroize;
 use crate::error::SyscityError;
 #[cfg(all(not(test), feature = "keyring"))]
 use crate::secrets::keyring_store::{probe_keyring, with_timeout};
-use crate::secrets::store::{SecretId, SecretOrigin, SecretStore, SecretStoreHandle};
+use crate::secrets::store::{SecretId, SecretStore, SecretStoreHandle};
 
 /// Top-level secrets directory (`~/.syscity/secrets`).
 pub fn secrets_root_dir() -> PathBuf {
@@ -221,7 +221,7 @@ impl SecretStore for FileStore {
         Ok(map.get(&id.kind).cloned())
     }
 
-    async fn set(&self, id: &SecretId, value: &str, _origin: SecretOrigin) -> crate::Result<()> {
+    async fn set(&self, id: &SecretId, value: &str) -> crate::Result<()> {
         let mut map = self.get_all(&id.entity).await?;
         map.insert(id.kind.clone(), value.to_string());
         self.set_all(&id.entity, &map).await
@@ -629,7 +629,7 @@ async fn migrate_legacy_mcp_env_with_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::store::{SecretId, SecretOrigin};
+    use crate::secrets::store::SecretId;
 
     /// Unique temp dir per test so concurrent tests do not wipe each other's
     /// state (all tests share the process id, so a name suffix is required).
@@ -736,10 +736,7 @@ mod tests {
         let store = FileStore::with_root("mcp-oauth", root.clone());
         let id = SecretId::new("mcp-oauth", "myserver", "refresh_token");
 
-        store
-            .set(&id, "rt_secret", SecretOrigin::UserEntered)
-            .await
-            .unwrap();
+        store.set(&id, "rt_secret").await.unwrap();
         assert!(store.has(&id).await);
         assert_eq!(store.get(&id).await.unwrap(), Some("rt_secret".to_string()));
         assert!(store.has_entity("myserver").await);
@@ -815,10 +812,7 @@ mod tests {
         let store = FileStore::with_root_encrypted("channel", root.join("secrets"), &key);
         let id = SecretId::new("channel", "whatsapp", "access_token");
 
-        store
-            .set(&id, "at_secret", SecretOrigin::UserEntered)
-            .await
-            .unwrap();
+        store.set(&id, "at_secret").await.unwrap();
         assert_eq!(store.get(&id).await.unwrap(), Some("at_secret".to_string()));
 
         // The on-disk file must not contain the plaintext value.
@@ -841,11 +835,7 @@ mod tests {
         let key = MasterKey::random();
         let store = FileStore::with_root_encrypted("channel", root.join("secrets"), &key);
         store
-            .set(
-                &SecretId::new("channel", "whatsapp", "access_token"),
-                "at_secret",
-                SecretOrigin::UserEntered,
-            )
+            .set(&SecretId::new("channel", "whatsapp", "access_token"), "at_secret")
             .await
             .unwrap();
 

@@ -129,11 +129,25 @@ Five tiers, from "most secure" to "most frequently read/written":
    (requires the `keyring` feature) when the keyring is available, otherwise
    Tier 2.
 
+What actually decides a write's tier is the **`SecretId`** — `choose` routes on
+`namespace` + `kind`, and `route_store` on `namespace` alone:
+
+- `(mcp-oauth | llm-oauth) + access_token` → Tier 3 (rule 1).
+- everything else → Tier 1 when the `keyring` feature is on and the keyring
+  answers, otherwise Tier 2 (rules 3 and 4 share one path: a system-generated
+  secret landing in the keyring is harmless, and having two paths for it would
+  be a distinction without a difference).
+
+Tier 4 is not reached through the store at all — ops-injected values are
+resolved by `SecretResolver` and never written. There is deliberately no
+"origin" parameter on `set`: the routing inputs are in the id, and an argument
+no backend reads is a knob that only looks like one.
+
 ---
 
 ## 3. Core Abstractions
 
-### 3.1 `SecretId` / `SecretOrigin` / `SecretStore`
+### 3.1 `SecretId` / `SecretStore`
 
 The logical identifier and unified backend interface (`src/secrets/store.rs`):
 
@@ -144,12 +158,10 @@ pub struct SecretId {
     pub kind: String,      // "api_key" | "refresh_token" | "access_token" | "secret" ...
 }
 
-pub enum SecretOrigin { UserEntered, SystemGenerated, OperatorInjected }
-
 #[async_trait]
 pub trait SecretStore: Send + Sync {
     async fn get(&self, id: &SecretId) -> crate::Result<Option<String>>;
-    async fn set(&self, id: &SecretId, value: &str, origin: SecretOrigin) -> crate::Result<()>;
+    async fn set(&self, id: &SecretId, value: &str) -> crate::Result<()>;
     async fn delete(&self, id: &SecretId) -> crate::Result<()>;
     async fn has(&self, id: &SecretId) -> bool;
     // Entity-level whole-map ops: get_all / set_all / delete_entity / has_entity (unsupported by default)
@@ -337,7 +349,7 @@ current state intact.
 ```
 src/secrets/
 ├── mod.rs           SecretRef / SecretResolver (env/file/exec, Tier 4)
-├── store.rs         SecretId / SecretOrigin / SecretStore trait / routing / SecretValue
+├── store.rs         SecretId / SecretStore trait / routing / SecretValue
 ├── keyring_store.rs Tier 1 backend + availability probe + KeyringHealth
 │                     (compiled only with the `keyring` feature)
 ├── file_store.rs    Tier 2 backend (AES-GCM encryption) + master key + migration

@@ -235,11 +235,7 @@ impl HttpGatewayClient {
 
         // `target.id` is a location (`llm-oauth/<provider>/refresh_token`), not
         // a value, so naming it in a log line leaks nothing.
-        if let Err(e) = target
-            .store
-            .set(&target.id, new_token, crate::secrets::SecretOrigin::SystemGenerated)
-            .await
-        {
+        if let Err(e) = target.store.set(&target.id, new_token).await {
             warn!(
                 "Failed to persist the rotated OAuth refresh token at {}: {e}. \
                  This process keeps working; the next start will present the old token",
@@ -732,10 +728,7 @@ mod tests {
         let store: Arc<dyn crate::secrets::SecretStore> =
             Arc::new(crate::secrets::FileStore::with_root("llm-oauth", dir.path().to_path_buf()));
         let id = crate::secrets::SecretId::new("llm-oauth", "grok", "refresh_token");
-        store
-            .set(&id, "original-refresh", crate::secrets::SecretOrigin::SystemGenerated)
-            .await
-            .unwrap();
+        store.set(&id, "original-refresh").await.unwrap();
 
         let credential = Credential::OAuth2 {
             access_token: String::new(),

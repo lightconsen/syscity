@@ -19,7 +19,7 @@
 //!
 //! The storage backend (`SecretStore`) coexists with the reference resolver
 //! (`SecretResolver`):
-//! - `store.rs` — `SecretId` / `SecretOrigin` / `SecretStore` trait / tier routing.
+//! - `store.rs` — `SecretId` / `SecretStore` trait / tier routing.
 //! - `keyring_store.rs` — Tier 1 OS keyring backend (feature `keyring`, opt-in).
 //! - `file_store.rs` — Tier 2 file backend (absorbs the retired `mcp/env_store.rs`).
 //! - `in_memory.rs` — Tier 3 zeroize memory backend.
@@ -45,7 +45,7 @@ pub use mask::{
     mask_secret_container_payload,
 };
 pub use store::{
-    SecretId, SecretOrigin, SecretStore, SecretStoreHandle, SecretStoreTier, SecretValue, StoreRef,
+    SecretId, SecretStore, SecretStoreHandle, SecretStoreTier, SecretValue, StoreRef,
     SENSITIVE_CHANNEL_CREDENTIALS,
 };
 

@@ -1,7 +1,7 @@
 //! Cloud session: OAuth login URL building + session token storage.
 
 use crate::cloud::config::CloudConfig;
-use crate::secrets::{SecretId, SecretOrigin, SecretStoreHandle};
+use crate::secrets::{SecretId, SecretStoreHandle};
 
 pub const CLOUD_NS: &str = "cloud";
 pub const ENTITY_SESSION: &str = "session";
@@ -23,10 +23,7 @@ pub async fn get_token(secrets: &SecretStoreHandle) -> Option<String> {
 
 /// Persist a session token (keyring-preferred for user-entered secrets).
 pub async fn set_token(secrets: &SecretStoreHandle, token: &str) -> crate::Result<()> {
-    secrets
-        .choose(&token_id())
-        .set(&token_id(), token, SecretOrigin::UserEntered)
-        .await
+    secrets.choose(&token_id()).set(&token_id(), token).await
 }
 
 /// Forget the session token (revoked / signed out).

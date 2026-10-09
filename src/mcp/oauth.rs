@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{info, warn};
 
 use crate::mcp::{McpEvent, McpManager, McpServerConfig};
-use crate::secrets::{SecretId, SecretOrigin, SecretStore, SecretStoreHandle};
+use crate::secrets::{SecretId, SecretStore, SecretStoreHandle};
 
 // ─────────────────────────────────────────────
 // Token data
@@ -654,7 +654,7 @@ async fn persist_refresh_token(
     refresh: &str,
 ) -> crate::Result<()> {
     refresh_token_store(secrets)
-        .set(&refresh_token_id(server_id), refresh, SecretOrigin::SystemGenerated)
+        .set(&refresh_token_id(server_id), refresh)
         .await
 }
 
@@ -771,10 +771,7 @@ async fn migrate_legacy_mcp_tokens_with_store(
             let id = refresh_token_id(&server_id);
             let already = store.get(&id).await.ok().flatten().is_some();
             if !already {
-                if let Err(e) = store
-                    .set(&id, &refresh, SecretOrigin::SystemGenerated)
-                    .await
-                {
+                if let Err(e) = store.set(&id, &refresh).await {
                     warn!("Failed to migrate refresh token for '{server_id}': {e}");
                     failed += 1;
                     continue;

@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 use crate::model_router::oauth_credential::Credential;
 use crate::model_router::oauth_flow::OAuthFlow;
 use crate::model_router::OAuthConfig;
-use crate::secrets::{SecretId, SecretOrigin, SecretStoreHandle};
+use crate::secrets::{SecretId, SecretStoreHandle};
 
 /// Path the gateway serves the OAuth callback on.
 pub const CALLBACK_PATH: &str = "/oauth/provider/callback";
@@ -204,10 +204,7 @@ impl ProviderOAuthFlows {
         };
 
         let id = Self::refresh_token_id(&entry.provider);
-        self.secrets
-            .choose(&id)
-            .set(&id, &refresh_token, SecretOrigin::SystemGenerated)
-            .await?;
+        self.secrets.choose(&id).set(&id, &refresh_token).await?;
 
         Ok(entry.provider)
     }
