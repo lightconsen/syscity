@@ -76,6 +76,13 @@ async fn start_hooked_gateway_opts(
         None,
         GatewayOptions {
             hooks_file: Some(hooks),
+            // Same hermetic root as every other e2e gateway. Without it the
+            // gateway resolves the real `~/.syscity` and creates *its* workspace
+            // there, while the shell tool's working directory is the process
+            // default (`test_paths_root()`), which nobody created — so the
+            // fenced shell cannot spawn and a test that expects the tool body to
+            // run sees no sentinel.
+            paths: Some(test_paths_root()),
             ..Default::default()
         },
     )
