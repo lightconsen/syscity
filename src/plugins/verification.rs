@@ -148,6 +148,63 @@ pub fn log_verification(plugin_id: &str, result: &VerificationResult) {
     }
 }
 
+/// What a deployment requires of a manifest's signature, on top of the
+/// cryptographic check.
+///
+/// The default accepts everything [`verify_manifest`] accepts: a signature
+/// proves the manifest is unmodified, not that its author is anyone in
+/// particular — a plugin can sign itself with a key it just generated. A
+/// deployment that wants the stronger claim sets these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignaturePolicy {
+    /// Refuse a manifest that carries no signature at all.
+    pub require_signed: bool,
+    /// When non-empty, a signed manifest is accepted only if its
+    /// `signer_public_key` — base64, as [`sign_manifest`] writes it — is one
+    /// of these.
+    pub trusted_signers: Vec<String>,
+}
+
+impl SignaturePolicy {
+    /// Whether the policy adds no requirement beyond the signature check.
+    pub fn is_permissive(&self) -> bool {
+        !self.require_signed && self.trusted_signers.is_empty()
+    }
+}
+
+/// Apply a [`SignaturePolicy`] on top of [`verify_manifest`].
+///
+/// Returns `Err(reason)` when the manifest does not satisfy the policy. The
+/// reason is written for an operator reading a log, so it names the setting
+/// that refused it.
+pub fn check_policy(manifest: &PluginManifest, policy: &SignaturePolicy) -> Result<(), String> {
+    if policy.is_permissive() {
+        return Ok(());
+    }
+    match verify_manifest(manifest) {
+        VerificationResult::Invalid(reason) => Err(reason),
+        VerificationResult::NotSigned if policy.require_signed => {
+            Err("the manifest is not signed and this deployment requires signed plugins"
+                .to_string())
+        }
+        VerificationResult::NotSigned => Ok(()),
+        VerificationResult::Valid => {
+            if policy.trusted_signers.is_empty() {
+                return Ok(());
+            }
+            let signer = manifest.signer_public_key.as_deref().unwrap_or_default();
+            if policy.trusted_signers.iter().any(|key| key == signer) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "signed by {}… which is not in the trusted signer list",
+                    &signer[..signer.len().min(12)]
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +325,84 @@ mod tests {
         // A minimal manifest has no signature fields
         let m = PluginManifest::minimal("com.test.empty", "");
         assert_eq!(verify_manifest(&m), VerificationResult::NotSigned);
+    }
+
+    /// Sign `manifest` with a fresh key and return that key's public half,
+    /// base64 as the manifest records it.
+    fn sign_with_fresh_key(manifest: &mut PluginManifest) -> String {
+        use ed25519_dalek::SigningKey;
+        use rand::Rng;
+        let mut secret_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut secret_bytes);
+        let engine = base64::engine::general_purpose::STANDARD;
+        let secret_b64 = engine.encode(SigningKey::from_bytes(&secret_bytes).to_bytes());
+        sign_manifest(manifest, &secret_b64).unwrap();
+        manifest.signer_public_key.clone().unwrap()
+    }
+
+    #[test]
+    fn the_default_policy_adds_nothing() {
+        assert!(SignaturePolicy::default().is_permissive());
+        let unsigned = unsigned_manifest();
+        assert!(check_policy(&unsigned, &SignaturePolicy::default()).is_ok());
+    }
+
+    #[test]
+    fn require_signed_refuses_an_unsigned_manifest() {
+        let policy = SignaturePolicy {
+            require_signed: true,
+            ..Default::default()
+        };
+        assert!(!policy.is_permissive());
+        let err = check_policy(&unsigned_manifest(), &policy).unwrap_err();
+        assert!(err.contains("not signed"), "{err}");
+    }
+
+    #[test]
+    fn require_signed_accepts_a_signed_manifest() {
+        let mut signed = unsigned_manifest();
+        sign_with_fresh_key(&mut signed);
+        let policy = SignaturePolicy {
+            require_signed: true,
+            ..Default::default()
+        };
+        assert!(check_policy(&signed, &policy).is_ok());
+    }
+
+    #[test]
+    fn a_signer_allowlist_refuses_a_key_it_does_not_list() {
+        let mut signed = unsigned_manifest();
+        sign_with_fresh_key(&mut signed);
+        let policy = SignaturePolicy {
+            require_signed: false,
+            trusted_signers: vec!["c29tZSBvdGhlciBrZXk=".to_string()],
+        };
+        let err = check_policy(&signed, &policy).unwrap_err();
+        assert!(err.contains("trusted signer list"), "{err}");
+    }
+
+    #[test]
+    fn a_signer_allowlist_accepts_the_listed_key() {
+        let mut signed = unsigned_manifest();
+        let signer = sign_with_fresh_key(&mut signed);
+        let policy = SignaturePolicy {
+            require_signed: false,
+            trusted_signers: vec![signer],
+        };
+        assert!(check_policy(&signed, &policy).is_ok());
+    }
+
+    #[test]
+    fn a_tampered_manifest_is_refused_under_any_policy() {
+        let mut signed = unsigned_manifest();
+        let signer = sign_with_fresh_key(&mut signed);
+        signed.description = "changed after signing".to_string();
+        // Even a policy that would otherwise accept this signer.
+        let policy = SignaturePolicy {
+            require_signed: true,
+            trusted_signers: vec![signer],
+        };
+        let err = check_policy(&signed, &policy).unwrap_err();
+        assert!(err.contains("signature mismatch"), "{err}");
     }
 }

@@ -66,11 +66,29 @@ pub struct PluginRuntime {
     event_dispatch_handle: Option<tokio::task::JoinHandle<()>>,
     /// Per-plugin metrics registry
     metrics: Arc<PluginMetricsRegistry>,
+    /// What the deployment requires of a manifest signature on top of the
+    /// cryptographic check. Permissive unless configured otherwise.
+    signature_policy: crate::plugins::verification::SignaturePolicy,
 }
 
 impl PluginRuntime {
     /// Create a new plugin runtime whose plugin state lives under `state_root`.
+    ///
+    /// Signature verification is cryptographic only; see
+    /// [`Self::with_signature_policy`] to also require a signature or restrict
+    /// which signers are accepted.
     pub fn new(state_root: std::path::PathBuf) -> crate::Result<Self> {
+        Self::with_signature_policy(
+            state_root,
+            crate::plugins::verification::SignaturePolicy::default(),
+        )
+    }
+
+    /// Create a runtime that enforces `policy` on every manifest it loads.
+    pub fn with_signature_policy(
+        state_root: std::path::PathBuf,
+        signature_policy: crate::plugins::verification::SignaturePolicy,
+    ) -> crate::Result<Self> {
         #[cfg(feature = "plugins")]
         {
             let mut config = wasmtime::Config::default();
@@ -117,6 +135,7 @@ impl PluginRuntime {
                 event_dispatch_handle,
                 metrics: Arc::new(PluginMetricsRegistry::new()),
                 state_root,
+                signature_policy,
             })
         }
 
@@ -126,8 +145,14 @@ impl PluginRuntime {
                 plugins: Arc::new(RwLock::new(HashMap::new())),
                 metrics: Arc::new(PluginMetricsRegistry::new()),
                 state_root,
+                signature_policy,
             })
         }
+    }
+
+    /// The signature policy this runtime enforces on every manifest it loads.
+    pub fn signature_policy(&self) -> &crate::plugins::verification::SignaturePolicy {
+        &self.signature_policy
     }
 
     /// Subscribe to events from a specific plugin (or `"*"` for all).
@@ -374,16 +399,19 @@ impl PluginRuntime {
         #[cfg(feature = "plugins")]
         Self::validate_manifest_version(&manifest);
 
-        // Verify manifest signature (reject invalid signatures)
+        // Verify manifest signature (reject invalid signatures), then apply the
+        // deployment's policy on top — a valid signature proves the manifest is
+        // unmodified, not that its author is anyone in particular.
         #[cfg(feature = "plugins")]
         {
             let verification = crate::plugins::verification::verify_manifest(&manifest);
             crate::plugins::verification::log_verification(&plugin_id, &verification);
-            if matches!(verification, crate::plugins::verification::VerificationResult::Invalid(_))
+            if let Err(reason) =
+                crate::plugins::verification::check_policy(&manifest, &self.signature_policy)
             {
                 return Err(crate::error::SyscityError::Validation(format!(
-                    "Plugin '{}' has an invalid manifest signature and cannot be loaded",
-                    plugin_id
+                    "Plugin '{}' cannot be loaded: {}",
+                    plugin_id, reason
                 )));
             }
         }
@@ -1228,6 +1256,48 @@ mod tests {
 
         let plugin = runtime.get_plugin("com.test.loader").await.unwrap();
         assert_eq!(plugin.name(), "Loader Test");
+    }
+
+    /// The same manifest, refused once the deployment requires a signature —
+    /// the policy has to be enforced at load, not merely available.
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn test_load_plugin_refuses_an_unsigned_manifest_when_required() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "id": "com.test.unsigned",
+            "name": "Unsigned Test",
+            "version": "0.1.0",
+            "description": "Has no signature"
+        });
+        tokio::fs::write(
+            temp_dir.path().join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let runtime = PluginRuntime::with_signature_policy(
+            std::env::temp_dir().join("syscity-plugin-tests"),
+            crate::plugins::verification::SignaturePolicy {
+                require_signed: true,
+                trusted_signers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let err = runtime
+            .load_plugin(temp_dir.path())
+            .await
+            .expect_err("an unsigned manifest must be refused")
+            .to_string();
+        assert!(err.contains("not signed"), "{err}");
+
+        // Reloading the same directory under the default policy still works, so
+        // the refusal is the policy and not the manifest.
+        let permissive =
+            PluginRuntime::new(std::env::temp_dir().join("syscity-plugin-tests")).unwrap();
+        assert!(permissive.load_plugin(temp_dir.path()).await.is_ok());
     }
 
     #[tokio::test]

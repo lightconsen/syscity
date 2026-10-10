@@ -87,10 +87,19 @@ pub struct PluginManager {
 impl PluginManager {
     /// Create a new plugin manager
     pub async fn new(plugins_dir: PathBuf) -> crate::Result<Self> {
+        Self::with_signature_policy(plugins_dir, Default::default()).await
+    }
+
+    /// Create a plugin manager that enforces `policy` on every plugin it loads.
+    pub async fn with_signature_policy(
+        plugins_dir: PathBuf,
+        policy: crate::plugins::verification::SignaturePolicy,
+    ) -> crate::Result<Self> {
         // `plugins_data_dir()` is defined as `<root>/plugins/data`, and this manager
         // is constructed with `<root>/plugins`, so the state root is derived here
         // rather than read from the process global.
-        let runtime = Arc::new(PluginRuntime::new(plugins_dir.join("data"))?);
+        let runtime =
+            Arc::new(PluginRuntime::with_signature_policy(plugins_dir.join("data"), policy)?);
         let hook_registry = Arc::new(HookRegistry::new());
 
         // Ensure plugins directory exists

@@ -110,7 +110,7 @@ pub async fn init_computer_adapter(
 
 /// Initialize the plugin manager and wire provider callbacks.
 pub async fn init_plugin_manager(
-    _config: &GatewayConfig,
+    config: &GatewayConfig,
     tool_registry: Arc<ToolRegistry>,
     model_router: Arc<ModelRouter>,
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
@@ -119,7 +119,9 @@ pub async fn init_plugin_manager(
 ) -> crate::Result<Arc<PluginManager>> {
     let plugins_dir = paths.config_dir().join("plugins");
     let plugin_manager = {
-        let pm = PluginManager::new(plugins_dir).await?;
+        let pm =
+            PluginManager::with_signature_policy(plugins_dir, config.plugins.signature_policy())
+                .await?;
         pm.set_tool_registry(tool_registry);
         Arc::new(pm)
     };

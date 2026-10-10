@@ -49,6 +49,13 @@ enabled = true
 [plugins]
 enabled = true
 
+# Signature policy. A signature proves a manifest is unmodified, not that its
+# author is anyone in particular — a plugin can sign itself with a key it just
+# generated — so both default to off/empty. `plugins.sign` prints the public
+# key a plugin was signed with.
+require_signed = false        # refuse a plugin whose manifest carries no signature
+trusted_signers = []          # base64 ed25519 public keys; non-empty = only these load
+
 # ── Cron ─────────────────────────────────────────────────────────────
 [cron]
 enabled = true

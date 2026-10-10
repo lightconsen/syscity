@@ -992,6 +992,17 @@ pub struct PluginConfig {
     pub auto_load: bool,
     /// Plugin directory path (None = default)
     pub plugin_dir: Option<String>,
+    /// Refuse to load a plugin whose manifest carries no signature.
+    ///
+    /// Off by default: signing is optional, and a signature only proves the
+    /// manifest is unmodified — a plugin can sign itself with a key it just
+    /// generated. Turn this on to require one anyway.
+    #[serde(default)]
+    pub require_signed: bool,
+    /// When non-empty, a signed plugin loads only if its `signer_public_key`
+    /// (base64, as written by `plugins.sign`) is one of these.
+    #[serde(default)]
+    pub trusted_signers: Vec<String>,
 }
 
 impl Default for PluginConfig {
@@ -1000,6 +1011,18 @@ impl Default for PluginConfig {
             enabled: true,
             auto_load: true,
             plugin_dir: None,
+            require_signed: false,
+            trusted_signers: Vec::new(),
+        }
+    }
+}
+
+impl PluginConfig {
+    /// The signature policy these settings describe.
+    pub fn signature_policy(&self) -> crate::plugins::verification::SignaturePolicy {
+        crate::plugins::verification::SignaturePolicy {
+            require_signed: self.require_signed,
+            trusted_signers: self.trusted_signers.clone(),
         }
     }
 }
