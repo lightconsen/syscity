@@ -57,6 +57,19 @@ impl syscity::outbound::OutboundPipeline for DummyOutboundPipeline {
 // ── Test helper: construct a minimal GatewayState
 // ─────────────────────────────
 
+/// A secrets handle rooted in a fresh temp dir.
+///
+/// Deliberately not `SecretStoreHandle::new()`: that means "the process-default
+/// store", so it reads the real `~/.syscity` and probes the OS keychain — on
+/// macOS a password prompt, from a test that has nothing to do with secrets.
+fn test_secrets() -> Arc<syscity::secrets::SecretStoreHandle> {
+    let root =
+        std::env::temp_dir().join(format!("syscity_msg_tool_secrets_{}", uuid::Uuid::new_v4()));
+    Arc::new(
+        syscity::secrets::SecretStoreHandle::with_root(root).expect("secrets handle for the test"),
+    )
+}
+
 async fn make_test_state(config: GatewayConfig) -> GatewayState {
     // Builds a bare `GatewayState`, bypassing gateway startup — so it must
     // install a root itself (see `install_test_root` in the parent module).
@@ -100,7 +113,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             .expect("skill manager"),
     ));
 
-    let secrets = Arc::new(syscity::secrets::SecretStoreHandle::new());
+    let secrets = test_secrets();
 
     GatewayState {
         config: Arc::new(RwLock::new(Arc::new(config))),
@@ -179,7 +192,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
                 )),
                 #[cfg(feature = "cloud")]
                 None,
-                Arc::new(syscity::secrets::SecretStoreHandle::new()),
+                test_secrets(),
                 syscity::dirs::paths(),
             )),
             approval_queue: Arc::new(syscity::tools::approval::ApprovalQueue::new()),

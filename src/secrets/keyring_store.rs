@@ -360,10 +360,26 @@ fn now_unix_secs() -> u64 {
 /// lifetime. Under `cfg(test)` the probe always returns `false` so tests never
 /// touch a real keychain.
 pub fn probe_keyring() -> bool {
-    if keyring_disabled() {
+    if keyring_disabled() || running_under_cargo_test() {
         return false;
     }
     KEYRING_HEALTH.available(now_unix_secs(), probe_keyring_uncached)
+}
+
+/// Whether this process is an integration-test binary launched by cargo.
+///
+/// `cfg(test)` covers the library's own unit-test binary, but an integration
+/// test links the library built **normally** — its `cfg(test)` is false, so a
+/// process-default secrets handle reaches the developer's real keychain. On
+/// macOS that is a password prompt, once per test binary, before the first test
+/// runs; and it is not only the probe that prompts, since a handle that decides
+/// the keyring is available routes every later secret read and write to it too.
+///
+/// `CARGO_BIN_EXE_<name>` is the signal: cargo sets it for integration-test and
+/// benchmark targets and nothing else. A run of the real binary through
+/// `cargo run` does not have it.
+fn running_under_cargo_test() -> bool {
+    std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CARGO_BIN_EXE_"))
 }
 
 /// Whether `SYSCITY_DISABLE_KEYRING` turns the OS keyring off for this process.
@@ -404,14 +420,26 @@ fn probe_keyring_uncached() -> bool {
             return false;
         }
     };
-    // Clear any stale probe result, then verify a full write/read cycle.
-    let _ = entry.delete_credential();
-    if entry.set_password("probe-ok").is_err() {
-        return false;
+    // Read-only, deliberately. A probe that wrote — which this one used to, with
+    // a `set_password`/`delete_credential` pair — creates and destroys a real
+    // keychain item on every call, and on macOS that raises an access dialog for
+    // whoever is at the machine, for a check whose only job is to pick a routing.
+    // Any binary that linked the library and built a default secrets handle
+    // popped one, tests included.
+    //
+    // Whether *writes* work is answered by the first real write instead: a
+    // failed operation marks the keyring down and routing degrades to the file
+    // store (see `KEYRING_HEALTH`, `mark_keyring_down`). Reaching the backend is
+    // what this check is for.
+    match entry.get_password() {
+        Ok(_) => true,
+        // The backend answered; there is simply no probe item yet.
+        Err(keyring::Error::NoEntry) => true,
+        Err(e) => {
+            tracing::debug!("Keyring probe failed: {e}");
+            false
+        }
     }
-    let ok = matches!(entry.get_password().as_deref(), Ok("probe-ok"));
-    let _ = entry.delete_credential();
-    ok
 }
 
 // ─────────────────────────────────────────────

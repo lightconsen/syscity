@@ -58,7 +58,13 @@ async fn chrome_devtools_connector_full_cycle() {
         Arc::new(SkillStorage::with_user_dir(user_skills.clone())),
         #[cfg(feature = "cloud")]
         None,
-        Arc::new(syscity::secrets::SecretStoreHandle::default()),
+        // Rooted in the test's own temp dir: the process-default handle would
+        // read the real `~/.syscity` and probe the OS keychain, which on macOS
+        // is a password prompt for a test that has nothing to do with secrets.
+        Arc::new(
+            syscity::secrets::SecretStoreHandle::with_root(base.join("secrets"))
+                .expect("secrets handle rooted in the test dir"),
+        ),
         syscity::dirs::paths(),
     );
 
