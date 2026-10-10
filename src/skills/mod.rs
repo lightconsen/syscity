@@ -27,6 +27,7 @@ mod builtin;
 mod builtin_macros;
 mod chain;
 mod config;
+pub mod curator;
 pub mod dependencies;
 mod frontmatter;
 pub mod guard;

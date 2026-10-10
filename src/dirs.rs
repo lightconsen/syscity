@@ -338,6 +338,16 @@ fn default_paths_root() -> Arc<SyscityPaths> {
 /// caller decides whether the difference is fatal (it is harmless when both
 /// resolve to the same root). This is deliberately *not* a mutable global:
 /// the root is fixed for the life of the process.
+/// The process default root, when one has been installed.
+///
+/// Unlike [`paths`], this neither falls back to resolving `SYSCITY_HOME`/`~` nor
+/// panics when nothing installed one. A caller that only wants to *recognise* a
+/// path — the write tool noticing that the agent just authored a skill — must
+/// not force a root into existence to do it.
+pub fn installed_paths() -> Option<Arc<SyscityPaths>> {
+    DEFAULT_PATHS.get().cloned()
+}
+
 pub fn set_default_paths(paths: Arc<SyscityPaths>) -> Result<(), Arc<SyscityPaths>> {
     DEFAULT_PATHS.set(paths)
 }

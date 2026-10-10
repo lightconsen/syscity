@@ -48,6 +48,9 @@ pub struct GatewayConfig {
     /// Cron scheduler configuration
     #[serde(default)]
     pub cron: CronConfig,
+    /// Skill lifecycle configuration
+    #[serde(default)]
+    pub skills: SkillsConfig,
     /// Heartbeat scheduler configuration
     #[serde(default)]
     pub heartbeat: crate::heartbeat::HeartbeatConfig,
@@ -1101,6 +1104,60 @@ impl Default for CronConfig {
     }
 }
 
+/// Skill lifecycle configuration — currently the curator that archives
+/// agent-authored skills nobody uses.
+///
+/// On by default, and archive-only: a skill the agent wrote and nobody has
+/// activated for `curator_archive_after_days` moves to `skills/.archive/`,
+/// where `syscity skill restore` puts it back. Skills the operator placed by
+/// hand and skills installed from the catalog are never touched — see
+/// `skills::curator`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// Run the periodic curator pass.
+    #[serde(default = "default_true")]
+    pub curator_enabled: bool,
+    /// How often it looks, in seconds.
+    #[serde(default = "default_curator_interval_seconds")]
+    pub curator_interval_seconds: u64,
+    /// Days without an activation before an agent-authored skill is archived.
+    #[serde(default = "default_curator_archive_after_days")]
+    pub curator_archive_after_days: i64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_curator_interval_seconds() -> u64 {
+    6 * 60 * 60
+}
+
+fn default_curator_archive_after_days() -> i64 {
+    30
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            curator_enabled: default_true(),
+            curator_interval_seconds: default_curator_interval_seconds(),
+            curator_archive_after_days: default_curator_archive_after_days(),
+        }
+    }
+}
+
+impl SkillsConfig {
+    /// The curator settings this config describes.
+    pub fn curator(&self) -> crate::skills::curator::CuratorConfig {
+        crate::skills::curator::CuratorConfig {
+            enabled: self.curator_enabled,
+            interval_seconds: self.curator_interval_seconds,
+            archive_after_days: self.curator_archive_after_days,
+        }
+    }
+}
+
 /// Cost guard configuration — live spend and action-rate tracking.
 ///
 /// Set `daily_limit_cents` and/or `hourly_action_limit` to non-zero values to
@@ -1485,6 +1542,7 @@ impl Default for GatewayConfig {
             hot_reload: HotReloadConfig::default(),
             acp: AcpConfig::default(),
             cron: CronConfig::default(),
+            skills: SkillsConfig::default(),
             heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             security: SecurityConfig::default(),
             #[cfg(feature = "cloud")]

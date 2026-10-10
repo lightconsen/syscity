@@ -56,6 +56,20 @@ enabled = true
 require_signed = false        # refuse a plugin whose manifest carries no signature
 trusted_signers = []          # base64 ed25519 public keys; non-empty = only these load
 
+# ── Skills ───────────────────────────────────────────────────────────
+[skills]
+# The curator archives skills the *agent* authored (via `/learn` or any
+# `file_write` into the skills directory) that nobody has activated for
+# `curator_archive_after_days`. They move to `skills/.archive/` and come back
+# with `syscity skill restore <name>` — it archives, never deletes.
+#
+# Skills you placed by hand have no install record and skills installed from
+# the catalog are not the agent's to tidy, so neither is ever touched; a pinned
+# skill is out of scope regardless of age.
+curator_enabled = true
+curator_interval_seconds = 21600    # 6h between passes
+curator_archive_after_days = 30
+
 # ── Cron ─────────────────────────────────────────────────────────────
 [cron]
 enabled = true

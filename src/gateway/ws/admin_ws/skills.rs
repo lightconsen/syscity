@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
@@ -316,6 +316,63 @@ pub(crate) async fn handle_skills_rollback(
             &req.id,
             serde_json::json!({ "success": true, "id": p.id, "version": p.version }),
         ),
+        Err(e) => WsResponse::err(&req.id, "NOT_FOUND", e.to_string()),
+    }
+}
+
+/// `skills.archived` — the skills the curator has moved out of the live set.
+///
+/// Takes `state` like every other admin handler (the dispatcher is uniform),
+/// but the archive is a directory listing, so the answer needs nothing from it.
+pub(crate) async fn handle_skills_archived(
+    req: &WsRequest,
+    _state: &Arc<GatewayState>,
+) -> WsResponse {
+    let archived = crate::skills::curator::archived(&crate::dirs::skills_dir()).await;
+    WsResponse::ok(&req.id, serde_json::json!({ "archived": archived }))
+}
+
+/// `skills.archive` — move a skill out of the live set by hand.
+pub(crate) async fn handle_skills_archive(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    match crate::skills::curator::archive(&crate::dirs::skills_dir(), &id).await {
+        Ok(path) => {
+            let sm = state.tools.skills_manager.read().await;
+            if let Err(e) = sm.reload().await {
+                warn!("Skill reload after archiving '{id}' failed: {e}");
+            }
+            WsResponse::ok(
+                &req.id,
+                serde_json::json!({ "success": true, "id": id, "path": path.display().to_string() }),
+            )
+        }
+        Err(e) => WsResponse::err(&req.id, "NOT_FOUND", e.to_string()),
+    }
+}
+
+/// `skills.restore` — put an archived skill back in the live set.
+pub(crate) async fn handle_skills_restore(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let id = match super::required_str_param(req, "id") {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    match crate::skills::curator::restore(&crate::dirs::skills_dir(), &id).await {
+        Ok(()) => {
+            let sm = state.tools.skills_manager.read().await;
+            if let Err(e) = sm.reload().await {
+                warn!("Skill reload after restoring '{id}' failed: {e}");
+            }
+            WsResponse::ok(&req.id, serde_json::json!({ "success": true, "id": id }))
+        }
         Err(e) => WsResponse::err(&req.id, "NOT_FOUND", e.to_string()),
     }
 }

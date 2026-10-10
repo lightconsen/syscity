@@ -351,6 +351,28 @@ impl Tool for FileWriteTool {
             guard.record(&context.conversation_id, &path);
         }
 
+        // A skill the agent wrote is one the agent authored — and this is the
+        // only moment that is knowable. `/learn` authors a skill by having the
+        // model call this tool, so the write path is where the fact can be
+        // recorded; it is what lets the curator tell an agent-written skill
+        // from one an operator placed by hand, which it must never archive.
+        //
+        // Scoped to the skills directory: a `SKILL.md` written anywhere else is
+        // a file, not an installed skill.
+        if path.file_name().is_some_and(|n| n == "SKILL.md") {
+            let in_skills_dir = crate::dirs::installed_paths()
+                .is_some_and(|paths| path.starts_with(paths.skills_dir()));
+            if in_skills_dir {
+                if let Some(skill_dir) = path.parent() {
+                    crate::skills::install_state::note_agent_authored(
+                        skill_dir,
+                        &context.conversation_id,
+                    )
+                    .await;
+                }
+            }
+        }
+
         info!("Wrote {} bytes to {}", content.len(), path.display());
 
         Ok(ToolExecutionResult::success(format!(
@@ -1240,5 +1262,58 @@ mod tests {
         assert!(result.success);
 
         let _ = tokio_fs::remove_file(&test_file).await;
+    }
+}
+
+/// Authoring a skill with `file_write` marks the agent as its author.
+///
+/// `/learn` authors a skill by having the model call this tool, so the write is
+/// the only place the fact is knowable — and the curator relies on it to leave
+/// hand-placed and catalog-installed skills alone.
+#[cfg(test)]
+mod authorship_tests {
+    use super::*;
+    use crate::tools::Tool;
+
+    async fn write_skill(dir: &std::path::Path, conversation: &str) -> crate::Result<()> {
+        let tool = FileWriteTool::new();
+        let path = dir.join("SKILL.md");
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "content": "---\nname: stamped\ndescription: \"d\"\n---\n\nbody\n",
+        });
+        // The workspace root is what makes the write allowed at all; the skills
+        // directory is separately granted by `is_path_allowed`.
+        let ctx = ToolContext::new("user", conversation).with_workspace_root(dir);
+        assert!(tool.execute(args, &ctx).await.unwrap().success);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writing_a_skill_under_the_skills_dir_stamps_the_agent() {
+        let dir = crate::dirs::skills_dir().join(format!("stamped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_skill(&dir, "conv-42").await.unwrap();
+
+        let state = crate::skills::install_state::load(&dir).await;
+        assert!(
+            crate::skills::install_state::is_agent_authored(&state),
+            "the agent's own skill must record that the agent wrote it"
+        );
+        assert_eq!(state.source.as_deref(), Some("agent:conv-42"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same file elsewhere is just a file: stamping it would put a
+    /// markdown file in a repo on the curator's list.
+    #[tokio::test]
+    async fn a_skill_file_outside_the_skills_dir_is_not_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "conv-1").await.unwrap();
+
+        let state = crate::skills::install_state::load(dir.path()).await;
+        assert!(!crate::skills::install_state::is_agent_authored(&state));
     }
 }

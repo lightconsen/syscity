@@ -437,6 +437,80 @@ pub async fn init_cron(config: &GatewayConfig, state: &Arc<GatewayState>) -> cra
 }
 
 /// Initialize the recurring task scheduler.
+/// Periodically archive agent-authored skills nobody uses.
+///
+/// The pass runs on its own clock (`[skills] curator_interval_seconds`) rather
+/// than on a session event, because staleness is a property of the calendar,
+/// not of a conversation. The first pass waits one full interval: archiving at
+/// startup would mean a daemon that restarts often never gives a skill the
+/// window it was promised.
+pub async fn init_skill_curator(
+    config: &GatewayConfig,
+    state: &Arc<GatewayState>,
+) -> crate::Result<()> {
+    let curator_config = config.skills.curator();
+    if !curator_config.enabled {
+        debug!("Skill curator disabled by configuration");
+        return Ok(());
+    }
+
+    let skills_dir = crate::dirs::skills_dir();
+    // A misconfigured zero would turn the loop into a spin.
+    let interval = std::time::Duration::from_secs(curator_config.interval_seconds.max(60));
+    let shutdown = state.shutdown_token.clone();
+    let task_state = Arc::clone(state);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+
+            let candidates = crate::skills::curator::stale(
+                &skills_dir,
+                curator_config.archive_after_days,
+                chrono::Utc::now(),
+            )
+            .await;
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let mut archived_any = false;
+            for candidate in candidates {
+                match crate::skills::curator::archive(&skills_dir, &candidate.name).await {
+                    Ok(path) => {
+                        info!(
+                            "Curator archived unused agent skill '{}' to {} (last reference: {:?})",
+                            candidate.name,
+                            path.display(),
+                            candidate.reference()
+                        );
+                        archived_any = true;
+                    }
+                    Err(e) => {
+                        warn!("Curator could not archive skill '{}': {}", candidate.name, e);
+                    }
+                }
+            }
+
+            // Only the live catalog changed, and only if something moved.
+            if archived_any {
+                if let Err(e) = task_state.tools.skills_manager.write().await.reload().await {
+                    warn!("Skill reload after curating failed: {}", e);
+                }
+            }
+        }
+    });
+
+    state
+        .task_registry
+        .insert_join("skills:curator", handle)
+        .await;
+    Ok(())
+}
+
 pub async fn init_task_scheduler(state: &Arc<GatewayState>) -> crate::Result<()> {
     let mut task_scheduler = crate::planner::TaskScheduler::new();
     let state_for_scheduler = Arc::clone(state);
@@ -699,6 +773,7 @@ pub async fn init_late_services(
     init_kb_manager(config, state, sqlite_pool, unified_vector_store).await?;
     init_hot_reload(config, state).await?;
     init_cron(config, state).await?;
+    init_skill_curator(config, state).await?;
     init_task_scheduler(state).await?;
     init_side_effect_context(state).await;
     Ok(())

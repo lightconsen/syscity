@@ -1148,6 +1148,9 @@ async fn dispatch_method(
         "skills.install_source" => admin_ws::handle_skills_install_source(req, state).await,
         "skills.pin" => admin_ws::handle_skills_pin(req, state).await,
         "skills.rollback" => admin_ws::handle_skills_rollback(req, state).await,
+        "skills.archived" => admin_ws::handle_skills_archived(req, state).await,
+        "skills.archive" => admin_ws::handle_skills_archive(req, state).await,
+        "skills.restore" => admin_ws::handle_skills_restore(req, state).await,
         _ => error_method_not_found(&req.id, &req.method),
     }
 }

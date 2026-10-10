@@ -1209,3 +1209,56 @@ async fn plugins_versions_pin_and_rollback_cover_the_lifecycle() {
 
     std::fs::remove_dir_all(state.paths.config_dir().join("plugins")).unwrap();
 }
+
+/// The archive surface a client uses. The curator archives on its own clock;
+/// these are the manual equivalents, and `restore` is the reason archiving is
+/// safe to do automatically at all.
+#[tokio::test]
+async fn skills_archive_and_restore_round_trip_over_ws() {
+    let state = state().await;
+    let name = format!("archivable-{}", std::process::id());
+    plant_skill(&state, &name, "1.0.0").await;
+
+    let before = handle_skills_archived(&req("a0", "skills.archived", None), &state).await;
+    assert!(before.ok, "{:?}", before.error);
+    assert_eq!(before.payload.expect("payload")["archived"], serde_json::json!([]));
+
+    let done = handle_skills_archive(
+        &req("a1", "skills.archive", Some(serde_json::json!({ "id": name }))),
+        &state,
+    )
+    .await;
+    assert!(done.ok, "{:?}", done.error);
+    assert!(!crate::dirs::skills_dir().join(&name).exists(), "left the live set");
+
+    let listed = handle_skills_archived(&req("a2", "skills.archived", None), &state).await;
+    let archived = listed.payload.expect("payload");
+    assert!(
+        archived["archived"]
+            .as_array()
+            .expect("array")
+            .contains(&serde_json::json!(name)),
+        "{archived:?}"
+    );
+
+    let back = handle_skills_restore(
+        &req("a3", "skills.restore", Some(serde_json::json!({ "id": name }))),
+        &state,
+    )
+    .await;
+    assert!(back.ok, "{:?}", back.error);
+    assert!(crate::dirs::skills_dir()
+        .join(&name)
+        .join("SKILL.md")
+        .exists());
+
+    // Restoring something that is not archived is an error, not a no-op.
+    let missing = handle_skills_restore(
+        &req("a4", "skills.restore", Some(serde_json::json!({ "id": name }))),
+        &state,
+    )
+    .await;
+    assert!(!missing.ok);
+
+    std::fs::remove_dir_all(crate::dirs::skills_dir().join(&name)).unwrap();
+}

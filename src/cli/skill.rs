@@ -104,6 +104,18 @@ pub enum SkillCommands {
         /// Version to restore (see `skill versions`)
         version: String,
     },
+    /// List the skills the curator has archived
+    Archived,
+    /// Move a skill out of the live set (the curator does this automatically)
+    Archive {
+        /// Skill name/ID
+        id: String,
+    },
+    /// Put an archived skill back in the live set
+    Restore {
+        /// Skill name/ID
+        id: String,
+    },
 }
 
 /// Run skill commands (over WebSocket).
@@ -226,6 +238,26 @@ pub async fn run_skill_command(command: &SkillCommands) -> Result<()> {
         SkillCommands::Rollback { id, version } => {
             ws::call("skills.rollback", json!({ "id": id, "version": version })).await?;
             println!("Skill '{}' rolled back to {version}.", id);
+        }
+        SkillCommands::Archived => {
+            let payload = ws::call("skills.archived", json!({})).await?;
+            let names = payload["archived"].as_array().cloned().unwrap_or_default();
+            if names.is_empty() {
+                println!("No archived skills.");
+            } else {
+                println!("Archived skills ({}):", names.len());
+                for name in names {
+                    println!("  {}", name.as_str().unwrap_or("?"));
+                }
+            }
+        }
+        SkillCommands::Archive { id } => {
+            ws::call("skills.archive", json!({ "id": id })).await?;
+            println!("Skill '{id}' archived. `skill restore {id}` puts it back.");
+        }
+        SkillCommands::Restore { id } => {
+            ws::call("skills.restore", json!({ "id": id })).await?;
+            println!("Skill '{id}' restored.");
         }
         SkillCommands::Run { id, input, context } => {
             let body = json!({

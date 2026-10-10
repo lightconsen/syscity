@@ -100,6 +100,43 @@ pub async fn record_use(skill_dir: &std::path::Path) -> crate::Result<()> {
     save(skill_dir, &state).await
 }
 
+/// The `source` value meaning "the agent authored this skill".
+///
+/// `agent:<conversation>` — the same prefix shape as `catalog:`/`git:`/`local:`.
+pub const AGENT_SOURCE_PREFIX: &str = "agent:";
+
+/// Whether this record says the agent — rather than an operator or a
+/// marketplace — authored the skill.
+pub fn is_agent_authored(state: &InstallState) -> bool {
+    state
+        .source
+        .as_deref()
+        .is_some_and(|s| s.starts_with(AGENT_SOURCE_PREFIX))
+}
+
+/// Note that the agent authored the skill in `skill_dir`, unless it already has
+/// a record.
+///
+/// Best-effort, and deliberately a no-op when a record exists: a catalog or git
+/// install already knows where it came from, and that provenance is the more
+/// useful fact. A skill with no record is one the operator placed by hand, and
+/// leaving it unstamped is what keeps the curator off it.
+pub async fn note_agent_authored(skill_dir: &std::path::Path, conversation_id: &str) {
+    if skill_dir.join(STATE_FILE).exists() {
+        return;
+    }
+    let state = InstallState {
+        source: Some(format!("{AGENT_SOURCE_PREFIX}{conversation_id}")),
+        installed_at: Some(chrono::Utc::now()),
+        ..Default::default()
+    };
+    if let Err(e) = save(skill_dir, &state).await {
+        // The cost of a missing stamp is only that the curator leaves the skill
+        // alone, so this must not fail the write that produced it.
+        tracing::warn!("could not record that the agent authored {:?}: {e}", skill_dir.display());
+    }
+}
+
 /// Back up the current `SKILL.md` before a replacement overwrites it.
 ///
 /// The backup is named for the version being replaced: from the install record
