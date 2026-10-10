@@ -144,6 +144,44 @@ impl Default for ToolModel {
     }
 }
 
+/// A ceiling on the trust level the rest of a turn may run under, shared between
+/// the agent that owns the turn and the tools that can lower it.
+///
+/// Loading a `Community`-trust skill lowers the ceiling; the next `ToolContext`
+/// the agent builds carries it, and [`crate::tools::registry::ToolRegistry`]
+/// withholds privileged tools from anyone below `Trusted`. It only ever lowers
+/// within a turn — the agent resets it when the next turn begins.
+#[derive(Debug, Clone)]
+pub struct SkillTrustCeiling(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl SkillTrustCeiling {
+    /// Wrap a value shared with whoever owns the turn.
+    pub fn new(shared: std::sync::Arc<std::sync::atomic::AtomicU8>) -> Self {
+        Self(shared)
+    }
+
+    /// Lower the ceiling to `trust` when that is stricter than the current
+    /// value. Never raises it: one community skill in a turn is enough.
+    pub fn lower_to(&self, trust: SkillTrust) {
+        self.0
+            .fetch_min(trust as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The ceiling as it stands.
+    pub fn get(&self) -> SkillTrust {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => SkillTrust::Community,
+            _ => SkillTrust::Trusted,
+        }
+    }
+
+    /// Raise the ceiling back to `Trusted`, for the start of a fresh turn.
+    pub fn reset(&self) {
+        self.0
+            .store(SkillTrust::Trusted as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The execution context for a tool
 ///
 /// Groups fields into three sub-structs for construction ergonomics:
@@ -170,6 +208,10 @@ pub struct ToolContext {
     /// Approval queue, so a command the fence refused can ask whether to run
     /// outside it. Attached wherever the ask queue is.
     pub approval_queue: Option<Arc<crate::tools::approval::ApprovalQueue>>,
+    /// Shared ceiling a tool may lower when it loads a skill with less trust
+    /// than the turn started with. `None` in contexts built outside an agent
+    /// turn (tests, one-off tool use), where nothing can lower it.
+    pub skill_trust_ceiling: Option<SkillTrustCeiling>,
 }
 
 /// Allowed environment variables that are safe to forward to child processes.
@@ -301,6 +343,18 @@ impl ToolContext {
     pub fn with_skill_trust(mut self, trust: SkillTrust) -> Self {
         self.model.skill_trust = trust;
         self
+    }
+
+    /// Attach the turn's skill-trust ceiling, so a tool that loads a
+    /// community-trust skill can lower it for the rest of the turn.
+    pub fn with_skill_trust_ceiling(mut self, ceiling: SkillTrustCeiling) -> Self {
+        self.skill_trust_ceiling = Some(ceiling);
+        self
+    }
+
+    /// The turn's skill-trust ceiling, when one is attached.
+    pub fn skill_trust_ceiling(&self) -> Option<&SkillTrustCeiling> {
+        self.skill_trust_ceiling.as_ref()
     }
 
     /// Set the model name for model-based tool gating.
@@ -892,5 +946,57 @@ mod path_permission_tests {
         let ctx = ToolContext::new("user", "conv").with_workspace_root("/tmp");
         assert!(ctx.is_path_allowed(std::path::Path::new("/tmp/notes.md")));
         assert!(!ctx.is_path_allowed(std::path::Path::new("/etc/passwd")));
+    }
+}
+
+#[cfg(test)]
+mod trust_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn lowering_is_one_way_until_reset() {
+        let ceiling = SkillTrustCeiling::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU8::new(SkillTrust::Trusted as u8),
+        ));
+        assert_eq!(ceiling.get(), SkillTrust::Trusted);
+
+        ceiling.lower_to(SkillTrust::Community);
+        assert_eq!(ceiling.get(), SkillTrust::Community);
+
+        // A later trusted skill must not undo the constraint the turn earned.
+        ceiling.lower_to(SkillTrust::Trusted);
+        assert_eq!(ceiling.get(), SkillTrust::Community);
+
+        ceiling.reset();
+        assert_eq!(ceiling.get(), SkillTrust::Trusted);
+    }
+
+    /// Two contexts built from the same agent share one ceiling, so a tool
+    /// lowering it is visible to the next context the agent builds.
+    #[test]
+    fn the_ceiling_is_shared_between_contexts() {
+        let shared =
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(SkillTrust::Trusted as u8));
+        let ctx = ToolContext::new("user", "conv")
+            .with_skill_trust_ceiling(SkillTrustCeiling::new(shared.clone()));
+
+        ctx.skill_trust_ceiling()
+            .expect("ceiling attached")
+            .lower_to(SkillTrust::Community);
+
+        let next = ToolContext::new("user", "conv")
+            .with_skill_trust_ceiling(SkillTrustCeiling::new(shared));
+        assert_eq!(
+            next.skill_trust_ceiling().expect("ceiling attached").get(),
+            SkillTrust::Community
+        );
+    }
+
+    /// A context built outside an agent turn has no ceiling to lower.
+    #[test]
+    fn a_bare_context_has_no_ceiling() {
+        assert!(ToolContext::new("user", "conv")
+            .skill_trust_ceiling()
+            .is_none());
     }
 }

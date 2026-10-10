@@ -36,6 +36,7 @@ fn tool_context() -> ToolContext {
         delegation: None,
         ask_queue: None,
         approval_queue: None,
+        skill_trust_ceiling: None,
     }
 }
 

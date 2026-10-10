@@ -435,6 +435,11 @@ impl Agent {
     ) -> crate::Result<OutgoingMessage> {
         debug!("Processing message with progress from user: {}", message.user_id);
 
+        // Trust is a property of the skills a turn loads, not of the agent, so
+        // it starts clean: a community skill loaded in the previous turn must
+        // not keep constraining this one.
+        self.set_skill_trust(crate::tools::SkillTrust::Trusted);
+
         let cfg = self.config_snapshot();
 
         let conversation_id = message.conversation_id.0.clone();

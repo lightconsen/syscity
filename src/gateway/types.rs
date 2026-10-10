@@ -165,14 +165,6 @@ pub struct MemoryAddRequest {
     pub collection: String,
 }
 
-// ── Skill runner ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct RunSkillRequest {
-    /// Input for the skill
-    pub input: String,
-}
-
 // ── MCP ──────────────────────────────────────────────────────────────────────
 
 fn mcp_default_timeout() -> u64 {

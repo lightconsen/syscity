@@ -471,31 +471,6 @@ pub(crate) async fn run_agent_loop(
                             );
                         }
                     }
-                    super::AgentQuery::RunSkill {
-                        session_id,
-                        message,
-                        user_id,
-                        skill_trust,
-                        response_tx,
-                    } => {
-                        agent.set_skill_trust(skill_trust);
-                        let incoming = crate::channels::IncomingMessage::new(
-                            user_id,
-                            &session_id,
-                            message,
-                        );
-                        let no_op: crate::agent::ProgressCallback =
-                            Arc::new(|_| Box::pin(async {}));
-                        let result =
-                            agent.process_message_with_progress(incoming, no_op).await;
-                        agent.set_skill_trust(crate::tools::SkillTrust::Trusted);
-                        if let Err(e) = response_tx.send(result) {
-                            warn!(
-                                "Agent {}: failed to send skill run result for {}: {:?}",
-                                agent_id, session_id, e
-                            );
-                        }
-                    }
                 }
             }
         }

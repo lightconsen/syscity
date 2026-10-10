@@ -53,7 +53,7 @@ impl Tool for SkillTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let name = args["name"].as_str().ok_or_else(|| {
             crate::error::SyscityError::Validation("Missing 'name' argument".to_string())
@@ -90,7 +90,16 @@ impl Tool for SkillTool {
         for skill_name in &order {
             // activate_skill re-verifies runtime requirements (bins, env, os).
             match manager.activate_skill(skill_name).await {
-                Ok(skill) => sections.push(skill.to_prompt_section(None)),
+                Ok(skill) => {
+                    // Loading a skill is what earns its trust level. A
+                    // community-trust skill lowers the ceiling for the rest of
+                    // the turn, so privileged tools stop being offered; the
+                    // agent resets it when the next turn begins.
+                    if let Some(ceiling) = context.skill_trust_ceiling() {
+                        ceiling.lower_to(skill.metadata.trust);
+                    }
+                    sections.push(skill.to_prompt_section(None))
+                }
                 Err(e) => {
                     return Ok(ToolExecutionResult::error(format!(
                         "Skill '{}' is unavailable: {}",

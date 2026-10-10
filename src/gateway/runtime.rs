@@ -93,17 +93,6 @@ pub enum AgentQuery {
         conv_id: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
-    /// Process a message as a skill invocation (request/response pattern).
-    RunSkill {
-        session_id: String,
-        message: String,
-        user_id: String,
-        /// Trust level of the invoking skill — constrains which tools are
-        /// available.
-        skill_trust: crate::tools::SkillTrust,
-        response_tx:
-            tokio::sync::oneshot::Sender<crate::error::Result<crate::channels::OutgoingMessage>>,
-    },
 }
 
 /// Events broadcast by gateway

@@ -214,6 +214,11 @@ impl Agent {
         let mut ctx = ToolContext::new(user_id.clone(), conversation_id)
             .with_timeout(Duration::from_secs(120))
             .with_skill_trust(self.current_skill_trust())
+            // Handed to the tools so that loading a community-trust skill lowers
+            // the ceiling the *next* context is built from.
+            .with_skill_trust_ceiling(crate::tools::SkillTrustCeiling::new(
+                self.active_skill_trust.clone(),
+            ))
             .with_workspace_root(agent_workspace.clone())
             .with_agent_workspace(agent_workspace.clone())
             .with_workspace_only(cfg.workspace_only)
@@ -833,6 +838,40 @@ mod tests {
         let ctx = agent.build_tool_context("user", "conv-1", None);
         assert!(ctx.fence_network());
         assert_eq!(ctx.fence_namespaces(), crate::tools::process_runner::NamespacePosture::Require);
+    }
+
+    /// The wiring that makes a skill's trust level mean something: the context
+    /// the agent hands a tool carries the turn's ceiling, so the `skill` tool
+    /// can lower it by loading a community-trust skill — and the *next* context
+    /// the agent builds is already constrained.
+    ///
+    /// Before this, `SkillManager::min_trust` had no caller and the agent's
+    /// trust atomic was never lowered, so community skills ran with the full
+    /// privileged tool set.
+    #[test]
+    fn loading_a_community_skill_lowers_the_next_tool_context() {
+        let agent = named_agent();
+
+        let first = agent.build_tool_context("user", "conv-1", None);
+        assert_eq!(first.model.skill_trust, crate::tools::SkillTrust::Trusted);
+
+        // What `SkillTool::execute` does after it activates a skill.
+        first
+            .skill_trust_ceiling()
+            .expect("an agent-built context carries the ceiling")
+            .lower_to(crate::tools::SkillTrust::Community);
+
+        let next = agent.build_tool_context("user", "conv-1", None);
+        assert_eq!(
+            next.model.skill_trust,
+            crate::tools::SkillTrust::Community,
+            "a community skill must constrain the tools offered afterwards"
+        );
+
+        // A fresh turn starts clean.
+        agent.set_skill_trust(crate::tools::SkillTrust::Trusted);
+        let next_turn = agent.build_tool_context("user", "conv-1", None);
+        assert_eq!(next_turn.model.skill_trust, crate::tools::SkillTrust::Trusted);
     }
 
     #[tokio::test]

@@ -892,6 +892,28 @@ mod tests {
         assert_eq!(SkillManager::min_trust(skills), crate::tools::SkillTrust::Trusted);
     }
 
+    /// One community skill is enough — the constraint is the minimum, so a
+    /// trusted skill alongside it cannot raise the result back up.
+    #[test]
+    fn test_min_trust_is_the_lowest_present() {
+        let trusted = Skill::new("trusted", "d", "p");
+        let mut community = Skill::new("community", "d", "p");
+        community.metadata.trust = crate::tools::SkillTrust::Community;
+
+        assert_eq!(
+            SkillManager::min_trust(&[trusted.clone(), trusted.clone()]),
+            crate::tools::SkillTrust::Trusted
+        );
+        assert_eq!(
+            SkillManager::min_trust(&[trusted.clone(), community.clone()]),
+            crate::tools::SkillTrust::Community
+        );
+        assert_eq!(
+            SkillManager::min_trust(&[community, trusted]),
+            crate::tools::SkillTrust::Community
+        );
+    }
+
     /// A skill file on disk is checked before it is loaded.
     ///
     /// Before this, the only thing standing between a file and the catalog was
