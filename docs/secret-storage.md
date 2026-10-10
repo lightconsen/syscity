@@ -85,6 +85,11 @@ consensus:
 3. **OS keyring is an opt-in compile-time feature**: with `--features keyring`
    the OS keychain (macOS Keychain / Windows DPAPI / Linux Secret Service) is
    the preferred backend; default builds use 0600 encrypted files everywhere.
+   `SYSCITY_DISABLE_KEYRING=1` turns it off at runtime without a rebuild — for a
+   host with no interactive keychain (a headless server, a CI runner, or the
+   test harness, which sets it so `cargo test --all-features` never prompts for
+   a macOS keychain password). The file store is used instead, exactly as it is
+   when the probe fails.
 4. **OAuth lifecycle**: access tokens stay **in memory only**; only the refresh
    token is persisted.
 5. **PKCE + minimal scope**: a desktop public client does not need a

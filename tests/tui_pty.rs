@@ -312,6 +312,10 @@ fn utf8_len(first: u8) -> usize {
 #[allow(clippy::field_reassign_with_default)]
 async fn start_gateway() -> u16 {
     let port = free_port();
+    // This binary links the library built normally, so the library's `cfg(test)`
+    // guard does not apply and the gateway would probe the developer's real
+    // keychain (a macOS password prompt) before the first test runs.
+    std::env::set_var("SYSCITY_DISABLE_KEYRING", "1");
     let db = std::env::temp_dir().join(format!("syscity_pty_test_{port}.db"));
     let _ = std::fs::remove_file(&db);
     let mut config = GatewayConfig::default();

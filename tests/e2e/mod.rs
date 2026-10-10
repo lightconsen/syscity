@@ -146,7 +146,22 @@ pub fn skip_if_no_provider() -> Option<LocalProviderConfig> {
 // ── Gateway Setup
 // ─────────────────────────────────────────────────────────────
 
+/// Keep the OS keyring out of the e2e run.
+///
+/// An integration test links the library built normally, so the library's own
+/// `cfg(test)` guard does not apply and `probe_keyring()` would reach the
+/// developer's real keychain — on macOS that is a password prompt, once per
+/// run, before the first test even starts. The 0600 file store takes over, as
+/// it does whenever the probe fails.
+///
+/// Called from every gateway the harness builds, so no test has to remember.
+pub fn isolate_keyring() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("SYSCITY_DISABLE_KEYRING", "1"));
+}
+
 pub fn test_config(port: u16, with_provider: bool) -> GatewayConfig {
+    isolate_keyring();
     let mut config = GatewayConfig::default();
     config.host = "127.0.0.1".to_string();
     config.port = port;
@@ -482,6 +497,7 @@ pub fn test_paths_root() -> Arc<SyscityPaths> {
 /// Every e2e gateway goes through here — `Gateway::new` would resolve the real
 /// home (see [`test_paths_root`]).
 pub async fn new_test_gateway(config: GatewayConfig) -> Gateway {
+    isolate_keyring();
     Gateway::with_options(
         config,
         None,

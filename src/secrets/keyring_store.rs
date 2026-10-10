@@ -360,7 +360,28 @@ fn now_unix_secs() -> u64 {
 /// lifetime. Under `cfg(test)` the probe always returns `false` so tests never
 /// touch a real keychain.
 pub fn probe_keyring() -> bool {
+    if keyring_disabled() {
+        return false;
+    }
     KEYRING_HEALTH.available(now_unix_secs(), probe_keyring_uncached)
+}
+
+/// Whether `SYSCITY_DISABLE_KEYRING` turns the OS keyring off for this process.
+///
+/// The `cfg(test)` guard only covers the library's own unit-test binary; an
+/// integration test links the library built normally, so it would probe the
+/// developer's real keychain — on macOS that means a password prompt per run.
+/// This is the explicit opt-out for a host with no interactive keychain: a test
+/// harness, a CI runner, or a headless server. The 0600 file store is used
+/// instead, exactly as it is when the probe fails.
+pub fn keyring_disabled() -> bool {
+    match std::env::var("SYSCITY_DISABLE_KEYRING") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "no")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Mark the keyring as unavailable after a failed or timed-out operation so
