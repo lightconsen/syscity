@@ -92,6 +92,26 @@ pub enum PluginCommands {
         #[arg(short, long)]
         key_file: PathBuf,
     },
+    /// Show a plugin's install record (version, source, pin, history)
+    Versions {
+        /// Plugin name/id
+        name: String,
+    },
+    /// Pin a plugin to its current version (or unpin with --unpin)
+    Pin {
+        /// Plugin name/id
+        name: String,
+        /// Release the pin instead of setting it
+        #[arg(long)]
+        unpin: bool,
+    },
+    /// Roll a plugin back to a version kept in its history
+    Rollback {
+        /// Plugin name/id
+        name: String,
+        /// Version to restore (see `plugin versions`)
+        version: String,
+    },
 }
 
 /// Run plugin commands (over WebSocket).
@@ -297,6 +317,62 @@ pub async fn run_plugin_command(command: &PluginCommands) -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!("Failed to sign plugin: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        PluginCommands::Versions { name } => {
+            match ws::call("plugins.versions", json!({ "name": name })).await {
+                Ok(payload) => {
+                    let version = payload["version"].as_str().unwrap_or("unknown");
+                    let pinned = if payload["pinned"].as_bool().unwrap_or(false) {
+                        " [pinned]"
+                    } else {
+                        ""
+                    };
+                    let source = payload["source"].as_str().unwrap_or("(no record)");
+                    println!("{name} v{version}{pinned} (source: {source})");
+                    if let Some(installed_at) = payload["installed_at"].as_str() {
+                        println!("  installed at {installed_at}");
+                    }
+                    let history = payload["history"].as_array().cloned().unwrap_or_default();
+                    if history.is_empty() {
+                        println!("  no saved versions to roll back to");
+                    } else {
+                        println!("  history:");
+                        for v in history {
+                            println!("    {}", v.as_str().unwrap_or("?"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to read plugin versions: {e}");
+                    return Err(e);
+                }
+            }
+        }
+        PluginCommands::Pin { name, unpin } => {
+            let body = json!({ "name": name, "pinned": !unpin });
+            match ws::call("plugins.pin", body).await {
+                Ok(_) => {
+                    if *unpin {
+                        println!("Plugin '{name}' unpinned.");
+                    } else {
+                        println!("Plugin '{name}' pinned to its current version.");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to pin plugin: {e}");
+                    return Err(e);
+                }
+            }
+        }
+        PluginCommands::Rollback { name, version } => {
+            let body = json!({ "name": name, "version": version });
+            match ws::call("plugins.rollback", body).await {
+                Ok(_) => println!("Plugin '{name}' rolled back to v{version}."),
+                Err(e) => {
+                    eprintln!("Failed to roll back plugin: {e}");
                     return Err(e);
                 }
             }

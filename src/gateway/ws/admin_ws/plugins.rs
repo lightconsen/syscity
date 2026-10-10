@@ -212,3 +212,96 @@ pub(crate) async fn handle_plugins_uninstall(
         }
     }
 }
+
+/// `plugins.versions` — a plugin's install record and its rollback history.
+pub(crate) async fn handle_plugins_versions(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+    }
+    let p: Params = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    match state
+        .infra
+        .plugin_manager
+        .plugin_install_state(&p.name)
+        .await
+    {
+        Ok((record, history)) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "name": p.name,
+                "version": record.version,
+                "source": record.source,
+                "sha256": record.sha256,
+                "pinned": record.pinned,
+                "installed_at": record.installed_at,
+                "history": history,
+            }),
+        ),
+        Err(e) => WsResponse::err(&req.id, "NOT_FOUND", e.to_string()),
+    }
+}
+
+/// `plugins.pin` — hold a plugin at its current version, or release the hold.
+pub(crate) async fn handle_plugins_pin(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        #[serde(default = "default_true")]
+        pinned: bool,
+    }
+    let p: Params = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    match state
+        .infra
+        .plugin_manager
+        .pin_plugin(&p.name, p.pinned)
+        .await
+    {
+        Ok(()) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({ "success": true, "name": p.name, "pinned": p.pinned }),
+        ),
+        Err(e) => WsResponse::err(&req.id, "NOT_FOUND", e.to_string()),
+    }
+}
+
+/// `plugins.rollback` — restore a version kept in the plugin's history.
+pub(crate) async fn handle_plugins_rollback(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        version: String,
+    }
+    let p: Params = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    match state
+        .infra
+        .plugin_manager
+        .rollback_plugin(&p.name, &p.version)
+        .await
+    {
+        Ok(()) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({ "success": true, "name": p.name, "version": p.version }),
+        ),
+        Err(e) => WsResponse::err(&req.id, "INTERNAL", e.to_string()),
+    }
+}
+
+fn default_true() -> bool {
+    true
+}

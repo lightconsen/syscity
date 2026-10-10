@@ -11,6 +11,7 @@
 pub mod activation;
 pub mod deps;
 pub mod hooks;
+pub mod install_state;
 pub mod installer;
 pub mod manifest;
 pub mod metrics;
@@ -800,6 +801,67 @@ Edit `config.json` to customize settings.
     pub async fn uninstall_plugin(&self, name: &str) -> crate::Result<()> {
         let installer = PluginInstaller::new(self.plugins_dir.clone());
         installer.uninstall(name).await
+    }
+
+    /// This plugin's install record and the versions `rollback` can restore.
+    ///
+    /// Mirrors `SkillManager::skill_install_state`, including the 404 for an
+    /// unknown plugin — a caller asking about a plugin that is not installed
+    /// has made a mistake worth reporting, not one to paper over with a default.
+    pub async fn plugin_install_state(
+        &self,
+        name: &str,
+    ) -> crate::Result<(install_state::InstallState, Vec<String>)> {
+        let dir = self.plugins_dir.join(name);
+        if !dir.join("plugin.json").exists() {
+            return Err(crate::error::SyscityError::NotFound {
+                resource: format!("plugin '{name}'"),
+            });
+        }
+        let record = install_state::load(&dir).await;
+        let history = install_state::history_versions(&dir).await;
+        Ok((record, history))
+    }
+
+    /// Hold this plugin at its current version (or release the hold).
+    ///
+    /// A plugin with no record gets its version read off `plugin.json` first,
+    /// so a pin set on a hand-placed plugin is still durable.
+    pub async fn pin_plugin(&self, name: &str, pinned: bool) -> crate::Result<()> {
+        let dir = self.plugins_dir.join(name);
+        if !dir.join("plugin.json").exists() {
+            return Err(crate::error::SyscityError::NotFound {
+                resource: format!("plugin '{name}'"),
+            });
+        }
+        let mut state = install_state::load(&dir).await;
+        if state.version.is_none() {
+            state.version = install_state::installed_version(&dir).await;
+        }
+        state.pinned = pinned;
+        install_state::save(&dir, &state).await
+    }
+
+    /// Restore a version kept in this plugin's history, then reload it.
+    pub async fn rollback_plugin(&self, name: &str, version: &str) -> crate::Result<()> {
+        let dir = self.plugins_dir.join(name);
+        if !dir.join("plugin.json").exists() {
+            return Err(crate::error::SyscityError::NotFound {
+                resource: format!("plugin '{name}'"),
+            });
+        }
+        install_state::rollback(&dir, version).await?;
+        // Reload by the manifest's id: the runtime keys on it, and the
+        // directory name is only where the package happens to sit. A plugin the
+        // runtime never loaded has nothing to reload — the rollback still
+        // happened on disk, and the next load picks it up.
+        let id = install_state::manifest_id(&dir)
+            .await
+            .unwrap_or_else(|| name.to_string());
+        if self.runtime.get_plugin(&id).await.is_some() {
+            self.reload_plugin(&id).await?;
+        }
+        Ok(())
     }
 }
 

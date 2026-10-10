@@ -1121,3 +1121,91 @@ async fn catalog_response_carries_usage_fields() {
     );
     assert_eq!(unrated["rating_count"], serde_json::json!(0));
 }
+
+/// Plant a plugin directory the way an install would leave it — without a real
+/// wasm module, since nothing here loads one.
+fn plant_plugin(state: &Arc<GatewayState>, name: &str, version: &str) -> std::path::PathBuf {
+    let dir = state.paths.config_dir().join("plugins").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        format!(r#"{{"id":"{name}","name":"{name}","version":"{version}","main":"{name}.wasm"}}"#),
+    )
+    .unwrap();
+    std::fs::write(dir.join(format!("{name}.wasm")), b"not-a-real-module").unwrap();
+    dir
+}
+
+/// The plugin half of the pin/rollback lifecycle, over the WS surface a client
+/// actually uses. The skills' equivalent is
+/// `skills_versions_pin_and_rollback_cover_the_lifecycle`.
+#[tokio::test]
+async fn plugins_versions_pin_and_rollback_cover_the_lifecycle() {
+    let state = state().await;
+    let name = format!("lifecycle-plugin-{}", std::process::id());
+
+    // Not found until the plugin exists.
+    let missing = handle_plugins_versions(
+        &req("p0", "plugins.versions", Some(serde_json::json!({ "name": name }))),
+        &state,
+    )
+    .await;
+    assert!(!missing.ok);
+    assert_eq!(missing.error.as_ref().unwrap().code, "NOT_FOUND");
+
+    let dir = plant_plugin(&state, &name, "1.0.0");
+
+    let pinned = handle_plugins_pin(
+        &req("p1", "plugins.pin", Some(serde_json::json!({ "name": name, "pinned": true }))),
+        &state,
+    )
+    .await;
+    assert!(pinned.ok, "{:?}", pinned.error);
+
+    let versions = handle_plugins_versions(
+        &req("p2", "plugins.versions", Some(serde_json::json!({ "name": name }))),
+        &state,
+    )
+    .await;
+    let payload = versions.payload.expect("payload");
+    assert_eq!(payload["pinned"], serde_json::json!(true));
+    // Back-filled from the manifest: the plugin had no record before the pin.
+    assert_eq!(payload["version"], serde_json::json!("1.0.0"));
+    assert_eq!(payload["history"], serde_json::json!([]));
+
+    // A version with no saved copy cannot be restored.
+    let missing_version = handle_plugins_rollback(
+        &req(
+            "p3",
+            "plugins.rollback",
+            Some(serde_json::json!({ "name": name, "version": "9.9.9" })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(!missing_version.ok);
+
+    // Once a copy is kept, it can be.
+    crate::plugins::install_state::backup_current(&dir)
+        .await
+        .unwrap();
+    let rolled = handle_plugins_rollback(
+        &req(
+            "p4",
+            "plugins.rollback",
+            Some(serde_json::json!({ "name": name, "version": "1.0.0" })),
+        ),
+        &state,
+    )
+    .await;
+    assert!(rolled.ok, "{:?}", rolled.error);
+
+    let after = handle_plugins_versions(
+        &req("p5", "plugins.versions", Some(serde_json::json!({ "name": name }))),
+        &state,
+    )
+    .await;
+    assert_eq!(after.payload.expect("payload")["version"], serde_json::json!("1.0.0"));
+
+    std::fs::remove_dir_all(state.paths.config_dir().join("plugins")).unwrap();
+}

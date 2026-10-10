@@ -35,6 +35,16 @@ impl PluginInstaller {
         }
 
         let dest = self.plugins_dir.join(name);
+
+        // A pinned plugin is a deliberate hold on a version; replacing it has to
+        // be an explicit choice (unpin first), not a side effect of an update.
+        // Checked before the copy so a refused install costs nothing.
+        if dest.exists() && crate::plugins::install_state::load(&dest).await.pinned {
+            return Err(crate::error::SyscityError::Validation(format!(
+                "Plugin '{name}' is pinned to its current version; unpin it first"
+            )));
+        }
+
         let staging = self.plugins_dir.join(format!(".staging-{name}"));
         tokio::fs::create_dir_all(&self.plugins_dir).await?;
         if staging.exists() {
@@ -42,7 +52,10 @@ impl PluginInstaller {
         }
         copy_dir_all(src, &staging).await?;
 
+        // Back up the copy being replaced so `rollback` has something to put
+        // back. A first install has nothing to back up.
         if dest.exists() {
+            crate::plugins::install_state::backup_current(&dest).await?;
             tokio::fs::remove_dir_all(&dest).await?;
         }
         tokio::fs::rename(&staging, &dest).await?;
@@ -322,6 +335,47 @@ mod tests {
             "new"
         );
         assert!(!plugins.path().join("demo/stale.txt").exists());
+
+        // And the replaced copy was kept, so it can be rolled back to.
+        assert!(
+            plugins.path().join(".history/demo").is_dir(),
+            "replacing a plugin must keep the copy it replaced"
+        );
+    }
+
+    /// A pin is a deliberate hold; replacing the plugin has to be an explicit
+    /// choice, not a side effect of an update.
+    #[tokio::test]
+    async fn stage_directory_refuses_to_replace_a_pinned_plugin() {
+        let plugins = tempdir().unwrap();
+        let installer = PluginInstaller::new(plugins.path().to_path_buf());
+
+        let first = tempdir().unwrap();
+        std::fs::write(first.path().join("plugin.json"), "old").unwrap();
+        installer
+            .stage_directory(first.path(), "demo")
+            .await
+            .unwrap();
+
+        let dest = plugins.path().join("demo");
+        let mut state = crate::plugins::install_state::load(&dest).await;
+        state.pinned = true;
+        crate::plugins::install_state::save(&dest, &state)
+            .await
+            .unwrap();
+
+        let next = tempdir().unwrap();
+        std::fs::write(next.path().join("plugin.json"), "new").unwrap();
+        let err = installer
+            .stage_directory(next.path(), "demo")
+            .await
+            .expect_err("a pinned plugin must not be replaced")
+            .to_string();
+        assert!(err.contains("pinned"), "{err}");
+
+        // The pinned copy is untouched, and no staging directory was left.
+        assert_eq!(std::fs::read_to_string(dest.join("plugin.json")).unwrap(), "old");
+        assert!(!plugins.path().join(".staging-demo").exists());
     }
 
     #[tokio::test]
