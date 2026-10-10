@@ -1123,6 +1123,14 @@ pub struct SkillsConfig {
     /// Days without an activation before an agent-authored skill is archived.
     #[serde(default = "default_curator_archive_after_days")]
     pub curator_archive_after_days: i64,
+    /// Ask before the agent writes into the skills directory.
+    ///
+    /// Off by default: writes run without a prompt, and `/learn` would stop and
+    /// wait every time. On, each write inside the skills directory suspends the
+    /// turn on the approval queue, so an operator sees a skill before it starts
+    /// loading in every future session.
+    #[serde(default)]
+    pub write_approval: bool,
 }
 
 fn default_true() -> bool {
@@ -1143,6 +1151,7 @@ impl Default for SkillsConfig {
             curator_enabled: default_true(),
             curator_interval_seconds: default_curator_interval_seconds(),
             curator_archive_after_days: default_curator_archive_after_days(),
+            write_approval: false,
         }
     }
 }

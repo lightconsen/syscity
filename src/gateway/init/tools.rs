@@ -290,6 +290,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 acp: acp.clone(),
                 mcp_manager: mcp_manager.clone(),
                 approval_queue: approval_queue.clone(),
+                skills_write_approval: config.skills.write_approval,
                 ask_queue: ask_queue.clone(),
                 session_store: session_store.clone(),
                 memory_manager: memory_manager_holder.clone(),

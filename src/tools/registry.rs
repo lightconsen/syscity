@@ -59,6 +59,9 @@ pub struct ToolRegistry {
     /// Approval queue for human-in-the-loop tool execution.
     /// When set, high-risk tool calls can be suspended pending human approval.
     approval_queue: Option<Arc<ApprovalQueue>>,
+    /// Ask before the agent writes into the skills directory (see
+    /// [`ToolRegistry::with_skills_write_approval`]).
+    skills_write_approval: bool,
     /// Ask queue for the `ask_user` clarification tool. When set, the tool
     /// can suspend a turn and wait for a human answer.
     ask_queue: Option<Arc<AskQueue>>,
@@ -87,6 +90,22 @@ pub struct ToolRegistry {
     metadata: std::sync::RwLock<HashMap<String, super::metadata::ToolDescriptionMeta>>,
 }
 
+/// Whether this call writes into the skills directory.
+///
+/// Only the tools that take a `path` and write to it; the target is resolved
+/// through the context so that an absolute path, a relative one and a `~` path
+/// all answer the same question.
+fn writes_into_skills_dir(name: &str, args: &Value, ctx: &ToolContext) -> bool {
+    if !matches!(name, "file_write" | "file_edit" | "apply_patch") {
+        return false;
+    }
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    let resolved = ctx.resolve_path(std::path::Path::new(path));
+    crate::dirs::installed_paths().is_some_and(|paths| resolved.starts_with(paths.skills_dir()))
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
@@ -101,6 +120,7 @@ impl Default for ToolRegistry {
             hooks: ToolHooks::new(),
             hooks_override: std::sync::Mutex::new(None),
             approval_queue: None,
+            skills_write_approval: false,
             ask_queue: None,
             permissions: Arc::new(PermissionsRuntime::default()),
             content_filter: None,
@@ -152,6 +172,7 @@ impl ToolRegistry {
             hooks: ToolHooks::new(),
             hooks_override: std::sync::Mutex::new(None),
             approval_queue: None,
+            skills_write_approval: false,
             ask_queue: None,
             permissions: Arc::new(PermissionsRuntime::default()),
             content_filter: None,
@@ -177,6 +198,7 @@ impl ToolRegistry {
             hooks: ToolHooks::new(),
             hooks_override: std::sync::Mutex::new(None),
             approval_queue: None,
+            skills_write_approval: false,
             ask_queue: None,
             permissions: Arc::new(PermissionsRuntime::default()),
             content_filter: None,
@@ -627,6 +649,17 @@ impl ToolRegistry {
         self.approval_queue.as_ref()
     }
 
+    /// Require approval before the agent writes into the skills directory.
+    ///
+    /// A skill lands in the system-prompt catalog of every future session, so
+    /// an operator can ask to see each one before it takes effect. Off by
+    /// default — the write category runs without prompts — and it reuses the
+    /// approval queue rather than staging the write anywhere new.
+    pub fn with_skills_write_approval(mut self, on: bool) -> Self {
+        self.skills_write_approval = on;
+        self
+    }
+
     /// Set the ask queue for the `ask_user` clarification tool.
     pub fn with_ask_queue(mut self, queue: Arc<AskQueue>) -> Self {
         self.ask_queue = Some(queue);
@@ -929,6 +962,18 @@ impl ToolRegistry {
     /// Reads the true (post-wrapper-fix) capabilities, so plan mode and the
     /// `write` category see what the tool really is.
     fn evaluate_permissions(&self, name: &str, args: &Value, ctx: &ToolContext) -> EngineDecision {
+        // A write into the skills directory changes what the agent will load in
+        // every future session. Checked here, ahead of the rules, because the
+        // rule engine matches the argument as written — and the same file can be
+        // named absolutely, relatively or through `~`. Resolving against the
+        // context is what makes "the skills directory" mean one thing.
+        if self.skills_write_approval && writes_into_skills_dir(name, args, ctx) {
+            return EngineDecision::Ask(
+                "this writes into the skills directory, which loads in every future session"
+                    .to_string(),
+            );
+        }
+
         let caps = self.tool_capabilities(name);
         self.permissions.evaluate(
             name,
@@ -2082,6 +2127,68 @@ mod tests {
         assert!(result.success);
         assert!(ran.load(Ordering::SeqCst));
         approver.await.expect("approver task");
+    }
+
+    /// `[skills] write_approval`: a write into the skills directory suspends for
+    /// a human, because a skill loads in every future session. The same call
+    /// elsewhere does not, and the toggle is off by default.
+    ///
+    /// The path is matched *resolved*, not as written — the rule engine matches
+    /// the argument, and the same file can be named absolutely, relatively or
+    /// through `~`.
+    #[tokio::test]
+    async fn a_write_into_the_skills_directory_asks_when_enabled() {
+        let skills_dir = crate::dirs::skills_dir();
+        let inside = skills_dir.join("gated").join("SKILL.md");
+        let outside_dir = tempfile::tempdir().expect("temp dir");
+        let outside = outside_dir.path().join("notes.md");
+
+        for (enabled, path, expects_ask) in [
+            (true, inside.as_path(), true),
+            (true, outside.as_path(), false),
+            (false, inside.as_path(), false),
+        ] {
+            let ran = Arc::new(AtomicBool::new(false));
+            let approval_queue = Arc::new(ApprovalQueue::new());
+            let mut registry = ToolRegistry::new()
+                .with_approval_queue(approval_queue.clone())
+                .with_skills_write_approval(enabled);
+            registry.register(spy("file_write", ran.clone()));
+
+            let call = FunctionCall {
+                name: "file_write".to_string(),
+                arguments: serde_json::json!({ "path": path.to_string_lossy() }).to_string(),
+            };
+            let ctx =
+                ToolContext::new("u", "conv1").with_workspace_root(path.parent().expect("parent"));
+
+            if !expects_ask {
+                let result = registry
+                    .execute_call(&call, &ctx)
+                    .await
+                    .expect("runs without approval");
+                assert!(result.success);
+                assert!(ran.load(Ordering::SeqCst));
+                assert!(approval_queue.is_empty().await, "{} must not be gated", path.display());
+                continue;
+            }
+
+            let queue = approval_queue.clone();
+            let mut rx = approval_queue.event_tx.subscribe();
+            let approver = tokio::spawn(async move {
+                let event = rx.recv().await.expect("approval event");
+                queue
+                    .resolve(&event.approval_id, ApprovalDecision::Approve)
+                    .await;
+            });
+            let result = registry
+                .execute_call(&call, &ctx)
+                .await
+                .expect("approved write proceeds");
+            assert!(result.success);
+            assert!(ran.load(Ordering::SeqCst));
+            approver.await.expect("approver task");
+        }
     }
 
     #[tokio::test]

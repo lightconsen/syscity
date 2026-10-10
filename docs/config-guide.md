@@ -70,6 +70,13 @@ curator_enabled = true
 curator_interval_seconds = 21600    # 6h between passes
 curator_archive_after_days = 30
 
+# Ask before the agent writes into the skills directory. A skill loads in the
+# system prompt of every future session, so this is the point to see one.
+# Off by default — the write category runs without prompts, and `/learn` would
+# otherwise stop and wait every time. On, the write suspends the turn on the
+# normal approval queue (approve / deny in the UI or `syscity` client).
+write_approval = false
+
 # ── Cron ─────────────────────────────────────────────────────────────
 [cron]
 enabled = true

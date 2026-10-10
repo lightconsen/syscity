@@ -925,6 +925,9 @@ pub(crate) struct ToolRegistryArgs {
     pub mcp_manager: Arc<McpManager>,
     /// Shared approval queue.
     pub approval_queue: Arc<ApprovalQueue>,
+    /// Ask before the agent writes into the skills directory
+    /// (`[skills] write_approval`).
+    pub skills_write_approval: bool,
     /// Shared ask-user queue.
     pub ask_queue: Arc<AskQueue>,
     /// Persistent session store.
@@ -967,6 +970,7 @@ pub(crate) async fn create_default_tool_registry(
         acp,
         mcp_manager,
         approval_queue,
+        skills_write_approval,
         ask_queue,
         session_store,
         memory_manager,
@@ -986,6 +990,7 @@ pub(crate) async fn create_default_tool_registry(
 
     let mut registry = ToolRegistry::new()
         .with_approval_queue(approval_queue)
+        .with_skills_write_approval(skills_write_approval)
         .with_ask_queue(ask_queue)
         .with_audit_log(audit_log)
         .with_hooks(tool_hooks)
