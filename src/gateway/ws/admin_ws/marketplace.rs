@@ -114,6 +114,11 @@ pub(crate) async fn handle_connectors_catalog(
                 "credits_per_use": e.credits_per_use,
                 "category": e.category,
                 "starter_prompt": e.starter_prompt,
+                // Usage the catalog service reports. `rating` is null for an
+                // entry nobody has rated — deliberately distinct from 0.
+                "downloads": e.downloads,
+                "rating": e.rating,
+                "rating_count": e.rating_count,
                 "installed": inst.is_some() || expert_installed,
                 "installed_version": inst.map(|s| s.version.clone()),
                 "state": inst.map(|s| serde_json::to_value(s.state).unwrap_or_default()),

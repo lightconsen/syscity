@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Loader2, Lock, Plus, RefreshCw, Search, Sparkles, Zap } from "lucide-react";
+import { Download, Loader2, Lock, Plus, RefreshCw, Search, Sparkles, Star, Zap } from "lucide-react";
 import { Section } from "@/components/ui/Section";
 import { getActiveTransport } from "@/SyscityWebSocketTransport";
 import { pushToast } from "@/components/ui/Toast";
@@ -22,6 +22,12 @@ interface CatalogEntry {
   /** Remote-authored starter prompt: pre-fills the composer on summon
    *  (experts) or on the skill toast's "try it" action. */
   starter_prompt?: string | null;
+  /** Archive fetches, as counted by the catalog service. */
+  downloads?: number;
+  /** Mean community rating (1-5), or null when nobody has rated — which is
+   *  not the same claim as a score of zero. */
+  rating?: number | null;
+  rating_count?: number;
   installed: boolean;
   installed_version?: string;
   state?: string;
@@ -469,6 +475,25 @@ export function MarketplaceSettings({
                     {e.installed && (
                       <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-sidebar text-secondary">
                         v{e.installed_version}
+                      </span>
+                    )}
+                    {e.rating != null && (
+                      <span
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sidebar text-secondary"
+                        title={t("MarketplaceSettings.ratingTitle", { count: e.rating_count ?? 0 })}
+                      >
+                        <Star size={10} />
+                        {e.rating.toFixed(1)}
+                        {(e.rating_count ?? 0) > 0 ? ` (${e.rating_count})` : ""}
+                      </span>
+                    )}
+                    {(e.downloads ?? 0) > 0 && (
+                      <span
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sidebar text-secondary"
+                        title={t("MarketplaceSettings.downloadsTitle")}
+                      >
+                        <Download size={10} />
+                        {e.downloads}
                       </span>
                     )}
                     {capsule(e)}

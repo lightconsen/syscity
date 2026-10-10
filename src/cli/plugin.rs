@@ -8,6 +8,27 @@ use serde_json::json;
 use crate::cli::ws;
 use crate::error::{Result, SyscityError};
 
+/// Render a catalog entry's usage for a one-line listing.
+///
+/// `rating` is null for an entry nobody has rated, which is not the same claim
+/// as a score of zero — so an unrated entry shows only its download count.
+fn usage_suffix(entry: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    let downloads = entry["downloads"].as_u64().unwrap_or(0);
+    if downloads > 0 {
+        parts.push(format!("{downloads}↓"));
+    }
+    if let Some(rating) = entry["rating"].as_f64() {
+        let count = entry["rating_count"].as_u64().unwrap_or(0);
+        parts.push(format!("★{rating:.1} ({count})"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" "))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum PluginCommands {
     /// List all plugins
@@ -239,11 +260,12 @@ pub async fn run_plugin_command(command: &PluginCommands) -> Result<()> {
                     println!("Catalog matches for '{query}' ({}):", matches.len());
                     for e in matches {
                         println!(
-                            "  {} [{}] v{} — {}",
+                            "  {} [{}] v{} — {}{}",
                             e["display_name"].as_str().unwrap_or("?"),
                             e["type"].as_str().unwrap_or("?"),
                             e["version"].as_str().unwrap_or("?"),
                             e["id"].as_str().unwrap_or("?"),
+                            usage_suffix(e),
                         );
                     }
                 }

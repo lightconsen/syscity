@@ -1054,3 +1054,70 @@ async fn skills_versions_pin_and_rollback_cover_the_lifecycle() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The catalog service reports how often an entry has been fetched and how it
+/// has been rated; `CatalogEntry` has parsed all three since 87ca9fb6, but the
+/// WS response dropped them, so nothing downstream could show them.
+///
+/// `rating` must survive as `null` when nobody has rated — "no score" and
+/// "scored zero" are different claims.
+#[tokio::test]
+async fn catalog_response_carries_usage_fields() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/catalog.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "connectors": [
+                {
+                    "id": "rated", "version": "1.0.0", "display_name": "Rated",
+                    "type": "skill", "kind": "byoa", "visibility": "public",
+                    "source": { "type": "tar.gz", "url": "https://example.test/rated.tgz" },
+                    "downloads": 42, "rating": 4.5, "rating_count": 3,
+                },
+                {
+                    "id": "unrated", "version": "1.0.0", "display_name": "Unrated",
+                    "type": "skill", "kind": "byoa", "visibility": "public",
+                    "source": { "type": "tar.gz", "url": "https://example.test/unrated.tgz" },
+                },
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = state().await;
+    state
+        .tools
+        .connector_manager
+        .sync_catalog(&format!("{}/catalog.json", server.uri()), None)
+        .await
+        .expect("sync the mock catalog");
+
+    let resp = handle_connectors_catalog(&req("r1", "connectors.catalog", None), &state).await;
+    assert!(resp.ok, "{:?}", resp.error);
+    let payload = resp.payload.expect("payload");
+    let entries = payload["entries"].as_array().expect("entries");
+
+    let rated = entries
+        .iter()
+        .find(|e| e["id"] == serde_json::json!("rated"))
+        .expect("rated entry");
+    assert_eq!(rated["downloads"], serde_json::json!(42));
+    assert_eq!(rated["rating"], serde_json::json!(4.5));
+    assert_eq!(rated["rating_count"], serde_json::json!(3));
+
+    let unrated = entries
+        .iter()
+        .find(|e| e["id"] == serde_json::json!("unrated"))
+        .expect("unrated entry");
+    assert_eq!(unrated["downloads"], serde_json::json!(0));
+    assert_eq!(
+        unrated["rating"],
+        serde_json::Value::Null,
+        "an unrated entry must report null, not 0"
+    );
+    assert_eq!(unrated["rating_count"], serde_json::json!(0));
+}

@@ -69,6 +69,8 @@
   "MarketplaceSettings.cloud": "云端",
   "MarketplaceSettings.localFree": "本地 · 免费",
   "MarketplaceSettings.members": "会员",
+  "MarketplaceSettings.ratingTitle": "社区平均评分，共 {{count}} 次评分",
+  "MarketplaceSettings.downloadsTitle": "归档下载次数",
   "MarketplaceSettings.summon": "召唤",
   "MarketplaceSettings.installed": "已安装",
   "MarketplaceSettings.update": "更新",
