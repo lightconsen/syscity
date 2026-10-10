@@ -480,6 +480,54 @@ pub(crate) async fn resolve_session_model(
 /// This routes execution through the centralized ACP actor queue,
 /// enabling per-session serial processing and runtime controls
 /// (pause / resume / step / cancel).
+/// Connectors the catalog says fit this request, matched on its own `suggest`
+/// keywords.
+///
+/// Advice, not capability: none of these is connected, and the block the agent
+/// receives says so. The match is a literal substring test against the request
+/// text — a connector should surface when the user names the thing it is for,
+/// not on a guess about what they meant.
+async fn suggested_connectors(state: &Arc<GatewayState>, text: &str) -> Vec<String> {
+    /// Three is enough to be useful and few enough to stay advice.
+    const MAX_SUGGESTIONS: usize = 3;
+
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(Some(doc)) = state.tools.connector_manager.cached_catalog().await else {
+        return Vec::new();
+    };
+    let lowered = text.to_lowercase();
+
+    let mut out = Vec::new();
+    for entry in &doc.connectors {
+        if out.len() >= MAX_SUGGESTIONS {
+            break;
+        }
+        let Some(keywords) = entry
+            .connector_extra
+            .as_ref()
+            .and_then(|extra| extra.get("suggest"))
+            .and_then(|suggest| suggest.get("keywords"))
+            .and_then(|keywords| keywords.as_array())
+        else {
+            continue;
+        };
+        let matched = keywords
+            .iter()
+            .filter_map(|k| k.as_str())
+            .any(|keyword| !keyword.trim().is_empty() && lowered.contains(&keyword.to_lowercase()));
+        if matched {
+            out.push(if entry.display_name.is_empty() {
+                entry.id.clone()
+            } else {
+                entry.display_name.clone()
+            });
+        }
+    }
+    out
+}
+
 pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDispatch) {
     let AgentDispatch {
         ref agent_id,
@@ -644,6 +692,26 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
             .metadata
             .extra
             .insert("mentions".to_string(), m);
+    }
+
+    // Connectors the catalog's own hints match to this request. Carried in the
+    // same hidden block the composer chips use, so it reaches the model without
+    // entering the transcript and without touching the cached system prompt.
+    let suggested = suggested_connectors(state, &incoming_msg.content).await;
+    if !suggested.is_empty() {
+        let mut merged = incoming_msg
+            .metadata
+            .extra
+            .get("mentions")
+            .and_then(|v| serde_json::from_value::<crate::channels::Mentions>(v.clone()).ok())
+            .unwrap_or_default();
+        merged.connectors = suggested;
+        if let Ok(value) = serde_json::to_value(&merged) {
+            incoming_msg
+                .metadata
+                .extra
+                .insert("mentions".to_string(), value);
+        }
     }
 
     // Broadcast processing status
@@ -1114,6 +1182,55 @@ mod tests {
             extract_session_name("one two three four five six seven"),
             "one two three four five six"
         );
+    }
+
+    /// The catalog's own `suggest` keywords drive the per-turn connector advice.
+    #[tokio::test]
+    async fn suggested_connectors_match_the_request_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": 1,
+                "connectors": [
+                    { "id": "linear", "version": "1.0.0", "display_name": "Linear",
+                      "type": "connector", "kind": "cloud", "visibility": "public",
+                      "source": { "type": "mcp", "url": "https://example.test/mcp" },
+                      "connector_extra": { "suggest": { "keywords": ["issue tracking", "backlog"] } } },
+                    { "id": "figma", "version": "1.0.0", "display_name": "Figma",
+                      "type": "connector", "kind": "cloud", "visibility": "public",
+                      "source": { "type": "mcp", "url": "https://example.test/mcp2" },
+                      "connector_extra": { "suggest": { "keywords": ["design file"] } } },
+                    { "id": "plain", "version": "1.0.0", "display_name": "Plain",
+                      "type": "connector", "kind": "cloud", "visibility": "public",
+                      "source": { "type": "mcp", "url": "https://example.test/mcp3" } },
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        state
+            .tools
+            .connector_manager
+            .sync_catalog(&format!("{}/catalog.json", server.uri()), None)
+            .await
+            .expect("sync the mock catalog");
+
+        assert_eq!(
+            suggested_connectors(&state, "please file these in our backlog").await,
+            vec!["Linear".to_string()]
+        );
+        // Nothing matches, and an entry with no hints can never match.
+        assert!(suggested_connectors(&state, "what is the weather")
+            .await
+            .is_empty());
+        // Case-insensitive, and two hits come back in catalog order.
+        let both = suggested_connectors(&state, "Backlog and DESIGN FILE").await;
+        assert_eq!(both, vec!["Linear".to_string(), "Figma".to_string()]);
     }
 
     #[test]

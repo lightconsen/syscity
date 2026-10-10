@@ -333,12 +333,18 @@ pub struct Mentions {
     /// Agent ids to consult via the `delegate` tool.
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Connectors the *gateway* matched to this message from the catalog's own
+    /// `suggest` hints — not chips the user attached, and not loaded tools.
+    /// They are told to the agent so it can offer one; connecting is still the
+    /// user's call.
+    #[serde(default)]
+    pub connectors: Vec<String>,
 }
 
 impl Mentions {
-    /// `true` when neither list carries an entry.
+    /// `true` when no list carries an entry.
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty() && self.agents.is_empty()
+        self.skills.is_empty() && self.agents.is_empty() && self.connectors.is_empty()
     }
 }
 
@@ -412,6 +418,24 @@ pub fn format_mentions_block(m: &Mentions) -> Option<String> {
              To involve these agents, call the `delegate` tool with target_agent set \
              to the agent id, give it a clear self-contained task, and integrate its \
              results into your reply.\n",
+        );
+    }
+
+    let connectors = dedup(&m.connectors);
+    if !connectors.is_empty() {
+        block.push_str("<suggested-connectors>\n");
+        for name in &connectors {
+            let name = name
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            block.push_str(&format!("  <connector name=\"{name}\" />\n"));
+        }
+        block.push_str(
+            "</suggested-connectors>\n\
+             These matched the request but the user has NOT connected them. If one \
+             plainly helps, say so and let them decide — do not claim it is \
+             available, and do not try to use it.\n",
         );
     }
 
@@ -1313,6 +1337,7 @@ mod tests {
         let m = Mentions {
             skills: vec!["canvas-design".to_string()],
             agents: vec![],
+            connectors: vec![],
         };
         let block = format_mentions_block(&m).expect("skills-only should format");
         assert!(block.starts_with("<attached-mentions>\n"));
@@ -1327,6 +1352,7 @@ mod tests {
         let m = Mentions {
             skills: vec![],
             agents: vec!["secretary-xiaowang".to_string()],
+            connectors: vec![],
         };
         let block = format_mentions_block(&m).expect("agents-only should format");
         assert!(block.contains("<agents>\n  <agent id=\"secretary-xiaowang\" />\n</agents>\n"));
@@ -1339,6 +1365,7 @@ mod tests {
         let m = Mentions {
             skills: vec!["a".to_string(), "b".to_string(), "a".to_string()],
             agents: vec!["bob".to_string(), "bob".to_string()],
+            connectors: vec![],
         };
         let block = format_mentions_block(&m).expect("both sections should format");
         assert!(block.contains("<skills>"));
@@ -1353,7 +1380,12 @@ mod tests {
     #[test]
     fn mentions_block_empty_is_none() {
         assert!(format_mentions_block(&Mentions::default()).is_none());
-        assert!(format_mentions_block(&Mentions { skills: vec![], agents: vec![] }).is_none());
+        assert!(format_mentions_block(&Mentions {
+            skills: vec![],
+            agents: vec![],
+            connectors: vec![]
+        })
+        .is_none());
     }
 
     #[test]
@@ -1361,10 +1393,27 @@ mod tests {
         let m = Mentions {
             skills: vec!["a<b>&".to_string()],
             agents: vec![],
+            connectors: vec![],
         };
         let block = format_mentions_block(&m).expect("should format");
         assert!(block.contains("a&lt;b&gt;&amp;"));
         assert!(!block.contains("a<b>&"));
+    }
+
+    /// A suggested connector is advice to relay, and the block has to say so:
+    /// the agent must not claim it is available or try to use it.
+    #[test]
+    fn suggested_connectors_render_as_advice_not_as_capability() {
+        let m = Mentions {
+            skills: vec![],
+            agents: vec![],
+            connectors: vec!["Linear".to_string(), "Linear".to_string()],
+        };
+        let block = format_mentions_block(&m).expect("connectors-only should format");
+        assert!(block.contains("<suggested-connectors>"), "{block}");
+        // Deduped like every other section.
+        assert_eq!(block.matches("<connector name=\"Linear\" />").count(), 1, "{block}");
+        assert!(block.contains("NOT connected"), "{block}");
     }
 
     #[test]
@@ -1372,6 +1421,7 @@ mod tests {
         let m = Mentions {
             skills: vec!["s".to_string()],
             agents: vec!["a".to_string()],
+            connectors: vec![],
         };
         let extra = HashMap::from([("mentions".to_string(), serde_json::to_value(&m).unwrap())]);
         assert_eq!(mentions_from_extra(&extra), Some(m));

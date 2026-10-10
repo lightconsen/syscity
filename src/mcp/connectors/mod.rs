@@ -119,6 +119,21 @@ impl std::fmt::Debug for ConnectorManager {
     }
 }
 
+/// Whether a catalog entry asks for its connector to come up enabled.
+///
+/// A missing document, a missing `tools`, a missing `default_enabled`, or one
+/// that is not a boolean all answer `false`: the hint has to be stated to take
+/// effect, so a partial or malformed document can never enable anything.
+fn entry_defaults_enabled(entry: &catalog::CatalogEntry) -> bool {
+    entry
+        .connector_extra
+        .as_ref()
+        .and_then(|extra| extra.get("tools"))
+        .and_then(|tools| tools.get("default_enabled"))
+        .and_then(|enabled| enabled.as_bool())
+        .unwrap_or(false)
+}
+
 impl ConnectorManager {
     /// Manager rooted at `root` (normally [`crate::dirs::connectors_dir()]).
     #[allow(clippy::too_many_arguments)]
@@ -795,7 +810,14 @@ impl ConnectorManager {
             }
         }
 
-        if was_enabled && summary.provides_mcp {
+        // A connector the catalog marks `tools.default_enabled` comes up enabled
+        // when it is installed for the first time, so adding one is a single
+        // action rather than two. Only a fresh install: an update never flips a
+        // connector the user has disabled, and only something that was already
+        // on is turned back on.
+        let enabled_by_hint = previous.is_none() && entry_defaults_enabled(entry);
+
+        if (was_enabled || enabled_by_hint) && summary.provides_mcp {
             return self.enable(&entry.id).await;
         }
         Ok(summary)
@@ -1552,5 +1574,46 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("cloud-provisioned"));
+    }
+}
+
+/// `tools.default_enabled` has to be stated to take effect — a partial or
+/// malformed hints document cannot enable anything.
+#[cfg(test)]
+mod default_enabled_tests {
+    use super::*;
+
+    fn entry(extra: serde_json::Value) -> catalog::CatalogEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": "hinted",
+            "version": "1.0.0",
+            "source": { "type": "mcp", "url": "https://example.test/mcp" },
+            "connector_extra": extra,
+        }))
+        .expect("entry")
+    }
+
+    #[test]
+    fn only_an_explicit_true_enables() {
+        assert!(entry_defaults_enabled(&entry(
+            serde_json::json!({ "tools": { "default_enabled": true } })
+        )));
+        assert!(!entry_defaults_enabled(&entry(
+            serde_json::json!({ "tools": { "default_enabled": false } })
+        )));
+    }
+
+    #[test]
+    fn absent_or_malformed_never_enables() {
+        // No hints at all.
+        assert!(!entry_defaults_enabled(&entry(serde_json::Value::Null)));
+        // Hints without the field.
+        assert!(!entry_defaults_enabled(&entry(
+            serde_json::json!({ "suggest": { "keywords": ["x"] } })
+        )));
+        // The wrong type — a stringified bool must not be read as true.
+        assert!(!entry_defaults_enabled(&entry(
+            serde_json::json!({ "tools": { "default_enabled": "true" } })
+        )));
     }
 }

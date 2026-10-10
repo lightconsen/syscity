@@ -70,6 +70,8 @@
   "MarketplaceSettings.localFree": "Local · free",
   "MarketplaceSettings.members": "Members",
   "MarketplaceSettings.ratingTitle": "Mean community rating over {{count}} rating(s)",
+  "MarketplaceSettings.enabledByDefault": "Enabled by default",
+  "MarketplaceSettings.suggestedFor": "Suggested for:",
   "MarketplaceSettings.downloadsTitle": "Archive downloads",
   "MarketplaceSettings.summon": "Summon",
   "MarketplaceSettings.installed": "Installed",

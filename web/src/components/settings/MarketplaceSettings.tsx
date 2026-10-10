@@ -28,6 +28,15 @@ interface CatalogEntry {
    *  not the same claim as a score of zero. */
   rating?: number | null;
   rating_count?: number;
+  /** The connector's own hints, passed through from its catalog entry: what it
+   *  is suggested for, and whether its tools start enabled. Null for entries
+   *  that declare none — which is all but the connectors that do. */
+  connector_extra?: {
+    suggest?: { keywords?: string[]; hosts?: string[] };
+    tools?: { default_enabled?: boolean };
+    scopes?: string[];
+    post_install?: string;
+  } | null;
   installed: boolean;
   installed_version?: string;
   state?: string;
@@ -496,6 +505,11 @@ export function MarketplaceSettings({
                         {e.downloads}
                       </span>
                     )}
+                    {e.connector_extra?.tools?.default_enabled && (
+                      <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sidebar text-secondary">
+                        <Zap size={10} /> {t("MarketplaceSettings.enabledByDefault")}
+                      </span>
+                    )}
                     {capsule(e)}
                   </div>
 
@@ -598,6 +612,14 @@ export function MarketplaceSettings({
                   <p className="text-xs text-secondary mt-1 leading-relaxed whitespace-pre-wrap">
                     {e.description || t("MarketplaceSettings.noDescription")}
                   </p>
+                  {(e.connector_extra?.suggest?.keywords?.length ?? 0) > 0 && (
+                    <p className="text-[11px] text-secondary mt-2">
+                      {t("MarketplaceSettings.suggestedFor")}{" "}
+                      <span className="opacity-80">
+                        {e.connector_extra?.suggest?.keywords?.join(" · ")}
+                      </span>
+                    </p>
+                  )}
                 </div>
                 <button
                   onClick={() => setDetailId(null)}
@@ -638,6 +660,11 @@ export function MarketplaceSettings({
                 {e.installed && (
                   <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-sidebar text-secondary">
                     {t("MarketplaceSettings.installed")} · v{e.installed_version}
+                  </span>
+                )}
+                {e.connector_extra?.tools?.default_enabled && (
+                  <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sidebar text-secondary">
+                    <Zap size={10} /> {t("MarketplaceSettings.enabledByDefault")}
                   </span>
                 )}
                 {capsule(e)}

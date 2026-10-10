@@ -70,6 +70,8 @@
   "MarketplaceSettings.localFree": "本地 · 免费",
   "MarketplaceSettings.members": "会员",
   "MarketplaceSettings.ratingTitle": "社区平均评分，共 {{count}} 次评分",
+  "MarketplaceSettings.enabledByDefault": "默认启用",
+  "MarketplaceSettings.suggestedFor": "适用于：",
   "MarketplaceSettings.downloadsTitle": "归档下载次数",
   "MarketplaceSettings.summon": "召唤",
   "MarketplaceSettings.installed": "已安装",
