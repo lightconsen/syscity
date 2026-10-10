@@ -71,6 +71,8 @@
   "MarketplaceSettings.members": "会员",
   "MarketplaceSettings.ratingTitle": "社区平均评分，共 {{count}} 次评分",
   "MarketplaceSettings.enabledByDefault": "默认启用",
+  "MarketplaceSettings.declaresScopes": "声明需要：",
+  "MarketplaceSettings.afterInstalling": "安装后（不会自动执行）：",
   "MarketplaceSettings.suggestedFor": "适用于：",
   "MarketplaceSettings.downloadsTitle": "归档下载次数",
   "MarketplaceSettings.summon": "召唤",

@@ -620,6 +620,18 @@ export function MarketplaceSettings({
                       </span>
                     </p>
                   )}
+                  {(e.connector_extra?.scopes?.length ?? 0) > 0 && (
+                    <p className="text-[11px] text-secondary mt-2">
+                      {t("MarketplaceSettings.declaresScopes")}{" "}
+                      <span className="opacity-80">{e.connector_extra?.scopes?.join(" · ")}</span>
+                    </p>
+                  )}
+                  {e.connector_extra?.post_install && (
+                    <p className="text-[11px] text-secondary mt-2">
+                      {t("MarketplaceSettings.afterInstalling")}{" "}
+                      <span className="opacity-80">{e.connector_extra.post_install}</span>
+                    </p>
+                  )}
                 </div>
                 <button
                   onClick={() => setDetailId(null)}

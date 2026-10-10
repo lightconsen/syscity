@@ -71,6 +71,8 @@
   "MarketplaceSettings.members": "Members",
   "MarketplaceSettings.ratingTitle": "Mean community rating over {{count}} rating(s)",
   "MarketplaceSettings.enabledByDefault": "Enabled by default",
+  "MarketplaceSettings.declaresScopes": "Declares it asks for:",
+  "MarketplaceSettings.afterInstalling": "After installing (not run for you):",
   "MarketplaceSettings.suggestedFor": "Suggested for:",
   "MarketplaceSettings.downloadsTitle": "Archive downloads",
   "MarketplaceSettings.summon": "Summon",

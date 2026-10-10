@@ -480,13 +480,53 @@ pub(crate) async fn resolve_session_model(
 /// This routes execution through the centralized ACP actor queue,
 /// enabling per-session serial processing and runtime controls
 /// (pause / resume / step / cancel).
+/// The hosts of every `scheme://…` URL in the text, lowercased and without
+/// userinfo or port.
+///
+/// Deliberately literal — no URL parser and no scheme allowlist. The question
+/// is whether the user pasted a link to `linear.app`, not whether the link is
+/// well-formed, so anything after `://` up to the next delimiter counts.
+fn mentioned_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        rest = &rest[at + 3..];
+        let end = rest
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | '>' | ')' | ',')
+            })
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        let host = authority
+            .rsplit('@')
+            .next()
+            .unwrap_or(authority)
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+            .to_lowercase();
+        if !host.is_empty() {
+            hosts.push(host);
+        }
+        rest = &rest[end..];
+    }
+    hosts
+}
+
+/// Whether a mentioned host names `suggested` or a subdomain of it.
+fn host_matches(mentioned: &str, suggested: &str) -> bool {
+    let suggested = suggested.trim().to_lowercase();
+    !suggested.is_empty()
+        && (mentioned == suggested || mentioned.ends_with(&format!(".{suggested}")))
+}
+
 /// Connectors the catalog says fit this request, matched on its own `suggest`
-/// keywords.
+/// hints — keywords against the text, hosts against any URL in it.
 ///
 /// Advice, not capability: none of these is connected, and the block the agent
-/// receives says so. The match is a literal substring test against the request
-/// text — a connector should surface when the user names the thing it is for,
-/// not on a guess about what they meant.
+/// receives says so. Matching is literal on both sides: a connector should
+/// surface when the user names the thing it is for or links to it, not on a
+/// guess about what they meant.
 async fn suggested_connectors(state: &Arc<GatewayState>, text: &str) -> Vec<String> {
     /// Three is enough to be useful and few enough to stay advice.
     const MAX_SUGGESTIONS: usize = 3;
@@ -498,26 +538,40 @@ async fn suggested_connectors(state: &Arc<GatewayState>, text: &str) -> Vec<Stri
         return Vec::new();
     };
     let lowered = text.to_lowercase();
+    let hosts = mentioned_hosts(text);
 
     let mut out = Vec::new();
     for entry in &doc.connectors {
         if out.len() >= MAX_SUGGESTIONS {
             break;
         }
-        let Some(keywords) = entry
+        let Some(suggest) = entry
             .connector_extra
             .as_ref()
             .and_then(|extra| extra.get("suggest"))
-            .and_then(|suggest| suggest.get("keywords"))
-            .and_then(|keywords| keywords.as_array())
         else {
             continue;
         };
-        let matched = keywords
-            .iter()
-            .filter_map(|k| k.as_str())
-            .any(|keyword| !keyword.trim().is_empty() && lowered.contains(&keyword.to_lowercase()));
-        if matched {
+
+        let keyword_hit = suggest
+            .get("keywords")
+            .and_then(|keywords| keywords.as_array())
+            .is_some_and(|keywords| {
+                keywords.iter().filter_map(|k| k.as_str()).any(|keyword| {
+                    !keyword.trim().is_empty() && lowered.contains(&keyword.to_lowercase())
+                })
+            });
+        let host_hit = suggest
+            .get("hosts")
+            .and_then(|suggested| suggested.as_array())
+            .is_some_and(|suggested| {
+                suggested
+                    .iter()
+                    .filter_map(|h| h.as_str())
+                    .any(|suggested| hosts.iter().any(|host| host_matches(host, suggested)))
+            });
+
+        if keyword_hit || host_hit {
             out.push(if entry.display_name.is_empty() {
                 entry.id.clone()
             } else {
@@ -1199,7 +1253,7 @@ mod tests {
                     { "id": "linear", "version": "1.0.0", "display_name": "Linear",
                       "type": "connector", "kind": "cloud", "visibility": "public",
                       "source": { "type": "mcp", "url": "https://example.test/mcp" },
-                      "connector_extra": { "suggest": { "keywords": ["issue tracking", "backlog"] } } },
+                      "connector_extra": { "suggest": { "keywords": ["issue tracking", "backlog"], "hosts": ["linear.app"] } } },
                     { "id": "figma", "version": "1.0.0", "display_name": "Figma",
                       "type": "connector", "kind": "cloud", "visibility": "public",
                       "source": { "type": "mcp", "url": "https://example.test/mcp2" },
@@ -1231,6 +1285,28 @@ mod tests {
         // Case-insensitive, and two hits come back in catalog order.
         let both = suggested_connectors(&state, "Backlog and DESIGN FILE").await;
         assert_eq!(both, vec!["Linear".to_string(), "Figma".to_string()]);
+
+        // A URL matches on its host, including a subdomain, userinfo and port.
+        for text in [
+            "see https://linear.app/team/eng for context",
+            "https://www.linear.app/team/x",
+            "https://user:pw@linear.app:8443/x",
+        ] {
+            assert_eq!(
+                suggested_connectors(&state, text).await,
+                vec!["Linear".to_string()],
+                "{text}"
+            );
+        }
+
+        // Naming the host without a URL is not a link, and a lookalike domain
+        // must not match `linear.app`.
+        assert!(suggested_connectors(&state, "we use linear.app internally")
+            .await
+            .is_empty());
+        assert!(suggested_connectors(&state, "https://notlinear.app/x")
+            .await
+            .is_empty());
     }
 
     #[test]
