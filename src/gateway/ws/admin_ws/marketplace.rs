@@ -119,6 +119,10 @@ pub(crate) async fn handle_connectors_catalog(
                 "downloads": e.downloads,
                 "rating": e.rating,
                 "rating_count": e.rating_count,
+                // A connector's own hints, passed through untouched — what to
+                // suggest it for, which tools start enabled, the scopes it asks
+                // for. Absent for the entries that declare none.
+                "connector_extra": e.connector_extra,
                 "installed": inst.is_some() || expert_installed,
                 "installed_version": inst.map(|s| s.version.clone()),
                 "state": inst.map(|s| serde_json::to_value(s.state).unwrap_or_default()),

@@ -116,6 +116,16 @@ pub struct CatalogEntry {
     /// How many ratings the mean is over. Zero means `rating` is meaningless.
     #[serde(default)]
     pub rating_count: u64,
+    /// Per-connector hints the catalog service passes through: what to suggest
+    /// the connector for (`suggest.keywords`/`hosts`), whether its tools start
+    /// enabled (`tools.default_enabled`), the OAuth scopes it asks for, and
+    /// anything to run after installing.
+    ///
+    /// Kept as an opaque document: the client reads it whole and hands it on,
+    /// and nothing here interprets it. Absent — not null — for the entries that
+    /// declare none, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_extra: Option<serde_json::Value>,
 }
 
 fn default_entry_type() -> String {
@@ -592,6 +602,7 @@ mod tests {
             downloads: 0,
             rating: None,
             rating_count: 0,
+            connector_extra: None,
         }
     }
 

@@ -1083,6 +1083,16 @@ async fn catalog_response_carries_usage_fields() {
                     "type": "skill", "kind": "byoa", "visibility": "public",
                     "source": { "type": "tar.gz", "url": "https://example.test/unrated.tgz" },
                 },
+                {
+                    "id": "hinted", "version": "1.0.0", "display_name": "Hinted",
+                    "type": "connector", "kind": "cloud", "visibility": "public",
+                    "source": { "type": "mcp", "url": "https://example.test/mcp" },
+                    "connector_extra": {
+                        "suggest": { "keywords": ["issue tracking"], "hosts": ["linear.app"] },
+                        "tools": { "default_enabled": true },
+                        "scopes": ["read"],
+                    },
+                },
             ]
         })))
         .mount(&server)
@@ -1120,6 +1130,20 @@ async fn catalog_response_carries_usage_fields() {
         "an unrated entry must report null, not 0"
     );
     assert_eq!(unrated["rating_count"], serde_json::json!(0));
+
+    // A connector's own hints reach the client untouched; an entry that
+    // declares none reports null rather than a fabricated empty document.
+    let hinted = entries
+        .iter()
+        .find(|e| e["id"] == serde_json::json!("hinted"))
+        .expect("hinted entry");
+    assert_eq!(hinted["connector_extra"]["suggest"]["hosts"], serde_json::json!(["linear.app"]));
+    assert_eq!(hinted["connector_extra"]["tools"]["default_enabled"], serde_json::json!(true));
+    assert_eq!(
+        unrated["connector_extra"],
+        serde_json::Value::Null,
+        "no hints must not be invented"
+    );
 }
 
 /// Plant a plugin directory the way an install would leave it — without a real

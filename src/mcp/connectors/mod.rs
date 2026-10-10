@@ -1327,6 +1327,7 @@ mod tests {
             downloads: 0,
             rating: None,
             rating_count: 0,
+            connector_extra: None,
         };
 
         let summary = fx.manager.upgrade(&entry).await.unwrap();
@@ -1383,6 +1384,7 @@ mod tests {
             downloads: 0,
             rating: None,
             rating_count: 0,
+            connector_extra: None,
         };
 
         let summary = fx.manager.upgrade(&entry).await.unwrap();
