@@ -66,6 +66,53 @@ async fn probes_and_metrics_are_served_over_http() {
     assert!(body["agents"]["ready"].as_bool().unwrap_or(false), "default agent is up");
 }
 
+/// Every root-level file the web build emits must be reachable.
+///
+/// The PWA's precache manifest lists all of them, and Workbox fails the entire
+/// service-worker install on a single 404 — `bad-precaching-response` — so one
+/// unrouted file takes the PWA down silently. Enumerating routes by hand is
+/// what kept missing them: the icons had no route at all, and the service
+/// worker never installed.
+#[tokio::test]
+#[serial]
+async fn every_root_level_web_asset_is_served() {
+    let port = free_port();
+    start_http_gateway(port, llm_mock_provider_for_streaming(), |_| {}).await;
+
+    // The root-level entries of the build's precache manifest, read out of the
+    // generated `dist/sw.js`. If the build starts emitting another one, this
+    // list is what to extend — and the fallback route is what keeps the list
+    // from being load-bearing.
+    for path in [
+        "/index.html",
+        "/syscity.png",
+        "/manifest.webmanifest",
+        "/registerSW.js",
+        "/sw.js",
+        "/favicon-16.png",
+        "/favicon-32.png",
+        "/favicon-64.png",
+        "/apple-touch-icon.png",
+    ] {
+        let resp = reqwest::get(format!("{}{}", base(port), path))
+            .await
+            .unwrap_or_else(|e| panic!("GET {path} failed: {e}"));
+        assert_eq!(resp.status(), 200, "GET {path} must be 200 — the PWA precaches it");
+    }
+
+    // The SPA document's own name serves the document, with the version
+    // placeholder already substituted (the fallback route would return the raw
+    // asset, which is why `/index.html` keeps its own handler).
+    let html = reqwest::get(format!("{}/index.html", base(port)))
+        .await
+        .expect("GET /index.html")
+        .text()
+        .await
+        .expect("body");
+    assert!(html.contains("<html"), "{html:.120}");
+    assert!(!html.contains("{VERSION}"), "version placeholder left in: {html:.120}");
+}
+
 /// Case 2 — the OpenAI-compatible model list reflects the registered catalog.
 #[tokio::test]
 #[serial]

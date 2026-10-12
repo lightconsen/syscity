@@ -1700,6 +1700,12 @@ pub(crate) async fn build_router(state: Arc<GatewayState>) -> Router {
     // SPA frontend routes (serve built React app from embedded assets)
     let frontend_router = Router::new()
         .route("/", get(super::web_terminal_html_handler))
+        // The same document under its own name. The PWA's precache manifest
+        // lists `index.html` (it comes from the web build's glob), so without
+        // this route Workbox fetches /index.html, gets a 404, and refuses to
+        // install the service worker — `bad-precaching-response`. It is also
+        // what a browser asks for when someone opens the UI at /index.html.
+        .route("/index.html", get(super::web_terminal_html_handler))
         .route("/favicon.ico", get(super::favicon_handler))
         // Cloud OAuth return URL (default `cloud.redirect_base`): serves the
         // SPA, whose App.tsx reads `#token=` here and persists it over WS
@@ -1713,7 +1719,15 @@ pub(crate) async fn build_router(state: Arc<GatewayState>) -> Router {
         .route("/manifest.webmanifest", get(super::manifest_handler))
         .route("/registerSW.js", get(super::register_sw_handler))
         .route("/sw.js", get(super::sw_js_handler))
-        .route("/assets/*path", get(super::asset_handler));
+        .route("/assets/*path", get(super::asset_handler))
+        // Any other single-segment file the build emits at the root — today the
+        // PWA icons (favicon-16/32/64.png, apple-touch-icon.png). Enumerating
+        // them one route at a time is what kept breaking: the service worker's
+        // precache manifest lists every root file (the web build's glob), and
+        // **one** 404 fails its install with `bad-precaching-response`, so a new
+        // icon silently took the whole PWA down. Static routes above still win;
+        // this only catches what nothing else claims, and still 404s a miss.
+        .route("/:file", get(super::asset_handler));
 
     // Cloud session endpoints (feature `cloud`). Public tier: these are how
     // the web SPA logs into Syscity Cloud and persists the session token.
