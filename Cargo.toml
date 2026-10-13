@@ -161,7 +161,7 @@ dashmap = "6.0"
 # Webhook signature verification
 hmac = "0.12"
 sha2 = "0.10"
-sha1 = { version = "0.10", optional = true }
+sha1 = { version = "0.11", optional = true }
 hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["pkcs8"] }
