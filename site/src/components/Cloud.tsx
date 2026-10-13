@@ -4,7 +4,7 @@ import { cloudUrl, useLanguage } from "../i18n";
 const PLANS = [
   { key: "free", priceKey: "free" },
   { key: "pro", priceKey: "pro" },
-  { key: "enterprise", priceKey: "enterprise" },
+  { key: "business", priceKey: "business" },
 ] as const;
 
 /** "Syscity Cloud" product section (after Platforms): cloud LLM/search, device
@@ -91,6 +91,9 @@ export default function CloudSection() {
               );
             })}
           </div>
+          <p className="mx-auto mt-5 max-w-xl text-center text-xs text-faint">
+            {t.cloud.plansNote}
+          </p>
         </div>
 
         <div className="mt-12 text-center">
