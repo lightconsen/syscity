@@ -166,6 +166,12 @@ export function ChatContent({ transport }: ChatContentProps) {
         instance.options.count > 0
       ) {
         instance.scrollToIndex(instance.options.count - 1, { align: "end" });
+        // `scrollToIndex` positions against *estimated* item heights; the real
+        // ones only exist once each item has been measured, so it lands short
+        // of the true bottom. The spacer's height is the real total, so pin the
+        // element to it on every recalculation while the settle window is armed.
+        const el = scrollRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
       }
     },
   });
@@ -183,22 +189,35 @@ export function ChatContent({ transport }: ChatContentProps) {
     // re-aligned by the virtualizer's onChange loop (stickUntilRef above).
     stickUntilRef.current = performance.now() + 500;
     virtualizer.scrollToIndex(messages.length - 1, { align: "end" });
+    // Go past the estimate immediately, and again on the next frame once the
+    // first measurements have landed. Without this, opening a session shows the
+    // *top* of it: the estimated heights put the "bottom" far short of the real
+    // one, and nothing scrolls the element the rest of the way.
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      requestAnimationFrame(() => {
+        if (stickUntilRef.current > performance.now()) el.scrollTop = el.scrollHeight;
+      });
+    }
   }, [messages.length, virtualizer]);
 
-  // Auto-scroll to bottom when new messages arrive (but not when prepending
-  // history — a prepend leaves the last message unchanged).
-  const prevMessagesLengthRef = useRef(messages.length);
-  const prevLastIdRef = useRef(messages[messages.length - 1]?.id ?? null);
+  // Show the end of the conversation whenever the tail changes: a message sent
+  // or received, and — just as much — opening or switching to a session, which
+  // to this effect looks like a tail it has never seen.
+  //
+  // Keyed on the last message's id rather than on the length, which is what
+  // makes the session cases work: a session switch can be *shorter* than the
+  // one before it, and a history prepend lengthens the list without changing
+  // the tail — the one case that must not scroll.
+  const prevLastIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const prevLength = prevMessagesLengthRef.current;
-    const prevLastId = prevLastIdRef.current;
-    prevMessagesLengthRef.current = messages.length;
     const lastId = messages[messages.length - 1]?.id ?? null;
+    const prevLastId = prevLastIdRef.current;
     prevLastIdRef.current = lastId;
-    if (messages.length > prevLength && lastId !== prevLastId) {
-      requestAnimationFrame(() => scrollToBottom());
-    }
-  }, [messages.length, messages, scrollToBottom]);
+    if (messages.length === 0 || lastId === prevLastId) return;
+    requestAnimationFrame(() => scrollToBottom());
+  }, [messages, scrollToBottom]);
 
   const [showScrollButton, setShowScrollButton] = useState(false);
 
