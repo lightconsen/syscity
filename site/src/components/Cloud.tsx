@@ -1,6 +1,9 @@
 import { ArrowRight, Cloud, RefreshCw, Store } from "lucide-react";
 import { cloudUrl, useLanguage } from "../i18n";
 
+/** Card order and i18n key suffix. Adding a tier means adding `plan_<key>_*`
+ * strings to both locales; the numbers live there, mirroring syscity-cloud's
+ * `pricing.md` §3. */
 const PLANS = [
   { key: "free", priceKey: "free" },
   { key: "pro", priceKey: "pro" },
