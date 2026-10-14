@@ -270,8 +270,10 @@ behind whatever command is running — the worse trade of the two.
 
 ## Deliberate Limitations
 
-- No markdown rendering: only fenced code blocks are styled; headings, tables
-  and lists appear as their source text.
+- Markdown is rendered structurally, not completely: headings, lists, quotes,
+  tables, fenced code blocks, inline `` `code` ``, `**bold**` / `_italic_` and
+  `[text](url)` links all style. There is no syntax highlighting *inside* a
+  code block, and no images.
 - Delegated-task rows are learned from live `delegation.updated` events and
   are lost on reconnect/restart — the events only ever reach a live
   subscription, so `/agents` lists what the TUI has seen this connection and
