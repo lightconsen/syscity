@@ -37,26 +37,42 @@ pub struct LiveLayout {
     pub block: Rect,
     /// Status row, absent on a terminal too short to afford it.
     pub status: Option<Rect>,
-    /// Input area, always at the bottom.
+    /// Input area.
     pub composer: Rect,
+    /// The row under the composer: the permission mode, the way Claude Code
+    /// shows it. Absent when the terminal has no room below the input.
+    pub footer: Option<Rect>,
 }
 
 /// Lay the region out bottom-up so it stays sane at any terminal height.
+///
+/// The bottom-up order is footer, composer, status, block. The mode row under
+/// the input is the last thing to appear and the first to be given up: the
+/// composer is what the region exists for.
 pub fn layout(area: Rect, composer_rows: u16) -> LiveLayout {
     let height = area.height;
     let composer_rows = composer_rows.clamp(1, COMPOSER_MAX_ROWS).min(height.max(1));
+
+    let has_footer = height > composer_rows;
+    let footer = has_footer.then(|| Rect {
+        x: area.x,
+        y: area.y + height - 1,
+        width: area.width,
+        height: 1,
+    });
+    let composer_bottom = area.y + height.saturating_sub(u16::from(has_footer));
     let composer = Rect {
         x: area.x,
-        y: area.y + height.saturating_sub(composer_rows),
+        y: composer_bottom.saturating_sub(composer_rows),
         width: area.width,
         height: composer_rows,
     };
 
     // The status row only exists when there is room for it *and* a block row.
-    let has_status = height > composer_rows;
+    let has_status = composer.y > area.y;
     let status = has_status.then(|| Rect {
         x: area.x,
-        y: composer.y.saturating_sub(1),
+        y: composer.y - 1,
         width: area.width,
         height: 1,
     });
@@ -67,7 +83,12 @@ pub fn layout(area: Rect, composer_rows: u16) -> LiveLayout {
         width: area.width,
         height: block_bottom.saturating_sub(area.y),
     };
-    LiveLayout { block, status, composer }
+    LiveLayout {
+        block,
+        status,
+        composer,
+        footer,
+    }
 }
 
 /// Byte length of a wrapped row's text.
@@ -224,17 +245,6 @@ fn status_line(state: &AppState, theme: &Theme) -> (Line<'static>, bool) {
         }
         spans.push(Span::styled(short_session(session), theme.status_style()));
     }
-    // A non-default permission mode is a thing the operator should never
-    // forget is on: it sits in the status line until it is switched off.
-    if state.permission_mode != crate::tools::PermissionMode::Default {
-        if !spans.is_empty() {
-            spans.push(sep());
-        }
-        spans.push(Span::styled(
-            format!("⨿ {}", state.permission_mode.as_str()),
-            theme.status_error_style(),
-        ));
-    }
     if let Some((status, _)) = &state.status {
         let is_error = status.starts_with('⚠') || status.starts_with('✘');
         if !spans.is_empty() {
@@ -256,6 +266,38 @@ fn status_line(state: &AppState, theme: &Theme) -> (Line<'static>, bool) {
 fn status_text(state: &AppState, theme: &Theme) -> (String, bool) {
     let (line, is_error) = status_line(state, theme);
     (line.spans.iter().map(|s| s.content.to_string()).collect(), is_error)
+}
+
+/// The row under the composer: the permission mode, in words.
+///
+/// Always shown, the way Claude Code shows it — including the default. The mode
+/// is the one piece of state that changes what the agent may do without asking,
+/// so "which mode am I in" should be readable without having to remember to
+/// look for it, and a blank row would read as "no mode" rather than "default".
+/// A non-default mode takes the alert style: it is on until it is switched off.
+fn mode_line(state: &AppState, theme: &Theme) -> Line<'static> {
+    use crate::tools::PermissionMode;
+    let (text, style) = match state.permission_mode {
+        PermissionMode::Default => ("default", theme.status_style()),
+        PermissionMode::AcceptEdits => ("accept edits on", theme.status_error_style()),
+        PermissionMode::Plan => ("plan mode on", theme.status_error_style()),
+        PermissionMode::Bypass => ("bypass permissions on", theme.status_error_style()),
+    };
+    Line::from(vec![
+        Span::styled(format!("{PROMPT_MARK} {text}"), style),
+        Span::styled(mode_hint(), theme.dim_style()),
+    ])
+}
+
+/// The marker in front of the mode, echoing the stdout cursor marking a mode.
+const PROMPT_MARK: &str = "⨿";
+
+/// The how-to-change-it hint that follows the mode.
+///
+/// Only `/mode`: shift+tab is bound to completion navigation here, so naming it
+/// would point at a key that does something else.
+fn mode_hint() -> &'static str {
+    "  (/mode)"
 }
 
 /// Compact a session id for the status row.
@@ -559,6 +601,12 @@ pub fn render(f: &mut Frame, state: &AppState) {
     }
 
     render_composer(f, state, theme, l.composer);
+
+    // Under the input, the mode — where Claude Code puts it, so the eye lands on
+    // it after typing rather than having to travel up to the status row.
+    if let Some(footer) = l.footer {
+        f.render_widget(Paragraph::new(mode_line(state, theme)), footer);
+    }
 }
 
 #[cfg(test)]
@@ -580,14 +628,75 @@ mod tests {
             let area = rect(0, height);
             let l = layout(area, 1);
             assert!(l.composer.height >= 1, "height {height}");
-            assert_eq!(l.composer.y + l.composer.height, area.height);
+
+            // The bottom-most row is the footer when there is one, else the
+            // composer; nothing else may reach the last row.
+            let bottom = match l.footer {
+                Some(footer) => {
+                    assert_eq!(footer.y + footer.height, area.height, "height {height}");
+                    assert!(l.composer.y + l.composer.height <= footer.y, "height {height}");
+                    footer.y
+                }
+                None => {
+                    assert_eq!(l.composer.y + l.composer.height, area.height, "height {height}");
+                    l.composer.y
+                }
+            };
             if let Some(status) = l.status {
                 assert!(status.y < l.composer.y, "height {height}");
                 assert!(l.block.y + l.block.height <= status.y);
             } else {
                 assert!(l.block.y + l.block.height <= l.composer.y, "height {height}");
             }
+            assert!(l.block.y + l.block.height <= bottom, "height {height}");
         }
+    }
+
+    /// Every mode is named in words under the input, default included — a
+    /// blank row would read as "no mode" rather than "default".
+    #[test]
+    fn every_mode_is_named_under_the_composer() {
+        use crate::tools::PermissionMode;
+        let mut state = AppState::default();
+        for (mode, expected) in [
+            (PermissionMode::Default, "default"),
+            (PermissionMode::AcceptEdits, "accept edits on"),
+            (PermissionMode::Plan, "plan mode on"),
+            (PermissionMode::Bypass, "bypass permissions on"),
+        ] {
+            state.permission_mode = mode;
+            let text: String = mode_line(&state, &Theme::dark())
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect();
+            assert!(text.contains(expected), "{mode:?} -> {text:?}");
+            // The way to change it is named, and it is the one that works here.
+            assert!(text.contains("/mode"), "{mode:?} -> {text:?}");
+            assert!(!text.contains("shift+tab"), "no such binding: {text:?}");
+        }
+    }
+
+    /// A terminal with room for the input but nothing under it keeps the input
+    /// and gives up the mode row rather than the other way round.
+    #[test]
+    fn the_mode_row_is_the_first_thing_given_up() {
+        // One row: the composer alone, no footer.
+        let one = layout(rect(0, 1), 1);
+        assert!(one.footer.is_none());
+        assert_eq!(one.composer.height, 1);
+
+        // Two rows: footer + composer, still no status row.
+        let two = layout(rect(0, 2), 1);
+        assert!(two.footer.is_some());
+        assert!(two.status.is_none());
+        assert_eq!(two.footer.unwrap().y, 1);
+
+        // Three: status appears above the composer.
+        let three = layout(rect(0, 3), 1);
+        assert!(three.footer.is_some() && three.status.is_some());
+        assert_eq!(three.status.unwrap().y, 0);
+        assert_eq!(three.composer.y, 1);
     }
 
     #[test]
