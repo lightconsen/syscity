@@ -104,6 +104,39 @@ fn is_url_byte(b: u8) -> bool {
         )
 }
 
+/// How many bytes of a scanned run actually belong to the URL.
+///
+/// A run ends at the first byte that cannot appear in a URL, but the bytes just
+/// before that often belong to the sentence rather than the address: a URL at
+/// the end of a sentence collects the full stop, and one inside a markdown link
+/// (`[text](https://x)`) collects the closing paren. Left on, the link opens a
+/// target that does not exist — square brackets and parens are all in
+/// `is_url_byte` precisely because they occur inside real URLs.
+///
+/// A closing paren or bracket is kept when the run opened it itself, because
+/// `.../Foo_(bar)` and `.../x[1]` are real paths; an unbalanced one is the
+/// sentence's.
+fn url_len(run: &[u8]) -> usize {
+    fn count(hay: &[u8], needle: u8) -> usize {
+        hay.iter().filter(|b| **b == needle).count()
+    }
+
+    let mut len = run.len();
+    while let Some(&last) = len.checked_sub(1).and_then(|i| run.get(i)) {
+        let strip = match last {
+            b')' => count(&run[..len], b'(') < count(&run[..len], b')'),
+            b']' => count(&run[..len], b'[') < count(&run[..len], b']'),
+            b',' | b'.' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' => true,
+            _ => false,
+        };
+        if !strip {
+            break;
+        }
+        len -= 1;
+    }
+    len
+}
+
 /// Find ASCII `http(s)://` URLs in `text`, as spans of source *characters*.
 ///
 /// The scan walks bytes — the URL itself is all ASCII — but the run's
@@ -127,6 +160,8 @@ fn detect_links(text: &str) -> Vec<LinkRun> {
                 while end < bytes.len() && is_url_byte(bytes[end]) {
                     end += 1;
                 }
+                // Drop the sentence's punctuation, keep the address's own.
+                end = i + url_len(&bytes[i..end]);
                 if end > i + n {
                     let url = &text[i..end];
                     out.push(LinkRun {
@@ -458,11 +493,56 @@ mod tests {
         assert!(detect_links("no links here").is_empty());
         assert!(detect_links("a https:// bare scheme has no target").is_empty());
         assert!(detect_links("https://").is_empty());
-        // A URL stops at whitespace and quotes, keeping only its own bytes.
-        let runs = detect_links("see https://example.com, ok");
+        // A URL stops at whitespace and quotes.
+        let runs = detect_links("see https://example.com ok");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].url, "https://example.com,");
+        assert_eq!(runs[0].url, "https://example.com");
         assert_eq!(runs[0].len, runs[0].url.len());
+    }
+
+    /// Sentence punctuation is not part of the address, or the link opens a
+    /// target that does not exist.
+    #[test]
+    fn sentence_punctuation_is_not_part_of_the_url() {
+        for (input, expected) in [
+            ("see https://example.com.", "https://example.com"),
+            ("see https://example.com, ok", "https://example.com"),
+            ("see https://example.com; then", "https://example.com"),
+            ("is it https://example.com?", "https://example.com"),
+            ("'https://example.com'", "https://example.com"),
+            ("(https://example.com)", "https://example.com"),
+            // A markdown link's closing paren belongs to the syntax.
+            ("[text](https://example.com)", "https://example.com"),
+            ("[Docs](https://example.com/a/b) and more", "https://example.com/a/b"),
+        ] {
+            let runs = detect_links(input);
+            assert_eq!(runs.len(), 1, "{input:?}");
+            assert_eq!(runs[0].url, expected, "{input:?}");
+        }
+
+        // Stripping can leave a bare scheme, which has no target and so is not
+        // a link — the same rule as `https://` on its own.
+        assert!(detect_links("nothing https://. here").is_empty());
+    }
+
+    /// An address that opened its own bracket keeps it.
+    #[test]
+    fn a_url_keeps_the_brackets_it_opened() {
+        for (input, expected) in [
+            (
+                "https://en.wikipedia.org/wiki/Tux_(mascot)",
+                "https://en.wikipedia.org/wiki/Tux_(mascot)",
+            ),
+            (
+                "see https://en.wikipedia.org/wiki/Tux_(mascot).",
+                "https://en.wikipedia.org/wiki/Tux_(mascot)",
+            ),
+            ("https://example.com/a[b]", "https://example.com/a[b]"),
+        ] {
+            let runs = detect_links(input);
+            assert_eq!(runs.len(), 1, "{input:?}");
+            assert_eq!(runs[0].url, expected, "{input:?}");
+        }
     }
 
     #[test]
