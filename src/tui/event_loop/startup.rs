@@ -128,7 +128,7 @@ fn welcome_lines(version: &str, cwd: Option<String>) -> Vec<TranscriptLine> {
     let mut lines = vec![
         TranscriptLine::separator(),
         TranscriptLine::new(Logo, "  ▗▄▖".to_string()),
-        TranscriptLine::new(Logo, " ▟███▙".to_string()),
+        TranscriptLine::new(Logo, " ▟●█●▙".to_string()),
         TranscriptLine::new(Logo, " ▝█▄█▘".to_string()),
         TranscriptLine::new(Logo, "  ▝▘".to_string()),
         TranscriptLine::new(Heading, format!("# ✻ Syscity v{version}")),
@@ -158,7 +158,7 @@ mod tests {
             assert_eq!(row.kind, LineKind::Logo);
         }
         assert_eq!(lines[1].text, "  ▗▄▖");
-        assert_eq!(lines[2].text, " ▟███▙");
+        assert_eq!(lines[2].text, " ▟●█●▙");
         assert_eq!(lines[3].text, " ▝█▄█▘");
         assert_eq!(lines[4].text, "  ▝▘");
         assert_eq!(lines[5].text, "# ✻ Syscity v0.3.8");
