@@ -35,6 +35,10 @@ pub enum LineKind {
     /// An ATX heading (`# …`): the `#` marker is dropped, the title renders
     /// bold (h1 underlined).
     Heading,
+    /// Brand mark art (the welcome logo): accent colour, no heading parse —
+    /// block-art lines must never go through the ATX renderer, which drops
+    /// the first character.
+    Logo,
     /// A system notice (connection, resume, errors, command output).
     Notice,
     /// A blank separator line between blocks.

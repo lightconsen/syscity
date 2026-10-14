@@ -25,6 +25,9 @@ pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
         LineKind::Blockquote => theme.dim_style(),
         LineKind::ListItem => theme.assistant_style(),
         LineKind::Heading => theme.assistant_style(),
+        LineKind::Logo => Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
         LineKind::Notice => theme.system_style(),
         LineKind::Separator => Style::default(),
     }

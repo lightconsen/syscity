@@ -115,24 +115,31 @@ pub(super) async fn startup(
     state.write().await.transcript.push_notice(greeting);
 }
 
-/// The startup banner: branding, the three hints a first-time user needs, and
-/// the working directory. Pushed as the first thing in scrollback, in the
-/// Claude-Code manner — a quiet "who am I talking to" block rather than a
-/// full-screen takeover, because this TUI lives inline and the transcript
+/// The startup banner: the spark logo, branding, the hints a first-time user
+/// needs, and the working directory. Pushed as the first thing in scrollback,
+/// in the Claude-Code manner — a quiet "who am I talking to" block rather than
+/// a full-screen takeover, because this TUI lives inline and the transcript
 /// below it is the product.
+///
+/// The logo is block art in the same family as Claude Code's rounded square,
+/// but a spark of our own (the ✻ brand mark), rendered in the theme accent.
 fn welcome_lines(version: &str, cwd: Option<String>) -> Vec<TranscriptLine> {
-    use LineKind::{Heading, Notice};
+    use LineKind::{Heading, Logo, Notice};
     let mut lines = vec![
         TranscriptLine::separator(),
+        TranscriptLine::new(Logo, "  ▗▄▖".to_string()),
+        TranscriptLine::new(Logo, " ▟███▙".to_string()),
+        TranscriptLine::new(Logo, " ▝█▄█▘".to_string()),
+        TranscriptLine::new(Logo, "  ▝▘".to_string()),
         TranscriptLine::new(Heading, format!("# ✻ Syscity v{version}")),
-        TranscriptLine::new(
-            Notice,
-            "/help for commands · /resume <n> to switch sessions · /theme for the palette",
-        ),
     ];
     if let Some(cwd) = cwd {
         lines.push(TranscriptLine::new(Notice, format!("cwd: {cwd}")));
     }
+    lines.push(TranscriptLine::new(
+        Notice,
+        "/help for commands · /resume <n> to switch sessions · /theme for the palette",
+    ));
     lines.push(TranscriptLine::separator());
     lines
 }
@@ -142,24 +149,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn welcome_carries_branding_hints_and_cwd() {
+    fn welcome_carries_logo_branding_hints_and_cwd() {
         let lines = welcome_lines("0.3.8", Some("/Users/x/work".to_string()));
-        // blank / heading / tips / cwd / blank
-        assert_eq!(lines.len(), 5);
+        // blank / 4 logo rows / heading / cwd / hints / blank
+        assert_eq!(lines.len(), 9);
         assert!(lines[0].text.is_empty());
-        assert_eq!(lines[1].text, "# ✻ Syscity v0.3.8");
-        assert_eq!(lines[1].kind, LineKind::Heading);
-        assert!(lines[2].text.contains("/help for commands"));
-        assert!(lines[2].text.contains("/resume <n>"));
-        assert!(lines[2].text.contains("/theme"));
-        assert_eq!(lines[3].text, "cwd: /Users/x/work");
-        assert!(lines[4].text.is_empty());
+        for row in &lines[1..5] {
+            assert_eq!(row.kind, LineKind::Logo);
+        }
+        assert_eq!(lines[1].text, "  ▗▄▖");
+        assert_eq!(lines[2].text, " ▟███▙");
+        assert_eq!(lines[3].text, " ▝█▄█▘");
+        assert_eq!(lines[4].text, "  ▝▘");
+        assert_eq!(lines[5].text, "# ✻ Syscity v0.3.8");
+        assert_eq!(lines[5].kind, LineKind::Heading);
+        assert_eq!(lines[6].text, "cwd: /Users/x/work");
+        assert!(lines[7].text.contains("/help for commands"));
+        assert!(lines[7].text.contains("/resume <n>"));
+        assert!(lines[7].text.contains("/theme"));
+        assert!(lines[8].text.is_empty());
     }
 
     #[test]
     fn welcome_omits_the_cwd_line_when_none() {
         let lines = welcome_lines("0.3.8", None);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 8);
         assert!(lines.iter().all(|l| !l.text.starts_with("cwd:")));
+        // The logo is still there.
+        assert_eq!(lines[1..5].iter().map(|l| l.kind).collect::<Vec<_>>(), vec![LineKind::Logo; 4]);
     }
 }
