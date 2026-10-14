@@ -12,6 +12,7 @@
 #   ./audit.sh --fix        # Run cargo update before audit
 #   ./audit.sh --quick      # Only run cargo audit (skip deny and pnpm audit)
 #   ./audit.sh --advisories # Only advisory checks
+#   ./audit.sh --js         # Only the pnpm workspaces (what CI runs)
 #   ./audit.sh --cached     # Same checks, no fetches (the offline retry)
 #
 
@@ -29,6 +30,7 @@ RESET='\033[0m'
 FIX=false
 QUICK=false
 ADVISORIES_ONLY=false
+JS_ONLY=false
 CACHED=false
 
 for arg in "$@"; do
@@ -36,6 +38,7 @@ for arg in "$@"; do
         --fix) FIX=true ;;
         --quick) QUICK=true ;;
         --advisories) ADVISORIES_ONLY=true ;;
+        --js) JS_ONLY=true ;;
         --cached) CACHED=true ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
@@ -44,6 +47,7 @@ for arg in "$@"; do
             echo "  --fix        Run cargo update before auditing"
             echo "  --quick      Only run cargo audit (skip cargo-deny and pnpm audit)"
             echo "  --advisories Only run advisory checks"
+            echo "  --js         Only audit the pnpm workspaces"
             echo "  --cached     No fetches — audit against the local advisory caches"
             echo "  -h, --help   Show this help"
             exit 0
@@ -126,6 +130,17 @@ audit_js_workspaces() {
         echo -e "${YELLOW}WARN: no pnpm-lock.yaml found — nothing to audit${RESET}"
     fi
 }
+
+# ── JS-only run ────────────────────────────────────────────────────────────
+# The half of the advisory gate that reads pnpm-lock.yaml, on its own. CI's
+# security job runs the Rust half through its own actions (which install
+# cargo-audit and cargo-deny for us) and calls this for the rest.
+if $JS_ONLY; then
+    audit_js_workspaces
+    echo ""
+    echo -e "${GREEN}JS advisory checks complete.${RESET}"
+    exit 0
+fi
 
 # ── Optional: update deps ──────────────────────────────────────────────────
 if $FIX; then

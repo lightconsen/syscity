@@ -143,16 +143,18 @@ syscity/
    - Security gate: a versioned pre-commit hook (`.githooks/pre-commit`) runs
      fast staged-content checks (`scripts/staged-checks.sh`: conflict markers,
      oversized files, rustfmt, secret patterns) and then `./scripts/audit.sh`
-     (`cargo audit` + `cargo deny`), rejecting the commit on failure. Enable it
-     once per clone with `git config core.hooksPath .githooks`; bypass a single
-     commit with `git commit --no-verify`.
+     (`cargo audit` + `pnpm audit` over the JS workspaces + `cargo deny`),
+     rejecting the commit on failure. Enable it once per clone with
+     `git config core.hooksPath .githooks`; bypass a single commit with
+     `git commit --no-verify`.
 
 2. **CI Checks:**
    - Format check: `cargo fmt -- --check`
    - Linting: `cargo clippy -- -D warnings`
    - Tests: `cargo test --all-features`
    - Documentation: `cargo doc --no-deps`
-   - Security audit: `cargo audit`
+   - Security audit: `./scripts/audit.sh` (`cargo audit`, `pnpm audit`,
+     `cargo deny` — the CI job splits the first two across steps)
    - Static analysis: `./scripts/static-analysis.sh`
 
 3. **Self-review checklist (review every change against these):**

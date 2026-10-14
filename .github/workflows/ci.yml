@@ -427,6 +427,18 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
+      # Everything above reads Cargo.lock. The pnpm workspaces are a second
+      # supply chain with a second advisory feed, and this job is the backstop
+      # for a commit that bypassed the local hook — `--no-verify`, or a clone
+      # that never ran `git config core.hooksPath .githooks`.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Audit the JS workspaces
+        run: ./scripts/audit.sh --js
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
