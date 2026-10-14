@@ -64,7 +64,7 @@ pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
                         spans.push(Span::styled(indent.to_string(), style));
                     }
                     spans.push(Span::styled(format!("{glyph} "), code));
-                    spans.extend(inline_code_spans(rest, style, code));
+                    spans.extend(inline_spans(rest, style, code));
                     spans
                 }
                 None => vec![Span::styled(entry.text.clone(), style)],
@@ -83,45 +83,86 @@ pub fn to_line(entry: &TranscriptLine, theme: &Theme) -> Line<'static> {
             // The code span derives from the heading style so a heading keeps
             // one weight throughout; only the foreground flips to the accent.
             let code = heading.fg(theme.accent);
-            inline_code_spans(title.trim_start(), heading, code)
+            inline_spans(title.trim_start(), heading, code)
         }
         // Prose lines get backtick spans. A fenced block is already tagged
         // `LineKind::Code` and must not be re-tokenized.
         LineKind::Assistant | LineKind::User => {
-            inline_code_spans(&entry.text, style, style.fg(theme.accent))
+            inline_spans(&entry.text, style, style.fg(theme.accent))
         }
         _ => vec![Span::styled(entry.text.clone(), style)],
     };
     Line::from(spans)
 }
 
-/// Split prose on backtick pairs so `` `code` `` renders as inline code.
+/// Split prose into styled spans: `` `code` ``, `**bold**`, `*italic*` /
+/// `_italic_`.
 ///
-/// Width-neutral by design: every source character survives, styled or not,
-/// because the scrollback's wrap alignment is measured from the line's width.
-/// The code span inherits the line's style and overrides the foreground with
-/// the accent — so a code span inside a user turn keeps that turn's
-/// background pill. A lone backtick with no closer, or an empty pair, is
-/// ordinary text.
-fn inline_code_spans(text: &str, plain: Style, code: Style) -> Vec<Span<'static>> {
+/// Code backticks stay visible — that is the long-standing behaviour here, and
+/// changing it is a separate call — and everything inside them is literal, so an
+/// emphasis marker in code is not honoured. Emphasis markers, by contrast, are
+/// **dropped** (as a heading drops its `#`): the line shows the words, not the
+/// syntax. That is safe because the wrap measures the spans rather than the
+/// source, and it is why the emphasis tests assert on the words.
+///
+/// Two rules keep prose from being italicised by accident:
+/// - a marker must open against a non-space and close against a non-space, so
+///   `2 * 3 * 4` is arithmetic;
+/// - `_` must additionally open at a word boundary, so `snake_case` is never
+///   italics.
+///
+/// A marker that does not close is ordinary text.
+fn inline_spans(text: &str, plain: Style, code: Style) -> Vec<Span<'static>> {
+    /// Is this a word character? Drives the `_` boundary rule.
+    fn is_word(c: Option<&char>) -> bool {
+        c.is_some_and(|c| c.is_alphanumeric())
+    }
+
+    fn flush(out: &mut Vec<Span<'static>>, buf: &mut String, style: Style) {
+        if !buf.is_empty() {
+            out.push(Span::styled(std::mem::take(buf), style));
+        }
+    }
+
+    /// The index just past a `**` closer at or after `from`.
+    fn bold_closer(chars: &[char], from: usize) -> Option<usize> {
+        (from..chars.len().saturating_sub(1))
+            .find(|&j| chars[j] == '*' && chars[j + 1] == '*')
+            .map(|j| j + 2)
+    }
+
+    /// The index just past a single-marker closer, if one is well-formed.
+    fn italic_closer(chars: &[char], from: usize, marker: char) -> Option<usize> {
+        (from..chars.len())
+            .find(|&j| chars[j] == marker && !chars[j - 1].is_whitespace())
+            .map(|j| j + 1)
+    }
+
+    /// A marker only opens when the next character is not blank, which is what
+    /// separates `*emphasis*` from a multiplication sign.
+    fn opens_at(chars: &[char], after: usize) -> bool {
+        chars.get(after).is_some_and(|c| !c.is_whitespace())
+    }
+
+    let bold = plain.add_modifier(Modifier::BOLD);
+    let italic = plain.add_modifier(Modifier::ITALIC);
+    let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
-    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
+
     while i < chars.len() {
-        if chars[i] == '`' {
-            // Find the matching closer. The backticks themselves are ordinary
-            // text before and after the code span — only the content between
-            // them is accented, and every source character survives.
+        let c = chars[i];
+
+        // Code comes first and wins: nothing inside backticks is parsed.
+        if c == '`' {
             if let Some(j) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), plain));
-                }
+                flush(&mut spans, &mut buf, plain);
                 buf.push('`');
-                spans.push(Span::styled(std::mem::take(&mut buf), plain));
-                let code_text: String = chars[i + 1..j].iter().collect();
-                if !code_text.is_empty() {
-                    spans.push(Span::styled(code_text, code));
+                flush(&mut spans, &mut buf, plain);
+                let body: String = chars[i + 1..j].iter().collect();
+                if !body.is_empty() {
+                    spans.push(Span::styled(body, code));
                 }
                 // The closing backtick stays in the buffer, joining whatever
                 // follows into the next plain run.
@@ -129,16 +170,53 @@ fn inline_code_spans(text: &str, plain: Style, code: Style) -> Vec<Span<'static>
                 i = j + 1;
                 continue;
             }
-            // No closing backtick: ordinary text.
             buf.push('`');
-        } else {
-            buf.push(chars[i]);
+            i += 1;
+            continue;
         }
+
+        // `**bold**`, checked before the single `*` branch below.
+        if c == '*' && chars.get(i + 1) == Some(&'*') && opens_at(&chars, i + 2) {
+            if let Some(body) = bold_closer(&chars, i + 2)
+                .map(|end| (chars[i + 2..end - 2].iter().collect::<String>(), end))
+                .filter(|(body, _)| !body.is_empty())
+            {
+                flush(&mut spans, &mut buf, plain);
+                // Recurse, so `**bold with _italics_ inside**` renders: the
+                // inner markers are parsed against the bold style as their
+                // base. Bodies are strictly shorter, so this terminates.
+                spans.extend(inline_spans(&body.0, bold, code));
+                i = body.1;
+                continue;
+            }
+        }
+
+        // `*italic*` and `_italic_` (the latter only at a word boundary).
+        let marker = match c {
+            '*' => Some('*'),
+            '_' if !is_word(chars.get(i.wrapping_sub(1))) => Some('_'),
+            _ => None,
+        };
+        // An empty pair (`**`, `__`) is not emphasis: consuming it would drop the
+        // markers from the line, and the width-neutrality of everything after
+        // depends on nothing being dropped unless it was styled.
+        if let Some(marker) = marker.filter(|_| opens_at(&chars, i + 1)) {
+            if let Some(body) = italic_closer(&chars, i + 1, marker)
+                .map(|end| (chars[i + 1..end - 1].iter().collect::<String>(), end))
+                .filter(|(body, _)| !body.is_empty())
+            {
+                flush(&mut spans, &mut buf, plain);
+                spans.extend(inline_spans(&body.0, italic, code));
+                i = body.1;
+                continue;
+            }
+        }
+
+        buf.push(c);
         i += 1;
     }
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, plain));
-    }
+
+    flush(&mut spans, &mut buf, plain);
     spans
 }
 
@@ -638,6 +716,80 @@ mod tests {
         let joined: String = empty.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "a``b");
         assert!(empty.spans.iter().all(|s| s.style.fg != Some(theme.accent)));
+    }
+
+    /// The styled span whose text is `word`, or a panic naming the source.
+    fn styled_word(line: &Line<'static>, word: &str, src: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|s| s.content == word)
+            .unwrap_or_else(|| panic!("{src:?} has no {word:?} span"))
+            .style
+    }
+
+    #[test]
+    fn emphasis_renders_and_the_markers_are_dropped() {
+        let theme = Theme::dark();
+        for (src, expected, word, modifier) in [
+            ("**bold** here", "bold here", "bold", Modifier::BOLD),
+            ("plain *it* here", "plain it here", "it", Modifier::ITALIC),
+            ("plain _it_ here", "plain it here", "it", Modifier::ITALIC),
+            ("**a _b_ c**", "a b c", "b", Modifier::ITALIC),
+        ] {
+            let line = to_line(&TranscriptLine::new(LineKind::Assistant, src.to_string()), &theme);
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, expected, "{src:?} renders without its markers");
+            assert!(
+                styled_word(&line, word, src)
+                    .add_modifier
+                    .contains(modifier),
+                "{src:?}: {word:?} is not {modifier:?}"
+            );
+        }
+    }
+
+    /// The two ways a marker reads as punctuation rather than emphasis.
+    #[test]
+    fn identifiers_arithmetic_and_unclosed_markers_stay_prose() {
+        let theme = Theme::dark();
+        for src in [
+            "snake_case_name",
+            "call foo_bar() then baz_qux()",
+            "a * b * c",
+            "2 * 3 * 4",
+            "** unclosed",
+            "unclosed _here",
+            "***",
+            "it **is** fine", // a real pair, checked below for contrast
+        ] {
+            let line = to_line(&TranscriptLine::new(LineKind::Assistant, src.to_string()), &theme);
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let is_prose = !src.contains("**is**");
+            if is_prose {
+                assert_eq!(joined, src, "{src:?} must survive untouched");
+                assert!(
+                    line.spans
+                        .iter()
+                        .all(|s| !s.style.add_modifier.contains(Modifier::ITALIC)),
+                    "{src:?} must not be italic"
+                );
+            }
+        }
+    }
+
+    /// Code wins: a marker inside backticks is literal, not emphasis.
+    #[test]
+    fn emphasis_inside_code_is_literal() {
+        let theme = Theme::dark();
+        let src = "compare `a ** b` and **this**";
+        let line = to_line(&TranscriptLine::new(LineKind::Assistant, src.to_string()), &theme);
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("`a ** b`"), "{joined:?}");
+        assert!(joined.contains("this"), "{joined:?}");
+        // The code span keeps its accent and is not bold.
+        let code = styled_word(&line, "a ** b", src);
+        assert_eq!(code.fg, Some(theme.accent));
+        assert!(!code.add_modifier.contains(Modifier::BOLD), "code must not be bolded");
     }
 
     #[test]
