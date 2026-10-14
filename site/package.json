@@ -21,7 +21,7 @@
     "@vitejs/plugin-react": "^4.3.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^4.3.1",
-    "typescript": "^5.7.0",
+    "typescript": "^7.0.2",
     "vite": "^6.0.0"
   },
   "pnpm": {
