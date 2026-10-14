@@ -115,22 +115,38 @@ pub(super) async fn startup(
     state.write().await.transcript.push_notice(greeting);
 }
 
-/// The startup banner: the spark logo, branding, the hints a first-time user
+/// The brand mark in block characters: three towers with a mast on the tallest,
+/// over a horizon — the logo (`syscity.png`) as a skyline.
+///
+/// Same family of glyphs as Claude Code's mark, drawn from our own logo rather
+/// than invented: the centre tower is tallest and carries the mast, the two
+/// flanking towers are lower, and the horizon runs under them. `LineKind::Logo`
+/// renders it in the theme accent, so the whole mark takes the active palette.
+///
+/// Rows are kept the same width on purpose — uneven rows still render, but the
+/// silhouette only reads cleanly when the towers line up column for column.
+const LOGO: [&str; 5] = [
+    "       ▐▌",
+    "  ▗▄▖  ▐█▌  ▗▄▖",
+    " ▟███▖▐███▌▗████▖",
+    "▐███████████████▌",
+    "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+];
+
+/// The startup banner: the skyline mark, branding, the hints a first-time user
 /// needs, and the working directory. Pushed as the first thing in scrollback,
 /// in the Claude-Code manner — a quiet "who am I talking to" block rather than
 /// a full-screen takeover, because this TUI lives inline and the transcript
 /// below it is the product.
-///
-/// The logo is block art in the same family as Claude Code's rounded square,
-/// but a spark of our own (the ✻ brand mark), rendered in the theme accent.
 fn welcome_lines(version: &str, cwd: Option<String>) -> Vec<TranscriptLine> {
     use LineKind::{Heading, Logo, Notice};
     let mut lines = vec![
         TranscriptLine::separator(),
-        TranscriptLine::new(Logo, "  ▗▄▖".to_string()),
-        TranscriptLine::new(Logo, " ▟●█●▙".to_string()),
-        TranscriptLine::new(Logo, " ▝█▄█▘".to_string()),
-        TranscriptLine::new(Logo, "  ▝▘".to_string()),
+        TranscriptLine::new(Logo, LOGO[0].to_string()),
+        TranscriptLine::new(Logo, LOGO[1].to_string()),
+        TranscriptLine::new(Logo, LOGO[2].to_string()),
+        TranscriptLine::new(Logo, LOGO[3].to_string()),
+        TranscriptLine::new(Logo, LOGO[4].to_string()),
         TranscriptLine::new(Heading, format!("# ✻ Syscity v{version}")),
     ];
     if let Some(cwd) = cwd {
@@ -151,31 +167,49 @@ mod tests {
     #[test]
     fn welcome_carries_logo_branding_hints_and_cwd() {
         let lines = welcome_lines("0.3.8", Some("/Users/x/work".to_string()));
-        // blank / 4 logo rows / heading / cwd / hints / blank
-        assert_eq!(lines.len(), 9);
+        // blank / 5 logo rows / heading / cwd / hints / blank
+        assert_eq!(lines.len(), 10);
         assert!(lines[0].text.is_empty());
-        for row in &lines[1..5] {
+        for row in &lines[1..6] {
             assert_eq!(row.kind, LineKind::Logo);
         }
-        assert_eq!(lines[1].text, "  ▗▄▖");
-        assert_eq!(lines[2].text, " ▟●█●▙");
-        assert_eq!(lines[3].text, " ▝█▄█▘");
-        assert_eq!(lines[4].text, "  ▝▘");
-        assert_eq!(lines[5].text, "# ✻ Syscity v0.3.8");
-        assert_eq!(lines[5].kind, LineKind::Heading);
-        assert_eq!(lines[6].text, "cwd: /Users/x/work");
-        assert!(lines[7].text.contains("/help for commands"));
-        assert!(lines[7].text.contains("/resume <n>"));
-        assert!(lines[7].text.contains("/theme"));
-        assert!(lines[8].text.is_empty());
+        // The mark is the skyline: a mast, three towers, and the horizon.
+        assert!(lines[1].text.contains('▐'), "mast");
+        assert!(lines[3].text.contains('▗') && lines[3].text.contains('▖'), "towers");
+        assert!(lines[5].text.starts_with('▀'), "horizon under the towers");
+        assert_eq!(lines[6].text, "# ✻ Syscity v0.3.8");
+        assert_eq!(lines[6].kind, LineKind::Heading);
+        assert_eq!(lines[7].text, "cwd: /Users/x/work");
+        assert!(lines[8].text.contains("/help for commands"));
+        assert!(lines[8].text.contains("/resume <n>"));
+        assert!(lines[8].text.contains("/theme"));
+        assert!(lines[9].text.is_empty());
+    }
+
+    /// The mark is a skyline: the towers rise from the horizon row, so nothing
+    /// is wider than it and it starts at the left edge. Rows differ in length —
+    /// leading spaces are what align the towers — so this is the property worth
+    /// pinning, not equal widths.
+    #[test]
+    fn the_logo_rises_from_its_left_aligned_base() {
+        let base = LOGO[LOGO.len() - 1];
+        assert!(base.starts_with('▀'), "the last row is the horizon: {base:?}");
+        let base_width = base.chars().count();
+        for row in LOGO {
+            assert!(
+                row.chars().count() <= base_width,
+                "logo row {row:?} is wider than the horizon"
+            );
+            assert!(!row.ends_with(' '), "trailing space would add width: {row:?}");
+        }
     }
 
     #[test]
     fn welcome_omits_the_cwd_line_when_none() {
         let lines = welcome_lines("0.3.8", None);
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 9);
         assert!(lines.iter().all(|l| !l.text.starts_with("cwd:")));
         // The logo is still there.
-        assert_eq!(lines[1..5].iter().map(|l| l.kind).collect::<Vec<_>>(), vec![LineKind::Logo; 4]);
+        assert_eq!(lines[1..6].iter().map(|l| l.kind).collect::<Vec<_>>(), vec![LineKind::Logo; 5]);
     }
 }
