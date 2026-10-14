@@ -6,7 +6,7 @@
 //! `Viewport::Inline`'s height cannot be changed after construction; overflow
 //! is handled by the transcript, not by growing this.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -42,6 +42,24 @@ pub struct LiveLayout {
     /// The row under the composer: the permission mode, the way Claude Code
     /// shows it. Absent when the terminal has no room below the input.
     pub footer: Option<Rect>,
+}
+
+/// The rows the stream preview may occupy — the block area's height.
+///
+/// The caller needs this *before* drawing: it decides how many graduated lines
+/// to keep live instead of writing them to scrollback, and a line written to
+/// scrollback can never be shown in the region again.
+///
+/// Takes the terminal [`Size`] rather than a `Rect` because that is what
+/// `Terminal::size` hands back, and the answer depends only on the region's
+/// height and the wrapping width — the y offset cancels out of the layout.
+pub fn preview_budget(size: Size, state: &AppState) -> usize {
+    // `size` is the viewport, which is what [`render`] lays out too, so the
+    // budget and the draw agree on how tall the region is.
+    let area = Rect::new(0, 0, size.width, size.height);
+    let composer_rows = (input_rows(state, &state.active_theme, area.width).len() as u16)
+        .clamp(1, COMPOSER_MAX_ROWS);
+    layout(area, composer_rows).block.height as usize
 }
 
 /// Lay the region out bottom-up so it stays sane at any terminal height.
@@ -554,6 +572,33 @@ fn task_row_lines(
     Some(lines)
 }
 
+/// The newest rows of the conversation, wrapped to the block and bottom-anchored.
+///
+/// Wrapping here rather than leaving it to the [`Paragraph`] is what keeps the
+/// *newest* text on screen: a `Paragraph` fills its area top-down, so a single
+/// long line wrapping into more rows than the block has would push the end of
+/// the answer out of the region and show its beginning instead. Wrapping first
+/// and keeping the last `height` rows anchors the region to the end of the
+/// conversation, which is the whole point of holding lines live.
+///
+/// The same wrapping the scrollback writer uses, so a line does not change
+/// shape on the way out of the region.
+fn preview_lines(state: &AppState, theme: &Theme, block: Rect) -> Option<Vec<Line<'static>>> {
+    let height = block.height as usize;
+    if height == 0 || block.width == 0 {
+        return None;
+    }
+    let preview = state.transcript.preview(height);
+    if preview.is_empty() {
+        return None;
+    }
+    let mut rows = wrapmod::wrap_lines(&blocks::to_lines(&preview, theme), block.width as usize);
+    if rows.len() > height {
+        rows.drain(..rows.len() - height);
+    }
+    Some(rows)
+}
+
 /// Render the whole live region.
 pub fn render(f: &mut Frame, state: &AppState) {
     let theme = &state.active_theme;
@@ -580,17 +625,13 @@ pub fn render(f: &mut Frame, state: &AppState) {
     };
     let block_lines = match block_lines {
         Some(lines) => Some(lines),
-        None => {
-            let preview = state.transcript.preview(l.block.height as usize);
-            if preview.is_empty() {
-                None
-            } else {
-                Some(blocks::to_lines(&preview, theme))
-            }
-        }
+        None => preview_lines(state, theme, l.block),
     };
     if let Some(lines) = block_lines {
         if l.block.height > 0 {
+            // The preview arrives pre-wrapped to the block's width, so this
+            // `Wrap` is a no-op for it and the real wrapping for the prompt and
+            // completion rows, which are built unwrapped.
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), l.block);
         }
     }
@@ -619,6 +660,70 @@ mod tests {
 
     fn rect(y: u16, height: u16) -> Rect {
         Rect { x: 0, y, width: 40, height }
+    }
+
+    /// The block area is anchored to the *end* of the conversation: when the
+    /// held lines outgrow it, the newest survive and the oldest go.
+    #[test]
+    fn the_preview_keeps_the_newest_rows() {
+        let mut state = AppState::default();
+        for word in ["alpha", "bravo", "charlie", "delta"] {
+            state.transcript.push_notice(word);
+        }
+        // What the loop does before every paint: graduate all but a budget.
+        state.transcript.take_flushable_keeping(4);
+
+        let block = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+        };
+        let texts: Vec<String> = preview_lines(&state, &Theme::dark(), block)
+            .expect("rows to draw")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts.iter().any(|t| t.contains("delta")), "newest kept: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("alpha")), "oldest dropped: {texts:?}");
+
+        // A line that wraps taller than the block must not push the end of the
+        // answer out of view — the whole reason the rows are wrapped here.
+        let mut state = AppState::default();
+        state
+            .transcript
+            .push_notice("one two three four five six seven");
+        state.transcript.take_flushable_keeping(4);
+        let block = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 2,
+        };
+        let texts: Vec<String> = preview_lines(&state, &Theme::dark(), block)
+            .expect("rows to draw")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts[1].contains("seven"), "the tail of the line: {texts:?}");
+        assert!(!texts[0].contains("one"), "the head scrolled off: {texts:?}");
+    }
+
+    /// With nothing held and nothing streaming the area is blank, not a row of
+    /// stale text — quitting must not leave the last answer frozen above the
+    /// shell prompt.
+    #[test]
+    fn an_empty_transcript_draws_nothing() {
+        let state = AppState::default();
+        let block = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        assert!(preview_lines(&state, &Theme::dark(), block).is_none());
     }
 
     /// The layout must never produce overlapping rows, at any height.

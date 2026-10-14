@@ -154,8 +154,15 @@ async fn a_lost_connection_converges_the_running_loop() {
         assert_eq!(s.live_mode, LiveMode::Composer, "the composer takes the input back");
         assert!(s.pending_ask.is_none());
         assert!(
-            s.transcript.preview(10).is_empty(),
-            "nothing is left hanging in the live region"
+            !s.transcript.has_stream(STREAM_ASSISTANT),
+            "no stream is left open, waiting for deltas that cannot come"
+        );
+        assert!(
+            s.transcript
+                .preview(10)
+                .iter()
+                .any(|l| l.text.contains("half an answer")),
+            "the text that did arrive is kept, not dropped with the stream"
         );
     }
 

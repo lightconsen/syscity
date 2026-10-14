@@ -271,6 +271,15 @@ pub struct Transcript {
     ready: Vec<TranscriptLine>,
     /// In-flight assistant streams, keyed by message id, in arrival order.
     streams: Vec<(String, StreamBuffer)>,
+    /// Graduated lines kept live instead of written to scrollback.
+    ///
+    /// The live region is a fixed number of rows and the block area above the
+    /// composer is where the newest text sits. Once a line is written to
+    /// scrollback it can never be revisited, so the newest lines wait here and
+    /// age into scrollback only when newer ones push them past the region's
+    /// capacity. Without this the block area is blank whenever nothing is
+    /// streaming — a gap between the conversation and the composer.
+    tail: Vec<TranscriptLine>,
 }
 
 impl Transcript {
@@ -343,24 +352,50 @@ impl Transcript {
     }
 
     /// Take everything that has graduated, for one scrollback write.
+    ///
+    /// Every graduated line, nothing held back — the whole-transcript moves
+    /// used by command output, a session switch and shutdown.
     pub fn take_flushable(&mut self) -> Vec<TranscriptLine> {
-        let mut out = std::mem::take(&mut self.ready);
+        self.take_flushable_keeping(0).0
+    }
+
+    /// Take the lines that should now go to scrollback, keeping the newest
+    /// `keep` of them live.
+    ///
+    /// A held line is not written yet — it is redrawn in the live region, and
+    /// graduates when `keep` newer lines push it out. This is what keeps the
+    /// region above the composer showing the end of the conversation instead of
+    /// going blank between turns.
+    ///
+    /// Returns the lines to write and whether the live tail changed — the
+    /// renderer needs the second to know it owes a repaint even when nothing
+    /// was written, since held lines are only ever seen through the region.
+    pub fn take_flushable_keeping(&mut self, keep: usize) -> (Vec<TranscriptLine>, bool) {
+        let mut graduated = std::mem::take(&mut self.ready);
         for (_, buf) in self.streams.iter_mut() {
-            out.extend(buf.take_flushable());
+            graduated.extend(buf.take_flushable());
         }
-        out
+        let changed = !graduated.is_empty();
+        if !changed && self.tail.len() <= keep {
+            return (Vec::new(), false);
+        }
+        self.tail.append(&mut graduated);
+        let excess = self.tail.len().saturating_sub(keep);
+        (self.tail.drain(..excess).collect(), changed)
     }
 
     /// The tail of what is still live, newest last, at most `max` lines.
+    ///
+    /// The held lines first — they are older — then whatever the streams have
+    /// not released yet.
     pub fn preview(&self, max: usize) -> Vec<TranscriptLine> {
-        let mut out: Vec<TranscriptLine> = Vec::new();
+        let mut out: Vec<TranscriptLine> = self.tail.clone();
         for (_, buf) in self.streams.iter() {
             if buf.is_empty() {
                 continue;
             }
-            let mut lines: Vec<TranscriptLine> = buf.held.clone();
-            lines.extend(lines_of(buf.pending(), buf.kind));
-            out.extend(lines);
+            out.extend(buf.held.clone());
+            out.extend(lines_of(buf.pending(), buf.kind));
         }
         if out.len() > max {
             out.split_off(out.len() - max)
@@ -387,6 +422,10 @@ impl Transcript {
     pub fn reset(&mut self) {
         self.ready.clear();
         self.streams.clear();
+        // The held tail belongs to the conversation being left; keeping it
+        // would leak the old session's last lines into the new one's region and
+        // then into its scrollback.
+        self.tail.clear();
     }
 
     fn stream_mut(&mut self, id: &str, kind: LineKind) -> &mut StreamBuffer {
@@ -591,6 +630,63 @@ mod tests {
         assert_eq!(texts(&t.take_flushable()), vec!["held"], "emitted once");
         // And a stream that does not exist is not an error.
         t.seal_stream("nope");
+    }
+
+    /// The newest lines are held live instead of written, and age out into
+    /// scrollback as newer ones arrive — that hold is what keeps the region
+    /// above the composer showing the end of the conversation.
+    #[test]
+    fn the_newest_lines_are_held_live_and_age_out() {
+        let mut t = Transcript::new();
+        t.push_notice("one");
+        t.push_notice("two");
+        // Room for two: nothing graduates yet.
+        let (written, changed) = t.take_flushable_keeping(2);
+        assert!(written.is_empty(), "both held: {written:?}");
+        assert!(changed, "they did move from ready to the tail");
+        assert_eq!(texts(&t.preview(10)), vec!["one", "two"]);
+
+        // A third line pushes the oldest out.
+        t.push_notice("three");
+        let (written, changed) = t.take_flushable_keeping(2);
+        assert_eq!(texts(&written), vec!["one"]);
+        assert!(changed);
+        assert_eq!(texts(&t.preview(10)), vec!["two", "three"]);
+    }
+
+    /// Nothing graduated means nothing owes a repaint — but a shrink in the
+    /// budget still has to release lines, and does so without claiming the
+    /// live tail moved.
+    #[test]
+    fn a_smaller_budget_releases_held_lines_without_a_preview_change() {
+        let mut t = Transcript::new();
+        t.push_notice("one");
+        t.push_notice("two");
+        t.take_flushable_keeping(2);
+        assert_eq!(texts(&t.take_flushable_keeping(0).0), vec!["one", "two"]);
+    }
+
+    /// The whole-transcript path still takes everything, held lines included —
+    /// a session switch or a quit must not lose the end of the conversation.
+    #[test]
+    fn take_flushable_ignores_the_hold() {
+        let mut t = Transcript::new();
+        t.push_notice("one");
+        t.push_notice("two");
+        t.take_flushable_keeping(5);
+        assert_eq!(texts(&t.take_flushable()), vec!["one", "two"]);
+        assert!(t.preview(10).is_empty(), "nothing is left live");
+    }
+
+    /// A quiet transcript is not a repaint: the budget is re-asked every frame.
+    #[test]
+    fn keeping_with_nothing_new_reports_no_change() {
+        let mut t = Transcript::new();
+        t.push_notice("one");
+        t.take_flushable_keeping(5);
+        let (written, changed) = t.take_flushable_keeping(5);
+        assert!(written.is_empty());
+        assert!(!changed, "the loop would repaint forever otherwise");
     }
 
     #[test]

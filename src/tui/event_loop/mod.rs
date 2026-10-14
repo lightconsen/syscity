@@ -272,6 +272,43 @@ where
     if let Some(handle) = in_flight {
         handle.abort();
     }
+
+    // The newest lines were held live, never written. On the way out they have
+    // to land, or quitting would drop the end of the conversation from the
+    // terminal's scrollback — the region is repainted afterwards so the lines
+    // are not also left showing there.
+    flush_held(terminal, &state).await?;
+    Ok(())
+}
+
+/// Write everything still held live, then repaint.
+///
+/// Closing the open streams first, so a turn cut off mid-line still lands as a
+/// line rather than vanishing with the region.
+async fn flush_held<B>(
+    terminal: &mut Terminal<B>,
+    state: &Arc<RwLock<AppState>>,
+) -> Result<(), TuiError>
+where
+    B: Backend,
+    TuiError: From<B::Error>,
+{
+    let area = terminal.size()?;
+    let pending = {
+        let mut s = state.write().await;
+        s.transcript.finish_open_streams();
+        s.transcript.take_flushable()
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let lines = {
+        let s = state.read().await;
+        blocks::to_lines(&pending, &s.active_theme)
+    };
+    scrollback::flush(terminal, &lines, area.width)?;
+    let s = state.read().await;
+    terminal.draw(|f| live::render(f, &s))?;
     Ok(())
 }
 
@@ -405,21 +442,25 @@ where
     B: Backend,
     TuiError: From<B::Error>,
 {
-    let (pending, dirty) = {
+    let area = terminal.size()?;
+    let (pending, live_changed, dirty) = {
         let mut s = state.write().await;
-        (s.transcript.take_flushable(), s.dirty)
+        // Hold the newest lines live so the region above the composer keeps
+        // showing the end of the conversation rather than going blank.
+        let keep = live::preview_budget(area, &s);
+        let (pending, changed) = s.transcript.take_flushable_keeping(keep);
+        (pending, changed, s.dirty)
     };
-    if pending.is_empty() && !dirty {
+    if pending.is_empty() && !dirty && !live_changed {
         return Ok(());
     }
 
     if !pending.is_empty() {
-        let width = terminal.size()?.width;
         let lines = {
             let s = state.read().await;
             blocks::to_lines(&pending, &s.active_theme)
         };
-        scrollback::flush(terminal, &lines, width)?;
+        scrollback::flush(terminal, &lines, area.width)?;
         // `flush` inserted above the viewport and cleared it — the draw below
         // is what puts the composer back.
     }
