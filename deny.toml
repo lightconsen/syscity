@@ -8,13 +8,6 @@ all-features = true
 [advisories]
 # A list of advisory IDs to ignore with documented justification
 ignore = [
-    # rustls-webpki vulnerabilities via serenity's transitive dependency.
-    # serenity 0.12.5 locks tokio-tungstenite 0.21.0 -> rustls 0.22.4 -> rustls-webpki 0.102.8.
-    # serenity upstream has not released a fix yet.
-    { id = "RUSTSEC-2026-0049", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
-    { id = "RUSTSEC-2026-0098", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
-    { id = "RUSTSEC-2026-0099", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
-    { id = "RUSTSEC-2026-0104", reason = "transitive dependency via serenity 0.12.5 -> tokio-tungstenite 0.21.0 -> rustls 0.22.4; serenity has not released a fix" },
     # `proc-macro-error2` is unmaintained but used by transitive proc-macro crates.
     { id = "RUSTSEC-2026-0173", reason = "transitive unmaintained dependency; no actionable upgrade path" },
     # lopdf 0.34 (via pdf-extract 0.7.12) stack overflow; fixed version needs a major bump no released pdf-extract pulls in yet.

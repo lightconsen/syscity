@@ -245,7 +245,7 @@ unicode-width = { version = "0.2" }
 
 # Channels (optional)
 teloxide = { version = "0.17", features = ["macros"], optional = true }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"], optional = true }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model"], optional = true }
 
 # System resource limits and signals (Unix only)
 [target.'cfg(unix)'.dependencies]
