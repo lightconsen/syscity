@@ -41,7 +41,8 @@
     ],
     "overrides": {
       "browserslist": "^4.29.0",
-      "baseline-browser-mapping": "^2.11.0"
+      "baseline-browser-mapping": "^2.11.0",
+      "source-map-js": "^1.2.2"
     }
   }
 }
