@@ -2,9 +2,9 @@
 #
 # Pre-commit gate: mirrors the CI "Security Audit" job locally.
 #
-# Runs scripts/audit.sh (cargo audit + cargo-deny) and rejects the commit on
-# any failure, so RUSTSEC advisories surface at commit time instead of after
-# a push breaks CI.
+# Runs scripts/audit.sh (cargo audit + pnpm audit + cargo-deny) and rejects the
+# commit on any failure, so RUSTSEC and npm advisories surface at commit time
+# instead of after a push breaks CI.
 #
 # Bypass in emergencies: git commit --no-verify
 
@@ -48,12 +48,15 @@ fi
 
 # First run failed. Retry once with the cached advisory DB so a transient
 # advisory-db fetch failure (offline / flaky GitHub) doesn't block commits.
-# Real findings fail both runs, so the gate stays strict. cargo-deny has no
-# --no-fetch, so run it --offline against its local advisory DB cache.
+# Real findings fail both runs, so the gate stays strict.
+#
+# The same script with --cached, not a second copy of its commands: the copy
+# this replaced is how the npm check came to be missing from the retry, and a
+# retry that checks less than the run it retries is a hole with a green label.
 echo ""
 echo "⚠️   audit failed — retrying once with the cached advisory DB"
 echo ""
-if cargo audit --stale --no-fetch && cargo deny --offline check; then
+if ./scripts/audit.sh --cached; then
     echo ""
     echo "✅  Passed on retry with the cached advisory DB."
     exit 0
