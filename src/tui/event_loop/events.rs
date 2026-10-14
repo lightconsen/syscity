@@ -315,11 +315,12 @@ pub(super) async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState
             }
             // Get the user's attention before queueing it: the turn is blocked
             // until someone answers, and nothing else here will be.
+            let mut s = state.write().await;
             notify(
+                s.notify,
                 "Syscity — approval needed",
                 &format!("{} wants to run {}", detail.requested_by, detail.tool_name),
             );
-            let mut s = state.write().await;
             s.approvals.push_back(detail);
             s.live_mode = LiveMode::Approval;
             s.dirty = true;
@@ -330,8 +331,8 @@ pub(super) async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState
                 .unwrap_or("the agent has a question")
                 .to_string();
             // Same as an approval: the turn is blocked until someone answers.
-            notify("Syscity — a question needs you", &question);
             let mut s = state.write().await;
+            notify(s.notify, "Syscity — a question needs you", &question);
             s.pending_ask = Some(AskPrompt {
                 ask_id: payload["ask_id"].as_str().unwrap_or_default().to_string(),
                 question,
@@ -380,11 +381,14 @@ pub(super) fn tool_call_lines(tool: &str, args: Option<&Value>) -> Vec<Transcrip
     lines
 }
 
-/// Ask the terminal to get the user's attention.
+/// Ask the terminal to get the user's attention, unless `[tui] notify` is off.
 ///
 /// Fire-and-forget: a terminal that rejects the escape must not fail the event
 /// that needed the attention, and a headless one has nothing to ring.
-fn notify(title: &str, body: &str) {
+fn notify(enabled: bool, title: &str, body: &str) {
+    if !enabled {
+        return;
+    }
     let mut out = std::io::stdout();
     if let Err(e) = crate::tui::commands::write_notify(&mut out, title, body) {
         tracing::debug!("could not notify the terminal: {e}");

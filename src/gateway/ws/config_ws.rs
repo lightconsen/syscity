@@ -44,6 +44,7 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
             "auth_mode": config.security.auth_mode,
             "tui": {
                 "theme": config.tui.theme,
+                "notify": config.tui.notify,
             },
             "permissions": {
                 "mode": config.permissions.mode,
@@ -333,6 +334,17 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
                 }
             }
         }
+        "tui.notify" => match params.value.as_bool() {
+            Some(on) => config.tui.notify = on,
+            None => {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "Expected a boolean: true rings the terminal when a prompt blocks the turn"
+                        .to_string(),
+                )
+            }
+        },
         "permissions.mode" => {
             match crate::tools::PermissionMode::parse(params.value.as_str().unwrap_or_default()) {
                 Some(mode) => config.permissions.mode = mode,
@@ -753,6 +765,32 @@ mod tests {
             crate::gateway::ThemeSetting::Light,
             "the reject must leave the previous value intact"
         );
+    }
+
+    /// The two `[tui]` preferences are separate paths: setting one must leave
+    /// the other standing, or someone who silenced notifications would get them
+    /// back the next time they changed the theme.
+    #[tokio::test]
+    async fn config_set_tui_notify_leaves_the_theme_alone() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        set_and_ok(&state, "tui.theme", serde_json::json!("light")).await;
+
+        let res = set_and_ok(&state, "tui.notify", serde_json::json!(false)).await;
+        assert!(res.ok, "silencing must set: {:?}", res.error);
+        {
+            let cfg = state.config.read().await;
+            assert!(!cfg.tui.notify);
+            assert_eq!(cfg.tui.theme, crate::gateway::ThemeSetting::Light, "the neighbour holds");
+        }
+
+        let res = handle_config_get(&req("g", "config.get", serde_json::json!({})), &state).await;
+        let p = res.payload.expect("payload");
+        assert_eq!(p["tui"]["notify"].as_bool(), Some(false));
+
+        // A non-bool is rejected, not coerced — and the reject is inert.
+        let res = set_and_ok(&state, "tui.notify", serde_json::json!("no")).await;
+        assert!(!res.ok);
+        assert!(!state.config.read().await.tui.notify);
     }
 
     #[tokio::test]

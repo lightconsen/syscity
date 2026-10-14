@@ -162,11 +162,19 @@ pub enum ThemeSetting {
 pub struct TuiConfig {
     /// The theme setting the TUI resolves at startup.
     pub theme: ThemeSetting,
+    /// Ring the terminal when a prompt blocks the turn (an approval or an
+    /// `ask`). On by default because the cost of missing one is a turn that
+    /// waits forever, but a terminal that does not know `OSC 777` has only the
+    /// bell left, so this is the switch for "stop making that noise".
+    pub notify: bool,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
-        Self { theme: ThemeSetting::Auto }
+        Self {
+            theme: ThemeSetting::Auto,
+            notify: true,
+        }
     }
 }
 
@@ -2259,6 +2267,33 @@ shared_token = "abc"
         // An unknown value name is a hard parse error, not a silent default.
         let bad = toml::from_str::<GatewayConfig>("[tui]\ntheme = \"neon\"\n");
         assert!(bad.is_err());
+    }
+
+    /// `tui.notify` defaults to **on**, including for a config written before
+    /// the key existed — the failure it guards against is a turn waiting
+    /// silently for an answer, so silence must be the opt-in.
+    #[test]
+    fn tui_notify_defaults_on_and_is_opt_out() {
+        let mut config = GatewayConfig::default();
+        config.tui.notify = false;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !toml::from_str::<GatewayConfig>(&toml_str)
+                .unwrap()
+                .tui
+                .notify
+        );
+
+        let old: GatewayConfig = toml::from_str("[tui]\ntheme = \"dark\"\n").unwrap();
+        assert!(old.tui.notify, "an older config keeps notifications");
+        assert_eq!(old.tui.theme, ThemeSetting::Dark);
+
+        let bare: GatewayConfig = toml::from_str("[tui]\n").unwrap();
+        assert!(bare.tui.notify);
+
+        let off: GatewayConfig = toml::from_str("[tui]\nnotify = false\n").unwrap();
+        assert!(!off.tui.notify);
+        assert_eq!(off.tui.theme, ThemeSetting::Auto, "the neighbour still defaults");
     }
 
     /// Build two configs with identical content but HashMaps populated in

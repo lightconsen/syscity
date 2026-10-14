@@ -77,6 +77,19 @@ curator_archive_after_days = 30
 # normal approval queue (approve / deny in the UI or `syscity` client).
 write_approval = false
 
+# ── TUI ──────────────────────────────────────────────────────────────
+[tui]
+# Palette. `auto` asks the terminal (OSC 11) and falls back to dark; `/theme`
+# in the TUI writes this and applies immediately.
+theme = "auto"
+
+# Ring the terminal when a prompt blocks the turn (a tool approval or an `ask`
+# from the agent). Only kitty, WezTerm and Ghostty understand the `OSC 777`
+# notification; everywhere else this is the bell, so it is the switch for
+# "stop making that noise". On by default — the failure it guards against is a
+# turn waiting silently for an answer.
+notify = true
+
 # ── Cron ─────────────────────────────────────────────────────────────
 [cron]
 enabled = true

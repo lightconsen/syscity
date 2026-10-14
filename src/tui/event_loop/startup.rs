@@ -46,17 +46,14 @@ pub(super) async fn startup(
     // silent failure anywhere just keeps the dark default — the theme is a
     // nicety, and the first frame must not wait on it.
     if let Ok(config) = gw::config_get(client).await {
-        let setting = config
-            .get("tui")
-            .and_then(|t| t.get("theme"))
-            .and_then(|v| serde_json::from_value::<crate::gateway::ThemeSetting>(v.clone()).ok())
-            .unwrap_or_default();
         let detected = state.read().await.startup_bg;
-        let id = osc11::resolve(setting, osc11::env_hint(), detected);
+        let id = osc11::resolve(theme_setting(&config), osc11::env_hint(), detected);
+        let notify = notify_setting(&config);
         // The palette is modeless; what the terminal can render is not, so
         // degrade the chosen dark/light colors at the last possible moment.
-        state.write().await.active_theme =
-            crate::tui::ui::Theme::from(id).for_mode(osc11::color_mode());
+        let mut s = state.write().await;
+        s.active_theme = crate::tui::ui::Theme::from(id).for_mode(osc11::color_mode());
+        s.notify = notify;
     }
 
     // The catalog feeds `/help` and Tab completion.
@@ -113,6 +110,31 @@ pub(super) async fn startup(
         }
     };
     state.write().await.transcript.push_notice(greeting);
+}
+
+/// The `tui.theme` setting in a `config.get` reply.
+///
+/// A silent failure anywhere keeps the default — the theme is a nicety, and the
+/// first frame must not wait on it.
+fn theme_setting(config: &serde_json::Value) -> crate::gateway::ThemeSetting {
+    config
+        .get("tui")
+        .and_then(|t| t.get("theme"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Whether a turn-blocking prompt should ring the terminal, per `[tui] notify`.
+///
+/// Absent means on. The thing being guarded against is a turn waiting silently
+/// for an answer while nobody is looking at the screen, so the unreadable and
+/// the unset both have to fall on the audible side.
+fn notify_setting(config: &serde_json::Value) -> bool {
+    config
+        .get("tui")
+        .and_then(|t| t.get("notify"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
 }
 
 /// The brand mark in block characters: three towers with a mast on the tallest,
@@ -202,6 +224,30 @@ mod tests {
             );
             assert!(!row.ends_with(' '), "trailing space would add width: {row:?}");
         }
+    }
+
+    /// The TUI reads both preferences out of one `config.get` reply, and every
+    /// way of failing to find `[tui] notify` has to leave the noise on.
+    #[test]
+    fn notify_is_read_from_config_and_defaults_to_on() {
+        use serde_json::json;
+        assert!(notify_setting(&json!({})));
+        assert!(notify_setting(&json!({"tui": {}})));
+        assert!(notify_setting(&json!({"tui": {"theme": "dark"}})));
+        assert!(!notify_setting(&json!({"tui": {"notify": false}})));
+        assert!(notify_setting(&json!({"tui": {"notify": true}})));
+        // Nonsense is not a way to silence it either.
+        assert!(notify_setting(&json!({"tui": {"notify": "no"}})));
+    }
+
+    /// The theme is read from the same reply, next to it.
+    #[test]
+    fn theme_is_read_from_the_same_reply() {
+        use crate::gateway::ThemeSetting;
+        use serde_json::json;
+        assert_eq!(theme_setting(&json!({})), ThemeSetting::Auto);
+        assert_eq!(theme_setting(&json!({"tui": {"theme": "light"}})), ThemeSetting::Light);
+        assert_eq!(theme_setting(&json!({"tui": {"theme": "neon"}})), ThemeSetting::Auto);
     }
 
     #[test]

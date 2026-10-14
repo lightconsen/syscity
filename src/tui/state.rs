@@ -298,6 +298,11 @@ pub struct AppState {
     /// What the OSC 11 query saw at startup, if the terminal answered. Kept so
     /// an `auto` setting can be re-resolved later without asking again.
     pub startup_bg: Option<crate::tui::ui::ThemeId>,
+    /// Whether to ring the terminal when a prompt blocks the turn, from
+    /// `[tui] notify`. True until the config says otherwise — including when
+    /// the config could not be read at all, which is the case that can least
+    /// afford a silently missed approval.
+    pub notify: bool,
     /// Session the TUI is talking to.
     pub current_session: Option<String>,
     /// Agent bound to the current session, if any.
@@ -396,6 +401,7 @@ impl Default for AppState {
             connection: ConnectionState::default(),
             active_theme: crate::tui::ui::Theme::dark(),
             startup_bg: None,
+            notify: true,
             current_session: None,
             current_agent: None,
             sessions: Vec::new(),
