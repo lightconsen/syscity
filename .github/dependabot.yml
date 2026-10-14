@@ -17,8 +17,22 @@ updates:
       include: "scope"
 
   # Frontend (web) dependencies
+  #
+  # `rebase-strategy: all` because the default does not reach this failure.
+  # `pnpm.overrides` in web/package.json and the matching `overrides:` block in
+  # the lockfile clash *semantically* and not textually: git merges both sides
+  # without complaint, the branch's lockfile ends up without the block, and
+  # `pnpm install --frozen-lockfile` then dies with
+  # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. Nothing reports a conflict, so nothing
+  # rebases — the PR just sits red. `all` regenerates the branch whenever the
+  # target branch moves, which is what puts the block back. Observed on
+  # 2026-10-08 and again 2026-10-14, six days apart.
+  #
+  # The two npm entries only: a cargo bump edits Cargo.lock as well, so a clash
+  # there *is* a textual conflict and the default already rebases on it.
   - package-ecosystem: "npm"
     directory: "/web"
+    rebase-strategy: "all"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -38,6 +52,7 @@ updates:
   # automated bump: version updates only run for the directories listed here.
   - package-ecosystem: "npm"
     directory: "/site"
+    rebase-strategy: "all"    # same lockfile-vs-overrides mismatch as /web
     schedule:
       interval: "weekly"
       day: "monday"
