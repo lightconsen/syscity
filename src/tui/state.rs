@@ -288,6 +288,61 @@ impl CommandInfo {
     }
 }
 
+/// How good a completion match is: the class, then how early it starts, then
+/// how tightly the query characters sit together. Lower sorts first.
+type CompletionRank = (u8, usize, usize);
+
+/// Where a match starts: at the first character, at a word boundary, anywhere.
+///
+/// Three classes rather than one score, because the gap between them must not
+/// be something a long name can pay off with enough other merits. A command
+/// whose name *begins* with what was typed is what was meant; one that only
+/// happens to contain the letters is a fallback.
+const STARTS_AT_NAME: u8 = 0;
+const STARTS_AT_WORD: u8 = 1;
+const STARTS_ANYWHERE: u8 = 2;
+
+/// Rank `name` against a completion query, or `None` when it does not match.
+///
+/// The query is a subsequence: every character in order, gaps allowed. That is
+/// the point of the thing — a prefix test can only find a command whose name
+/// was remembered from the beginning, and `/rmem` finding `/remember` is worth
+/// more than a tidy ordering.
+///
+/// Command names only. Matching the description too would put a candidate in
+/// the list that the query cannot be seen in, and this list's job is to be
+/// accepted: what Tab inserts is the name.
+fn completion_rank(name: &str, query: &str) -> Option<CompletionRank> {
+    if query.is_empty() {
+        // A bare `/` lists everything, all at the same rank.
+        return Some((STARTS_AT_NAME, 0, 0));
+    }
+    let hay: Vec<char> = name.to_lowercase().chars().collect();
+    let needle: Vec<char> = query.to_lowercase().chars().collect();
+    let mut cursor = 0;
+    let mut first = None;
+    let mut gaps = 0;
+    let mut previous = None;
+    for ch in &needle {
+        let at = cursor + hay.get(cursor..)?.iter().position(|h| h == ch)?;
+        match previous {
+            None => first = Some(at),
+            Some(prev) => gaps += at - prev - 1,
+        }
+        previous = Some(at);
+        cursor = at + 1;
+    }
+    let first = first?;
+    let class = if first == 0 {
+        STARTS_AT_NAME
+    } else if matches!(hay[first - 1], '-' | '_' | ' ') {
+        STARTS_AT_WORD
+    } else {
+        STARTS_ANYWHERE
+    };
+    Some((class, first, gaps))
+}
+
 /// Central mutable application state.
 #[derive(Debug)]
 pub struct AppState {
@@ -622,6 +677,10 @@ impl AppState {
     }
 
     /// Candidates for completing the `/command` being typed.
+    ///
+    /// Ranked by [`completion_rank`] rather than filtered by prefix, so a query
+    /// that is only half-remembered still finds its command. Ties keep the
+    /// catalog's order.
     pub fn completions(&self) -> Vec<&CommandInfo> {
         let trimmed = self.input_buffer.trim_start();
         let Some(rest) = trimmed.strip_prefix('/') else {
@@ -631,10 +690,15 @@ impl AppState {
         if rest.contains(char::is_whitespace) {
             return Vec::new();
         }
-        self.command_list
+        let mut ranked: Vec<(CompletionRank, &CommandInfo)> = self
+            .command_list
             .iter()
-            .filter(|c| c.name.to_lowercase().starts_with(&rest.to_lowercase()))
-            .collect()
+            .filter_map(|c| completion_rank(&c.name, rest).map(|rank| (rank, c)))
+            .collect();
+        // Stable, and the catalog order survives as the tiebreak: with the
+        // whole list ranked equal by a bare `/`, sorting must not shuffle it.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, c)| c).collect()
     }
 
     /// Apply the highlighted completion to the input buffer.
@@ -946,6 +1010,89 @@ mod tests {
         assert_eq!(s.completion_index, 1, "second candidate highlighted");
         s.apply_completion();
         assert_eq!(s.input_buffer, "/stop ");
+    }
+
+    /// A catalog with just the names, for the completion tests.
+    fn catalog(names: &[&str]) -> AppState {
+        let mut s = AppState::default();
+        s.command_list = names
+            .iter()
+            .map(|n| CommandInfo {
+                name: (*n).into(),
+                ..Default::default()
+            })
+            .collect();
+        s
+    }
+
+    fn candidates(s: &AppState) -> Vec<String> {
+        s.completions().iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// The query does not have to be a prefix. `/rmem` finding `/remember` is
+    /// the whole point: a prefix test only completes the part of the name that
+    /// was remembered from its first letter.
+    #[test]
+    fn a_query_matches_a_subsequence_not_only_a_prefix() {
+        let mut s = catalog(&["remember", "mode", "clear-history"]);
+        typing(&mut s, "/rmem");
+        assert_eq!(candidates(&s), vec!["remember"], "in order, with gaps");
+
+        s.clear_input();
+        typing(&mut s, "/his");
+        assert_eq!(candidates(&s), vec!["clear-history"], "a match inside the name still counts");
+
+        // Nothing in the list spells it, so there is nothing to offer.
+        s.clear_input();
+        typing(&mut s, "/zzz");
+        assert!(candidates(&s).is_empty());
+    }
+
+    /// Ranked, not merely matched: a name that *begins* with the query beats
+    /// one that only contains it, and the catalog order is the weaker match's
+    /// last line of defence — not its first.
+    #[test]
+    fn a_match_at_the_start_outranks_one_in_the_middle() {
+        // Catalog order is deliberately the wrong way round.
+        let mut s = catalog(&["clear-history", "history"]);
+        typing(&mut s, "/his");
+        assert_eq!(candidates(&s), vec!["history", "clear-history"]);
+    }
+
+    /// Among matches that start in the same place, the tighter one wins — and
+    /// only then does the catalog order decide.
+    #[test]
+    fn a_tighter_match_outranks_a_scattered_one() {
+        let mut s = catalog(&["settings", "status"]);
+        typing(&mut s, "/sts");
+        // `status` has one character between its first and last s; `settings`
+        // skips four. Both start at the first character.
+        assert_eq!(candidates(&s), vec!["status", "settings"]);
+
+        // Equally good matches are left in the order the gateway listed them.
+        let mut s = catalog(&["stop", "status"]);
+        typing(&mut s, "/st");
+        assert_eq!(candidates(&s), vec!["stop", "status"]);
+    }
+
+    /// A bare `/` still lists the whole catalog as listed — the ranking must
+    /// not reshuffle a list nobody has narrowed yet.
+    #[test]
+    fn a_bare_slash_lists_the_catalog_in_its_own_order() {
+        let mut s = catalog(&["zeta", "alpha", "middle"]);
+        typing(&mut s, "/");
+        assert_eq!(candidates(&s), vec!["zeta", "alpha", "middle"]);
+    }
+
+    /// Completion is case-insensitive, and what Tab inserts is the catalog's
+    /// own spelling rather than what was typed.
+    #[test]
+    fn completion_ignores_case_and_inserts_the_real_name() {
+        let mut s = catalog(&["Status"]);
+        typing(&mut s, "/sta");
+        assert_eq!(candidates(&s), vec!["Status"]);
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "/Status ");
     }
 
     #[test]
