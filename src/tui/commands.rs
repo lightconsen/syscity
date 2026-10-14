@@ -683,6 +683,26 @@ pub fn write_osc52(out: &mut impl std::io::Write, text: &str) -> std::io::Result
     out.flush()
 }
 
+/// Ask the terminal to get the user's attention, on `out`.
+///
+/// A prompt that blocks the turn — an approval, an `ask_user` question — is the
+/// one thing in this TUI that needs a person, and it does nothing at all until
+/// they look. Without this, a long turn that stops for approval waits in
+/// silence on a screen nobody is watching.
+///
+/// Two channels on purpose: the bell is what every terminal has (if it is
+/// turned on), and `OSC 777;notify` is the toast kitty, WezTerm and Ghostty
+/// draw. Terminals that do not know the OSC ignore it, so this degrades to just
+/// the bell. Like the clipboard escape it moves no cursor, so it is safe on the
+/// event lane between frames and must never run during a render.
+pub fn write_notify(out: &mut impl std::io::Write, title: &str, body: &str) -> std::io::Result<()> {
+    // The OSC parameter is `;`-separated and BEL/ESC terminate it, so neither
+    // may appear in the text.
+    let clean = |s: &str| s.replace(';', ",").replace(['\x07', '\x1b'], "");
+    write!(out, "\x07\x1b]777;notify;{};{}\x07", clean(title), clean(body))?;
+    out.flush()
+}
+
 /// `/expand` — print the last tool call in full.
 ///
 /// The live preview truncates a call's arguments and result to a few rows
@@ -1214,6 +1234,25 @@ mod tests {
         let expected =
             format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode("hi"));
         assert_eq!(String::from_utf8(out).expect("utf8"), expected);
+    }
+
+    /// The notification is a bell for every terminal, plus the OSC 777 toast
+    /// the modern ones draw.
+    #[test]
+    fn notify_rings_and_emits_an_osc_toast() {
+        let mut out = Vec::new();
+        write_notify(&mut out, "Title", "Body").expect("writes");
+        assert_eq!(String::from_utf8(out).expect("utf8"), "\x07\x1b]777;notify;Title;Body\x07");
+    }
+
+    /// A `;` in the text would split the OSC parameter and BEL/ESC would end it
+    /// early, so both are removed rather than smuggled through.
+    #[test]
+    fn notify_sanitises_the_parameters() {
+        let mut out = Vec::new();
+        write_notify(&mut out, "a;b", "c\x07d\x1be").expect("writes");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text, "\x07\x1b]777;notify;a,b;cde\x07");
     }
 
     /// `/copy` with no finished answer says so instead of clearing the
