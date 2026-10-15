@@ -1322,6 +1322,42 @@ pub struct SecurityConfig {
     /// stays refused either way.
     #[serde(default)]
     pub browser_allow_private: bool,
+
+    /// Install the built-in shell-safety policy hook
+    /// (`src/tools/shell_safety.rs`) in the gateway's tool registry.
+    ///
+    /// Off by default, and it is a real change when on: a recognised-safe
+    /// binary stops prompting, an unrecognised one asks (or not — see
+    /// `shell_safety_unknown_binary`), a known-risky one asks, and a
+    /// dangerous pattern (`rm -rf /`, fork bombs) is refused outright. With
+    /// it off, `shell` behaves exactly as it did before.
+    ///
+    /// Gateway-wide, read once at startup: unlike `fence_network` this is not
+    /// carried per agent, and it cannot be changed at runtime.
+    #[serde(default)]
+    pub shell_safety: bool,
+
+    /// What shell-safety does with a command whose first token is not a known
+    /// binary. Only read when `shell_safety` is on.
+    ///
+    /// `ask` (the default) treats it as high-risk and requests approval —
+    /// right for a deployment whose toolchain is in the built-in list, noisy
+    /// for one that lives in `terraform`/`uv`/`just`. `allow` clears it.
+    #[serde(default)]
+    pub shell_safety_unknown_binary: crate::tools::shell_safety::UnknownBinaryPosture,
+
+    /// Install the registry-level sandbox interceptor
+    /// (`src/tools/sandbox_interceptor.rs`) with its built-in rule set.
+    ///
+    /// Off by default, and blunt when on: the default set blocks `rm` and
+    /// `dd` as bare names (so `rm -rf ./build` inside the workspace is
+    /// refused, not only `rm -rf /`), blocks the credential paths
+    /// (`~/.ssh`, `/etc`, `/proc`, the Windows system dirs), and flags
+    /// arguments containing `api_key`/`password`/`secret`/`token` for
+    /// approval — which fails closed to a refusal when nobody can answer.
+    /// There is no config surface for tuning it yet.
+    #[serde(default)]
+    pub sandbox_interceptor: bool,
     /// Whether the Linux runner builds a namespace view (read-only root,
     /// private `/tmp`, working trees re-bound on top) around fenced command
     /// tools, in addition to the Landlock write rules.
@@ -1480,6 +1516,9 @@ impl Default for SecurityConfig {
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             browser_allow_private: false,
+            shell_safety: false,
+            shell_safety_unknown_binary: crate::tools::shell_safety::UnknownBinaryPosture::Ask,
+            sandbox_interceptor: false,
         }
     }
 }
@@ -2122,6 +2161,39 @@ shared_token = "abc"
             toml::from_str::<GatewayConfig>("[security]\nfence_namespaces = \"yes\"\n").is_err(),
             "an unknown posture must fail the parse, not fall back"
         );
+    }
+
+    /// The two opt-in policy hooks default to off — an upgrade must not start
+    /// refusing commands — and the shell-safety posture defaults to `ask`,
+    /// which is what the hook did before it was configurable.
+    #[test]
+    fn the_policy_hooks_default_to_off_and_the_posture_to_ask() {
+        let default = SecurityConfig::default();
+        assert!(!default.shell_safety, "off unless asked for");
+        assert!(!default.sandbox_interceptor, "off unless asked for");
+        assert_eq!(
+            default.shell_safety_unknown_binary,
+            crate::tools::shell_safety::UnknownBinaryPosture::Ask
+        );
+
+        let parsed: GatewayConfig = toml::from_str(
+            "[security]\nshell_safety = true\nsandbox_interceptor = true\n\
+             shell_safety_unknown_binary = \"allow\"\n",
+        )
+        .expect("both knobs parse");
+        assert!(parsed.security.shell_safety);
+        assert!(parsed.security.sandbox_interceptor);
+        assert_eq!(
+            parsed.security.shell_safety_unknown_binary,
+            crate::tools::shell_safety::UnknownBinaryPosture::Allow
+        );
+
+        // A typo'd posture is a parse error, not a silent fallback: "alow"
+        // quietly meaning "ask" would be a fence nobody meant to configure.
+        assert!(toml::from_str::<GatewayConfig>(
+            "[security]\nshell_safety_unknown_binary = \"alow\"\n"
+        )
+        .is_err());
     }
 
     #[test]
