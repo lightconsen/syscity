@@ -9,11 +9,16 @@
 //!
 //! ```rust
 //! use syscity::tools::sandbox_interceptor::SandboxInterceptor;
+//! use syscity::tools::ToolContext;
 //!
 //! # async fn demo() {
-//! let interceptor = SandboxInterceptor::default();
-//! let hook = interceptor.as_policy_hook();
-//! let decision = hook("shell", &serde_json::json!({"command": "echo hello"})).await;
+//! let hook = SandboxInterceptor::default().as_policy_hook();
+//! let decision = hook(
+//!     "shell",
+//!     &serde_json::json!({"command": "echo hello"}),
+//!     &ToolContext::default(),
+//! )
+//! .await;
 //! assert!(decision.is_allow());
 //! # }
 //! ```
@@ -26,7 +31,8 @@ use std::sync::{Arc, LazyLock};
 use regex::Regex;
 use serde_json::Value;
 
-use super::hooks::ToolPolicyDecision;
+use super::hooks::{PolicyHookFn, ToolPolicyDecision};
+use super::ToolContext;
 
 #[allow(clippy::unwrap_used)]
 static PATH_BLACKLIST: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -351,20 +357,14 @@ impl SandboxInterceptor {
 
     /// Convert this interceptor into a policy hook that can be registered
     /// with [`ToolHooks`].
-    pub fn as_policy_hook(
-        self,
-    ) -> impl Fn(
-        &str,
-        &Value,
-    )
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolPolicyDecision> + Send>> {
+    pub fn as_policy_hook(self) -> PolicyHookFn {
         let this = Arc::new(self);
-        move |name: &str, args: &Value| {
+        Arc::new(move |name: &str, args: &Value, _ctx: &ToolContext| {
             let this = Arc::clone(&this);
             let name = name.to_string();
             let args = args.clone();
             Box::pin(async move { this.evaluate(&name, &args) })
-        }
+        })
     }
 
     /// Evaluate a tool call and return a [`ToolPolicyDecision`].
@@ -762,7 +762,7 @@ mod tests {
         let interceptor = SandboxInterceptor::with_defaults();
         let hook = interceptor.as_policy_hook();
         let args = json!({"command": "rm -rf /"});
-        let decision = hook("shell", &args).await;
+        let decision = hook("shell", &args, &ToolContext::default()).await;
         assert!(decision.is_deny());
     }
 
@@ -771,7 +771,7 @@ mod tests {
         let interceptor = SandboxInterceptor::with_defaults();
         let hook = interceptor.as_policy_hook();
         let args = json!({"command": "echo hello"});
-        let decision = hook("shell", &args).await;
+        let decision = hook("shell", &args, &ToolContext::default()).await;
         assert!(decision.is_allow());
     }
 
