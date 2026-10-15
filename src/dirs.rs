@@ -212,6 +212,12 @@ impl SyscityPaths {
         self.root.join("transcripts")
     }
 
+    /// Session checkpoint directory (`<root>/checkpoints`): the pre-image of
+    /// every file a write replaces while a checkpoint is open.
+    pub fn checkpoints_dir(&self) -> PathBuf {
+        self.root.join("checkpoints")
+    }
+
     /// Turn observability records directory (`<root>/turns`).
     pub fn turns_dir(&self) -> PathBuf {
         self.root.join("turns")

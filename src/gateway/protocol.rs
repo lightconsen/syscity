@@ -409,6 +409,9 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     // A write: it appends to a session's history.
     ("sessions.import", Some(SCOPE_WRITE)),
     ("sessions.branch", Some(SCOPE_WRITE)),
+    ("sessions.snapshot", Some(SCOPE_WRITE)),
+    ("sessions.snapshots", Some(SCOPE_READ)),
+    ("sessions.rollback", Some(SCOPE_WRITE)),
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),

@@ -159,6 +159,10 @@ pub struct InfraState {
     pub storage: Arc<RwLock<dyn Storage>>,
     pub runtime_settings: Arc<RwLock<HashMap<String, serde_json::Value>>>,
     pub transcript_store: Arc<TranscriptStore>,
+    /// Session checkpoints: what a session's file writes replace, kept while a
+    /// checkpoint is open. Shared with every agent's tool registry, so the
+    /// capture and the rollback are the same store.
+    pub checkpoints: Arc<crate::agent::checkpoints::CheckpointStore>,
     pub artifact_store: Arc<ArtifactStore>,
     pub disk_budget: Arc<DiskBudgetManager>,
     pub session_file_manager: Arc<SessionFileManager>,

@@ -23,7 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
-    "expand", "undo", "plan", "save", "import", "branch", "theme", "mode",
+    "expand", "undo", "plan", "save", "import", "branch", "snapshot", "rollback", "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -94,6 +94,8 @@ async fn handle_local_command(
         "save" => command_save(args, state, ws).await,
         "import" => command_import(args, state, ws).await,
         "branch" => command_branch(args, state, ws).await,
+        "snapshot" => command_snapshot(args, state, ws).await,
+        "rollback" => command_rollback(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -245,6 +247,8 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("save", "[md|html|json|text]", "write this conversation to a file"),
         ("import", "<file>", "read a saved conversation into this session"),
         ("branch", "[name]", "continue this conversation down a second path"),
+        ("snapshot", "[label|list]", "record what this session's file writes replace"),
+        ("rollback", "[id]", "put files back as they were at a snapshot"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -773,6 +777,115 @@ async fn command_branch(
                 .await
                 .transcript
                 .push_notice(format!("✘ /branch: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// `/snapshot [label|list]` — start recording what this session's writes
+/// replace, or show what has been recorded.
+///
+/// The recording is the point: the content a write destroys is gone the moment
+/// it happens, so a checkpoint taken afterwards could only offer an empty
+/// promise. From here until a rollback, the tools that name the file they write
+/// keep its pre-image once.
+async fn command_snapshot(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to snapshot yet");
+        return Ok(());
+    };
+
+    if args.trim().eq_ignore_ascii_case("list") {
+        let (snapshots, recording) = gw::sessions_snapshots(ws, &id).await?;
+        let mut s = state.write().await;
+        if snapshots.is_empty() {
+            s.transcript.push_notice(
+                "🗂 no snapshots — /snapshot starts recording what this session's writes replace",
+            );
+            return Ok(());
+        }
+        let mut lines = vec![format!("🗂 {} snapshot(s):", snapshots.len())];
+        for snapshot in &snapshots {
+            let label = snapshot.label.as_deref().unwrap_or("-");
+            let recording = if recording.as_deref() == Some(snapshot.id.as_str()) {
+                " (recording)"
+            } else {
+                ""
+            };
+            lines
+                .push(format!("  {} [{label}] {} file(s){recording}", snapshot.id, snapshot.files));
+        }
+        let text = lines.join("\n");
+        s.transcript.push_notice(text);
+        return Ok(());
+    }
+
+    let label = match args.trim() {
+        "" => None,
+        other => Some(other),
+    };
+    match gw::sessions_snapshot(ws, &id, label).await {
+        Ok(snapshot) => {
+            state.write().await.transcript.push_notice(format!(
+                "🗂 recording into {snapshot} — /rollback puts the files back"
+            ));
+        }
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /snapshot: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// `/rollback [id]` — put this session's files back.
+///
+/// It says what it did to the files, because that is the part nobody can see:
+/// the transcript above it still shows the turns that wrote them.
+async fn command_rollback(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to roll back yet");
+        return Ok(());
+    };
+    let snapshot = match args.trim() {
+        "" => None,
+        other => Some(other),
+    };
+
+    match gw::sessions_rollback(ws, &id, snapshot).await {
+        Ok((restored, removed)) => {
+            state.write().await.transcript.push_notice(format!(
+                "↩ rolled back: {restored} file(s) restored, {removed} removed. The conversation \
+                 is untouched — /undo is what walks that back"
+            ));
+        }
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /rollback: {e}"));
         }
     }
     Ok(())
@@ -2179,5 +2292,81 @@ mod tests {
 
         let lines = output(&state).await;
         assert!(lines[0].contains("/branch"), "got {lines:?}");
+    }
+
+    /// `/snapshot` opens a checkpoint and says what it is for; `/rollback`
+    /// reports what it did to the files, because that is the part nobody can
+    /// see from the transcript.
+    #[tokio::test]
+    async fn snapshot_opens_a_checkpoint_and_rollback_reports_the_effect() {
+        let gateway = TestGateway::start().await;
+        gateway.reply("sessions.snapshot", serde_json::json!({ "id": "20261016-101010-abc123" }));
+        gateway.reply(
+            "sessions.rollback",
+            serde_json::json!({ "restored": 2, "removed": 1, "dropped": 1 }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_snapshot("experiment", state.clone(), &client).await;
+        let requests = gateway.requests();
+        let opened = requests
+            .iter()
+            .find(|r| r.method == "sessions.snapshot")
+            .expect("the snapshot on the wire");
+        assert_eq!(opened.params["label"], "experiment");
+        drop(requests);
+        let lines = output(&state).await;
+        assert!(lines[0].contains("20261016-101010-abc123"), "got {lines:?}");
+
+        let _ = command_rollback("", state.clone(), &client).await;
+        let lines = output(&state).await;
+        let text = lines.join("\n");
+        assert!(text.contains("2 file(s) restored"), "got {text}");
+        assert!(text.contains("1 removed"), "got {text}");
+        // The distinction is worth printing: rolling files back does not
+        // rewrite the conversation.
+        assert!(text.contains("/undo"), "got {text}");
+    }
+
+    /// `/snapshot list` shows what can be rolled back to, and which checkpoint
+    /// is still recording.
+    #[tokio::test]
+    async fn snapshot_list_shows_the_checkpoints() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.snapshots",
+            serde_json::json!({
+                "recording": "20261016-1010-bbb",
+                "snapshots": [
+                    { "id": "20261016-1010-bbb", "label": "second", "files": 3 },
+                    { "id": "20261016-0900-aaa", "label": null, "files": 1 },
+                ],
+            }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_snapshot("list", state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        let text = lines.join("\n");
+        assert!(text.contains("2 snapshot(s)"), "got {text}");
+        assert!(text.contains("[second] 3 file(s) (recording)"), "got {text}");
+        assert!(text.contains("20261016-0900-aaa"), "got {text}");
+    }
+
+    /// Nothing to roll back to is the gateway's answer, shown as such.
+    #[tokio::test]
+    async fn rollback_reports_an_empty_history() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("sessions.rollback", "NOT_FOUND");
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_rollback("", state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("/rollback"), "got {lines:?}");
     }
 }

@@ -221,6 +221,9 @@ pub async fn make_test_state_parts(
             storage: Arc::new(RwLock::new(crate::adapters::InMemoryStorage::new())),
             runtime_settings: Arc::new(RwLock::new(HashMap::new())),
             transcript_store: Arc::new(transcript_store),
+            checkpoints: Arc::new(crate::agent::checkpoints::CheckpointStore::new(
+                tmp.path().join("checkpoints"),
+            )),
             artifact_store: Arc::new(artifact_store),
             disk_budget: Arc::new(disk_budget),
             session_file_manager: Arc::new(session_file_manager),

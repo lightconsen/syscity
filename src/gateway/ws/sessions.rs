@@ -261,6 +261,147 @@ pub(super) async fn session_id_for(
     }
 }
 
+/// `sessions.snapshot` — start recording what this session's writes replace
+/// (`{ session_id?, label? }`).
+///
+/// From here until a rollback, the three tools that name the file they write
+/// keep the pre-image of each file they touch, once. That is the whole feature:
+/// the content a write destroys cannot be reconstructed afterwards, so "put it
+/// back" has to be arranged before the write.
+pub(super) async fn handle_sessions_snapshot(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct SnapshotParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+    }
+
+    let params: SnapshotParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let label = params
+        .label
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty());
+    match state.infra.checkpoints.begin(&session_id, label).await {
+        Ok(checkpoint) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "session_id": session_id,
+                "id": checkpoint.id,
+                "label": checkpoint.label,
+                "created_at": checkpoint.created_at.to_rfc3339(),
+            }),
+        ),
+        Err(e) => WsResponse::err(&req.id, "SNAPSHOT_FAILED", e.to_string()),
+    }
+}
+
+/// `sessions.snapshots` — what can be rolled back to (`{ session_id? }`).
+pub(super) async fn handle_sessions_snapshots(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let checkpoints = state.infra.checkpoints.list(&session_id).await;
+    let open = state.infra.checkpoints.open(&session_id).await;
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "session_id": session_id,
+            // Which checkpoint is recording. `None` means writes are not being
+            // kept, which is the ordinary state.
+            "recording": open,
+            "snapshots": checkpoints
+                .iter()
+                .map(|checkpoint| serde_json::json!({
+                    "id": checkpoint.id,
+                    "label": checkpoint.label,
+                    "created_at": checkpoint.created_at.to_rfc3339(),
+                    "files": checkpoint.files,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    )
+}
+
+/// `sessions.rollback` — put this session's files back (`{ session_id?, id? }`).
+///
+/// With no `id`, the newest checkpoint. The files are restored from the
+/// pre-images taken while it was open, and every checkpoint from that point on
+/// is dropped: they describe a state that no longer applies.
+pub(super) async fn handle_sessions_rollback(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct RollbackParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    }
+
+    let params: RollbackParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let checkpoints = state.infra.checkpoints.list(&session_id).await;
+    let id = match params.id.filter(|id| !id.is_empty()) {
+        Some(id) => id,
+        // The newest, because `/rollback` with no argument means "undo what I
+        // have been doing since the last snapshot", which is the common case.
+        None => match checkpoints.first() {
+            Some(checkpoint) => checkpoint.id.clone(),
+            None => {
+                return WsResponse::err(
+                    &req.id,
+                    "NOT_FOUND",
+                    format!("session '{session_id}' has no snapshots to roll back to"),
+                )
+            }
+        },
+    };
+
+    match state.infra.checkpoints.rollback(&session_id, &id).await {
+        Ok(report) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "session_id": session_id,
+                "id": id,
+                "restored": report.restored,
+                "removed": report.removed,
+                "dropped": report.dropped,
+            }),
+        ),
+        Err(e) => WsResponse::err(&req.id, "ROLLBACK_FAILED", e.to_string()),
+    }
+}
+
 /// `sessions.branch` — continue this conversation down a second path
 /// (`{ session_id?, name? }`).
 ///
@@ -1821,6 +1962,82 @@ mod tests {
 
         assert!(!res.ok);
         assert_eq!(res.error.expect("error").code, "ALREADY_EXISTS");
+    }
+
+    /// Snapshot, then roll back: the files a session's writes replaced come
+    /// back, and the checkpoint is spent.
+    #[tokio::test]
+    async fn snapshot_then_rollback_restores_the_files() {
+        let state = state_with_undoing_agent(vec![]).await;
+        assert!(state.infra.checkpoints.list("s1").await.is_empty());
+        let conn = make_test_conn(&["write"]);
+
+        // A file the session "writes into" — the store keeps whatever absolute
+        // path it is handed, so it does not have to be under the profile.
+        let dir = std::env::temp_dir().join(format!("syscity_rollback_ws_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("dir");
+        let file = dir.join("notes.txt");
+        tokio::fs::write(&file, "before").await.expect("write");
+
+        let opened = handle_sessions_snapshot(
+            &req(
+                "r1",
+                "sessions.snapshot",
+                serde_json::json!({ "session_id": "s1", "label": "experiment" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(opened.ok, "{:?}", opened.error);
+        let id = opened.payload.expect("payload")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The write the checkpoint exists to undo.
+        state
+            .infra
+            .checkpoints
+            .capture("s1", &file)
+            .await
+            .expect("capture");
+        tokio::fs::write(&file, "after").await.expect("write");
+
+        let listed = handle_sessions_snapshots(
+            &req("r2", "sessions.snapshots", serde_json::json!({ "session_id": "s1" })),
+            &conn,
+            &state,
+        )
+        .await;
+        let payload = listed.payload.expect("payload");
+        assert_eq!(payload["recording"].as_str(), Some(id.as_str()));
+        assert_eq!(payload["snapshots"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["snapshots"][0]["files"], 1);
+
+        let rolled = handle_sessions_rollback(
+            &req("r3", "sessions.rollback", serde_json::json!({ "session_id": "s1" })),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(rolled.ok, "{:?}", rolled.error);
+        let payload = rolled.payload.expect("payload");
+        assert_eq!(payload["restored"], 1);
+        assert_eq!(tokio::fs::read_to_string(&file).await.expect("read"), "before");
+
+        // And there is nothing left to roll back to, which is what stops a
+        // second `/rollback` from claiming to have done anything.
+        let again = handle_sessions_rollback(
+            &req("r4", "sessions.rollback", serde_json::json!({ "session_id": "s1" })),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!again.ok);
+        assert_eq!(again.error.expect("error").code, "NOT_FOUND");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! [`ToolRegistry`]: tool storage, execution, caching, and policy gating.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +76,9 @@ pub struct ToolRegistry {
     guardian: Option<Arc<super::guardian::Guardian>>,
     /// Content filter for scanning tool outputs for PII and secrets.
     content_filter: Option<Arc<crate::security::content_filter::ContentFilter>>,
+    /// Session checkpoints: the pre-image of every file a write is about to
+    /// replace, kept only while a checkpoint is open (`/snapshot`).
+    checkpoints: Option<Arc<crate::agent::checkpoints::CheckpointStore>>,
     /// Audit logger for recording tool invocations and security events.
     audit_log: Option<Arc<dyn crate::security::runtime_audit::AuditLogger>>,
     /// Shared provider list for the web_search tool. Hot-reload updates this
@@ -92,6 +96,19 @@ pub struct ToolRegistry {
     /// When present for a tool, its `description` replaces the static
     /// `Tool::description()` in every emitted `FunctionDefinition`.
     metadata: std::sync::RwLock<HashMap<String, super::metadata::ToolDescriptionMeta>>,
+}
+
+/// Whether this call overwrites a named file.
+///
+/// The same three tools that name what they write, and the same reason
+/// `writes_into_skills_dir` names them: `shell` can overwrite anything without
+/// ever saying which file, and a checkpoint that guessed would be worse than one
+/// that says what it covers (see `crate::agent::checkpoints`).
+fn writes_a_named_file(name: &str, args: &Value) -> Option<PathBuf> {
+    if !matches!(name, "file_write" | "file_edit" | "apply_patch") {
+        return None;
+    }
+    args.get("path").and_then(Value::as_str).map(PathBuf::from)
 }
 
 /// Whether this call writes into the skills directory.
@@ -129,6 +146,7 @@ impl Default for ToolRegistry {
             permissions: Arc::new(PermissionsRuntime::default()),
             guardian: None,
             content_filter: None,
+            checkpoints: None,
             audit_log: None,
             web_search_providers: None,
             todo_state: None,
@@ -182,6 +200,7 @@ impl ToolRegistry {
             permissions: Arc::new(PermissionsRuntime::default()),
             guardian: None,
             content_filter: None,
+            checkpoints: None,
             audit_log: None,
             web_search_providers: None,
             todo_state: None,
@@ -209,6 +228,7 @@ impl ToolRegistry {
             permissions: Arc::new(PermissionsRuntime::default()),
             guardian: None,
             content_filter: None,
+            checkpoints: None,
             audit_log: None,
             web_search_providers: None,
             todo_state: None,
@@ -697,6 +717,16 @@ impl ToolRegistry {
         self
     }
 
+    /// Attach session checkpoints, so a file a write is about to replace is kept
+    /// while a checkpoint is open (`/snapshot`).
+    pub fn with_checkpoints(
+        mut self,
+        store: Arc<crate::agent::checkpoints::CheckpointStore>,
+    ) -> Self {
+        self.checkpoints = Some(store);
+        self
+    }
+
     /// Set the audit logger for recording security events.
     pub fn with_audit_log(
         mut self,
@@ -907,6 +937,27 @@ impl ToolRegistry {
             .filter(|(_, tool)| tool.is_available(context))
             .map(|(name, tool)| self.definition_for(&name, &tool))
             .collect()
+    }
+
+    /// Keep what this call is about to replace, while a checkpoint is open.
+    ///
+    /// Every execution path calls this. A checkpoint that covered only one of
+    /// them would roll back some of a session's writes and leave the rest,
+    /// which is worse than having no checkpoint at all: the files would be in a
+    /// state that never existed.
+    async fn checkpoint_before_write(&self, name: &str, args: &Value, context: &ToolContext) {
+        let Some(store) = &self.checkpoints else {
+            return;
+        };
+        let Some(path) = writes_a_named_file(name, args) else {
+            return;
+        };
+        let resolved = context.resolve_path(&path);
+        if let Err(e) = store.capture(&context.conversation_id, &resolved).await {
+            // The tool runs either way; the alternative to reporting this is a
+            // checkpoint that quietly misses a file.
+            warn!("Failed to checkpoint {} before {}: {}", resolved.display(), name, e);
+        }
     }
 
     /// Execute a tool by name with optional caching, hooks, and approval flow.
@@ -1288,6 +1339,10 @@ impl ToolRegistry {
                 .finalize_result(name, &args, context, Some(result))
                 .await;
         }
+
+        // After the cache check, because a cache hit writes nothing, and after
+        // approval, because a refused call never reaches the file.
+        self.checkpoint_before_write(name, &args, context).await;
 
         // Execute the tool — clone args so the original remains for after-hooks
         let execution_result: Option<crate::Result<ToolExecutionResult>> = {
@@ -1738,6 +1793,9 @@ impl ToolRegistry {
             }
         }
 
+        self.checkpoint_before_write(&tool_name, &args, context)
+            .await;
+
         // Try static tools first
         if let Some(tool) = self.get(&tool_name) {
             let exec_start = std::time::Instant::now();
@@ -1887,6 +1945,9 @@ impl ToolRegistry {
 
         // Run before-hooks.
         self.active_hooks().run_before(&tool_name, &args).await;
+
+        self.checkpoint_before_write(&tool_name, &args, context)
+            .await;
 
         // Look up the tool and consume its stream.
         let collected = if let Some(tool) = self.get(&tool_name) {
@@ -2867,5 +2928,60 @@ mod tests {
             .find(|d| d.name == "spy")
             .expect("spy tool available");
         assert_eq!(avail.description, "renamed: reports what the spy tool does");
+    }
+
+    /// The capture hook, end to end through the registry: a `file_write` while
+    /// a checkpoint is open leaves the file's previous content recoverable.
+    #[tokio::test]
+    async fn a_checkpointed_write_keeps_what_it_replaces() {
+        let dir = std::env::temp_dir().join(format!("syscity_cp_hook_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "original").expect("seed");
+
+        let store = std::sync::Arc::new(crate::agent::checkpoints::CheckpointStore::new(
+            dir.join("checkpoints"),
+        ));
+        // `file_write` normally asks a human first, and this test has none; the
+        // allow rule is what a deployment that pre-approves it looks like.
+        let mut registry = ToolRegistry::new()
+            .with_checkpoints(store.clone())
+            .with_permissions(perms(PermissionMode::Default, false));
+        registry.permissions().reload(&PermissionsConfig {
+            allow: vec!["file_write".to_string()],
+            ..Default::default()
+        });
+        registry.register(Box::new(crate::tools::file::FileWriteTool::new()));
+        let ctx = ToolContext::new("u", "conv1").with_workspace_root(&dir);
+
+        // With no checkpoint open, nothing is kept — the feature costs nothing
+        // until it is asked for.
+        let write = |content: &str| FunctionCall {
+            name: "file_write".to_string(),
+            arguments: serde_json::json!({ "path": file.to_string_lossy(), "content": content })
+                .to_string(),
+        };
+        registry
+            .execute_call(&write("unrecorded"), &ctx)
+            .await
+            .expect("write");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "unrecorded");
+
+        let checkpoint = store.begin("conv1", None).await.expect("begin");
+        registry
+            .execute_call(&write("changed"), &ctx)
+            .await
+            .expect("write");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "changed");
+
+        // What the first write left behind is now the pre-image, not the
+        // original: a checkpoint records from the moment it is opened.
+        store
+            .rollback("conv1", &checkpoint.id)
+            .await
+            .expect("rollback");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "unrecorded");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

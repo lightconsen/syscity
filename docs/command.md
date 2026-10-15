@@ -220,6 +220,8 @@ terminal's scrollback — the TUI runs inline and has no popups.
 | `/save` | `[md\|html\|json\|text]` | Write this conversation to a file (`sessions.export`), and print where it landed; defaults to Markdown. |
 | `/import` | `<file>` | Read a saved conversation into this session (`sessions.import`), appending its messages to this session's history. Only a `.json` export can be read back — the other renderings are documents, not data. |
 | `/branch` | `[name]` | Continue this conversation down a second path (`sessions.branch`): a new session holding what this one has so far, with the original left alone. Does not switch to it — the notice names the id for `/resume`. |
+| `/snapshot` | `[label\|list]` | Start recording what this session's file writes replace (`sessions.snapshot`), or list what has been recorded. Nothing is kept until a snapshot is open. |
+| `/rollback` | `[id]` | Put the files back as they were at that snapshot (`sessions.rollback`), newest by default. Rolling back drops that snapshot and every newer one — they describe a state that no longer applies. The conversation is untouched: `/undo` is what walks that back. |
 | `/pin` | — | Pin or unpin the current session. |
 | `/agents` | — | List agents. |
 | `/agent` | `<id>` | Start a session bound to an agent. |

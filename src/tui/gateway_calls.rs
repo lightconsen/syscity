@@ -365,6 +365,82 @@ pub async fn sessions_branch(
         .to_string())
 }
 
+/// Open a checkpoint: from here, the files this session's writes replace are
+/// kept. Returns the checkpoint id.
+pub async fn sessions_snapshot(
+    ws: &WsClient,
+    id: &str,
+    label: Option<&str>,
+) -> Result<String, TuiError> {
+    let value = ws
+        .request("sessions.snapshot", Some(json!({ "session_id": id, "label": label })))
+        .await?;
+    Ok(value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// One checkpoint, as the gateway reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub id: String,
+    pub label: Option<String>,
+    pub files: u64,
+}
+
+/// The checkpoints a session can roll back to, and which one is recording.
+pub async fn sessions_snapshots(
+    ws: &WsClient,
+    id: &str,
+) -> Result<(Vec<Snapshot>, Option<String>), TuiError> {
+    let value = ws
+        .request("sessions.snapshots", Some(json!({ "session_id": id })))
+        .await?;
+    let snapshots = value
+        .get("snapshots")
+        .and_then(|s| s.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| Snapshot {
+                    id: entry
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    label: entry
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    files: entry.get("files").and_then(|v| v.as_u64()).unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let recording = value
+        .get("recording")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((snapshots, recording))
+}
+
+/// Put a session's files back as they were at a checkpoint.
+pub async fn sessions_rollback(
+    ws: &WsClient,
+    id: &str,
+    snapshot: Option<&str>,
+) -> Result<(u64, u64), TuiError> {
+    let value = ws
+        .request("sessions.rollback", Some(json!({ "session_id": id, "id": snapshot })))
+        .await?;
+    Ok((
+        value.get("restored").and_then(|v| v.as_u64()).unwrap_or(0),
+        value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0),
+    ))
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))

@@ -553,6 +553,9 @@ impl Gateway {
                     let store = crate::agent::TranscriptStore::new(paths.transcripts_dir());
                     Arc::new(store)
                 },
+                checkpoints: Arc::new(crate::agent::checkpoints::CheckpointStore::new(
+                    paths.checkpoints_dir(),
+                )),
                 artifact_store: {
                     let store = crate::agent::ArtifactStore::new(paths.artifacts_dir());
                     Arc::new(store)

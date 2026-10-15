@@ -81,6 +81,7 @@ pub use agent_config::AgentConfig;
 pub mod acp;
 pub mod artifacts;
 pub mod budget;
+pub mod checkpoints;
 pub mod compaction;
 pub mod compressor;
 pub mod context;

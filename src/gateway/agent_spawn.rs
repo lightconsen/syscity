@@ -1029,6 +1029,11 @@ pub(crate) async fn create_default_tool_registry(
     } = args;
 
     let mut registry = ToolRegistry::new()
+        // Checkpoints record into the profile's own directory, so a rollback
+        // cannot reach another profile's files.
+        .with_checkpoints(Arc::new(crate::agent::checkpoints::CheckpointStore::new(
+            paths.checkpoints_dir(),
+        )))
         .with_approval_queue(approval_queue)
         .with_skills_write_approval(skills_write_approval)
         .with_ask_queue(ask_queue)
