@@ -31,6 +31,7 @@ P2（有规避方案的功能/可靠性缺陷）、P3+（维护性）。
 | **REL-001** | P2 | shutdown drain | ⏳ 未复核 | 原判"静态证实"；`writes::pending` guard 与 TaskRegistry 机制存在，drain 完整性未重验 |
 | **REL-002** | P2 | WS 可靠性 | ⏳ **未清账** | 结构化错误已做（WsError code 体系）；**lag/resync 与 backpressure 行为未复核**（`FrameLimiter` 是限流不是背压） |
 | **COR-001** | P2 | UTF-8 分片 | ⏳ 未复核 | TUI 侧多字节 delta 边界有测试；**WS 层的 char-boundary chunker 未确认** |
+| **OPS-002** | P2 | 配置写回丢用户输入 | ⏳ **未清账**（2026-10-15 新增） | `config.set` 落盘走 `persist_config_atomic`（`src/gateway/handlers/config.rs:14`）：`toml::to_string_pretty(整个 GatewayConfig)` 后写**整份**文件，`src/` 内没有任何保留注释/排版的代码。触发者是日常动作——`/theme`、`/mode`，以及**按 `a`「批准并记住」审批**（它写一条 `[permissions].allow` 规则）。于是用户在自己 `config.toml` 写的注释与排布会在第一次这类动作后消失。来源：`audit/omh.local.md`（已删除）对照 oh-my-hermes 的第 7 条 —— OMH 的做法是手写的按行编辑器，只在真变了才写盘。修法方向：只重写被改动的键、其余原文保留。**用户文件的字节稳定性本身就是承诺** |
 | **OPS-001** | P1/P2 | effective config | ⏳ 未复核 | `config.get` 返回 revision + 投影、CAS 有；启动时"effective config 报告"未做 |
 | **TEST-001** | P2 | 质量证据 | ⏳ 未复核 | CI 结构（fmt/clippy/audit/deny + 分套测试）已运转；覆盖率阈值与 E2E 跳过矩阵未重审 |
 | **ARCH-001** | P2 | 多状态路径 | ⏳ 未复核 | MemoryManager 迁移与单一持久化契约未重验 |
