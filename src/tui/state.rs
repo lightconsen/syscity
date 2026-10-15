@@ -499,6 +499,21 @@ impl PathCompletions {
     }
 }
 
+/// One tool call, whole, for `/expand`.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub name: String,
+    /// Untruncated arguments, as the gateway sent them.
+    pub args: Option<Value>,
+    /// Untruncated result; `None` until the call finishes.
+    pub result: Option<Value>,
+}
+
+/// How many recent calls the ring holds. Small on purpose: the payloads are
+/// large (they are the untruncated ones) and `/expand 4` is already a
+/// archaeology exercise.
+const RECENT_TOOL_CAP: usize = 8;
+
 /// Central mutable application state.
 #[derive(Debug)]
 pub struct AppState {
@@ -573,15 +588,15 @@ pub struct AppState {
     /// The last plain-text prompt sent (a slash command is never recorded —
     /// only a message). What `/retry` resends. `None` until the first send.
     pub last_user_prompt: Option<String>,
-    /// The most recent tool call, kept whole for `/expand`. Only the latest
-    /// is held: a turn can call many tools, and every one after the first
-    /// makes the previous expand pointless.
-    pub last_tool_name: Option<String>,
-    /// The last tool call's arguments, *untruncated*. `None` until a call.
-    pub last_tool_args: Option<Value>,
-    /// The last tool call's result, *untruncated*. `None` until a result.
-    /// Cleared by the next `tool.calling`, which a result follows.
-    pub last_tool_result: Option<Value>,
+    /// The most recent tool calls, newest last, kept whole for `/expand`.
+    ///
+    /// The live preview truncates arguments and results to a few rows; these
+    /// are the untruncated originals. A ring rather than a single slot, so
+    /// `/expand 2` can still reach the call before the last one — a turn
+    /// calls many tools, and "the one that scrolled past" is a real thing to
+    /// want back. Bounded because the payloads are large and old ones stop
+    /// being interesting.
+    pub recent_tools: VecDeque<ToolCall>,
     /// When the current run started, for the elapsed counter.
     pub run_started: Option<Instant>,
     /// What the in-flight turn is doing right now.
@@ -641,9 +656,7 @@ impl Default for AppState {
             queued: VecDeque::new(),
             last_assistant_text: None,
             last_user_prompt: None,
-            last_tool_name: None,
-            last_tool_args: None,
-            last_tool_result: None,
+            recent_tools: VecDeque::new(),
             run_started: None,
             run_phase: RunPhase::default(),
             word_offset: 0,
@@ -837,6 +850,52 @@ impl AppState {
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.completion_index = 0;
+    }
+
+    /// Record a tool call starting. Its result is filled in by
+    /// [`Self::finish_tool_call`].
+    pub fn begin_tool_call(&mut self, name: &str, args: Option<Value>) {
+        self.recent_tools.push_back(ToolCall {
+            name: name.to_string(),
+            args,
+            result: None,
+        });
+        while self.recent_tools.len() > RECENT_TOOL_CAP {
+            self.recent_tools.pop_front();
+        }
+    }
+
+    /// Attach a result to a call.
+    ///
+    /// A result with no matching call — a reconnect mid-call — becomes a
+    /// record of its own, so it stays expandable instead of being dropped.
+    pub fn finish_tool_call(&mut self, name: &str, result: Option<Value>) {
+        match self
+            .recent_tools
+            .iter_mut()
+            .rev()
+            .find(|call| call.name == name)
+        {
+            Some(call) => call.result = result,
+            None => {
+                self.recent_tools.push_back(ToolCall {
+                    name: name.to_string(),
+                    args: None,
+                    result,
+                });
+                while self.recent_tools.len() > RECENT_TOOL_CAP {
+                    self.recent_tools.pop_front();
+                }
+            }
+        }
+    }
+
+    /// The `nth` most recent tool call, 1-based (1 = the newest).
+    pub fn recent_tool(&self, nth: usize) -> Option<&ToolCall> {
+        if nth == 0 {
+            return None;
+        }
+        self.recent_tools.iter().rev().nth(nth - 1)
     }
 
     /// The `@path` token the cursor sits in, if any.

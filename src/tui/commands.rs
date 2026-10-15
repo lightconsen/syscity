@@ -100,7 +100,7 @@ async fn handle_local_command(
         }
         "retry" => crate::tui::event_loop::retry_last_message(&state, ws).await,
         "expand" => {
-            command_expand(&state).await;
+            command_expand(&state, args).await;
             Ok(())
         }
         "theme" => command_theme(args, &state, ws).await,
@@ -244,7 +244,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("answer", "<text>", "answer a pending question"),
         ("copy", "", "copy the last answer to the clipboard"),
         ("retry", "", "resend the last prompt"),
-        ("expand", "", "print the last tool call in full"),
+        ("expand", "[n]", "print a recent tool call in full (1 = the last)"),
         ("theme", "[dark|light|auto]", "switch the palette, persisted in config"),
         (
             "mode",
@@ -703,23 +703,48 @@ pub fn write_notify(out: &mut impl std::io::Write, title: &str, body: &str) -> s
     out.flush()
 }
 
-/// `/expand` — print the last tool call in full.
+/// `/expand [n]` — print a recent tool call in full.
 ///
 /// The live preview truncates a call's arguments and result to a few rows
-/// each. The last call is kept whole in the state; this command reprints it
-/// with no cap, so a payload the live view cut off is still inspectable.
-async fn command_expand(state: &Arc<RwLock<AppState>>) {
+/// each. The recent calls are kept whole in the state; this reprints one with
+/// no cap, so a payload the live view cut off is still inspectable. No
+/// argument means the most recent call, which is what `Ctrl+O` sends.
+///
+/// A *reprint* rather than a fold, because scrollback is append-only — a line
+/// written there is never rewritten — so "expanding" something already on
+/// screen can only mean printing it again, in full, below.
+async fn command_expand(state: &Arc<RwLock<AppState>>, args: &str) {
+    let nth = match args.trim() {
+        "" => 1,
+        other => match other.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                state.write().await.transcript.push_notice(
+                    "⚠ /expand takes a count back from the newest (1 = the last call)".to_string(),
+                );
+                return;
+            }
+        },
+    };
+
     let mut s = state.write().await;
-    let Some(name) = s.last_tool_name.clone() else {
-        s.transcript
-            .push_notice("⚠ no tool call yet — run a turn that calls a tool");
+    let Some(call) = s.recent_tool(nth).cloned() else {
+        let held = s.recent_tools.len();
+        s.transcript.push_notice(if held == 0 {
+            "⚠ no tool call yet — run a turn that calls a tool".to_string()
+        } else {
+            format!("⚠ only {held} recent tool calls held — /expand 1 is the newest")
+        });
         return;
     };
-    let args = s.last_tool_args.clone();
-    let result = s.last_tool_result.clone();
+    let name = call.name;
+    let args = call.args;
+    let result = call.result;
     s.transcript.push_separator();
+    // `▾` marks the uncapped reprint, so it reads as complete where the live
+    // preview showed `▸` and a `…`.
     s.transcript
-        .push(vec![TranscriptLine::new(LineKind::Tool, format!("⚙ {name}"))]);
+        .push(vec![TranscriptLine::new(LineKind::Tool, format!("⚙ {name} ▾"))]);
     if let Some(args) = args {
         // `usize::MAX` rows: nothing truncated, the verbatim arguments.
         for row in blocks::args_lines(&args, "  ", usize::MAX) {
@@ -1294,7 +1319,7 @@ mod tests {
         let gateway = TestGateway::start().await;
         let (state, _client) = connect(&gateway).await;
 
-        command_expand(&state).await;
+        command_expand(&state, "").await;
         let lines = output(&state).await;
         assert!(lines[0].contains("no tool call yet"), "got {lines:?}");
     }
@@ -1310,11 +1335,16 @@ mod tests {
         for i in 0..40 {
             map.insert(format!("key_{i}"), serde_json::json!(format!("value_{i}")));
         }
-        state.write().await.last_tool_name = Some("finder".to_string());
-        state.write().await.last_tool_args = Some(serde_json::Value::Object(map));
-        state.write().await.last_tool_result = Some(serde_json::json!({ "found": 3 }));
+        state
+            .write()
+            .await
+            .begin_tool_call("finder", Some(serde_json::Value::Object(map)));
+        state
+            .write()
+            .await
+            .finish_tool_call("finder", Some(serde_json::json!({ "found": 3 })));
 
-        command_expand(&state).await;
+        command_expand(&state, "").await;
         let lines = output(&state).await;
         assert!(lines.iter().any(|l| l.contains("key_39")), "got {lines:?}");
         let arg_rows = lines.iter().filter(|l| l.contains("\"key_")).count();
@@ -1326,6 +1356,71 @@ mod tests {
             lines.iter().any(|l| l.contains("↳ finder:")),
             "missing the result marker row, got {lines:?}"
         );
+    }
+
+    /// `/expand n` reaches back through the ring: the call before the last
+    /// one is still addressable.
+    #[tokio::test]
+    async fn expand_reaches_earlier_calls_by_count() {
+        let gateway = TestGateway::start().await;
+        let (state, _client) = connect(&gateway).await;
+        {
+            let mut s = state.write().await;
+            s.begin_tool_call("first", Some(serde_json::json!({ "n": 1 })));
+            s.finish_tool_call("first", Some(serde_json::json!({ "ok": 1 })));
+            s.begin_tool_call("second", Some(serde_json::json!({ "n": 2 })));
+            s.finish_tool_call("second", Some(serde_json::json!({ "ok": 2 })));
+        }
+
+        command_expand(&state, "2").await;
+        let lines = output(&state).await;
+        assert!(lines.iter().any(|l| l.contains("⚙ first ▾")), "got {lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("second")), "only the one asked for");
+
+        // Out of range is a notice, not a silent reprint of something else.
+        command_expand(&state, "9").await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("2 recent tool calls held"), "got {lines:?}");
+
+        command_expand(&state, "later").await;
+        let lines = output(&state).await;
+        assert!(lines[0].contains("takes a count"), "got {lines:?}");
+    }
+
+    /// The ring is bounded, and drops the oldest rather than growing.
+    #[tokio::test]
+    async fn the_recent_tool_ring_is_bounded() {
+        let gateway = TestGateway::start().await;
+        let (state, _client) = connect(&gateway).await;
+        {
+            let mut s = state.write().await;
+            for i in 0..12 {
+                s.begin_tool_call(&format!("call{i}"), None);
+            }
+            assert_eq!(s.recent_tools.len(), 8, "capped");
+            assert_eq!(s.recent_tool(1).map(|c| c.name.as_str()), Some("call11"), "newest");
+            assert_eq!(s.recent_tool(8).map(|c| c.name.as_str()), Some("call4"), "oldest held");
+            assert!(s.recent_tool(9).is_none(), "and the rest are gone");
+        }
+    }
+
+    /// A result attaches to the call it belongs to, not to whatever is newest.
+    /// A result with no call of its own — a reconnect mid-call — is still kept.
+    #[tokio::test]
+    async fn results_attach_to_their_own_call() {
+        let mut s = AppState::default();
+        s.begin_tool_call("a", Some(serde_json::json!({})));
+        s.begin_tool_call("b", Some(serde_json::json!({})));
+        s.finish_tool_call("a", Some(serde_json::json!({ "for": "a" })));
+
+        assert_eq!(
+            s.recent_tool(2).and_then(|c| c.result.clone()),
+            Some(serde_json::json!({ "for": "a" }))
+        );
+        assert_eq!(s.recent_tool(1).and_then(|c| c.result.clone()), None, "b is still running");
+
+        s.finish_tool_call("orphan", Some(serde_json::json!({ "no": "call" })));
+        assert_eq!(s.recent_tool(1).map(|c| c.name.as_str()), Some("orphan"));
     }
 
     /// `/mode` with no argument reports the current mode; a valid argument

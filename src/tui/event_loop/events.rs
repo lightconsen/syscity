@@ -113,11 +113,8 @@ pub(super) async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState
             s.run_phase = RunPhase::ToolCall(tool.clone());
             s.transcript.push(tool_call_lines(&tool, args.as_ref()));
             // Keep the whole call for `/expand` — the live rows above are
-            // truncated. The next call evicts this one, which is fine: an
-            // expand targets what just ran.
-            s.last_tool_name = Some(tool.clone());
-            s.last_tool_args = args.clone();
-            s.last_tool_result = None;
+            // truncated, and these are not.
+            s.begin_tool_call(&tool, args.clone());
             s.dirty = true;
         }
         "tool.result" => {
@@ -133,11 +130,9 @@ pub(super) async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState
                     .into_iter()
                     .map(|row| TranscriptLine::new(LineKind::ToolResult, row)),
             );
-            // The full result is what `/expand` prints. The name is set here
-            // too: a result without a matching `tool.calling` (a reconnect
-            // mid-call) should still be expandable.
-            s.last_tool_name = Some(tool);
-            s.last_tool_result = result;
+            // The full result is what `/expand` prints, attached to the call
+            // it belongs to (or to a record of its own, if the call was missed).
+            s.finish_tool_call(&tool, result);
             s.dirty = true;
         }
         "delegation.updated" => {
