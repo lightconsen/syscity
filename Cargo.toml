@@ -167,6 +167,17 @@ base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["pkcs8"] }
 subtle = "2.5"
 
+# TUI code-block syntax highlighting.
+#
+# Already in the tree transitively (`ppt-rs` → `pdfrs` enables syntect's
+# `default-fancy`), so this adds no crate, no feature and no compile time —
+# Cargo unions features, and the binary already carries the syntax dumps the
+# crate `include_bytes!`s. Declared with the minimum *we* use rather than
+# `default-fancy`, so that if `pdfrs` ever stops pulling it, we keep only
+# what highlighting needs: no `onig` (C), no theme dump (the theme is
+# synthesised from our own palette), no plist/yaml loaders, no html.
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+
 # WeChat Official Account (wechatmp) encrypted-message protocol
 aes = { version = "0.8", optional = true }
 cbc = { version = "0.1", optional = true }

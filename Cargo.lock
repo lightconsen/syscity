@@ -8342,6 +8342,7 @@ dependencies = [
  "sqlite-vec",
  "sqlx",
  "subtle",
+ "syntect",
  "sysinfo",
  "tar",
  "teloxide",
