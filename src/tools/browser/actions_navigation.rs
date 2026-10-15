@@ -12,7 +12,44 @@ use chromiumoxide::cdp::browser_protocol::input::{
 };
 
 use crate::browser::coordinate_space::{self, PageMetrics};
+use crate::browser::navigation_guard::{assert_navigation_allowed, NavigationPolicy};
 use crate::browser::pointer::{self, PointerButton, PointerStep};
+
+/// Gate a `Navigate` target before the browser is pointed at it.
+///
+/// The same guard `web_fetch` walks its redirect hops with: it admits
+/// `http`, `https` and `about`, rejects the private ranges (literal and
+/// DNS-resolved) and the configured hostname lists, and rejects every other
+/// scheme — `file:` included, which this tool used to open, handing a local
+/// file's contents to the page and to whatever the model can read back.
+///
+/// `data:` is exempt, and deliberately: an inline document has no origin to
+/// resolve and no request to forge, so it is not an SSRF path at all — and
+/// the integration suite loads every fixture that way.
+///
+/// This checks the URL the action names. It cannot check where a page goes
+/// next: link clicks, form submits, `window.location`, meta-refresh,
+/// `window.open`, new tabs and every subresource a page fetches are all
+/// navigations this never sees, and `Back`/`Forward`/`Reload` re-enter URLs
+/// that are not knowable up front. Closing those needs a CDP
+/// `Page.frameNavigated` / `Network.requestWillBeSent` subscription rather
+/// than a URL check.
+pub(super) async fn check_navigation_target(
+    url: &str,
+    policy: &NavigationPolicy,
+) -> Result<(), String> {
+    // `get(..5)` rather than `[..5]`: a multi-byte first character must not
+    // panic here.
+    if url
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+    {
+        return Ok(());
+    }
+    assert_navigation_allowed(url, policy)
+        .await
+        .map_err(|e| format!("navigation to '{}' is blocked by the SSRF guard: {}", url, e))
+}
 
 /// Dispatch a pointer sequence, one CDP event per step.
 ///
@@ -111,9 +148,14 @@ pub(super) async fn execute_navigation_actions(
     page: &chromiumoxide::Page,
     _browser: Option<&chromiumoxide::Browser>,
     _screenshot_data: &mut Option<BrowserScreenshot>,
+    policy: &NavigationPolicy,
 ) -> Result<serde_json::Value, String> {
     match action {
         BrowserAction::Navigate { url } => {
+            // At the sink, right before the browser is pointed anywhere: a
+            // check in the caller's action loop would be a second place to
+            // keep in step, and the one that gets forgotten.
+            check_navigation_target(&url, policy).await?;
             info!("Navigating to: {}", url);
             match page.goto(&url).await {
                 Ok(_) => {
@@ -274,5 +316,77 @@ pub(super) async fn execute_navigation_actions(
             Err("Tab management requires pool-based mode".to_string())
         }
         _ => Err("browser: action not handled by this group".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every case here is hermetic: `localhost` is the default hostname
+    /// blocklist and `127.0.0.1` is an IP literal, so neither needs DNS.
+    #[tokio::test]
+    async fn the_guard_admits_web_targets_and_refuses_the_rest() {
+        let policy = NavigationPolicy::default();
+
+        for allowed in [
+            "https://example.com/",
+            "http://example.com/page?q=1",
+            "about:blank",
+            // An inline document has no origin to resolve, and the
+            // integration suite loads every fixture this way.
+            "data:text/html,<h1>hi</h1>",
+        ] {
+            assert!(
+                check_navigation_target(allowed, &policy).await.is_ok(),
+                "{allowed} should be allowed"
+            );
+        }
+
+        for refused in [
+            "http://127.0.0.1/",
+            "http://127.0.0.1:1/",
+            "http://localhost/",
+            "http://10.0.0.1/",
+            "http://[::1]/",
+            // Local file disclosure into a page the model can read back.
+            "file:///etc/passwd",
+            "ftp://example.com/",
+        ] {
+            assert!(
+                check_navigation_target(refused, &policy).await.is_err(),
+                "{refused} should be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn error_names_the_guard_and_the_url() {
+        let err = check_navigation_target("http://127.0.0.1:8080/", &NavigationPolicy::default())
+            .await
+            .expect_err("loopback is refused by default");
+        assert!(err.contains("SSRF guard"), "{err}");
+        assert!(err.contains("127.0.0.1:8080"), "the model needs the URL: {err}");
+    }
+
+    /// A permissive policy is what a deployment driving a local dev server
+    /// opts into; the scheme rule still holds.
+    #[tokio::test]
+    async fn a_permissive_policy_reopens_loopback_but_not_other_schemes() {
+        let policy = NavigationPolicy::permissive();
+        assert!(check_navigation_target("http://127.0.0.1:3000/", &policy)
+            .await
+            .is_ok());
+        assert!(check_navigation_target("file:///etc/passwd", &policy)
+            .await
+            .is_err());
+    }
+
+    /// A multi-byte first character must not panic the scheme test.
+    #[tokio::test]
+    async fn a_non_ascii_url_is_refused_not_panicked_on() {
+        assert!(check_navigation_target("中文://x", &NavigationPolicy::default())
+            .await
+            .is_err());
     }
 }

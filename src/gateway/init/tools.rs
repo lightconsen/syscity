@@ -306,6 +306,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 secrets: secrets.clone(),
                 paths: paths.clone(),
                 permissions,
+                browser_allow_private: config.security.browser_allow_private,
             },
         )
         .await?,

@@ -158,6 +158,7 @@ impl BrowserTool {
                         &current_handle.page,
                         Some(instance.browser.as_ref()),
                         &mut screenshot_data,
+                        &self.navigation_policy,
                     )
                     .await
                 }
@@ -246,6 +247,7 @@ impl BrowserTool {
                 &page,
                 Some(browser.as_ref()),
                 &mut screenshot_data,
+                &self.navigation_policy,
             )
             .await;
             results.push(result);

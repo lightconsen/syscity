@@ -11,6 +11,14 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Added
+
+- **`[security] browser_allow_private`** (default `false`). The browser tool now runs the same SSRF guard `web_fetch` has always run, so private and loopback addresses need this switch to be reachable again — for a deployment driving its own dev server on `localhost`. The scheme rule is unaffected: `file:` stays refused either way.
+
+### Changed
+
+- **The browser tool refuses private, loopback and non-web navigation targets.** Every `Navigate` now goes through the SSRF guard before Chrome is pointed anywhere: private ranges (literal and DNS-resolved) and the default `localhost` blocklist are refused, and so is `file://`, which used to open — handing a local file's contents to the page and to whatever the model can read back. Set `[security] browser_allow_private = true` to re-open private targets. What this does *not* cover: link clicks, form submits, `window.location`, meta-refresh, `window.open`, new tabs, `Back`/`Forward`/`Reload` and page subresources — closing those needs a CDP-level navigation subscription, not a check on the URL an action names.
+
 ## [0.3.10] - 2026-10-02
 
 ### Highlights

@@ -72,6 +72,10 @@ pub struct BrowserTool {
     /// Optional browser pool for persistent sessions
     #[cfg(feature = "browser")]
     pool: Option<std::sync::Arc<crate::browser::BrowserPool>>,
+    /// SSRF policy for every `Navigate` target — the same guard `web_fetch`
+    /// walks its redirect hops with, and the same restrictive default.
+    #[cfg(feature = "browser")]
+    navigation_policy: crate::browser::NavigationPolicy,
     /// Profile name for pool-based sessions
     profile: String,
 }
@@ -86,6 +90,8 @@ impl Default for BrowserTool {
             default_timeout: Duration::from_secs(30),
             #[cfg(feature = "browser")]
             pool: None,
+            #[cfg(feature = "browser")]
+            navigation_policy: crate::browser::NavigationPolicy::default(),
             profile: "default".to_string(),
         }
     }
@@ -123,6 +129,17 @@ impl BrowserTool {
         self
     }
 
+    /// Set the SSRF policy applied to every navigation target.
+    ///
+    /// The default is restrictive — private addresses and every scheme but
+    /// `http`/`https`/`about` are refused. `NavigationPolicy::permissive()`
+    /// is how a deployment that drives a local dev server gets loopback back.
+    #[cfg(feature = "browser")]
+    pub fn with_navigation_policy(mut self, policy: crate::browser::NavigationPolicy) -> Self {
+        self.navigation_policy = policy;
+        self
+    }
+
     /// Set profile name for pool-based sessions
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
         self.profile = profile.into();
@@ -136,6 +153,7 @@ impl BrowserTool {
         page: &chromiumoxide::Page,
         browser: Option<&chromiumoxide::Browser>,
         screenshot_data: &mut Option<BrowserScreenshot>,
+        policy: &crate::browser::NavigationPolicy,
     ) -> Result<serde_json::Value, String> {
         match action {
             BrowserAction::Navigate { .. }
@@ -150,7 +168,7 @@ impl BrowserTool {
             | BrowserAction::ListTabs
             | BrowserAction::SwitchTab { .. }
             | BrowserAction::CloseTab { .. } => {
-                execute_navigation_actions(action, page, browser, screenshot_data).await
+                execute_navigation_actions(action, page, browser, screenshot_data, policy).await
             }
             BrowserAction::GetHtml
             | BrowserAction::GetText { .. }
@@ -869,6 +887,24 @@ mod tests {
         assert_eq!(tool.default_timeout, Duration::from_secs(30));
         assert!(tool.chrome_path.is_none());
         assert_eq!(tool.profile, "default");
+    }
+
+    /// Restrictive unless someone says otherwise — the same posture
+    /// `web_fetch` runs in production.
+    #[cfg(feature = "browser")]
+    #[test]
+    fn the_default_navigation_policy_refuses_private_targets() {
+        let default = BrowserTool::new();
+        assert!(!default.navigation_policy.allow_private);
+        assert_eq!(default.navigation_policy.blocked_hostnames, vec!["localhost".to_string()]);
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn test_browser_tool_with_navigation_policy() {
+        let tool = BrowserTool::new()
+            .with_navigation_policy(crate::browser::NavigationPolicy::permissive());
+        assert!(tool.navigation_policy.allow_private, "the opt-out has to reach the field");
     }
 
     #[test]

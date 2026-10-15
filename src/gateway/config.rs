@@ -1312,6 +1312,16 @@ pub struct SecurityConfig {
     /// fenced command in the deployment.
     #[serde(default)]
     pub fence_network: bool,
+    /// Let the browser tool navigate to private and loopback addresses
+    /// (`http://localhost:3000`, a dev server on the LAN).
+    ///
+    /// Off by default, because the browser tool now runs the same SSRF policy
+    /// `web_fetch` has always run — private ranges are what an SSRF is *for*.
+    /// On, the policy becomes permissive, which is what a deployment driving
+    /// its own dev server needs; the scheme rule is unaffected, so `file:`
+    /// stays refused either way.
+    #[serde(default)]
+    pub browser_allow_private: bool,
     /// Whether the Linux runner builds a namespace view (read-only root,
     /// private `/tmp`, working trees re-bound on top) around fenced command
     /// tools, in addition to the Landlock write rules.
@@ -1469,6 +1479,7 @@ impl Default for SecurityConfig {
             credential_precedence: CredentialPrecedence::default(),
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
+            browser_allow_private: false,
         }
     }
 }

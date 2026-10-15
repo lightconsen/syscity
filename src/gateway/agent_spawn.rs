@@ -954,6 +954,9 @@ pub(crate) struct ToolRegistryArgs {
     pub tool_hooks: crate::tools::hooks::ToolHooks,
     /// Secret-store instance handle shared with the gateway (cloud tools).
     pub secrets: Arc<crate::secrets::SecretStoreHandle>,
+    /// Let the browser tool reach private and loopback addresses
+    /// (`[security] browser_allow_private`).
+    pub browser_allow_private: bool,
     /// Shared permission runtime seeded from `[permissions]` config.
     pub permissions: Arc<crate::tools::PermissionsRuntime>,
     /// Layout root shared with the gateway.
@@ -986,6 +989,7 @@ pub(crate) async fn create_default_tool_registry(
         secrets,
         paths,
         permissions,
+        browser_allow_private,
     } = args;
 
     let mut registry = ToolRegistry::new()
@@ -1077,9 +1081,17 @@ pub(crate) async fn create_default_tool_registry(
     // Register time tool
     registry.register(Box::new(TimeTool::new()));
 
-    // Register browser tool (if browser feature enabled)
+    // Register browser tool (if browser feature enabled). The navigation
+    // policy is the SSRF guard web_fetch has always run; permissive is the
+    // opt-in for a deployment that drives its own dev server.
     #[cfg(feature = "browser")]
-    registry.register(Box::new(BrowserTool::new()));
+    registry.register(Box::new(BrowserTool::new().with_navigation_policy(
+        if browser_allow_private {
+            crate::browser::NavigationPolicy::permissive()
+        } else {
+            crate::browser::NavigationPolicy::default()
+        },
+    )));
 
     // Register ACP tools for subagent spawning
     registry.register(Box::new(AcpSpawnTool::new(acp.clone(), session_store.clone())));
