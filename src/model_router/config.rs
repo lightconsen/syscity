@@ -495,222 +495,68 @@ pub struct ProviderPreset {
 }
 
 /// Built-in provider presets keyed by provider name.
+///
+/// A *view* of `providers/presets.toml`, not a second registry: the vendor
+/// list, the display names, the base URLs and the model lists all come from
+/// that one table, so adding a vendor is one entry there. What this function
+/// adds is the shape the config-facing callers want — a flat map keyed by name,
+/// carrying the legacy [`ProviderType`] — plus the synthetic `custom` entry.
 pub fn provider_presets() -> HashMap<String, ProviderPreset> {
-    let mut m = HashMap::new();
-    m.insert(
-        "anthropic".to_string(),
-        ProviderPreset {
-            display_name: "Anthropic".to_string(),
-            protocol: ProviderType::Anthropic,
-            default_base_url: None,
-            models: vec![
-                "claude-opus-4-6".to_string(),
-                "claude-sonnet-4-6".to_string(),
-                "claude-haiku-4-5-20251001".to_string(),
-                "claude-sonnet-4-20250514".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "openai".to_string(),
-        ProviderPreset {
-            display_name: "OpenAI".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://api.openai.com/v1".to_string()),
-            models: vec![
-                "gpt-5.5".to_string(),
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-5.4-nano".to_string(),
-                "gpt-4o".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "deepseek".to_string(),
-        ProviderPreset {
-            display_name: "DeepSeek".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://api.deepseek.com/v1".to_string()),
-            models: vec![
-                "deepseek-v4-flash".to_string(),
-                "deepseek-v4-pro".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "qwen".to_string(),
-        ProviderPreset {
-            display_name: "Qwen".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
-            models: vec![
-                "qwen3.8-max".to_string(),
-                "qwen3.7-plus".to_string(),
-                "qwen3.7-flash".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "kimi".to_string(),
-        ProviderPreset {
-            display_name: "Kimi".to_string(),
-            protocol: ProviderType::Moonshot,
-            default_base_url: None,
-            models: vec![
-                "kimi-k2.5".to_string(),
-                "kimi-k2.6".to_string(),
-                "kimi-k2.7-code".to_string(),
-                "kimi-k2.7-code-highspeed".to_string(),
-                "kimi-k3".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "gemini".to_string(),
-        ProviderPreset {
-            display_name: "Gemini".to_string(),
-            protocol: ProviderType::Gemini,
-            default_base_url: None,
-            models: vec![
-                "gemini-2.5-pro".to_string(),
-                "gemini-2.5-flash".to_string(),
-                "gemini-2.5-flash-lite".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "glm".to_string(),
-        ProviderPreset {
-            display_name: "GLM (Zhipu)".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://open.bigmodel.cn/api/paas/v4".to_string()),
-            models: vec![
-                "glm-4.7".to_string(),
-                "glm-5-turbo".to_string(),
-                "glm-5.2".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "minimax".to_string(),
-        ProviderPreset {
-            display_name: "MiniMax".to_string(),
-            protocol: ProviderType::Minimax,
-            default_base_url: None,
-            models: vec![
-                "MiniMax-M3".to_string(),
-                "MiniMax-M2.7".to_string(),
-                "MiniMax-M2.7-highspeed".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "azure".to_string(),
-        ProviderPreset {
-            display_name: "Azure OpenAI".to_string(),
-            protocol: ProviderType::Azure,
-            default_base_url: None,
-            models: vec![
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-4o".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "ollama".to_string(),
-        ProviderPreset {
-            display_name: "Ollama".to_string(),
-            protocol: ProviderType::Ollama,
-            default_base_url: Some("http://localhost:11434".to_string()),
-            models: vec![
-                "qwen3".to_string(),
-                "llama4".to_string(),
-                "deepseek-r1".to_string(),
-                "gemma3".to_string(),
-            ],
-        },
-    );
-    m.insert(
+    let mut presets: HashMap<String, ProviderPreset> =
+        crate::providers::preset::builtin_providers()
+            .values()
+            .map(|vendor| {
+                let first = vendor.variants.first();
+                let protocol = match first {
+                    Some(variant) => variant.protocol,
+                    None => crate::providers::Protocol::OpenAi,
+                };
+                let preset = ProviderPreset {
+                    display_name: vendor.display_name.clone(),
+                    protocol: provider_type_for_key(&vendor.name, protocol),
+                    default_base_url: first.map(|v| v.default_base_url.clone()),
+                    models: vendor.models.clone(),
+                };
+                (vendor.name.clone(), preset)
+            })
+            .collect();
+    // "custom" is a shape rather than a vendor: no table describes it, because
+    // its defaults are the absence of defaults.
+    presets.insert(
         "custom".to_string(),
         ProviderPreset {
             display_name: "Custom".to_string(),
             protocol: ProviderType::Custom { name: "custom".to_string() },
             default_base_url: None,
-            models: vec![],
+            models: Vec::new(),
         },
     );
-    m.insert(
-        "volcengine".to_string(),
-        ProviderPreset {
-            display_name: "Volcengine (火山引擎)".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://ark.cn-beijing.volces.com/api/v3".to_string()),
-            models: vec![
-                "doubao-seed-2-1-pro-260628".to_string(),
-                "doubao-seed-2-1-turbo-260628".to_string(),
-                "doubao-seed-evolving".to_string(),
-            ],
+    presets
+}
+
+/// The legacy [`ProviderType`] for a preset key.
+///
+/// `ProviderConfig.provider_type` predates the preset registry, and what is
+/// read from it today is a *name*: the router stringifies it and looks the
+/// preset up by that string. Four keys keep a dedicated variant because the
+/// configs that already exist carry it (`moonshot` is still mapped back to
+/// `kimi` on the way in); every other vendor speaks the OpenAI protocol, so the
+/// legacy answer for it is `OpenAi`, with the vendor's own endpoint travelling
+/// separately in `base_url` and the preset itself resolved from the provider's
+/// key.
+fn provider_type_for_key(key: &str, protocol: crate::providers::Protocol) -> ProviderType {
+    use crate::providers::Protocol;
+    match key {
+        "azure" => ProviderType::Azure,
+        "ollama" => ProviderType::Ollama,
+        "kimi" => ProviderType::Moonshot,
+        "minimax" => ProviderType::Minimax,
+        _ => match protocol {
+            Protocol::OpenAi => ProviderType::OpenAi,
+            Protocol::Anthropic => ProviderType::Anthropic,
+            Protocol::Gemini => ProviderType::Gemini,
         },
-    );
-    m.insert(
-        "hunyuan".to_string(),
-        ProviderPreset {
-            display_name: "Hunyuan (Tencent)".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://api.hunyuan.cloud.tencent.com/v1".to_string()),
-            models: vec![
-                "hunyuan-t1-latest".to_string(),
-                "hunyuan-turbos-latest".to_string(),
-                "hunyuan-standard".to_string(),
-                "hunyuan-lite".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "grok".to_string(),
-        ProviderPreset {
-            display_name: "xAI (Grok)".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://api.x.ai/v1".to_string()),
-            models: vec![
-                "grok-4.5".to_string(),
-                "grok-4.3".to_string(),
-                "grok-4.1-fast".to_string(),
-                "grok-code-fast-1".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "mistral".to_string(),
-        ProviderPreset {
-            display_name: "Mistral".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://api.mistral.ai/v1".to_string()),
-            models: vec![
-                "mistral-large-latest".to_string(),
-                "mistral-medium-latest".to_string(),
-                "magistral-medium-latest".to_string(),
-                "mistral-small-latest".to_string(),
-                "codestral-latest".to_string(),
-            ],
-        },
-    );
-    m.insert(
-        "cohere".to_string(),
-        ProviderPreset {
-            display_name: "Cohere".to_string(),
-            protocol: ProviderType::OpenAi,
-            default_base_url: Some("https://api.cohere.ai/compatibility/v1".to_string()),
-            models: vec![
-                "command-a-plus-05-2026".to_string(),
-                "command-a-03-2025".to_string(),
-                "command-r-plus-08-2024".to_string(),
-            ],
-        },
-    );
-    m
+    }
 }
 
 /// Resolve a provider preset by its config key or by its display name
@@ -1057,6 +903,55 @@ mod tests {
         assert_eq!(config.model_costs.len(), 3);
         assert_eq!(config.routing_rules.len(), 9);
         assert_eq!(config.default_model, "default");
+    }
+
+    #[test]
+    fn provider_presets_agree_with_the_preset_table() {
+        // The registry has one source. A vendor added to `presets.toml` and not
+        // here — or one whose display name, base URL or model list drifted —
+        // used to be possible: there were two hand-maintained tables, and they
+        // disagreed (three vendors resolved but never appeared in the model
+        // pickers).
+        let presets = provider_presets();
+        for vendor in crate::providers::preset::builtin_providers().values() {
+            let preset = presets
+                .get(&vendor.name)
+                .unwrap_or_else(|| panic!("{} has no preset", vendor.name));
+            assert_eq!(preset.display_name, vendor.display_name, "{}", vendor.name);
+            assert_eq!(preset.models, vendor.models, "{}", vendor.name);
+            assert_eq!(
+                preset.default_base_url.as_deref(),
+                vendor.variants.first().map(|v| v.default_base_url.as_str()),
+                "{}",
+                vendor.name
+            );
+            assert!(
+                !preset.models.is_empty(),
+                "{} ships no model list, so the pickers would show none",
+                vendor.name
+            );
+        }
+    }
+
+    #[test]
+    fn provider_presets_carry_the_legacy_provider_types() {
+        // `provider_type` is a name, and these are the names existing configs
+        // hold: the router resolves a preset by stringifying it. Anything else
+        // would silently move a configured provider onto another vendor's
+        // preset.
+        let presets = provider_presets();
+        let legacy = |key: &str| format!("{:?}", presets[key].protocol);
+        assert_eq!(legacy("openai"), "OpenAi");
+        assert_eq!(legacy("anthropic"), "Anthropic");
+        assert_eq!(legacy("gemini"), "Gemini");
+        assert_eq!(legacy("azure"), "Azure");
+        assert_eq!(legacy("ollama"), "Ollama");
+        assert_eq!(legacy("minimax"), "Minimax");
+        // Kimi's configs say "moonshot"; the router maps it back to the preset.
+        assert_eq!(legacy("kimi"), "Moonshot");
+        // An OpenAI-compatible vendor with no legacy variant of its own.
+        assert_eq!(legacy("deepseek"), "OpenAi");
+        assert_eq!(legacy("custom"), "Custom { name: \"custom\" }");
     }
 
     #[test]

@@ -149,7 +149,14 @@ pub(super) async fn handle_models_presets(
     req: &WsRequest,
     _state: &Arc<GatewayState>,
 ) -> WsResponse {
-    let presets = crate::model_router::provider_presets();
+    let mut presets: Vec<(String, crate::model_router::ProviderPreset)> =
+        crate::model_router::provider_presets()
+            .into_iter()
+            .collect();
+    // The registry is a map, so its order is arbitrary; the picker renders this
+    // list in order, and a button that moves between two opens is a button the
+    // user has to re-find.
+    presets.sort_by(|(_, a), (_, b)| a.display_name.cmp(&b.display_name));
     let builtins = crate::providers::preset::builtin_providers();
     let list: Vec<serde_json::Value> = presets
         .into_iter()
@@ -162,13 +169,9 @@ pub(super) async fn handle_models_presets(
                 .and_then(|b| b.variants.first())
                 .map(|v| v.auth_method != crate::providers::AuthMethod::None)
                 .unwrap_or(true);
-            // Fall back to the TOML registry base URL when the legacy preset
-            // does not define one (e.g. Anthropic, Gemini).
-            let base_url = p.default_base_url.or_else(|| {
-                builtin
-                    .and_then(|b| b.variants.first())
-                    .map(|v| v.default_base_url.clone())
-            });
+            // Base URL comes from the preset, which is derived from the TOML
+            // registry; the `custom` entry is the one preset with none.
+            let base_url = p.default_base_url;
             serde_json::json!({
                 "name": name,
                 "display_name": p.display_name,

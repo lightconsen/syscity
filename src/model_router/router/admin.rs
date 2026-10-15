@@ -265,7 +265,7 @@ impl ModelRouter {
             .register_from_config(name, &auth_config)
             .await;
 
-        let provider = self.create_provider(&config).await?;
+        let provider = self.create_provider(name, &config).await?;
 
         {
             let mut providers = self.providers.write().await;
@@ -319,7 +319,7 @@ impl ModelRouter {
             .register_from_config(name, &auth_config)
             .await;
 
-        let provider = self.create_provider(&config).await?;
+        let provider = self.create_provider(name, &config).await?;
         {
             let mut providers = self.providers.write().await;
             providers.insert(name.to_string(), provider);

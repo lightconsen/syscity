@@ -648,6 +648,12 @@ pub struct ProviderDefinition {
     pub name: String,
     /// Human-readable display name
     pub display_name: String,
+    /// Suggested model IDs, the vendor's default model first. This is the
+    /// vendor's model list — the one the pickers show and the one a provider
+    /// with no model list of its own is backfilled from — so a vendor is
+    /// described in exactly one place.
+    #[serde(default)]
+    pub models: Vec<String>,
     /// Available protocol variants
     pub variants: Vec<ProtocolVariant>,
 }

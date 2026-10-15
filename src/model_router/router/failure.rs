@@ -4,26 +4,67 @@ use super::*;
 
 impl ModelRouter {
     /// Create a provider instance from config
+    ///
+    /// The provider's *key* names the vendor: a key that matches a built-in
+    /// preset resolves that preset — its stream family, its context window, its
+    /// suggested models — with the config's own base URL and model on top. That
+    /// is what makes a preset authoritative for the vendor rather than a set of
+    /// values copied into config once at add time.
+    ///
+    /// A key that is not a preset falls back to `provider_type`, which is the
+    /// case that needs it: a provider registered under a display-name spelling
+    /// ("DeepSeek") still sits on the `deepseek` preset.
     pub(super) async fn create_provider(
         &self,
+        name: &str,
         config: &ProviderConfig,
     ) -> crate::Result<Arc<dyn Provider + Send + Sync>> {
         let api_key = config.effective_key(self.secrets.as_deref()).await;
-        let provider_type = config.provider_type.to_string();
 
-        // Map legacy provider_type names to preset names
-        let provider_type = match provider_type.as_str() {
-            "moonshot" => "kimi",
-            other => other,
+        use crate::providers::preset::{builtin_providers, canonical_provider_name};
+
+        let by_name = canonical_provider_name(name);
+        let schemes = builtin_providers();
+        let preset = if schemes.contains_key(by_name) {
+            by_name.to_string()
+        } else {
+            // Map legacy provider_type names to preset names
+            match config.provider_type.to_string().as_str() {
+                "moonshot" => "kimi".to_string(),
+                other => other.to_string(),
+            }
         };
+        // `provider_type` also chooses *which endpoint of the vendor* to talk
+        // to, which is a real choice for a dual-protocol vendor like Kimi
+        // (`api.moonshot.cn/v1` or `.../anthropic`). It is taken as that choice
+        // only when the preset it selects actually speaks the protocol —
+        // otherwise the preset's own first variant stands, which also keeps a
+        // contradictory config (`provider_type = "anthropic"` under `openai`)
+        // from failing at startup over a field nothing depended on.
+        let protocol = match config.provider_type {
+            ProviderType::OpenAi => Some(crate::providers::Protocol::OpenAi),
+            ProviderType::Anthropic => Some(crate::providers::Protocol::Anthropic),
+            ProviderType::Gemini => Some(crate::providers::Protocol::Gemini),
+            // Legacy vendor names, not protocols; `custom` has no preset.
+            ProviderType::Azure
+            | ProviderType::Ollama
+            | ProviderType::Moonshot
+            | ProviderType::Minimax
+            | ProviderType::Custom { .. } => None,
+        }
+        .filter(|protocol| {
+            schemes
+                .get(preset.as_str())
+                .is_some_and(|def| def.variants.iter().any(|v| v.protocol == *protocol))
+        });
 
         use crate::providers::resolver::{resolve_from_config, ProviderOverrides};
 
         let provider = resolve_from_config(
-            provider_type,
+            &preset,
             Some(api_key),
             ProviderOverrides {
-                // protocol: auto-detect from preset default
+                protocol,
                 base_url: config.base_url.clone(),
                 // Honor the config's default_model: without this the concrete
                 // provider instance falls back to the *preset* default model

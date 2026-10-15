@@ -80,7 +80,7 @@ impl ModelRouter {
                 .await;
             info!("Registered auth profile for '{}' with {} key(s)", name, auth_config.keys.len());
 
-            let provider = self.create_provider(provider_config).await?;
+            let provider = self.create_provider(name, provider_config).await?;
 
             let mut providers = self.providers.write().await;
             providers.insert(name.clone(), provider);

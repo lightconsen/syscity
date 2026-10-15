@@ -264,6 +264,56 @@ mod tests {
         );
     }
 
+    /// A provider's key names the vendor, so the preset's own defaults apply:
+    /// its context window and stream family, not the ones `provider_type`
+    /// happened to carry. Before, the *preset* was chosen from `provider_type`
+    /// alone, so a provider keyed `grok` but typed `open_ai` ran on the OpenAI
+    /// preset's 128k window.
+    #[tokio::test]
+    async fn provider_key_selects_the_preset() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        let mut config = test_provider_config(&["grok-4.3"]);
+        config.provider_type = ProviderType::OpenAi;
+        config.base_url = Some("https://api.x.ai/v1".to_string());
+        router.add_provider("grok", config).await.unwrap();
+
+        let provider = router.get_provider("grok").await.unwrap();
+        assert_eq!(provider.max_context(), 131_072);
+    }
+
+    /// `provider_type` still chooses the vendor's *endpoint* where the vendor
+    /// offers more than one protocol, and the key chooses the vendor.
+    #[tokio::test]
+    async fn provider_type_selects_a_preset_variant() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        let mut config = test_provider_config(&["kimi-k2.6"]);
+        config.provider_type = ProviderType::Anthropic;
+        router.add_provider("kimi", config).await.unwrap();
+
+        let provider = router.get_provider("kimi").await.unwrap();
+        assert_eq!(
+            provider.name(),
+            "anthropic",
+            "kimi keyed as kimi and typed anthropic must run its Anthropic endpoint"
+        );
+    }
+
+    /// A key that is not a preset keeps resolving through `provider_type`, which
+    /// is what makes a display-name spelling work.
+    #[tokio::test]
+    async fn a_key_that_is_not_a_preset_falls_back_to_provider_type() {
+        let router = ModelRouter::new(ModelRouterConfig::default());
+        let mut config = test_provider_config(&["gpt-5.4-mini"]);
+        config.provider_type = ProviderType::OpenAi;
+        router
+            .add_provider("OpenAI (personal)", config)
+            .await
+            .unwrap();
+
+        let provider = router.get_provider("OpenAI (personal)").await.unwrap();
+        assert_eq!(provider.max_context(), 128_000);
+    }
+
     #[tokio::test]
     async fn add_provider_rejects_duplicate_name() {
         let router = ModelRouter::new(ModelRouterConfig::default());

@@ -11,6 +11,7 @@
 //! system still boots.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -25,6 +26,11 @@ const PRESETS_TOML: &str = include_str!("presets.toml");
 #[derive(Debug, Deserialize)]
 struct RawPreset {
     display_name: String,
+    /// Suggested model IDs, the vendor's default model first. Defaulted so a
+    /// table that omits the key still parses; `every_preset_lists_models`
+    /// keeps that from being a way to ship an empty picker.
+    #[serde(default)]
+    models: Vec<String>,
     variants: Vec<ProtocolVariant>,
 }
 
@@ -45,19 +51,24 @@ pub fn canonical_provider_name(name: &str) -> &str {
 /// All built-in provider definitions.
 ///
 /// The key is the preset name used in config (e.g. `"openai"`, `"kimi"`).
-pub fn builtin_providers() -> HashMap<&'static str, ProviderDefinition> {
-    match toml::from_str::<HashMap<String, RawPreset>>(PRESETS_TOML) {
+///
+/// Parsed once and held for the process, and the keys are handed out as
+/// `&'static str`: the table is read on paths that run per request (a display
+/// name per model row, a preset look-up per provider add), so parsing it — and
+/// leaking a key string to satisfy that signature — on every call was a leak
+/// that grew with traffic, not with the vendor list.
+pub fn builtin_providers() -> &'static HashMap<&'static str, ProviderDefinition> {
+    static PROVIDERS: OnceLock<HashMap<&'static str, ProviderDefinition>> = OnceLock::new();
+    PROVIDERS.get_or_init(|| match toml::from_str::<HashMap<String, RawPreset>>(PRESETS_TOML) {
         Ok(raw) => raw
             .into_iter()
             .map(|(name, p)| {
                 let def = ProviderDefinition {
                     name: name.clone(),
                     display_name: p.display_name,
+                    models: p.models,
                     variants: p.variants,
                 };
-                // Leak the key to obtain a `&'static str`. The preset set is
-                // small and built once; this keeps the long-standing
-                // `&'static str` key contract without churn at call sites.
                 (Box::leak(name.into_boxed_str()) as &'static str, def)
             })
             .collect(),
@@ -68,7 +79,7 @@ pub fn builtin_providers() -> HashMap<&'static str, ProviderDefinition> {
             );
             fallback_providers()
         }
-    }
+    })
 }
 
 /// Minimal hand-rolled provider set used only if `presets.toml` fails to
@@ -80,6 +91,7 @@ fn fallback_providers() -> HashMap<&'static str, ProviderDefinition> {
         ProviderDefinition {
             name: "openai".into(),
             display_name: "OpenAI".into(),
+            models: vec!["gpt-5.4-mini".into()],
             variants: vec![ProtocolVariant {
                 protocol: Protocol::OpenAi,
                 default_base_url: "https://api.openai.com/v1".into(),
@@ -98,6 +110,9 @@ fn fallback_providers() -> HashMap<&'static str, ProviderDefinition> {
         ProviderDefinition {
             name: "anthropic".into(),
             display_name: "Anthropic".into(),
+            // The fallback set exists so the gateway still boots; it carries
+            // the two vendors' defaults and nothing else.
+            models: vec![crate::providers::DEFAULT_MODEL.into()],
             variants: vec![ProtocolVariant {
                 protocol: Protocol::Anthropic,
                 default_base_url: "https://api.anthropic.com".into(),
@@ -186,7 +201,7 @@ mod tests {
     #[test]
     fn test_names_match_keys() {
         let providers = builtin_providers();
-        for (key, def) in &providers {
+        for (key, def) in providers {
             assert_eq!(*key, def.name, "preset key must match definition name");
         }
     }
@@ -247,8 +262,36 @@ mod tests {
     #[test]
     fn test_each_provider_has_at_least_one_variant() {
         let providers = builtin_providers();
-        for (name, def) in &providers {
+        for (name, def) in providers {
             assert!(!def.variants.is_empty(), "{} has no variants", name);
+        }
+    }
+
+    /// The model list is what the pickers show and what a provider with no
+    /// model list of its own is backfilled from, so an empty one is a vendor
+    /// that cannot be selected.
+    #[test]
+    fn every_preset_lists_models() {
+        let providers = builtin_providers();
+        for (name, def) in providers {
+            assert!(!def.models.is_empty(), "{name} lists no models");
+        }
+    }
+
+    /// The first listed model and the variant's `default_model` are read
+    /// interchangeably — the backfill takes the list's head as the provider's
+    /// default, while the provider instance defaults to `default_model` — so
+    /// they have to be the same model. They were not: the OpenAI preset offered
+    /// `gpt-5.5` first and defaulted to `gpt-5.4-mini`.
+    #[test]
+    fn every_preset_lists_its_default_model_first() {
+        let providers = builtin_providers();
+        for (name, def) in providers {
+            assert_eq!(
+                def.models.first().map(String::as_str),
+                Some(def.variants[0].default_model.as_str()),
+                "{name}: the model list must lead with the default model"
+            );
         }
     }
 }

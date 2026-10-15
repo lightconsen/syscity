@@ -4,6 +4,12 @@
 # `kimi`). The `name` field of the resulting `ProviderDefinition` is filled
 # from this key automatically — do not repeat it here.
 #
+# `display_name` and `models` are vendor-level: `models` is the suggested model
+# list shown in the pickers and used when a provider has no model list of its
+# own. Its **first entry must be the variant's `default_model`** — the two are
+# read interchangeably (a provider backfilled from a preset takes the list's
+# head as its default), and `preset.rs` has a test that keeps them in step.
+#
 # Field encodings (serde):
 #   protocol              = "open_ai" | "anthropic" | "gemini"
 #   auth_method           = "bearer" | "api_key_header" | "google_api_key" | "none"
@@ -17,6 +23,9 @@
 
 [openai]
 display_name = "OpenAI"
+# Suggested model IDs, the vendor's default model first (see `default_model`
+# below — the first entry and the default must agree).
+models = ["gpt-5.4-mini", "gpt-5.5", "gpt-5.4", "gpt-5.4-nano", "gpt-4o"]
 [[openai.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.openai.com/v1"
@@ -30,6 +39,7 @@ default_stream_family = "OpenAi"
 
 [deepseek]
 display_name = "DeepSeek"
+models = ["deepseek-v4-flash", "deepseek-v4-pro"]
 [[deepseek.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.deepseek.com/v1"
@@ -43,6 +53,7 @@ default_stream_family = "OpenAi"
 
 [ollama]
 display_name = "Ollama"
+models = ["qwen3", "llama4", "deepseek-r1", "gemma3"]
 [[ollama.variants]]
 protocol = "open_ai"
 default_base_url = "http://localhost:11434/v1"
@@ -56,6 +67,7 @@ default_stream_family = "OpenAi"
 
 [qwen]
 display_name = "Qwen"
+models = ["qwen3.7-plus", "qwen3.8-max", "qwen3.7-flash"]
 [[qwen.variants]]
 protocol = "open_ai"
 default_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -70,6 +82,7 @@ default_stream_family = "OpenAi"
 # Kimi (Moonshot): supports both OpenAI and Anthropic protocols.
 [kimi]
 display_name = "Moonshot (Kimi)"
+models = ["kimi-k2.6", "kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.5"]
 [[kimi.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.moonshot.cn/v1"
@@ -93,6 +106,13 @@ default_stream_family = "Anthropic"
 
 [anthropic]
 display_name = "Anthropic"
+models = [
+    "claude-sonnet-5",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-20250514",
+]
 [[anthropic.variants]]
 protocol = "anthropic"
 default_base_url = "https://api.anthropic.com"
@@ -106,6 +126,7 @@ default_stream_family = "Anthropic"
 
 [azure]
 display_name = "Azure OpenAI"
+models = ["gpt-5.4", "gpt-5.4-mini", "gpt-4o"]
 [[azure.variants]]
 protocol = "open_ai"
 default_base_url = "https://YOUR_RESOURCE.openai.azure.com"
@@ -119,6 +140,7 @@ default_stream_family = "OpenAi"
 
 [gemini]
 display_name = "Gemini"
+models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"]
 [[gemini.variants]]
 protocol = "gemini"
 default_base_url = "https://generativelanguage.googleapis.com/v1beta"
@@ -132,6 +154,7 @@ default_stream_family = "GoogleThinking"
 
 [glm]
 display_name = "GLM (Zhipu)"
+models = ["glm-5.2", "glm-4.7", "glm-5-turbo"]
 [[glm.variants]]
 protocol = "open_ai"
 default_base_url = "https://open.bigmodel.cn/api/paas/v4"
@@ -145,6 +168,7 @@ default_stream_family = "OpenAi"
 
 [minimax]
 display_name = "MiniMax"
+models = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"]
 [[minimax.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.minimax.chat/v1"
@@ -160,6 +184,7 @@ default_stream_family = "Minimax"
 # Legacy config key "doubao" resolves here via PROVIDER_ALIASES.
 [volcengine]
 display_name = "Volcengine (火山引擎)"
+models = ["doubao-seed-2-1-pro-260628", "doubao-seed-2-1-turbo-260628", "doubao-seed-evolving"]
 [[volcengine.variants]]
 protocol = "open_ai"
 default_base_url = "https://ark.cn-beijing.volces.com/api/v3"
@@ -174,6 +199,7 @@ default_stream_family = "OpenAi"
 # Tencent Hunyuan (腾讯混元), OpenAI-compatible endpoint.
 [hunyuan]
 display_name = "Hunyuan (Tencent)"
+models = ["hunyuan-turbos-latest", "hunyuan-t1-latest", "hunyuan-standard", "hunyuan-lite"]
 [[hunyuan.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.hunyuan.cloud.tencent.com/v1"
@@ -188,6 +214,7 @@ default_stream_family = "OpenAi"
 # xAI Grok, OpenAI-compatible endpoint.
 [grok]
 display_name = "xAI (Grok)"
+models = ["grok-4.3", "grok-4.5", "grok-4.1-fast", "grok-code-fast-1"]
 [[grok.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.x.ai/v1"
@@ -202,6 +229,13 @@ default_stream_family = "OpenAi"
 # Mistral, OpenAI-compatible endpoint.
 [mistral]
 display_name = "Mistral"
+models = [
+    "mistral-large-latest",
+    "mistral-medium-latest",
+    "magistral-medium-latest",
+    "mistral-small-latest",
+    "codestral-latest",
+]
 [[mistral.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.mistral.ai/v1"
@@ -216,6 +250,7 @@ default_stream_family = "OpenAi"
 # Cohere, official OpenAI-compatible endpoint.
 [cohere]
 display_name = "Cohere"
+models = ["command-a-plus-05-2026", "command-a-03-2025", "command-r-plus-08-2024"]
 [[cohere.variants]]
 protocol = "open_ai"
 default_base_url = "https://api.cohere.ai/compatibility/v1"
