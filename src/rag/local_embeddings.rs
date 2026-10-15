@@ -243,7 +243,7 @@ impl LazyEmbeddingModel {
         text: String,
     ) -> crate::Result<Vec<f32>> {
         // Tokenize the input
-        let tokens = Self::tokenize(&inner, &text)?;
+        let tokens = Self::tokenize(&inner, &text);
 
         // Create a context for inference
         let mut ctx = inner
@@ -285,18 +285,18 @@ impl LazyEmbeddingModel {
         Ok(vec)
     }
 
-    fn tokenize(inner: &EmbeddingModelInner, text: &str) -> crate::Result<Vec<LlamaToken>> {
-        // Simple tokenization using the model's tokenizer
-        // Use add_bos=true for embeddings (helps with sentence representation)
-        use llama_cpp_2::model::AddBos;
-        let tokens = inner
-            .model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| {
-                crate::error::SyscityError::Validation(format!("Tokenization failed: {}", e))
-            })?;
-
-        Ok(tokens)
+    /// Tokenize for embedding.
+    ///
+    /// `add_special` adds BOS when the model is configured for it — what
+    /// `AddBos::Always` meant before the API moved onto the vocabulary — and
+    /// `parse_special` stays **on**, because that is what the old call passed
+    /// underneath; turning it off would silently change how text containing
+    /// something like `<|endoftext|>` is split.
+    ///
+    /// Infallible now: the vocabulary's `tokenize` returns the tokens rather
+    /// than a `Result`, so there is no failure left to report.
+    fn tokenize(inner: &EmbeddingModelInner, text: &str) -> Vec<LlamaToken> {
+        inner.model.vocab().tokenize(text.as_bytes(), true, true)
     }
 
     /// Get model name
