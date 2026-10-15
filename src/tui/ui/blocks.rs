@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::gateway_calls::HistoryMessage;
 use crate::tui::transcript::{LineKind, TranscriptLine};
-use crate::tui::ui::{wrap, Theme};
+use crate::tui::ui::{highlight, wrap, Theme};
 
 /// The style a transcript line kind renders with.
 pub fn kind_style(theme: &Theme, kind: LineKind) -> Style {
@@ -221,8 +221,35 @@ fn inline_spans(text: &str, plain: Style, code: Style) -> Vec<Span<'static>> {
 }
 
 /// Render a batch of transcript lines.
+///
+/// Code lines are the one kind that cannot be rendered alone: a fence is a
+/// property of the *run*, and the highlight pass needs the whole block (for
+/// multi-line strings and comments) plus the language tag off its opening
+/// fence. So this walks the batch, takes maximal runs of [`LineKind::Code`],
+/// and hands each run to [`highlight::highlight_code_lines`]; everything else
+/// goes through [`to_line`] as before.
+///
+/// A lone code line is still rendered by `to_line`'s catch-all when it is not
+/// part of a run — which cannot happen from the parser, but keeps the
+/// single-line path honest for any future caller.
 pub fn to_lines(entries: &[TranscriptLine], theme: &Theme) -> Vec<Line<'static>> {
-    entries.iter().map(|e| to_line(e, theme)).collect()
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(entries.len());
+    let mut i = 0;
+    while i < entries.len() {
+        if entries[i].kind == LineKind::Code {
+            let run = entries[i..]
+                .iter()
+                .take_while(|e| e.kind == LineKind::Code)
+                .count();
+            let texts: Vec<String> = entries[i..i + run].iter().map(|e| e.text.clone()).collect();
+            out.extend(highlight::highlight_code_lines(theme, &texts));
+            i += run;
+        } else {
+            out.push(to_line(&entries[i], theme));
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Argument rows the *live* preview may show.
@@ -806,12 +833,73 @@ mod tests {
         assert_eq!(code.style.bg, Some(theme.user_bg));
     }
 
+    /// A code line is never run through the *prose* tokenizer: a backtick pair
+    /// inside a fence is literal, not an inline-code span.
+    ///
+    /// This used to assert `to_line`'s single span, which was the whole
+    /// rendering story for code back then. Now that a fenced run is
+    /// highlighted as a block, the property has to be stated where the
+    /// rendering actually happens — the old assertion would have gone on
+    /// passing while asserting the behaviour it was meant to protect.
     #[test]
     fn fenced_blocks_are_not_re_tokenized() {
         let theme = Theme::dark();
+        let entries = vec![
+            TranscriptLine::new(LineKind::Code, "```".to_string()),
+            TranscriptLine::new(LineKind::Code, "let `x = 1;`".to_string()),
+            TranscriptLine::new(LineKind::Code, "```".to_string()),
+        ];
+        let out = to_lines(&entries, &theme);
+
+        assert_eq!(out.len(), entries.len(), "one row per input line");
+        let body: String = out[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(body, "let `x = 1;`", "the backticks stay literal");
+        // Nothing in the body carries the inline-code accent, which is what
+        // prose tokenizing would have produced.
+        assert!(
+            out[1]
+                .spans
+                .iter()
+                .all(|s| s.style.fg != Some(theme.accent) || s.content.contains("let")),
+            "no inline-code span inside a fence: {:?}",
+            out[1].spans
+        );
+    }
+
+    /// A lone code line — no fence around it — keeps the plain path, so a
+    /// caller that never had a block still gets one span.
+    #[test]
+    fn a_code_line_outside_a_block_stays_one_span() {
+        let theme = Theme::dark();
         let line =
             to_line(&TranscriptLine::new(LineKind::Code, "let `x = 1;`".to_string()), &theme);
-        assert_eq!(line.spans.len(), 1, "a code fence renders as one span");
+        assert_eq!(line.spans.len(), 1);
+    }
+
+    /// The batch path takes the whole run, so a block keeps its shape and its
+    /// non-code neighbours are untouched.
+    #[test]
+    fn a_fenced_block_is_highlighted_without_disturbing_its_neighbours() {
+        let theme = Theme::dark();
+        let entries = vec![
+            TranscriptLine::new(LineKind::Assistant, "here:".to_string()),
+            TranscriptLine::new(LineKind::Code, "```rust".to_string()),
+            TranscriptLine::new(LineKind::Code, "// note".to_string()),
+            TranscriptLine::new(LineKind::Code, "let x = 1;".to_string()),
+            TranscriptLine::new(LineKind::Code, "```".to_string()),
+            TranscriptLine::new(LineKind::Assistant, "done".to_string()),
+        ];
+        let out = to_lines(&entries, &theme);
+
+        assert_eq!(out.len(), entries.len());
+        let plain = |line: &Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert_eq!(plain(&out[0]), "here:");
+        assert_eq!(plain(&out[5]), "done");
+        assert_eq!(plain(&out[1]), "```rust");
+        assert!(out[3].spans.len() > 1, "the body is tokenized: {:?}", out[3].spans);
+        assert_eq!(out[2].spans[0].style.fg, Some(theme.dim), "the comment is dimmed");
     }
 
     #[test]

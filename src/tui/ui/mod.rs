@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::tui::osc11::ColorMode;
 
 pub mod blocks;
+pub mod highlight;
 pub mod live;
 pub mod wrap;
 
@@ -243,6 +244,63 @@ pub fn degrade(color: Color, mode: ColorMode) -> Color {
             Color::Rgb(r, g, b) => Color::Indexed(nearest_ansi16(r, g, b)),
             other => other,
         },
+    }
+}
+
+/// The RGB a colour stands for, for code that has to hand one to a library and
+/// get it back.
+///
+/// `None` for a colour with no fixed value (`Reset`, and any variant this
+/// palette never constructs): the caller decides the fallback, which for
+/// syntax highlighting is the text colour — never an RGB, so a 16-colour
+/// session cannot be handed a truecolor escape.
+pub(crate) fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Indexed(i) => Some(indexed_to_rgb(i)),
+        // The named variants are the ANSI-16 table by another name.
+        Color::Black => Some(ANSI_16[0]),
+        Color::Red => Some(ANSI_16[1]),
+        Color::Green => Some(ANSI_16[2]),
+        Color::Yellow => Some(ANSI_16[3]),
+        Color::Blue => Some(ANSI_16[4]),
+        Color::Magenta => Some(ANSI_16[5]),
+        Color::Cyan => Some(ANSI_16[6]),
+        Color::Gray => Some(ANSI_16[7]),
+        Color::DarkGray => Some(ANSI_16[8]),
+        Color::LightRed => Some(ANSI_16[9]),
+        Color::LightGreen => Some(ANSI_16[10]),
+        Color::LightYellow => Some(ANSI_16[11]),
+        Color::LightBlue => Some(ANSI_16[12]),
+        Color::LightMagenta => Some(ANSI_16[13]),
+        Color::LightCyan => Some(ANSI_16[14]),
+        Color::White => Some(ANSI_16[15]),
+        Color::Reset => None,
+    }
+}
+
+/// The xterm 256-colour palette, in the two halves `degrade` writes into.
+fn indexed_to_rgb(index: u8) -> (u8, u8, u8) {
+    match index {
+        0..=15 => ANSI_16[index as usize],
+        // 16..=231 is the 6×6×6 cube, in the order `degrade` packs it.
+        16..=231 => {
+            let n = index - 16;
+            let level = |v: u8| match v {
+                0 => 0,
+                1 => 95,
+                2 => 135,
+                3 => 175,
+                4 => 215,
+                _ => 255,
+            };
+            (level(n / 36), level((n % 36) / 6), level(n % 6))
+        }
+        // 232..=255 is a 24-step grey ramp.
+        _ => {
+            let v = 8 + 10 * (index - 232);
+            (v, v, v)
+        }
     }
 }
 
