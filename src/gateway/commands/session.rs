@@ -431,6 +431,14 @@ pub(super) async fn handle_session(
     }
 }
 
+/// `/export-session [format]` — write this session's conversation to a file.
+///
+/// The format argument is new: this used to write HTML and nothing else, from
+/// the transcript buffer rather than the session store, which meant it could not
+/// export a session this process had not touched. Both now go through
+/// [`crate::gateway::session_export`], so the formats on offer and the
+/// conversations that can be exported are the same over the command and over
+/// `sessions.export`.
 pub(super) async fn handle_export_session(
     req: &WsRequest,
     conn: &Arc<RwLock<ProtocolConnection>>,
@@ -438,31 +446,47 @@ pub(super) async fn handle_export_session(
     args: &str,
 ) -> WsResponse {
     let session_id = conn.read().await.subscriptions.first().cloned();
-    let _path_hint = args.trim();
 
-    if let Some(sid) = session_id {
-        match state
-            .infra
-            .transcript_store
-            .export(&sid, TranscriptFormat::Html)
-            .await
-        {
-            Ok(path) => {
-                let text =
-                    format!("📄 **Session `{}` exported**\n\nHTML: `{}`", sid, path.display());
-                return WsResponse::ok(&req.id, serde_json::json!({ "text": text }));
-            }
-            Err(e) => {
-                return WsResponse::err(
-                    &req.id,
-                    "EXPORT_FAILED",
-                    format!("Failed to export session: {}", e),
-                );
-            }
+    // No argument keeps the format this command always wrote, so an existing
+    // `/export-session` in someone's habit still produces what it produced.
+    let asked = match args.trim() {
+        "" => "html",
+        other => other,
+    };
+    let Some(format) = crate::gateway::session_export::parse_format(asked) else {
+        return WsResponse::err(
+            &req.id,
+            "INVALID_ARGS",
+            format!(
+                "Usage: /export-session [{}] — not '{asked}'",
+                crate::gateway::session_export::FORMATS
+            ),
+        );
+    };
+
+    let Some(sid) = session_id else {
+        return WsResponse::ok(
+            &req.id,
+            serde_json::json!({ "text": "📄 No active session to export." }),
+        );
+    };
+
+    match crate::gateway::session_export::export_session(state, &sid, format).await {
+        Ok(path) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "text": format!("📄 **Session `{sid}` exported**\n\n{format}: `{}`", path.display()),
+            }),
+        ),
+        Err(crate::gateway::session_export::ExportError::Empty) => WsResponse::err(
+            &req.id,
+            "NOT_FOUND",
+            format!("Session `{sid}` has no messages to export."),
+        ),
+        Err(crate::gateway::session_export::ExportError::Failed(e)) => {
+            WsResponse::err(&req.id, "EXPORT_FAILED", format!("Failed to export session: {e}"))
         }
     }
-
-    WsResponse::ok(&req.id, serde_json::json!({ "text": "📄 No active session to export." }))
 }
 
 #[cfg(test)]

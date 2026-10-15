@@ -329,6 +329,18 @@ fn parse_plan(value: &Value) -> Option<Plan> {
     })
 }
 
+/// Write a session's conversation to a file; returns where it landed.
+pub async fn sessions_export(ws: &WsClient, id: &str, format: &str) -> Result<String, TuiError> {
+    let value = ws
+        .request("sessions.export", Some(json!({ "session_id": id, "format": format })))
+        .await?;
+    Ok(value
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))

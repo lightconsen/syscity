@@ -33,7 +33,7 @@ The command system has two layers:
 | `/reset` | `[soft\|hard]` | Reset the current session. Terminates the session, recreates it, and deletes persisted history. | no | no |
 | `/stop` | — | Abort the current run by cancelling the active ACP session. | no | no |
 | `/compact` | `[instructions]` | Compact the session context via `Agent::compact_context()` and flush the transcript to disk as HTML. | no | no |
-| `/export-session` | `[path]` | Export the current session transcript as HTML via `TranscriptStore::export()`. | no | no |
+| `/export-session` | `[md\|html\|json\|text]` | Write this session's conversation to a file. Reads the session store, so a session untouched since the last start exports like any other; no argument keeps HTML, which is what this command always wrote. | no | no |
 | `/clear` | — | Clear chat history from the local message buffer (client-side only). | yes | no |
 | `/session` | `idle\|max-age <duration\|off>` | Read or set session timeout values (`session.idle`, `session.max-age`). | no | no |
 
@@ -214,6 +214,7 @@ terminal's scrollback — the TUI runs inline and has no popups.
 | `/title` | `<name>` | Alias of `/rename`. |
 | `/undo` | `[n]` | Walk the conversation back over its last turn, or `n` of them (`sessions.undo`). The agent drops them from its context and its turn log; the lines already on screen stay where they are. |
 | `/plan` | — | Print the plan the agent is working through (`sessions.plan`): the goal, each step marked done / current / pending, and the expected outcome of the current one. A conversation with no plan says so. |
+| `/save` | `[md\|html\|json\|text]` | Write this conversation to a file (`sessions.export`), and print where it landed; defaults to Markdown. |
 | `/pin` | — | Pin or unpin the current session. |
 | `/agents` | — | List agents. |
 | `/agent` | `<id>` | Start a session bound to an agent. |

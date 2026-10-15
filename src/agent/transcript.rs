@@ -489,13 +489,30 @@ impl TranscriptStore {
     }
 
     /// Export a transcript to a file.
+    ///
+    /// Only what this process still holds in memory; a session nobody has
+    /// touched since the last start is not here. Callers that want any session
+    /// build the transcript from the store and use [`Self::write`].
     pub async fn export(
         &self,
         session_id: &str,
         format: TranscriptFormat,
     ) -> Result<PathBuf, String> {
         let transcript = self.get(session_id).ok_or("Transcript not found")?;
-        let content = render_transcript(&transcript, format);
+        self.write(&transcript, format).await
+    }
+
+    /// Render a transcript and write it into the store's directory.
+    ///
+    /// The single writer: every export goes through here, so the filename
+    /// convention and the formats on offer are one thing rather than one per
+    /// caller.
+    pub async fn write(
+        &self,
+        transcript: &Transcript,
+        format: TranscriptFormat,
+    ) -> Result<PathBuf, String> {
+        let content = render_transcript(transcript, format);
 
         let filename = format!(
             "{}_{}.{}",
@@ -505,6 +522,12 @@ impl TranscriptStore {
         );
         let path = self.root_dir.join(&filename);
 
+        // The store's directory is created by whoever set it up in the running
+        // gateway, but writing is the one thing that cannot fail just because
+        // nobody has written before.
+        tokio::fs::create_dir_all(&self.root_dir)
+            .await
+            .map_err(|e| format!("Failed to create {}: {}", self.root_dir.display(), e))?;
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| format!("Failed to write transcript: {}", e))?;

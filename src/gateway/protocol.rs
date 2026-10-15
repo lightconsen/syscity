@@ -403,6 +403,9 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("sessions.undo", Some(SCOPE_WRITE)),
     // A read: it reports the plan, it does not change it.
     ("sessions.plan", Some(SCOPE_READ)),
+    // A read of the session that writes a file; the read scope is what it
+    // needs, since it exposes nothing the reader could not already fetch.
+    ("sessions.export", Some(SCOPE_READ)),
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),

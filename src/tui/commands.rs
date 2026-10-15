@@ -23,7 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
-    "expand", "undo", "plan", "theme", "mode",
+    "expand", "undo", "plan", "save", "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -91,6 +91,7 @@ async fn handle_local_command(
         "rename" | "title" => command_rename(args, state, ws).await,
         "undo" => command_undo(args, state, ws).await,
         "plan" => command_plan(state, ws).await,
+        "save" => command_save(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -239,6 +240,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("title", "<name>", "alias of /rename"),
         ("undo", "[n]", "walk back over the last turn, or several"),
         ("plan", "", "print the plan the agent is working through"),
+        ("save", "[md|html|json|text]", "write this conversation to a file"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -601,6 +603,73 @@ async fn command_plan(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(),
         ),
     ));
     s.transcript.push(lines);
+    Ok(())
+}
+
+/// `/save [format]` — write this conversation to a file.
+///
+/// The gateway writes it, from the session store, because that is the durable
+/// record: a conversation being talked to and one untouched since the last start
+/// export the same way. Which formats exist is the gateway's answer too — this
+/// only checks the spelling so a typo comes back as a sentence rather than as a
+/// file with the wrong extension.
+async fn command_save(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let format =
+        match args.trim() {
+            "" => "md",
+            other => match other.to_ascii_lowercase().as_str() {
+                "md" | "markdown" => "md",
+                "html" => "html",
+                "json" => "json",
+                "text" | "txt" => "text",
+                _ => {
+                    state.write().await.transcript.push_notice(format!(
+                        "⚠ /save writes md, html, json or text — not '{other}'"
+                    ));
+                    return Ok(());
+                }
+            },
+        };
+
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to save yet");
+        return Ok(());
+    };
+
+    match gw::sessions_export(ws, &id, format).await {
+        Ok(path) if !path.is_empty() => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("💾 saved as {format}: {path}"));
+        }
+        // The gateway refused with a reason worth showing verbatim: "this
+        // session has no messages" is the common one, and it is not a bug.
+        Ok(_) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice("⚠ the gateway reported no path for the export");
+        }
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /save: {e}"));
+        }
+    }
     Ok(())
 }
 
@@ -1852,5 +1921,61 @@ mod tests {
 
         let lines = output(&state).await;
         assert!(lines[0].contains("no active plan"), "got {lines:?}");
+    }
+
+    /// `/save md` asks the gateway to write the conversation and prints where.
+    #[tokio::test]
+    async fn save_names_the_format_and_reports_the_path() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.export",
+            serde_json::json!({ "path": "/tmp/transcripts/s1_20261015.md", "format": "md" }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_save("md", state.clone(), &client).await;
+
+        let requests = gateway.requests();
+        let export = requests
+            .iter()
+            .find(|r| r.method == "sessions.export")
+            .expect("the export on the wire");
+        assert_eq!(export.params["session_id"], "s1");
+        assert_eq!(export.params["format"], "md");
+        drop(requests);
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("/tmp/transcripts/s1_20261015.md"), "got {lines:?}");
+    }
+
+    /// No argument is the format people want, and a typo is refused before the
+    /// gateway is asked to write a file with the wrong extension.
+    #[tokio::test]
+    async fn save_defaults_to_markdown_and_refuses_a_format_it_does_not_know() {
+        let gateway = TestGateway::start().await;
+        gateway.reply("sessions.export", serde_json::json!({ "path": "/tmp/x.md" }));
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_save("", state.clone(), &client).await;
+        let asked = gateway
+            .requests()
+            .iter()
+            .find(|r| r.method == "sessions.export")
+            .map(|r| r.params["format"].clone());
+        assert_eq!(asked, Some(serde_json::json!("md")));
+
+        let _ = command_save("pdf", state.clone(), &client).await;
+        let lines = output(&state).await;
+        // The earlier notice is still in the transcript, so this asserts on
+        // the line the refused call added rather than on position.
+        assert!(lines.iter().any(|l| l.contains("md, html, json or text")), "got {lines:?}");
+        let exports = gateway
+            .requests()
+            .iter()
+            .filter(|r| r.method == "sessions.export")
+            .count();
+        assert_eq!(exports, 1, "a refused /save must not reach the wire");
     }
 }

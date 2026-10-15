@@ -259,6 +259,70 @@ pub(super) async fn session_id_for(
     }
 }
 
+/// `sessions.export` — write a session's conversation to a file
+/// (`{ session_id?, format? }`).
+///
+/// The conversation comes from the **session store**, not from the transcript
+/// buffer this process happens to hold: the store is the durable record, and a
+/// session untouched since the last start exports exactly like one being talked
+/// to right now. That is also what makes this the export path rather than a
+/// third one — the CLI's exporter and the `/export-session` command each had
+/// their own idea of which formats existed and where the messages came from.
+pub(super) async fn handle_sessions_export(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct ExportParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        #[serde(default)]
+        format: Option<String>,
+    }
+
+    let params: ExportParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+    let asked = params.format.as_deref().unwrap_or("md");
+    let Some(format) = crate::gateway::session_export::parse_format(asked) else {
+        return WsResponse::err(
+            &req.id,
+            "INVALID_PARAMS",
+            format!(
+                "unknown format '{asked}': expected {}",
+                crate::gateway::session_export::FORMATS
+            ),
+        );
+    };
+
+    match crate::gateway::session_export::export_session(state, &session_id, format).await {
+        Ok(path) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "session_id": session_id,
+                "format": format.to_string(),
+                "path": path.display().to_string(),
+                "file_name": path.file_name().map(|n| n.to_string_lossy().to_string()),
+            }),
+        ),
+        Err(crate::gateway::session_export::ExportError::Empty) => WsResponse::err(
+            &req.id,
+            "NOT_FOUND",
+            format!("session '{session_id}' has no messages to export"),
+        ),
+        Err(crate::gateway::session_export::ExportError::Failed(e)) => {
+            WsResponse::err(&req.id, "EXPORT_FAILED", e)
+        }
+    }
+}
+
 /// `sessions.undo` — walk a session back over its last turn, or several
 /// (`{ session_id?, count? }`).
 ///
@@ -1314,6 +1378,81 @@ mod tests {
         )
         .await;
 
+        assert!(!res.ok);
+        assert_eq!(res.error.expect("error").code, "NOT_FOUND");
+    }
+
+    /// Export reads the *stored* conversation, so a session nobody has touched
+    /// in this process exports like any other — which is the whole reason it
+    /// reads the store rather than the transcript buffer.
+    #[tokio::test]
+    async fn export_writes_the_stored_conversation_in_the_format_asked_for() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.agents.store.clone().expect("store");
+        for (role, content) in [("user", "what is 2+2?"), ("assistant", "4")] {
+            store
+                .append_message(&crate::agent::session_store::AppendMessageParams {
+                    session_id: "s1",
+                    role,
+                    content,
+                    ..Default::default()
+                })
+                .await
+                .expect("append");
+        }
+        let conn = make_test_conn(&["read"]);
+
+        for (asked, expected_ext) in [("md", "md"), ("json", "json"), ("text", "txt")] {
+            let res = handle_sessions_export(
+                &req(
+                    "r1",
+                    "sessions.export",
+                    serde_json::json!({ "session_id": "s1", "format": asked }),
+                ),
+                &conn,
+                &state,
+            )
+            .await;
+            assert!(res.ok, "{asked}: {:?}", res.error);
+            let payload = res.payload.expect("payload");
+            let path = payload["path"].as_str().expect("path").to_string();
+            assert!(path.ends_with(expected_ext), "{asked} wrote {path}");
+
+            let written = tokio::fs::read_to_string(&path)
+                .await
+                .expect("the file is there");
+            assert!(written.contains("2+2"), "{asked} lost the question");
+            assert!(written.contains('4'), "{asked} lost the answer");
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn export_refuses_an_unknown_format_and_an_empty_session() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["read"]);
+
+        let res = handle_sessions_export(
+            &req(
+                "r1",
+                "sessions.export",
+                serde_json::json!({ "session_id": "s1", "format": "pdf" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.expect("error").code, "INVALID_PARAMS");
+
+        // A session with nothing in it has nothing to write, and saying so
+        // beats producing an empty file.
+        let res = handle_sessions_export(
+            &req("r2", "sessions.export", serde_json::json!({ "session_id": "s1" })),
+            &conn,
+            &state,
+        )
+        .await;
         assert!(!res.ok);
         assert_eq!(res.error.expect("error").code, "NOT_FOUND");
     }

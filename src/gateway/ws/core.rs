@@ -925,6 +925,7 @@ async fn dispatch_method(
         "sessions.rename" => sessions::handle_sessions_rename(req, conn, state).await,
         "sessions.undo" => sessions::handle_sessions_undo(req, conn, state).await,
         "sessions.plan" => sessions::handle_sessions_plan(req, conn, state).await,
+        "sessions.export" => sessions::handle_sessions_export(req, conn, state).await,
         "sessions.set_pinned" => sessions::handle_sessions_set_pinned(req, conn, state).await,
         "sessions.set_model" => sessions::handle_sessions_set_model(req, conn, state).await,
         "sessions.set_mode" => sessions::handle_sessions_set_mode(req, conn, state).await,

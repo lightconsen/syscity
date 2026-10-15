@@ -38,6 +38,7 @@ pub use quality_gate::{
 };
 pub mod rate_limit;
 pub mod send_policy;
+pub mod session_export;
 pub mod state;
 pub use config::*;
 pub use state::*;
