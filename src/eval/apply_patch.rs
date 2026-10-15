@@ -68,7 +68,7 @@ pub async fn apply_optimizer_patch(
     // Persist while still holding the write lock so a concurrent writer cannot
     // overwrite our update before it is serialized (mirrors `config.set`).
     if let Some(config_path) = state.config_path.clone() {
-        if let Err(e) = persist_config_atomic(config, &config_path).await {
+        if let Err(e) = persist_config_atomic(config, &config_path, None).await {
             warn!("Optimizer applied {} but failed to persist config: {}", patch.path, e);
         }
     }

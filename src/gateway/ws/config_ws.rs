@@ -151,6 +151,10 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     };
 
     let mut config_guard = state.config.write().await;
+    // Taken before the match mutates anything: the persist below writes only
+    // what changed between this and the result, so the user's own comments and
+    // layout in the file survive a one-key change.
+    let before = config_guard.clone();
 
     // Authoritative CAS: under the write lock no other writer can slip between
     // this check and the mutation below.
@@ -469,7 +473,7 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // Keep the write lock held across persistence so concurrent writers cannot
     // overwrite our update before it is serialized.
     if let Some(config_path) = state.config_path.clone() {
-        if let Err(e) = persist_config_atomic(&config_guard, &config_path).await {
+        if let Err(e) = persist_config_atomic(&config_guard, &config_path, Some(&before)).await {
             return WsResponse::err(
                 &req.id,
                 "PERSIST_FAILED",

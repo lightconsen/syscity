@@ -371,7 +371,8 @@ impl Gateway {
         let migrated = init::agents::migrate_model_router_config(&mut config).await;
         if migrated {
             if let Some(config_path) = config_path.clone() {
-                if let Err(e) = handlers::config::persist_config_atomic(&config, &config_path).await
+                if let Err(e) =
+                    handlers::config::persist_config_atomic(&config, &config_path, None).await
                 {
                     warn!("Failed to persist migrated config: {}", e);
                 }

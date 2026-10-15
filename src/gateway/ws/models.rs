@@ -506,6 +506,7 @@ pub(super) async fn handle_models_add(req: &WsRequest, state: &Arc<GatewayState>
     }
 
     // Reflect the router's live state back into the persisted GatewayConfig.
+    let before = state.config.read().await.clone();
     sync_config_from_router(state).await;
 
     // Promote to default when none is configured yet, or the update removed
@@ -534,7 +535,7 @@ pub(super) async fn handle_models_add(req: &WsRequest, state: &Arc<GatewayState>
 
     if let Some(config_path) = state.config_path.clone() {
         let config_guard = state.config.read().await;
-        if let Err(e) = persist_config_atomic(&config_guard, &config_path).await {
+        if let Err(e) = persist_config_atomic(&config_guard, &config_path, Some(&before)).await {
             return WsResponse::err(
                 &req.id,
                 "PERSIST_FAILED",
@@ -593,11 +594,12 @@ pub(super) async fn handle_models_remove(req: &WsRequest, state: &Arc<GatewaySta
         return WsResponse::err(&req.id, "MODEL_NOT_FOUND", format!("{}", e));
     }
 
+    let before = state.config.read().await.clone();
     sync_config_from_router(state).await;
 
     if let Some(config_path) = state.config_path.clone() {
         let config_guard = state.config.read().await;
-        if let Err(e) = persist_config_atomic(&config_guard, &config_path).await {
+        if let Err(e) = persist_config_atomic(&config_guard, &config_path, Some(&before)).await {
             return WsResponse::err(
                 &req.id,
                 "PERSIST_FAILED",
@@ -630,11 +632,12 @@ pub(super) async fn handle_models_set_default(
         return WsResponse::err(&req.id, "MODEL_NOT_FOUND", format!("{}", e));
     }
 
+    let before = state.config.read().await.clone();
     sync_config_from_router(state).await;
 
     if let Some(config_path) = state.config_path.clone() {
         let config_guard = state.config.read().await;
-        if let Err(e) = persist_config_atomic(&config_guard, &config_path).await {
+        if let Err(e) = persist_config_atomic(&config_guard, &config_path, Some(&before)).await {
             return WsResponse::err(
                 &req.id,
                 "PERSIST_FAILED",

@@ -102,6 +102,9 @@ async fn remember_allow_rules(
     rules: &[String],
 ) -> crate::Result<Vec<String>> {
     let mut guard = state.config.write().await;
+    // The document before this write, so only the appended rules are written
+    // and the rest of the user's file — comments included — is untouched.
+    let before = Arc::make_mut(&mut guard).clone();
     let mut newly = Vec::new();
     {
         let config = Arc::make_mut(&mut guard);
@@ -118,9 +121,13 @@ async fn remember_allow_rules(
     }
     if let Some(config_path) = state.config_path.clone() {
         let config = Arc::make_mut(&mut guard);
-        crate::gateway::handlers::config::persist_config_atomic(config, &config_path)
-            .await
-            .map_err(|e| crate::SyscityError::Validation(format!("persist failed: {e}")))?;
+        crate::gateway::handlers::config::persist_config_atomic(
+            config,
+            &config_path,
+            Some(&before),
+        )
+        .await
+        .map_err(|e| crate::SyscityError::Validation(format!("persist failed: {e}")))?;
     }
     let updated = guard.permissions.clone();
     drop(guard);

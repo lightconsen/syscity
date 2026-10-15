@@ -143,13 +143,17 @@ pub(crate) async fn handle_agents_purge(req: &WsRequest, state: &Arc<GatewayStat
     {
         let mut config_guard = state.config.write().await;
         let config = Arc::make_mut(&mut config_guard);
+        let before = config.clone();
         let dropped_model = config.agent_models.remove(&id).is_some();
         let dropped_overrides = config.agent_overrides.remove(&id).is_some();
         if dropped_model || dropped_overrides {
             if let Some(config_path) = state.config_path.clone() {
-                if let Err(e) =
-                    crate::gateway::handlers::config::persist_config_atomic(config, &config_path)
-                        .await
+                if let Err(e) = crate::gateway::handlers::config::persist_config_atomic(
+                    config,
+                    &config_path,
+                    Some(&before),
+                )
+                .await
                 {
                     return WsResponse::err(
                         &req.id,
