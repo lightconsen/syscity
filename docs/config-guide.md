@@ -270,6 +270,26 @@ auth_mode = "jwt"           # jwt, none, tailscale, trusted_proxy
 # fence_network = false
 # fence_namespaces = "auto"  # auto, off, require
 
+# Opt-in policy hooks, both off by default — turning either on changes which
+# calls reach a human. `shell_safety` classifies every segment of a shell
+# command: a recognised-safe binary runs without prompting, a risky one asks,
+# a dangerous pattern (`rm -rf /`, fork bombs) is refused outright. Its safe
+# list is ~90 names, so `shell_safety_unknown_binary` decides what anything
+# else means — "ask" is what the hook always did, "allow" is for a toolchain
+# that lives in terraform/uv/just. `sandbox_interceptor` applies a
+# command/path blocklist and asks about arguments containing credential-shaped
+# words (`api_key`, `password`, `secret`, `token`); it is blunt — `rm` is
+# blocked as a bare name, so `rm -rf ./build` is refused — and has no config
+# surface for tuning yet. Both are gateway-wide and read once at startup.
+# shell_safety = false
+# shell_safety_unknown_binary = "ask"   # ask, allow
+# sandbox_interceptor = false
+
+# The browser tool runs the same SSRF policy `web_fetch` does: private and
+# loopback targets are refused, as is every scheme but http/https/about
+# (`file://` included). Set this to reach a dev server on localhost.
+# browser_allow_private = false
+
 [security.rate_limit]
 enabled = true
 capacity = 60               # max requests per window
