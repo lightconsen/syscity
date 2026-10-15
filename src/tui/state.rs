@@ -6,7 +6,7 @@
 //! local copy and the gateway disagree.
 // INVARIANTS-NONE: presentation-layer state; owns no persistent data.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use serde_json::Value;
@@ -343,6 +343,156 @@ fn completion_rank(name: &str, query: &str) -> Option<CompletionRank> {
     Some((class, first, gaps))
 }
 
+/// The `@path` token the cursor sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathToken {
+    /// Byte offset of the `@`, which is what a completion replaces from.
+    start: usize,
+    /// Byte offset of the cursor, where it replaces to.
+    end: usize,
+    /// Workspace-relative directory to list; empty means the workspace root.
+    dir: String,
+    /// The partial leaf name after the token's last `/`.
+    prefix: String,
+}
+
+/// One directory's listing, as `@` completion needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// What the composer is completing at the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// The `/command` being typed.
+    Command { query: String },
+    /// The `@path` token the cursor sits in. `start` is the byte offset of the
+    /// `@`, `dir` the workspace-relative directory to list (empty = root), and
+    /// `prefix` the partial leaf name after its last `/`.
+    Path {
+        start: usize,
+        dir: String,
+        prefix: String,
+    },
+}
+
+/// A completion candidate: a slash command, or an entry in the workspace.
+#[derive(Debug)]
+pub enum Completion<'a> {
+    Command(&'a CommandInfo),
+    Path(&'a PathEntry),
+}
+
+impl Completion<'_> {
+    /// What accepting this candidate inserts (minus the trigger).
+    pub fn name(&self) -> &str {
+        match self {
+            Completion::Command(c) => &c.name,
+            Completion::Path(p) => &p.name,
+        }
+    }
+
+    /// The right-hand description, for the kinds that have one.
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            Completion::Command(c) => Some(&c.description),
+            // Paths say what they are with a trailing slash instead.
+            Completion::Path(_) => None,
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Completion::Path(p) if p.is_dir)
+    }
+}
+
+/// A directory the gateway refused to list, cached so the composer stops
+/// asking on every keystroke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirState {
+    Loaded(Vec<PathEntry>),
+    Unavailable,
+}
+
+/// The `@` completion cache: one listing per directory the user has descended
+/// into, filled by the event loop and read synchronously by the composer.
+#[derive(Debug, Default)]
+pub struct PathCompletions {
+    dirs: HashMap<String, DirState>,
+    /// Directories with a request out, so keystrokes coalesce into one.
+    in_flight: HashSet<String>,
+    /// Recency, oldest first.
+    order: VecDeque<String>,
+    /// Bumped when the workspace may have changed; a reply carrying an older
+    /// generation is dropped rather than written.
+    generation: u64,
+}
+
+/// How many directory listings to keep. Small: the user walks a handful.
+const PATH_CACHE_MAX: usize = 32;
+
+impl PathCompletions {
+    /// The cached listing for a directory, if it has one.
+    pub fn entries_for(&self, dir: &str) -> Option<&[PathEntry]> {
+        match self.dirs.get(dir) {
+            Some(DirState::Loaded(entries)) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// Mark a fetch as wanted. `None` means it is already cached or already
+    /// in flight — either way the caller should not send another request.
+    pub fn begin_fetch(&mut self, dir: &str) -> Option<u64> {
+        if self.dirs.contains_key(dir) || self.in_flight.contains(dir) {
+            return None;
+        }
+        self.in_flight.insert(dir.to_string());
+        Some(self.generation)
+    }
+
+    /// Record a reply. A reply from an older generation is dropped: the
+    /// workspace it described is not the one on screen any more.
+    pub fn finish_fetch(&mut self, dir: &str, generation: u64, result: Option<Vec<PathEntry>>) {
+        if generation != self.generation {
+            return;
+        }
+        self.in_flight.remove(dir);
+        let state = match result {
+            Some(entries) => DirState::Loaded(entries),
+            // The gateway refused: remember that, so typing does not retry it.
+            None => DirState::Unavailable,
+        };
+        self.dirs.insert(dir.to_string(), state);
+        self.order.retain(|d| d != dir);
+        self.order.push_back(dir.to_string());
+        while self.order.len() > PATH_CACHE_MAX {
+            let Some(oldest) = self.order.front().cloned() else {
+                break;
+            };
+            self.order.pop_front();
+            self.dirs.remove(&oldest);
+        }
+    }
+
+    /// Drop the connection's request mark without caching anything, so a
+    /// reconnect and another keystroke will try again.
+    pub fn abandon_fetch(&mut self, dir: &str) {
+        self.in_flight.remove(dir);
+    }
+
+    /// The workspace may be a different one now. Everything cached described
+    /// the old one.
+    pub fn invalidate(&mut self) {
+        self.dirs.clear();
+        self.in_flight.clear();
+        self.order.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
 /// Central mutable application state.
 #[derive(Debug)]
 pub struct AppState {
@@ -404,6 +554,8 @@ pub struct AppState {
     pub command_list: Vec<CommandInfo>,
     /// Highlighted entry in the completion list.
     pub completion_index: usize,
+    /// Directory listings for `@` completion, filled by the event loop.
+    pub path_completions: PathCompletions,
     /// A response is streaming.
     pub is_running: bool,
     /// Messages submitted while a turn was running, oldest first. They go out
@@ -478,6 +630,7 @@ impl Default for AppState {
             config_revision: None,
             command_list: Vec::new(),
             completion_index: 0,
+            path_completions: PathCompletions::default(),
             is_running: false,
             queued: VecDeque::new(),
             last_assistant_text: None,
@@ -504,6 +657,7 @@ impl AppState {
     pub fn insert_char(&mut self, c: char) {
         self.input_buffer.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+        self.input_edited();
     }
 
     /// Insert a newline at the cursor.
@@ -531,6 +685,7 @@ impl AppState {
         }
         self.input_buffer.replace_range(prev..self.input_cursor, "");
         self.input_cursor = prev;
+        self.input_edited();
     }
 
     /// Move the cursor one character left.
@@ -543,6 +698,7 @@ impl AppState {
             prev -= 1;
         }
         self.input_cursor = prev;
+        self.input_edited();
     }
 
     /// Move the cursor one character right.
@@ -555,6 +711,7 @@ impl AppState {
             next += 1;
         }
         self.input_cursor = next.min(self.input_buffer.len());
+        self.input_edited();
     }
 
     /// Byte offset of the start of the line the cursor is on.
@@ -676,40 +833,183 @@ impl AppState {
         self.completion_index = 0;
     }
 
-    /// Candidates for completing the `/command` being typed.
+    /// The `@path` token the cursor sits in, if any.
     ///
-    /// Ranked by [`completion_rank`] rather than filtered by prefix, so a query
-    /// that is only half-remembered still finds its command. Ties keep the
-    /// catalog's order.
-    pub fn completions(&self) -> Vec<&CommandInfo> {
-        let trimmed = self.input_buffer.trim_start();
-        let Some(rest) = trimmed.strip_prefix('/') else {
-            return Vec::new();
+    /// A token opens at an `@` that is at the start of the input or preceded by
+    /// whitespace, and the *last* such `@` before the cursor wins; a
+    /// whitespace between it and the cursor means the token is finished, and
+    /// `foo@bar` is not one at all — an address, not a path.
+    fn path_token(&self) -> Option<PathToken> {
+        let cursor = self.input_cursor.min(self.input_buffer.len());
+        let bytes = self.input_buffer.as_bytes();
+        // Scanning bytes backwards is safe for an ASCII search: a UTF-8
+        // continuation byte is never `@` or a space.
+        let mut start = None;
+        let mut i = cursor;
+        while i > 0 {
+            i -= 1;
+            let byte = bytes[i];
+            if byte == b'@' {
+                let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                start = at_boundary.then_some(i);
+                break;
+            }
+            if byte.is_ascii_whitespace() {
+                break;
+            }
+        }
+        let start = start?;
+        let fragment = self.input_buffer.get(start + 1..cursor)?;
+        let (dir, prefix) = match fragment.rfind('/') {
+            Some(slash) => (fragment[..=slash].to_string(), fragment[slash + 1..].to_string()),
+            None => (String::new(), fragment.to_string()),
         };
+        Some(PathToken {
+            start,
+            end: cursor,
+            dir,
+            prefix,
+        })
+    }
+
+    /// What the composer is completing at the cursor.
+    ///
+    /// The two kinds cannot both apply: the command rule needs the whole input
+    /// to be one word beginning with `/`, and a path token needs an `@` at a
+    /// word boundary.
+    pub fn completion_kind(&self) -> Option<CompletionKind> {
+        if let Some(token) = self.path_token() {
+            return Some(CompletionKind::Path {
+                start: token.start,
+                dir: token.dir,
+                prefix: token.prefix,
+            });
+        }
+        let trimmed = self.input_buffer.trim_start();
+        let rest = trimmed.strip_prefix('/')?;
         // Only the first word is being completed.
         if rest.contains(char::is_whitespace) {
-            return Vec::new();
+            return None;
         }
-        let mut ranked: Vec<(CompletionRank, &CommandInfo)> = self
-            .command_list
-            .iter()
-            .filter_map(|c| completion_rank(&c.name, rest).map(|rank| (rank, c)))
-            .collect();
-        // Stable, and the catalog order survives as the tiebreak: with the
-        // whole list ranked equal by a bare `/`, sorting must not shuffle it.
-        ranked.sort_by_key(|(rank, _)| *rank);
-        ranked.into_iter().map(|(_, c)| c).collect()
+        Some(CompletionKind::Command { query: rest.to_string() })
+    }
+
+    /// Candidates for whatever is being completed at the cursor.
+    ///
+    /// Both kinds go through [`completion_rank`] rather than a prefix test, so
+    /// a query that is only half-remembered still finds its target. Ties keep
+    /// the source order — the command catalog's, or the gateway's
+    /// directories-first listing.
+    pub fn completions(&self) -> Vec<Completion<'_>> {
+        match self.completion_kind() {
+            Some(CompletionKind::Command { query }) => {
+                let mut ranked: Vec<(CompletionRank, &CommandInfo)> = self
+                    .command_list
+                    .iter()
+                    .filter_map(|c| completion_rank(&c.name, &query).map(|rank| (rank, c)))
+                    .collect();
+                // Stable, so equal ranks keep the catalog's order: with the
+                // whole list ranked equal by a bare `/`, sorting must not
+                // shuffle it.
+                ranked.sort_by_key(|(rank, _)| *rank);
+                ranked
+                    .into_iter()
+                    .map(|(_, c)| Completion::Command(c))
+                    .collect()
+            }
+            Some(CompletionKind::Path { dir, prefix, .. }) => {
+                // A directory whose listing has not arrived (or that the
+                // gateway refused) has no candidates rather than an error: the
+                // composer keeps working and the next keystroke may fill it.
+                let Some(entries) = self.path_completions.entries_for(&dir) else {
+                    return Vec::new();
+                };
+                let mut ranked: Vec<(CompletionRank, &PathEntry)> = entries
+                    .iter()
+                    .filter_map(|e| completion_rank(&e.name, &prefix).map(|rank| (rank, e)))
+                    .collect();
+                ranked.sort_by_key(|(rank, _)| *rank);
+                ranked
+                    .into_iter()
+                    .map(|(_, e)| Completion::Path(e))
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The token a completed path should replace, as a byte range.
+    pub fn completion_range(&self) -> Option<(usize, usize)> {
+        let token = self.path_token()?;
+        Some((token.start, token.end))
     }
 
     /// Apply the highlighted completion to the input buffer.
     pub fn apply_completion(&mut self) {
-        let candidates = self.completions();
-        if candidates.is_empty() {
+        // Decide while the candidate borrow is alive, act after it drops.
+        enum Apply {
+            /// Replace the whole input with a slash command.
+            Command(String),
+            /// Replace just the `@path` token.
+            Path {
+                start: usize,
+                end: usize,
+                text: String,
+            },
+        }
+        let Some(apply) = ({
+            let candidates = self.completions();
+            if candidates.is_empty() {
+                None
+            } else {
+                let idx = self.completion_index.min(candidates.len() - 1);
+                let candidate = &candidates[idx];
+                match (candidate, self.completion_range()) {
+                    (Completion::Command(c), _) => Some(Apply::Command(format!("/{} ", c.name))),
+                    (Completion::Path(p), Some((start, end))) => {
+                        // A directory keeps the token open — no trailing space,
+                        // and a slash, so Tab drills into it next.
+                        let text = if p.is_dir {
+                            format!("@{}/", p.path.trim_start_matches('/').trim_end_matches('/'))
+                        } else {
+                            format!("@{} ", p.path.trim_start_matches('/'))
+                        };
+                        Some(Apply::Path { start, end, text })
+                    }
+                    // A path candidate with no token cannot happen; refusing to
+                    // act beats inserting something arbitrary.
+                    (Completion::Path(_), None) => None,
+                }
+            }
+        }) else {
+            return;
+        };
+
+        match apply {
+            Apply::Command(text) => self.set_input(text),
+            Apply::Path { start, end, text } => self.replace_range(start, end, &text),
+        }
+        self.completion_index = 0;
+    }
+
+    /// Replace a byte range of the input and leave the cursor after it.
+    ///
+    /// `set_input` is wrong for a completion in the middle of a sentence: it
+    /// replaces everything and parks the cursor at the end.
+    pub fn replace_range(&mut self, start: usize, end: usize, text: &str) {
+        let start = start.min(self.input_buffer.len());
+        let end = end.min(self.input_buffer.len()).max(start);
+        if !self.input_buffer.is_char_boundary(start) || !self.input_buffer.is_char_boundary(end) {
             return;
         }
-        let idx = self.completion_index.min(candidates.len() - 1);
-        let completed = format!("/{} ", candidates[idx].name);
-        self.set_input(completed);
+        self.input_buffer.replace_range(start..end, text);
+        self.input_cursor = start + text.len();
+        self.input_edited();
+    }
+
+    /// The completion highlight follows the target, not the keystroke: any
+    /// edit can change which candidates there are.
+    fn input_edited(&mut self) {
         self.completion_index = 0;
     }
 
@@ -1026,7 +1326,10 @@ mod tests {
     }
 
     fn candidates(s: &AppState) -> Vec<String> {
-        s.completions().iter().map(|c| c.name.clone()).collect()
+        s.completions()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
     }
 
     /// The query does not have to be a prefix. `/rmem` finding `/remember` is
@@ -1077,6 +1380,179 @@ mod tests {
 
     /// A bare `/` still lists the whole catalog as listed — the ranking must
     /// not reshuffle a list nobody has narrowed yet.
+    // ── `@` path completion ──────────────────────────────────────────────
+
+    fn with_listing(dir: &str, names: &[(&str, bool)]) -> AppState {
+        let mut s = AppState::default();
+        let entries = names
+            .iter()
+            .map(|(name, is_dir)| PathEntry {
+                name: (*name).into(),
+                path: if *is_dir {
+                    format!("{dir}{name}")
+                } else {
+                    format!("{dir}{name}")
+                },
+                is_dir: *is_dir,
+            })
+            .collect();
+        let generation = s
+            .path_completions
+            .begin_fetch(dir)
+            .expect("not yet fetched");
+        s.path_completions
+            .finish_fetch(dir, generation, Some(entries));
+        s
+    }
+
+    #[test]
+    fn an_at_token_lists_the_directory_and_filters_by_the_leaf() {
+        let mut s = with_listing("", &[("src", true), ("main.rs", false), ("Cargo.toml", false)]);
+        typing(&mut s, "@");
+        let names: Vec<String> = s
+            .completions()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["src", "main.rs", "Cargo.toml"], "dirs first, then the rest");
+
+        typing(&mut s, "ma");
+        let names: Vec<String> = s
+            .completions()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["main.rs"], "filtered by the leaf");
+    }
+
+    #[test]
+    fn accepting_a_directory_opens_it_and_accepting_a_file_closes_the_token() {
+        let mut s = with_listing("", &[("src", true)]);
+        typing(&mut s, "@sr");
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "@src/", "a directory stays open for the next Tab");
+
+        // The listing for `src/` is now what completion reads.
+        let generation = s
+            .path_completions
+            .begin_fetch("src/")
+            .expect("not yet fetched");
+        s.path_completions.finish_fetch(
+            "src/",
+            generation,
+            Some(vec![PathEntry {
+                name: "main.rs".into(),
+                path: "src/main.rs".into(),
+                is_dir: false,
+            }]),
+        );
+        typing(&mut s, "ma");
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "@src/main.rs ", "a file closes the token");
+
+        let mut s = with_listing("", &[("src", true)]);
+        typing(&mut s, "@");
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "@src/");
+    }
+
+    #[test]
+    fn a_completed_path_leaves_the_rest_of_the_sentence_alone() {
+        let mut s = with_listing("", &[("main.rs", false)]);
+        typing(&mut s, "look at @ma");
+        s.apply_completion();
+        assert_eq!(s.input_buffer, "look at @main.rs ");
+        assert_eq!(s.input_cursor, "look at @main.rs ".len(), "the cursor lands after it");
+    }
+
+    /// An address is not a path: the token needs an `@` at a word boundary.
+    #[test]
+    fn an_at_sign_inside_a_word_does_not_open_a_token() {
+        let mut s = with_listing("", &[("main.rs", false)]);
+        typing(&mut s, "foo@ma");
+        assert!(s.completions().is_empty(), "no candidates for an address");
+    }
+
+    #[test]
+    fn the_last_at_token_before_the_cursor_wins() {
+        let mut s = with_listing("", &[("main.rs", false)]);
+        typing(&mut s, "@x @ma");
+        let names: Vec<String> = s
+            .completions()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["main.rs"]);
+    }
+
+    /// A token the cursor has left behind is finished, not completed.
+    #[test]
+    fn a_whitespace_after_the_token_ends_it() {
+        let mut s = with_listing("", &[("main.rs", false)]);
+        typing(&mut s, "@ma ");
+        assert!(s.completions().is_empty());
+    }
+
+    #[test]
+    fn a_directory_the_gateway_refused_offers_nothing_and_does_not_panic() {
+        let mut s = AppState::default();
+        let generation = s
+            .path_completions
+            .begin_fetch("secret")
+            .expect("not yet fetched");
+        s.path_completions.finish_fetch("secret", generation, None);
+        typing(&mut s, "@secret/");
+        assert!(s.completions().is_empty());
+        // And it is not asked for again.
+        assert!(s.path_completions.begin_fetch("secret").is_none(), "cached as unavailable");
+    }
+
+    #[test]
+    fn a_listing_that_has_not_arrived_yet_offers_nothing() {
+        let mut s = AppState::default();
+        typing(&mut s, "@src/");
+        assert!(s.completions().is_empty(), "no cache entry, no candidates, no error");
+    }
+
+    #[test]
+    fn a_reply_from_an_older_workspace_is_dropped() {
+        let mut s = AppState::default();
+        let stale = s.path_completions.begin_fetch("").expect("not yet fetched");
+        // The session switches while the request is out.
+        s.path_completions.invalidate();
+        s.path_completions.finish_fetch(
+            "",
+            stale,
+            Some(vec![PathEntry {
+                name: "gone.rs".into(),
+                path: "gone.rs".into(),
+                is_dir: false,
+            }]),
+        );
+        typing(&mut s, "@");
+        assert!(s.completions().is_empty(), "the old workspace's entries were dropped");
+    }
+
+    #[test]
+    fn the_completion_highlight_resets_when_the_target_changes() {
+        let mut s = with_listing("", &[("alpha", false), ("beta", false), ("gamma", false)]);
+        typing(&mut s, "@");
+        s.move_completion(true);
+        assert_eq!(s.completion_index, 1);
+        typing(&mut s, "b");
+        assert_eq!(s.completion_index, 0, "a narrower list starts from the top");
+    }
+
+    #[test]
+    fn an_at_token_does_not_disturb_slash_completion() {
+        let mut s = catalog(&["status", "stop"]);
+        typing(&mut s, "/st");
+        assert_eq!(s.completions().len(), 2, "the command rule still applies");
+        s.clear_input();
+        typing(&mut s, "@");
+        assert!(s.completions().is_empty(), "and a path token is not a command");
+    }
+
     #[test]
     fn a_bare_slash_lists_the_catalog_in_its_own_order() {
         let mut s = catalog(&["zeta", "alpha", "middle"]);

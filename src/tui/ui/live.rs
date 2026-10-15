@@ -501,9 +501,12 @@ fn completion_lines(
                 theme.dim_style()
             };
             Line::from(vec![
-                Span::styled(format!("  /{:<12}", cmd.name), name_style),
+                Span::styled(format!("  /{:<12}", cmd.name()), name_style),
                 Span::styled(
-                    truncate_to_width(&cmd.description, width.saturating_sub(16)),
+                    truncate_to_width(
+                        cmd.description().unwrap_or_default(),
+                        width.saturating_sub(16),
+                    ),
                     desc_style,
                 ),
             ])
