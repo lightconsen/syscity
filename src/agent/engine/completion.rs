@@ -358,6 +358,54 @@ impl Agent {
     /// request as over its real context window, `needs_pruning()` may still be
     /// false (our estimate is larger than the model's limit), so compaction
     /// must not be gated on it.
+    /// The one place that looks at both budget levers before a request goes out.
+    ///
+    /// Two mechanisms act on budget today and neither knows about the other:
+    /// context compaction (driven by `Context::needs_pruning`, an absolute
+    /// token budget) and the router's cost-aware steering (driven by its own
+    /// spend against its own limit). This decides what *this* loop should do,
+    /// and records what it saw — including the lever it deliberately leaves
+    /// alone.
+    ///
+    /// Compaction wins when both apply, and it is the only lever the agent
+    /// pulls: freeing context is local and immediate, and it makes the request
+    /// cheaper without changing which model answers. The model choice belongs
+    /// to the router, which already steers to its cheapest candidate once its
+    /// own budget is spent — a second place deciding it here would be the
+    /// opposite of unifying the two.
+    fn decide_session_budget(
+        &self,
+        context: &Context,
+        collector: &mut TurnMetricsCollector,
+    ) -> bool {
+        let tokens = context.token_count();
+        let max_tokens = context.max_context_tokens();
+        let pressured = context.needs_pruning();
+
+        let (spend_cents, limit_cents) = match self.cost_guard.as_ref() {
+            Some(guard) => (guard.daily_spend_cents(), guard.daily_limit_cents),
+            None => (0, 0),
+        };
+        // The routing lever's state, so one record explains both.
+        let routing = self.model_router.as_ref().map(|_| {
+            if limit_cents == 0 {
+                "router attached; no daily cost limit configured".to_string()
+            } else {
+                format!("router attached; spend {spend_cents}c of {limit_cents}c daily limit")
+            }
+        });
+
+        collector.record_budget_decision(crate::observe::record::BudgetDecisionRecord {
+            tokens,
+            max_tokens,
+            spend_cents,
+            limit_cents,
+            decision: if pressured { "compact" } else { "none" }.to_string(),
+            routing,
+        });
+        pressured
+    }
+
     pub(crate) async fn compact_context_forced(
         &self,
         context: &mut Context,
@@ -547,6 +595,14 @@ impl Agent {
         self.patch_request_for_reasoning(&mut request);
         if !tools.is_empty() {
             request.tools = Some(tools.clone());
+        }
+
+        // What should this session do before the request goes out? Compaction
+        // is the lever here; the model choice is the router's. Asked before the
+        // cost guard so a context that needs room gets it either way.
+        if self.decide_session_budget(context, collector) {
+            self.compact_context_forced(context, &cfg, Some(collector))
+                .await;
         }
 
         // Check live cost guard before calling provider

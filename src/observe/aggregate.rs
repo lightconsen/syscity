@@ -299,6 +299,7 @@ mod tests {
                 error: None,
             }],
             route_log: vec![],
+            budget_decisions: vec![],
             compressions: vec![],
             plan_snapshot: None,
             channel: None,

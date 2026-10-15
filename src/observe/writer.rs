@@ -147,6 +147,7 @@ mod tests {
             llm_rounds: vec![],
             tool_calls: vec![],
             route_log: vec![],
+            budget_decisions: vec![],
             compressions: vec![],
             plan_snapshot: None,
             channel: None,

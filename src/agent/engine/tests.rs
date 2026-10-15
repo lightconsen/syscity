@@ -1151,6 +1151,59 @@ fn metrics_collector(conversation: &str) -> crate::observe::collector::TurnMetri
     })
 }
 
+/// The progress loop now compacts *proactively*, like the non-progress path
+/// always did — before this it only compacted after a provider rejected the
+/// request for length — and the turn records what the budget point saw.
+#[tokio::test]
+async fn a_turn_over_its_token_budget_compacts_before_asking() {
+    let provider = Arc::new(MarkupThenOk { calls: AtomicUsize::new(0) });
+    let agent =
+        Agent::new(AgentConfig::default(), provider, Arc::new(crate::tools::ToolRegistry::new()));
+
+    // A budget small enough that the prompt alone is over it. (The context's
+    // estimate is a coarse `len / 4`, so this has to be smaller than the
+    // system prompt's own estimate, not merely small.)
+    let mut context = Context::new("conv-budget", "You are a helpful assistant", 1);
+    context.add_message(Message::user("hello"));
+    assert!(context.needs_pruning(), "the fixture must be over budget");
+
+    let mut collector = metrics_collector("conv-budget");
+    let cb: ProgressCallback = Arc::new(|_| Box::pin(async {}));
+    let _ = agent
+        .get_completion_with_progress(&mut context, &mut collector, cb, "user1")
+        .await;
+
+    let decisions = collector.budget_decisions();
+    let decision = decisions
+        .first()
+        .expect("the budget point records what it decided");
+    assert_eq!(decision.decision, "compact", "pressure means compaction");
+    assert!(decision.max_tokens <= decision.tokens, "and it was over the budget");
+}
+
+/// With room to spare the point still records — an absent record would be
+/// indistinguishable from a loop that never asked.
+#[tokio::test]
+async fn a_turn_with_room_records_a_no_op_decision() {
+    let provider = Arc::new(MarkupThenOk { calls: AtomicUsize::new(0) });
+    let agent =
+        Agent::new(AgentConfig::default(), provider, Arc::new(crate::tools::ToolRegistry::new()));
+    let mut context = Context::new("conv-room", "You are a helpful assistant", 100_000);
+    context.add_message(Message::user("hello"));
+    assert!(!context.needs_pruning());
+
+    let mut collector = metrics_collector("conv-room");
+    let cb: ProgressCallback = Arc::new(|_| Box::pin(async {}));
+    let _ = agent
+        .get_completion_with_progress(&mut context, &mut collector, cb, "user1")
+        .await;
+
+    let decisions = collector.budget_decisions();
+    let decision = decisions.first().expect("recorded either way");
+    assert_eq!(decision.decision, "none");
+    assert!(decision.tokens < decision.max_tokens, "and it was under budget");
+}
+
 /// `chat.abort` has to interrupt a reply, not just the next tool step.
 ///
 /// A long generation is *one* iteration, and the controller was only consulted

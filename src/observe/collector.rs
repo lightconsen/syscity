@@ -15,9 +15,10 @@ use crate::agent::turns::ToolCallRecord;
 use crate::providers::Usage;
 
 use super::record::{
-    json_value_or_string, ChannelObservation, CompressionObservation, ErrorSource, FullTraceEvent,
-    LlmRoundRecord, ObservedError, ObservedToolCall, ObservedUsage, PlanSnapshot, RouteRecord,
-    TurnEndState, TurnRecord, DEFAULT_MIN_RETENTION_RATIO, SCHEMA_VERSION,
+    json_value_or_string, BudgetDecisionRecord, ChannelObservation, CompressionObservation,
+    ErrorSource, FullTraceEvent, LlmRoundRecord, ObservedError, ObservedToolCall, ObservedUsage,
+    PlanSnapshot, RouteRecord, TurnEndState, TurnRecord, DEFAULT_MIN_RETENTION_RATIO,
+    SCHEMA_VERSION,
 };
 use super::writer::TurnMetricsWriter;
 use super::TurnMetricsSink;
@@ -62,6 +63,8 @@ pub struct TurnMetricsCollector {
     route_log: Vec<RouteRecord>,
     /// Context-compression events recorded this turn (see [`CompressionObservation`]).
     compressions: Vec<CompressionObservation>,
+    /// Session-budget decisions recorded this turn (see [`BudgetDecisionRecord`]).
+    budget_decisions: Vec<BudgetDecisionRecord>,
     /// Planner DAG snapshot recorded this turn, if any (see [`PlanSnapshot`]).
     plan_snapshot: Option<PlanSnapshot>,
     /// Inbound channel-layer observation, if any (see [`ChannelObservation`]).
@@ -137,6 +140,7 @@ impl TurnMetricsCollector {
             tools: Vec::new(),
             route_log: Vec::new(),
             compressions: Vec::new(),
+            budget_decisions: Vec::new(),
             plan_snapshot: None,
             channel: None,
             min_retention_ratio: DEFAULT_MIN_RETENTION_RATIO,
@@ -208,6 +212,16 @@ impl TurnMetricsCollector {
             strategy,
             self.min_retention_ratio,
         ));
+    }
+
+    /// Record a session-budget decision.
+    pub fn record_budget_decision(&mut self, rec: BudgetDecisionRecord) {
+        self.budget_decisions.push(rec);
+    }
+
+    /// The session-budget decisions taken this turn, in order.
+    pub fn budget_decisions(&self) -> &[BudgetDecisionRecord] {
+        &self.budget_decisions
     }
 
     /// Compression-quality risk signals for this turn (§三).
@@ -481,6 +495,7 @@ impl TurnMetricsCollector {
             tool_calls: self.tools.clone(),
             route_log: self.route_log.clone(),
             compressions: self.compressions.clone(),
+            budget_decisions: self.budget_decisions.clone(),
             plan_snapshot: self.plan_snapshot.clone(),
             channel: self.channel.clone(),
         }

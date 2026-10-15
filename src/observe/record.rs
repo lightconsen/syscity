@@ -260,6 +260,32 @@ pub struct ChannelObservation {
 }
 
 /// A complete per-turn observability record.
+/// One decision from the session-budget point, recorded where a reader can
+/// see *both* levers at once.
+///
+/// Compaction and cost-aware routing each log their own outcome
+/// ([`CompressionObservation`], [`RouteRecord`]) and neither knows about the
+/// other. This is the place that looked at both and said what it did — and
+/// what it did *not* have to do, because the cost lever belongs to the router.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetDecisionRecord {
+    /// Context tokens before the decision.
+    pub tokens: usize,
+    /// The context's token budget — what `tokens` was compared against.
+    pub max_tokens: usize,
+    /// The cost guard's spend so far, in cents (0 when no guard is configured).
+    pub spend_cents: u64,
+    /// The cost guard's daily limit, in cents (0 = unlimited).
+    pub limit_cents: u64,
+    /// What was decided: `"compact"`, or `"none"` when the context had room.
+    pub decision: String,
+    /// The routing lever's state, so the record is self-contained: whether the
+    /// router's cost-aware steering is on, and its own spend against its own
+    /// limit. `None` when no router is attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub schema_version: u32,
@@ -294,6 +320,10 @@ pub struct TurnRecord {
     /// Context-compression events during this turn (see [`CompressionObservation`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compressions: Vec<CompressionObservation>,
+    /// Session-budget decisions taken during this turn (see
+    /// [`BudgetDecisionRecord`]) — the one place that saw both levers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_decisions: Vec<BudgetDecisionRecord>,
     /// Planner DAG snapshot, when this turn produced a plan (see [`PlanSnapshot`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_snapshot: Option<PlanSnapshot>,
@@ -396,6 +426,14 @@ mod tests {
                 chosen: "anthropic/claude".into(),
                 reason: Some("fallback after 1 failed".into()),
                 fallback_occurred: true,
+            }],
+            budget_decisions: vec![BudgetDecisionRecord {
+                tokens: 1000,
+                max_tokens: 800,
+                spend_cents: 120,
+                limit_cents: 500,
+                decision: "compact".into(),
+                routing: Some("router attached".into()),
             }],
             compressions: vec![CompressionObservation {
                 triggered_at_ms: 5,
