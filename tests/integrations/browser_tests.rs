@@ -134,6 +134,46 @@ async fn test_browser_navigate_blocks_private_ip() {
         .is_ok());
 }
 
+/// The guard has to be wired into the tool, not merely available: this asks
+/// the real `BrowserTool` to navigate somewhere it must refuse, and checks
+/// that the refusal reaches the caller as a tool error naming the guard.
+#[tokio::test]
+#[serial]
+async fn test_browser_navigate_refuses_a_private_target() {
+    skip_if_incompatible();
+    if !chrome_compatible() {
+        return;
+    }
+
+    let tool = BrowserTool::new();
+    let ctx = ToolContext::default();
+    let args = json!({
+        "actions": [ { "navigate": { "url": "http://127.0.0.1:1/" } } ]
+    });
+
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(!result.success, "a loopback target must not load: {result:?}");
+    let error = result.error.unwrap_or_default();
+    assert!(error.contains("SSRF guard"), "the refusal must say why: {error}");
+
+    // And the inline-document shape the rest of this file depends on still
+    // works, so the exemption did not become a blanket pass.
+    let tool = BrowserTool::new();
+    let args = json!({
+        "actions": [ { "navigate": { "url": "data:text/html,<h1>still fine</h1>" } } ]
+    });
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "data: fixtures must keep loading: {result:?}");
+
+    // The opt-out is what a deployment driving a dev server sets.
+    let tool = BrowserTool::new().with_navigation_policy(NavigationPolicy::permissive());
+    let args = json!({
+        "actions": [ { "navigate": { "url": "data:text/html,<h1>permissive</h1>" } } ]
+    });
+    let result = tool.execute(args, &ctx).await.unwrap();
+    assert!(result.success, "a permissive policy still loads ordinary pages: {result:?}");
+}
+
 #[test]
 fn test_browser_profile_serde_roundtrip() {
     let profile = BrowserProfile::new("test")
