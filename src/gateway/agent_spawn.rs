@@ -957,6 +957,9 @@ pub(crate) struct ToolRegistryArgs {
     /// Let the browser tool reach private and loopback addresses
     /// (`[security] browser_allow_private`).
     pub browser_allow_private: bool,
+    /// A second model that reviews calls reaching human approval
+    /// (`[security] guardian`); `None` when the deployment has not opted in.
+    pub guardian: Option<Arc<crate::tools::guardian::Guardian>>,
     /// Shared permission runtime seeded from `[permissions]` config.
     pub permissions: Arc<crate::tools::PermissionsRuntime>,
     /// Layout root shared with the gateway.
@@ -990,6 +993,7 @@ pub(crate) async fn create_default_tool_registry(
         paths,
         permissions,
         browser_allow_private,
+        guardian,
     } = args;
 
     let mut registry = ToolRegistry::new()
@@ -999,6 +1003,9 @@ pub(crate) async fn create_default_tool_registry(
         .with_audit_log(audit_log)
         .with_hooks(tool_hooks)
         .with_permissions(permissions);
+    if let Some(guardian) = guardian {
+        registry = registry.with_guardian(guardian);
+    }
     if let Some(filter) = content_filter {
         registry = registry.with_content_filter(filter);
     }

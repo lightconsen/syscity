@@ -62,6 +62,7 @@ pub mod delegate_tool;
 pub mod file;
 pub mod gateway;
 pub mod grep;
+pub mod guardian;
 pub mod heartbeat_tool;
 pub mod hooks;
 pub mod image;

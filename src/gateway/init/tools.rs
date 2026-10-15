@@ -251,6 +251,43 @@ pub struct ToolSystemDeps {
     pub paths: Arc<crate::dirs::SyscityPaths>,
 }
 
+/// Build the guardian reviewer, if this deployment asked for one.
+///
+/// The provider comes from the router, which is the same one the agent uses —
+/// so the guardian inherits the operator's provider configuration, keys and
+/// fallbacks instead of needing its own. A provider that cannot be built is
+/// logged and the guardian simply is not installed: a deployment that asked
+/// for review still runs its tools, it just runs them without it, and the
+/// gate's own approval step is untouched either way.
+async fn build_guardian(
+    config: &GatewayConfig,
+    router: &Arc<ModelRouter>,
+) -> Option<Arc<crate::tools::guardian::Guardian>> {
+    if !config.security.guardian {
+        return None;
+    }
+    match router.create_default_provider().await {
+        Ok(provider) => {
+            info!(
+                model = config
+                    .security
+                    .guardian_model
+                    .as_deref()
+                    .unwrap_or("(provider default)"),
+                "guardian review enabled for calls reaching human approval"
+            );
+            Some(Arc::new(crate::tools::guardian::Guardian::new(
+                provider,
+                config.security.guardian_model.clone(),
+            )))
+        }
+        Err(e) => {
+            warn!(error = %e, "guardian enabled but no provider could be built; reviews are off");
+            None
+        }
+    }
+}
+
 /// Layer the built-in security policy hooks onto the ones the shell-hook
 /// bridge produced.
 ///
@@ -342,6 +379,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 paths: paths.clone(),
                 permissions,
                 browser_allow_private: config.security.browser_allow_private,
+                guardian: build_guardian(config, &model_router).await,
             },
         )
         .await?,

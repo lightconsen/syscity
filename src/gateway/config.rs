@@ -1358,6 +1358,25 @@ pub struct SecurityConfig {
     /// There is no config surface for tuning it yet.
     #[serde(default)]
     pub sandbox_interceptor: bool,
+
+    /// Let a second model review every call that reaches human approval
+    /// (`[security] guardian`).
+    ///
+    /// Off by default: it costs one model call per approval-worthy tool call.
+    /// On, the reviewer may **refuse** a call — which denies it without asking
+    /// anyone — and may add its reason to the approval a human sees. It can
+    /// never approve a call in the human's place: the gate's rule is that a
+    /// call needing approval is denied when nobody is there to grant it, and a
+    /// model that could grant it would be a wider hole than this closes.
+    #[serde(default)]
+    pub guardian: bool,
+
+    /// The model the guardian reviews with. `None` uses the default provider's
+    /// own default, which is what an operator who configured no review model
+    /// would expect. A cheap, fast model is the right choice: this sits inside
+    /// a tool call that is already waiting for a person.
+    #[serde(default)]
+    pub guardian_model: Option<String>,
     /// Whether the Linux runner builds a namespace view (read-only root,
     /// private `/tmp`, working trees re-bound on top) around fenced command
     /// tools, in addition to the Landlock write rules.
@@ -1519,6 +1538,8 @@ impl Default for SecurityConfig {
             shell_safety: false,
             shell_safety_unknown_binary: crate::tools::shell_safety::UnknownBinaryPosture::Ask,
             sandbox_interceptor: false,
+            guardian: false,
+            guardian_model: None,
         }
     }
 }
@@ -2166,6 +2187,22 @@ shared_token = "abc"
     /// The two opt-in policy hooks default to off — an upgrade must not start
     /// refusing commands — and the shell-safety posture defaults to `ask`,
     /// which is what the hook did before it was configurable.
+    /// The guardian is off unless asked for, and its model defaults to the
+    /// provider's own — an operator who configured no review model gets one
+    /// rather than a broken feature.
+    #[test]
+    fn the_guardian_defaults_to_off_with_no_model() {
+        let default = SecurityConfig::default();
+        assert!(!default.guardian, "reviewing costs a model call; it is opt-in");
+        assert!(default.guardian_model.is_none());
+
+        let parsed: GatewayConfig =
+            toml::from_str("[security]\nguardian = true\nguardian_model = \"cheap\"\n")
+                .expect("parses");
+        assert!(parsed.security.guardian);
+        assert_eq!(parsed.security.guardian_model.as_deref(), Some("cheap"));
+    }
+
     #[test]
     fn the_policy_hooks_default_to_off_and_the_posture_to_ask() {
         let default = SecurityConfig::default();

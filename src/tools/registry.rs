@@ -69,6 +69,10 @@ pub struct ToolRegistry {
     /// tool execution and before the toolset is advertised. Shared with the
     /// gateway, which seeds it from config and applies session overrides.
     permissions: Arc<PermissionsRuntime>,
+    /// The second-model reviewer for calls that reach human approval
+    /// (`[security] guardian`). `None` means nobody is reviewing, which is
+    /// the default.
+    guardian: Option<Arc<super::guardian::Guardian>>,
     /// Content filter for scanning tool outputs for PII and secrets.
     content_filter: Option<Arc<crate::security::content_filter::ContentFilter>>,
     /// Audit logger for recording tool invocations and security events.
@@ -123,6 +127,7 @@ impl Default for ToolRegistry {
             skills_write_approval: false,
             ask_queue: None,
             permissions: Arc::new(PermissionsRuntime::default()),
+            guardian: None,
             content_filter: None,
             audit_log: None,
             web_search_providers: None,
@@ -175,6 +180,7 @@ impl ToolRegistry {
             skills_write_approval: false,
             ask_queue: None,
             permissions: Arc::new(PermissionsRuntime::default()),
+            guardian: None,
             content_filter: None,
             audit_log: None,
             web_search_providers: None,
@@ -201,6 +207,7 @@ impl ToolRegistry {
             skills_write_approval: false,
             ask_queue: None,
             permissions: Arc::new(PermissionsRuntime::default()),
+            guardian: None,
             content_filter: None,
             audit_log: None,
             web_search_providers: None,
@@ -627,6 +634,16 @@ impl ToolRegistry {
     /// `config.set` / hot reload.
     pub fn with_permissions(mut self, permissions: Arc<PermissionsRuntime>) -> Self {
         self.permissions = permissions;
+        self
+    }
+
+    /// Install a second-model reviewer for calls that reach human approval.
+    ///
+    /// It can only make the outcome stricter: a rejection denies the call, and
+    /// anything else leaves the approval exactly as it was. See
+    /// [`super::guardian`].
+    pub fn with_guardian(mut self, guardian: Arc<super::guardian::Guardian>) -> Self {
+        self.guardian = Some(guardian);
         self
     }
 
@@ -1059,8 +1076,73 @@ impl ToolRegistry {
             }
         };
 
+        // The guardian, where a deployment opted in: a second model looks at
+        // whatever reached human approval. It may stop the call or add its
+        // reason to the prompt — never wave it through in the human's place.
+        let decision = self.guardian_review(name, args, ctx, decision).await;
+
         self.audit_policy_decision(name, ctx, &decision).await;
         decision
+    }
+
+    /// A second model's opinion on a call that is about to ask a human.
+    ///
+    /// Deny-only: a rejection replaces the approval outright, a passing review
+    /// only annotates it, and no reviewer (or no opinion) leaves it alone.
+    /// Anything else would let a model stand in for the person the gate is
+    /// waiting for.
+    async fn guardian_review(
+        &self,
+        name: &str,
+        args: &Value,
+        ctx: &ToolContext,
+        decision: ToolPolicyDecision,
+    ) -> ToolPolicyDecision {
+        let Some(guardian) = self.guardian.as_ref() else {
+            return decision;
+        };
+        // Only calls a human was going to see anyway: anything already allowed
+        // has no queue to annotate and nothing to veto.
+        if !matches!(decision, ToolPolicyDecision::NeedsApproval { .. }) {
+            return decision;
+        }
+
+        match guardian.review(name, args, ctx).await {
+            Some(verdict) if !verdict.allow => ToolPolicyDecision::Deny {
+                reason: format!(
+                    "Tool '{name}' was refused by the guardian ({}): {}",
+                    guardian.label(),
+                    verdict.reason
+                ),
+            },
+            Some(verdict) => {
+                // Passing review: the human still decides, now with a second
+                // opinion in front of them.
+                match decision {
+                    ToolPolicyDecision::NeedsApproval {
+                        approval_id,
+                        tool_name,
+                        args,
+                        risk_level,
+                        requested_by,
+                        message,
+                    } => ToolPolicyDecision::NeedsApproval {
+                        approval_id,
+                        tool_name,
+                        args,
+                        risk_level,
+                        requested_by,
+                        message: format!(
+                            "{message} [guardian {}: {}]",
+                            guardian.label(),
+                            verdict.reason
+                        ),
+                    },
+                    other => other,
+                }
+            }
+            None => decision,
+        }
     }
 
     /// Audit a non-allow policy decision as a `ToolDeny` event so a denied or
@@ -2354,6 +2436,145 @@ mod tests {
             .expect_err("should be denied");
         assert!(err.to_string().contains("blocked-by-policy"), "err: {}", err);
         assert!(!ran.load(Ordering::SeqCst), "tool body must not run when denied");
+    }
+
+    /// A guardian that rejects a call denies it outright — nobody is asked,
+    /// and the body never runs.
+    #[tokio::test]
+    async fn a_guardian_rejection_denies_without_asking_a_human() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let guardian = Arc::new(crate::tools::guardian::Guardian::new(
+            Arc::new(crate::providers::mock::MockProvider::new().with_responses(vec![
+                crate::providers::Message::assistant(
+                    r#"{"allow": false, "reason": "writes outside the workspace"}"#,
+                ),
+            ])),
+            None,
+        ));
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_guardian(guardian);
+        registry.register(approval_spy("spy", ran.clone()));
+
+        let ctx = askable_context();
+        let err = registry
+            .execute_call(&call("spy"), &ctx)
+            .await
+            .expect_err("a refused call does not reach the human");
+        assert!(err.to_string().contains("refused by the guardian"), "err: {err}");
+        assert!(err.to_string().contains("writes outside the workspace"), "the reason travels");
+        assert!(!ran.load(Ordering::SeqCst), "the tool body must not run");
+        assert!(
+            pending_message(&approval_queue).await.is_none(),
+            "nobody was asked — the queue stayed empty"
+        );
+    }
+
+    /// A passing review does not let the call through: the human still
+    /// decides, now with the reviewer's reason in front of them.
+    #[tokio::test]
+    async fn a_passing_review_annotates_the_approval_rather_than_granting_it() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        // One canned reply, not two: `execute_call` evaluates the policy twice
+        // for a single call, and the guardian's memo is what keeps that from
+        // being two model calls — so a second reply would never be asked for.
+        let provider = Arc::new(crate::providers::mock::MockProvider::new().with_responses(vec![
+            crate::providers::Message::assistant(
+                r#"{"allow": true, "reason": "an ordinary read"}"#,
+            ),
+        ]));
+        let guardian = Arc::new(crate::tools::guardian::Guardian::new(provider, None));
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_guardian(guardian);
+        registry.register(approval_spy("spy", ran.clone()));
+
+        let ctx = askable_context();
+        // The call suspends on the queue. Answer it from the outside so the
+        // test ends; the assertion is about what the human was shown.
+        let decider = tokio::spawn({
+            let queue = Arc::clone(&approval_queue);
+            async move {
+                for _ in 0..200 {
+                    if let Some(message) = pending_message(&queue).await {
+                        assert!(
+                            message.contains("guardian"),
+                            "the review travels into the prompt: {message}"
+                        );
+                        assert!(
+                            message.contains("an ordinary read"),
+                            "with the reviewer's reason: {message}"
+                        );
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                false
+            }
+        });
+
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), registry.execute_call(&call("spy"), &ctx))
+                .await;
+        let saw_it = decider.await.expect("decider task");
+        assert!(saw_it, "the approval reached the queue with the review attached");
+    }
+
+    /// No opinion — an unreachable provider — leaves the approval exactly as
+    /// it would have been. The reviewer failing must not fail the call.
+    #[tokio::test]
+    async fn a_guardian_that_cannot_answer_leaves_the_approval_alone() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let approval_queue = Arc::new(ApprovalQueue::new());
+        let provider =
+            Arc::new(crate::providers::mock::MockProvider::new().with_error_callback(|_| {
+                Some(crate::error::SyscityError::Internal("reviewer is down".into()))
+            }));
+        let guardian = Arc::new(crate::tools::guardian::Guardian::new(provider, None));
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(approval_queue.clone())
+            .with_guardian(guardian);
+        registry.register(approval_spy("spy", ran.clone()));
+
+        let ctx = askable_context();
+        let queued = tokio::spawn({
+            let queue = Arc::clone(&approval_queue);
+            async move {
+                for _ in 0..200 {
+                    if let Some(message) = pending_message(&queue).await {
+                        return message;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                String::new()
+            }
+        });
+
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), registry.execute_call(&call("spy"), &ctx))
+                .await;
+        let message = queued.await.expect("queue watcher");
+        assert!(!message.is_empty(), "the approval was still queued");
+        assert!(!message.contains("guardian"), "and carries no opinion: {message}");
+    }
+
+    /// A context where a human is present to answer, so `requires_approval`
+    /// routes to the queue rather than failing closed. (`system` as the user
+    /// would mark it a cron/heartbeat context with nobody to ask.)
+    fn askable_context() -> ToolContext {
+        ToolContext::new("user1", "conv-guardian")
+            .with_ask_queue(Arc::new(crate::tools::ask_user::AskQueue::new()))
+    }
+
+    /// The approval waiting on a queue, if one is.
+    async fn pending_message(queue: &ApprovalQueue) -> Option<String> {
+        queue
+            .list_pending(Default::default())
+            .await
+            .first()
+            .map(|summary| summary.message.clone())
     }
 
     /// A `requires_approval` tool with no policy hooks and nobody to ask
