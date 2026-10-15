@@ -1374,6 +1374,30 @@ mod tests {
         }
     }
 
+    /// Every method the scope table names must actually dispatch.
+    ///
+    /// The two tables are held together by a text parse of this file
+    /// (`method_table_matches_the_dispatcher`), which proves the *names*
+    /// agree — but it reads source, so an arm written in a shape the parser
+    /// does not recognise would be skipped and the table could go on
+    /// describing a method nobody handles. This asks the dispatcher instead:
+    /// for each entry, one probe, and the only outcome that fails is
+    /// `METHOD_NOT_FOUND` (the handler may refuse for its own reasons — no
+    /// session, bad params — and that is not this test's business).
+    #[tokio::test]
+    async fn every_method_in_the_scope_table_dispatches() {
+        let conn = make_test_conn(&[crate::gateway::protocol::SCOPE_ADMIN]);
+
+        for (method, _scope) in crate::gateway::protocol::METHOD_SCOPES {
+            let resp = dispatch(&conn, &req("r1", method, Some(serde_json::json!({})))).await;
+            assert_ne!(
+                resp.error.as_ref().map(|e| e.code.as_str()),
+                Some("METHOD_NOT_FOUND"),
+                "'{method}' is in METHOD_SCOPES but the dispatcher does not handle it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_commands_execute_without_scope_forbidden() {
         // A scope-refused `commands.execute` is answered and nothing else
