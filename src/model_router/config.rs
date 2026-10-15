@@ -35,8 +35,23 @@ use crate::secrets::{SecretStoreHandle, StoreRef};
 pub struct OAuthConfig {
     /// OAuth2 client ID
     pub client_id: String,
-    /// Authorization endpoint URL
-    pub auth_url: String,
+    /// Authorization endpoint URL (the browser flow's `/authorize`).
+    ///
+    /// Unset means this provider offers no browser flow: a device-only provider
+    /// names [`Self::device_auth_url`] instead, and asking for a browser start
+    /// is refused rather than turned into a URL that cannot work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    /// Device authorization endpoint URL (RFC 8628), e.g.
+    /// `https://provider.example/oauth/device/code`.
+    ///
+    /// Declaration is what makes the device flow available for a provider: it is
+    /// the one login that works with no browser on the gateway's host — over
+    /// SSH, in a container, on a headless box — where the browser flow needs a
+    /// redirect back to this gateway. A provider whose config names this and no
+    /// `auth_url` is device-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_auth_url: Option<String>,
     /// Token endpoint URL
     pub token_url: String,
     /// Optional scope string

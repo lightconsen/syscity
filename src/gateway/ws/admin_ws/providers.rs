@@ -138,11 +138,13 @@ fn default_redirect_base(config: &crate::gateway::GatewayConfig) -> String {
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", config.port))
 }
 
-/// `providers.auth_start` — begin an OAuth authorization (`{ id }`).
+/// `providers.auth_start` — begin an OAuth authorization (`{ id, mode? }`).
 ///
-/// Returns the URL to open. The flow stays here, keyed by its `flow_id`; the
-/// provider eventually redirects the browser to the gateway's own callback
-/// route, which is what completes it (`providers.auth_complete` event).
+/// `mode` is `"browser"` (the default) or `"device"`. The browser flow returns
+/// the URL to open and completes when the provider redirects to the gateway's
+/// own callback route; the device flow returns a code to type at a verification
+/// URI and completes when the client polls `providers.auth_status`. A provider
+/// that declares only one of the two endpoints picks the mode for itself.
 pub(crate) async fn handle_providers_auth_start(
     req: &WsRequest,
     state: &Arc<GatewayState>,
@@ -151,6 +153,20 @@ pub(crate) async fn handle_providers_auth_start(
         Ok(v) => v,
         Err(res) => return res,
     };
+    let mode = match crate::gateway::ws::parse_params::<serde_json::Value>(req)
+        .ok()
+        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(str::to_string))
+    {
+        Some(mode) => mode,
+        None => "browser".to_string(),
+    };
+    if mode != "browser" && mode != "device" {
+        return WsResponse::err(
+            &req.id,
+            "INVALID_PARAMS",
+            format!("unknown auth mode '{mode}': expected \"browser\" or \"device\""),
+        );
+    }
 
     // Scoped: the config lock is not held across the flow start.
     let (oauth, base) = {
@@ -172,18 +188,66 @@ pub(crate) async fn handle_providers_auth_start(
         (oauth, default_redirect_base(&config))
     };
 
-    let started = state.provider_oauth.start(&id, &oauth, &base).await;
-    WsResponse::ok(
-        &req.id,
-        serde_json::json!({
-            "id": id,
-            "flow_id": started.flow_id,
-            "auth_url": started.auth_url,
-        }),
-    )
+    // A provider that names one endpoint and not the other is asked for the one
+    // it has, rather than refused for the mode the caller left at its default.
+    let wants_device = match (mode.as_str(), &oauth.device_auth_url, &oauth.auth_url) {
+        ("device", _, _) => true,
+        ("browser", None, Some(_)) => false,
+        ("browser", Some(_), None) => true,
+        ("browser", ..) => false,
+        _ => unreachable!("mode is validated above"),
+    };
+
+    if wants_device {
+        let Some(device_auth_url) = oauth.device_auth_url.as_deref() else {
+            return WsResponse::err(
+                &req.id,
+                "INVALID_PARAMS",
+                format!(
+                    "provider '{id}' declares no device_auth_url, so there is no device flow to \
+                     start; use mode \"browser\""
+                ),
+            );
+        };
+        return match state
+            .provider_oauth
+            .start_device(&id, &oauth, device_auth_url)
+            .await
+        {
+            Ok(started) => WsResponse::ok(
+                &req.id,
+                serde_json::json!({
+                    "id": id,
+                    "flow_id": started.flow_id,
+                    "device": {
+                        "user_code": started.prompt.user_code,
+                        "verification_uri": started.prompt.verification_uri,
+                        "interval_secs": started.prompt.interval_secs,
+                        "expires_in_secs": started.expires_in_secs,
+                    },
+                }),
+            ),
+            Err(e) => WsResponse::err(&req.id, "OAUTH_DEVICE_START_FAILED", e.to_string()),
+        };
+    }
+
+    match state.provider_oauth.start(&id, &oauth, &base).await {
+        Ok(started) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "id": id,
+                "flow_id": started.flow_id,
+                "auth_url": started.auth_url,
+            }),
+        ),
+        Err(e) => WsResponse::err(&req.id, "OAUTH_START_FAILED", e.to_string()),
+    }
 }
 
 /// `providers.auth_status` — is this provider authorized? (`{ id }`).
+///
+/// For a pending *device* flow this call also polls the provider, so a client
+/// that asks repeatedly is what advances the login.
 pub(crate) async fn handle_providers_auth_status(
     req: &WsRequest,
     state: &Arc<GatewayState>,
@@ -200,6 +264,12 @@ pub(crate) async fn handle_providers_auth_status(
             "id": id,
             "authorized": status.authorized,
             "pending": status.pending,
+            "device": status.device.map(|prompt| serde_json::json!({
+                "user_code": prompt.user_code,
+                "verification_uri": prompt.verification_uri,
+                "interval_secs": prompt.interval_secs,
+            })),
+            "poll_error": status.poll_error,
         }),
     )
 }

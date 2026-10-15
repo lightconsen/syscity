@@ -162,7 +162,8 @@ mod tests {
     fn oauth_config(token_url: String) -> OAuthConfig {
         OAuthConfig {
             client_id: "test-client".to_string(),
-            auth_url: "https://provider.example/authorize".to_string(),
+            auth_url: Some("https://provider.example/authorize".to_string()),
+            device_auth_url: None,
             token_url,
             scope: None,
             client_secret: None,
@@ -238,7 +239,8 @@ mod tests {
                 &oauth_config(format!("{}/token", server.uri())),
                 "http://127.0.0.1:18080",
             )
-            .await;
+            .await
+            .unwrap();
         let mut rx = state.events.tx.subscribe();
 
         let resp = callback_handler(
@@ -269,7 +271,8 @@ mod tests {
                 &oauth_config("https://provider.example/token".to_string()),
                 "http://127.0.0.1:18080",
             )
-            .await;
+            .await
+            .unwrap();
         let mut rx = state.events.tx.subscribe();
 
         let resp = callback_handler(

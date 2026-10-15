@@ -30,7 +30,8 @@ fn add_oauth_provider(config: &mut GatewayConfig, id: &str, token_url: String) {
             auth_profile: None,
             oauth: Some(OAuthConfig {
                 client_id: "e2e-client".to_string(),
-                auth_url: "https://provider.example/authorize".to_string(),
+                auth_url: Some("https://provider.example/authorize".to_string()),
+                device_auth_url: None,
                 token_url,
                 scope: None,
                 client_secret: None,

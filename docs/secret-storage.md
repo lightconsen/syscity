@@ -289,6 +289,13 @@ authorization-code + PKCE flow rather than configured with a key:
 - The flow runs on the gateway: `providers.auth_start` hands out the authorization
   URL, and the browser is redirected back to `GET /oauth/provider/callback`, which
   exchanges the code and stores the refresh token under the provider's name.
+- A provider that declares `device_auth_url` may instead be authorized by the
+  **device flow** (RFC 8628), which has no callback: the user types a code at the
+  provider's verification URI, and `providers.auth_status` polls the token
+  endpoint. The device code is a bearer of an authorization in progress and is
+  kept in memory with the flow — only the refresh token that ends up being issued
+  reaches the store, through the same path as the browser flow, so the
+  memory-only invariant below covers both.
 - When a provider **rotates** the refresh token during a refresh, the new value is
   written back to the store (`HttpGatewayClient::persist_rotated_refresh_token`).
   A server that rotates invalidates the old token, so losing the new one would

@@ -647,7 +647,8 @@ fn oauth_provider() -> crate::model_router::ProviderConfig {
         auth_profile: None,
         oauth: Some(crate::model_router::OAuthConfig {
             client_id: "test-client".to_string(),
-            auth_url: "https://provider.example/authorize".to_string(),
+            auth_url: Some("https://provider.example/authorize".to_string()),
+            device_auth_url: None,
             token_url: "https://provider.example/token".to_string(),
             scope: None,
             client_secret: None,
@@ -693,6 +694,121 @@ async fn providers_auth_start_hands_out_a_gateway_hosted_url() {
     .to_string();
     assert!(auth_url.contains(&expected), "{auth_url}");
     assert!(!payload["flow_id"].as_str().unwrap_or_default().is_empty());
+}
+
+/// A provider that offers the device flow only, as a headless deployment's
+/// provider would be configured. The mock server comes back with the state so
+/// the caller keeps it alive for as long as the flow needs it.
+async fn device_only_state() -> (Arc<GatewayState>, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/device"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-code",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://provider.example/activate",
+            "expires_in": 900,
+            "interval": 5,
+        })))
+        .mount(&server)
+        .await;
+
+    let mut provider = oauth_provider();
+    provider.oauth = Some(crate::model_router::OAuthConfig {
+        auth_url: None,
+        device_auth_url: Some(format!("{}/device", server.uri())),
+        token_url: format!("{}/token", server.uri()),
+        ..provider.oauth.expect("oauth config")
+    });
+
+    let mut config = GatewayConfig::default();
+    config.providers.insert("grok".to_string(), provider);
+    (Arc::new(make_test_state(config).await), server)
+}
+
+#[tokio::test]
+async fn providers_auth_start_defaults_to_the_device_flow_when_that_is_all_there_is() {
+    let (state, _server) = device_only_state().await;
+
+    let resp = handle_providers_auth_start(
+        &req("r1", "providers.auth_start", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+
+    assert!(resp.ok, "{:?}", resp.error);
+    let payload = resp.payload.expect("payload");
+    // No URL to open: the code is the whole instruction.
+    assert!(payload["auth_url"].is_null());
+    assert_eq!(payload["device"]["user_code"], "WXYZ-1234");
+    assert_eq!(payload["device"]["verification_uri"], "https://provider.example/activate");
+    assert_eq!(payload["device"]["interval_secs"], 5);
+}
+
+#[tokio::test]
+async fn providers_auth_start_refuses_device_mode_without_a_device_endpoint() {
+    let state = oauth_state().await;
+
+    let resp = handle_providers_auth_start(
+        &req(
+            "r1",
+            "providers.auth_start",
+            Some(serde_json::json!({ "id": "grok", "mode": "device" })),
+        ),
+        &state,
+    )
+    .await;
+
+    assert!(!resp.ok);
+    let error = resp.error.expect("error");
+    assert_eq!(error.code, "INVALID_PARAMS");
+    assert!(error.message.contains("device_auth_url"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn providers_auth_start_rejects_an_unknown_mode() {
+    let state = oauth_state().await;
+
+    let resp = handle_providers_auth_start(
+        &req(
+            "r1",
+            "providers.auth_start",
+            Some(serde_json::json!({ "id": "grok", "mode": "carrier-pigeon" })),
+        ),
+        &state,
+    )
+    .await;
+
+    assert!(!resp.ok);
+    let error = resp.error.expect("error");
+    assert_eq!(error.code, "INVALID_PARAMS");
+    assert!(error.message.contains("carrier-pigeon"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn providers_auth_status_reports_a_pending_device_code() {
+    let (state, _server) = device_only_state().await;
+
+    let started = handle_providers_auth_start(
+        &req("r1", "providers.auth_start", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+    assert!(started.ok, "{:?}", started.error);
+
+    let status = handle_providers_auth_status(
+        &req("r2", "providers.auth_status", Some(serde_json::json!({ "id": "grok" }))),
+        &state,
+    )
+    .await;
+
+    assert!(status.ok, "{:?}", status.error);
+    let payload = status.payload.expect("payload");
+    assert_eq!(payload["authorized"], false);
+    assert!(payload["pending"].as_str().is_some());
+    // The prompt has to reach a client that only ever asks for status, which is
+    // how the TUI and the WebUI learn the code.
+    assert_eq!(payload["device"]["user_code"], "WXYZ-1234");
 }
 
 #[tokio::test]

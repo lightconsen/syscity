@@ -230,6 +230,7 @@ pub struct ProviderInstanceConfig {
 - Auth profile store with SQLite persistence (`AuthProfileStore`) — key state metadata only (failure counts, cooldown, status); raw keys remain in config
 - API key rotation with `AuthProfile` / `AuthProfileManager` — automatic failover between multiple keys per provider
 - OAuth 2.0 + PKCE initial authorization flow (`pkce.rs`, `oauth_flow.rs`, `oauth_callback.rs`) + CLI `syscity provider auth` command
+- OAuth 2.0 device authorization (RFC 8628) for providers that declare a `device_auth_url` — no browser needed on the gateway's host, and the flow advances through `providers.auth_status` polling rather than a callback (`provider_oauth.rs`)
 - Differentiated cooldown — `FailureClass::default_backoff_secs()` used per failure type (RateLimit=60s, AuthTemporary=5s, etc.), never below config minimum
 - Usage tracking (`ProviderUsageTracker`) — per-provider token consumption, cost estimation, time windows (today/this_hour/this_month), budget enforcement
 - Model catalog (`ModelCatalog`) — dynamic registry with `ModelCatalogEntry`, suppression list; exposed via OpenAI-compatible `/v1/models` and WS `models.list`

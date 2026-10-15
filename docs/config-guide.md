@@ -236,6 +236,12 @@ scope     = "openid offline_access"
 # URI you registered with the provider.
 # redirect_base = "https://gw.example.com"
 
+# Optional. The device authorization endpoint (RFC 8628), which is what makes
+# the device flow available: a login that needs no browser on *this* host — over
+# SSH, in a container, on a headless box. A provider configured with this and no
+# auth_url is device-only, and is started in device mode for you.
+# device_auth_url = "https://provider.example/oauth/device/code"
+
 # Written by the callback when the authorization completes — a location, never a
 # value. Do not fill this in by hand.
 # refresh_token = { namespace = "llm-oauth", entity = "grok", kind = "refresh_token" }
@@ -246,6 +252,12 @@ returns the URL to open. The provider redirects the browser to this gateway's
 `/oauth/provider/callback`, which exchanges the code and stores the refresh token;
 `providers.auth_status` reports whether a provider is authorized, and
 `providers.auth_complete` / `providers.auth_failed` events announce the outcome.
+
+With `mode: "device"` — or from the CLI, `syscity provider auth grok --device` —
+`providers.auth_start` asks for a device code instead and returns it with the
+verification URI to type it at. There is no callback: `providers.auth_status`
+polls the provider on each call, so the client waiting for the login is what
+advances it, and the answer carries the code to display until it is approved.
 
 From then on requests refresh the access token automatically — including writing
 back a refresh token the provider rotates, so a rotation is not lost across a
