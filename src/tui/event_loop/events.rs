@@ -360,8 +360,19 @@ pub(super) async fn handle_event(event: ClientEvent, state: &Arc<RwLock<AppState
 }
 
 /// Transcript lines for a tool invocation.
+///
+/// The header carries `▸` when the arguments did not fit and the rows below
+/// end in `…`, which is what makes a folded call read as folded — `/expand`
+/// (and `Ctrl+O`) prints the same call in full under `▾`.
 pub(super) fn tool_call_lines(tool: &str, args: Option<&Value>) -> Vec<TranscriptLine> {
-    let mut lines = vec![TranscriptLine::new(LineKind::Tool, format!("⚙ {tool}"))];
+    let capped = args
+        .map(|args| blocks::args_lines(args, "", usize::MAX).len() > blocks::TOOL_ARG_LINES_LIVE)
+        .unwrap_or(false);
+    let marker = if capped { " ▸" } else { "" };
+    let mut lines = vec![TranscriptLine::new(
+        LineKind::Tool,
+        format!("⚙ {tool}{marker}"),
+    )];
     if let Some(args) = args {
         // One transcript line per row. Packing the rows into one line loses
         // the newlines at render time (a `\n` has zero cell width and is

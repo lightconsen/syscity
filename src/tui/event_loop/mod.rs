@@ -377,7 +377,9 @@ fn dispatch(action: &TuiAction, online: bool, busy: bool) -> Dispatch {
         Dispatch::Quit
     } else if !online {
         Dispatch::Offline
-    } else if is_local_edit(action) || matches!(action, TuiAction::CopyAnswer) {
+    } else if is_local_edit(action)
+        || matches!(action, TuiAction::CopyAnswer | TuiAction::ExpandLastTool)
+    {
         // Copying the last answer is local work: it must never wait its turn
         // behind a hung gateway, any more than typing must.
         Dispatch::Edit

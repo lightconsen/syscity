@@ -713,7 +713,7 @@ pub fn write_notify(out: &mut impl std::io::Write, title: &str, body: &str) -> s
 /// A *reprint* rather than a fold, because scrollback is append-only — a line
 /// written there is never rewritten — so "expanding" something already on
 /// screen can only mean printing it again, in full, below.
-async fn command_expand(state: &Arc<RwLock<AppState>>, args: &str) {
+pub async fn command_expand(state: &Arc<RwLock<AppState>>, args: &str) {
     let nth = match args.trim() {
         "" => 1,
         other => match other.parse::<usize>() {

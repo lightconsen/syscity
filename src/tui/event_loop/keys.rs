@@ -35,6 +35,7 @@ pub(super) async fn handle_action(
         TuiAction::Quit => state.write().await.should_quit = true,
         TuiAction::Abort => abort_or_quit(state, ws).await?,
         TuiAction::CopyAnswer => crate::tui::commands::command_copy(Arc::clone(state)).await,
+        TuiAction::ExpandLastTool => crate::tui::commands::command_expand(state, "").await,
         TuiAction::SendMessage => send_message(state, ws).await?,
         TuiAction::RunSlashCommand(cmd) => {
             let mut s = state.write().await;
@@ -108,6 +109,7 @@ pub(super) async fn handle_offline_action(
             | TuiAction::CompleteNext
             | TuiAction::CompletePrev
             | TuiAction::Resize(..)
+            | TuiAction::ExpandLastTool
             | TuiAction::None
     );
     if edit_only {
@@ -156,6 +158,7 @@ pub(super) async fn handle_offline_action(
         TuiAction::Escape => {
             state.write().await.clear_input();
         }
+        TuiAction::ExpandLastTool => crate::tui::commands::command_expand(state, "").await,
         TuiAction::CopyAnswer => crate::tui::commands::command_copy(Arc::clone(state)).await,
         _ => {}
     }

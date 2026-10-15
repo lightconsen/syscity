@@ -542,6 +542,30 @@ fn tool_call_lines_include_the_arguments() {
     );
 }
 
+/// A call whose arguments did not fit says so in its header, so a folded
+/// block is distinguishable from a short one without reading to the
+/// ellipsis.
+#[test]
+fn a_capped_call_marks_its_header_as_folded() {
+    let small = serde_json::json!({ "path": "/tmp/x" });
+    let short = tool_call_lines("file_read", Some(&small));
+    assert_eq!(short[0].text, "⚙ file_read", "a call that fits is not marked");
+
+    let mut big = serde_json::Map::new();
+    for i in 0..40 {
+        big.insert(format!("k{i}"), serde_json::json!(i));
+    }
+    let large = serde_json::Value::Object(big);
+    let long = tool_call_lines("file_read", Some(&large));
+    assert_eq!(long[0].text, "⚙ file_read ▸", "a capped call is marked folded");
+    assert!(
+        long.last()
+            .is_some_and(|l| l.text.trim_end().ends_with('…')),
+        "and still ends in the ellipsis: {:?}",
+        long.last().map(|l| &l.text)
+    );
+}
+
 /// The live preview must never exceed what the region can hold, and must
 /// never starve the text being written into the same space.
 #[test]

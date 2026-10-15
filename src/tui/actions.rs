@@ -47,6 +47,9 @@ pub enum TuiAction {
     Abort,
     /// Copy the last finished answer to the clipboard (OSC 52).
     CopyAnswer,
+    /// Reprint the most recent tool call in full (`/expand`). Local: it reads
+    /// state, so it must not queue behind a gateway round trip.
+    ExpandLastTool,
     /// Quit.
     Quit,
     /// The terminal was resized.
@@ -63,6 +66,8 @@ impl TuiAction {
             KeyCode::Char('c') if ctrl => Self::Abort,
             // Ctrl+Y copies the last answer; Ctrl+R is already /resume.
             KeyCode::Char('y') if ctrl => Self::CopyAnswer,
+            // Ctrl+O expands; Ctrl+E is already /config.
+            KeyCode::Char('o') if ctrl => Self::ExpandLastTool,
             KeyCode::Char('q') if ctrl => Self::Quit,
             KeyCode::Char('d') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => Self::Quit,
             KeyCode::Char('h') if ctrl => Self::RunSlashCommand("/help".to_string()),
@@ -117,6 +122,7 @@ mod tests {
     fn control_keys_map_to_their_actions() {
         assert_eq!(TuiAction::from_key_event(ctrl('c')), TuiAction::Abort);
         assert_eq!(TuiAction::from_key_event(ctrl('y')), TuiAction::CopyAnswer);
+        assert_eq!(TuiAction::from_key_event(ctrl('o')), TuiAction::ExpandLastTool);
         assert_eq!(TuiAction::from_key_event(ctrl('q')), TuiAction::Quit);
         assert_eq!(
             TuiAction::from_key_event(ctrl('r')),
