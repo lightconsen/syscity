@@ -299,3 +299,39 @@ fn renders_at_degenerate_sizes() {
         terminal.draw(|f| live::render(f, &state)).expect("draw");
     }
 }
+
+/// `@` path candidates reach the screen: the list lands in the live region
+/// above the composer, with a directory marked by the slash Tab will insert.
+#[test]
+fn at_path_candidates_are_painted_into_the_live_region() {
+    let mut state = state_with(LiveMode::Composer);
+    let generation = state
+        .path_completions
+        .begin_fetch("")
+        .expect("not yet fetched");
+    state.path_completions.finish_fetch(
+        "",
+        generation,
+        Some(vec![
+            syscity::tui::state::PathEntry {
+                name: "src".into(),
+                path: "src".into(),
+                is_dir: true,
+            },
+            syscity::tui::state::PathEntry {
+                name: "README.md".into(),
+                path: "README.md".into(),
+                is_dir: false,
+            },
+        ]),
+    );
+    state.set_input("@".into());
+
+    let mut terminal = terminal();
+    settle(&mut terminal, &mut state);
+
+    let screen = visible(&terminal);
+    assert!(screen.contains("src/"), "the directory is listed: {screen}");
+    assert!(screen.contains("README.md"), "the file is listed: {screen}");
+    assert!(screen.contains('@'), "and the composer still shows what was typed: {screen}");
+}

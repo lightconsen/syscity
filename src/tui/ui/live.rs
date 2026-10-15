@@ -14,7 +14,7 @@ use ratatui::Frame;
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::tui::state::{AppState, ApprovalChoice, LiveMode, RunPhase};
+use crate::tui::state::{AppState, ApprovalChoice, Completion, LiveMode, RunPhase};
 use crate::tui::ui::blocks;
 use crate::tui::ui::wrap as wrapmod;
 use crate::tui::ui::Theme;
@@ -488,7 +488,7 @@ fn completion_lines(
     let lines = candidates[start..start + window]
         .iter()
         .enumerate()
-        .map(|(i, cmd)| {
+        .map(|(i, candidate)| {
             let highlighted = start + i == selected;
             let name_style = if highlighted {
                 theme.highlight_style()
@@ -500,16 +500,28 @@ fn completion_lines(
             } else {
                 theme.dim_style()
             };
-            Line::from(vec![
-                Span::styled(format!("  /{:<12}", cmd.name()), name_style),
-                Span::styled(
-                    truncate_to_width(
-                        cmd.description().unwrap_or_default(),
-                        width.saturating_sub(16),
+            match candidate {
+                // A command row keeps its fixed gutter so the descriptions
+                // line up.
+                Completion::Command(cmd) => Line::from(vec![
+                    Span::styled(format!("  /{:<12}", cmd.name), name_style),
+                    Span::styled(
+                        truncate_to_width(&cmd.description, width.saturating_sub(16)),
+                        desc_style,
                     ),
-                    desc_style,
-                ),
-            ])
+                ]),
+                // A path row has no description to align to: the name is the
+                // whole row, and a directory says so with the same trailing
+                // slash Tab will insert.
+                Completion::Path(entry) => {
+                    let name = truncate_to_width(&entry.name, width.saturating_sub(4));
+                    let mut spans = vec![Span::raw("  "), Span::styled(name, name_style)];
+                    if entry.is_dir {
+                        spans.push(Span::styled("/", name_style));
+                    }
+                    Line::from(spans)
+                }
+            }
         })
         .collect();
     Some(lines)
@@ -953,6 +965,76 @@ mod tests {
         // must fall back to the stream preview.
         state.set_input("hello".into());
         assert!(completion_lines(&state, &Theme::dark(), 6, 80).is_none());
+    }
+
+    /// A path candidate says what it is with the same trailing slash that Tab
+    /// will insert, and never borrows the command gutter.
+    #[test]
+    fn typing_an_at_lists_workspace_paths_with_directories_marked() {
+        let mut state = AppState::default();
+        let generation = state
+            .path_completions
+            .begin_fetch("")
+            .expect("not yet fetched");
+        state.path_completions.finish_fetch(
+            "",
+            generation,
+            Some(vec![
+                crate::tui::state::PathEntry {
+                    name: "src".into(),
+                    path: "src".into(),
+                    is_dir: true,
+                },
+                crate::tui::state::PathEntry {
+                    name: "main.rs".into(),
+                    path: "main.rs".into(),
+                    is_dir: false,
+                },
+            ]),
+        );
+        state.set_input("@".into());
+
+        let lines = completion_lines(&state, &Theme::dark(), 6, 80).expect("candidates");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "  src/", "a directory is marked and opens");
+        assert_eq!(line_text(&lines[1]), "  main.rs", "a file is not");
+        // The first row is the selected one, as for commands.
+        assert_eq!(lines[0].spans[1].style, Theme::dark().highlight_style());
+        assert_eq!(lines[1].spans[1].style, Style::default());
+    }
+
+    /// A directory with no listing yet shows nothing rather than an empty box,
+    /// so the block falls through to whatever else wants the space.
+    #[test]
+    fn an_unlisted_directory_has_no_candidates_to_draw() {
+        let mut state = AppState::default();
+        state.set_input("@src/".into());
+        assert!(completion_lines(&state, &Theme::dark(), 6, 80).is_none());
+    }
+
+    /// A long path is chopped rather than wrapped, like every other row.
+    #[test]
+    fn a_long_path_row_is_chopped_to_the_width() {
+        let mut state = AppState::default();
+        let long = "a".repeat(200);
+        let generation = state
+            .path_completions
+            .begin_fetch("")
+            .expect("not yet fetched");
+        state.path_completions.finish_fetch(
+            "",
+            generation,
+            Some(vec![crate::tui::state::PathEntry {
+                name: long.clone(),
+                path: long,
+                is_dir: false,
+            }]),
+        );
+        state.set_input("@".into());
+        let lines = completion_lines(&state, &Theme::dark(), 4, 40).expect("candidates");
+        let text = line_text(&lines[0]);
+        assert!(text.chars().count() <= 40, "{text:?}");
+        assert!(text.ends_with('…'), "{text:?}");
     }
 
     #[test]
