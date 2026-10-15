@@ -325,6 +325,16 @@ fn canned(method: &str) -> Value {
         "chat.send" => json!({ "session_id": "s1" }),
         "chat.history" => json!({ "messages": [], "has_more": false }),
         "commands.list" => json!({ "commands": [] }),
+        // Explicit rather than left to the catch-all: a parser test against
+        // an empty object would pass while proving nothing.
+        "workspace.list" => json!({
+            "root": "/tmp/workspace",
+            "path": "",
+            "entries": [
+                { "name": "src", "path": "src", "kind": "dir", "size": 0 },
+                { "name": "main.rs", "path": "main.rs", "kind": "file", "size": 12 },
+            ],
+        }),
         _ => json!({}),
     }
 }

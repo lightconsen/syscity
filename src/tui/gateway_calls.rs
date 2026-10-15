@@ -381,6 +381,51 @@ pub async fn commands_list(ws: &WsClient) -> Result<Vec<crate::tui::state::Comma
     Ok(parse_commands(&value))
 }
 
+/// List a directory in the agent's workspace.
+///
+/// `path` is workspace-relative; empty means the workspace root. Omitting
+/// `agent_id` lets the gateway resolve the default agent's workspace, which is
+/// what a session with no bound agent wants.
+pub async fn workspace_list(
+    ws: &WsClient,
+    agent_id: Option<&str>,
+    path: &str,
+) -> Result<Vec<crate::tui::state::PathEntry>, TuiError> {
+    let mut params = serde_json::Map::new();
+    if let Some(agent) = agent_id {
+        params.insert("agent_id".to_string(), json!(agent));
+    }
+    if !path.is_empty() {
+        params.insert("path".to_string(), json!(path));
+    }
+    let value = ws
+        .request("workspace.list", Some(Value::Object(params)))
+        .await?;
+    Ok(parse_workspace_list(&value))
+}
+
+/// Read `workspace.list`'s entries into the shape completion wants.
+///
+/// The gateway already orders directories first and validates the paths, so
+/// this is a translation and not a policy: anything unrecognised in the
+/// payload is skipped rather than guessed at.
+pub fn parse_workspace_list(value: &Value) -> Vec<crate::tui::state::PathEntry> {
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.to_string();
+            let path = entry.get("path")?.as_str()?.to_string();
+            // `kind` is the field the gateway documents; a directory is the
+            // only thing a listing can offer that Tab should drill into.
+            let is_dir = entry.get("kind").and_then(Value::as_str) == Some("dir");
+            Some(crate::tui::state::PathEntry { name, path, is_dir })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,5 +657,79 @@ mod tests {
         assert_eq!(agents[0].emoji, "🤖");
         assert_eq!(agents[1].emoji, "👻");
         assert!(!agents[1].is_valid);
+    }
+    #[test]
+    fn workspace_entries_parse_from_the_documented_shape() {
+        let value = json!({
+            "root": "/tmp/ws",
+            "path": "src",
+            "entries": [
+                { "name": "tui", "path": "src/tui", "kind": "dir", "size": 0 },
+                { "name": "main.rs", "path": "src/main.rs", "kind": "file", "size": 12 },
+            ],
+        });
+        let entries = parse_workspace_list(&value);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "tui");
+        assert_eq!(entries[0].path, "src/tui");
+        assert!(entries[0].is_dir);
+        assert!(!entries[1].is_dir);
+    }
+
+    /// A payload missing what a row needs is skipped, not guessed at.
+    #[test]
+    fn a_malformed_entry_is_skipped_rather_than_invented() {
+        let value = json!({
+            "entries": [
+                { "name": "good", "path": "good", "kind": "file" },
+                { "path": "nameless", "kind": "file" },
+                { "name": "pathless", "kind": "dir" },
+                { "name": "unkinded", "path": "unkinded" },
+            ],
+        });
+        let entries = parse_workspace_list(&value);
+        assert_eq!(entries.len(), 2, "only the rows with a name and a path");
+        assert_eq!(entries[0].name, "good");
+        assert!(!entries[1].is_dir, "an unknown kind is not treated as a directory");
+    }
+
+    #[test]
+    fn a_payload_without_entries_is_empty_not_an_error() {
+        assert!(parse_workspace_list(&json!({})).is_empty());
+        assert!(parse_workspace_list(&json!({ "entries": null })).is_empty());
+    }
+
+    /// The request carries the agent and the path, and omits what it does not
+    /// have — an empty `path` means the workspace root, not the empty string
+    /// joined onto something.
+    #[tokio::test]
+    async fn workspace_list_asks_for_the_directory_it_was_given() {
+        let gateway = TestGateway::start().await;
+        let client = connect(&gateway).await;
+
+        let entries = workspace_list(&client, Some("writer"), "src")
+            .await
+            .expect("listed");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_dir, "the gateway's ordering is preserved");
+
+        let seen = gateway.requests();
+        let request = seen
+            .iter()
+            .find(|r| r.method == "workspace.list")
+            .expect("asked");
+        assert_eq!(request.params.get("agent_id").and_then(Value::as_str), Some("writer"));
+        assert_eq!(request.params.get("path").and_then(Value::as_str), Some("src"));
+
+        // With no agent and the root, neither field is sent.
+        let _ = workspace_list(&client, None, "").await.expect("listed");
+        let seen = gateway.requests();
+        let last = seen
+            .iter()
+            .filter(|r| r.method == "workspace.list")
+            .next_back()
+            .expect("asked");
+        assert!(last.params.get("agent_id").is_none());
+        assert!(last.params.get("path").is_none(), "empty path is the root, not \"\"");
     }
 }
