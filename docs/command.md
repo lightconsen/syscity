@@ -61,7 +61,10 @@ The command system has two layers:
 | `/trace` | `on\|off` | Toggle plugin trace via `PluginManager::set_trace_enabled()` and store as `trace.enabled`. | no | no |
 | `/fast` | `[on\|off\|status]` | Enable or disable fast mode, which swaps `config.model` to the resolved `fast` alias and restores it on disable. | no | no |
 | `/reasoning` | `[on\|off\|stream]` | Set reasoning visibility stored as `reasoning.visibility`. | no | no |
-| `/queue` | `<mode>` | Set queue behavior (`steer`, `interrupt`, `followup`) stored as `queue.mode`. | no | no |
+| `/queue` | `[prompt]` | Queue a prompt for the next turn: it runs when the turn it was queued behind finishes, and goes through the inbound pipeline like any message. | no | no |
+| `/queue list\|clear\|rm N\|edit N <text>\|move A B` | — | Inspect and change what is queued. A leading verb whose arguments fit manages the queue; anything else is a prompt, so `/queue clear the logs` queues "clear the logs". | no | no |
+| `/queue add <prompt>` | — | Force the other reading when a prompt starts with a management verb. | no | no |
+| `/queue mode <steer\|interrupt\|followup>` | — | Set what an arriving message does to a *running* turn (`queue.mode`). The bare old spelling (`/queue interrupt`) still sets it. | no | no |
 
 ### Examples
 

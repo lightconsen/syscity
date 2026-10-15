@@ -143,6 +143,8 @@ pub struct PipelineState {
     pub sse_streamer: Arc<SseStreamer>,
     pub routed_tx: mpsc::Sender<RoutedMessage>,
     pub inbound_entry: mpsc::Sender<IncomingMessage>,
+    /// Prompts queued for a session's next turn (`/queue`).
+    pub prompt_queue: Arc<crate::gateway::prompt_queue::PendingPrompts>,
 }
 
 /// Event broadcasting and hook registry state.

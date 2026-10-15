@@ -208,6 +208,7 @@ pub async fn make_test_state_parts(
             sse_streamer,
             routed_tx,
             inbound_entry: inbound_entry_tx,
+            prompt_queue: Arc::new(crate::gateway::prompt_queue::PendingPrompts::new()),
         },
         events: EventState {
             tx: event_tx,

@@ -513,7 +513,10 @@ pub async fn handle_commands_execute(
             "trace" => model::handle_trace(req, state, &params.args).await,
             "fast" => model::handle_fast(req, state, &params.args).await,
             "reasoning" => model::handle_reasoning(req, state, &params.args).await,
-            "queue" => model::handle_queue(req, state, &params.args).await,
+            "queue" => {
+                model::handle_queue(req, conn, state, &params.args, params.session_id.as_deref())
+                    .await
+            }
             "tools" => tools::handle_tools(req, state, &params.args).await,
             "usage" => session::handle_usage(req, state, &params.args).await,
             "context" => session::handle_context(req, conn, state).await,

@@ -403,6 +403,20 @@ pub(crate) async fn run_agent_loop(
                             status: super::AgentStatus::Idle,
                         });
                         busy.store(false, Ordering::Release);
+
+                        // A prompt queued for this session was queued *behind
+                        // the turn that has just finished, so this is its
+                        // moment.
+                        if let Some(Err(e)) =
+                            super::prompt_queue::release_next(&state.pipelines, &session_id).await
+                        {
+                            // It has already left the queue: saying so is the
+                            // only alternative to losing it quietly.
+                            warn!(
+                                "Agent {}: failed to release the queued prompt for {}: {}",
+                                agent_id, session_id, e
+                            );
+                        }
                     }
                     super::AgentCommand::Cancel => {
                         if use_acp {

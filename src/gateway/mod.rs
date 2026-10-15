@@ -36,6 +36,7 @@ pub use quality_gate::{
     ABReport, FeedbackCollector, PhaseStore, ProdTurn, ReleaseDecision, ReleaseSignals,
     ShadowReport,
 };
+pub mod prompt_queue;
 pub mod rate_limit;
 pub mod send_policy;
 pub mod session_export;
@@ -536,6 +537,7 @@ impl Gateway {
                 sse_streamer: pipelines_init.sse_streamer.clone(),
                 routed_tx: routed_tx.clone(),
                 inbound_entry: inbound_entry_tx.clone(),
+                prompt_queue: Arc::new(prompt_queue::PendingPrompts::new()),
             },
             events: EventState {
                 tx: event_tx.clone(),
