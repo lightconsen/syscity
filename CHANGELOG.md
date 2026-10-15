@@ -13,6 +13,7 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **`[security] shell_safety` and `[security] sandbox_interceptor`** (both default `false`) install two policy hooks that were written but never plugged in. `shell_safety` classifies every segment of a shell command — a safe binary runs without prompting, a risky one asks, a dangerous one (`rm -rf /`, fork bombs) is refused; `shell_safety_unknown_binary = "ask" | "allow"` decides what an unrecognised binary means, since the built-in safe list is ~90 names and ordinary work runs plenty outside it. `sandbox_interceptor` applies a command/path blocklist and flags credential-shaped arguments for approval. Both are gateway-wide and read at startup. Off by default: turning either on changes which calls reach a human.
 - **`[security] browser_allow_private`** (default `false`). The browser tool now runs the same SSRF guard `web_fetch` has always run, so private and loopback addresses need this switch to be reachable again — for a deployment driving its own dev server on `localhost`. The scheme rule is unaffected: `file:` stays refused either way.
 
 ### Changed

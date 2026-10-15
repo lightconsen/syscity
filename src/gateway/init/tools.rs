@@ -24,6 +24,7 @@ use crate::security::content_filter::ContentFilter;
 use crate::security::runtime_audit::AuditLogger;
 use crate::tools::approval::ApprovalQueue;
 use crate::tools::ask_user::AskQueue;
+use crate::tools::hooks::ToolHooks;
 use crate::tools::ToolRegistry;
 
 /// Tool subsystem initialization result.
@@ -250,6 +251,40 @@ pub struct ToolSystemDeps {
     pub paths: Arc<crate::dirs::SyscityPaths>,
 }
 
+/// Layer the built-in security policy hooks onto the ones the shell-hook
+/// bridge produced.
+///
+/// The bridge stays first, and that order is load-bearing:
+/// [`ToolHooks::run_policy`] returns the first `Deny` or `NeedsApproval` it
+/// meets and never walks back, so registering a built-in ask ahead of it
+/// could mask an operator's `PreToolUse` deny. The bridge's plain `Allow`
+/// *abstains* rather than claiming, so the built-ins still get their say
+/// after it, and a built-in `Deny` still wins over a bridge `AllowByHook` —
+/// a claim does not short-circuit the fold.
+///
+/// Both hooks are off by default, so an upgrade composes nothing and the
+/// `ToolHooks` value is the bridge's, unchanged.
+fn with_security_hooks(config: &GatewayConfig, base: ToolHooks) -> ToolHooks {
+    use crate::tools::sandbox_interceptor::SandboxInterceptor;
+    use crate::tools::shell_safety::{shell_safety_policy_with_posture, SafeBinList};
+
+    let mut hooks = base;
+    if config.security.shell_safety {
+        // Cheapest and most specific first: pure string analysis, and it only
+        // speaks about the command tools.
+        let policy = shell_safety_policy_with_posture(
+            SafeBinList::new(),
+            config.security.shell_safety_unknown_binary,
+        );
+        hooks = hooks.policy(move |name, args, ctx| policy(name, args, ctx));
+    }
+    if config.security.sandbox_interceptor {
+        let policy = SandboxInterceptor::with_defaults().as_policy_hook();
+        hooks = hooks.policy(move |name, args, ctx| policy(name, args, ctx));
+    }
+    hooks
+}
+
 /// Initialize the full tool subsystem.
 pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::Result<ToolsInit> {
     let ToolSystemDeps {
@@ -302,7 +337,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 cloud_config: config.cloud.clone(),
                 device_bridge,
                 skills_manager,
-                tool_hooks: shell_hooks.tool_hooks(),
+                tool_hooks: with_security_hooks(config, shell_hooks.tool_hooks()),
                 secrets: secrets.clone(),
                 paths: paths.clone(),
                 permissions,
@@ -380,4 +415,91 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         channels,
         channel_extensions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::hooks::ToolPolicyDecision;
+    use serde_json::json;
+
+    fn config() -> GatewayConfig {
+        GatewayConfig::default()
+    }
+
+    /// The whole point of the knobs: an upgrade that changes nothing in its
+    /// config must compose nothing.
+    #[tokio::test]
+    async fn no_knob_means_the_bridge_bundle_comes_back_untouched() {
+        let hooks = with_security_hooks(&config(), ToolHooks::new());
+        let decision = hooks
+            .run_policy("shell", &json!({"command": "rm -rf /"}), &Default::default())
+            .await;
+        assert!(
+            decision.is_allow(),
+            "nothing is installed by default, so nothing has an opinion: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_shell_safety_installs_it() {
+        let mut config = config();
+        config.security.shell_safety = true;
+        let hooks = with_security_hooks(&config, ToolHooks::new());
+
+        let decide = async |command: &str| {
+            hooks
+                .run_policy("shell", &json!({ "command": command }), &Default::default())
+                .await
+        };
+        assert!(decide("rm -rf /").await.is_deny(), "dangerous patterns are refused");
+        assert!(decide("sudo reboot").await.is_needs_approval(), "risk asks");
+        assert!(decide("ls -la").await.is_allow(), "a safe binary is cleared");
+    }
+
+    #[tokio::test]
+    async fn enabling_the_interceptor_installs_it() {
+        let mut config = config();
+        config.security.sandbox_interceptor = true;
+        let hooks = with_security_hooks(&config, ToolHooks::new());
+        let decision = hooks
+            .run_policy("shell", &json!({"command": "rm -rf ./build"}), &Default::default())
+            .await;
+        assert!(
+            decision.is_deny(),
+            "the default set blocks the bare name, not just rm -rf /: {decision:?}"
+        );
+    }
+
+    /// Order, and the reason for it: a built-in ask must not stand in front of
+    /// an operator's own deny.
+    #[tokio::test]
+    async fn an_operator_deny_is_not_masked_by_a_built_in_ask() {
+        let base = ToolHooks::new().policy(|_, _, _| async {
+            ToolPolicyDecision::Deny {
+                reason: "operator says no".to_string(),
+            }
+        });
+        let mut config = config();
+        config.security.shell_safety = true;
+
+        let decision = with_security_hooks(&config, base)
+            .run_policy("shell", &json!({ "command": "sudo reboot" }), &Default::default())
+            .await;
+        assert!(decision.is_deny(), "the bridge's deny must win: {decision:?}");
+    }
+
+    /// And the other direction: a built-in deny is authoritative even after
+    /// the bridge has claimed the call.
+    #[tokio::test]
+    async fn a_built_in_deny_beats_a_bridge_claim() {
+        let base = ToolHooks::new().policy(|_, _, _| async { ToolPolicyDecision::AllowByHook });
+        let mut config = config();
+        config.security.shell_safety = true;
+
+        let decision = with_security_hooks(&config, base)
+            .run_policy("shell", &json!({ "command": "rm -rf /" }), &Default::default())
+            .await;
+        assert!(decision.is_deny(), "a claim does not short-circuit the fold: {decision:?}");
+    }
 }
