@@ -80,6 +80,43 @@ impl SyscityPaths {
         Self::from_root(resolve_base_dir(std::env::var_os("SYSCITY_HOME")))
     }
 
+    /// Build the layout for a **named profile**: `<base>/profiles/<name>`.
+    ///
+    /// A profile is an isolated home and nothing more — its own config, database,
+    /// skills, memories, sessions and secrets — so it is a distinct root, and a
+    /// distinct root is a distinct process (see `docs/scale.md`'s route A, and
+    /// ARCH-002 in the risk register). Two profiles never share a process, a
+    /// database or a cache; that is the point of them.
+    ///
+    /// `SYSCITY_HOME` still names the *base* the profiles live under, so an
+    /// operator who pinned a home keeps it: profiles go inside it.
+    pub fn for_profile(name: &str) -> Result<Self, InvalidProfile> {
+        let name = validate_profile_name(name)?;
+        Ok(Self::from_root(
+            resolve_base_dir(std::env::var_os("SYSCITY_HOME"))
+                .join(PROFILES_DIR)
+                .join(name),
+        ))
+    }
+
+    /// The production layout, honouring a profile when one was named.
+    ///
+    /// With no name this is [`Self::from_env`] exactly; with one it is
+    /// [`Self::for_profile`]. The environment is read here rather than by the
+    /// caller so that the "the root is resolved once, at the entry point"
+    /// contract stays in one place.
+    pub fn from_env_or_profile(profile: Option<&str>) -> Result<Self, InvalidProfile> {
+        let named = profile.map(str::to_string).or_else(|| {
+            std::env::var("SYSCITY_PROFILE")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+        });
+        match named {
+            Some(name) => Self::for_profile(&name),
+            None => Ok(Self::from_env()),
+        }
+    }
+
     /// The base directory every other path is derived from.
     pub fn root(&self) -> &Path {
         &self.root
@@ -289,6 +326,63 @@ impl SyscityPaths {
 }
 
 /// Process-default path handle, installed once at process entry.
+/// The directory profiles live under, inside the base root.
+pub const PROFILES_DIR: &str = "profiles";
+
+/// A profile name that cannot be a single path segment under `profiles/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidProfile {
+    /// The name as given.
+    pub name: String,
+    /// Why it was refused, for the message the operator sees.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for InvalidProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid profile name {:?}: {}", self.name, self.reason)
+    }
+}
+
+impl std::error::Error for InvalidProfile {}
+
+/// Check a profile name is a single, ordinary path segment.
+///
+/// The name becomes a directory under the base root, so anything that could
+/// escape it — a separator, a parent reference, an absolute path, a leading dot
+/// that would hide it, a control character that would confuse a listing — is
+/// refused rather than sanitised. Silently rewriting a name would mean the
+/// operator's `--profile work` and the directory on disk disagree.
+pub fn validate_profile_name(name: &str) -> Result<&str, InvalidProfile> {
+    let refuse = |reason| Err(InvalidProfile { name: name.to_string(), reason });
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return refuse("a profile needs a name");
+    }
+    if trimmed != name {
+        return refuse("surrounding whitespace would make the directory disagree with the name");
+    }
+    if name == "." || name == ".." {
+        return refuse("that is a path, not a name");
+    }
+    if name.starts_with('.') {
+        return refuse("a leading dot would hide the profile directory");
+    }
+    if name.len() > 64 {
+        return refuse("too long to be a name (64 bytes is the cap)");
+    }
+    if name.contains(['/', '\\']) || name.contains(std::path::MAIN_SEPARATOR) {
+        return refuse("a name is one path segment, not a path");
+    }
+    if name
+        .chars()
+        .any(|c| !(c.is_alphanumeric() || matches!(c, '-' | '_')))
+    {
+        return refuse("letters, digits, '-' and '_' only");
+    }
+    Ok(name)
+}
+
 static DEFAULT_PATHS: OnceLock<Arc<SyscityPaths>> = OnceLock::new();
 
 /// The process-default path handle.
@@ -746,6 +840,51 @@ pub enum FileType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile is a root under the base: same base, one more segment, and
+    /// the two profiles differ.
+    #[test]
+    fn a_profile_is_a_named_root_under_the_base() {
+        let work = SyscityPaths::for_profile("work").expect("valid name");
+        let personal = SyscityPaths::for_profile("personal").expect("valid name");
+
+        assert!(work.root().ends_with(Path::new(PROFILES_DIR).join("work")));
+        assert!(personal
+            .root()
+            .ends_with(Path::new(PROFILES_DIR).join("personal")));
+        assert_ne!(work.root(), personal.root(), "two profiles, two homes");
+        // Everything else about the layout is derived, so one check stands in
+        // for the rest: the profile's config lives in the profile.
+        assert_eq!(work.config_dir(), work.root());
+        assert!(work.default_memory_db().starts_with(work.root()));
+    }
+
+    /// The name becomes a directory, so anything that is not one ordinary path
+    /// segment is refused rather than sanitised — a silently rewritten name
+    /// would leave the operator's `--profile` and the directory disagreeing.
+    #[test]
+    fn a_profile_name_must_be_one_ordinary_segment() {
+        for bad in [
+            "", "  ", " work", "work ", ".", "..", ".hidden", "a/b", "/abs", "a\\b",
+        ] {
+            assert!(
+                SyscityPaths::for_profile(bad).is_err(),
+                "{bad:?} should not be a profile name"
+            );
+        }
+        for good in ["work", "Work-2", "a_b", "p1"] {
+            assert!(SyscityPaths::for_profile(good).is_ok(), "{good:?} is a fine name");
+        }
+        assert!(validate_profile_name(&"x".repeat(65)).is_err(), "the cap holds");
+        assert!(validate_profile_name(&"x".repeat(64)).is_ok());
+    }
+
+    /// With no profile named, the root is exactly the ordinary one.
+    #[test]
+    fn no_profile_means_the_ordinary_root() {
+        let plain = SyscityPaths::from_env_or_profile(None).expect("no profile");
+        assert_eq!(plain.root(), SyscityPaths::from_env().root());
+    }
 
     /// Layout entries exercised by the isolation/hermetic tests. Every entry is
     /// produced by a `SyscityPaths` method so the tests cover the whole surface.

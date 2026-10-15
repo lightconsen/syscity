@@ -129,6 +129,17 @@ pub fn environment() -> String {
 /// This function sets up logging, panic handlers, and other
 /// global initialization.
 pub fn init() -> Result<()> {
+    init_with_profile(None)
+}
+
+/// Initialize with a named profile, whose home replaces the default root.
+///
+/// Separate from [`init`] because the profile arrives as a command-line
+/// argument, and the root has to be pinned *before* anything resolves a path —
+/// so the caller parses its arguments, decides the profile, and only then
+/// initializes. `None` means the ordinary root (`SYSCITY_HOME`, else
+/// `~/.syscity`), and `SYSCITY_PROFILE` is read as a fallback in either case.
+pub fn init_with_profile(profile: Option<&str>) -> Result<()> {
     utils::logging::setup_panic_handler();
 
     // Pin the process-wide filesystem root here, at the library's documented
@@ -140,7 +151,7 @@ pub fn init() -> Result<()> {
     // `Err` means a root was already installed (an embedder or test pinned its
     // own first); that one wins, and the difference is harmless because both
     // resolve to the same layout.
-    let root = std::sync::Arc::new(crate::dirs::SyscityPaths::from_env());
+    let root = std::sync::Arc::new(crate::dirs::SyscityPaths::from_env_or_profile(profile)?);
     if crate::dirs::set_default_paths(root).is_err() {
         tracing::debug!("path root already installed; keeping the existing one");
     }

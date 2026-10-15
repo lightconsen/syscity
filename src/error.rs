@@ -39,6 +39,9 @@ pub enum SyscityError {
     /// Validation errors
     #[error("Validation error: {0}")]
     Validation(String),
+    /// A profile name that cannot be a directory under the base root.
+    #[error("{0}")]
+    InvalidProfile(#[from] crate::dirs::InvalidProfile),
 
     /// Resource not found
     #[error("Resource not found: {resource}")]

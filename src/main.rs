@@ -3,20 +3,26 @@
 //! This is the main entry point for the Syscity application.
 //! It initializes the application and runs the CLI.
 
+use clap::Parser;
 use syscity::cli::Cli;
 
 #[tokio::main]
 async fn main() {
+    // Parsed before initializing because `--profile` decides the path root, and
+    // the root is pinned exactly once, before anything resolves a path.
+    let cli = Cli::parse();
+    let profile = cli.profile.clone();
+
     // Initialize the application. This also pins the process-wide path root
-    // (`syscity::init`), so the CLI's single-root contract is established before
-    // any `dirs::` free function runs.
-    if let Err(e) = syscity::init() {
+    // (`syscity::init_with_profile`), so the CLI's single-root contract is
+    // established before any `dirs::` free function runs.
+    if let Err(e) = syscity::init_with_profile(profile.as_deref()) {
         eprintln!("Failed to initialize: {}", e);
         std::process::exit(1);
     }
 
     // Run the CLI
-    if let Err(e) = Cli::run().await {
+    if let Err(e) = cli.run_parsed().await {
         handle_error(e);
     }
 }

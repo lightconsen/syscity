@@ -32,6 +32,7 @@ mod mcp;
 mod memory;
 mod observe;
 mod plugin;
+mod profile;
 mod provider;
 mod secrets;
 mod security;
@@ -61,6 +62,7 @@ pub use mcp::McpCommands;
 pub use memory::MemoryCommands;
 pub use observe::ObserveCommands;
 pub use plugin::PluginCommands;
+pub use profile::ProfileCommands;
 pub use provider::ProviderCommands;
 pub use secrets::SecretsCommands;
 pub use security::{GateCommands, PairingCommands, SecurityCommands};
@@ -81,6 +83,14 @@ pub struct Cli {
     /// Log level override (trace, debug, info, warn, error)
     #[arg(short, long, global = true)]
     pub log_level: Option<String>,
+
+    /// Run against a named profile: an isolated home under `<base>/profiles/`.
+    ///
+    /// A profile is its own config, database, skills, memories and secrets. Two
+    /// profiles never share a process, so switching profiles means running the
+    /// command again with a different name (or setting `SYSCITY_PROFILE`).
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// Subcommand to execute
     #[command(subcommand)]
@@ -260,6 +270,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: SecurityCommands,
     },
+    /// Isolated homes: list them, create one, print its root
+    Profile {
+        /// Profile subcommand
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
     /// Session, thread, and turn management (introspect & undo)
     Session {
         /// Session subcommand
@@ -424,8 +440,18 @@ fn init_logging(log_level: Option<&str>) {
 
 impl Cli {
     /// Run the CLI
+    /// Parse the arguments and run.
+    ///
+    /// Kept for callers that do not need to influence the path root first; the
+    /// binary parses for itself so it can pass the profile to
+    /// [`syscity::init_with_profile`] before anything resolves a path.
     pub async fn run() -> Result<()> {
-        let cli = Cli::parse();
+        Cli::parse().run_parsed().await
+    }
+
+    /// Run an already-parsed command line.
+    pub async fn run_parsed(self) -> Result<()> {
+        let cli = self;
 
         // Initialize logging
         init_logging(cli.log_level.as_deref());
@@ -501,6 +527,7 @@ impl Cli {
             Commands::Memory { command } => memory::run_memory_command(command).await,
             Commands::Kb { command } => kb::run_kb_command(command).await,
             Commands::Security { command } => security::run_security_command(command).await,
+            Commands::Profile { command } => profile::run_profile_command(command).await,
             Commands::Session { command } => session::run_session_command(command).await,
             Commands::Observe { command } => observe::run_observe_command(command).await,
             Commands::Update { command } => update::run_update_command(command).await,
