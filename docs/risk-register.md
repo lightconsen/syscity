@@ -22,7 +22,7 @@ P2（有规避方案的功能/可靠性缺陷）、P3+（维护性）。
 | **SEC-007** | P1 | CORS `*` + credentials | ⏳ **未清账** | `CorsConfig` 已是 allowlist 形状（`allowed_origins` 列表），但"默认值是否仍 `*` + mirror origin + credentials 组合"未复核。启用 cookie/session 前必须清掉这条 |
 | **SEC-008** | P1/P2 | 事件广播越主体 | ⏳ **部分未清** | 按会话分发已做（WS `audience_of`：ApprovalRequired/AgentResponse/Thinking 等路由到 session）；**设备、渠道、MCP、AgentStatus 级事件仍广播全体连接**——单主体下是元数据噪音，多主体部署前必须收紧 |
 | **SEC-009** | P2 | 凭据暴露 | ⏳ **未清账** | 短时 ticket 已有（`/api/v1/ws-ticket` + `?ticket=`，升级 URL 长期 token 有一次性警告）；localStorage 长期 token 与日志脱敏未复核 |
-| **SEC-010** | P2 | 沙箱边界 | 📌 **文档化结论** | 沙箱能力边界已入 `audit/audit-sandbox-syscity-vs-codex-vs-claude-code.local.md`（网络 advisory、读全域开放是已知设计）；结论不变：不可信租户需要容器/microVM + 出口控制 |
+| **SEC-010** | P2 | 沙箱边界 | 🔒 **按设计关闭**（2026-10-15 复核） | 命令工具的边界已从"应用级允许列表"变为**内核强制**：`workspace_only` 时 `shell` / `code_exec` / `process` 各自附加 `WriteFence`（`src/tools/process_runner/mod.rs`）——macOS 把 argv 改写成 `/usr/bin/sandbox-exec -p <profile>`、Linux 在 `pre_exec` 装 Landlock（不可用时 fail-closed）、Windows AppContainer；`.git` 与 `.syscity` 即使在被授予的根内也恒不可写（`PROTECTED_WRITE_NAMES`）。在此之上还有三层可选/附带约束：`[security] fence_network`（macOS `(deny network*)`、Linux seccomp 拒 `socket(AF_INET\|AF_INET6)` 而保留 AF_UNIX，默认 false）、`[security] fence_namespaces`（只读根 + 私有 `/tmp` 的 namespace 视图，默认 auto）、以及每次围栏运行都装的 seccomp 逃逸向量拒列表。**读仍全域开放是设计**（围栏约束的是写）。结论不变：不可信租户仍需容器/microVM + 出口控制。（原引用的本地审计 `audit/audit-sandbox-*.local.md` 已删除——它"网络在内核层完全不管"的结论在 `fence_network` 落地后即过期——本行改为自足陈述，不再指向本地笔记。） |
 
 ## 可靠性 / 正确性 / 运维
 
