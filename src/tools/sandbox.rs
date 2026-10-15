@@ -129,9 +129,24 @@ impl SandboxedTool {
 
     /// Inspect `args` for any path-like field and validate it.
     ///
-    /// Checks the following common field names: `"path"`, `"file"`,
-    /// `"directory"`, `"dir"`, `"source"`, `"destination"`, `"dst"`.
-    fn check_path_args(&self, args: &Value) -> crate::Result<()> {
+    /// Checks the following field names: `"path"`, `"file"`, `"directory"`,
+    /// `"dir"`, `"source"`, `"destination"`, `"dst"`, `"working_dir"`.
+    ///
+    /// Each value is resolved the way the tool itself will resolve it —
+    /// `~` expanded, a relative path anchored at the workspace root, an
+    /// absolute path untouched — before it meets the blocklist. Comparing the
+    /// raw argument instead let an argument written as `~/.ssh/id_rsa` or
+    /// relative walk straight past a `blocked_paths` entry, which is checked
+    /// here and nowhere else (`ToolSandbox::is_path_allowed`, the other gate,
+    /// never consults the blocklist).
+    ///
+    /// Two honest limits: the value is resolved but **not canonicalised** —
+    /// canonicalising one side only would make `/tmp` fail an allowlist
+    /// written `/tmp` on macOS, where it is a symlink to `/private/tmp` — so
+    /// a `..` inside the argument is not collapsed; and this scan only sees
+    /// top-level string fields, so a path nested in an object is left to the
+    /// tool's own checks.
+    fn check_path_args(&self, args: &Value, context: &ToolContext) -> crate::Result<()> {
         const PATH_FIELDS: &[&str] = &[
             "path",
             "file",
@@ -140,12 +155,13 @@ impl SandboxedTool {
             "source",
             "destination",
             "dst",
+            "working_dir",
         ];
 
         for field in PATH_FIELDS {
             if let Some(raw) = args.get(field).and_then(|v| v.as_str()) {
-                let path = Path::new(raw);
-                self.config.check_path(path)?;
+                let path = context.resolve_path(Path::new(raw));
+                self.config.check_path(&path)?;
             }
         }
 
@@ -196,7 +212,7 @@ impl Tool for SandboxedTool {
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         // ── path checks ──────────────────────────────────────────────────
-        self.check_path_args(&args)?;
+        self.check_path_args(&args, context)?;
 
         // ── network access guard ─────────────────────────────────────────
         // Check the tool's advertised capabilities: if it has the "network"
@@ -341,6 +357,85 @@ mod tests {
         let args = json!({"path": "/etc/passwd"});
         let result = tool.execute(args, &dummy_context()).await;
         assert!(matches!(result, Err(SyscityError::SandboxViolation(_))));
+    }
+
+    /// A relative argument means what the tool will do with it — resolved
+    /// against the workspace root — so an allowlist written in absolute terms
+    /// still recognises it.
+    #[tokio::test]
+    async fn test_relative_path_resolved_into_allowlist_passes() {
+        let config = SandboxConfig {
+            allowed_paths: vec![PathBuf::from("/tmp")],
+            ..Default::default()
+        };
+        let tool = SandboxedTool::new(EchoTool, config);
+        let args = json!({"path": "notes.txt"});
+        let result = tool.execute(args, &dummy_context()).await;
+        assert!(result.is_ok(), "workspace_root is /tmp: {result:?}");
+    }
+
+    /// Resolving does not mean "allow": a relative path anchored somewhere
+    /// else still fails an allowlist it does not land in.
+    #[tokio::test]
+    async fn test_relative_path_outside_workspace_still_rejected() {
+        let config = SandboxConfig {
+            allowed_paths: vec![PathBuf::from("/tmp")],
+            ..Default::default()
+        };
+        let tool = SandboxedTool::new(EchoTool, config);
+        let mut context = dummy_context();
+        context.sandbox.workspace_root = Some(PathBuf::from("/home/user"));
+        let args = json!({"path": "notes.txt"});
+        let result = tool.execute(args, &context).await;
+        assert!(matches!(result, Err(SyscityError::SandboxViolation(_))));
+    }
+
+    /// The security half of the fix: `~` is expanded before the blocklist
+    /// sees the path. The raw string never matched an absolute entry, so this
+    /// request for a private key used to go through.
+    #[tokio::test]
+    async fn test_tilde_path_is_expanded_before_the_blocklist() {
+        let Some(home) = dirs::home_dir() else {
+            return; // no home directory to expand against — nothing to assert
+        };
+        let config = SandboxConfig {
+            blocked_paths: vec![home.join(".ssh")],
+            ..Default::default()
+        };
+        let tool = SandboxedTool::new(EchoTool, config);
+        let args = json!({"path": "~/.ssh/id_rsa"});
+        let result = tool.execute(args, &dummy_context()).await;
+        assert!(
+            matches!(result, Err(SyscityError::SandboxViolation(_))),
+            "~/.ssh/id_rsa must resolve into the blocked ~/.ssh: {result:?}"
+        );
+    }
+
+    /// `working_dir` is the shell's real cwd and the field an operator is
+    /// most likely to point at something they meant to fence off. It was not
+    /// in the scan at all.
+    #[tokio::test]
+    async fn test_working_dir_is_checked_against_the_blocklist() {
+        let config = SandboxConfig {
+            blocked_paths: vec![PathBuf::from("/etc")],
+            ..Default::default()
+        };
+        let tool = SandboxedTool::new(EchoTool, config);
+        let args = json!({"working_dir": "/etc"});
+        let result = tool.execute(args, &dummy_context()).await;
+        assert!(matches!(result, Err(SyscityError::SandboxViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn test_working_dir_relative_resolves_into_allowlist() {
+        let config = SandboxConfig {
+            allowed_paths: vec![PathBuf::from("/tmp")],
+            ..Default::default()
+        };
+        let tool = SandboxedTool::new(EchoTool, config);
+        let args = json!({"working_dir": "sub"});
+        let result = tool.execute(args, &dummy_context()).await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
