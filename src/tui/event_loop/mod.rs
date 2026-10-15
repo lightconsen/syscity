@@ -10,6 +10,7 @@
 //! flush without a following draw leaves the composer invisible.
 // INVARIANTS-NONE: event loop; state lives in `AppState`.
 
+mod complete;
 mod events;
 mod keys;
 mod plain;
@@ -196,6 +197,12 @@ where
                         in_flight = Some(spawn_action(action, &state, Arc::clone(client)));
                     }
                 }
+            }
+            // Typing may have moved the cursor into an `@path` token naming a
+            // directory nobody has listed yet. This asks in the background and
+            // returns at once, so neither the keystroke nor Tab waits on it.
+            if let Some(client) = ws.as_ref() {
+                complete::ensure_path_listing(&state, client).await;
             }
             if state.read().await.should_quit {
                 break;

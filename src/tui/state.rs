@@ -443,6 +443,12 @@ impl PathCompletions {
         }
     }
 
+    /// True when the gateway refused this directory: cached as a fact so the
+    /// composer stops asking, and observable so a caller can say so.
+    pub fn is_unavailable(&self, dir: &str) -> bool {
+        matches!(self.dirs.get(dir), Some(DirState::Unavailable))
+    }
+
     /// Mark a fetch as wanted. `None` means it is already cached or already
     /// in flight — either way the caller should not send another request.
     pub fn begin_fetch(&mut self, dir: &str) -> Option<u64> {
@@ -1091,6 +1097,9 @@ impl AppState {
         let was_running = self.is_running;
         self.end_run();
         self.transcript.finish_open_streams();
+        // The listings described a workspace this connection can no longer
+        // vouch for, and any request still out has nowhere to come back to.
+        self.path_completions.invalidate();
 
         let dropped_approvals = self.approvals.len();
         self.approvals.clear();

@@ -101,6 +101,9 @@ pub async fn switch_to(
     ws: &WsClient,
 ) -> Result<(), TuiError> {
     let previous = { state.read().await.current_session.clone() };
+    // A different session can be bound to a different agent, and therefore a
+    // different workspace: the cached listings are not this session's.
+    state.write().await.path_completions.invalidate();
     if let Some(previous) = previous.filter(|p| p != id) {
         // Without this the connection keeps receiving the old session's deltas.
         if let Err(e) = gw::sessions_unsubscribe(ws, &previous).await {

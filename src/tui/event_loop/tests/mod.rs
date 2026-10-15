@@ -6,6 +6,7 @@
 
 mod support;
 
+mod complete_tests;
 mod events_tests;
 mod loop_tests;
 mod plain_tests;
