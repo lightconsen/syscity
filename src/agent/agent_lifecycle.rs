@@ -10,6 +10,7 @@ use crate::providers::Message;
 use crate::tools::ToolRegistry;
 
 use super::agent_cache::{RE_CODE_BLOCK, RE_URL};
+use super::planner::ActivePlanView;
 use super::*;
 
 impl Agent {
@@ -145,6 +146,16 @@ impl Agent {
             }
             (before, after)
         })
+    }
+
+    /// Whether a conversation has a plan in flight, and how far along it is.
+    ///
+    /// The plan itself is the agent's own bookkeeping — the model drives it
+    /// through the `update_plan` tool — so this is the read side: what a client
+    /// shows when someone asks what the agent thinks it is doing.
+    pub async fn active_plan(&self, conversation_id: &str) -> Option<ActivePlanView> {
+        let plans = self.active_plans.read().await;
+        plans.get(conversation_id).map(ActivePlanView::from_active)
     }
 
     /// Undo the last turn for a conversation.

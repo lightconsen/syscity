@@ -250,6 +250,85 @@ pub async fn sessions_undo(ws: &WsClient, id: &str, count: u32) -> Result<u32, T
     Ok(value.get("undone").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
 }
 
+/// One step of the session's plan, as the gateway reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTask {
+    pub description: String,
+    pub expected_outcome: String,
+    pub current: bool,
+    pub done: bool,
+}
+
+/// The plan a session is executing, if it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub goal: String,
+    pub original_request: String,
+    pub is_complete: bool,
+    pub tasks: Vec<PlanTask>,
+}
+
+/// Ask what the session is working through.
+///
+/// `Ok(None)` is "this conversation has no plan", which is its ordinary state —
+/// not an error and not worth an `Err`.
+pub async fn sessions_plan(ws: &WsClient, id: &str) -> Result<Option<Plan>, TuiError> {
+    let value = ws
+        .request("sessions.plan", Some(json!({ "session_id": id })))
+        .await?;
+    Ok(parse_plan(&value))
+}
+
+/// Read a `sessions.plan` payload. `None` when the payload carries no plan.
+fn parse_plan(value: &Value) -> Option<Plan> {
+    let plan = value.get("plan")?;
+    if plan.is_null() {
+        return None;
+    }
+    Some(Plan {
+        goal: plan
+            .get("goal")
+            .and_then(|g| g.as_str())
+            .unwrap_or("")
+            .to_string(),
+        original_request: plan
+            .get("original_request")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_complete: plan
+            .get("is_complete")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(false),
+        tasks: plan
+            .get("tasks")
+            .and_then(|t| t.as_array())
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .map(|task| PlanTask {
+                        description: task
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        expected_outcome: task
+                            .get("expected_outcome")
+                            .and_then(|o| o.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        current: task
+                            .get("current")
+                            .and_then(|c| c.as_bool())
+                            .unwrap_or(false),
+                        done: task.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))

@@ -93,6 +93,11 @@ pub enum AgentQuery {
         conv_id: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    /// The plan a conversation is executing, if it has one.
+    GetPlan {
+        conv_id: String,
+        response_tx: tokio::sync::oneshot::Sender<Option<crate::agent::ActivePlanView>>,
+    },
 }
 
 /// Events broadcast by gateway

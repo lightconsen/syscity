@@ -401,6 +401,8 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("cost.reset", Some(SCOPE_WRITE)),
     ("sessions.rename", Some(SCOPE_WRITE)),
     ("sessions.undo", Some(SCOPE_WRITE)),
+    // A read: it reports the plan, it does not change it.
+    ("sessions.plan", Some(SCOPE_READ)),
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),

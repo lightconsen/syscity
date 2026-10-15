@@ -127,7 +127,7 @@ pub use personality::{
     AgentPersonality, AgentRegistry, AgentTemplateParams, PersonalityContext, SharedAgentRegistry,
 };
 pub use planner::PersistedPlan;
-pub use planner::{ActivePlan, TaskPlan, TaskPlanner};
+pub use planner::{ActivePlan, ActivePlanView, PlanTaskView, TaskPlan, TaskPlanner};
 pub use prompt_builder::{ConversationPhase, PromptBuilder, PromptContext, TaskType};
 pub use route_resolution::{
     BindingCache, BindingMode, ConversationScope, ResolvedBinding, RouteResolution, RouteResolver,

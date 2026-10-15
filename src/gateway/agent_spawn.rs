@@ -471,6 +471,14 @@ pub(crate) async fn run_agent_loop(
                             );
                         }
                     }
+                    super::AgentQuery::GetPlan { conv_id, response_tx } => {
+                        if let Err(e) = response_tx.send(agent.active_plan(&conv_id).await) {
+                            warn!(
+                                "Agent {}: failed to send the plan for {}: {:?}",
+                                agent_id, conv_id, e
+                            );
+                        }
+                    }
                 }
             }
         }

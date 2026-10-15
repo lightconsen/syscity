@@ -23,7 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
-    "expand", "undo", "theme", "mode",
+    "expand", "undo", "plan", "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -90,6 +90,7 @@ async fn handle_local_command(
         "resume" => crate::tui::resume::command_resume(args, state, ws).await,
         "rename" | "title" => command_rename(args, state, ws).await,
         "undo" => command_undo(args, state, ws).await,
+        "plan" => command_plan(state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -237,6 +238,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("rename", "<name>", "rename the current session"),
         ("title", "<name>", "alias of /rename"),
         ("undo", "[n]", "walk back over the last turn, or several"),
+        ("plan", "", "print the plan the agent is working through"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -534,6 +536,71 @@ async fn command_undo(
         "── undone {undone} {plural}; the lines above are still shown, but the agent no longer \
          has them ──"
     ));
+    Ok(())
+}
+
+/// `/plan` — print the plan the agent is working through.
+///
+/// The plan is the agent's own, made by the planner and advanced through the
+/// `update_plan` tool, so this prints what it says rather than anything the TUI
+/// tracks. A conversation with no plan says so: that is the ordinary state, and
+/// it is not a failure.
+async fn command_plan(state: Arc<RwLock<AppState>>, ws: &WsClient) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session yet");
+        return Ok(());
+    };
+
+    let plan = gw::sessions_plan(ws, &id).await?;
+    let mut s = state.write().await;
+    let Some(plan) = plan else {
+        s.transcript
+            .push_notice("no active plan — the agent works turn by turn until it makes one");
+        return Ok(());
+    };
+
+    let mut lines = vec![TranscriptLine::new(
+        LineKind::Notice,
+        format!("🎯 plan: {}", plan.goal),
+    )];
+    for (index, task) in plan.tasks.iter().enumerate() {
+        // The marker is the whole point of the view: where the agent is, and
+        // what is behind it.
+        let marker = match (task.done, task.current) {
+            (true, _) => "✔",
+            (false, true) => "▶",
+            (false, false) => "·",
+        };
+        lines.push(TranscriptLine::new(
+            LineKind::Notice,
+            format!("  {marker} {}. {}", index + 1, task.description),
+        ));
+        if task.current && !task.expected_outcome.is_empty() {
+            lines.push(TranscriptLine::new(
+                LineKind::Notice,
+                format!("      expected: {}", task.expected_outcome),
+            ));
+        }
+    }
+    let done = plan.tasks.iter().filter(|t| t.done).count();
+    lines.push(TranscriptLine::new(
+        LineKind::Notice,
+        format!(
+            "  {done}/{} done{}",
+            plan.tasks.len(),
+            if plan.is_complete {
+                " — complete"
+            } else {
+                ""
+            }
+        ),
+    ));
+    s.transcript.push(lines);
     Ok(())
 }
 
@@ -1725,5 +1792,65 @@ mod tests {
         drop(requests);
         let lines = output(&state).await;
         assert!(lines[0].contains("Release triage"), "got {lines:?}");
+    }
+
+    /// `/plan` prints the plan the agent reports, marking where it is.
+    #[tokio::test]
+    async fn plan_prints_the_agents_plan() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.plan",
+            serde_json::json!({
+                "session_id": "s1",
+                "plan": {
+                    "goal": "ship the release",
+                    "original_request": "cut 0.4",
+                    "is_complete": false,
+                    "tasks": [
+                        { "description": "bump the version", "expected_outcome": "0.4.0 in Cargo.toml",
+                          "current": false, "done": true },
+                        { "description": "write the notes", "expected_outcome": "a CHANGELOG section",
+                          "current": true, "done": false },
+                    ],
+                },
+            }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_plan(state.clone(), &client).await;
+
+        let requests = gateway.requests();
+        let plan = requests
+            .iter()
+            .find(|r| r.method == "sessions.plan")
+            .expect("the plan on the wire");
+        assert_eq!(plan.params["session_id"], "s1");
+        drop(requests);
+
+        let lines = output(&state).await;
+        let text = lines.join("\n");
+        assert!(text.contains("ship the release"), "got {text}");
+        assert!(text.contains("✔ 1. bump the version"), "got {text}");
+        assert!(text.contains("▶ 2. write the notes"), "got {text}");
+        // The expected outcome is shown only for the step being worked on: it is
+        // what "done" means now, and a wall of them buries the position.
+        assert!(text.contains("expected: a CHANGELOG section"), "got {text}");
+        assert!(!text.contains("expected: 0.4.0"), "got {text}");
+        assert!(text.contains("1/2 done"), "got {text}");
+    }
+
+    /// No plan is the ordinary state of a conversation, not a failure.
+    #[tokio::test]
+    async fn plan_says_when_there_is_none() {
+        let gateway = TestGateway::start().await;
+        gateway.reply("sessions.plan", serde_json::json!({ "session_id": "s1", "plan": null }));
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_plan(state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("no active plan"), "got {lines:?}");
     }
 }

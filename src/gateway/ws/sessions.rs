@@ -155,6 +155,110 @@ pub(super) async fn handle_sessions_delete(
     )
 }
 
+/// `sessions.plan` — the plan the session is executing (`{ session_id? }`).
+///
+/// The plan belongs to the agent, so this asks it rather than reading anything
+/// here; an agent with no plan for the session is an answer ("there is none"),
+/// not an error, because that is the ordinary state of a conversation.
+pub(super) async fn handle_sessions_plan(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let agent_id = state
+        .agents
+        .router
+        .resolve_by_session(&session_id)
+        .await
+        .agent_id;
+    let handle = {
+        let agents = state.agents.agents.read().await;
+        agents.get(&agent_id).cloned()
+    };
+    let Some(handle) = handle else {
+        return WsResponse::err(
+            &req.id,
+            "NOT_FOUND",
+            format!("session '{session_id}' is not attached to a running agent"),
+        );
+    };
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    if handle
+        .query_tx
+        .send(crate::gateway::runtime::AgentQuery::GetPlan {
+            conv_id: session_id.clone(),
+            response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return WsResponse::err(
+            &req.id,
+            "AGENT_UNAVAILABLE",
+            format!("agent '{agent_id}' is no longer running"),
+        );
+    }
+    let plan = match response_rx.await {
+        Ok(plan) => plan,
+        Err(e) => {
+            warn!("Agent {agent_id} did not answer a plan request: {e}");
+            return WsResponse::err(
+                &req.id,
+                "AGENT_UNAVAILABLE",
+                format!("agent '{agent_id}' did not answer"),
+            );
+        }
+    };
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "session_id": session_id,
+            "plan": plan,
+        }),
+    )
+}
+
+/// The session a request is about: the one it names, else the one its
+/// connection is watching, else a refusal.
+///
+/// Naming it is optional on purpose — a client subscribed to a single session
+/// asks about *that* session, which is what makes the TUI commands read as
+/// `/undo` and `/plan` rather than `/undo <id>`.
+pub(super) async fn session_id_for(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    _state: &Arc<GatewayState>,
+) -> Result<String, WsResponse> {
+    #[derive(Debug, Deserialize)]
+    struct SessionIdParam {
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+
+    let params: SessionIdParam = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return Err(res),
+    };
+    if let Some(id) = params.session_id.filter(|id| !id.is_empty()) {
+        return Ok(id);
+    }
+    match conn.read().await.subscriptions.first().cloned() {
+        Some(id) => Ok(id),
+        None => Err(WsResponse::err(
+            &req.id,
+            "INVALID_PARAMS",
+            "no session_id given and this connection is not subscribed to one",
+        )),
+    }
+}
+
 /// `sessions.undo` — walk a session back over its last turn, or several
 /// (`{ session_id?, count? }`).
 ///
@@ -170,7 +274,10 @@ pub(super) async fn handle_sessions_undo(
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct UndoParams {
+        /// Read via [`session_id_for`]; accepted here so the field is not
+        /// rejected as unknown.
         #[serde(default)]
+        #[allow(dead_code)]
         session_id: Option<String>,
         #[serde(default)]
         count: Option<u32>,
@@ -183,18 +290,9 @@ pub(super) async fn handle_sessions_undo(
 
     // A session the caller did not name is the one it is watching, which is what
     // makes `/undo` in the TUI a command with no arguments at all.
-    let session_id = match params.session_id {
-        Some(id) if !id.is_empty() => id,
-        _ => match conn.read().await.subscriptions.first().cloned() {
-            Some(id) => id,
-            None => {
-                return WsResponse::err(
-                    &req.id,
-                    "INVALID_PARAMS",
-                    "no session_id given and this connection is not subscribed to one",
-                )
-            }
-        },
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
     };
 
     let count = params.count.unwrap_or(1).clamp(1, 1000);
@@ -1079,7 +1177,8 @@ mod tests {
 
     /// Build a state with one running agent whose query channel answers the
     /// `UndoLastTurn` queries from `answers`, in order — a stand-in for the
-    /// agent loop, which is what really answers them.
+    /// agent loop, which is what really answers them. `GetPlan` is answered with
+    /// no plan: these tests are about the undo path.
     async fn state_with_undoing_agent(answers: Vec<bool>) -> Arc<GatewayState> {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
         let provider: Arc<dyn crate::providers::Provider> =
@@ -1113,6 +1212,9 @@ mod tests {
                     crate::gateway::AgentQuery::UndoLastTurn { response_tx, .. } => {
                         let answer = answers.next().unwrap_or(false);
                         let _ = response_tx.send(answer);
+                    }
+                    crate::gateway::AgentQuery::GetPlan { response_tx, .. } => {
+                        let _ = response_tx.send(None);
                     }
                     // The handler only sends undo queries; anything else means
                     // this test has lost track of what it is testing.
@@ -1176,6 +1278,44 @@ mod tests {
         let payload = res.payload.expect("payload");
         assert_eq!(payload["undone"], 1);
         assert_eq!(payload["requested"], 1);
+    }
+
+    /// `sessions.plan` reaches the agent and reports what it says — including
+    /// "nothing", which is the ordinary state of a conversation.
+    #[tokio::test]
+    async fn plan_reports_the_agents_answer_including_none() {
+        let state = state_with_undoing_agent(vec![]).await;
+        let conn = make_test_conn(&["read"]);
+
+        let res = handle_sessions_plan(
+            &req("r1", "sessions.plan", serde_json::json!({ "session_id": "s1" })),
+            &conn,
+            &state,
+        )
+        .await;
+
+        assert!(res.ok, "{:?}", res.error);
+        let payload = res.payload.expect("payload");
+        assert_eq!(payload["session_id"], "s1");
+        assert!(payload["plan"].is_null(), "a conversation with no plan reports none");
+    }
+
+    /// The plan belongs to the agent, so a session with no running agent has no
+    /// plan to report — and saying so beats reporting an empty one.
+    #[tokio::test]
+    async fn plan_reports_a_session_with_no_running_agent() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["read"]);
+
+        let res = handle_sessions_plan(
+            &req("r1", "sessions.plan", serde_json::json!({ "session_id": "nobody-home" })),
+            &conn,
+            &state,
+        )
+        .await;
+
+        assert!(!res.ok);
+        assert_eq!(res.error.expect("error").code, "NOT_FOUND");
     }
 
     #[tokio::test]

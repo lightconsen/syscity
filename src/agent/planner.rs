@@ -544,6 +544,61 @@ impl ActivePlan {
 
 // ── Persistence ──────────────────────────────────────────────────────────
 
+/// What a client needs to show a plan: the goal, the steps in order, and which
+/// one is current.
+///
+/// A view rather than the plan itself, because the full `ActivePlan` holds a
+/// `TodoStore` that is neither serializable nor anybody else's business. The
+/// three fields here are the plan as its reader sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivePlanView {
+    /// The request the plan was made for.
+    pub original_request: String,
+    /// What the plan is trying to achieve.
+    pub goal: String,
+    /// The steps, in execution order.
+    pub tasks: Vec<PlanTaskView>,
+    /// Whether every step has run.
+    pub is_complete: bool,
+}
+
+/// One step of a plan, as its reader sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanTaskView {
+    /// Step description.
+    pub description: String,
+    /// The expected outcome, which is what "done" means for the step.
+    pub expected_outcome: String,
+    /// This is the step being worked on.
+    pub current: bool,
+    /// This step has been completed.
+    pub done: bool,
+}
+
+impl ActivePlanView {
+    /// Read a live plan as the view.
+    pub fn from_active(active: &ActivePlan) -> Self {
+        let current = active.plan.current_task_index;
+        Self {
+            original_request: active.plan.original_request.clone(),
+            goal: active.plan.goal.clone(),
+            tasks: active
+                .plan
+                .tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| PlanTaskView {
+                    description: task.description.clone(),
+                    expected_outcome: task.expected_outcome.clone(),
+                    current: index == current,
+                    done: active.completed_tasks.contains(&task.id),
+                })
+                .collect(),
+            is_complete: active.plan.is_complete,
+        }
+    }
+}
+
 /// Serializable snapshot of an ActivePlan for disk persistence.
 ///
 /// We don't persist the full `ActivePlan` because `TodoStore` isn't
