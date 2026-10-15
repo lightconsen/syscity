@@ -569,6 +569,15 @@ impl TranscriptStore {
             .map_err(|e| format!("Failed to parse transcript JSON: {}", e))
     }
 
+    /// The directory exports are written to and imports are read from.
+    ///
+    /// Exposed so a caller can confine a path to it: a transcript file is named
+    /// by the user, and a name that resolved anywhere on the filesystem would
+    /// turn "import a saved conversation" into "read any file the gateway can".
+    pub fn root_dir(&self) -> &std::path::Path {
+        &self.root_dir
+    }
+
     /// List all transcript files in the store.
     pub async fn list_files(&self) -> Vec<PathBuf> {
         let mut files = Vec::new();

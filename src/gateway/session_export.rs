@@ -88,9 +88,16 @@ pub(crate) async fn export_session(
 
 /// Every stored message of a session, oldest first.
 ///
-/// Paged rather than asked for in one go: `get_messages` takes a limit, and a
-/// conversation longer than any single limit is exactly the one somebody wants
-/// to export.
+/// Read in one go, because that is what an export is: the whole conversation is
+/// about to be written into one file, so streaming it in pages would trade a
+/// query's worth of memory for a page boundary that has to be exact. It cannot
+/// be exact — `get_messages` pages on the timestamp, and a burst of messages
+/// inside one millisecond shares it — so paging here would silently drop the
+/// messages that straddle a boundary.
+///
+/// The order comes from the row id rather than the timestamp for the same
+/// reason: ids are appended in order and a tie between two messages written in
+/// the same millisecond is not a tie about which came first.
 async fn load_all_messages(
     state: &GatewayState,
     session_id: &str,
@@ -99,43 +106,117 @@ async fn load_all_messages(
         return Err("this gateway has no session store, so there is nothing to export".to_string());
     };
 
-    const PAGE: i64 = 500;
-    let mut newest_first: Vec<TranscriptMessage> = Vec::new();
-    let mut before: Option<chrono::DateTime<Utc>> = None;
-    loop {
-        let rows = store
-            .get_messages(session_id, PAGE, before)
-            .await
-            .map_err(|e| format!("failed to read session '{session_id}': {e}"))?;
-        let short_page = (rows.len() as i64) < PAGE;
-        let oldest = rows.last().map(|row| row.5);
-        for row in rows {
-            let (_id, role, content, reasoning, tool_calls, ts, _transcript_id, _run_id, _turn_id) =
-                row;
+    let rows = store
+        .get_messages(session_id, i64::MAX, None)
+        .await
+        .map_err(|e| format!("failed to read session '{session_id}': {e}"))?;
+
+    let mut by_id: Vec<(i64, TranscriptMessage)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let (id, role, content, reasoning, tool_calls, ts, _t, _r, _turn) = row;
             // A reasoning transcript is not something the model *said*, and an
             // assistant message that existed only to carry tool calls has no
             // prose to render; both are dropped, so the export is the
             // conversation rather than every column of the table.
             if reasoning.is_some() || (content.is_empty() && tool_calls.is_some()) {
-                continue;
+                return None;
             }
-            newest_first.push(TranscriptMessage {
-                role,
-                content,
-                timestamp: ts,
-                metadata: None,
-            });
-        }
-        // `get_messages` is newest-first and takes a `before`, so the next page
-        // is whatever is older than the oldest row of this one.
-        match oldest {
-            Some(ts) if !short_page => before = Some(ts),
-            _ => break,
-        }
+            Some((
+                id,
+                TranscriptMessage {
+                    role,
+                    content,
+                    timestamp: ts,
+                    metadata: None,
+                },
+            ))
+        })
+        .collect();
+
+    by_id.sort_by_key(|(id, _)| *id);
+    Ok(by_id.into_iter().map(|(_, message)| message).collect())
+}
+
+/// Import a saved conversation into a session.
+///
+/// Only the **JSON** rendering can be read back: Markdown, HTML and text are
+/// documents written for a person, and re-reading a conversation out of them
+/// would be guesswork dressed up as fidelity. Writing JSON and importing it is
+/// the round trip, and the reason `render_transcript`'s JSON is the full
+/// transcript rather than a summary of it.
+///
+/// `file` is resolved inside the transcript store's own directory and nowhere
+/// else. The name comes from the caller, and a name that could name any file on
+/// the filesystem would make this "read whatever the gateway can read".
+pub(crate) async fn import_session(
+    state: &GatewayState,
+    session_id: &str,
+    file: &str,
+) -> Result<ImportedSession, ExportError> {
+    let store = state
+        .agents
+        .store
+        .as_ref()
+        .ok_or_else(|| ExportError::Failed("this gateway has no session store".to_string()))?;
+    let transcripts = &state.infra.transcript_store;
+
+    let name = std::path::Path::new(file)
+        .file_name()
+        .map(|n| n.to_owned())
+        .ok_or_else(|| ExportError::Failed(format!("'{file}' is not a file name")))?;
+    if name != std::ffi::OsStr::new(file) {
+        // A path was given rather than a name. Accepting it would be accepting
+        // an arbitrary read; the name is enough, since exports land in one
+        // directory.
+        return Err(ExportError::Failed(format!(
+            "'{file}' is a path: give the file's name, as `sessions.export` reported it"
+        )));
     }
 
-    newest_first.reverse();
-    Ok(newest_first)
+    let transcript = transcripts.load(file).await.map_err(|e| {
+        ExportError::Failed(format!(
+            "{e} — only the JSON rendering can be read back ({} is a document, not data)",
+            file.rsplit_once('.')
+                .map(|(_, ext)| ext)
+                .unwrap_or("this file")
+        ))
+    })?;
+    if transcript.messages.is_empty() {
+        return Err(ExportError::Empty);
+    }
+
+    let mut imported = 0usize;
+    for message in &transcript.messages {
+        store
+            .append_message(&crate::agent::session_store::AppendMessageParams {
+                session_id,
+                role: &message.role,
+                content: &message.content,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                ExportError::Failed(format!("failed to append an imported message: {e}"))
+            })?;
+        imported += 1;
+    }
+
+    Ok(ImportedSession {
+        messages: imported,
+        from: transcript.session_id,
+        title: transcript.title,
+    })
+}
+
+/// What an import put where.
+pub(crate) struct ImportedSession {
+    /// How many messages were appended.
+    pub messages: usize,
+    /// The session the file was exported from, which may be another one.
+    pub from: String,
+    /// That session's title, when the export carried one.
+    pub title: Option<String>,
 }
 
 /// A session's name, for the exported document's title.

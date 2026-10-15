@@ -323,6 +323,56 @@ pub(super) async fn handle_sessions_export(
     }
 }
 
+/// `sessions.import` — read a saved conversation into a session
+/// (`{ session_id?, file }`).
+///
+/// The other half of `sessions.export`, and deliberately narrower: only the
+/// JSON rendering round-trips, because the others are documents. The messages
+/// are appended to the session's history, where the next turn and the history
+/// view will find them.
+pub(super) async fn handle_sessions_import(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct ImportParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        file: String,
+    }
+
+    let params: ImportParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    match crate::gateway::session_export::import_session(state, &session_id, &params.file).await {
+        Ok(imported) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "session_id": session_id,
+                "messages": imported.messages,
+                "from": imported.from,
+                "title": imported.title,
+            }),
+        ),
+        Err(crate::gateway::session_export::ExportError::Empty) => WsResponse::err(
+            &req.id,
+            "INVALID_PARAMS",
+            format!("'{}' holds no messages", params.file),
+        ),
+        Err(crate::gateway::session_export::ExportError::Failed(e)) => {
+            WsResponse::err(&req.id, "IMPORT_FAILED", e)
+        }
+    }
+}
+
 /// `sessions.undo` — walk a session back over its last turn, or several
 /// (`{ session_id?, count? }`).
 ///
@@ -1455,6 +1505,110 @@ mod tests {
         .await;
         assert!(!res.ok);
         assert_eq!(res.error.expect("error").code, "NOT_FOUND");
+    }
+
+    /// Export then import is the round trip: what was written can be read back
+    /// into another session, message for message.
+    #[tokio::test]
+    async fn export_then_import_round_trips_the_conversation() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.agents.store.clone().expect("store");
+        for (role, content) in [("user", "keep this"), ("assistant", "kept")] {
+            store
+                .append_message(&crate::agent::session_store::AppendMessageParams {
+                    session_id: "source",
+                    role,
+                    content,
+                    ..Default::default()
+                })
+                .await
+                .expect("append");
+        }
+        let conn = make_test_conn(&["read", "write"]);
+
+        let exported = handle_sessions_export(
+            &req(
+                "r1",
+                "sessions.export",
+                serde_json::json!({ "session_id": "source", "format": "json" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(exported.ok, "{:?}", exported.error);
+        let file = exported.payload.expect("payload")["file_name"]
+            .as_str()
+            .expect("file_name")
+            .to_string();
+
+        let imported = handle_sessions_import(
+            &req(
+                "r2",
+                "sessions.import",
+                serde_json::json!({ "session_id": "target", "file": file }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(imported.ok, "{:?}", imported.error);
+        let payload = imported.payload.expect("payload");
+        assert_eq!(payload["messages"], 2);
+        assert_eq!(payload["from"], "source");
+
+        // The messages are in the target session's history, in order.
+        let messages = store
+            .get_messages("target", 10, None)
+            .await
+            .expect("read back");
+        let contents: Vec<String> = messages.into_iter().map(|m| m.2).collect();
+        assert_eq!(contents, vec!["keep this".to_string(), "kept".to_string()]);
+
+        let _ = tokio::fs::remove_file(state.infra.transcript_store.root_dir().join(&file)).await;
+    }
+
+    /// A rendering is a document, so it is refused rather than parsed on a
+    /// guess — and a path is refused rather than read.
+    #[tokio::test]
+    async fn import_refuses_a_render_and_a_path() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_import(
+            &req(
+                "r1",
+                "sessions.import",
+                serde_json::json!({ "session_id": "s1", "file": "/etc/passwd" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        let error = res.error.expect("error");
+        assert_eq!(error.code, "IMPORT_FAILED");
+        assert!(error.message.contains("is a path"), "{}", error.message);
+
+        let res = handle_sessions_import(
+            &req(
+                "r2",
+                "sessions.import",
+                serde_json::json!({ "session_id": "s1", "file": "conversation.md" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        let error = res.error.expect("error");
+        assert!(
+            error
+                .message
+                .contains("only the JSON rendering can be read back"),
+            "{}",
+            error.message
+        );
     }
 
     #[tokio::test]

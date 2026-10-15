@@ -215,6 +215,7 @@ terminal's scrollback — the TUI runs inline and has no popups.
 | `/undo` | `[n]` | Walk the conversation back over its last turn, or `n` of them (`sessions.undo`). The agent drops them from its context and its turn log; the lines already on screen stay where they are. |
 | `/plan` | — | Print the plan the agent is working through (`sessions.plan`): the goal, each step marked done / current / pending, and the expected outcome of the current one. A conversation with no plan says so. |
 | `/save` | `[md\|html\|json\|text]` | Write this conversation to a file (`sessions.export`), and print where it landed; defaults to Markdown. |
+| `/import` | `<file>` | Read a saved conversation into this session (`sessions.import`), appending its messages to this session's history. Only a `.json` export can be read back — the other renderings are documents, not data. |
 | `/pin` | — | Pin or unpin the current session. |
 | `/agents` | — | List agents. |
 | `/agent` | `<id>` | Start a session bound to an agent. |

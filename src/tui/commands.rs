@@ -23,7 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
-    "expand", "undo", "plan", "save", "theme", "mode",
+    "expand", "undo", "plan", "save", "import", "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -92,6 +92,7 @@ async fn handle_local_command(
         "undo" => command_undo(args, state, ws).await,
         "plan" => command_plan(state, ws).await,
         "save" => command_save(args, state, ws).await,
+        "import" => command_import(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -241,6 +242,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("undo", "[n]", "walk back over the last turn, or several"),
         ("plan", "", "print the plan the agent is working through"),
         ("save", "[md|html|json|text]", "write this conversation to a file"),
+        ("import", "<file>", "read a saved conversation into this session"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -668,6 +670,60 @@ async fn command_save(
                 .await
                 .transcript
                 .push_notice(format!("✘ /save: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// `/import <file>` — read a saved conversation into this session.
+///
+/// The counterpart of `/save`, and narrower on purpose: only the JSON rendering
+/// can be read back, because the others are documents. The gateway names the
+/// directory, so what is given here is a file name — one it wrote, or one put
+/// where exports land.
+async fn command_import(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let file = args.trim();
+    if file.is_empty() {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ usage: /import <file> (a .json export from /save)");
+        return Ok(());
+    }
+
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to import into yet");
+        return Ok(());
+    };
+
+    match gw::sessions_import(ws, &id, file).await {
+        Ok(messages) => {
+            let plural = if messages == 1 { "message" } else { "messages" };
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("📥 imported {messages} {plural} from {file}"));
+        }
+        // The gateway's refusals are its own answers — a path instead of a
+        // name, a rendering instead of data, an empty file — and each of them
+        // is the sentence the user needs.
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /import: {e}"));
         }
     }
     Ok(())
@@ -1977,5 +2033,54 @@ mod tests {
             .filter(|r| r.method == "sessions.export")
             .count();
         assert_eq!(exports, 1, "a refused /save must not reach the wire");
+    }
+
+    /// `/import` sends the file name and reports how much came back.
+    #[tokio::test]
+    async fn import_sends_the_file_and_reports_the_count() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.import",
+            serde_json::json!({ "messages": 12, "from": "other-session" }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_import("triage_20261015.json", state.clone(), &client).await;
+
+        let requests = gateway.requests();
+        let import = requests
+            .iter()
+            .find(|r| r.method == "sessions.import")
+            .expect("the import on the wire");
+        assert_eq!(import.params["session_id"], "s1");
+        assert_eq!(import.params["file"], "triage_20261015.json");
+        drop(requests);
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("12 messages"), "got {lines:?}");
+    }
+
+    /// The gateway's refusal is the sentence the user needs, so it is shown
+    /// rather than replaced with something generic.
+    #[tokio::test]
+    async fn import_shows_why_the_gateway_refused() {
+        let gateway = TestGateway::start().await;
+        gateway.reply("sessions.import", serde_json::json!({}));
+        gateway.fail_with("sessions.import", "IMPORT_FAILED");
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_import("notes.md", state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("/import"), "got {lines:?}");
+
+        // And no argument is refused without asking the gateway anything.
+        let before = gateway.requests().len();
+        let _ = command_import("", state.clone(), &client).await;
+        let lines = output(&state).await;
+        assert!(lines.iter().any(|l| l.contains("usage: /import")), "got {lines:?}");
+        assert_eq!(gateway.requests().len(), before, "an empty /import must not hit the wire");
     }
 }

@@ -406,6 +406,8 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     // A read of the session that writes a file; the read scope is what it
     // needs, since it exposes nothing the reader could not already fetch.
     ("sessions.export", Some(SCOPE_READ)),
+    // A write: it appends to a session's history.
+    ("sessions.import", Some(SCOPE_WRITE)),
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),

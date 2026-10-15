@@ -341,6 +341,14 @@ pub async fn sessions_export(ws: &WsClient, id: &str, format: &str) -> Result<St
         .to_string())
 }
 
+/// Read a saved conversation into a session; returns how many messages came.
+pub async fn sessions_import(ws: &WsClient, id: &str, file: &str) -> Result<u64, TuiError> {
+    let value = ws
+        .request("sessions.import", Some(json!({ "session_id": id, "file": file })))
+        .await?;
+    Ok(value.get("messages").and_then(|m| m.as_u64()).unwrap_or(0))
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))
