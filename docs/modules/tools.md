@@ -115,21 +115,25 @@ pub struct ToolSandbox {
     pub cpu_limit: Option<u64>,
     pub fd_limit: Option<u64>,
     pub process_limit: Option<u64>,
-    pub workspace_root: PathBuf,
+    /// Workspace boundary. `None` means the process-default workspace dir,
+    /// resolved on first read.
+    pub(crate) workspace_root: Option<PathBuf>,
     /// Owning agent's own workspace (differs from `workspace_root` for
     /// delegated children; where reports/artifacts are written)
     pub agent_workspace: Option<PathBuf>,
     pub workspace_only: bool,
-    pub sandbox_policy: Option<SandboxPolicy>,
+    /// The kernel fence around command tools also denies outbound network.
+    pub fence_network: bool,
+    /// The Linux runner builds a private filesystem view around fenced
+    /// commands (read-only root, private `/tmp`). Ignored elsewhere.
+    pub fence_namespaces: NamespacePosture,
     pub plugin_allowlist: Option<Vec<String>>,
 }
 
 pub struct ToolModel {
     pub model_name: Option<String>,
     pub provider_name: Option<String>,
-    pub model_capabilities: ModelCapabilities,
     pub skill_trust: SkillTrust,
-    pub tool_policy: Option<ToolPolicy>,
 }
 ```
 
