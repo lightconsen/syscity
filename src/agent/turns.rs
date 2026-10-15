@@ -204,6 +204,29 @@ impl Thread {
         self.turns.len()
     }
 
+    /// Copy this branch's turn log and context under a new identity.
+    ///
+    /// What a branch is: the same conversation up to now, which can then be
+    /// continued on its own — so the copy carries the turns and the message
+    /// window, and nothing else. The redo stack does not come along, because
+    /// undoing is a fact about *this* branch's history rather than about the
+    /// conversation; a branch that could redo the parent's undo would be able to
+    /// restore a turn the parent no longer has.
+    pub fn fork(&self, id: impl Into<String>, label: impl Into<String>) -> Self {
+        let id = id.into();
+        let mut context = self.context.clone();
+        context.set_id(id.clone());
+        Self {
+            id,
+            label: label.into(),
+            turns: self.turns.clone(),
+            redo_stack: Vec::new(),
+            context,
+            created_at: SystemTime::now(),
+            compaction_state: self.compaction_state.clone(),
+        }
+    }
+
     /// Append a new `Pending` turn for `user_message`.
     ///
     /// Clears the redo stack — new input invalidates the redo history.
@@ -733,5 +756,36 @@ mod tests {
         // Third check - can flush again after compaction
         let _should_flush_3 = thread.should_run_memory_flush(&config);
         // May or may not flush depending on context hash change
+    }
+
+    /// A fork is the same conversation under a new identity: the turns and the
+    /// message window come along, and — the part that would be a bug — the
+    /// parent and the branch are independent afterwards.
+    #[test]
+    fn forking_copies_the_turns_and_leaves_the_parent_alone() {
+        let mut parent = make_thread();
+        parent.push_turn("what changed?");
+        parent.turns[0].complete("the parser");
+        parent.context.add_message(Message::user("what changed?"));
+        parent.context.add_message(Message::assistant("the parser"));
+
+        let mut branch = parent.fork("thread-branch", "branch");
+        assert_eq!(branch.id, "thread-branch");
+        assert_eq!(branch.label, "branch");
+        assert_eq!(branch.context.id(), "thread-branch");
+        assert_eq!(branch.turn_count(), 1);
+        assert_eq!(branch.turns[0].assistant_response, "the parser");
+        assert_eq!(branch.context.message_count(), parent.context.message_count());
+
+        // Writing to the branch does not reach the parent.
+        branch.push_turn("and now?");
+        assert_eq!(branch.turn_count(), 2);
+        assert_eq!(parent.turn_count(), 1, "the parent gained a turn it never had");
+
+        // The redo stack is this branch's business: a fork that could restore
+        // the parent's undone turn would resurrect one the parent dropped.
+        assert!(parent.undo_last_turn());
+        let mut branch = parent.fork("thread-branch-2", "branch-2");
+        assert!(!branch.undo_last_turn(), "the fork inherited the parent's undo");
     }
 }

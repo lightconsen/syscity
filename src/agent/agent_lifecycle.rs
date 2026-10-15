@@ -148,6 +148,71 @@ impl Agent {
         })
     }
 
+    /// Branch a conversation: copy what it has so far under a new id, and
+    /// persist the copy.
+    ///
+    /// The new branch is a *live* conversation — it has the parent's turns and
+    /// message window, so continuing in it continues this conversation rather
+    /// than starting a blank one — and it is written to the session store, so it
+    /// survives a restart and appears in the session list like any other.
+    ///
+    /// Persistence is awaited rather than spawned: the point of the call is to
+    /// create something durable, and reporting success before the rows exist
+    /// would make a failed write look like a branch. The parent is not touched.
+    ///
+    /// Returns the number of turns copied.
+    pub async fn fork_conversation(&self, from: &str, to: &str) -> crate::Result<usize> {
+        let thread_id = format!("thread-{to}");
+
+        // The parent, when this agent has it in memory; otherwise a context of
+        // the kind a fresh conversation gets, since building one is the agent's
+        // job (system prompt, tools, memories) and both are this agent's
+        // conversations.
+        let parent = {
+            let map = self.thread_map.lock().await;
+            map.get(from)
+                .map(|thread| thread.fork(thread_id.clone(), to))
+        };
+        let forked = match parent {
+            Some(forked) => forked,
+            None => {
+                let context = self.build_fresh_context(to, "branch", "").await;
+                Thread::from_context(thread_id.clone(), to, context)
+            }
+        };
+
+        if let (Some(store), Some(session_id)) =
+            (self.session_store.as_ref(), self.session_id.as_deref())
+        {
+            store
+                .save_thread(
+                    session_id,
+                    &thread_id,
+                    &forked.label,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+            for turn in &forked.turns {
+                store
+                    .append_turn(
+                        session_id,
+                        &thread_id,
+                        turn.index as i64,
+                        &turn.user_message,
+                        &turn.assistant_response,
+                        turn_state_name(turn.state),
+                        None,
+                    )
+                    .await?;
+            }
+        }
+
+        let turns = forked.turns.len();
+        self.thread_map.lock().await.insert(to.to_string(), forked);
+        info!("Forked conversation {} into {} ({} turns)", from, to, turns);
+        Ok(turns)
+    }
+
     /// Whether a conversation has a plan in flight, and how far along it is.
     ///
     /// The plan itself is the agent's own bookkeeping — the model drives it
@@ -481,5 +546,117 @@ impl Agent {
                 }
             }
         }
+    }
+}
+
+/// A turn's state as the store records it.
+///
+/// The same words the engine writes: `session_messages.turn_state` is read back
+/// with a `COALESCE(..., 'complete')`, so an unrecognised spelling would show up
+/// as a finished turn.
+fn turn_state_name(state: crate::agent::turns::TurnState) -> &'static str {
+    match state {
+        crate::agent::turns::TurnState::Pending => "pending",
+        crate::agent::turns::TurnState::Running => "running",
+        crate::agent::turns::TurnState::Complete => "complete",
+        crate::agent::turns::TurnState::Interrupted => "interrupted",
+        crate::agent::turns::TurnState::Error => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An agent with a store, the way the gateway builds one.
+    async fn agent_with_store() -> (Arc<Agent>, Arc<crate::agent::session_store::SessionStore>) {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.expect("pool");
+        let store = Arc::new(
+            crate::agent::session_store::SessionStore::from_pool(pool)
+                .await
+                .expect("store"),
+        );
+        // The session row, because the thread rows carry a foreign key to it —
+        // the same order the gateway creates them in.
+        store
+            .save_session(
+                "session-1",
+                &crate::agent::session_store::SessionMetadata::new("session-1", "a", "ws", "u"),
+                "{}",
+            )
+            .await
+            .expect("session row");
+        let agent = AgentBuilder::new()
+            .config(crate::agent::AgentConfig::default())
+            .provider(Arc::new(crate::providers::mock::MockProvider::new()))
+            .tools(Arc::new(ToolRegistry::new()))
+            .build()
+            .expect("agent")
+            .with_session_store(store.clone(), "session-1");
+        (Arc::new(agent), store)
+    }
+
+    /// Give a conversation two turns, the way a finished exchange leaves it.
+    async fn add_turns(agent: &Agent, conversation_id: &str) {
+        let mut map = agent.thread_map.lock().await;
+        let context = agent.build_fresh_context(conversation_id, "u", "").await;
+        let mut thread =
+            Thread::from_context(format!("thread-{conversation_id}"), conversation_id, context);
+        for (user, assistant) in [("first", "one"), ("second", "two")] {
+            let index = thread.push_turn(user);
+            thread.turns[index].complete(assistant);
+            thread.context.add_message(Message::user(user));
+            thread.context.add_message(Message::assistant(assistant));
+        }
+        map.insert(conversation_id.to_string(), thread);
+    }
+
+    /// The branch is the conversation so far, and it is written down: that
+    /// second half is what makes it something to come back to rather than
+    /// something to lose on the next restart.
+    #[tokio::test]
+    async fn forking_a_conversation_copies_it_and_persists_the_copy() {
+        let (agent, store) = agent_with_store().await;
+        add_turns(&agent, "a").await;
+
+        let turns = agent.fork_conversation("a", "b").await.expect("fork");
+        assert_eq!(turns, 2);
+
+        let map = agent.thread_map.lock().await;
+        let branch = map.get("b").expect("the branch is a live conversation");
+        assert_eq!(branch.turn_count(), 2);
+        assert_eq!(branch.turns[1].assistant_response, "two");
+        assert_eq!(branch.context.id(), "thread-b");
+        assert_eq!(map.get("a").expect("parent").turn_count(), 2);
+        drop(map);
+
+        // And it is in the store, turn for turn, so `chat.history` and the
+        // session list see the same conversation the agent has.
+        let rows = store
+            .load_threads_for_session("session-1")
+            .await
+            .expect("threads");
+        let branch_row = rows
+            .iter()
+            .find(|(id, ..)| id == "thread-b")
+            .expect("the branch thread was saved");
+        assert_eq!(branch_row.3.len(), 2);
+        assert_eq!(branch_row.3[0].1, "first");
+        assert_eq!(branch_row.3[1].2, "two");
+    }
+
+    /// Branching a conversation the agent has no thread for branches what it
+    /// has — nothing — rather than failing: a session resumed from the store is
+    /// exactly that case.
+    #[tokio::test]
+    async fn forking_an_unknown_conversation_starts_an_empty_branch() {
+        let (agent, _store) = agent_with_store().await;
+
+        let turns = agent
+            .fork_conversation("never-seen", "branch")
+            .await
+            .expect("fork");
+        assert_eq!(turns, 0);
+        assert!(agent.thread_map.lock().await.contains_key("branch"));
     }
 }

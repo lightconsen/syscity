@@ -1,5 +1,7 @@
 //! Session list/create/delete/rename/pin/reset + subscribe/unsubscribe (incl. legacy).
 
+use chrono::Utc;
+
 use super::*;
 pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
     let sessions: Vec<serde_json::Value> = if let Some(ref store) = state.agents.store {
@@ -257,6 +259,138 @@ pub(super) async fn session_id_for(
             "no session_id given and this connection is not subscribed to one",
         )),
     }
+}
+
+/// `sessions.branch` — continue this conversation down a second path
+/// (`{ session_id?, name? }`).
+///
+/// The branch is a new session holding what this one has so far, so exploring an
+/// alternative does not disturb the original. The copying happens in the agent
+/// (which owns the turns and the message window) and is persisted as it goes, so
+/// the branch is a conversation like any other: it appears in `sessions.list`,
+/// `chat.history` shows it, and `/resume` switches to it.
+pub(super) async fn handle_sessions_branch(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct BranchParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    }
+
+    let params: BranchParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let branch_id = match params
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        Some(name) => format!("{session_id}:{name}"),
+        None => format!("{session_id}:fork-{}", Utc::now().format("%Y%m%d-%H%M%S")),
+    };
+    if let Some(ref store) = state.agents.store {
+        match store.load_session(&branch_id).await {
+            Ok(Some(_)) => {
+                return WsResponse::err(
+                    &req.id,
+                    "ALREADY_EXISTS",
+                    format!("session '{branch_id}' already exists"),
+                )
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return WsResponse::err(
+                    &req.id,
+                    "BRANCH_FAILED",
+                    format!("could not check whether '{branch_id}' exists: {e}"),
+                )
+            }
+        }
+    }
+
+    let agent_id = state
+        .agents
+        .router
+        .resolve_by_session(&session_id)
+        .await
+        .agent_id;
+    let handle = {
+        let agents = state.agents.agents.read().await;
+        agents.get(&agent_id).cloned()
+    };
+    let Some(handle) = handle else {
+        return WsResponse::err(
+            &req.id,
+            "NOT_FOUND",
+            format!("session '{session_id}' is not attached to a running agent"),
+        );
+    };
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    if handle
+        .query_tx
+        .send(crate::gateway::runtime::AgentQuery::ForkConversation {
+            from: session_id.clone(),
+            to: branch_id.clone(),
+            response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return WsResponse::err(
+            &req.id,
+            "AGENT_UNAVAILABLE",
+            format!("agent '{agent_id}' is no longer running"),
+        );
+    }
+    let turns = match response_rx.await {
+        Ok(Ok(turns)) => turns,
+        Ok(Err(e)) => return WsResponse::err(&req.id, "BRANCH_FAILED", e.to_string()),
+        Err(e) => {
+            warn!("Agent {agent_id} did not answer a branch request: {e}");
+            return WsResponse::err(
+                &req.id,
+                "AGENT_UNAVAILABLE",
+                format!("agent '{agent_id}' did not answer"),
+            );
+        }
+    };
+
+    // The session row is what makes the branch findable; the turns the agent
+    // copied are already in its history.
+    let metadata =
+        crate::agent::session_store::SessionMetadata::new(&branch_id, &agent_id, "ws", "ws");
+    if let Some(ref store) = state.agents.store {
+        if let Err(e) = store.save_session(&branch_id, &metadata, "{}").await {
+            return WsResponse::err(
+                &req.id,
+                "BRANCH_FAILED",
+                format!("the branch was copied but its session row could not be written: {e}"),
+            );
+        }
+    }
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "session_id": branch_id,
+            "branch_of": session_id,
+            "turns": turns,
+        }),
+    )
 }
 
 /// `sessions.export` — write a session's conversation to a file
@@ -1294,7 +1428,8 @@ mod tests {
     /// agent loop, which is what really answers them. `GetPlan` is answered with
     /// no plan: these tests are about the undo path.
     async fn state_with_undoing_agent(answers: Vec<bool>) -> Arc<GatewayState> {
-        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        // With a store, because two of these tests are about what reaches it.
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
         let provider: Arc<dyn crate::providers::Provider> =
             Arc::new(crate::providers::mock::MockProvider::new());
         let tools = Arc::new(crate::tools::ToolRegistry::new());
@@ -1329,6 +1464,11 @@ mod tests {
                     }
                     crate::gateway::AgentQuery::GetPlan { response_tx, .. } => {
                         let _ = response_tx.send(None);
+                    }
+                    // A fork of a conversation with no turns copies nothing, and
+                    // that is what the real agent answers too.
+                    crate::gateway::AgentQuery::ForkConversation { response_tx, .. } => {
+                        let _ = response_tx.send(Ok(0));
                     }
                     // The handler only sends undo queries; anything else means
                     // this test has lost track of what it is testing.
@@ -1609,6 +1749,78 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    /// Branching copies the conversation under a new id and writes it down: the
+    /// branch is a session like any other, which is what makes it something you
+    /// can go back to.
+    #[tokio::test]
+    async fn branch_copies_the_conversation_into_a_new_session() {
+        let state = state_with_undoing_agent(vec![]).await;
+        let store = state.agents.store.clone().expect("store");
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_branch(
+            &req(
+                "r1",
+                "sessions.branch",
+                serde_json::json!({ "session_id": "s1", "name": "alternative" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+
+        assert!(res.ok, "{:?}", res.error);
+        let payload = res.payload.expect("payload");
+        assert_eq!(payload["session_id"], "s1:alternative");
+        assert_eq!(payload["branch_of"], "s1");
+        // The stand-in agent copies nothing (it has no turns), and the branch is
+        // still a session: the copy is the agent's, the row is this method's.
+        assert!(
+            store
+                .load_session("s1:alternative")
+                .await
+                .expect("lookup")
+                .is_some(),
+            "the branch has a session row"
+        );
+    }
+
+    /// A branch named after a session that exists is refused: two sessions with
+    /// one id is not two branches, it is a collision.
+    #[tokio::test]
+    async fn branch_refuses_a_name_already_taken() {
+        let state = state_with_undoing_agent(vec![]).await;
+        let store = state.agents.store.clone().expect("store");
+        store
+            .save_session(
+                "s1:alternative",
+                &crate::agent::session_store::SessionMetadata::new(
+                    "s1:alternative",
+                    "a",
+                    "ws",
+                    "u",
+                ),
+                "{}",
+            )
+            .await
+            .expect("seed");
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_branch(
+            &req(
+                "r1",
+                "sessions.branch",
+                serde_json::json!({ "session_id": "s1", "name": "alternative" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+
+        assert!(!res.ok);
+        assert_eq!(res.error.expect("error").code, "ALREADY_EXISTS");
     }
 
     #[tokio::test]

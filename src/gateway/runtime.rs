@@ -93,6 +93,12 @@ pub enum AgentQuery {
         conv_id: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Copy a conversation's turns and context under a new id.
+    ForkConversation {
+        from: String,
+        to: String,
+        response_tx: tokio::sync::oneshot::Sender<crate::Result<usize>>,
+    },
     /// The plan a conversation is executing, if it has one.
     GetPlan {
         conv_id: String,

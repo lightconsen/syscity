@@ -485,6 +485,16 @@ pub(crate) async fn run_agent_loop(
                             );
                         }
                     }
+                    super::AgentQuery::ForkConversation { from, to, response_tx } => {
+                        if let Err(e) =
+                            response_tx.send(agent.fork_conversation(&from, &to).await)
+                        {
+                            warn!(
+                                "Agent {}: failed to send fork result for {}: {:?}",
+                                agent_id, from, e
+                            );
+                        }
+                    }
                     super::AgentQuery::GetPlan { conv_id, response_tx } => {
                         if let Err(e) = response_tx.send(agent.active_plan(&conv_id).await) {
                             warn!(

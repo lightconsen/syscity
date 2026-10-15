@@ -328,6 +328,12 @@ impl Context {
         &self.id
     }
 
+    /// Rename the context — used when a thread is forked, since the copy holds
+    /// the same conversation under a different identity.
+    pub fn set_id(&mut self, id: impl Into<String>) {
+        self.id = id.into();
+    }
+
     /// Get the system prompt
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt

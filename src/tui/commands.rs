@@ -23,7 +23,7 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
-    "expand", "undo", "plan", "save", "import", "theme", "mode",
+    "expand", "undo", "plan", "save", "import", "branch", "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -93,6 +93,7 @@ async fn handle_local_command(
         "plan" => command_plan(state, ws).await,
         "save" => command_save(args, state, ws).await,
         "import" => command_import(args, state, ws).await,
+        "branch" => command_branch(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -243,6 +244,7 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("plan", "", "print the plan the agent is working through"),
         ("save", "[md|html|json|text]", "write this conversation to a file"),
         ("import", "<file>", "read a saved conversation into this session"),
+        ("branch", "[name]", "continue this conversation down a second path"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -724,6 +726,53 @@ async fn command_import(
                 .await
                 .transcript
                 .push_notice(format!("✘ /import: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// `/branch [name]` — continue this conversation down a second path.
+///
+/// The branch is a new session holding what this one has so far; the original is
+/// left exactly as it was, which is the point — exploring an alternative should
+/// not cost you the conversation you had. It does not switch to the branch: the
+/// TUI is subscribed to one session, and moving there is `/resume <id>`, which
+/// the notice names.
+async fn command_branch(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to branch yet");
+        return Ok(());
+    };
+    let name = match args.trim() {
+        "" => None,
+        other => Some(other),
+    };
+
+    match gw::sessions_branch(ws, &id, name).await {
+        Ok(branch) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("⑂ branched to {branch} — /resume {branch} switches to it"));
+        }
+        // The gateway's refusals are its own answers: a name already taken, an
+        // agent that has gone away. Each is the sentence the user needs.
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /branch: {e}"));
         }
     }
     Ok(())
@@ -2082,5 +2131,53 @@ mod tests {
         let lines = output(&state).await;
         assert!(lines.iter().any(|l| l.contains("usage: /import")), "got {lines:?}");
         assert_eq!(gateway.requests().len(), before, "an empty /import must not hit the wire");
+    }
+
+    /// `/branch` names the new session and says how to get to it — it does not
+    /// switch, because the TUI watches one session and moving is `/resume`.
+    #[tokio::test]
+    async fn branch_reports_the_new_session_without_switching() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.branch",
+            serde_json::json!({ "session_id": "s1:alternative", "branch_of": "s1", "turns": 4 }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_branch("alternative", state.clone(), &client).await;
+
+        let requests = gateway.requests();
+        let branch = requests
+            .iter()
+            .find(|r| r.method == "sessions.branch")
+            .expect("the branch on the wire");
+        assert_eq!(branch.params["session_id"], "s1");
+        assert_eq!(branch.params["name"], "alternative");
+        drop(requests);
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("s1:alternative"), "got {lines:?}");
+        assert!(lines[0].contains("/resume"), "how to get there: {lines:?}");
+        assert_eq!(
+            state.read().await.current_session.as_deref(),
+            Some("s1"),
+            "branching must not move the session out from under the user"
+        );
+    }
+
+    /// A refused branch says why, since the gateway's reasons — a name already
+    /// taken, an agent that has gone away — are the ones that matter.
+    #[tokio::test]
+    async fn branch_shows_the_gateways_refusal() {
+        let gateway = TestGateway::start().await;
+        gateway.fail_with("sessions.branch", "ALREADY_EXISTS");
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_branch("alternative", state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("/branch"), "got {lines:?}");
     }
 }

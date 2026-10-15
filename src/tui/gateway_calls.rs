@@ -349,6 +349,22 @@ pub async fn sessions_import(ws: &WsClient, id: &str, file: &str) -> Result<u64,
     Ok(value.get("messages").and_then(|m| m.as_u64()).unwrap_or(0))
 }
 
+/// Branch a session; returns the new session's id.
+pub async fn sessions_branch(
+    ws: &WsClient,
+    id: &str,
+    name: Option<&str>,
+) -> Result<String, TuiError> {
+    let value = ws
+        .request("sessions.branch", Some(json!({ "session_id": id, "name": name })))
+        .await?;
+    Ok(value
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))
