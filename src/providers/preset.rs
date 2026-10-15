@@ -169,30 +169,56 @@ mod tests {
     #[test]
     fn test_builtin_providers_contains_expected() {
         let providers = builtin_providers();
-        assert!(providers.contains_key("openai"));
-        assert!(providers.contains_key("anthropic"));
-        assert!(providers.contains_key("gemini"));
-        assert!(providers.contains_key("kimi"));
-        assert!(providers.contains_key("deepseek"));
-        assert!(providers.contains_key("ollama"));
-        assert!(providers.contains_key("qwen"));
-        assert!(providers.contains_key("minimax"));
-        assert!(providers.contains_key("azure"));
-        assert!(providers.contains_key("glm"));
-        assert!(providers.contains_key("volcengine"));
-        assert!(providers.contains_key("hunyuan"));
-        assert!(providers.contains_key("grok"));
-        assert!(providers.contains_key("mistral"));
-        assert!(providers.contains_key("cohere"));
+        for key in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "kimi",
+            "deepseek",
+            "ollama",
+            "qwen",
+            "minimax",
+            "azure",
+            "glm",
+            "volcengine",
+            "hunyuan",
+            "grok",
+            "mistral",
+            "cohere",
+            "openrouter",
+            "ai-gateway",
+            "huggingface",
+            "opencode",
+            "kilocode",
+            "nvidia",
+            "fireworks",
+            "novita",
+            "gmi",
+            "nebius",
+            "deepinfra",
+            "arcee",
+            "upstage",
+            "groq",
+            "zai",
+            "stepfun",
+            "xiaomi",
+            "tencent-tokenhub",
+            "ollama-cloud",
+            "lmstudio",
+        ] {
+            assert!(providers.contains_key(key), "{key} is missing");
+        }
     }
 
     #[test]
     fn test_embedded_toml_parses() {
         // If the embedded TOML is malformed we would fall back to 2 entries;
-        // the full set proves the file parsed cleanly.
+        // the full set proves the file parsed cleanly. The floor is below the
+        // real count on purpose — this catches a fallback, not a missing row,
+        // which is what the test above is for.
         let providers = builtin_providers();
         assert!(
-            providers.len() >= 9,
+            providers.len() >= 30,
             "expected full preset set from presets.toml, got {}",
             providers.len()
         );
@@ -275,6 +301,25 @@ mod tests {
         let providers = builtin_providers();
         for (name, def) in providers {
             assert!(!def.models.is_empty(), "{name} lists no models");
+        }
+    }
+
+    /// Two vendors sharing an endpoint means one of them was copied and not
+    /// finished — the failure mode a table this size invites.
+    #[test]
+    fn every_preset_has_its_own_base_url() {
+        let providers = builtin_providers();
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for (name, def) in providers {
+            for variant in &def.variants {
+                assert!(
+                    variant.default_base_url.starts_with("http"),
+                    "{name} has no usable base URL"
+                );
+                if let Some(other) = seen.insert(variant.default_base_url.as_str(), name) {
+                    panic!("{name} and {other} share a base URL");
+                }
+            }
         }
     }
 

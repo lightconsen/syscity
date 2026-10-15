@@ -54,22 +54,64 @@ All three accept `ProviderInstanceConfig`, making them fully config-driven. Vend
 ### Builtin Presets (`presets.toml` + `preset.rs`)
 
 Vendor definitions live in `presets.toml`, embedded at compile time via
-`include_str!` and parsed once per `builtin_providers()` call. Adding a new
-vendor is a data-only change (one TOML table). If the embedded TOML ever fails
-to parse, `preset.rs` logs the error and falls back to a minimal hand-rolled
-set (OpenAI + Anthropic) so the gateway still boots.
+`include_str!` and parsed once, on the first `builtin_providers()` call. **This
+is the only vendor registry**: adding a vendor is one TOML table — display name,
+its suggested models, and one table per protocol endpoint — plus a row in the
+table below. Nothing else reads a vendor list of its own; the config-facing
+`model_router::provider_presets()` is a view over this one, adding the legacy
+`ProviderType` and the synthetic `custom` entry.
 
-| Preset | Default Protocol | Default Base URL | Auth | Notes |
-|--------|-----------------|------------------|------|-------|
-| openai | OpenAI | `api.openai.com/v1` | Bearer | — |
-| deepseek | OpenAI | `api.deepseek.com/v1` | Bearer | — |
-| ollama | OpenAI | `localhost:11434/v1` | None | Local models |
-| qwen | OpenAI | `dashscope.aliyuncs.com/compatible-mode/v1` | Bearer | Alibaba Cloud |
-| kimi | OpenAI (v0) / Anthropic (v1) | `api.moonshot.cn/v1` / `api.moonshot.cn/anthropic` | Bearer / ApiKeyHeader | Dual-protocol |
-| anthropic | Anthropic | `api.anthropic.com` | ApiKeyHeader | — |
-| azure | OpenAI | `YOUR_RESOURCE.openai.azure.com` | Bearer | Requires base_url |
-| gemini | Gemini | `generativelanguage.googleapis.com/v1beta` | GoogleApiKey | — |
-| minimax | OpenAI | `api.minimax.chat/v1` | Bearer | — |
+A vendor's `models` list is what the pickers show and what a provider with no
+model list of its own is backfilled from, and its **first entry must be the
+variant's `default_model`** — the two are read interchangeably, so a test holds
+them together. If the embedded TOML ever fails to parse, `preset.rs` logs the
+error and falls back to a minimal hand-rolled set (OpenAI + Anthropic) so the
+gateway still boots.
+
+| Preset | Display name | Default base URL | Auth | Default model |
+|--------|--------------|------------------|------|---------------|
+| `openai` | OpenAI | `api.openai.com/v1` | Bearer | `gpt-5.4-mini` |
+| `deepseek` | DeepSeek | `api.deepseek.com/v1` | Bearer | `deepseek-v4-flash` |
+| `ollama` | Ollama | `localhost:11434/v1` | None | `qwen3` |
+| `qwen` | Qwen | `dashscope.aliyuncs.com/compatible-mode/v1` | Bearer | `qwen3.7-plus` |
+| `kimi` | Moonshot (Kimi) | `api.moonshot.cn/v1` | Bearer | `kimi-k2.6` |
+| `anthropic` | Anthropic | `api.anthropic.com` | `x-api-key` | `claude-sonnet-5` |
+| `azure` | Azure OpenAI | `YOUR_RESOURCE.openai.azure.com` | Bearer | `gpt-5.4` |
+| `gemini` | Gemini | `generativelanguage.googleapis.com/v1beta` | `x-goog-api-key` | `gemini-2.5-flash` |
+| `glm` | GLM (Zhipu) | `open.bigmodel.cn/api/paas/v4` | Bearer | `glm-5.2` |
+| `minimax` | MiniMax | `api.minimax.chat/v1` | Bearer | `MiniMax-M3` |
+| `volcengine` | Volcengine (火山引擎) | `ark.cn-beijing.volces.com/api/v3` | Bearer | `doubao-seed-2-1-pro-260628` |
+| `hunyuan` | Hunyuan (Tencent) | `api.hunyuan.cloud.tencent.com/v1` | Bearer | `hunyuan-turbos-latest` |
+| `grok` | xAI (Grok) | `api.x.ai/v1` | Bearer | `grok-4.3` |
+| `mistral` | Mistral | `api.mistral.ai/v1` | Bearer | `mistral-large-latest` |
+| `cohere` | Cohere | `api.cohere.ai/compatibility/v1` | Bearer | `command-a-plus-05-2026` |
+| `openrouter` | OpenRouter | `openrouter.ai/api/v1` | Bearer | `anthropic/claude-sonnet-5.5` |
+| `ai-gateway` | Vercel AI Gateway | `ai-gateway.vercel.sh/v1` | Bearer | `moonshotai/kimi-k2.6` |
+| `huggingface` | Hugging Face | `router.huggingface.co/v1` | Bearer | `moonshotai/Kimi-K2.6` |
+| `opencode` | OpenCode Zen | `opencode.ai/zen/v1` | Bearer | `kimi-k3` |
+| `kilocode` | Kilo Code | `api.kilo.ai/api/gateway` | Bearer | `anthropic/claude-sonnet-4.6` |
+| `nvidia` | NVIDIA NIM | `integrate.api.nvidia.com/v1` | Bearer | `nvidia/nemotron-3-ultra-550b-a55b` |
+| `fireworks` | Fireworks AI | `api.fireworks.ai/inference/v1` | Bearer | `accounts/fireworks/models/kimi-k2p6` |
+| `novita` | Novita AI | `api.novita.ai/openai/v1` | Bearer | `moonshotai/kimi-k2.5` |
+| `gmi` | GMI Cloud | `api.gmi-serving.com/v1` | Bearer | `deepseek-ai/DeepSeek-V3.2` |
+| `nebius` | Nebius Token Factory | `api.tokenfactory.nebius.com/v1` | Bearer | `nvidia/Nemotron-3-Ultra-550b-a55b` |
+| `deepinfra` | DeepInfra | `api.deepinfra.com/v1/openai` | Bearer | `zai-org/GLM-5.3` |
+| `arcee` | Arcee AI | `api.arcee.ai/api/v1` | Bearer | `trinity-large-thinking` |
+| `upstage` | Upstage | `api.upstage.ai/v1/solar` | Bearer | `solar-pro4` |
+| `groq` | Groq | `api.groq.com/openai/v1` | Bearer | `openai/gpt-oss-120b` |
+| `zai` | Z.AI (GLM) | `api.z.ai/api/paas/v4` | Bearer | `glm-5.3` |
+| `stepfun` | StepFun | `api.stepfun.com/v1` | Bearer | `step-3.7-flash` |
+| `xiaomi` | Xiaomi MiMo | `api.xiaomimimo.com/v1` | Bearer | `mimo-v2.6-pro` |
+| `tencent-tokenhub` | Tencent TokenHub | `tokenhub.tencentmaas.com/v1` | Bearer | `hy4-preview` |
+| `ollama-cloud` | Ollama Cloud | `ollama.com/v1` | Bearer | `kimi-k3` |
+| `lmstudio` | LM Studio | `127.0.0.1:1234/v1` | None | `qwen/qwen3-30b-a3b-2507` |
+
+Only the OpenAI protocol is listed above; `kimi` is the dual-protocol vendor
+(its Anthropic-compatible endpoint is `api.moonshot.cn/anthropic`, selected with
+`protocol = "anthropic"`). `upstage` is the one preset whose model list is not
+under its chat base URL, so its `models_endpoint` is absolute — the only field
+in the file that may be a full URL.
+
 
 ### Resolver (`resolver.rs`)
 
@@ -77,6 +119,11 @@ set (OpenAI + Anthropic) so the gateway still boots.
 - `resolve_from_config()` — Full resolution with all overrides (protocol, base_url, model, max_context, vision/tools support, stream_family, auth_method)
 - Automatically selects the correct protocol variant (e.g. Kimi's Anthropic endpoint when `protocol = "anthropic"`)
 - Custom providers fall through to manual configuration
+- The runtime entry point is `ModelRouter::create_provider(name, config)`: a
+  provider whose **key** names a preset resolves that preset's variant, with the
+  config's own base URL and model on top. `config.provider_type` decides only for
+  a key that is not a preset (a display-name spelling like `DeepSeek`), and
+  otherwise chooses which of a dual-protocol vendor's endpoints to use.
 
 ## Design
 
@@ -140,10 +187,22 @@ pub struct ProtocolVariant {
     pub default_base_url: String,
     pub default_model: String,
     pub auth_method: AuthMethod,
+    /// List-models path relative to `default_base_url`, or an absolute URL when
+    /// the list does not live under it (`None` = derive from the protocol).
+    pub models_endpoint: Option<String>,
     pub default_max_context: usize,
     pub default_supports_vision: bool,
     pub default_supports_tools: bool,
     pub default_stream_family: ProviderStreamFamily,
+}
+
+/// A vendor: its identity, its suggested models, and one variant per endpoint
+pub struct ProviderDefinition {
+    pub name: String,
+    pub display_name: String,
+    /// Suggested model IDs, the default model first
+    pub models: Vec<String>,
+    pub variants: Vec<ProtocolVariant>,
 }
 
 /// Resolved runtime config for a protocol provider

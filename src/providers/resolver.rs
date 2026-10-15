@@ -366,4 +366,21 @@ mod tests {
         let result = resolve_provider("ollama", None, None, None, Some(Protocol::Anthropic));
         assert!(result.is_err());
     }
+
+    /// A vendor added to `presets.toml` is usable without a line of code: its
+    /// key resolves, and to the model its variant declares. The per-preset
+    /// tests above cover the vendors someone thought to name — this covers the
+    /// ones nobody will remember to.
+    #[test]
+    fn every_preset_resolves_to_its_declared_default_model() {
+        for (key, definition) in crate::providers::preset::builtin_providers() {
+            let provider = resolve_provider(key, Some("sk-test".into()), None, None, None)
+                .unwrap_or_else(|e| panic!("{key} does not resolve: {e}"));
+            assert_eq!(
+                provider.default_model(),
+                definition.variants[0].default_model,
+                "{key} resolved to the wrong default model"
+            );
+        }
+    }
 }

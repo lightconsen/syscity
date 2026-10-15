@@ -13,8 +13,10 @@
 # Field encodings (serde):
 #   protocol              = "open_ai" | "anthropic" | "gemini"
 #   auth_method           = "bearer" | "api_key_header" | "google_api_key" | "none"
-#   models_endpoint       = list-models path relative to base_url (e.g. "/models");
-#                           when omitted it is derived from the protocol
+#   models_endpoint       = list-models path relative to base_url (e.g. "/models"),
+#                           or an absolute URL when the list does not live under
+#                           the chat base; when omitted it is derived from the
+#                           protocol
 #   default_stream_family = "OpenAi" | "Anthropic" | "OpenAiReasoning"
 #                           | "AnthropicThinking" | "GoogleThinking"
 #                           | "OpenRouter" | "Moonshot" | "Minimax" | "Generic"
@@ -259,5 +261,388 @@ auth_method = "bearer"
 models_endpoint = "/models"
 default_max_context = 128000
 default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+# ── Aggregators and gateways ────────────────────────────────────────────────
+# One endpoint in front of many vendors' models; the model id carries the
+# vendor ("anthropic/claude-sonnet-5.5"), so the default model is the
+# aggregator's most capable general one rather than a vendor default.
+
+[openrouter]
+display_name = "OpenRouter"
+models = [
+    "anthropic/claude-sonnet-5.5",
+    "anthropic/claude-opus-5.5",
+    "openai/gpt-5.5",
+    "google/gemini-3.8-flash",
+    "deepseek/deepseek-v4-pro",
+    "moonshotai/kimi-k3",
+    "z-ai/glm-5.2",
+    "qwen/qwen3.8-max-0902",
+    "x-ai/grok-4.7",
+    "minimax/minimax-m3",
+]
+[[openrouter.variants]]
+protocol = "open_ai"
+default_base_url = "https://openrouter.ai/api/v1"
+default_model = "anthropic/claude-sonnet-5.5"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1000000
+default_supports_vision = true
+default_supports_tools = true
+# Reasoning arrives in OpenRouter's own delta shape.
+default_stream_family = "OpenRouter"
+
+[ai-gateway]
+display_name = "Vercel AI Gateway"
+models = [
+    "moonshotai/kimi-k2.6",
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4",
+    "google/gemini-3.1-pro-preview",
+    "zai/glm-5.1",
+    "minimax/minimax-m2.7",
+]
+[[ai-gateway.variants]]
+protocol = "open_ai"
+default_base_url = "https://ai-gateway.vercel.sh/v1"
+default_model = "moonshotai/kimi-k2.6"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 262144
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[huggingface]
+display_name = "Hugging Face"
+models = [
+    "moonshotai/Kimi-K2.6",
+    "zai-org/GLM-5.3",
+    "deepseek-ai/DeepSeek-V3.2",
+    "openai/gpt-oss-120b",
+]
+[[huggingface.variants]]
+protocol = "open_ai"
+default_base_url = "https://router.huggingface.co/v1"
+default_model = "moonshotai/Kimi-K2.6"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 262144
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[opencode]
+display_name = "OpenCode Zen"
+models = [
+    "kimi-k3",
+    "claude-sonnet-5",
+    "gpt-5.6-sol",
+    "gemini-3.8-flash",
+    "grok-4.6",
+    "glm-5.3",
+    "minimax-m3",
+    "deepseek-v4-pro",
+]
+[[opencode.variants]]
+protocol = "open_ai"
+default_base_url = "https://opencode.ai/zen/v1"
+default_model = "kimi-k3"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1048576
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[kilocode]
+display_name = "Kilo Code"
+models = [
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-opus-4.6",
+    "openai/gpt-5.4",
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+]
+[[kilocode.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.kilo.ai/api/gateway"
+default_model = "anthropic/claude-sonnet-4.6"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 200000
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+# ── Inference platforms ─────────────────────────────────────────────────────
+# Open-weight models served by a third party; the ids are the platform's own
+# spellings of Hugging Face repositories.
+
+[nvidia]
+display_name = "NVIDIA NIM"
+models = [
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "z-ai/glm-5.3",
+    "moonshotai/kimi-k2.6",
+    "qwen/qwen3.5-397b-a17b",
+]
+[[nvidia.variants]]
+protocol = "open_ai"
+default_base_url = "https://integrate.api.nvidia.com/v1"
+default_model = "nvidia/nemotron-3-ultra-550b-a55b"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1000000
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[fireworks]
+display_name = "Fireworks AI"
+models = [
+    "accounts/fireworks/models/kimi-k2p6",
+    "accounts/fireworks/models/kimi-k2p7-code",
+    "accounts/fireworks/models/glm-5p2",
+]
+[[fireworks.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.fireworks.ai/inference/v1"
+default_model = "accounts/fireworks/models/kimi-k2p6"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 262144
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[novita]
+display_name = "Novita AI"
+models = [
+    "moonshotai/kimi-k2.5",
+    "zai-org/glm-5",
+    "minimax/minimax-m2.7",
+    "deepseek/deepseek-r1-0528",
+    "qwen/qwen3-235b-a22b-fp8",
+]
+[[novita.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.novita.ai/openai/v1"
+default_model = "moonshotai/kimi-k2.5"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 262144
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[gmi]
+display_name = "GMI Cloud"
+models = [
+    "deepseek-ai/DeepSeek-V3.2",
+    "zai-org/GLM-5.1-FP8",
+    "moonshotai/Kimi-K2.5",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.4",
+]
+[[gmi.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.gmi-serving.com/v1"
+default_model = "deepseek-ai/DeepSeek-V3.2"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 163840
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[nebius]
+display_name = "Nebius Token Factory"
+models = [
+    "nvidia/Nemotron-3-Ultra-550b-a55b",
+    "deepseek-ai/DeepSeek-V4-Pro",
+    "zai-org/GLM-5.3",
+    "moonshotai/Kimi-K3",
+    "openai/gpt-oss-120b",
+]
+[[nebius.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.tokenfactory.nebius.com/v1"
+default_model = "nvidia/Nemotron-3-Ultra-550b-a55b"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1048576
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[deepinfra]
+display_name = "DeepInfra"
+models = [
+    "zai-org/GLM-5.3",
+    "deepseek-ai/DeepSeek-V3.2",
+    "moonshotai/Kimi-K2.6",
+    "openai/gpt-oss-120b",
+]
+[[deepinfra.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.deepinfra.com/v1/openai"
+default_model = "zai-org/GLM-5.3"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1048576
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[arcee]
+display_name = "Arcee AI"
+models = [
+    "trinity-large-thinking",
+    "moonshotai/kimi-k3",
+    "deepseek/deepseek-v4-pro",
+    "zai-org/glm-5.2",
+]
+[[arcee.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.arcee.ai/api/v1"
+default_model = "trinity-large-thinking"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 262144
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[upstage]
+display_name = "Upstage"
+models = ["solar-pro4", "solar-pro3", "solar-mini"]
+[[upstage.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.upstage.ai/v1/solar"
+default_model = "solar-pro4"
+auth_method = "bearer"
+# Absolute: chat is under /v1/solar, the model list is not.
+models_endpoint = "https://api.upstage.ai/v1/models"
+default_max_context = 524288
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+# ── Vendor endpoints ────────────────────────────────────────────────────────
+
+# Groq serves open-weight models with its own fast inference.
+[groq]
+display_name = "Groq"
+models = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3.6-27b",
+    "groq/compound",
+]
+[[groq.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.groq.com/openai/v1"
+default_model = "openai/gpt-oss-120b"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 131072
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+# Z.AI is the GLM family's international endpoint; the `glm` preset above is the
+# same family on its mainland one (open.bigmodel.cn).
+[zai]
+display_name = "Z.AI (GLM)"
+models = ["glm-5.3", "glm-5.2", "glm-5.1", "glm-4.7", "glm-4.5-flash"]
+[[zai.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.z.ai/api/paas/v4"
+default_model = "glm-5.3"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1000000
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[stepfun]
+display_name = "StepFun"
+models = ["step-3.7-flash", "step-3.5-flash", "step-5-preview"]
+[[stepfun.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.stepfun.com/v1"
+default_model = "step-3.7-flash"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 256000
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[xiaomi]
+display_name = "Xiaomi MiMo"
+models = ["mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.5-pro"]
+[[xiaomi.variants]]
+protocol = "open_ai"
+default_base_url = "https://api.xiaomimimo.com/v1"
+default_model = "mimo-v2.6-pro"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1048576
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+[tencent-tokenhub]
+display_name = "Tencent TokenHub"
+models = ["hy4-preview", "hy3"]
+[[tencent-tokenhub.variants]]
+protocol = "open_ai"
+default_base_url = "https://tokenhub.tencentmaas.com/v1"
+default_model = "hy4-preview"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1024000
+default_supports_vision = false
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+# ── Local and self-hosted ───────────────────────────────────────────────────
+
+# Ollama's hosted models — the local preset's ids, served remotely.
+[ollama-cloud]
+display_name = "Ollama Cloud"
+models = ["kimi-k3", "glm-5.3", "deepseek-v4-flash", "minimax-m3", "qwen3.5:397b"]
+[[ollama-cloud.variants]]
+protocol = "open_ai"
+default_base_url = "https://ollama.com/v1"
+default_model = "kimi-k3"
+auth_method = "bearer"
+models_endpoint = "/models"
+default_max_context = 1048576
+default_supports_vision = true
+default_supports_tools = true
+default_stream_family = "OpenAi"
+
+# LM Studio's local server. Its model ids are the ones it downloaded, so the
+# list here is a starting point that the picker replaces with whatever the
+# server actually has.
+[lmstudio]
+display_name = "LM Studio"
+models = ["qwen/qwen3-30b-a3b-2507", "openai/gpt-oss-20b", "qwen/qwen3-coder-30b"]
+[[lmstudio.variants]]
+protocol = "open_ai"
+default_base_url = "http://127.0.0.1:1234/v1"
+default_model = "qwen/qwen3-30b-a3b-2507"
+auth_method = "none"
+models_endpoint = "/models"
+default_max_context = 262144
+default_supports_vision = false
 default_supports_tools = true
 default_stream_family = "OpenAi"

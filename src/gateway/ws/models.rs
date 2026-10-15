@@ -185,6 +185,24 @@ pub(super) async fn handle_models_presets(
     WsResponse::ok(&req.id, serde_json::json!({ "presets": list }))
 }
 
+/// The URL to list a provider's models at.
+///
+/// The variant's `models_endpoint` wins where it names one: relative to the
+/// provider's base URL, or absolute for a vendor whose model list does not live
+/// under its chat base (Upstage serves `/v1/solar/chat/completions` but lists at
+/// `/v1/models`). With no endpoint to go on, the protocol decides.
+pub(super) fn models_list_url(
+    variant: Option<&crate::providers::ProtocolVariant>,
+    protocol: crate::providers::Protocol,
+    base_url: &str,
+) -> String {
+    match variant.and_then(|v| v.models_endpoint.as_deref()) {
+        Some(endpoint) if endpoint.starts_with("http") => endpoint.to_string(),
+        Some(endpoint) => format!("{}{}", base_url.trim_end_matches('/'), endpoint),
+        None => models_endpoint_url(protocol, base_url),
+    }
+}
+
 /// Build the list-models endpoint URL for a protocol.
 pub(super) fn models_endpoint_url(protocol: crate::providers::Protocol, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
@@ -314,10 +332,7 @@ pub(super) async fn handle_models_fetch_remote(
             .unwrap_or_default()
     };
 
-    let url = match variant.and_then(|v| v.models_endpoint.as_deref()) {
-        Some(endpoint) => format!("{}{}", base_url.trim_end_matches('/'), endpoint),
-        None => models_endpoint_url(protocol, &base_url),
-    };
+    let url = models_list_url(variant, protocol, &base_url);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -773,6 +788,29 @@ mod tests {
             assert!(entry["name"].as_str().is_some());
             assert!(entry["display_name"].as_str().is_some());
         }
+    }
+
+    #[test]
+    fn models_list_url_reads_the_presets_model_endpoints() {
+        let builtins = crate::providers::preset::builtin_providers();
+        let endpoint_of = |key: &str| builtins[key].variants.first();
+        let protocol = crate::providers::Protocol::OpenAi;
+
+        // Relative to the provider's own base URL.
+        assert_eq!(
+            models_list_url(endpoint_of("openai"), protocol, "https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+        // Absolute, because the list is not under the chat base.
+        assert_eq!(
+            models_list_url(endpoint_of("upstage"), protocol, "https://api.upstage.ai/v1/solar"),
+            "https://api.upstage.ai/v1/models"
+        );
+        // Nothing declared: the protocol's own path.
+        assert_eq!(
+            models_list_url(None, protocol, "https://example.test/v1"),
+            "https://example.test/v1/models"
+        );
     }
 
     #[tokio::test]
