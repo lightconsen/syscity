@@ -222,6 +222,7 @@ terminal's scrollback — the TUI runs inline and has no popups.
 | `/branch` | `[name]` | Continue this conversation down a second path (`sessions.branch`): a new session holding what this one has so far, with the original left alone. Does not switch to it — the notice names the id for `/resume`. |
 | `/snapshot` | `[label\|list]` | Start recording what this session's file writes replace (`sessions.snapshot`), or list what has been recorded. Nothing is kept until a snapshot is open. |
 | `/rollback` | `[id]` | Put the files back as they were at that snapshot (`sessions.rollback`), newest by default. Rolling back drops that snapshot and every newer one — they describe a state that no longer applies. The conversation is untouched: `/undo` is what walks that back. |
+| `/handoff` | `[take <file>]` | Carry a session to another gateway (`sessions.handoff` / `sessions.handoff_take`): a bundle holding the conversation plus the session state that is not in the messages — its name, its model, and the plan it was working through. The file lands in the transcripts directory; copy it across and take it there. The plan travels but is not applied: a plan is the receiving agent's own bookkeeping. |
 | `/pin` | — | Pin or unpin the current session. |
 | `/agents` | — | List agents. |
 | `/agent` | `<id>` | Start a session bound to an agent. |

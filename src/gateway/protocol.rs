@@ -412,6 +412,10 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("sessions.snapshot", Some(SCOPE_WRITE)),
     ("sessions.snapshots", Some(SCOPE_READ)),
     ("sessions.rollback", Some(SCOPE_WRITE)),
+    // Writing a bundle reads the session and writes a file, like
+    // `sessions.export`; taking one appends to a session's history.
+    ("sessions.handoff", Some(SCOPE_READ)),
+    ("sessions.handoff_take", Some(SCOPE_WRITE)),
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),

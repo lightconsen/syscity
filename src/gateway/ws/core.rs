@@ -929,6 +929,8 @@ async fn dispatch_method(
         "sessions.snapshot" => sessions::handle_sessions_snapshot(req, conn, state).await,
         "sessions.snapshots" => sessions::handle_sessions_snapshots(req, conn, state).await,
         "sessions.rollback" => sessions::handle_sessions_rollback(req, conn, state).await,
+        "sessions.handoff" => sessions::handle_sessions_handoff(req, conn, state).await,
+        "sessions.handoff_take" => sessions::handle_sessions_handoff_take(req, conn, state).await,
         "sessions.export" => sessions::handle_sessions_export(req, conn, state).await,
         "sessions.import" => sessions::handle_sessions_import(req, conn, state).await,
         "sessions.set_pinned" => sessions::handle_sessions_set_pinned(req, conn, state).await,

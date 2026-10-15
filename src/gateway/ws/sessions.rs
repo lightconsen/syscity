@@ -261,6 +261,164 @@ pub(super) async fn session_id_for(
     }
 }
 
+/// `sessions.handoff` — write this session out as a bundle another gateway can
+/// take (`{ session_id?, file? }`).
+///
+/// The bundle is the conversation plus the session state that is not in the
+/// messages: its name, its model, and the plan it was working through. What it
+/// is not is a live move — nothing about this session changes, and the receiving
+/// gateway applies it to a session of its own.
+pub(super) async fn handle_sessions_handoff(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct HandoffParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        #[serde(default)]
+        file: Option<String>,
+    }
+
+    let params: HandoffParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    // The plan is the agent's, so it is asked for rather than read here — and a
+    // session whose agent is gone still hands off, without one.
+    let plan = match agent_handle(state, &session_id).await {
+        Some(handle) => match ask_agent(&handle, &session_id).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::debug!("Handing off {session_id} without its plan: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    match crate::gateway::session_export::write_handoff(
+        state,
+        &session_id,
+        params.file.as_deref(),
+        plan,
+    )
+    .await
+    {
+        Ok((path, bundle)) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "session_id": session_id,
+                "file_name": path.file_name().map(|n| n.to_string_lossy().to_string()),
+                "path": path.display().to_string(),
+                "messages": bundle.messages.len(),
+                "plan_steps": bundle.plan.as_ref().and_then(|p| p.get("tasks"))
+                    .and_then(|t| t.as_array()).map(|t| t.len()).unwrap_or(0),
+            }),
+        ),
+        Err(crate::gateway::session_export::ExportError::Empty) => WsResponse::err(
+            &req.id,
+            "NOT_FOUND",
+            format!("session '{session_id}' has no messages to hand off"),
+        ),
+        Err(crate::gateway::session_export::ExportError::Failed(e)) => {
+            WsResponse::err(&req.id, "HANDOFF_FAILED", e)
+        }
+    }
+}
+
+/// `sessions.handoff_take` — apply a bundle to this session
+/// (`{ session_id?, file }`).
+pub(super) async fn handle_sessions_handoff_take(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct TakeParams {
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: Option<String>,
+        file: String,
+    }
+
+    let params: TakeParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let session_id = match session_id_for(req, conn, state).await {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    match crate::gateway::session_export::take_handoff(state, &session_id, &params.file).await {
+        Ok(taken) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "session_id": session_id,
+                "messages": taken.messages,
+                "from_session": taken.from_session,
+                "applied": taken.applied,
+                // Not applied, and said so: a plan belongs to the agent it is
+                // running on, which builds one from the conversation.
+                "plan_steps": taken.plan_steps,
+            }),
+        ),
+        Err(crate::gateway::session_export::ExportError::Empty) => WsResponse::err(
+            &req.id,
+            "INVALID_PARAMS",
+            format!("'{}' carries no messages", params.file),
+        ),
+        Err(crate::gateway::session_export::ExportError::Failed(e)) => {
+            WsResponse::err(&req.id, "HANDOFF_FAILED", e)
+        }
+    }
+}
+
+/// The running agent for a session, if there is one.
+async fn agent_handle(
+    state: &Arc<GatewayState>,
+    session_id: &str,
+) -> Option<crate::gateway::AgentHandle> {
+    let agent_id = state
+        .agents
+        .router
+        .resolve_by_session(session_id)
+        .await
+        .agent_id;
+    let agents = state.agents.agents.read().await;
+    agents.get(&agent_id).cloned()
+}
+
+/// Ask an agent for a conversation's plan.
+async fn ask_agent(
+    handle: &crate::gateway::AgentHandle,
+    session_id: &str,
+) -> crate::Result<Option<serde_json::Value>> {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    handle
+        .query_tx
+        .send(crate::gateway::runtime::AgentQuery::GetPlan {
+            conv_id: session_id.to_string(),
+            response_tx,
+        })
+        .await
+        .map_err(|e| {
+            crate::error::SyscityError::Internal(format!("the agent is no longer running: {e}"))
+        })?;
+    let plan = response_rx.await.map_err(|e| {
+        crate::error::SyscityError::Internal(format!("the agent did not answer: {e}"))
+    })?;
+    Ok(plan.and_then(|plan| serde_json::to_value(plan).ok()))
+}
+
 /// `sessions.snapshot` — start recording what this session's writes replace
 /// (`{ session_id?, label? }`).
 ///
@@ -2038,6 +2196,131 @@ mod tests {
         assert!(!again.ok);
         assert_eq!(again.error.expect("error").code, "NOT_FOUND");
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Handing a session out and taking it elsewhere: the conversation and the
+    /// session state that is not in the messages both travel.
+    #[tokio::test]
+    async fn handoff_writes_a_bundle_that_another_gateway_can_take() {
+        let state = state_with_undoing_agent(vec![]).await;
+        let store = state.agents.store.clone().expect("store");
+        for (role, content) in [("user", "what broke?"), ("assistant", "the parser")] {
+            store
+                .append_message(&crate::agent::session_store::AppendMessageParams {
+                    session_id: "s1",
+                    role,
+                    content,
+                    ..Default::default()
+                })
+                .await
+                .expect("append");
+        }
+        // After the messages, because the first append is what creates the
+        // session row this writes to.
+        store
+            .set_session_name("s1", "release triage")
+            .await
+            .expect("name");
+        let conn = make_test_conn(&["read", "write"]);
+
+        let written = handle_sessions_handoff(
+            &req("r1", "sessions.handoff", serde_json::json!({ "session_id": "s1" })),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(written.ok, "{:?}", written.error);
+        let payload = written.payload.expect("payload");
+        assert_eq!(payload["messages"], 2);
+        let file = payload["file_name"]
+            .as_str()
+            .expect("file_name")
+            .to_string();
+
+        // The bundle carries the name the messages cannot.
+        let path = state.infra.transcript_store.root_dir().join(&file);
+        let text = tokio::fs::read_to_string(&path).await.expect("read");
+        assert!(text.contains("release triage"), "{text}");
+        assert!(text.contains("\"version\""), "{text}");
+
+        // Taking it elsewhere: the messages arrive, and the name is applied to
+        // a session that has none.
+        let taken = handle_sessions_handoff_take(
+            &req(
+                "r2",
+                "sessions.handoff_take",
+                serde_json::json!({ "session_id": "target", "file": file }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(taken.ok, "{:?}", taken.error);
+        let payload = taken.payload.expect("payload");
+        assert_eq!(payload["messages"], 2);
+        assert_eq!(payload["from_session"], "s1");
+        assert_eq!(payload["applied"][0], "name 'release triage'");
+        assert_eq!(
+            store.get_session_name("target").await.expect("name"),
+            Some("release triage".to_string())
+        );
+        let messages = store
+            .get_messages("target", 10, None)
+            .await
+            .expect("history");
+        assert_eq!(messages.len(), 2);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// A bundle this build cannot read is refused rather than partly applied,
+    /// and a path is refused rather than read.
+    #[tokio::test]
+    async fn handoff_refuses_a_version_it_does_not_know_and_a_path() {
+        let state = state_with_undoing_agent(vec![]).await;
+        let conn = make_test_conn(&["write"]);
+        let dir = state.infra.transcript_store.root_dir().to_path_buf();
+        tokio::fs::create_dir_all(&dir).await.expect("dir");
+        tokio::fs::write(
+            dir.join("future.json"),
+            serde_json::json!({
+                "version": 99,
+                "exported_at": "2026-10-16T00:00:00Z",
+                "origin": { "session_id": "other" },
+                "messages": [{ "role": "user", "content": "hi", "timestamp": "2026-10-16T00:00:00Z" }],
+            })
+            .to_string(),
+        )
+        .await
+        .expect("write");
+
+        let res = handle_sessions_handoff_take(
+            &req(
+                "r1",
+                "sessions.handoff_take",
+                serde_json::json!({ "session_id": "s1", "file": "future.json" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        let message = res.error.expect("error").message;
+        assert!(message.contains("version 99"), "{message}");
+
+        let res = handle_sessions_handoff_take(
+            &req(
+                "r2",
+                "sessions.handoff_take",
+                serde_json::json!({ "session_id": "s1", "file": "/etc/passwd" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        assert!(res.error.expect("error").message.contains("is a path"));
+        let _ = tokio::fs::remove_file(dir.join("future.json")).await;
     }
 
     #[tokio::test]

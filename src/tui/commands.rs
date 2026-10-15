@@ -23,7 +23,8 @@ use crate::tui::ws_client::WsClient;
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
     "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
-    "expand", "undo", "plan", "save", "import", "branch", "snapshot", "rollback", "theme", "mode",
+    "expand", "undo", "plan", "save", "import", "branch", "snapshot", "rollback", "handoff",
+    "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -96,6 +97,7 @@ async fn handle_local_command(
         "branch" => command_branch(args, state, ws).await,
         "snapshot" => command_snapshot(args, state, ws).await,
         "rollback" => command_rollback(args, state, ws).await,
+        "handoff" => command_handoff(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -249,6 +251,11 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("branch", "[name]", "continue this conversation down a second path"),
         ("snapshot", "[label|list]", "record what this session's file writes replace"),
         ("rollback", "[id]", "put files back as they were at a snapshot"),
+        (
+            "handoff",
+            "[take <file>]",
+            "write this session out for another gateway, or take one in",
+        ),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -886,6 +893,94 @@ async fn command_rollback(
                 .await
                 .transcript
                 .push_notice(format!("✘ /rollback: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// `/handoff [take <file>]` — carry a session to another gateway.
+///
+/// There is no transport between gateways, so a handoff is a file: this writes
+/// the conversation and the session state that is not in the messages, and the
+/// other side takes it. `take` is the same command on the receiving end,
+/// because that is where someone will look for it.
+async fn command_handoff(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to hand off yet");
+        return Ok(());
+    };
+
+    let args = args.trim();
+    let (verb, rest) = match args.split_once(char::is_whitespace) {
+        Some((verb, rest)) => (verb.to_ascii_lowercase(), rest.trim()),
+        None => (args.to_ascii_lowercase(), ""),
+    };
+
+    if verb == "take" {
+        if rest.is_empty() {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice("⚠ usage: /handoff take <file>");
+            return Ok(());
+        }
+        return match gw::sessions_handoff_take(ws, &id, rest).await {
+            Ok((messages, applied, plan_steps)) => {
+                let mut lines = vec![format!("📦 took {messages} message(s) from {rest}")];
+                if !applied.is_empty() {
+                    lines.push(format!("   applied: {}", applied.join(", ")));
+                }
+                if plan_steps > 0 {
+                    // Said out loud, because it is the one part of the bundle
+                    // that does not take effect: a plan belongs to the agent
+                    // that builds one.
+                    lines.push(format!(
+                        "   the bundle carries a {plan_steps}-step plan, which this agent \
+                         builds for itself — /plan shows its own"
+                    ));
+                }
+                let text = lines.join("\n");
+                state.write().await.transcript.push_notice(text);
+                Ok(())
+            }
+            Err(e) => {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("✘ /handoff: {e}"));
+                Ok(())
+            }
+        };
+    }
+
+    let file = match verb.as_str() {
+        "" => None,
+        _ => Some(args),
+    };
+    match gw::sessions_handoff(ws, &id, file).await {
+        Ok((name, messages, plan_steps)) => {
+            state.write().await.transcript.push_notice(format!(
+                "📦 wrote {messages} message(s) to {name} ({plan_steps} plan steps) — copy it to \
+                 the other gateway and run /handoff take {name} there"
+            ));
+        }
+        Err(e) => {
+            state
+                .write()
+                .await
+                .transcript
+                .push_notice(format!("✘ /handoff: {e}"));
         }
     }
     Ok(())
@@ -2368,5 +2463,74 @@ mod tests {
 
         let lines = output(&state).await;
         assert!(lines[0].contains("/rollback"), "got {lines:?}");
+    }
+
+    /// `/handoff` writes a bundle and says what to do with it; `/handoff take`
+    /// applies one, and says plainly which part does *not* take effect.
+    #[tokio::test]
+    async fn handoff_writes_a_bundle_and_takes_one() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.handoff",
+            serde_json::json!({
+                "file_name": "handoff_s1_20261016.json",
+                "messages": 12,
+                "plan_steps": 3,
+            }),
+        );
+        gateway.reply(
+            "sessions.handoff_take",
+            serde_json::json!({
+                "messages": 12,
+                "from_session": "s1",
+                "applied": ["name 'release triage'", "model 'gpt-5.4'"],
+                "plan_steps": 3,
+            }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_handoff("", state.clone(), &client).await;
+        let lines = output(&state).await;
+        let text = lines.join("\n");
+        assert!(text.contains("handoff_s1_20261016.json"), "got {text}");
+        assert!(text.contains("12 message(s)"), "got {text}");
+        assert!(text.contains("/handoff take"), "the next step: {text}");
+
+        let _ = command_handoff("take handoff_s1_20261016.json", state.clone(), &client).await;
+        let requests = gateway.requests();
+        let take = requests
+            .iter()
+            .find(|r| r.method == "sessions.handoff_take")
+            .expect("the take on the wire");
+        assert_eq!(take.params["file"], "handoff_s1_20261016.json");
+        assert_eq!(take.params["session_id"], "s1");
+        drop(requests);
+
+        let lines = output(&state).await;
+        let text = lines.join("\n");
+        assert!(text.contains("applied: name 'release triage'"), "got {text}");
+        assert!(text.contains("3-step plan"), "got {text}");
+        assert!(text.contains("builds for itself"), "the limit is stated: {text}");
+    }
+
+    /// `take` with nothing to take is refused without asking the gateway.
+    #[tokio::test]
+    async fn handoff_take_needs_a_file() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_handoff("take", state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("usage: /handoff take"), "got {lines:?}");
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|r| r.method == "sessions.handoff_take"),
+            "nothing to take is not a request"
+        );
     }
 }

@@ -441,6 +441,58 @@ pub async fn sessions_rollback(
     ))
 }
 
+/// Write a session out as a handoff bundle; returns the file name it landed in.
+pub async fn sessions_handoff(
+    ws: &WsClient,
+    id: &str,
+    file: Option<&str>,
+) -> Result<(String, u64, u64), TuiError> {
+    let value = ws
+        .request("sessions.handoff", Some(json!({ "session_id": id, "file": file })))
+        .await?;
+    Ok((
+        value
+            .get("file_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        value.get("messages").and_then(|v| v.as_u64()).unwrap_or(0),
+        value
+            .get("plan_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    ))
+}
+
+/// Apply a handoff bundle to a session.
+pub async fn sessions_handoff_take(
+    ws: &WsClient,
+    id: &str,
+    file: &str,
+) -> Result<(u64, Vec<String>, u64), TuiError> {
+    let value = ws
+        .request("sessions.handoff_take", Some(json!({ "session_id": id, "file": file })))
+        .await?;
+    let applied = value
+        .get("applied")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((
+        value.get("messages").and_then(|v| v.as_u64()).unwrap_or(0),
+        applied,
+        value
+            .get("plan_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    ))
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))
