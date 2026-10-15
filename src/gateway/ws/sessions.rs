@@ -155,6 +155,107 @@ pub(super) async fn handle_sessions_delete(
     )
 }
 
+/// `sessions.undo` — walk a session back over its last turn, or several
+/// (`{ session_id?, count? }`).
+///
+/// The undo itself is the agent's, and it stays there: the request goes down the
+/// agent's query channel, so an undo is serialised with the turns it is undoing
+/// rather than racing the loop that is running one. What this adds is a way in —
+/// `AgentQuery::UndoLastTurn` had no caller — and the loop for `/undo 5`, which
+/// stops at the first turn there was nothing to undo.
+pub(super) async fn handle_sessions_undo(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct UndoParams {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        count: Option<u32>,
+    }
+
+    let params: UndoParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+
+    // A session the caller did not name is the one it is watching, which is what
+    // makes `/undo` in the TUI a command with no arguments at all.
+    let session_id = match params.session_id {
+        Some(id) if !id.is_empty() => id,
+        _ => match conn.read().await.subscriptions.first().cloned() {
+            Some(id) => id,
+            None => {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "no session_id given and this connection is not subscribed to one",
+                )
+            }
+        },
+    };
+
+    let count = params.count.unwrap_or(1).clamp(1, 1000);
+
+    let agent_id = state
+        .agents
+        .router
+        .resolve_by_session(&session_id)
+        .await
+        .agent_id;
+    let handle = {
+        let agents = state.agents.agents.read().await;
+        agents.get(&agent_id).cloned()
+    };
+    let Some(handle) = handle else {
+        return WsResponse::err(
+            &req.id,
+            "NOT_FOUND",
+            format!("session '{session_id}' is not attached to a running agent"),
+        );
+    };
+
+    let mut undone = 0u32;
+    for _ in 0..count {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if handle
+            .query_tx
+            .send(crate::gateway::runtime::AgentQuery::UndoLastTurn {
+                conv_id: session_id.clone(),
+                response_tx,
+            })
+            .await
+            .is_err()
+        {
+            // The agent loop is gone: report what did happen rather than
+            // pretending the rest of the undo did too.
+            break;
+        }
+        match response_rx.await {
+            Ok(true) => undone += 1,
+            // Nothing left to undo, or the agent could not answer: either way
+            // there is no point asking again.
+            Ok(false) => break,
+            Err(e) => {
+                warn!("Agent {agent_id} did not answer an undo request: {e}");
+                break;
+            }
+        }
+    }
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "status": "undone",
+            "session_id": session_id,
+            "undone": undone,
+            "requested": count,
+        }),
+    )
+}
+
 pub(super) async fn handle_sessions_rename(
     req: &WsRequest,
     _conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
@@ -974,5 +1075,138 @@ mod tests {
             state.tools.registry.permissions().effective_mode("s1"),
             crate::tools::PermissionMode::Bypass
         );
+    }
+
+    /// Build a state with one running agent whose query channel answers the
+    /// `UndoLastTurn` queries from `answers`, in order — a stand-in for the
+    /// agent loop, which is what really answers them.
+    async fn state_with_undoing_agent(answers: Vec<bool>) -> Arc<GatewayState> {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let provider: Arc<dyn crate::providers::Provider> =
+            Arc::new(crate::providers::mock::MockProvider::new());
+        let tools = Arc::new(crate::tools::ToolRegistry::new());
+        let agent_config = crate::agent::AgentConfig::default();
+        let agent = Arc::new(crate::agent::Agent::new(agent_config.clone(), provider, tools));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (query_tx, mut query_rx) = tokio::sync::mpsc::channel::<crate::gateway::AgentQuery>(8);
+        let handle = crate::gateway::AgentHandle {
+            id: "agent-a".to_string(),
+            config: agent_config.clone(),
+            base_config: agent_config,
+            tx,
+            query_tx,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent,
+        };
+        state
+            .agents
+            .agents
+            .write()
+            .await
+            .insert("agent-a".to_string(), handle);
+
+        tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            while let Some(query) = query_rx.recv().await {
+                match query {
+                    crate::gateway::AgentQuery::UndoLastTurn { response_tx, .. } => {
+                        let answer = answers.next().unwrap_or(false);
+                        let _ = response_tx.send(answer);
+                    }
+                    // The handler only sends undo queries; anything else means
+                    // this test has lost track of what it is testing.
+                    _ => panic!("the handler sent a query this test does not answer"),
+                }
+            }
+        });
+
+        state
+            .agents
+            .router
+            .bind_session(
+                "s1",
+                &crate::inbound::RouteResult {
+                    agent_id: "agent-a".to_string(),
+                    workspace_id: None,
+                    persisted_binding: false,
+                    is_fallback: false,
+                },
+            )
+            .await;
+
+        state
+    }
+
+    #[tokio::test]
+    async fn undo_walks_back_and_stops_when_there_is_nothing_left() {
+        // Three asks, two turns to give: the third answer is the agent saying
+        // there is nothing left, and the loop must stop there rather than keep
+        // asking for the rest of the count.
+        let state = state_with_undoing_agent(vec![true, true, false]).await;
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_undo(
+            &req("r1", "sessions.undo", serde_json::json!({ "session_id": "s1", "count": 5 })),
+            &conn,
+            &state,
+        )
+        .await;
+
+        assert!(res.ok, "{:?}", res.error);
+        let payload = res.payload.expect("payload");
+        assert_eq!(payload["undone"], 2);
+        assert_eq!(payload["requested"], 5);
+        assert_eq!(payload["session_id"], "s1");
+    }
+
+    /// `/undo` with no argument is the common case, and a client watching one
+    /// session should not have to name it.
+    #[tokio::test]
+    async fn undo_defaults_to_the_subscribed_session_and_one_turn() {
+        let state = state_with_undoing_agent(vec![true]).await;
+        let conn = make_test_conn(&["write"]);
+        conn.write().await.subscriptions.push("s1".to_string());
+
+        let res =
+            handle_sessions_undo(&req("r1", "sessions.undo", serde_json::json!({})), &conn, &state)
+                .await;
+
+        assert!(res.ok, "{:?}", res.error);
+        let payload = res.payload.expect("payload");
+        assert_eq!(payload["undone"], 1);
+        assert_eq!(payload["requested"], 1);
+    }
+
+    #[tokio::test]
+    async fn undo_reports_a_session_with_no_running_agent() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_undo(
+            &req("r1", "sessions.undo", serde_json::json!({ "session_id": "nobody-home" })),
+            &conn,
+            &state,
+        )
+        .await;
+
+        assert!(!res.ok);
+        assert_eq!(res.error.expect("error").code, "NOT_FOUND");
+    }
+
+    /// Nothing to name the session with: refused with the reason rather than
+    /// undone against whichever session happened to be first.
+    #[tokio::test]
+    async fn undo_refuses_when_no_session_can_be_determined() {
+        let state = state_with_undoing_agent(vec![true]).await;
+        // No subscriptions, and the caller named none.
+        let conn = make_test_conn(&["write"]);
+
+        let res =
+            handle_sessions_undo(&req("r1", "sessions.undo", serde_json::json!({})), &conn, &state)
+                .await;
+
+        assert!(!res.ok);
+        assert_eq!(res.error.expect("error").code, "INVALID_PARAMS");
     }
 }

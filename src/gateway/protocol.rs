@@ -400,6 +400,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("agents.rename", Some(SCOPE_WRITE)),
     ("cost.reset", Some(SCOPE_WRITE)),
     ("sessions.rename", Some(SCOPE_WRITE)),
+    ("sessions.undo", Some(SCOPE_WRITE)),
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),

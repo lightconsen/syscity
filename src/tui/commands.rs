@@ -22,8 +22,8 @@ use crate::tui::ws_client::WsClient;
 /// Commands implemented inside the TUI.
 pub const LOCAL_COMMANDS: &[&str] = &[
     "new", "clear", "quit", "exit", "help", "history", "config", "status", "tools", "model",
-    "sessions", "resume", "rename", "pin", "agents", "agent", "answer", "copy", "retry", "expand",
-    "theme", "mode",
+    "sessions", "resume", "rename", "title", "pin", "agents", "agent", "answer", "copy", "retry",
+    "expand", "undo", "theme", "mode",
 ];
 
 /// Split a submitted line into `(name, args)`.
@@ -88,7 +88,8 @@ async fn handle_local_command(
         "sessions" => command_sessions(state, ws).await,
         "history" => command_history(args, state, ws).await,
         "resume" => crate::tui::resume::command_resume(args, state, ws).await,
-        "rename" => command_rename(args, state, ws).await,
+        "rename" | "title" => command_rename(args, state, ws).await,
+        "undo" => command_undo(args, state, ws).await,
         "pin" => command_pin(state, ws).await,
         "agents" => command_agents(state, ws).await,
         "agent" => command_agent(args, state, ws).await,
@@ -234,6 +235,8 @@ pub fn local_command_list() -> Vec<CommandInfo> {
         ("sessions", "", "list sessions"),
         ("history", "[n|more]", "print more of this conversation"),
         ("rename", "<name>", "rename the current session"),
+        ("title", "<name>", "alias of /rename"),
+        ("undo", "[n]", "walk back over the last turn, or several"),
         ("pin", "", "pin or unpin the current session"),
         ("agents", "", "list agents"),
         ("agent", "<id>", "start a session bound to an agent"),
@@ -478,6 +481,59 @@ async fn command_rename(
         entry.name = Some(name.to_string());
     }
     s.transcript.push_notice(format!("renamed to \"{name}\""));
+    Ok(())
+}
+
+/// `/undo [n]` — walk the conversation back over its last turn, or several.
+///
+/// The turns are removed by the agent, which is what owns the turn log, the redo
+/// stack and the transcript store; this asks rather than editing anything
+/// locally. What it deliberately does *not* do is erase what is on screen: the
+/// terminal's scrollback cannot be unwritten (the same reason `/clear` says so),
+/// and a view that quietly disagreed with the agent's context would be worse
+/// than one that says out loud which lines no longer count.
+async fn command_undo(
+    args: &str,
+    state: Arc<RwLock<AppState>>,
+    ws: &WsClient,
+) -> Result<(), TuiError> {
+    let requested = match args.trim() {
+        "" => 1,
+        other => match other.parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                state
+                    .write()
+                    .await
+                    .transcript
+                    .push_notice(format!("⚠ /undo takes a positive count, not '{other}'"));
+                return Ok(());
+            }
+        },
+    };
+
+    let session = state.read().await.current_session.clone();
+    let Some(id) = session else {
+        state
+            .write()
+            .await
+            .transcript
+            .push_notice("⚠ no session to undo in yet");
+        return Ok(());
+    };
+
+    let undone = gw::sessions_undo(ws, &id, requested).await?;
+    let mut s = state.write().await;
+    if undone == 0 {
+        s.transcript
+            .push_notice("⚠ nothing to undo — the agent has no turns left to drop");
+        return Ok(());
+    }
+    let plural = if undone == 1 { "turn" } else { "turns" };
+    s.transcript.push_notice(format!(
+        "── undone {undone} {plural}; the lines above are still shown, but the agent no longer \
+         has them ──"
+    ));
     Ok(())
 }
 
@@ -1577,5 +1633,97 @@ mod tests {
         let payload = serde_json::json!({ "model": long });
         let text: Vec<String> = config_lines(&payload).into_iter().map(|l| l.text).collect();
         assert!(text[0].chars().count() < 100);
+    }
+
+    /// `/undo` asks the agent to drop the turn and reports how many went —
+    /// including when fewer went than were asked for.
+    #[tokio::test]
+    async fn undo_asks_the_agent_and_reports_what_actually_went() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.undo",
+            serde_json::json!({ "status": "undone", "undone": 2, "requested": 5 }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_undo("5", state.clone(), &client).await;
+
+        let requests = gateway.requests();
+        let undo = requests
+            .iter()
+            .find(|r| r.method == "sessions.undo")
+            .expect("the undo on the wire");
+        assert_eq!(undo.params["session_id"], "s1");
+        assert_eq!(undo.params["count"], 5);
+        drop(requests);
+
+        // The count reported is the agent's, not the one asked for: saying
+        // "undone 5" when two turns existed would be a lie about the context.
+        let lines = output(&state).await;
+        assert!(lines[0].contains("undone 2 turns"), "got {lines:?}");
+    }
+
+    /// Nothing to undo is a notice, not a silent success: the agent answered,
+    /// and the answer was "there was nothing there".
+    #[tokio::test]
+    async fn undo_with_nothing_left_says_so() {
+        let gateway = TestGateway::start().await;
+        gateway.reply(
+            "sessions.undo",
+            serde_json::json!({ "status": "undone", "undone": 0, "requested": 1 }),
+        );
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = command_undo("", state.clone(), &client).await;
+
+        let lines = output(&state).await;
+        assert!(lines[0].contains("nothing to undo"), "got {lines:?}");
+    }
+
+    /// A count that is not a count is refused locally, without asking the
+    /// agent to undo something nobody asked for.
+    #[tokio::test]
+    async fn undo_refuses_a_count_it_cannot_read() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        for bad in ["-1", "0", "two", "1.5"] {
+            let _ = command_undo(bad, state.clone(), &client).await;
+            let lines = output(&state).await;
+            assert!(lines[0].contains("positive count"), "{bad}: got {lines:?}");
+        }
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|r| r.method == "sessions.undo"),
+            "a refused /undo must not reach the wire"
+        );
+    }
+
+    /// `/title` is `/rename`: same wire call, same effect on the session list.
+    /// Driven through the dispatcher, because the alias is what is registered —
+    /// a helper the match arm does not reach would test nothing.
+    #[tokio::test]
+    async fn title_is_rename() {
+        let gateway = TestGateway::start().await;
+        let (state, client) = connect(&gateway).await;
+        state.write().await.current_session = Some("s1".to_string());
+
+        let _ = handle_slash_command("/title Release triage", state.clone(), &client).await;
+
+        let requests = gateway.requests();
+        let rename = requests
+            .iter()
+            .find(|r| r.method == "sessions.rename")
+            .expect("the rename on the wire");
+        assert_eq!(rename.params["session_id"], "s1");
+        assert_eq!(rename.params["name"], "Release triage");
+        drop(requests);
+        let lines = output(&state).await;
+        assert!(lines[0].contains("Release triage"), "got {lines:?}");
     }
 }

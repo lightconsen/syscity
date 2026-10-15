@@ -43,6 +43,10 @@ struct Shared {
     close: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     silent: Arc<std::sync::atomic::AtomicBool>,
     failures: Arc<Mutex<HashMap<String, String>>>,
+    /// Scripted success payloads, overriding [`canned`]/[`payload_for`] — the
+    /// shapes that depend on the call (how many turns an undo took, what a
+    /// plan contains) cannot be canned ahead of time.
+    replies: Arc<Mutex<HashMap<String, Value>>>,
     upgrade_headers: Arc<Mutex<Vec<(String, String)>>>,
     history: Arc<Mutex<Vec<Value>>>,
     held: Arc<Mutex<Vec<String>>>,
@@ -72,6 +76,7 @@ impl TestGateway {
             close: Arc::new(Mutex::new(None)),
             silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failures: Arc::new(Mutex::new(HashMap::new())),
+            replies: Arc::new(Mutex::new(HashMap::new())),
             upgrade_headers: Arc::new(Mutex::new(Vec::new())),
             history: Arc::new(Mutex::new(Vec::new())),
             held: Arc::new(Mutex::new(Vec::new())),
@@ -134,6 +139,15 @@ impl TestGateway {
             .lock()
             .expect("failure table")
             .insert(method.to_string(), code.to_string());
+    }
+
+    /// Make `method` answer with `payload`.
+    pub fn reply(&self, method: &str, payload: Value) {
+        self.shared
+            .replies
+            .lock()
+            .expect("reply table")
+            .insert(method.to_string(), payload);
     }
 
     /// Every request received so far, in order.
@@ -256,7 +270,13 @@ async fn serve(stream: tokio::net::TcpStream, shared: Shared, mut close_rx: ones
                         "type": "res",
                         "id": frame["id"].clone(),
                         "ok": true,
-                        "payload": payload_for(&method, &params, &shared.history),
+                        "payload": shared
+                            .replies
+                            .lock()
+                            .expect("reply table")
+                            .get(&method)
+                            .cloned()
+                            .unwrap_or_else(|| payload_for(&method, &params, &shared.history)),
                     }),
                 };
                 if socket.send(Message::Text(reply.to_string())).await.is_err() {

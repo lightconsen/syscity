@@ -238,6 +238,18 @@ pub async fn sessions_rename(ws: &WsClient, id: &str, name: &str) -> Result<(), 
         .map(|_| ())
 }
 
+/// Undo the last turn (or several) of a session, returning how many went.
+///
+/// The count that comes back is the agent's answer, not the one asked for:
+/// `/undo 5` on a conversation with two turns undoes two, and the caller has to
+/// be able to say so.
+pub async fn sessions_undo(ws: &WsClient, id: &str, count: u32) -> Result<u32, TuiError> {
+    let value = ws
+        .request("sessions.undo", Some(json!({ "session_id": id, "count": count })))
+        .await?;
+    Ok(value.get("undone").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+}
+
 /// Pin or unpin a session.
 pub async fn sessions_set_pinned(ws: &WsClient, id: &str, pinned: bool) -> Result<(), TuiError> {
     ws.request("sessions.set_pinned", Some(json!({ "session_id": id, "pinned": pinned })))
