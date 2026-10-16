@@ -171,6 +171,23 @@ async fn dispatch_direct_webhook(
     user_id: &str,
     text: &str,
 ) -> InboundDisposition {
+    dispatch_direct_webhook_to(state, channel, user_id, user_id, text).await
+}
+
+/// As [`dispatch_direct_webhook`], but the reply is addressed somewhere other
+/// than the sender.
+///
+/// Google Chat is why this exists: a message arrives from a *user*
+/// (`users/123`) inside a *space* (`spaces/S`), and a reply goes to the space.
+/// Keying the session on the sender is still right; addressing the reply to
+/// them would name something the Chat API cannot send to.
+async fn dispatch_direct_webhook_to(
+    state: &Arc<GatewayState>,
+    channel: &str,
+    user_id: &str,
+    conversation_id: &str,
+    text: &str,
+) -> InboundDisposition {
     if state
         .check_incoming_access(
             channel,
@@ -194,10 +211,11 @@ async fn dispatch_direct_webhook(
     };
 
     // Remember which channel owns this session, so the agent's reply can be
-    // routed back out through it.
+    // routed back out through it — addressed to `conversation_id`, which is the
+    // sender for every channel whose reply goes back to them.
     {
         let mut sessions = state.channels.session_channels.write().await;
-        sessions.insert(session_id.clone(), (channel.to_string(), user_id.to_string()));
+        sessions.insert(session_id.clone(), (channel.to_string(), conversation_id.to_string()));
     }
 
     let incoming = IncomingMessage::new(user_id, session_id, text).with_provenance(
@@ -245,6 +263,10 @@ pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
     // Twilio SMS webhooks (feature-gated channel)
     #[cfg(feature = "twilio")]
     let router = router.route("/webhooks/twilio", post(twilio_webhook_handler));
+
+    // Google Chat webhooks (feature-gated channel)
+    #[cfg(feature = "googlechat")]
+    let router = router.route("/webhooks/googlechat", post(googlechat_webhook_handler));
 
     // One guard for the process: a delivery is a replay wherever in the router
     // it arrives.
@@ -977,6 +999,136 @@ async fn twilio_webhook_handler(
     }
 
     twiml_ok()
+}
+
+/// Handle Google Chat webhooks.
+///
+/// Chat authenticates with a bearer token rather than a signature, which makes
+/// this handler different in two ways from its neighbours. The token is checked
+/// against the issuer's published keys — and then its **identity** is checked
+/// too, because Google signs these for its own service accounts: a valid
+/// signature proves Google issued the token, not that it was issued for *this*
+/// app.
+///
+/// A delivery may also be a bot's own reply arriving back around, or one of the
+/// non-message events Chat posts to the same URL. Both are acknowledged without
+/// becoming turns.
+#[cfg(feature = "googlechat")]
+async fn googlechat_webhook_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    info!("Received Google Chat webhook");
+
+    // Built once at init and kept, because the verifier caches the issuer's key
+    // set — constructing one here would refetch it on every delivery.
+    let verifier = {
+        let verifiers = state.channels.webhook_verifiers.read().await;
+        verifiers.get("googlechat").cloned()
+    };
+    let Some(verifier) = verifier else {
+        warn!("Google Chat webhook: the channel is not configured to verify deliveries — refusing");
+        return (StatusCode::UNAUTHORIZED, "Channel is not configured to verify deliveries")
+            .into_response();
+    };
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    let Some(token) = token else {
+        warn!("Google Chat webhook: no bearer token — refusing");
+        return (StatusCode::UNAUTHORIZED, "A bearer token is required").into_response();
+    };
+
+    let claims = match verifier.verify(token).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            warn!("Google Chat webhook: {}", e);
+            return (StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response();
+        }
+    };
+
+    // Which identity the token was issued to, resolved the same way the other
+    // handlers resolve their credentials.
+    let allowed = {
+        let legacy = {
+            let config = state.config.read().await;
+            config
+                .channels
+                .get("googlechat")
+                .and_then(|c| c.credentials.get("allowed_service_accounts"))
+                .cloned()
+        };
+        state
+            .secrets
+            .resolve_channel_credential("googlechat", "allowed_service_accounts", legacy.as_deref())
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v.into_inner())
+    };
+    let allowed: Vec<String> = allowed
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    if !crate::channels::googlechat::identity_is_allowed(&allowed, email) {
+        warn!("Google Chat webhook: bearer token was not issued to an allowed identity");
+        return (StatusCode::UNAUTHORIZED, "Token identity is not allowed").into_response();
+    }
+    debug!("Google Chat webhook: bearer token verified");
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("Google Chat webhook: duplicate delivery ignored");
+        return Json(WebhookResponse {
+            success: true,
+            message: "duplicate ignored".to_string(),
+        })
+        .into_response();
+    }
+
+    match crate::channels::googlechat::parse_event(&body) {
+        Ok(Some(incoming)) => {
+            // The session is keyed on the sender, the reply addressed to the
+            // space — which is why this is the `_to` variant.
+            dispatch_direct_webhook_to(
+                &state,
+                "googlechat",
+                &incoming.user_id,
+                &incoming.space,
+                &incoming.text,
+            )
+            .await;
+        }
+        Ok(None) => {
+            debug!("Google Chat webhook: not a user message — acknowledged");
+        }
+        Err(e) => {
+            warn!("Google Chat webhook: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid payload").into_response();
+        }
+    }
+
+    Json(WebhookResponse {
+        success: true,
+        message: "OK".to_string(),
+    })
+    .into_response()
 }
 
 // ─────────────────────────────────────────────

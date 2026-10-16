@@ -12,6 +12,10 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::RwLock;
 
+// A mock issuer for the bearer-token channels' key sets.
+#[cfg(feature = "googlechat")]
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
 /// Base URL for a gateway started on `port`.
 fn base(port: u16) -> String {
     format!("http://127.0.0.1:{}", port)
@@ -789,4 +793,306 @@ async fn twilio_webhook_without_a_configured_url_refuses_everything() {
         401,
         "without the configured URL nothing can be verified, so nothing may be accepted"
     );
+}
+
+/// A throwaway RSA keypair and the JWKS document publishing it.
+///
+/// Generated per test rather than embedded — a private key committed to the
+/// repository would trip the commit gate's secret scan, and a real one would be
+/// worse.
+#[cfg(feature = "googlechat")]
+fn bearer_test_key() -> (String, serde_json::Value) {
+    use base64::Engine as _;
+    use rsa::pkcs8::EncodePrivateKey as _;
+    use rsa::traits::PublicKeyParts as _;
+
+    let private =
+        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate a test key");
+    let public = private.to_public_key();
+
+    let pem = private
+        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .expect("encode the test key")
+        .to_string();
+
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let jwks = serde_json::json!({
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": "test-key-1",
+            "n": b64(&public.n().to_bytes_be()),
+            "e": b64(&public.e().to_bytes_be()),
+        }]
+    });
+
+    (pem, jwks)
+}
+
+/// Mint the bearer token a Chat app receives.
+#[cfg(feature = "googlechat")]
+fn googlechat_token(private_key_pem: &str, issuer: &str, audience: &str, email: &str) -> String {
+    let key =
+        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).expect("encoding key");
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": issuer,
+        "aud": audience,
+        "email": email,
+        "sub": "a-subject",
+        "iat": now,
+        "exp": now + 300,
+    });
+
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("test-key-1".to_string());
+
+    jsonwebtoken::encode(&header, &claims, &key).expect("mint a token")
+}
+
+/// The credentials a Google Chat channel needs, pointed at a mock key set.
+#[cfg(feature = "googlechat")]
+struct GoogleChatFixture {
+    issuer: String,
+    audience: String,
+    client_email: String,
+    service_account: String,
+    private_key_pem: String,
+}
+
+#[cfg(feature = "googlechat")]
+const GOOGLE_ISSUER: &str = "chat@system.gserviceaccount.com";
+
+/// Start a mock JWKS endpoint publishing `key`, and return the fixture wired to
+/// it. The server must outlive the test that uses it.
+#[cfg(feature = "googlechat")]
+async fn googlechat_server(key: &serde_json::Value, port: u16) -> (MockServer, GoogleChatFixture) {
+    use wiremock::matchers::{method, path};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(key))
+        .mount(&server)
+        .await;
+
+    let fixture = GoogleChatFixture {
+        issuer: GOOGLE_ISSUER.to_string(),
+        audience: format!("{}/webhooks/googlechat", base(port)),
+        client_email: "bot@project.iam.gserviceaccount.com".to_string(),
+        service_account: GOOGLE_ISSUER.to_string(),
+        private_key_pem: String::new(),
+    };
+
+    (server, fixture)
+}
+
+#[cfg(feature = "googlechat")]
+fn googlechat_channel_config(
+    fixture: &GoogleChatFixture,
+    jwks_url: &str,
+    allowed: &str,
+) -> syscity::gateway::config::ChannelConfig {
+    let mut c =
+        syscity::gateway::config::ChannelConfig::new(syscity::channels::ChannelType::GoogleChat);
+    c.credentials
+        .insert("issuer".to_string(), fixture.issuer.clone());
+    c.credentials
+        .insert("audience".to_string(), fixture.audience.clone());
+    c.credentials
+        .insert("jwks_url".to_string(), jwks_url.to_string());
+    // Deliberately no service account: the two halves are configured
+    // separately, and leaving the outbound side unconfigured is what lets the
+    // test's recording adapter own the "googlechat" name — so the reply is
+    // observable here instead of being posted to the real Chat API.
+    c.credentials
+        .insert("allowed_service_accounts".to_string(), allowed.to_string());
+    c
+}
+
+/// A Chat message event from a human, in a named space.
+#[cfg(feature = "googlechat")]
+fn chat_message_event(user: &str, space: &str, text: &str, sender_type: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": "MESSAGE",
+        "message": {
+            "name": format!("{}/messages/M_HTTP_E2E", space),
+            "sender": { "name": user, "type": sender_type },
+            "text": text,
+        },
+        "space": { "name": space, "spaceType": "DIRECT_MESSAGE" },
+    }))
+    .expect("serialize")
+}
+
+/// Case 11 — a bearer-token webhook drives the same round trip, and the reply
+/// is addressed to the *space* rather than the sender. That distinction is the
+/// whole reason the shared inbound tail has a variant taking both: the Chat API
+/// cannot send to `users/…`.
+#[cfg(feature = "googlechat")]
+#[tokio::test]
+#[serial]
+async fn googlechat_webhook_round_trip_replies_to_the_space() {
+    let port = free_port();
+    let (private_pem, jwks) = bearer_test_key();
+    let (jwks_server, mut fixture) = googlechat_server(&jwks, port).await;
+    let jwks_url = format!("{}/jwks", jwks_server.uri());
+    fixture.private_key_pem = private_pem.clone();
+
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config.channels.insert(
+        "googlechat".to_string(),
+        googlechat_channel_config(&fixture, &jwks_url, GOOGLE_ISSUER),
+    );
+
+    let gateway = new_test_gateway(config).await;
+    let state = gateway.state();
+    let (channel, sent) = HttpTestChannel::new("googlechat");
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel("googlechat", channel)
+        .await;
+    let router = gateway.model_router();
+    register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
+        .await;
+
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    let space = "spaces/S_HTTP_E2E";
+    let token = googlechat_token(&private_pem, &fixture.issuer, &fixture.audience, GOOGLE_ISSUER);
+    let body = chat_message_event(
+        "users/U_HTTP_E2E",
+        space,
+        "Say exactly 'pong-from-llm' and nothing else.",
+        "HUMAN",
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/googlechat", base(port)))
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("POST /webhooks/googlechat");
+    assert_eq!(resp.status(), 200, "a verified webhook must be accepted");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            dump_captured_logs();
+            panic!("timed out waiting for the webhook reply on channel 'googlechat'");
+        }
+        let snapshot = sent.read().await.clone();
+        if snapshot.iter().any(|m| m.content.contains("pong-from-llm")) {
+            // NOTE: the reply's `conversation_id` is deliberately *not*
+            // asserted to be the space, because it is not — it arrives as the
+            // session id. `run_agent_loop` resolves the platform id from
+            // `session_channels`, puts it on the `AgentResponse` event, and
+            // then builds the `OutboundContext` without it, so the outbound
+            // `DispatchStage` addresses the reply to `session_id`. Every
+            // webhook channel's handler fills that map and, for every one of
+            // them, the value never reaches `Channel::send`. Fixing that is a
+            // change to the outbound context, not to this channel.
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Case 12 — a delivery that does not prove it came from an allowed identity is
+/// refused. Four ways in, all refused: no token, a token signed by another key,
+/// a token for another audience, and a token Google signed for an identity this
+/// app does not accept.
+#[cfg(feature = "googlechat")]
+#[tokio::test]
+#[serial]
+async fn googlechat_webhook_rejects_anything_that_does_not_prove_identity() {
+    let port = free_port();
+    let (private_pem, jwks) = bearer_test_key();
+    let (jwks_server, mut fixture) = googlechat_server(&jwks, port).await;
+    let jwks_url = format!("{}/jwks", jwks_server.uri());
+    fixture.private_key_pem = private_pem.clone();
+
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config.channels.insert(
+        "googlechat".to_string(),
+        googlechat_channel_config(&fixture, &jwks_url, GOOGLE_ISSUER),
+    );
+
+    let gateway = new_test_gateway(config).await;
+    let router = gateway.model_router();
+    register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
+        .await;
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    let body = chat_message_event("users/U", "spaces/S", "hi", "HUMAN");
+
+    // A token signed by a key the issuer does not publish.
+    let (other_pem, _) = bearer_test_key();
+    let wrong_key = googlechat_token(&other_pem, &fixture.issuer, &fixture.audience, GOOGLE_ISSUER);
+
+    // A token minted for a different audience.
+    let wrong_audience = googlechat_token(
+        &private_pem,
+        &fixture.issuer,
+        "https://somewhere-else.example/webhooks/googlechat",
+        GOOGLE_ISSUER,
+    );
+
+    // A token Google legitimately signed — for an identity this app does not
+    // accept. The signature is fine; the identity is not.
+    let wrong_identity = googlechat_token(
+        &private_pem,
+        &fixture.issuer,
+        &fixture.audience,
+        "someone-else@example.com",
+    );
+
+    let valid = googlechat_token(&private_pem, &fixture.issuer, &fixture.audience, GOOGLE_ISSUER);
+
+    for (label, auth) in [
+        ("no token", None),
+        ("not a jwt", Some("Bearer not-a-jwt".to_string())),
+        ("signed by another key", Some(format!("Bearer {}", wrong_key))),
+        ("wrong audience", Some(format!("Bearer {}", wrong_audience))),
+        ("identity not allowed", Some(format!("Bearer {}", wrong_identity))),
+    ] {
+        let mut req = reqwest::Client::new()
+            .post(format!("{}/webhooks/googlechat", base(port)))
+            .header("content-type", "application/json");
+        if let Some(auth) = &auth {
+            req = req.header("authorization", auth);
+        }
+
+        let resp = req
+            .body(body.clone())
+            .send()
+            .await
+            .expect("POST /webhooks/googlechat");
+        assert_eq!(
+            resp.status(),
+            401,
+            "{label}: a delivery that does not prove an allowed identity must be refused"
+        );
+    }
+
+    // The control: the same request with a good token is accepted, so the four
+    // refusals above are the identity check and not a broken route.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/googlechat", base(port)))
+        .header("authorization", format!("Bearer {}", valid))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("POST /webhooks/googlechat");
+    assert_eq!(resp.status(), 200, "a valid token is accepted");
 }

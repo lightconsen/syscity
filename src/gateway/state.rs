@@ -107,6 +107,15 @@ pub struct ChannelState {
     pub session_channels: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// Webhook session storage: platform_key -> session_uuid.
     pub webhook_sessions: Arc<RwLock<HashMap<String, String>>>,
+    /// Bearer-token verifiers for the channels that authenticate with one
+    /// (Teams, Google Chat), keyed by channel name.
+    ///
+    /// Held here rather than built per delivery because a verifier caches the
+    /// issuer's key set: one constructed per request would refetch it every
+    /// time, which is slow and a good way to be rate limited by the issuer.
+    #[cfg(any(feature = "teams", feature = "googlechat"))]
+    pub webhook_verifiers:
+        Arc<RwLock<HashMap<String, Arc<crate::gateway::jwt_verify::JwtVerifier>>>>,
 }
 
 /// Memory, search, and background consolidation state.

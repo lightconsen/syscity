@@ -176,6 +176,7 @@ async fn run_channel_add(
         ChannelType::WechatMp => add_wechatmp_channel(token, agent, extra_creds).await,
         ChannelType::Line => add_line_channel(token, agent, extra_creds).await,
         ChannelType::Twilio => add_twilio_channel(token, agent, extra_creds).await,
+        ChannelType::GoogleChat => add_googlechat_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -1071,6 +1072,88 @@ async fn add_twilio_channel(
     Ok(())
 }
 
+/// Add/configure a Google Chat channel in Gateway
+async fn add_googlechat_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    // Every one of these is required, and for the same reason: this channel has
+    // no safe default. The issuer, audience and key URL depend on the app's
+    // Authentication Audience setting, and the identity allowlist is what
+    // separates "Google signed this" from "Google signed this for us".
+    let required = |env: &str, key: &str| -> Result<String> {
+        lookup(env, key).ok_or_else(|| {
+            crate::error::SyscityError::Config(crate::error::ConfigError::Missing(format!(
+                "{} environment variable, or --credential {}=...",
+                env, key
+            )))
+        })
+    };
+
+    // `--token` carries the service account's address, which is the one
+    // credential an operator is most likely to have to hand.
+    let client_email = match token {
+        Some(t) => t,
+        None => required("GOOGLE_CHAT_CLIENT_EMAIL", "client_email")?,
+    };
+    let private_key_pem = required("GOOGLE_CHAT_PRIVATE_KEY", "private_key_pem")?;
+    let issuer = required("GOOGLE_CHAT_ISSUER", "issuer")?;
+    let audience = required("GOOGLE_CHAT_AUDIENCE", "audience")?;
+    let jwks_url = required("GOOGLE_CHAT_JWKS_URL", "jwks_url")?;
+    let allowed = required("GOOGLE_CHAT_ALLOWED_SERVICE_ACCOUNTS", "allowed_service_accounts")?;
+
+    println!("🚀 Adding Google Chat channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("client_email".to_string(), client_email);
+    credentials.insert("private_key_pem".to_string(), private_key_pem);
+    credentials.insert("issuer".to_string(), issuer);
+    credentials.insert("audience".to_string(), audience);
+    credentials.insert("jwks_url".to_string(), jwks_url);
+    credentials.insert("allowed_service_accounts".to_string(), allowed);
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::GoogleChat,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config
+        .channels
+        .insert("googlechat".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ Google Chat channel configured in Gateway");
+    println!("   Point the Chat app's connection settings at <public>/webhooks/googlechat");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1423,6 +1506,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::Twilio => {
             println!("    ℹ️  Twilio uses the account SID + auth token, and needs the public webhook URL the console was given");
+        }
+        ChannelType::GoogleChat => {
+            println!("    ℹ️  Google Chat needs a service account, the app's issuer/audience/JWKS, and the allowed service-account identities");
         }
     }
 

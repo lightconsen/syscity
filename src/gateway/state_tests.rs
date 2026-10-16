@@ -166,6 +166,8 @@ pub async fn make_test_state_parts(
             acp_bridge: None,
             session_channels: Arc::new(RwLock::new(HashMap::new())),
             webhook_sessions: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(any(feature = "teams", feature = "googlechat"))]
+            webhook_verifiers: Arc::new(RwLock::new(HashMap::new())),
         },
         memory: MemoryState {
             vector: tokio::sync::RwLock::new(None),

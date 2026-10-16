@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 use crate::channels::{
-    Channel, ChannelCapabilities, ChatType, ConversationId, OutgoingMessage, PlainTextFormatter,
+    split_message, Channel, ChannelCapabilities, ChatType, ConversationId, OutgoingMessage,
+    PlainTextFormatter,
 };
 use crate::core::models::Id;
 use crate::error::SyscityError;
@@ -223,46 +224,6 @@ pub fn parse_incoming(params: &[(String, String)]) -> Option<TwilioIncoming> {
     })
 }
 
-/// Split a reply into pieces Twilio will accept.
-///
-/// Splitting counts **characters**, not bytes: a body cut at a byte offset panics
-/// on a multi-byte character, and SMS is where non-ASCII text is most likely to
-/// appear. Within the window the split prefers the last whitespace so a word is
-/// not cut in half, falling back to a hard cut when there is none — a long URL,
-/// or a run of CJK text with no spaces at all.
-fn split_sms(text: &str, max: usize) -> Vec<String> {
-    let max = max.max(1);
-    let mut out = Vec::new();
-    let mut rest = text;
-
-    while rest.chars().count() > max {
-        let hard_cut = rest
-            .char_indices()
-            .nth(max)
-            .map(|(i, _)| i)
-            .unwrap_or(rest.len());
-        let window = &rest[..hard_cut];
-
-        let split_at = window
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(i, _)| i)
-            // A split at 0 would emit an empty piece and never advance.
-            .filter(|i| *i > 0)
-            .unwrap_or(hard_cut);
-
-        out.push(rest[..split_at].trim_end().to_string());
-        rest = rest[split_at..].trim_start();
-    }
-
-    if !rest.is_empty() {
-        out.push(rest.to_string());
-    }
-
-    out
-}
-
 /// Twilio SMS channel implementation.
 pub struct TwilioChannel {
     config: TwilioConfig,
@@ -391,7 +352,7 @@ impl Channel for TwilioChannel {
         // limit arrives as consecutive texts — the closest thing to one reply
         // the medium has. A send that fails part-way leaves the earlier
         // segments delivered, which is stated in the error rather than hidden.
-        for segment in split_sms(&text, MAX_SMS_CHARS) {
+        for segment in split_message(&text, MAX_SMS_CHARS) {
             self.send_sms(recipient, &segment).await?;
         }
 
@@ -581,14 +542,14 @@ mod tests {
 
     #[test]
     fn a_short_reply_is_one_segment() {
-        assert_eq!(split_sms("hello", MAX_SMS_CHARS), vec!["hello".to_string()]);
-        assert!(split_sms("", MAX_SMS_CHARS).is_empty());
+        assert_eq!(split_message("hello", MAX_SMS_CHARS), vec!["hello".to_string()]);
+        assert!(split_message("", MAX_SMS_CHARS).is_empty());
     }
 
     #[test]
     fn a_long_reply_is_split_within_the_limit_and_loses_nothing() {
         let text = "word ".repeat(1000); // 5000 chars
-        let segments = split_sms(&text, MAX_SMS_CHARS);
+        let segments = split_message(&text, MAX_SMS_CHARS);
 
         assert!(segments.len() > 1, "5000 chars must not fit in one message");
         for segment in &segments {
@@ -610,7 +571,7 @@ mod tests {
     #[test]
     fn splitting_counts_characters_not_bytes() {
         let text = "字".repeat(4000); // 4000 chars, 12000 bytes
-        let segments = split_sms(&text, MAX_SMS_CHARS);
+        let segments = split_message(&text, MAX_SMS_CHARS);
 
         assert!(segments.len() > 1);
         let total: usize = segments.iter().map(|s| s.chars().count()).sum();
@@ -627,7 +588,7 @@ mod tests {
         // The space falls *inside* the window, so it is taken and the second
         // word survives whole.
         let text = format!("{} {}", "a".repeat(1500), "b".repeat(300));
-        let segments = split_sms(&text, MAX_SMS_CHARS);
+        let segments = split_message(&text, MAX_SMS_CHARS);
 
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0], "a".repeat(1500), "the split lands on the space");
@@ -636,7 +597,7 @@ mod tests {
         // A word longer than the window has no space to take, so it is hard-cut
         // — and nothing is lost in the process.
         let unbroken = "b".repeat(2000);
-        let segments = split_sms(&unbroken, MAX_SMS_CHARS);
+        let segments = split_message(&unbroken, MAX_SMS_CHARS);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments.iter().map(|s| s.len()).sum::<usize>(), 2000);
     }

@@ -28,6 +28,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | **WeChat MP (公众号)** | **`wechatmp`** | ✅ | Encrypted webhook | `/webhooks/wechatmp` |
 | **LINE** | **`line`** | ✅ | Messaging API webhook | `/webhooks/line` |
 | **Twilio SMS** | **`twilio`** | ✅ | Messages webhook (form-encoded) | `/webhooks/twilio` |
+| **Google Chat** | **`googlechat`** | ✅ | Chat app webhook (bearer token) | `/webhooks/googlechat` |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -85,6 +86,7 @@ Per-channel credential keys:
 | WeChat MP | `app_id`, `app_secret`, `token`, `encoding_aes_key` | `WECHAT_MP_*` |
 | LINE | `channel_access_token`, `channel_secret` | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` |
 | Twilio SMS | `account_sid`, `auth_token`, `from_number`, `webhook_url` | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_WEBHOOK_URL` |
+| Google Chat | `issuer`, `audience`, `jwks_url`, `allowed_service_accounts`, `client_email`, `private_key_pem` | `GOOGLE_CHAT_ISSUER`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_JWKS_URL`, `GOOGLE_CHAT_ALLOWED_SERVICE_ACCOUNTS`, `GOOGLE_CHAT_CLIENT_EMAIL`, `GOOGLE_CHAT_PRIVATE_KEY` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -178,6 +180,45 @@ boundary where there is one (SMS has no editing, threading or reply-to, so
 consecutive texts are the closest thing to one reply the medium has). Status
 callbacks — which Twilio posts to the same URL for messages it has already
 handled — carry no body and are acknowledged without becoming a turn.
+
+### Google Chat — the full flow
+
+1. Create a Chat app in the [Google Cloud console](https://console.cloud.google.com/)
+   and take its **service account** address and private key (the JSON key file's
+   `client_email` and `private_key`).
+2. Under the app's connection settings, note the **Authentication Audience**
+   setting — it decides three of the values below, and getting them wrong means
+   every delivery is refused:
+   - **HTTP endpoint URL** — the token is an OIDC ID token with
+     `iss = chat@system.gserviceaccount.com` and `aud` = your endpoint URL; keys
+     are published at
+     `https://www.googleapis.com/service_accounts/v1/metadata/jwk/chat@system.gserviceaccount.com`.
+   - **Project number** — the token is signed by the same service account with
+     `aud` = your GCP project number.
+3. Configure the channel:
+   ```bash
+   export GOOGLE_CHAT_ISSUER=chat@system.gserviceaccount.com
+   export GOOGLE_CHAT_AUDIENCE=<your endpoint URL or project number>
+   export GOOGLE_CHAT_JWKS_URL=<the key URL matching that mode>
+   export GOOGLE_CHAT_ALLOWED_SERVICE_ACCOUNTS=chat@system.gserviceaccount.com
+   export GOOGLE_CHAT_CLIENT_EMAIL=bot@project.iam.gserviceaccount.com
+   export GOOGLE_CHAT_PRIVATE_KEY="$(cat service-account-key.pem)"
+   syscity channels add googlechat
+   ```
+   Then `syscity start` to run the gateway.
+4. Point the app's connection settings at `https://<public>/webhooks/googlechat`.
+
+`allowed_service_accounts` is not optional and has no default: Google signs these
+tokens for **its own** service accounts, so a valid signature proves Google issued
+the token — not that it was issued for your app. The `email` claim is checked
+against that list, and an empty list refuses everything. `issuer`, `audience` and
+`jwks_url` are required for the same reason: they depend on the mode above, and a
+guessed default would reject every delivery.
+
+Only user messages are routed. A bot's own reply comes back through the same
+webhook — answering it would make the bot talk to itself — and Chat posts
+non-message events (adds, removals) to the same URL; both are acknowledged and
+skipped. Replies over 4096 characters are split into consecutive messages.
 
 ## Access control
 

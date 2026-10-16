@@ -513,6 +513,8 @@ impl Gateway {
                 acp_bridge: Some(Arc::new(ChannelAcpBridge::new(acp.command_tx()))),
                 session_channels: Arc::new(RwLock::new(HashMap::new())),
                 webhook_sessions: Arc::new(RwLock::new(HashMap::new())),
+                #[cfg(any(feature = "teams", feature = "googlechat"))]
+                webhook_verifiers: Arc::new(RwLock::new(HashMap::new())),
             },
             memory: MemoryState {
                 vector: RwLock::new(None),

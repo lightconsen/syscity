@@ -51,6 +51,8 @@ pub enum ChannelType {
     Line,
     /// Twilio SMS webhook
     Twilio,
+    /// Google Chat webhook (bearer-token authenticated)
+    GoogleChat,
 }
 
 #[cfg(feature = "telegram")]
@@ -96,6 +98,9 @@ pub mod twilio;
 /// access token rather than a long-lived one (Teams, Google Chat).
 #[cfg(any(feature = "teams", feature = "googlechat"))]
 pub mod oauth_token;
+
+#[cfg(feature = "googlechat")]
+pub mod googlechat;
 
 pub mod acp_bridge;
 pub mod command_gate;
@@ -708,6 +713,50 @@ pub enum ChatType {
     Channel,
     /// Thread/reply
     Thread,
+}
+
+/// Split a reply into pieces a channel's API will accept.
+///
+/// Shared because more than one platform caps a message well below what an
+/// agent turn produces — SMS at 1600 characters, Google Chat at 4096 — and the
+/// hard part is not the limit but where to cut.
+///
+/// Splitting counts **characters**, not bytes: a body cut at a byte offset
+/// panics on a multi-byte character, and these are exactly the channels where
+/// non-ASCII text is most likely to appear. Within the window the split prefers
+/// the last whitespace so a word is not cut in half, falling back to a hard cut
+/// when there is none — a long URL, or a run of CJK text with no spaces at all.
+pub fn split_message(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out = Vec::new();
+    let mut rest = text;
+
+    while rest.chars().count() > max {
+        let hard_cut = rest
+            .char_indices()
+            .nth(max)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        let window = &rest[..hard_cut];
+
+        let split_at = window
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, _)| i)
+            // A split at 0 would emit an empty piece and never advance.
+            .filter(|i| *i > 0)
+            .unwrap_or(hard_cut);
+
+        out.push(rest[..split_at].trim_end().to_string());
+        rest = rest[split_at..].trim_start();
+    }
+
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+
+    out
 }
 
 /// Channel capabilities

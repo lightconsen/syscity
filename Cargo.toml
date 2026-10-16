@@ -395,6 +395,9 @@ hex = "0.4"
 # in the repository would trip the commit gate's secret scan, and rightly so.
 # Already in the tree transitively, so this adds no crate.
 rsa = "0.9"
+# Signing that token with the same crate the library verifies with, so the e2e
+# exercises the real construction rather than a hand-rolled one.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 # Read-back verification of generated xlsx in converter tests
 calamine = "0.36"
 

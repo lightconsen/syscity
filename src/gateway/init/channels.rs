@@ -317,6 +317,16 @@ pub(crate) async fn init_single_channel(
                 warn!("Twilio feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::GoogleChat => {
+            #[cfg(feature = "googlechat")]
+            {
+                init_googlechat_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "googlechat"))]
+            {
+                warn!("Google Chat feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -785,6 +795,113 @@ pub(crate) async fn init_twilio_channel(
             name
         );
     }
+    Ok(())
+}
+
+/// Initialize Google Chat channel.
+///
+/// Inbound arrives via the bearer-token webhook in `gateway/webhooks.rs`. The
+/// two halves are set up separately because they have separate credentials: the
+/// verification side needs the issuer, audience and key URL, and the outbound
+/// side needs a service account. A deployment can legitimately have one without
+/// the other, and — more to the point — a missing outbound key must not quietly
+/// take the inbound check down with it.
+#[cfg(feature = "googlechat")]
+pub(crate) async fn init_googlechat_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::googlechat::{GoogleChatChannel, GoogleChatConfig};
+
+    let (Some(issuer), Some(audience), Some(jwks_url)) = (
+        channel_cred(&state.secrets, name, config, "issuer").await,
+        channel_cred(&state.secrets, name, config, "audience").await,
+        channel_cred(&state.secrets, name, config, "jwks_url").await,
+    ) else {
+        warn!(
+            "Google Chat channel '{}' missing one of 'issuer'/'audience'/'jwks_url' — deliveries \
+             cannot be verified and will be refused",
+            name
+        );
+        return Ok(());
+    };
+
+    // The identity allowlist is read rather than defaulted: an absent setting
+    // has to mean "nobody", because a token whose signature verifies but whose
+    // identity is unlisted must not be acted on.
+    let allowed_service_accounts =
+        channel_cred(&state.secrets, name, config, "allowed_service_accounts")
+            .await
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+    if allowed_service_accounts.is_empty() {
+        warn!(
+            "Google Chat channel '{}' has no 'allowed_service_accounts' — every delivery will be \
+             refused until one is configured",
+            name
+        );
+    }
+
+    // Registered before the outbound half is even looked at: this is what the
+    // webhook handler needs, and it has to outlive a request because it caches
+    // the issuer's key set.
+    state.channels.webhook_verifiers.write().await.insert(
+        name.to_string(),
+        Arc::new(crate::gateway::jwt_verify::JwtVerifier::new(&issuer, &audience, &jwks_url)),
+    );
+    info!("Google Chat channel '{}': deliveries verified against issuer {}", name, issuer);
+
+    let (Some(client_email), Some(private_key_pem)) = (
+        channel_cred(&state.secrets, name, config, "client_email").await,
+        channel_cred(&state.secrets, name, config, "private_key_pem").await,
+    ) else {
+        warn!(
+            "Google Chat channel '{}' has no service account ('client_email'/'private_key_pem'), \
+             so replies cannot be posted",
+            name
+        );
+        return Ok(());
+    };
+
+    let channel = Arc::new(GoogleChatChannel::new(GoogleChatConfig {
+        issuer,
+        audience,
+        jwks_url,
+        allowed_service_accounts,
+        client_email,
+        private_key_pem,
+    }));
+
+    let channel_name = name.to_string();
+    let channel_for_task = channel.clone();
+    let main_handle = tokio::spawn(async move {
+        if let Err(e) = channel_for_task.start().await {
+            error!("Google Chat channel {} failed: {}", channel_name, e);
+        }
+    });
+    register_channel_task(&state, name, "main", main_handle).await;
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel(name, channel.clone())
+        .await;
+    state
+        .channels
+        .channels
+        .write()
+        .await
+        .insert(name.to_string(), channel);
+    info!(
+        "✅ Google Chat channel '{}' initialized (inbound via bearer-token webhook)",
+        name
+    );
+
     Ok(())
 }
 
