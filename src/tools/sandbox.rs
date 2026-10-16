@@ -306,6 +306,7 @@ mod tests {
                 sender_id: None,
             },
             sandbox: crate::tools::ToolSandbox {
+                execution_backends: std::collections::HashMap::new(),
                 working_directory: PathBuf::from("/tmp"),
                 environment: Default::default(),
                 timeout: Duration::from_secs(10),

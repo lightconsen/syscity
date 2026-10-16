@@ -427,6 +427,7 @@ mod tests {
     #[test]
     fn test_agent_config_full_system_prompt_without_skills() {
         let config = AgentConfig {
+            execution_backends: std::collections::HashMap::new(),
             system_prompt: "base".to_string(),
             ..Default::default()
         };
@@ -461,6 +462,7 @@ mod tests {
             workspace_only: false,
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
+            execution_backends: std::collections::HashMap::new(),
             heartbeat: Some(crate::heartbeat::HeartbeatConfig {
                 enabled: true,
                 interval_seconds: 120,

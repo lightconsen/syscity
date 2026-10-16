@@ -373,6 +373,7 @@ impl AgentPersonality {
             // Stamped from `[security]` at spawn (`spawn_agent_inner`), like
             // `fence_network`.
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
+            execution_backends: std::collections::HashMap::new(),
             heartbeat: None,
             agent_id: None,
             reflection_config: None,

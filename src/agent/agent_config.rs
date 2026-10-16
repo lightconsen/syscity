@@ -45,6 +45,13 @@ pub struct AgentConfig {
     /// `SecurityConfig::fence_namespaces`, which is copied here at spawn).
     #[serde(default)]
     pub fence_namespaces: crate::tools::process_runner::NamespacePosture,
+    /// The named places this agent's command tools may send work to
+    /// (`SecurityConfig::execution_backends`, copied here at spawn — the tool
+    /// context is built per call, so the choice has to travel with it rather
+    /// than live in a process-global).
+    #[serde(default)]
+    pub execution_backends:
+        std::collections::HashMap<String, crate::gateway::config::ExecutionBackendConfig>,
     /// Model to use for LLM-powered context compaction.
     ///
     /// When `None`, the agent's primary model is used.  Set to a cheaper/faster
@@ -132,6 +139,7 @@ Use rich formatting for lists, structured data, and technical content:
             workspace_only: false,
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
+            execution_backends: std::collections::HashMap::new(),
             heartbeat: None,
             agent_id: None,
             reflection_config: None,

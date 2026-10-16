@@ -38,8 +38,9 @@ mod validators;
 pub use registrar::ToolRegistrar;
 pub use registry::{ToolRegistry, WebSearchProviders};
 pub use types::{
-    BoxedTool, SharedTool, SkillTrust, SkillTrustCeiling, Tool, ToolContext, ToolExecutionChunk,
-    ToolExecutionResult, ToolId, ToolIdentity, ToolModel, ToolSandbox,
+    execution_backend_error, BoxedTool, SharedTool, SkillTrust, SkillTrustCeiling, Tool,
+    ToolContext, ToolExecutionChunk, ToolExecutionResult, ToolId, ToolIdentity, ToolModel,
+    ToolSandbox,
 };
 pub use util::create_schema;
 pub use validators::{

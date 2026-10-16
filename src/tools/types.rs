@@ -39,6 +39,22 @@ impl std::fmt::Display for ToolId {
     }
 }
 
+/// Why a tool call naming an execution backend was refused.
+///
+/// Shared so three tools describe the same failure the same way — and so the
+/// message always names what *is* available, which is what makes the next call
+/// right rather than another guess.
+pub fn execution_backend_error(available: &[String], name: &str) -> String {
+    if available.is_empty() {
+        format!(
+            "no execution backends are configured, so '{name}' does not exist; this command can \
+             only run locally"
+        )
+    } else {
+        format!("no execution backend named '{name}'; configured: {}", available.join(", "))
+    }
+}
+
 /// Identity fields: who is calling the tool.
 #[derive(Debug, Clone, Default)]
 pub struct ToolIdentity {
@@ -97,6 +113,11 @@ pub struct ToolSandbox {
     pub fence_namespaces: crate::tools::process_runner::NamespacePosture,
     /// Optional allowlist of plugin tool prefixes/names.
     pub plugin_allowlist: Option<Vec<String>>,
+    /// The named places a command may be sent to instead of this machine,
+    /// carried here (from the agent config) because the choice is made per tool
+    /// call. Empty means every command runs locally, where the kernel enforces
+    /// the write fence — which is what every deployment got before this existed.
+    pub execution_backends: HashMap<String, crate::gateway::config::ExecutionBackendConfig>,
 }
 
 impl Default for ToolSandbox {
@@ -119,6 +140,7 @@ impl Default for ToolSandbox {
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             plugin_allowlist: None,
+            execution_backends: HashMap::new(),
         }
     }
 }
@@ -273,6 +295,27 @@ impl ToolContext {
     }
     /// Whether the Linux runner builds a namespace view around fenced
     /// command tools.
+    /// The backend a tool call named, or `None` when the named one does not
+    /// exist — which the caller reports rather than falling back to local,
+    /// because a request that meant to run somewhere else and quietly ran here
+    /// would be answering a different question.
+    pub fn execution_backend(
+        &self,
+        name: &str,
+    ) -> Option<crate::tools::process_runner::ExecutionBackend> {
+        self.sandbox
+            .execution_backends
+            .get(name)
+            .map(crate::tools::process_runner::ExecutionBackend::from)
+    }
+
+    /// The backend names this agent may ask for, for an error that lists them.
+    pub fn execution_backend_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.sandbox.execution_backends.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub fn fence_namespaces(&self) -> crate::tools::process_runner::NamespacePosture {
         self.sandbox.fence_namespaces
     }
@@ -331,6 +374,15 @@ impl ToolContext {
 
     /// Set the namespace-view posture for the Linux fence (carried through to
     /// `WriteFence`; ignored by every other runner).
+    /// Carry the named execution backends onto the tool context.
+    pub fn with_execution_backends(
+        mut self,
+        backends: HashMap<String, crate::gateway::config::ExecutionBackendConfig>,
+    ) -> Self {
+        self.sandbox.execution_backends = backends;
+        self
+    }
+
     pub fn with_fence_namespaces(
         mut self,
         posture: crate::tools::process_runner::NamespacePosture,

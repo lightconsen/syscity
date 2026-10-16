@@ -224,6 +224,7 @@ impl Agent {
             .with_workspace_only(cfg.workspace_only)
             .with_fence_network(cfg.fence_network)
             .with_fence_namespaces(cfg.fence_namespaces)
+            .with_execution_backends(cfg.execution_backends.clone())
             .with_model_name(self.model.clone().unwrap_or_default())
             .with_provider_name(self.provider.name().to_string())
             .with_sender_id(user_id);

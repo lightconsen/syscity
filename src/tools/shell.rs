@@ -145,6 +145,15 @@ impl Tool for ShellTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for the command"
+                },
+                "execution": {
+                    "type": "string",
+                    "description": "Optional name of a configured execution backend to run the \
+                                    command on instead of this machine (for example a container \
+                                    or a remote host). Named by the deployment, not chosen here; \
+                                    omit it to run locally, where the kernel enforces the \
+                                    workspace fence. A backend that cannot honour the fence \
+                                    refuses the command rather than running it unfenced."
                 }
             }),
             vec!["command"],
@@ -218,6 +227,31 @@ impl Tool for ShellTool {
             }),
             ..Default::default()
         };
+
+        // Where the command runs is named, not described: a deployment decides
+        // what is reachable, and this call decides which of those to use. A name
+        // that does not exist is an error rather than a quiet fallback to local,
+        // because a command that meant to run somewhere else and ran here
+        // instead would have answered a different question.
+        if let Some(name) = args["execution"]
+            .as_str()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            match context.execution_backend(name) {
+                Some(backend) => req.backend = backend,
+                None => {
+                    let available = context.execution_backend_names();
+                    return Ok(ToolExecutionResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(crate::tools::execution_backend_error(&available, name)),
+                        data: None,
+                        execution_time: start_time.elapsed(),
+                    });
+                }
+            }
+        }
 
         // Apply resource limits in sandboxed mode (Unix only)
         #[cfg(unix)]
@@ -439,6 +473,94 @@ impl Tool for ShellTool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    /// A name the deployment did not configure is an error, not a quiet fallback
+    /// to local: a command that meant to run somewhere else and ran here instead
+    /// would have answered a different question.
+    #[tokio::test]
+    async fn an_unknown_execution_backend_is_refused() {
+        let tool = ShellTool::new();
+        let context = ToolContext::new("user", "conv1");
+
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo hi", "execution": "nowhere" }), &context)
+            .await
+            .expect("the tool answers rather than erroring");
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("nowhere"), "{error}");
+        assert!(
+            error.contains("only run locally"),
+            "with nothing configured, it says so: {error}"
+        );
+    }
+
+    /// The error names what *is* available, so the next call can be right rather
+    /// than another guess.
+    #[tokio::test]
+    async fn an_unknown_backend_lists_the_configured_ones() {
+        let tool = ShellTool::new();
+        let context = ToolContext::new("user", "conv1").with_execution_backends(HashMap::from([
+            (
+                "build".to_string(),
+                crate::gateway::config::ExecutionBackendConfig::Docker {
+                    image: "debian:stable".to_string(),
+                    extra_args: Vec::new(),
+                },
+            ),
+            (
+                "staging".to_string(),
+                crate::gateway::config::ExecutionBackendConfig::Ssh {
+                    host: "build.example".to_string(),
+                    user: None,
+                    port: 22,
+                    key_path: None,
+                    extra_args: Vec::new(),
+                },
+            ),
+        ]));
+
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo hi", "execution": "prod" }), &context)
+            .await
+            .expect("the tool answers");
+
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("build, staging"), "the names are listed in order: {error}");
+    }
+
+    /// A backend that refuses the fence turns into a failed tool call with the
+    /// backend's own reason, rather than a panic or a silent local run.
+    #[tokio::test]
+    async fn a_backend_that_cannot_honour_the_fence_refuses_the_command() {
+        let tool = ShellTool::new();
+        let context = ToolContext::new("user", "conv1").with_execution_backends(HashMap::from([(
+            "staging".to_string(),
+            crate::gateway::config::ExecutionBackendConfig::Ssh {
+                host: "build.example".to_string(),
+                user: None,
+                port: 22,
+                key_path: None,
+                extra_args: Vec::new(),
+            },
+        )]));
+
+        // `workspace_only` is the default, so this request carries a fence — and
+        // ssh has nothing to translate one onto.
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo hi", "execution": "staging" }), &context)
+            .await
+            .expect("the tool answers");
+
+        assert!(!result.success, "{result:?}");
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("cannot honour a write fence"),
+            "the refusal travels with its reason: {error}"
+        );
+    }
     use std::time::{Duration, Instant};
 
     use super::*;

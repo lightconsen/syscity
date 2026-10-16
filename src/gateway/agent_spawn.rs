@@ -103,6 +103,10 @@ pub(crate) async fn spawn_agent_inner(
     let security = &state.config.read().await.security;
     config.fence_network = security.fence_network;
     config.fence_namespaces = security.fence_namespaces;
+    // The named backends travel the same way the fence posture does: they are a
+    // per-call fact, so they have to live on the tool context rather than in a
+    // process-global.
+    config.execution_backends = security.execution_backends.clone();
     info!("Spawning agent: {}", id);
 
     // Capture the base config before merging per-agent overrides so a later

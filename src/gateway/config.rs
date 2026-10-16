@@ -1204,6 +1204,85 @@ pub enum CredentialPrecedence {
     ConfigFirst,
 }
 
+/// One place a command may be sent to, as a deployment declares it.
+///
+/// Tagged so the TOML reads as what it is:
+///
+/// ```toml
+/// [security.execution_backends.build]
+/// type = "docker"
+/// image = "rust:1.85"
+///
+/// [security.execution_backends.staging]
+/// type = "ssh"
+/// host = "build.example"
+/// user = "deploy"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionBackendConfig {
+    /// A container. The fence becomes the container's mounts, so the container
+    /// is the enforcement point instead of the local kernel.
+    Docker {
+        /// The image to run in. Required: it decides what the command can even
+        /// see.
+        image: String,
+        /// Extra `docker run` flags, for a deployment that needs them.
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
+    /// A host reached over SSH. It cannot honour a fence at all, so a fenced
+    /// request sent here is refused rather than run unfenced.
+    Ssh {
+        /// The host to connect to.
+        host: String,
+        /// The user to connect as, when it is not the client's default.
+        #[serde(default)]
+        user: Option<String>,
+        /// The port to connect on.
+        #[serde(default = "default_ssh_port")]
+        port: u16,
+        /// A private key to authenticate with.
+        #[serde(default)]
+        key_path: Option<String>,
+        /// Extra `ssh` flags.
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+impl From<&ExecutionBackendConfig> for crate::tools::process_runner::ExecutionBackend {
+    fn from(config: &ExecutionBackendConfig) -> Self {
+        use crate::tools::process_runner::remote::{DockerBackend, SshBackend};
+
+        match config {
+            ExecutionBackendConfig::Docker { image, extra_args } => {
+                crate::tools::process_runner::ExecutionBackend::Docker(DockerBackend {
+                    image: image.clone(),
+                    extra_args: extra_args.clone(),
+                })
+            }
+            ExecutionBackendConfig::Ssh {
+                host,
+                user,
+                port,
+                key_path,
+                extra_args,
+            } => crate::tools::process_runner::ExecutionBackend::Ssh(SshBackend {
+                host: host.clone(),
+                user: user.clone(),
+                port: *port,
+                key_path: key_path.clone(),
+                extra_args: extra_args.clone(),
+            }),
+        }
+    }
+}
+
 /// Security configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1391,6 +1470,21 @@ pub struct SecurityConfig {
     /// afterwards.
     #[serde(default)]
     pub fence_namespaces: crate::tools::process_runner::NamespacePosture,
+    /// Named places a command may be sent to instead of this machine.
+    ///
+    /// The agent selects one **by name**, never by image or host, so a
+    /// deployment decides what is reachable and a tool call only decides which
+    /// of those to use. A request that names none runs locally, where the kernel
+    /// enforces the write fence; the two that can be named answer for the fence
+    /// differently, and `docs/modules/tools.md` says how.
+    ///
+    /// This lives under `[security]` because *where a command runs decides who
+    /// enforces the fence* — a `docker` backend translates it onto container
+    /// mounts and an `ssh` backend refuses a fenced request outright, so
+    /// declaring one is a security decision rather than a deployment detail.
+    /// Changing this only affects agents spawned afterwards.
+    #[serde(default)]
+    pub execution_backends: HashMap<String, ExecutionBackendConfig>,
 }
 
 fn default_tailscale_ttl() -> u64 {
@@ -1534,6 +1628,7 @@ impl Default for SecurityConfig {
             credential_precedence: CredentialPrecedence::default(),
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
+            execution_backends: HashMap::new(),
             browser_allow_private: false,
             shell_safety: false,
             shell_safety_unknown_binary: crate::tools::shell_safety::UnknownBinaryPosture::Ask,
