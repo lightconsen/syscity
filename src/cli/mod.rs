@@ -397,6 +397,66 @@ pub enum ChannelType {
     WechatMp,
 }
 
+impl ChannelType {
+    /// The name this channel is stored under in the gateway config.
+    ///
+    /// This string is the channel's *identity*, not a label: it is the key in
+    /// `gateway.toml`'s `[channels]`, the `channel` field the webhook
+    /// provenance carries, and the subcommand name. Renaming it would orphan
+    /// stored configuration, so it is deliberately separate from
+    /// [`Self::display_name`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelType::Telegram => "telegram",
+            ChannelType::Discord => "discord",
+            ChannelType::Slack => "slack",
+            ChannelType::Whatsapp => "whatsapp",
+            ChannelType::Qq => "qq",
+            ChannelType::Feishu => "feishu",
+            ChannelType::Websocket => "websocket",
+            ChannelType::Signal => "signal",
+            ChannelType::Imessage => "imessage",
+            ChannelType::Webchat => "webchat",
+            ChannelType::WechatMp => "wechatmp",
+        }
+    }
+
+    /// The name to show a person.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ChannelType::Telegram => "Telegram",
+            ChannelType::Discord => "Discord",
+            ChannelType::Slack => "Slack",
+            ChannelType::Whatsapp => "WhatsApp",
+            ChannelType::Qq => "QQ",
+            ChannelType::Feishu => "Feishu/Lark",
+            ChannelType::Websocket => "WebSocket",
+            ChannelType::Signal => "Signal",
+            ChannelType::Imessage => "iMessage",
+            ChannelType::Webchat => "WebChat",
+            ChannelType::WechatMp => "WeChat MP",
+        }
+    }
+
+    /// Whether this channel's adapter is compiled into this build.
+    pub fn feature_enabled(self) -> bool {
+        match self {
+            ChannelType::Telegram => cfg!(feature = "telegram"),
+            ChannelType::Discord => cfg!(feature = "discord"),
+            ChannelType::Slack => cfg!(feature = "slack"),
+            ChannelType::Whatsapp => cfg!(feature = "whatsapp"),
+            ChannelType::Qq => cfg!(feature = "qq"),
+            ChannelType::Feishu => cfg!(feature = "feishu"),
+            // The WebSocket channel is a transport the gateway already has.
+            ChannelType::Websocket => true,
+            ChannelType::Signal => cfg!(feature = "signal"),
+            ChannelType::Imessage => cfg!(feature = "imessage"),
+            ChannelType::Webchat => cfg!(feature = "webchat"),
+            ChannelType::WechatMp => cfg!(feature = "wechatmp"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
     Json,
@@ -823,5 +883,39 @@ mod tests {
     fn parse_unknown_command_fails() {
         let result = Cli::try_parse_from(["syscity", "unknown-cmd"]);
         assert!(result.is_err());
+    }
+
+    /// The config key is the channel's identity — it is the `[channels]` key,
+    /// the webhook provenance's `channel`, and the subcommand name. Two
+    /// variants sharing one would silently address the same stored config, and
+    /// a copy-pasted row is exactly how that happens. This walks
+    /// `value_variants()` so a *new* variant is covered without being listed
+    /// here.
+    #[test]
+    fn every_channel_type_has_a_distinct_config_key() {
+        use clap::ValueEnum;
+
+        let mut keys: Vec<&str> = ChannelType::value_variants()
+            .iter()
+            .map(|c| c.as_str())
+            .collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "two channel types share a config key");
+    }
+
+    #[test]
+    fn every_channel_type_has_a_distinct_display_name() {
+        use clap::ValueEnum;
+
+        let mut names: Vec<&str> = ChannelType::value_variants()
+            .iter()
+            .map(|c| c.display_name())
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two channel types share a display name");
     }
 }

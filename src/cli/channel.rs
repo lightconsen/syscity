@@ -179,19 +179,7 @@ async fn run_channel_add(
 
 /// Stop/disable a channel
 async fn run_channel_stop(channel: ChannelType) -> Result<()> {
-    let channel_name = match channel {
-        ChannelType::Telegram => "telegram",
-        ChannelType::Discord => "discord",
-        ChannelType::Slack => "slack",
-        ChannelType::Whatsapp => "whatsapp",
-        ChannelType::Qq => "qq",
-        ChannelType::Feishu => "feishu",
-        ChannelType::Websocket => "websocket",
-        ChannelType::Signal => "signal",
-        ChannelType::Imessage => "imessage",
-        ChannelType::Webchat => "webchat",
-        ChannelType::WechatMp => "wechatmp",
-    };
+    let channel_name = channel.as_str();
 
     println!("🛑 Disabling {} channel...", channel_name);
 
@@ -217,19 +205,7 @@ async fn run_channel_stop(channel: ChannelType) -> Result<()> {
 
 /// Remove/disconnect a channel (removes from Gateway config)
 async fn run_channel_remove(channel: ChannelType, agent: Option<String>) -> Result<()> {
-    let channel_name = match channel {
-        ChannelType::Telegram => "telegram",
-        ChannelType::Discord => "discord",
-        ChannelType::Slack => "slack",
-        ChannelType::Whatsapp => "whatsapp",
-        ChannelType::Qq => "qq",
-        ChannelType::Feishu => "feishu",
-        ChannelType::Websocket => "websocket",
-        ChannelType::Signal => "signal",
-        ChannelType::Imessage => "imessage",
-        ChannelType::Webchat => "webchat",
-        ChannelType::WechatMp => "wechatmp",
-    };
+    let channel_name = channel.as_str();
 
     // Check if agent filter was specified
     if let Some(ref agent_name) = agent {
@@ -1115,33 +1091,8 @@ async fn run_channel_status(
 
     match channel {
         Some(ch) => {
-            let channel_name = match ch {
-                ChannelType::Telegram => "telegram",
-                ChannelType::Discord => "discord",
-                ChannelType::Slack => "slack",
-                ChannelType::Whatsapp => "whatsapp",
-                ChannelType::Qq => "qq",
-                ChannelType::Feishu => "feishu",
-                ChannelType::Websocket => "websocket",
-                ChannelType::Signal => "signal",
-                ChannelType::Imessage => "imessage",
-                ChannelType::Webchat => "webchat",
-                ChannelType::WechatMp => "wechatmp",
-            };
-
-            let display_name = match ch {
-                ChannelType::Telegram => "Telegram",
-                ChannelType::Discord => "Discord",
-                ChannelType::Slack => "Slack",
-                ChannelType::Whatsapp => "WhatsApp",
-                ChannelType::Qq => "QQ",
-                ChannelType::Feishu => "Feishu/Lark",
-                ChannelType::Websocket => "WebSocket",
-                ChannelType::Signal => "Signal",
-                ChannelType::Imessage => "iMessage",
-                ChannelType::Webchat => "WebChat",
-                ChannelType::WechatMp => "WeChat MP",
-            };
+            let channel_name = ch.as_str();
+            let display_name = ch.display_name();
 
             // If --agent is specified, include it in the title
             if let Some(ref agent_name) = agent_filter {
@@ -1244,19 +1195,7 @@ async fn run_channel_status(
 
 /// Test channel configuration
 async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result<()> {
-    let channel_name = match channel {
-        ChannelType::Telegram => "Telegram",
-        ChannelType::Discord => "Discord",
-        ChannelType::Slack => "Slack",
-        ChannelType::Whatsapp => "WhatsApp",
-        ChannelType::Qq => "QQ",
-        ChannelType::Feishu => "Feishu/Lark",
-        ChannelType::Websocket => "WebSocket",
-        ChannelType::Signal => "Signal",
-        ChannelType::Imessage => "iMessage",
-        ChannelType::Webchat => "WebChat",
-        ChannelType::WechatMp => "WeChat MP",
-    };
+    let channel_name = channel.display_name();
 
     println!("🧪 Testing {} configuration...", channel_name);
 
@@ -1266,19 +1205,7 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
     }
 
     // Check compile-time feature
-    let feature_enabled = match channel {
-        ChannelType::Telegram => cfg!(feature = "telegram"),
-        ChannelType::Discord => cfg!(feature = "discord"),
-        ChannelType::Slack => cfg!(feature = "slack"),
-        ChannelType::Whatsapp => cfg!(feature = "whatsapp"),
-        ChannelType::Qq => cfg!(feature = "qq"),
-        ChannelType::Feishu => cfg!(feature = "feishu"),
-        ChannelType::Websocket => true,
-        ChannelType::Signal => cfg!(feature = "signal"),
-        ChannelType::Imessage => cfg!(feature = "imessage"),
-        ChannelType::Webchat => cfg!(feature = "webchat"),
-        ChannelType::WechatMp => cfg!(feature = "wechatmp"),
-    };
+    let feature_enabled = channel.feature_enabled();
 
     if feature_enabled {
         println!("  ✅ Feature compiled in");
@@ -1376,19 +1303,7 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
 
     // Check Gateway config
     println!("\n  Gateway configuration:");
-    let config_key = match channel {
-        ChannelType::Telegram => "telegram",
-        ChannelType::Discord => "discord",
-        ChannelType::Slack => "slack",
-        ChannelType::Whatsapp => "whatsapp",
-        ChannelType::Qq => "qq",
-        ChannelType::Feishu => "feishu",
-        ChannelType::Websocket => "websocket",
-        ChannelType::Signal => "signal",
-        ChannelType::Imessage => "imessage",
-        ChannelType::Webchat => "webchat",
-        ChannelType::WechatMp => "wechatmp",
-    };
+    let config_key = channel.as_str();
 
     if let Some(ref cfg) = load_gateway_config().await {
         if let Some(channel_config) = cfg.channels.get(config_key) {
