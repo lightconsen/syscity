@@ -405,6 +405,8 @@ pub enum ChannelType {
     Teams,
     /// WeCom AI Bot (long-lived WebSocket)
     Wecom,
+    /// DingTalk Stream Mode (long-lived connection)
+    DingTalk,
 }
 
 impl ChannelType {
@@ -433,6 +435,7 @@ impl ChannelType {
             ChannelType::GoogleChat => "googlechat",
             ChannelType::Teams => "teams",
             ChannelType::Wecom => "wecom",
+            ChannelType::DingTalk => "dingtalk",
         }
     }
 
@@ -455,6 +458,7 @@ impl ChannelType {
             ChannelType::GoogleChat => "Google Chat",
             ChannelType::Teams => "Microsoft Teams",
             ChannelType::Wecom => "WeCom",
+            ChannelType::DingTalk => "DingTalk",
         }
     }
 
@@ -478,6 +482,7 @@ impl ChannelType {
             ChannelType::GoogleChat => cfg!(feature = "googlechat"),
             ChannelType::Teams => cfg!(feature = "teams"),
             ChannelType::Wecom => cfg!(feature = "wecom"),
+            ChannelType::DingTalk => cfg!(feature = "dingtalk"),
         }
     }
 }

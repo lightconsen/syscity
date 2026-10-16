@@ -179,6 +179,7 @@ async fn run_channel_add(
         ChannelType::GoogleChat => add_googlechat_channel(token, agent, extra_creds).await,
         ChannelType::Teams => add_teams_channel(token, agent, extra_creds).await,
         ChannelType::Wecom => add_wecom_channel(token, agent, extra_creds).await,
+        ChannelType::DingTalk => add_dingtalk_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -1312,6 +1313,82 @@ async fn add_wecom_channel(
     Ok(())
 }
 
+/// Add/configure a DingTalk (钉钉) Stream Mode channel in Gateway
+async fn add_dingtalk_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    let required = |env: &str, key: &str| -> Result<String> {
+        lookup(env, key).ok_or_else(|| {
+            crate::error::SyscityError::Config(crate::error::ConfigError::Missing(format!(
+                "{} environment variable, or --credential {}=...",
+                env, key
+            )))
+        })
+    };
+
+    // `--token` is the client secret, the way it is Twilio's auth token and
+    // Teams' app secret: the credential, not the identity.
+    let client_secret = match token {
+        Some(t) => t,
+        None => required("DINGTALK_CLIENT_SECRET", "client_secret")?,
+    };
+    let client_id = required("DINGTALK_CLIENT_ID", "client_id")?;
+
+    println!("🚀 Adding DingTalk channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("client_id".to_string(), client_id);
+    credentials.insert("client_secret".to_string(), client_secret);
+    // Only for a sovereign deployment or a test peer; the public API is the
+    // default and is what almost every deployment wants.
+    if let Some(endpoint) = lookup("DINGTALK_OPENAPI_ENDPOINT", "openapi_endpoint") {
+        credentials.insert("openapi_endpoint".to_string(), endpoint);
+    }
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::DingTalk,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config
+        .channels
+        .insert("dingtalk".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ DingTalk channel configured in Gateway");
+    println!("   Nothing to point anywhere: the gateway connects out to DingTalk itself");
+    println!("   The app's robot must have its message-receiving mode set to Stream Mode");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1673,6 +1750,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::Wecom => {
             println!("    ℹ️  WeCom needs an AI Bot's Bot ID and Secret; it holds a WebSocket out, so it needs no public URL");
+        }
+        ChannelType::DingTalk => {
+            println!("    ℹ️  DingTalk needs the app's Client ID and Client Secret, with the robot's message mode set to Stream");
         }
     }
 

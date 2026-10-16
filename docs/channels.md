@@ -31,6 +31,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | **Google Chat** | **`googlechat`** | ✅ | Chat app webhook (bearer token) | `/webhooks/googlechat` |
 | **Microsoft Teams** | **`teams`** | ✅ | Bot Framework activity (bearer token) | `/webhooks/teams` |
 | **WeCom (企业微信)** | **`wecom`** | ✅ | AI Bot WebSocket (long-lived) | — |
+| **DingTalk (钉钉)** | **`dingtalk`** | ✅ | Stream Mode (long-lived) | — |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -91,6 +92,7 @@ Per-channel credential keys:
 | Google Chat | `issuer`, `audience`, `jwks_url`, `allowed_service_accounts`, `client_email`, `private_key_pem` | `GOOGLE_CHAT_ISSUER`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_JWKS_URL`, `GOOGLE_CHAT_ALLOWED_SERVICE_ACCOUNTS`, `GOOGLE_CHAT_CLIENT_EMAIL`, `GOOGLE_CHAT_PRIVATE_KEY` |
 | Microsoft Teams | `app_id`, `tenant_id`, `client_secret`, `issuer`, `jwks_url` | `TEAMS_APP_ID`, `TEAMS_TENANT_ID`, `TEAMS_CLIENT_SECRET`, `TEAMS_ISSUER`, `TEAMS_JWKS_URL` |
 | WeCom (企业微信) | `bot_id`, `secret`, `ws_url` | `WECOM_BOT_ID`, `WECOM_SECRET`, `WECOM_WEBSOCKET_URL` |
+| DingTalk (钉钉) | `client_id`, `client_secret`, `openapi_endpoint` | `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET`, `DINGTALK_OPENAPI_ENDPOINT` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -315,6 +317,47 @@ are acknowledged and skipped. Replies over 4000 characters go out as consecutive
 messages. The typing bubble on this platform is the first frame of a *streamed*
 reply, which this channel does not send — so there is no typing indicator, and a
 long answer arrives when it is finished rather than growing in place.
+
+### DingTalk (钉钉) — the full flow
+
+1. At [open-dev.dingtalk.com](https://open-dev.dingtalk.com/), create an app and
+   take its **Client ID** (the AppKey) and **Client Secret** (the AppSecret).
+2. Under **Add Capability → Robot**, enable the robot, and set its **Message
+   Reception Mode** to **Stream Mode**.
+3. Configure the channel:
+   ```bash
+   export DINGTALK_CLIENT_ID=<the app key>
+   export DINGTALK_CLIENT_SECRET=<the app secret>
+   syscity channels add dingtalk
+   ```
+   Then `syscity start` to run the gateway. Nothing to point anywhere — the
+   gateway connects out to DingTalk itself.
+
+`DINGTALK_OPENAPI_ENDPOINT` only needs setting for a sovereign deployment or a
+test peer; `https://api.dingtalk.com` is the default.
+
+**Stream Mode opens no socket until the platform hands one over.** The gateway
+first makes an HTTP call that returns an endpoint and a one-shot ticket, and
+only then connects — which is why a reconnect starts with the handshake again
+rather than with the socket.
+
+**Every delivery is acknowledged, before it becomes a turn.** An unacknowledged
+message is redelivered, so the acknowledgement goes out first and the message is
+handed on after — and a redelivery of the same message is acknowledged again
+without becoming a second turn.
+
+**A reply does not go over that socket.** It is an HTTP POST to a
+`sessionWebhook` URL that **arrived inside the message**, and that URL is
+therefore checked against DingTalk's own hosts before anything is sent to it.
+The URL **expires** — which is the platform's limitation rather than this
+channel's: a bot can only reply to a conversation it has heard from recently,
+and a reply after the window closes is refused with that reason. The durable
+alternative needs an access token and is not implemented here.
+
+Only **text** messages are routed; pictures, files, audio and cards arrive on the
+same connection and are skipped. A group message's mention comes from the
+platform's own field rather than being parsed out of the text, so `require_mention`
+works here. Replies over 20,000 characters go out as consecutive messages.
 
 ## Access control
 

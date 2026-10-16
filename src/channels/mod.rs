@@ -57,6 +57,8 @@ pub enum ChannelType {
     Teams,
     /// WeCom (企业微信) AI Bot, over a long-lived WebSocket
     Wecom,
+    /// DingTalk (钉钉) Stream Mode, over a long-lived connection
+    DingTalk,
 }
 
 #[cfg(feature = "telegram")]
@@ -111,6 +113,9 @@ pub mod teams;
 
 #[cfg(feature = "wecom")]
 pub mod wecom;
+
+#[cfg(feature = "dingtalk")]
+pub mod dingtalk;
 
 pub mod acp_bridge;
 pub mod command_gate;

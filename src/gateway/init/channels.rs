@@ -347,6 +347,16 @@ pub(crate) async fn init_single_channel(
                 warn!("WeCom feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::DingTalk => {
+            #[cfg(feature = "dingtalk")]
+            {
+                init_dingtalk_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "dingtalk"))]
+            {
+                warn!("DingTalk feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -1099,6 +1109,89 @@ pub(crate) async fn init_wecom_channel(
         .await
         .insert(name.to_string(), channel);
     info!("✅ WeCom channel '{}' initialized (long-lived WebSocket)", name);
+
+    Ok(())
+}
+
+/// Initialize DingTalk (钉钉) Stream Mode channel.
+///
+/// The second connection channel, and the same shape as WeCom's: the transport
+/// is new here and nothing above it is. What differs is only the handshake —
+/// Stream Mode opens no socket until an HTTP call hands one over — and that
+/// inbound has to be acknowledged, which the connection loop does before the
+/// message is handed on.
+#[cfg(feature = "dingtalk")]
+pub(crate) async fn init_dingtalk_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::dingtalk::{DingTalkChannel, DingTalkConfig};
+
+    let (Some(client_id), Some(client_secret)) = (
+        channel_cred(&state.secrets, name, config, "client_id").await,
+        channel_cred(&state.secrets, name, config, "client_secret").await,
+    ) else {
+        warn!(
+            "DingTalk channel '{}' missing 'client_id'/'client_secret' — it cannot authenticate, \
+             so it is not started",
+            name
+        );
+        return Ok(());
+    };
+
+    let (inbound_tx, mut inbound_rx) =
+        mpsc::unbounded_channel::<crate::channels::IncomingMessage>();
+
+    let mut dingtalk_config = DingTalkConfig::new(client_id, client_secret);
+    dingtalk_config.message_tx = Some(inbound_tx);
+    if let Some(endpoint) = channel_cred(&state.secrets, name, config, "openapi_endpoint").await {
+        dingtalk_config.openapi_endpoint = endpoint;
+    }
+
+    let channel = Arc::new(DingTalkChannel::new(dingtalk_config));
+
+    // Bridge: every message the connection delivers goes through the shared
+    // tail, which is what applies access control, honours `/new`, and records
+    // which channel owns the session so the agent's reply can be routed back.
+    let state_for_bridge = state.clone();
+    let channel_name = name.to_string();
+    let bridge_handle = tokio::spawn(async move {
+        while let Some(msg) = inbound_rx.recv().await {
+            crate::gateway::webhooks::dispatch_channel_message_to(
+                &state_for_bridge,
+                &channel_name,
+                &msg.user_id.0,
+                &msg.conversation_id.0,
+                &msg.content,
+                msg.mention,
+            )
+            .await;
+        }
+    });
+    register_channel_task(&state, name, "bridge", bridge_handle).await;
+
+    let name_for_task = name.to_string();
+    let channel_for_task = channel.clone();
+    let main_handle = tokio::spawn(async move {
+        if let Err(e) = channel_for_task.start().await {
+            error!("DingTalk channel {} failed: {}", name_for_task, e);
+        }
+    });
+    register_channel_task(&state, name, "main", main_handle).await;
+
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel(name, channel.clone())
+        .await;
+    state
+        .channels
+        .channels
+        .write()
+        .await
+        .insert(name.to_string(), channel);
+    info!("✅ DingTalk channel '{}' initialized (Stream Mode)", name);
 
     Ok(())
 }
