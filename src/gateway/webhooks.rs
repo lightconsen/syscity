@@ -234,6 +234,45 @@ async fn dispatch_direct_webhook_to(
     }
 }
 
+/// Resolve one channel credential from config, falling back to the secret store.
+///
+/// The secret store (namespace `channel`) is authoritative; the plaintext
+/// `credentials` map is the legacy fallback for pre-migration configs. Returns
+/// `None` when the key is unset, which every caller reads as "refuse".
+#[cfg(any(feature = "googlechat", feature = "teams"))]
+async fn channel_credential(state: &Arc<GatewayState>, channel: &str, key: &str) -> Option<String> {
+    let legacy = {
+        let config = state.config.read().await;
+        config
+            .channels
+            .get(channel)
+            .and_then(|c| c.credentials.get(key))
+            .cloned()
+    };
+    state
+        .secrets
+        .resolve_channel_credential(channel, key, legacy.as_deref())
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.into_inner())
+}
+
+/// The bearer token on a delivery, or `None` when it carries none.
+///
+/// Shared by the two channels whose webhook is authenticated by a JWT rather
+/// than a signature. A missing or empty header is `None` rather than an empty
+/// string, so a caller cannot accidentally hand `""` to a verifier.
+#[cfg(any(feature = "googlechat", feature = "teams"))]
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 /// Create the public webhook router
 pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
     let router = Router::new()
@@ -267,6 +306,10 @@ pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
     // Google Chat webhooks (feature-gated channel)
     #[cfg(feature = "googlechat")]
     let router = router.route("/webhooks/googlechat", post(googlechat_webhook_handler));
+
+    // Microsoft Teams webhooks (feature-gated channel)
+    #[cfg(feature = "teams")]
+    let router = router.route("/webhooks/teams", post(teams_webhook_handler));
 
     // One guard for the process: a delivery is a replay wherever in the router
     // it arrives.
@@ -1034,14 +1077,7 @@ async fn googlechat_webhook_handler(
             .into_response();
     };
 
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|t| !t.is_empty());
-
-    let Some(token) = token else {
+    let Some(token) = bearer_token(&headers) else {
         warn!("Google Chat webhook: no bearer token — refusing");
         return (StatusCode::UNAUTHORIZED, "A bearer token is required").into_response();
     };
@@ -1056,24 +1092,8 @@ async fn googlechat_webhook_handler(
 
     // Which identity the token was issued to, resolved the same way the other
     // handlers resolve their credentials.
-    let allowed = {
-        let legacy = {
-            let config = state.config.read().await;
-            config
-                .channels
-                .get("googlechat")
-                .and_then(|c| c.credentials.get("allowed_service_accounts"))
-                .cloned()
-        };
-        state
-            .secrets
-            .resolve_channel_credential("googlechat", "allowed_service_accounts", legacy.as_deref())
-            .await
-            .ok()
-            .flatten()
-            .map(|v| v.into_inner())
-    };
-    let allowed: Vec<String> = allowed
+    let allowed: Vec<String> = channel_credential(&state, "googlechat", "allowed_service_accounts")
+        .await
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -1123,6 +1143,128 @@ async fn googlechat_webhook_handler(
             return (StatusCode::BAD_REQUEST, "Invalid payload").into_response();
         }
     }
+
+    Json(WebhookResponse {
+        success: true,
+        message: "OK".to_string(),
+    })
+    .into_response()
+}
+
+/// Handle Microsoft Teams webhooks.
+///
+/// The delivery is a Bot Framework *activity* carrying a bearer token. The token
+/// is verified against the issuer's published keys, and then its `serviceurl`
+/// claim is compared with the activity's `serviceUrl` field — Microsoft signs one token per bot,
+/// and that claim is what binds a token that verifies to the conversation
+/// surface the activity actually came from. This is the check that stands in for
+/// Google Chat's identity allowlist: there, the token names an identity that has
+/// to be listed; here, it names the service that has to agree.
+///
+/// An activity may also be a conversation update, a reaction, or the bot's own
+/// message arriving back around. All of those are acknowledged without becoming
+/// turns.
+#[cfg(feature = "teams")]
+async fn teams_webhook_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    info!("Received Microsoft Teams webhook");
+
+    // Built once at init and kept, because the verifier caches the issuer's key
+    // set — constructing one here would refetch it on every delivery.
+    let verifier = {
+        let verifiers = state.channels.webhook_verifiers.read().await;
+        verifiers.get("teams").cloned()
+    };
+    let Some(verifier) = verifier else {
+        warn!("Teams webhook: the channel is not configured to verify deliveries — refusing");
+        return (StatusCode::UNAUTHORIZED, "Channel is not configured to verify deliveries")
+            .into_response();
+    };
+
+    let Some(token) = bearer_token(&headers) else {
+        warn!("Teams webhook: no bearer token — refusing");
+        return (StatusCode::UNAUTHORIZED, "A bearer token is required").into_response();
+    };
+
+    let claims = match verifier.verify(token).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            warn!("Teams webhook: {}", e);
+            return (StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response();
+        }
+    };
+    debug!("Teams webhook: bearer token verified");
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("Teams webhook: duplicate delivery ignored");
+        return Json(WebhookResponse {
+            success: true,
+            message: "duplicate ignored".to_string(),
+        })
+        .into_response();
+    }
+
+    // The app id is what the token was verified against, so it is already
+    // configured; it is read again because the parser needs it to recognise the
+    // bot's own activities.
+    let app_id = channel_credential(&state, "teams", "app_id")
+        .await
+        .unwrap_or_default();
+
+    let incoming = match crate::channels::teams::parse_activity(&body, &app_id) {
+        Ok(Some(incoming)) => incoming,
+        Ok(None) => {
+            debug!("Teams webhook: not a user message — acknowledged");
+            return Json(WebhookResponse {
+                success: true,
+                message: "OK".to_string(),
+            })
+            .into_response();
+        }
+        Err(e) => {
+            warn!("Teams webhook: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid payload").into_response();
+        }
+    };
+
+    // The claim is spelled `serviceurl` — all one word, all lower case — which
+    // is the constant both Bot Framework SDKs look up, and the name the claim
+    // actually carries in the token. `serviceUrl` is the activity *field*'s
+    // spelling and finds nothing here, which would refuse every delivery.
+    //
+    // Both sides go through the same canonicalization, so a tenant that spells
+    // its service URL with and without the trailing slash still matches. A token
+    // minted for another bot's connector verifies against the same keys and
+    // names the same audience, so this comparison is what says it belongs to
+    // *this* conversation.
+    let claimed = claims
+        .get("serviceurl")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if crate::channels::teams::validate_service_url(claimed).as_deref()
+        != Some(incoming.address.service_url.as_str())
+    {
+        warn!(
+            "Teams webhook: the token's serviceurl claim does not match the activity's — refusing"
+        );
+        return (StatusCode::UNAUTHORIZED, "Token is for another service").into_response();
+    }
+
+    // The session is keyed on the sender, the reply addressed to the
+    // conversation they wrote in — which is why this is the `_to` variant.
+    dispatch_direct_webhook_to(
+        &state,
+        "teams",
+        &incoming.user_id,
+        &incoming.address.encode(),
+        &incoming.text,
+    )
+    .await;
 
     Json(WebhookResponse {
         success: true,

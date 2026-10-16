@@ -29,6 +29,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | **LINE** | **`line`** | ✅ | Messaging API webhook | `/webhooks/line` |
 | **Twilio SMS** | **`twilio`** | ✅ | Messages webhook (form-encoded) | `/webhooks/twilio` |
 | **Google Chat** | **`googlechat`** | ✅ | Chat app webhook (bearer token) | `/webhooks/googlechat` |
+| **Microsoft Teams** | **`teams`** | ✅ | Bot Framework activity (bearer token) | `/webhooks/teams` |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -87,6 +88,7 @@ Per-channel credential keys:
 | LINE | `channel_access_token`, `channel_secret` | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` |
 | Twilio SMS | `account_sid`, `auth_token`, `from_number`, `webhook_url` | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_WEBHOOK_URL` |
 | Google Chat | `issuer`, `audience`, `jwks_url`, `allowed_service_accounts`, `client_email`, `private_key_pem` | `GOOGLE_CHAT_ISSUER`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_JWKS_URL`, `GOOGLE_CHAT_ALLOWED_SERVICE_ACCOUNTS`, `GOOGLE_CHAT_CLIENT_EMAIL`, `GOOGLE_CHAT_PRIVATE_KEY` |
+| Microsoft Teams | `app_id`, `tenant_id`, `client_secret`, `issuer`, `jwks_url` | `TEAMS_APP_ID`, `TEAMS_TENANT_ID`, `TEAMS_CLIENT_SECRET`, `TEAMS_ISSUER`, `TEAMS_JWKS_URL` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -219,6 +221,52 @@ Only user messages are routed. A bot's own reply comes back through the same
 webhook — answering it would make the bot talk to itself — and Chat posts
 non-message events (adds, removals) to the same URL; both are acknowledged and
 skipped. Replies over 4096 characters are split into consecutive messages.
+
+### Microsoft Teams — the full flow
+
+1. Register a bot in the [Azure Bot Service](https://portal.azure.com/) and note
+   three things: the **Microsoft App ID**, an app **secret** for it, and the
+   **tenant** it lives in.
+2. Configure the channel:
+   ```bash
+   export TEAMS_APP_ID=<the app id>
+   export TEAMS_TENANT_ID=<the tenant id>
+   export TEAMS_CLIENT_SECRET=<the app secret>
+   syscity channels add teams
+   ```
+   Then `syscity start` to run the gateway.
+3. Set the bot's **messaging endpoint** to `https://<public>/webhooks/teams`.
+
+`TEAMS_ISSUER` and `TEAMS_JWKS_URL` default to the public cloud's values
+(`https://api.botframework.com` and
+`https://login.botframework.com/v1/.well-known/keys`) and need setting only for a
+sovereign cloud.
+
+Two checks stand between a delivery and a turn, and they answer different
+questions. The token has to verify against the issuer's published keys **and**
+name your app as its audience — that is what says Microsoft minted it for this
+bot. Then its `serviceurl` claim — one word, lower case; `serviceUrl` is only the
+activity field's spelling — has to match the activity's, which is what says it
+was minted for *this* conversation surface. A token Microsoft legitimately
+signed for another tenant's connector passes the first check and fails the
+second, which is why both are there.
+
+The reply address is two values, not one. A Bot Framework reply goes to
+`{serviceUrl}v3/conversations/{conversationId}/activities`, and the service URL is
+per-tenant — the regions differ by path (`/amer/`, `/emea/`, `/apac/`) — so both
+travel together in the conversation id, joined by `|`. The service URL is held to
+an allowlist of Bot Framework hosts before a freshly minted token is attached to
+it, because that host is what decides where this bot's credentials go. The
+allowlist covers the commercial and government clouds; a sovereign deployment on
+another host is not supported yet.
+
+Only messages from people are routed. Teams posts conversation updates,
+reactions, invokes and typing to the same URL, and the bot's own activity would
+loop if it were answered — all of them are acknowledged and skipped. The
+`<at>…</at>` markup Teams wraps a mention in is removed, but the name inside it is
+kept, so `<at>Alice</at> can you check this` reaches the agent as
+`Alice can you check this`. Replies over 28,000 characters are split into
+consecutive messages.
 
 ## Access control
 

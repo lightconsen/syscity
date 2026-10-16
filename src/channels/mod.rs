@@ -53,6 +53,8 @@ pub enum ChannelType {
     Twilio,
     /// Google Chat webhook (bearer-token authenticated)
     GoogleChat,
+    /// Microsoft Teams webhook (Bot Framework activity)
+    Teams,
 }
 
 #[cfg(feature = "telegram")]
@@ -101,6 +103,9 @@ pub mod oauth_token;
 
 #[cfg(feature = "googlechat")]
 pub mod googlechat;
+
+#[cfg(feature = "teams")]
+pub mod teams;
 
 pub mod acp_bridge;
 pub mod command_gate;

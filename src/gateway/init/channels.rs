@@ -327,6 +327,16 @@ pub(crate) async fn init_single_channel(
                 warn!("Google Chat feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::Teams => {
+            #[cfg(feature = "teams")]
+            {
+                init_teams_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "teams"))]
+            {
+                warn!("Teams feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -901,6 +911,90 @@ pub(crate) async fn init_googlechat_channel(
         "✅ Google Chat channel '{}' initialized (inbound via bearer-token webhook)",
         name
     );
+
+    Ok(())
+}
+
+/// Initialize Microsoft Teams channel.
+///
+/// Inbound arrives via the Bot Framework webhook in `gateway/webhooks.rs`. As
+/// with Google Chat, the two halves are set up separately because they have
+/// separate credentials — verification needs the app id, the issuer and the key
+/// URL, sending needs the tenant and the app secret — and a deployment can
+/// legitimately have one without the other. A missing secret must not quietly
+/// take the inbound check down with it, which is why the outbound half is looked
+/// at last.
+#[cfg(feature = "teams")]
+pub(crate) async fn init_teams_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::teams::{TeamsChannel, TeamsConfig};
+
+    let (Some(app_id), Some(issuer), Some(jwks_url)) = (
+        channel_cred(&state.secrets, name, config, "app_id").await,
+        channel_cred(&state.secrets, name, config, "issuer").await,
+        channel_cred(&state.secrets, name, config, "jwks_url").await,
+    ) else {
+        warn!(
+            "Teams channel '{}' missing one of 'app_id'/'issuer'/'jwks_url' — activities \
+             cannot be verified and will be refused",
+            name
+        );
+        return Ok(());
+    };
+
+    // Registered before the outbound half is even looked at: this is what the
+    // webhook handler needs, and it has to outlive a request because it caches
+    // the issuer's key set. The app id is the audience, which is the same value
+    // the outbound half sends as.
+    state.channels.webhook_verifiers.write().await.insert(
+        name.to_string(),
+        Arc::new(crate::gateway::jwt_verify::JwtVerifier::new(&issuer, &app_id, &jwks_url)),
+    );
+    info!("Teams channel '{}': activities verified against issuer {}", name, issuer);
+
+    let (Some(tenant_id), Some(client_secret)) = (
+        channel_cred(&state.secrets, name, config, "tenant_id").await,
+        channel_cred(&state.secrets, name, config, "client_secret").await,
+    ) else {
+        warn!(
+            "Teams channel '{}' has no app registration secret ('tenant_id'/'client_secret'), \
+             so replies cannot be posted",
+            name
+        );
+        return Ok(());
+    };
+
+    let channel = Arc::new(TeamsChannel::new(TeamsConfig {
+        issuer,
+        app_id,
+        jwks_url,
+        tenant_id,
+        client_secret,
+    }));
+
+    let channel_name = name.to_string();
+    let channel_for_task = channel.clone();
+    let main_handle = tokio::spawn(async move {
+        if let Err(e) = channel_for_task.start().await {
+            error!("Teams channel {} failed: {}", channel_name, e);
+        }
+    });
+    register_channel_task(&state, name, "main", main_handle).await;
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel(name, channel.clone())
+        .await;
+    state
+        .channels
+        .channels
+        .write()
+        .await
+        .insert(name.to_string(), channel);
+    info!("✅ Teams channel '{}' initialized (inbound via Bot Framework webhook)", name);
 
     Ok(())
 }

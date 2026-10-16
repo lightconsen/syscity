@@ -126,6 +126,15 @@ impl TokenSource {
         }
     }
 
+    /// The token endpoint this source mints against.
+    ///
+    /// Exposed the way `JwtVerifier::issuer` is: a configured value that ends up
+    /// inside a URL is worth being able to see, and worth being able to pin in a
+    /// test.
+    pub fn token_url(&self) -> &str {
+        &self.token_url
+    }
+
     /// A usable access token, fetching or refreshing it as needed.
     ///
     /// Two callers that miss the cache at the same moment will both fetch. That

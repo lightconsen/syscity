@@ -401,6 +401,8 @@ pub enum ChannelType {
     Twilio,
     /// Google Chat webhook
     GoogleChat,
+    /// Microsoft Teams webhook
+    Teams,
 }
 
 impl ChannelType {
@@ -427,6 +429,7 @@ impl ChannelType {
             ChannelType::Line => "line",
             ChannelType::Twilio => "twilio",
             ChannelType::GoogleChat => "googlechat",
+            ChannelType::Teams => "teams",
         }
     }
 
@@ -447,6 +450,7 @@ impl ChannelType {
             ChannelType::Line => "LINE",
             ChannelType::Twilio => "Twilio SMS",
             ChannelType::GoogleChat => "Google Chat",
+            ChannelType::Teams => "Microsoft Teams",
         }
     }
 
@@ -468,6 +472,7 @@ impl ChannelType {
             ChannelType::Line => cfg!(feature = "line"),
             ChannelType::Twilio => cfg!(feature = "twilio"),
             ChannelType::GoogleChat => cfg!(feature = "googlechat"),
+            ChannelType::Teams => cfg!(feature = "teams"),
         }
     }
 }

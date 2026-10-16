@@ -13,7 +13,7 @@ use sha2::Sha256;
 use tokio::sync::RwLock;
 
 // A mock issuer for the bearer-token channels' key sets.
-#[cfg(feature = "googlechat")]
+#[cfg(any(feature = "googlechat", feature = "teams"))]
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Base URL for a gateway started on `port`.
@@ -814,7 +814,7 @@ async fn twilio_webhook_without_a_configured_url_refuses_everything() {
 /// Generated per test rather than embedded — a private key committed to the
 /// repository would trip the commit gate's secret scan, and a real one would be
 /// worse.
-#[cfg(feature = "googlechat")]
+#[cfg(any(feature = "googlechat", feature = "teams"))]
 fn bearer_test_key() -> (String, serde_json::Value) {
     use base64::Engine as _;
     use rsa::pkcs8::EncodePrivateKey as _;
@@ -1106,5 +1106,278 @@ async fn googlechat_webhook_rejects_anything_that_does_not_prove_identity() {
         .send()
         .await
         .expect("POST /webhooks/googlechat");
+    assert_eq!(resp.status(), 200, "a valid token is accepted");
+}
+
+// ─────────────────────────────────────────────
+// Microsoft Teams
+// ─────────────────────────────────────────────
+
+/// The public cloud's Bot Framework issuer and the app id the test's bot
+/// answers as. The service URL is the tenant routing path replies go back to,
+/// which is *not* a constant — the regions differ — and so travels with each
+/// activity rather than being pinned here.
+#[cfg(feature = "teams")]
+const TEAMS_ISSUER: &str = "https://api.botframework.com";
+#[cfg(feature = "teams")]
+const TEAMS_APP_ID: &str = "11111111-2222-3333-4444-555555555555";
+#[cfg(feature = "teams")]
+const TEAMS_SERVICE_URL: &str = "https://smba.trafficmanager.net/amer/";
+
+/// Mint the Bot Framework token a Teams delivery carries.
+///
+/// Microsoft signs one token per bot and stamps the connector it was minted for
+/// into `serviceUrl`; that claim is what the gateway holds the activity's own
+/// `serviceUrl` to, so it is the interesting thing to be able to vary.
+#[cfg(feature = "teams")]
+fn teams_token(private_key_pem: &str, issuer: &str, app_id: &str, service_url: &str) -> String {
+    let key =
+        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).expect("encoding key");
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": issuer,
+        "aud": app_id,
+        // All one word, all lower case: this is the claim the Bot Framework
+        // SDKs look up, and `serviceUrl` is only the activity field's spelling.
+        "serviceurl": service_url,
+        "sub": "a-subject",
+        "iat": now,
+        "exp": now + 300,
+    });
+
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("test-key-1".to_string());
+
+    jsonwebtoken::encode(&header, &claims, &key).expect("mint a token")
+}
+
+/// Start a mock key set publishing `key`. The server must outlive the test that
+/// uses it.
+#[cfg(feature = "teams")]
+async fn teams_jwks_server(key: &serde_json::Value) -> MockServer {
+    use wiremock::matchers::{method, path};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(key))
+        .mount(&server)
+        .await;
+
+    server
+}
+
+/// The credentials a Teams channel needs to verify deliveries, pointed at a mock
+/// key set.
+#[cfg(feature = "teams")]
+fn teams_channel_config(jwks_url: &str) -> syscity::gateway::config::ChannelConfig {
+    let mut c = syscity::gateway::config::ChannelConfig::new(syscity::channels::ChannelType::Teams);
+    c.credentials
+        .insert("app_id".to_string(), TEAMS_APP_ID.to_string());
+    c.credentials
+        .insert("issuer".to_string(), TEAMS_ISSUER.to_string());
+    c.credentials
+        .insert("jwks_url".to_string(), jwks_url.to_string());
+    // Deliberately no app registration: the two halves are configured
+    // separately, and leaving the outbound side unconfigured is what lets the
+    // test's recording adapter own the "teams" name — so the reply is observable
+    // here instead of being posted to the real Bot Framework connector.
+    c
+}
+
+/// A message activity from a human, in a named conversation.
+#[cfg(feature = "teams")]
+fn teams_activity(from: &str, conversation: &str, text: &str, service_url: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": "message",
+        "id": "ACT_HTTP_E2E",
+        "text": text,
+        "serviceUrl": service_url,
+        "channelId": "msteams",
+        "from": { "id": from, "aadObjectId": "aad-object-id" },
+        "recipient": { "id": format!("28:{}", TEAMS_APP_ID) },
+        "conversation": { "id": conversation, "conversationType": "channel" },
+    }))
+    .expect("serialize")
+}
+
+/// Case 13 — a Bot Framework activity drives the same round trip, and the reply
+/// is addressed to the *conversation* rather than the sender. The address is a
+/// pair — the tenant's connector host and the conversation — because that is
+/// what the connector takes, and the service URL is per-tenant rather than a
+/// constant.
+#[cfg(feature = "teams")]
+#[tokio::test]
+#[serial]
+async fn teams_webhook_round_trip_replies_to_the_conversation() {
+    let port = free_port();
+    let (private_pem, jwks) = bearer_test_key();
+    let jwks_server = teams_jwks_server(&jwks).await;
+    let jwks_url = format!("{}/jwks", jwks_server.uri());
+
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config
+        .channels
+        .insert("teams".to_string(), teams_channel_config(&jwks_url));
+
+    let gateway = new_test_gateway(config).await;
+    let state = gateway.state();
+    let (channel, sent) = HttpTestChannel::new("teams");
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel("teams", channel)
+        .await;
+    let router = gateway.model_router();
+    register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
+        .await;
+
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    let conversation = "19:conv@thread.tacv2";
+    let token = teams_token(&private_pem, TEAMS_ISSUER, TEAMS_APP_ID, TEAMS_SERVICE_URL);
+    let body = teams_activity(
+        "29:user",
+        conversation,
+        "Say exactly 'pong-from-llm' and nothing else.",
+        TEAMS_SERVICE_URL,
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/teams", base(port)))
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("POST /webhooks/teams");
+    assert_eq!(resp.status(), 200, "a verified webhook must be accepted");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            dump_captured_logs();
+            panic!("timed out waiting for the webhook reply on channel 'teams'");
+        }
+        let snapshot = sent.read().await.clone();
+        if let Some(reply) = snapshot
+            .iter()
+            .find(|m| m.content.contains("pong-from-llm"))
+        {
+            assert_eq!(
+                reply.conversation_id.0,
+                format!("{}|{}", TEAMS_SERVICE_URL, conversation),
+                "the reply is addressed to the tenant's connector and the conversation, \
+                 not to the sender or the session"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Case 14 — a delivery that does not prove it came from *this* bot's connector
+/// is refused.
+///
+/// The last two are the ones Teams adds over Google Chat: a token Microsoft
+/// legitimately signed for another app is refused by the audience check, and one
+/// it signed for another tenant's connector — same issuer, same app, same keys —
+/// is refused only because the `serviceUrl` claim and the activity disagree.
+#[cfg(feature = "teams")]
+#[tokio::test]
+#[serial]
+async fn teams_webhook_rejects_anything_that_does_not_prove_the_service() {
+    let port = free_port();
+    let (private_pem, jwks) = bearer_test_key();
+    let jwks_server = teams_jwks_server(&jwks).await;
+    let jwks_url = format!("{}/jwks", jwks_server.uri());
+
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config
+        .channels
+        .insert("teams".to_string(), teams_channel_config(&jwks_url));
+
+    let gateway = new_test_gateway(config).await;
+    let router = gateway.model_router();
+    register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
+        .await;
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    let body = teams_activity("29:user", "19:conv@thread.tacv2", "hi", TEAMS_SERVICE_URL);
+
+    // A token signed by a key the issuer does not publish.
+    let (other_pem, _) = bearer_test_key();
+    let wrong_key = teams_token(&other_pem, TEAMS_ISSUER, TEAMS_APP_ID, TEAMS_SERVICE_URL);
+
+    // A token minted for a different bot.
+    let wrong_app = teams_token(&private_pem, TEAMS_ISSUER, "another-app-id", TEAMS_SERVICE_URL);
+
+    // A token from a different issuer.
+    let wrong_issuer =
+        teams_token(&private_pem, "https://elsewhere.example", TEAMS_APP_ID, TEAMS_SERVICE_URL);
+
+    // Signed by the right key, for the right app, by the right issuer — and for
+    // another tenant's connector.
+    let other_tenant = "https://smba.trafficmanager.net/emea/";
+    let wrong_service = teams_token(&private_pem, TEAMS_ISSUER, TEAMS_APP_ID, other_tenant);
+
+    let valid = teams_token(&private_pem, TEAMS_ISSUER, TEAMS_APP_ID, TEAMS_SERVICE_URL);
+
+    for (label, auth) in [
+        ("no token", None),
+        ("not a jwt", Some("Bearer not-a-jwt".to_string())),
+        ("signed by another key", Some(format!("Bearer {}", wrong_key))),
+        ("another app", Some(format!("Bearer {}", wrong_app))),
+        ("another issuer", Some(format!("Bearer {}", wrong_issuer))),
+        ("another tenant's connector", Some(format!("Bearer {}", wrong_service))),
+    ] {
+        let mut req = reqwest::Client::new()
+            .post(format!("{}/webhooks/teams", base(port)))
+            .header("content-type", "application/json");
+        if let Some(auth) = &auth {
+            req = req.header("authorization", auth);
+        }
+
+        let resp = req
+            .body(body.clone())
+            .send()
+            .await
+            .expect("POST /webhooks/teams");
+        assert_eq!(
+            resp.status(),
+            401,
+            "{label}: a delivery that does not prove it came from this bot's connector must be \
+             refused"
+        );
+    }
+
+    // The claim check on its own: a token that verifies against every other
+    // check, carrying an activity whose serviceUrl says something else.
+    let elsewhere = teams_activity("29:user", "19:conv@thread.tacv2", "hi", other_tenant);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/teams", base(port)))
+        .header("authorization", format!("Bearer {}", valid))
+        .header("content-type", "application/json")
+        .body(elsewhere)
+        .send()
+        .await
+        .expect("POST /webhooks/teams");
+    assert_eq!(resp.status(), 401, "the token's serviceUrl claim and the activity's must agree");
+
+    // The control: the same request with a good token is accepted, so the
+    // refusals above are the checks and not a broken route.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/teams", base(port)))
+        .header("authorization", format!("Bearer {}", valid))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("POST /webhooks/teams");
     assert_eq!(resp.status(), 200, "a valid token is accepted");
 }

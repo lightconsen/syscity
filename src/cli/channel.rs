@@ -177,6 +177,7 @@ async fn run_channel_add(
         ChannelType::Line => add_line_channel(token, agent, extra_creds).await,
         ChannelType::Twilio => add_twilio_channel(token, agent, extra_creds).await,
         ChannelType::GoogleChat => add_googlechat_channel(token, agent, extra_creds).await,
+        ChannelType::Teams => add_teams_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -1154,6 +1155,89 @@ async fn add_googlechat_channel(
     Ok(())
 }
 
+/// Add/configure a Microsoft Teams channel in Gateway
+async fn add_teams_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    let required = |env: &str, key: &str| -> Result<String> {
+        lookup(env, key).ok_or_else(|| {
+            crate::error::SyscityError::Config(crate::error::ConfigError::Missing(format!(
+                "{} environment variable, or --credential {}=...",
+                env, key
+            )))
+        })
+    };
+
+    // `--token` is the app registration's secret, the way it is Twilio's auth
+    // token: the credential, not the identity.
+    let client_secret = match token {
+        Some(t) => t,
+        None => required("TEAMS_CLIENT_SECRET", "client_secret")?,
+    };
+
+    // The app id is one value with two jobs — the audience Microsoft signs
+    // inbound tokens for, and the app registration replies are sent as — so it
+    // is asked for once.
+    let app_id = required("TEAMS_APP_ID", "app_id")?;
+    let tenant_id = required("TEAMS_TENANT_ID", "tenant_id")?;
+
+    // The public cloud's issuer and key URL are fixed, documented values, so
+    // they are defaulted rather than demanded; a sovereign cloud overrides both.
+    let issuer = lookup("TEAMS_ISSUER", "issuer")
+        .unwrap_or_else(|| "https://api.botframework.com".to_string());
+    let jwks_url = lookup("TEAMS_JWKS_URL", "jwks_url")
+        .unwrap_or_else(|| "https://login.botframework.com/v1/.well-known/keys".to_string());
+
+    println!("🚀 Adding Microsoft Teams channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("app_id".to_string(), app_id);
+    credentials.insert("tenant_id".to_string(), tenant_id);
+    credentials.insert("client_secret".to_string(), client_secret);
+    credentials.insert("issuer".to_string(), issuer);
+    credentials.insert("jwks_url".to_string(), jwks_url);
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::Teams,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config.channels.insert("teams".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ Microsoft Teams channel configured in Gateway");
+    println!("   Set the bot's messaging endpoint to <public>/webhooks/teams");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1509,6 +1593,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::GoogleChat => {
             println!("    ℹ️  Google Chat needs a service account, the app's issuer/audience/JWKS, and the allowed service-account identities");
+        }
+        ChannelType::Teams => {
+            println!("    ℹ️  Teams needs the bot's app registration (app id + secret + tenant) and the Bot Framework issuer/JWKS");
         }
     }
 
