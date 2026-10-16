@@ -512,7 +512,11 @@ impl WeComChannel {
 
         // Pending acknowledgements drop here, which is what tells their callers
         // the connection went away.
-        let _ = write.send(Message::Close(None)).await;
+        // Closing politely is best-effort: the connection is ending either
+        // way, and a failure here says nothing worth acting on.
+        if let Err(e) = write.send(Message::Close(None)).await {
+            debug!("WeCom channel: could not close the socket cleanly: {}", e);
+        }
         Ok(())
     }
 

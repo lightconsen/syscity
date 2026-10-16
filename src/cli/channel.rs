@@ -180,6 +180,7 @@ async fn run_channel_add(
         ChannelType::Teams => add_teams_channel(token, agent, extra_creds).await,
         ChannelType::Wecom => add_wecom_channel(token, agent, extra_creds).await,
         ChannelType::DingTalk => add_dingtalk_channel(token, agent, extra_creds).await,
+        ChannelType::Irc => add_irc_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -1389,6 +1390,96 @@ async fn add_dingtalk_channel(
     Ok(())
 }
 
+/// Add/configure an IRC channel in Gateway
+async fn add_irc_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    let required = |env: &str, key: &str| -> Result<String> {
+        lookup(env, key).ok_or_else(|| {
+            crate::error::SyscityError::Config(crate::error::ConfigError::Missing(format!(
+                "{} environment variable, or --credential {}=...",
+                env, key
+            )))
+        })
+    };
+
+    // `--token` is the NickServ password, which is the only credential anyone
+    // is likely to have to hand — the server itself usually needs none.
+    let nickserv_password = token.or_else(|| lookup("IRC_NICKSERV_PASSWORD", "nickserv_password"));
+
+    let server = required("IRC_SERVER", "server")?;
+    let channel = required("IRC_CHANNEL", "channel")?;
+
+    println!("🚀 Adding IRC channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("server".to_string(), server);
+    credentials.insert("channel".to_string(), channel);
+    credentials.insert(
+        "nickname".to_string(),
+        lookup("IRC_NICKNAME", "nickname").unwrap_or_else(|| "syscity-bot".to_string()),
+    );
+    credentials.insert(
+        "port".to_string(),
+        lookup("IRC_PORT", "port").unwrap_or_else(|| "6697".to_string()),
+    );
+    // TLS is on unless it is switched off, matching the reference: the port the
+    // channel defaults to is the TLS one, and most networks insist.
+    if let Some(use_tls) = lookup("IRC_USE_TLS", "use_tls") {
+        credentials.insert("use_tls".to_string(), use_tls);
+    }
+    if let Some(server_password) = lookup("IRC_SERVER_PASSWORD", "server_password") {
+        credentials.insert("server_password".to_string(), server_password);
+    }
+    if let Some(password) = nickserv_password {
+        credentials.insert("nickserv_password".to_string(), password);
+    }
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::Irc,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        // A bot sitting in a channel should not answer everything said in it.
+        // This is the one channel whose default differs, and it is the channel
+        // where getting it wrong is most visible.
+        require_mention: true,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config.channels.insert("irc".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ IRC channel configured in Gateway");
+    println!("   Nothing to point anywhere: the gateway connects out to the server");
+    println!("   In a channel the bot answers when named (e.g. `syscity-bot: hello`)");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1753,6 +1844,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::DingTalk => {
             println!("    ℹ️  DingTalk needs the app's Client ID and Client Secret, with the robot's message mode set to Stream");
+        }
+        ChannelType::Irc => {
+            println!("    ℹ️  IRC needs a server, a nickname and a channel to join; TLS on port 6697 is the default");
         }
     }
 

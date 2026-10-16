@@ -357,6 +357,16 @@ pub(crate) async fn init_single_channel(
                 warn!("DingTalk feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::Irc => {
+            #[cfg(feature = "irc")]
+            {
+                init_irc_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "irc"))]
+            {
+                warn!("IRC feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -1192,6 +1202,99 @@ pub(crate) async fn init_dingtalk_channel(
         .await
         .insert(name.to_string(), channel);
     info!("✅ DingTalk channel '{}' initialized (Stream Mode)", name);
+
+    Ok(())
+}
+
+/// Initialize IRC channel.
+///
+/// The third connection channel, and the least exotic of the three: a plain TCP
+/// socket carrying lines rather than a WebSocket. The shape is the same, so only
+/// the transport differs — and inbound goes through the shared tail unchanged.
+#[cfg(feature = "irc")]
+pub(crate) async fn init_irc_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::irc::{IrcChannel, IrcConfig};
+
+    let (Some(server), Some(channel_name)) = (
+        channel_cred(&state.secrets, name, config, "server").await,
+        channel_cred(&state.secrets, name, config, "channel").await,
+    ) else {
+        warn!(
+            "IRC channel '{}' missing 'server'/'channel' — there is nowhere to connect to, so it \
+             is not started",
+            name
+        );
+        return Ok(());
+    };
+
+    let nickname = channel_cred(&state.secrets, name, config, "nickname")
+        .await
+        .unwrap_or_else(|| "syscity-bot".to_string());
+
+    let (inbound_tx, mut inbound_rx) =
+        mpsc::unbounded_channel::<crate::channels::IncomingMessage>();
+
+    let mut irc_config = IrcConfig::new(server, nickname, channel_name);
+    irc_config.message_tx = Some(inbound_tx);
+    if let Some(port) = channel_cred(&state.secrets, name, config, "port").await {
+        match port.parse() {
+            Ok(port) => irc_config.port = port,
+            Err(e) => warn!("IRC channel '{}': ignoring an unusable port: {}", name, e),
+        }
+    }
+    if let Some(use_tls) = channel_cred(&state.secrets, name, config, "use_tls").await {
+        irc_config.use_tls =
+            matches!(use_tls.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    irc_config.server_password =
+        channel_cred(&state.secrets, name, config, "server_password").await;
+    irc_config.nickserv_password =
+        channel_cred(&state.secrets, name, config, "nickserv_password").await;
+
+    let channel = Arc::new(IrcChannel::new(irc_config));
+
+    let state_for_bridge = state.clone();
+    let name_for_bridge = name.to_string();
+    let bridge_handle = tokio::spawn(async move {
+        while let Some(msg) = inbound_rx.recv().await {
+            crate::gateway::webhooks::dispatch_channel_message_to(
+                &state_for_bridge,
+                &name_for_bridge,
+                &msg.user_id.0,
+                &msg.conversation_id.0,
+                &msg.content,
+                msg.mention,
+            )
+            .await;
+        }
+    });
+    register_channel_task(&state, name, "bridge", bridge_handle).await;
+
+    let name_for_task = name.to_string();
+    let channel_for_task = channel.clone();
+    let main_handle = tokio::spawn(async move {
+        if let Err(e) = channel_for_task.start().await {
+            error!("IRC channel {} failed: {}", name_for_task, e);
+        }
+    });
+    register_channel_task(&state, name, "main", main_handle).await;
+
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel(name, channel.clone())
+        .await;
+    state
+        .channels
+        .channels
+        .write()
+        .await
+        .insert(name.to_string(), channel);
+    info!("✅ IRC channel '{}' initialized (long-lived socket)", name);
 
     Ok(())
 }

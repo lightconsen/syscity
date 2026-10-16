@@ -407,6 +407,8 @@ pub enum ChannelType {
     Wecom,
     /// DingTalk Stream Mode (long-lived connection)
     DingTalk,
+    /// IRC (long-lived socket)
+    Irc,
 }
 
 impl ChannelType {
@@ -436,6 +438,7 @@ impl ChannelType {
             ChannelType::Teams => "teams",
             ChannelType::Wecom => "wecom",
             ChannelType::DingTalk => "dingtalk",
+            ChannelType::Irc => "irc",
         }
     }
 
@@ -459,6 +462,7 @@ impl ChannelType {
             ChannelType::Teams => "Microsoft Teams",
             ChannelType::Wecom => "WeCom",
             ChannelType::DingTalk => "DingTalk",
+            ChannelType::Irc => "IRC",
         }
     }
 
@@ -483,6 +487,7 @@ impl ChannelType {
             ChannelType::Teams => cfg!(feature = "teams"),
             ChannelType::Wecom => cfg!(feature = "wecom"),
             ChannelType::DingTalk => cfg!(feature = "dingtalk"),
+            ChannelType::Irc => cfg!(feature = "irc"),
         }
     }
 }

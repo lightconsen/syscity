@@ -59,6 +59,8 @@ pub enum ChannelType {
     Wecom,
     /// DingTalk (钉钉) Stream Mode, over a long-lived connection
     DingTalk,
+    /// IRC, over a long-lived socket
+    Irc,
 }
 
 #[cfg(feature = "telegram")]
@@ -116,6 +118,9 @@ pub mod wecom;
 
 #[cfg(feature = "dingtalk")]
 pub mod dingtalk;
+
+#[cfg(feature = "irc")]
+pub mod irc;
 
 pub mod acp_bridge;
 pub mod command_gate;
@@ -761,6 +766,58 @@ pub fn split_message(text: &str, max: usize) -> Vec<String> {
             .map(|(i, _)| i)
             // A split at 0 would emit an empty piece and never advance.
             .filter(|i| *i > 0)
+            .unwrap_or(hard_cut);
+
+        out.push(rest[..split_at].trim_end().to_string());
+        rest = rest[split_at..].trim_start();
+    }
+
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+
+    out
+}
+
+/// Split a reply into pieces of at most `max_bytes` UTF-8 bytes.
+///
+/// The sibling of [`split_message`], for the platforms whose limit is a *byte*
+/// budget rather than a character count. IRC caps a whole line at 510 bytes
+/// including the command that carries it, so the room left for the message is
+/// measured in bytes — and cutting at an arbitrary byte offset would split a
+/// character in half, which is the same trap [`split_message`] avoids from the
+/// other side. Cuts land on character boundaries and prefer the last whitespace
+/// in the window, falling back to a hard cut when there is none.
+pub fn split_message_bytes(text: &str, max_bytes: usize) -> Vec<String> {
+    let max_bytes = max_bytes.max(1);
+    let mut out = Vec::new();
+    let mut rest = text;
+
+    while rest.len() > max_bytes {
+        // The furthest character boundary that still fits.
+        let largest_fit = rest
+            .char_indices()
+            .take_while(|(at, c)| at + c.len_utf8() <= max_bytes)
+            .last()
+            .map(|(at, c)| at + c.len_utf8());
+
+        // No character fits at all — the budget is smaller than one character.
+        // Taking one anyway is the only way to make progress, and it is what
+        // keeps this from looping forever.
+        let hard_cut = largest_fit.unwrap_or_else(|| {
+            rest.chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(rest.len())
+        });
+
+        let split_at = rest[..hard_cut]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(at, _)| at)
+            // A split at 0 would emit an empty piece and never advance.
+            .filter(|at| *at > 0)
             .unwrap_or(hard_cut);
 
         out.push(rest[..split_at].trim_end().to_string());

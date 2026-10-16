@@ -501,7 +501,11 @@ impl DingTalkChannel {
             }
         }
 
-        let _ = write.send(Message::Close(None)).await;
+        // Closing politely is best-effort: the connection is ending either
+        // way, and a failure here says nothing worth acting on.
+        if let Err(e) = write.send(Message::Close(None)).await {
+            debug!("DingTalk channel: could not close the socket cleanly: {}", e);
+        }
         Ok(())
     }
 

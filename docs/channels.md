@@ -32,6 +32,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | **Microsoft Teams** | **`teams`** | ✅ | Bot Framework activity (bearer token) | `/webhooks/teams` |
 | **WeCom (企业微信)** | **`wecom`** | ✅ | AI Bot WebSocket (long-lived) | — |
 | **DingTalk (钉钉)** | **`dingtalk`** | ✅ | Stream Mode (long-lived) | — |
+| **IRC** | **`irc`** | ✅ | Line protocol over TCP (long-lived) | — |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -93,6 +94,7 @@ Per-channel credential keys:
 | Microsoft Teams | `app_id`, `tenant_id`, `client_secret`, `issuer`, `jwks_url` | `TEAMS_APP_ID`, `TEAMS_TENANT_ID`, `TEAMS_CLIENT_SECRET`, `TEAMS_ISSUER`, `TEAMS_JWKS_URL` |
 | WeCom (企业微信) | `bot_id`, `secret`, `ws_url` | `WECOM_BOT_ID`, `WECOM_SECRET`, `WECOM_WEBSOCKET_URL` |
 | DingTalk (钉钉) | `client_id`, `client_secret`, `openapi_endpoint` | `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET`, `DINGTALK_OPENAPI_ENDPOINT` |
+| IRC | `server`, `channel`, `nickname`, `port`, `use_tls`, `server_password`, `nickserv_password` | `IRC_SERVER`, `IRC_CHANNEL`, `IRC_NICKNAME`, `IRC_PORT`, `IRC_USE_TLS`, `IRC_SERVER_PASSWORD`, `IRC_NICKSERV_PASSWORD` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -358,6 +360,46 @@ Only **text** messages are routed; pictures, files, audio and cards arrive on th
 same connection and are skipped. A group message's mention comes from the
 platform's own field rather than being parsed out of the text, so `require_mention`
 works here. Replies over 20,000 characters go out as consecutive messages.
+
+### IRC — the full flow
+
+1. Decide the network, the nickname the bot should use, and the channel it
+   should sit in.
+2. Configure the channel:
+   ```bash
+   export IRC_SERVER=irc.example.net
+   export IRC_CHANNEL='#my-channel'
+   export IRC_NICKNAME=syscity-bot
+   # export IRC_NICKSERV_PASSWORD=...   # if the nickname is registered
+   syscity channels add irc
+   ```
+   Then `syscity start` to run the gateway. Nothing to point anywhere — the
+   gateway dials out to the server.
+
+TLS is **on** by default, on port `6697`; set `IRC_USE_TLS=false` and
+`IRC_PORT=6667` only for a network that genuinely has neither.
+
+**In a channel the bot answers when it is named.** `syscity-bot: hello`,
+`syscity-bot, hello` and `syscity-bot hello` all count, and the name is removed
+before the agent sees the text. A message that does *not* name it is still
+delivered — marked as unmentioned — so `require_mention` decides rather than the
+channel: this is the one channel whose default for that setting is `true`, because
+a bot sitting in a channel answering everything said in it is the wrong default.
+A private message is addressed to the bot by definition and is answered to the
+sender.
+
+**The nickname asked for is not always the one you get.** A server that already
+has it hands back `syscity-bot_`, then `syscity-bot_1`, and so on; the confirmed
+name is the one a channel message has to be addressed to, so it is what the bot
+watches for.
+
+**The message limit is bytes, not characters.** IRC caps a whole line at 510
+bytes *including* the command carrying it, so how much of a reply fits depends on
+the length of the channel name — a long name leaves less room. Replies are split
+on that budget, at character boundaries. A reply is a protocol line, so any line
+break or NUL in it is neutralised before sending: otherwise an agent's answer
+could contain a second IRC command. Older clients' colour codes are stripped from
+incoming messages.
 
 ## Access control
 
