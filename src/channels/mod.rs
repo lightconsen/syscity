@@ -55,6 +55,8 @@ pub enum ChannelType {
     GoogleChat,
     /// Microsoft Teams webhook (Bot Framework activity)
     Teams,
+    /// WeCom (企业微信) AI Bot, over a long-lived WebSocket
+    Wecom,
 }
 
 #[cfg(feature = "telegram")]
@@ -106,6 +108,9 @@ pub mod googlechat;
 
 #[cfg(feature = "teams")]
 pub mod teams;
+
+#[cfg(feature = "wecom")]
+pub mod wecom;
 
 pub mod acp_bridge;
 pub mod command_gate;

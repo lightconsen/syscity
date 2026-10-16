@@ -178,6 +178,7 @@ async fn run_channel_add(
         ChannelType::Twilio => add_twilio_channel(token, agent, extra_creds).await,
         ChannelType::GoogleChat => add_googlechat_channel(token, agent, extra_creds).await,
         ChannelType::Teams => add_teams_channel(token, agent, extra_creds).await,
+        ChannelType::Wecom => add_wecom_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -1238,6 +1239,79 @@ async fn add_teams_channel(
     Ok(())
 }
 
+/// Add/configure a WeCom (企业微信) AI Bot channel in Gateway
+async fn add_wecom_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    let required = |env: &str, key: &str| -> Result<String> {
+        lookup(env, key).ok_or_else(|| {
+            crate::error::SyscityError::Config(crate::error::ConfigError::Missing(format!(
+                "{} environment variable, or --credential {}=...",
+                env, key
+            )))
+        })
+    };
+
+    // `--token` is the secret, the way it is Twilio's auth token and Teams' app
+    // secret: the credential, not the identity.
+    let secret = match token {
+        Some(t) => t,
+        None => required("WECOM_SECRET", "secret")?,
+    };
+    let bot_id = required("WECOM_BOT_ID", "bot_id")?;
+
+    println!("🚀 Adding WeCom channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("bot_id".to_string(), bot_id);
+    credentials.insert("secret".to_string(), secret);
+    // Only for a sovereign deployment, or a test peer; the public gateway is
+    // the default and is what almost every deployment wants.
+    if let Some(ws_url) = lookup("WECOM_WEBSOCKET_URL", "ws_url") {
+        credentials.insert("ws_url".to_string(), ws_url);
+    }
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::Wecom,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config.channels.insert("wecom".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ WeCom channel configured in Gateway");
+    println!("   Nothing to point anywhere: the gateway connects out to WeCom itself");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1596,6 +1670,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::Teams => {
             println!("    ℹ️  Teams needs the bot's app registration (app id + secret + tenant) and the Bot Framework issuer/JWKS");
+        }
+        ChannelType::Wecom => {
+            println!("    ℹ️  WeCom needs an AI Bot's Bot ID and Secret; it holds a WebSocket out, so it needs no public URL");
         }
     }
 

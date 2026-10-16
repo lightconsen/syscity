@@ -403,6 +403,8 @@ pub enum ChannelType {
     GoogleChat,
     /// Microsoft Teams webhook
     Teams,
+    /// WeCom AI Bot (long-lived WebSocket)
+    Wecom,
 }
 
 impl ChannelType {
@@ -430,6 +432,7 @@ impl ChannelType {
             ChannelType::Twilio => "twilio",
             ChannelType::GoogleChat => "googlechat",
             ChannelType::Teams => "teams",
+            ChannelType::Wecom => "wecom",
         }
     }
 
@@ -451,6 +454,7 @@ impl ChannelType {
             ChannelType::Twilio => "Twilio SMS",
             ChannelType::GoogleChat => "Google Chat",
             ChannelType::Teams => "Microsoft Teams",
+            ChannelType::Wecom => "WeCom",
         }
     }
 
@@ -473,6 +477,7 @@ impl ChannelType {
             ChannelType::Twilio => cfg!(feature = "twilio"),
             ChannelType::GoogleChat => cfg!(feature = "googlechat"),
             ChannelType::Teams => cfg!(feature = "teams"),
+            ChannelType::Wecom => cfg!(feature = "wecom"),
         }
     }
 }

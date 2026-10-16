@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use super::GatewayState;
-use crate::channels::{ConversationId, IncomingMessage, InputProvenance, OutgoingMessage};
+use crate::channels::{
+    ConversationId, IncomingMessage, InputProvenance, MentionState, OutgoingMessage,
+};
 
 /// Query params for webhook verification (used by some platforms)
 #[derive(Debug, Deserialize)]
@@ -74,7 +76,7 @@ const REPLAY_CAPACITY: usize = 4096;
 /// means the common case, a platform retry, needs no per-platform payload
 /// parsing to catch.
 #[derive(Debug, Default)]
-struct ReplayGuard {
+pub(crate) struct ReplayGuard {
     seen: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
@@ -83,7 +85,7 @@ impl ReplayGuard {
     ///
     /// Either way the caller answers 200 — the platform should stop retrying —
     /// but a delivery that is not new must not be processed again.
-    fn first_sighting(&self, body: &[u8]) -> bool {
+    pub(crate) fn first_sighting(&self, body: &[u8]) -> bool {
         let key = delivery_digest(body);
         let now = std::time::Instant::now();
         // A poisoned lock would only mean another request panicked mid-insert;
@@ -136,9 +138,9 @@ async fn reset_session(sessions: &RwLock<HashMap<String, String>>, platform_key:
     new_session
 }
 
-/// What became of a message handed to [`dispatch_direct_webhook`].
+/// What became of a message handed to [`dispatch_channel_message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboundDisposition {
+pub(crate) enum InboundDisposition {
     /// Accepted and queued for the agent.
     Queued,
     /// Access control refused the sender. The platform is told nothing, so a
@@ -148,53 +150,61 @@ enum InboundDisposition {
     QueueFull,
 }
 
-/// The tail that every direct-message webhook channel shares.
+/// The tail that every direct-message channel shares — webhook or not.
 ///
-/// Once a handler has verified a signature and pulled a `(user_id, text)` pair
-/// out of its platform's payload, what remains is the same everywhere: ask
+/// Once a channel has authenticated a delivery and pulled a `(user_id, text)`
+/// pair out of its platform's payload, what remains is the same everywhere: ask
 /// access control, derive the platform session key, honour `/new`, remember
-/// which channel owns the session so the reply can be routed back, and hand
-/// the message to the unified inbound entry.
+/// which channel owns the session so the reply can be routed back, and hand the
+/// message to the unified inbound entry.
 ///
 /// Feishu, WeChat MP and the generic webhook had each grown their own copy of
-/// this. Sharing it is what keeps a new channel down to "verify, extract, call
-/// this" — and it is the part easiest to get subtly wrong, because a handler
-/// that forgets the `session_channels` insert still compiles and still accepts
-/// messages; the agent just answers into the void.
+/// this. Sharing it is what keeps a new channel down to "authenticate, extract,
+/// call this" — and it is the part easiest to get subtly wrong, because a
+/// handler that forgets the `session_channels` insert still compiles and still
+/// accepts messages; the agent just answers into the void.
+///
+/// It is `pub(crate)` because a channel that holds a connection rather than a
+/// route needs exactly the same tail: `init_wecom_channel`'s bridge calls this
+/// for every message the socket delivers, so a persistent-connection channel
+/// does not grow a second copy of the access check and the session mapping.
 ///
 /// Slack and WhatsApp are deliberately not callers: Slack keys sessions by
 /// channel rather than user and has no `/new`, and WhatsApp resets *before*
 /// the access check because it sends the user a confirmation.
-async fn dispatch_direct_webhook(
+pub(crate) async fn dispatch_channel_message(
     state: &Arc<GatewayState>,
     channel: &str,
     user_id: &str,
     text: &str,
+    mention: crate::channels::MentionState,
 ) -> InboundDisposition {
-    dispatch_direct_webhook_to(state, channel, user_id, user_id, text).await
+    dispatch_channel_message_to(state, channel, user_id, user_id, text, mention).await
 }
 
-/// As [`dispatch_direct_webhook`], but the reply is addressed somewhere other
+/// As [`dispatch_channel_message`], but the reply is addressed somewhere other
 /// than the sender.
 ///
 /// Google Chat is why this exists: a message arrives from a *user*
 /// (`users/123`) inside a *space* (`spaces/S`), and a reply goes to the space.
 /// Keying the session on the sender is still right; addressing the reply to
 /// them would name something the Chat API cannot send to.
-async fn dispatch_direct_webhook_to(
+///
+/// `mention` carries more than whether the bot was named. A group message is
+/// exactly one that is not a [`MentionState::DirectMessage`], and the inbound
+/// stage reads the provenance built from that to decide whether an unmentioned
+/// group message is suppressed — so a channel that reports a group as direct
+/// has its bot answer every message in it.
+pub(crate) async fn dispatch_channel_message_to(
     state: &Arc<GatewayState>,
     channel: &str,
     user_id: &str,
     conversation_id: &str,
     text: &str,
+    mention: crate::channels::MentionState,
 ) -> InboundDisposition {
     if state
-        .check_incoming_access(
-            channel,
-            user_id,
-            text,
-            &crate::channels::MentionState::DirectMessage,
-        )
+        .check_incoming_access(channel, user_id, text, &mention)
         .await
         .is_err()
     {
@@ -218,12 +228,12 @@ async fn dispatch_direct_webhook_to(
         sessions.insert(session_id.clone(), (channel.to_string(), conversation_id.to_string()));
     }
 
-    let incoming = IncomingMessage::new(user_id, session_id, text).with_provenance(
-        InputProvenance::ExternalUser {
+    let incoming = IncomingMessage::new(user_id, session_id, text)
+        .with_provenance(InputProvenance::ExternalUser {
             channel: channel.to_string(),
-            is_direct: true,
-        },
-    );
+            is_direct: matches!(mention, crate::channels::MentionState::DirectMessage),
+        })
+        .with_mention(mention);
 
     match state.pipelines.inbound_entry.send(incoming).await {
         Ok(()) => InboundDisposition::Queued,
@@ -799,7 +809,14 @@ async fn feishu_webhook_handler(
                 );
 
                 // Verify, extract, hand off — the shared direct-message tail.
-                if dispatch_direct_webhook(&state, "feishu", user_id, text).await
+                if dispatch_channel_message(
+                    &state,
+                    "feishu",
+                    user_id,
+                    text,
+                    MentionState::DirectMessage,
+                )
+                .await
                     == InboundDisposition::Refused
                 {
                     return Json(WebhookResponse {
@@ -910,7 +927,14 @@ async fn line_webhook_handler(
         // non-2xx with the same body, and the replay guard above would then
         // drop that retry as a duplicate — so the retry cannot recover the
         // message and a non-2xx would only claim it might.
-        dispatch_direct_webhook(&state, "line", &event.user_id, &event.text).await;
+        dispatch_channel_message(
+            &state,
+            "line",
+            &event.user_id,
+            &event.text,
+            MentionState::DirectMessage,
+        )
+        .await;
     }
 
     Json(WebhookResponse {
@@ -1034,7 +1058,14 @@ async fn twilio_webhook_handler(
     match crate::channels::twilio::parse_incoming(&params) {
         Some(incoming) => {
             // Verify, extract, hand off — the shared direct-message tail.
-            dispatch_direct_webhook(&state, "twilio", &incoming.from, &incoming.body).await;
+            dispatch_channel_message(
+                &state,
+                "twilio",
+                &incoming.from,
+                &incoming.body,
+                MentionState::DirectMessage,
+            )
+            .await;
         }
         None => {
             debug!("Twilio webhook: not an inbound message (a status callback?) — acknowledged");
@@ -1126,12 +1157,13 @@ async fn googlechat_webhook_handler(
         Ok(Some(incoming)) => {
             // The session is keyed on the sender, the reply addressed to the
             // space — which is why this is the `_to` variant.
-            dispatch_direct_webhook_to(
+            dispatch_channel_message_to(
                 &state,
                 "googlechat",
                 &incoming.user_id,
                 &incoming.space,
                 &incoming.text,
+                MentionState::DirectMessage,
             )
             .await;
         }
@@ -1257,12 +1289,13 @@ async fn teams_webhook_handler(
 
     // The session is keyed on the sender, the reply addressed to the
     // conversation they wrote in — which is why this is the `_to` variant.
-    dispatch_direct_webhook_to(
+    dispatch_channel_message_to(
         &state,
         "teams",
         &incoming.user_id,
         &incoming.address.encode(),
         &incoming.text,
+        MentionState::DirectMessage,
     )
     .await;
 
@@ -1446,7 +1479,14 @@ async fn wechatmp_webhook_handler(
     }
 
     // Verify, extract, hand off — the shared direct-message tail.
-    if dispatch_direct_webhook(&state, "wechatmp", &incoming.from_user, &incoming.content).await
+    if dispatch_channel_message(
+        &state,
+        "wechatmp",
+        &incoming.from_user,
+        &incoming.content,
+        MentionState::DirectMessage,
+    )
+    .await
         == InboundDisposition::Refused
     {
         return Json(WebhookResponse {
@@ -1739,7 +1779,15 @@ async fn generic_webhook_handler(
 
     if !content.is_empty() {
         // Verify, extract, hand off — the shared direct-message tail.
-        match dispatch_direct_webhook(&state, &channel, &user_id, &content).await {
+        match dispatch_channel_message(
+            &state,
+            &channel,
+            &user_id,
+            &content,
+            MentionState::DirectMessage,
+        )
+        .await
+        {
             InboundDisposition::Refused => {
                 return Json(WebhookResponse {
                     success: true,

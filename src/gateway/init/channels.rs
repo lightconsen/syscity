@@ -337,6 +337,16 @@ pub(crate) async fn init_single_channel(
                 warn!("Teams feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::Wecom => {
+            #[cfg(feature = "wecom")]
+            {
+                init_wecom_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "wecom"))]
+            {
+                warn!("WeCom feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -995,6 +1005,100 @@ pub(crate) async fn init_teams_channel(
         .await
         .insert(name.to_string(), channel);
     info!("✅ Teams channel '{}' initialized (inbound via Bot Framework webhook)", name);
+
+    Ok(())
+}
+
+/// Initialize WeCom (企业微信) AI Bot channel.
+///
+/// The first channel with no webhook route: the gateway holds a WebSocket to
+/// WeCom and the same socket carries messages both ways. What is new is
+/// therefore only the transport — inbound goes through
+/// [`dispatch_channel_message_to`](crate::gateway::webhooks::dispatch_channel_message_to),
+/// the tail every other direct-message channel uses, so the access check, the
+/// session keying and the `session_channels` mapping that reply addressing
+/// depends on are shared rather than reimplemented.
+///
+/// The bridge is a task of its own rather than a closure inside the connection
+/// loop, because the loop has to survive a reconnect and the bridge has to
+/// survive it too — and because both need to be in the `TaskRegistry` for
+/// shutdown to join them.
+#[cfg(feature = "wecom")]
+pub(crate) async fn init_wecom_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::wecom::{WeComChannel, WeComConfig};
+
+    let (Some(bot_id), Some(secret)) = (
+        channel_cred(&state.secrets, name, config, "bot_id").await,
+        channel_cred(&state.secrets, name, config, "secret").await,
+    ) else {
+        warn!(
+            "WeCom channel '{}' missing 'bot_id'/'secret' — it cannot authenticate, so it is \
+             not started",
+            name
+        );
+        return Ok(());
+    };
+
+    let (inbound_tx, mut inbound_rx) =
+        mpsc::unbounded_channel::<crate::channels::IncomingMessage>();
+
+    let mut wecom_config = WeComConfig::new(bot_id, secret);
+    wecom_config.message_tx = Some(inbound_tx);
+    if let Some(url) = channel_cred(&state.secrets, name, config, "ws_url").await {
+        wecom_config.ws_url = url;
+    }
+
+    let channel = Arc::new(WeComChannel::new(wecom_config));
+
+    // Bridge: every message the socket delivers goes through the shared tail,
+    // which is what applies access control, honours `/new`, and records which
+    // channel owns the session so the agent's reply can be routed back.
+    let state_for_bridge = state.clone();
+    let channel_name = name.to_string();
+    let bridge_handle = tokio::spawn(async move {
+        while let Some(msg) = inbound_rx.recv().await {
+            // The mention state travels with the message because it is what
+            // tells the inbound stage whether an unmentioned group message
+            // should be suppressed — and a group reported as a direct message
+            // has its bot answer everything in it.
+            crate::gateway::webhooks::dispatch_channel_message_to(
+                &state_for_bridge,
+                &channel_name,
+                &msg.user_id.0,
+                &msg.conversation_id.0,
+                &msg.content,
+                msg.mention,
+            )
+            .await;
+        }
+    });
+    register_channel_task(&state, name, "bridge", bridge_handle).await;
+
+    let name_for_task = name.to_string();
+    let channel_for_task = channel.clone();
+    let main_handle = tokio::spawn(async move {
+        if let Err(e) = channel_for_task.start().await {
+            error!("WeCom channel {} failed: {}", name_for_task, e);
+        }
+    });
+    register_channel_task(&state, name, "main", main_handle).await;
+
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel(name, channel.clone())
+        .await;
+    state
+        .channels
+        .channels
+        .write()
+        .await
+        .insert(name.to_string(), channel);
+    info!("✅ WeCom channel '{}' initialized (long-lived WebSocket)", name);
 
     Ok(())
 }

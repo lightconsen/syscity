@@ -30,6 +30,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | **Twilio SMS** | **`twilio`** | ✅ | Messages webhook (form-encoded) | `/webhooks/twilio` |
 | **Google Chat** | **`googlechat`** | ✅ | Chat app webhook (bearer token) | `/webhooks/googlechat` |
 | **Microsoft Teams** | **`teams`** | ✅ | Bot Framework activity (bearer token) | `/webhooks/teams` |
+| **WeCom (企业微信)** | **`wecom`** | ✅ | AI Bot WebSocket (long-lived) | — |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -89,6 +90,7 @@ Per-channel credential keys:
 | Twilio SMS | `account_sid`, `auth_token`, `from_number`, `webhook_url` | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_WEBHOOK_URL` |
 | Google Chat | `issuer`, `audience`, `jwks_url`, `allowed_service_accounts`, `client_email`, `private_key_pem` | `GOOGLE_CHAT_ISSUER`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_JWKS_URL`, `GOOGLE_CHAT_ALLOWED_SERVICE_ACCOUNTS`, `GOOGLE_CHAT_CLIENT_EMAIL`, `GOOGLE_CHAT_PRIVATE_KEY` |
 | Microsoft Teams | `app_id`, `tenant_id`, `client_secret`, `issuer`, `jwks_url` | `TEAMS_APP_ID`, `TEAMS_TENANT_ID`, `TEAMS_CLIENT_SECRET`, `TEAMS_ISSUER`, `TEAMS_JWKS_URL` |
+| WeCom (企业微信) | `bot_id`, `secret`, `ws_url` | `WECOM_BOT_ID`, `WECOM_SECRET`, `WECOM_WEBSOCKET_URL` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -267,6 +269,52 @@ loop if it were answered — all of them are acknowledged and skipped. The
 kept, so `<at>Alice</at> can you check this` reaches the agent as
 `Alice can you check this`. Replies over 28,000 characters are split into
 consecutive messages.
+
+## Connection-based channels
+
+These channels need no public endpoint: the gateway **dials out** and holds the
+connection open, so there is nothing to expose and nothing to point at the
+gateway.
+
+### WeCom (企业微信) — the full flow
+
+1. In the WeCom admin console, create an **AI Bot**: *Workspace → Smart Robot →
+   Create smart robots*, and select **API Mode**.
+2. Copy the **Bot ID** and **Secret** it shows you.
+3. Configure the channel:
+   ```bash
+   export WECOM_BOT_ID=<the bot id>
+   export WECOM_SECRET=<the secret>
+   syscity channels add wecom
+   ```
+   Then `syscity start` to run the gateway. Nothing else to point anywhere — the
+   gateway connects out to `wss://openws.work.weixin.qq.com` itself.
+
+`WECOM_WEBSOCKET_URL` only needs setting for a sovereign deployment or a test
+peer; the public gateway is the default.
+
+**A reply is a frame that echoes the message it answers.** Every inbound message
+carries a `req_id`, and answering means sending it back — which is what puts the
+answer in the thread the question came from. That window closes, so the channel
+remembers the last `req_id` per chat and, when it has expired, falls back to
+starting a message instead. **A group has no such fallback**: an AI Bot cannot
+start a conversation in a group, so a reply whose window has closed is refused
+with that reason rather than sent into the void. The same rule means the channel
+can only answer a conversation it has heard from — a chat that has sent nothing
+has nowhere to be replied to.
+
+The gateway allows **one connection per bot**, and a reconnect is a fresh
+authentication rather than a resumption, so the channel reconnects with a
+backoff of 2/5/10/30/60 seconds and re-subscribes. If another connection takes
+the bot's place the channel stands down rather than fighting it for the socket,
+since reconnecting would only kick the newcomer back.
+
+Only **text** messages are routed. WeCom delivers images, files and voice notes
+over the same socket, and those carry no text this channel can act on, so they
+are acknowledged and skipped. Replies over 4000 characters go out as consecutive
+messages. The typing bubble on this platform is the first frame of a *streamed*
+reply, which this channel does not send — so there is no typing indicator, and a
+long answer arrives when it is finished rather than growing in place.
 
 ## Access control
 
