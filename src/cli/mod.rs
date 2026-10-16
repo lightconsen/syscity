@@ -409,6 +409,8 @@ pub enum ChannelType {
     DingTalk,
     /// IRC (long-lived socket)
     Irc,
+    /// SimpleX Chat (local daemon)
+    Simplex,
 }
 
 impl ChannelType {
@@ -439,6 +441,7 @@ impl ChannelType {
             ChannelType::Wecom => "wecom",
             ChannelType::DingTalk => "dingtalk",
             ChannelType::Irc => "irc",
+            ChannelType::Simplex => "simplex",
         }
     }
 
@@ -463,6 +466,7 @@ impl ChannelType {
             ChannelType::Wecom => "WeCom",
             ChannelType::DingTalk => "DingTalk",
             ChannelType::Irc => "IRC",
+            ChannelType::Simplex => "SimpleX",
         }
     }
 
@@ -488,6 +492,7 @@ impl ChannelType {
             ChannelType::Wecom => cfg!(feature = "wecom"),
             ChannelType::DingTalk => cfg!(feature = "dingtalk"),
             ChannelType::Irc => cfg!(feature = "irc"),
+            ChannelType::Simplex => cfg!(feature = "simplex"),
         }
     }
 }

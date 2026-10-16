@@ -298,7 +298,7 @@ windows-sys = { version = "=0.59.0", features = [
 ] }
 
 [features]
-default = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc", "plugins", "hot-reload", "local-embeddings", "browser", "vision", "sqlite-vec"]
+default = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc", "simplex", "plugins", "hot-reload", "local-embeddings", "browser", "vision", "sqlite-vec"]
 telegram = ["teloxide"]
 discord = ["serenity"]
 slack = []
@@ -325,13 +325,16 @@ wecom = []
 # IRC — a plain line protocol over a TCP socket, optionally over TLS, which is
 # why it needs the TLS client above.
 irc = []
+# SimpleX — a WebSocket to a local simplex-chat daemon, carrying that daemon's
+# own command language. Needs no extra crate.
+simplex = []
 # DingTalk Stream Mode — also a long-lived connection, and also needing no extra
 # crate: the handshake and the framing are plain HTTP and JSON.
 dingtalk = []
 # Google Chat — webhook in, Chat API out. Inbound requests carry a Google-issued
 # bearer token, so this pulls the same verifier as `teams`.
 googlechat = ["dep:jsonwebtoken"]
-all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc"]
+all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc", "simplex"]
 web = []
 # Syscity Cloud integration (login + cloud LLM/search/KB/connectors). Default
 # OFF: default builds contain no cloud coupling (§2.7) — a default `cargo
@@ -363,7 +366,7 @@ keyring = ["dep:keyring"]
 # Build with: cargo build --no-default-features --features intel-macos
 intel-macos = [
     "cloud", "telegram", "discord", "slack", "whatsapp", "qq", "feishu",
-    "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc",
+    "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc", "simplex",
     "plugins", "hot-reload",
     "local-embeddings", "browser", "sqlite-vec",
 ]

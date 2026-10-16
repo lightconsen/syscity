@@ -61,6 +61,8 @@ pub enum ChannelType {
     DingTalk,
     /// IRC, over a long-lived socket
     Irc,
+    /// SimpleX Chat, over a local daemon's WebSocket
+    Simplex,
 }
 
 #[cfg(feature = "telegram")]
@@ -121,6 +123,9 @@ pub mod dingtalk;
 
 #[cfg(feature = "irc")]
 pub mod irc;
+
+#[cfg(feature = "simplex")]
+pub mod simplex;
 
 pub mod acp_bridge;
 pub mod command_gate;

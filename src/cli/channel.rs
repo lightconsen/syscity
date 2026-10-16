@@ -181,6 +181,7 @@ async fn run_channel_add(
         ChannelType::Wecom => add_wecom_channel(token, agent, extra_creds).await,
         ChannelType::DingTalk => add_dingtalk_channel(token, agent, extra_creds).await,
         ChannelType::Irc => add_irc_channel(token, agent, extra_creds).await,
+        ChannelType::Simplex => add_simplex_channel(agent, extra_creds).await,
     }
 }
 
@@ -1480,6 +1481,72 @@ async fn add_irc_channel(
     Ok(())
 }
 
+/// Add/configure a SimpleX Chat channel in Gateway
+async fn add_simplex_channel(
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    println!("🚀 Adding SimpleX channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    // The daemon is local, so its endpoint has a sensible default rather than
+    // being required — the only channel here where that is true.
+    credentials.insert(
+        "ws_url".to_string(),
+        lookup("SIMPLEX_WS_URL", "ws_url")
+            .unwrap_or_else(|| crate::channels::simplex::DEFAULT_WS_URL.to_string()),
+    );
+    if let Some(auto_accept) = lookup("SIMPLEX_AUTO_ACCEPT", "auto_accept") {
+        credentials.insert("auto_accept".to_string(), auto_accept);
+    }
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::Simplex,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        // SimpleX has no way for a sender to address a bot in a group, so this
+        // setting can only mean "say nothing in groups". Off, so that a group
+        // the bot has been added to works; turn it on to silence groups.
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config
+        .channels
+        .insert("simplex".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ SimpleX channel configured in Gateway");
+    println!("   Run the daemon first: simplex-chat -p 5225");
+    println!(
+        "   Contact requests are accepted automatically (SIMPLEX_AUTO_ACCEPT=false to stop that)"
+    );
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1847,6 +1914,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::Irc => {
             println!("    ℹ️  IRC needs a server, a nickname and a channel to join; TLS on port 6697 is the default");
+        }
+        ChannelType::Simplex => {
+            println!("    ℹ️  SimpleX needs a running simplex-chat daemon; it listens on ws://127.0.0.1:5225 by default");
         }
     }
 

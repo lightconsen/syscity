@@ -33,6 +33,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | **WeCom (企业微信)** | **`wecom`** | ✅ | AI Bot WebSocket (long-lived) | — |
 | **DingTalk (钉钉)** | **`dingtalk`** | ✅ | Stream Mode (long-lived) | — |
 | **IRC** | **`irc`** | ✅ | Line protocol over TCP (long-lived) | — |
+| **SimpleX** | **`simplex`** | ✅ | Local `simplex-chat` daemon (long-lived) | — |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -95,6 +96,7 @@ Per-channel credential keys:
 | WeCom (企业微信) | `bot_id`, `secret`, `ws_url` | `WECOM_BOT_ID`, `WECOM_SECRET`, `WECOM_WEBSOCKET_URL` |
 | DingTalk (钉钉) | `client_id`, `client_secret`, `openapi_endpoint` | `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET`, `DINGTALK_OPENAPI_ENDPOINT` |
 | IRC | `server`, `channel`, `nickname`, `port`, `use_tls`, `server_password`, `nickserv_password` | `IRC_SERVER`, `IRC_CHANNEL`, `IRC_NICKNAME`, `IRC_PORT`, `IRC_USE_TLS`, `IRC_SERVER_PASSWORD`, `IRC_NICKSERV_PASSWORD` |
+| SimpleX | `ws_url`, `auto_accept` | `SIMPLEX_WS_URL`, `SIMPLEX_AUTO_ACCEPT` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -400,6 +402,42 @@ on that budget, at character boundaries. A reply is a protocol line, so any line
 break or NUL in it is neutralised before sending: otherwise an agent's answer
 could contain a second IRC command. Older clients' colour codes are stripped from
 incoming messages.
+
+### SimpleX — the full flow
+
+1. Run the daemon, which is what actually talks to the network:
+   ```bash
+   simplex-chat -p 5225
+   ```
+2. Configure the channel:
+   ```bash
+   export SIMPLEX_WS_URL=ws://127.0.0.1:5225   # the default
+   syscity channels add simplex
+   ```
+   Then `syscity start` to run the gateway.
+
+The channel speaks to the daemon over a WebSocket, and what travels on it is
+**SimpleX's own command language wrapped in JSON** — a command string out,
+events in. This is the one connection channel whose endpoint has a default, and
+the only one that needs a local process running: the gateway is a client of the
+daemon, not of SimpleX itself.
+
+**Contact requests are accepted automatically**, because otherwise nobody could
+ever reach the bot. That is not the access control — the gateway's own runs on
+every message afterwards, so `dm_policy` and `allow_from` are what actually
+decide who is answered. Set `SIMPLEX_AUTO_ACCEPT=false` to answer requests by
+hand.
+
+**SimpleX has no mention.** In a group there is no way for a sender to address
+the bot, so group messages arrive marked as unmentioned — which makes
+`require_mention` mean "say nothing in groups". It is off by default, so a group
+the bot has been added to works; turn it on to silence groups entirely.
+
+Only **text** is routed. Images, files and voice notes are delivered as separate
+events carrying no text this channel acts on, and are skipped — as are the file
+transfers the daemon offers, which are not fetched. The daemon is legitimately
+silent for long stretches, so idle time is not treated as a dropped connection;
+the keepalive is the WebSocket's own ping.
 
 ## Access control
 

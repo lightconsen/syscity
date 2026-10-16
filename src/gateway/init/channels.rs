@@ -367,6 +367,16 @@ pub(crate) async fn init_single_channel(
                 warn!("IRC feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::Simplex => {
+            #[cfg(feature = "simplex")]
+            {
+                init_simplex_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "simplex"))]
+            {
+                warn!("SimpleX feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -1295,6 +1305,79 @@ pub(crate) async fn init_irc_channel(
         .await
         .insert(name.to_string(), channel);
     info!("✅ IRC channel '{}' initialized (long-lived socket)", name);
+
+    Ok(())
+}
+
+/// Initialize SimpleX Chat channel.
+///
+/// The fourth connection channel: a WebSocket to a local `simplex-chat` daemon.
+/// The shape is the same as the three before it, so only the transport differs,
+/// and inbound goes through the shared tail unchanged.
+#[cfg(feature = "simplex")]
+pub(crate) async fn init_simplex_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::simplex::{SimplexChannel, SimplexConfig};
+
+    // A local daemon has a default endpoint, so this is the one connection
+    // channel that can start without being told where to connect.
+    let ws_url = channel_cred(&state.secrets, name, config, "ws_url")
+        .await
+        .unwrap_or_else(|| crate::channels::simplex::DEFAULT_WS_URL.to_string());
+
+    let (inbound_tx, mut inbound_rx) =
+        mpsc::unbounded_channel::<crate::channels::IncomingMessage>();
+
+    let mut simplex_config = SimplexConfig::new(ws_url);
+    simplex_config.message_tx = Some(inbound_tx);
+    if let Some(auto_accept) = channel_cred(&state.secrets, name, config, "auto_accept").await {
+        simplex_config.auto_accept =
+            matches!(auto_accept.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+
+    let channel = Arc::new(SimplexChannel::new(simplex_config));
+
+    let state_for_bridge = state.clone();
+    let name_for_bridge = name.to_string();
+    let bridge_handle = tokio::spawn(async move {
+        while let Some(msg) = inbound_rx.recv().await {
+            crate::gateway::webhooks::dispatch_channel_message_to(
+                &state_for_bridge,
+                &name_for_bridge,
+                &msg.user_id.0,
+                &msg.conversation_id.0,
+                &msg.content,
+                msg.mention,
+            )
+            .await;
+        }
+    });
+    register_channel_task(&state, name, "bridge", bridge_handle).await;
+
+    let name_for_task = name.to_string();
+    let channel_for_task = channel.clone();
+    let main_handle = tokio::spawn(async move {
+        if let Err(e) = channel_for_task.start().await {
+            error!("SimpleX channel {} failed: {}", name_for_task, e);
+        }
+    });
+    register_channel_task(&state, name, "main", main_handle).await;
+
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel(name, channel.clone())
+        .await;
+    state
+        .channels
+        .channels
+        .write()
+        .await
+        .insert(name.to_string(), channel);
+    info!("✅ SimpleX channel '{}' initialized (local daemon)", name);
 
     Ok(())
 }
