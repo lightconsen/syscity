@@ -92,6 +92,11 @@ pub mod line;
 #[cfg(feature = "twilio")]
 pub mod twilio;
 
+/// Outbound OAuth token sources, for the channels whose API takes a minted
+/// access token rather than a long-lived one (Teams, Google Chat).
+#[cfg(any(feature = "teams", feature = "googlechat"))]
+pub mod oauth_token;
+
 pub mod acp_bridge;
 pub mod command_gate;
 pub mod envelope;
