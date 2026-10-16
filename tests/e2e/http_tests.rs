@@ -492,7 +492,14 @@ async fn line_webhook_round_trip_replies_to_the_channel() {
             panic!("timed out waiting for the webhook reply on channel 'line'");
         }
         let snapshot = sent.read().await.clone();
-        if snapshot.iter().any(|m| m.content.contains("pong-from-llm")) {
+        if let Some(reply) = snapshot
+            .iter()
+            .find(|m| m.content.contains("pong-from-llm"))
+        {
+            assert_eq!(
+                reply.conversation_id.0, "U_HTTP_E2E",
+                "the reply is pushed to the user who wrote in, not to a session id"
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -662,7 +669,14 @@ async fn twilio_webhook_round_trip_replies_to_the_channel() {
             panic!("timed out waiting for the webhook reply on channel 'twilio'");
         }
         let snapshot = sent.read().await.clone();
-        if snapshot.iter().any(|m| m.content.contains("pong-from-llm")) {
+        if let Some(reply) = snapshot
+            .iter()
+            .find(|m| m.content.contains("pong-from-llm"))
+        {
+            assert_eq!(
+                reply.conversation_id.0, "+15550000001",
+                "the reply is texted to the number that wrote in, not to a session id"
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -989,16 +1003,14 @@ async fn googlechat_webhook_round_trip_replies_to_the_space() {
             panic!("timed out waiting for the webhook reply on channel 'googlechat'");
         }
         let snapshot = sent.read().await.clone();
-        if snapshot.iter().any(|m| m.content.contains("pong-from-llm")) {
-            // NOTE: the reply's `conversation_id` is deliberately *not*
-            // asserted to be the space, because it is not — it arrives as the
-            // session id. `run_agent_loop` resolves the platform id from
-            // `session_channels`, puts it on the `AgentResponse` event, and
-            // then builds the `OutboundContext` without it, so the outbound
-            // `DispatchStage` addresses the reply to `session_id`. Every
-            // webhook channel's handler fills that map and, for every one of
-            // them, the value never reaches `Channel::send`. Fixing that is a
-            // change to the outbound context, not to this channel.
+        if let Some(reply) = snapshot
+            .iter()
+            .find(|m| m.content.contains("pong-from-llm"))
+        {
+            assert_eq!(
+                reply.conversation_id.0, space,
+                "the reply is addressed to the space, not to the sender or the session"
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

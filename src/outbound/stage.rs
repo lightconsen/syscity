@@ -225,7 +225,15 @@ impl OutboundStage for DispatchStage {
         }
 
         let outbound_msg = crate::channels::OutgoingMessage {
-            conversation_id: crate::channels::ConversationId::new(&ctx.input.session_id),
+            // The platform's own id when the inbound path knew one — see
+            // `OutboundContext::conversation_id`. The session id is the
+            // fallback, and for the built-in surfaces it is the right answer.
+            conversation_id: crate::channels::ConversationId::new(
+                ctx.input
+                    .conversation_id
+                    .as_deref()
+                    .unwrap_or(&ctx.input.session_id),
+            ),
             content: ctx.result.text.clone(),
             reasoning_content: ctx.input.reasoning_content.clone(),
             tool_calls: None,
@@ -440,6 +448,7 @@ mod tests {
     fn dummy_context() -> OutboundStageContext {
         OutboundStageContext::new(OutboundContext {
             session_id: "sess-1".into(),
+            conversation_id: None,
             channel: "test".into(),
             agent_id: "agent-1".into(),
             raw_output: "hello world".into(),

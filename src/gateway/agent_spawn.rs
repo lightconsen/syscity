@@ -653,6 +653,9 @@ async fn process_message_acp(
         let cfg = state.config.read().await;
         crate::outbound::OutboundContext {
             session_id: session_id.to_string(),
+            // Resolved above from `session_channels` — the platform id, which
+            // is what a channel needs in order to address a reply.
+            conversation_id: Some(conversation_id),
             channel: channel.to_string(),
             agent_id: agent_id.to_string(),
             raw_output: response_content,

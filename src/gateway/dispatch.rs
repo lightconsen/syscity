@@ -1025,6 +1025,14 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
                     let cfg = state.config.read().await;
                     crate::outbound::OutboundContext {
                         session_id: session_id.to_string(),
+                        // The platform id when this session arrived over a
+                        // webhook channel — the value its handler recorded so
+                        // the reply could be addressed. `None` for the built-in
+                        // surfaces, whose conversation *is* the session.
+                        conversation_id: {
+                            let sessions = state.channels.session_channels.read().await;
+                            sessions.get(session_id).map(|(_, cid)| cid.clone())
+                        },
                         channel: channel.to_string(),
                         agent_id: agent_id.to_string(),
                         raw_output: outgoing.content,

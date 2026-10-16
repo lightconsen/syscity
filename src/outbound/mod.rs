@@ -54,6 +54,17 @@ pub trait OutboundPipeline: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct OutboundContext {
     pub session_id: String,
+    /// Where the reply is addressed, when that is not the session.
+    ///
+    /// A webhook channel's session id is a UUID *this gateway minted*, so
+    /// addressing a reply to it means addressing it to nothing the platform
+    /// recognises — LINE would push to a UUID, Twilio would text one, Google
+    /// Chat would post into a space that does not exist. The inbound handler
+    /// knows the real platform id (it is what it recorded in
+    /// `session_channels`), so it travels here and the dispatch stage prefers
+    /// it, falling back to the session id for the paths that have no platform
+    /// id to give.
+    pub conversation_id: Option<String>,
     pub channel: String,
     pub agent_id: String,
     pub raw_output: String,
