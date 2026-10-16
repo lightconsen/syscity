@@ -49,6 +49,8 @@ pub enum ChannelType {
     WechatMp,
     /// LINE Messaging API webhook
     Line,
+    /// Twilio SMS webhook
+    Twilio,
 }
 
 #[cfg(feature = "telegram")]
@@ -86,6 +88,9 @@ pub mod wechatmp;
 
 #[cfg(feature = "line")]
 pub mod line;
+
+#[cfg(feature = "twilio")]
+pub mod twilio;
 
 pub mod acp_bridge;
 pub mod command_gate;

@@ -242,6 +242,10 @@ pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
     #[cfg(feature = "line")]
     let router = router.route("/webhooks/line", post(line_webhook_handler));
 
+    // Twilio SMS webhooks (feature-gated channel)
+    #[cfg(feature = "twilio")]
+    let router = router.route("/webhooks/twilio", post(twilio_webhook_handler));
+
     // One guard for the process: a delivery is a replay wherever in the router
     // it arrives.
     router
@@ -849,6 +853,130 @@ async fn line_webhook_handler(
         message: "OK".to_string(),
     })
     .into_response()
+}
+
+/// The empty TwiML reply that tells Twilio there is nothing to send back.
+///
+/// A 2xx with any body would also do, but an explicit empty `<Response/>` is
+/// what Twilio's own examples use and removes the ambiguity about whether the
+/// gateway meant to reply.
+#[cfg(feature = "twilio")]
+fn twiml_ok() -> axum::response::Response {
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/xml"),
+        )],
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response></Response>",
+    )
+        .into_response()
+}
+
+/// Handle Twilio SMS webhooks.
+///
+/// Twilio posts `application/x-www-form-urlencoded`, not JSON, and signs **the
+/// URL it dialled** together with the sorted parameters. That is why
+/// verification needs the configured public URL and cannot read it off the
+/// request: behind a tunnel the gateway sees `127.0.0.1:<port>` while Twilio
+/// signed `https://…`. A delivery whose signature cannot be checked is refused
+/// rather than let through — there is deliberately no "skip validation" switch,
+/// the way there is none for the other channels.
+///
+/// The same URL also receives status callbacks for messages Twilio has already
+/// handled. Those carry no `Body`, so they are acknowledged without becoming an
+/// empty turn.
+#[cfg(feature = "twilio")]
+async fn twilio_webhook_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    info!("Received Twilio webhook");
+
+    let signature = headers
+        .get(crate::channels::twilio::TWILIO_SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+
+    // Resolve the auth token and the configured public URL from the secret
+    // store, falling back to the legacy plaintext credentials map. The config
+    // guard is released before the async resolution to avoid holding the lock
+    // across `.await`.
+    let (auth_token, webhook_url) = {
+        let legacy = {
+            let config = state.config.read().await;
+            config.channels.get("twilio").map(|c| {
+                (
+                    c.credentials.get("auth_token").cloned(),
+                    c.credentials.get("webhook_url").cloned(),
+                )
+            })
+        };
+        let (legacy_token, legacy_url) = legacy.unwrap_or((None, None));
+
+        let token = state
+            .secrets
+            .resolve_channel_credential("twilio", "auth_token", legacy_token.as_deref())
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v.into_inner());
+        let url = state
+            .secrets
+            .resolve_channel_credential("twilio", "webhook_url", legacy_url.as_deref())
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v.into_inner());
+
+        (token, url)
+    };
+
+    // Every piece is required, and the URL is not optional the way a display
+    // name would be: without it the signature covers a string this process
+    // cannot construct, so nothing can be verified.
+    let (auth_token, webhook_url, signature) = match (auth_token, webhook_url, signature) {
+        (Some(token), Some(url), Some(signature)) => (token, url, signature),
+        _ => {
+            warn!(
+                "Twilio webhook: auth token, configured webhook URL, or signature header \
+                 missing — refusing the delivery"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Signature verification requires the auth token, the configured webhook URL, \
+                 and the signature header",
+            )
+                .into_response();
+        }
+    };
+
+    let params = crate::channels::twilio::parse_form(&body);
+
+    if !crate::channels::twilio::verify_signature(&auth_token, &webhook_url, &params, signature) {
+        warn!("Twilio webhook: invalid signature");
+        return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+    }
+    debug!("Twilio webhook: signature verified");
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("Twilio webhook: duplicate delivery ignored");
+        return twiml_ok();
+    }
+
+    match crate::channels::twilio::parse_incoming(&params) {
+        Some(incoming) => {
+            // Verify, extract, hand off — the shared direct-message tail.
+            dispatch_direct_webhook(&state, "twilio", &incoming.from, &incoming.body).await;
+        }
+        None => {
+            debug!("Twilio webhook: not an inbound message (a status callback?) — acknowledged");
+        }
+    }
+
+    twiml_ok()
 }
 
 // ─────────────────────────────────────────────

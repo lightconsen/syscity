@@ -397,6 +397,8 @@ pub enum ChannelType {
     WechatMp,
     /// LINE Messaging API webhook
     Line,
+    /// Twilio SMS webhook
+    Twilio,
 }
 
 impl ChannelType {
@@ -421,6 +423,7 @@ impl ChannelType {
             ChannelType::Webchat => "webchat",
             ChannelType::WechatMp => "wechatmp",
             ChannelType::Line => "line",
+            ChannelType::Twilio => "twilio",
         }
     }
 
@@ -439,6 +442,7 @@ impl ChannelType {
             ChannelType::Webchat => "WebChat",
             ChannelType::WechatMp => "WeChat MP",
             ChannelType::Line => "LINE",
+            ChannelType::Twilio => "Twilio SMS",
         }
     }
 
@@ -458,6 +462,7 @@ impl ChannelType {
             ChannelType::Webchat => cfg!(feature = "webchat"),
             ChannelType::WechatMp => cfg!(feature = "wechatmp"),
             ChannelType::Line => cfg!(feature = "line"),
+            ChannelType::Twilio => cfg!(feature = "twilio"),
         }
     }
 }

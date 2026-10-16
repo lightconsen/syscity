@@ -175,6 +175,7 @@ async fn run_channel_add(
         ChannelType::Webchat => add_webchat_channel(token, agent, extra_creds).await,
         ChannelType::WechatMp => add_wechatmp_channel(token, agent, extra_creds).await,
         ChannelType::Line => add_line_channel(token, agent, extra_creds).await,
+        ChannelType::Twilio => add_twilio_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -981,6 +982,95 @@ async fn add_line_channel(
     Ok(())
 }
 
+/// Add/configure a Twilio SMS channel in Gateway
+async fn add_twilio_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    // `--token` is the auth token. The account SID is the other half of the
+    // Basic-auth pair, and the from-number is the line replies come out of —
+    // both are asked for separately rather than inferred.
+    let auth_token = match token {
+        Some(t) => t,
+        None => std::env::var("TWILIO_AUTH_TOKEN").map_err(|_| {
+            crate::error::ConfigError::Missing(
+                "TWILIO_AUTH_TOKEN environment variable, or --token argument".to_string(),
+            )
+        })?,
+    };
+
+    let lookup = |env: &str, key: &str| -> Option<String> {
+        std::env::var(env).ok().or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+
+    let account_sid = lookup("TWILIO_ACCOUNT_SID", "account_sid").ok_or_else(|| {
+        crate::error::ConfigError::Missing(
+            "TWILIO_ACCOUNT_SID environment variable, or --credential account_sid=...".to_string(),
+        )
+    })?;
+
+    let from_number = lookup("TWILIO_FROM_NUMBER", "from_number").ok_or_else(|| {
+        crate::error::ConfigError::Missing(
+            "TWILIO_FROM_NUMBER environment variable, or --credential from_number=...".to_string(),
+        )
+    })?;
+
+    // Twilio signs the URL it dialled, and the gateway cannot recover that from
+    // the request — so this is not optional the way a display name would be.
+    // A channel without it refuses every delivery, and it is better to say so
+    // here than to have the operator discover it from a 401.
+    let webhook_url = lookup("TWILIO_WEBHOOK_URL", "webhook_url").ok_or_else(|| {
+        crate::error::ConfigError::Missing(
+            "TWILIO_WEBHOOK_URL (the public URL configured in the Twilio console), or \
+             --credential webhook_url=..."
+                .to_string(),
+        )
+    })?;
+
+    println!("🚀 Adding Twilio SMS channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("auth_token".to_string(), auth_token);
+    credentials.insert("account_sid".to_string(), account_sid);
+    credentials.insert("from_number".to_string(), from_number);
+    credentials.insert("webhook_url".to_string(), webhook_url);
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::Twilio,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config.channels.insert("twilio".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ Twilio SMS channel configured in Gateway");
+    println!("   Point the phone number's messaging webhook at <public>/webhooks/twilio");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
@@ -1330,6 +1420,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::Line => {
             println!("    ℹ️  LINE uses the Messaging API credentials (channel access token + channel secret)");
+        }
+        ChannelType::Twilio => {
+            println!("    ℹ️  Twilio uses the account SID + auth token, and needs the public webhook URL the console was given");
         }
     }
 

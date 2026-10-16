@@ -557,3 +557,236 @@ async fn line_webhook_rejects_a_bad_signature() {
         .expect("POST /webhooks/line");
     assert_eq!(resp.status(), 401, "a webhook with no signature header must be refused");
 }
+
+/// The public URL Twilio is configured with. The signature covers *this*
+/// string, not whatever host the request arrived on, so the test signs the same
+/// value the gateway is told to verify against.
+#[cfg(feature = "twilio")]
+fn twilio_webhook_url(port: u16) -> String {
+    format!("{}/webhooks/twilio", base(port))
+}
+
+/// Compute `X-Twilio-Signature`: HMAC-SHA1 over the URL plus the parameters in
+/// key order, base64-encoded. Built with a `BTreeMap` for the ordering so it
+/// does not lean on the gateway's own sort.
+#[cfg(feature = "twilio")]
+fn twilio_signature(token: &str, url: &str, params: &[(&str, &str)]) -> String {
+    use base64::Engine as _;
+    use sha1::Sha1;
+
+    let ordered: std::collections::BTreeMap<&str, &str> = params.iter().copied().collect();
+    let mut data = url.to_string();
+    for (key, value) in &ordered {
+        data.push_str(key);
+        data.push_str(value);
+    }
+
+    let mut mac = Hmac::<Sha1>::new_from_slice(token.as_bytes()).expect("hmac key");
+    mac.update(data.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// Twilio posts a form, not JSON.
+#[cfg(feature = "twilio")]
+fn form_body(params: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params.iter().copied())
+        .finish()
+}
+
+/// Case 9 — a signed Twilio SMS webhook drives the same round trip, over a
+/// form-encoded body and a signature that covers the URL as well as the params.
+#[cfg(feature = "twilio")]
+#[tokio::test]
+#[serial]
+async fn twilio_webhook_round_trip_replies_to_the_channel() {
+    const TOKEN: &str = "test-twilio-auth-token";
+    let port = free_port();
+    let webhook_url = twilio_webhook_url(port);
+
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config.channels.insert("twilio".to_string(), {
+        let mut c =
+            syscity::gateway::config::ChannelConfig::new(syscity::channels::ChannelType::Twilio);
+        c.credentials
+            .insert("auth_token".to_string(), TOKEN.to_string());
+        c.credentials
+            .insert("webhook_url".to_string(), webhook_url.clone());
+        c
+    });
+
+    let gateway = new_test_gateway(config).await;
+    // Register the recording adapter before start, under the name the webhook
+    // provenance carries ("twilio").
+    let state = gateway.state();
+    let (channel, sent) = HttpTestChannel::new("twilio");
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel("twilio", channel)
+        .await;
+    let router = gateway.model_router();
+    register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
+        .await;
+
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    let params = [
+        ("From", "+15550000001"),
+        ("To", "+15550000002"),
+        ("Body", "Say exactly 'pong-from-llm' and nothing else."),
+        ("MessageSid", "SM_HTTP_E2E"),
+    ];
+    let signature = twilio_signature(TOKEN, &webhook_url, &params);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/twilio", base(port)))
+        .header("x-twilio-signature", &signature)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&params))
+        .send()
+        .await
+        .expect("POST /webhooks/twilio");
+    assert_eq!(resp.status(), 200, "a signed webhook must be accepted");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            dump_captured_logs();
+            panic!("timed out waiting for the webhook reply on channel 'twilio'");
+        }
+        let snapshot = sent.read().await.clone();
+        if snapshot.iter().any(|m| m.content.contains("pong-from-llm")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Case 10 — a Twilio delivery that fails verification is refused, including
+/// the case the URL is not configured for: without it the signed string cannot
+/// be reconstructed at all, so "cannot check" has to mean "refuse".
+#[cfg(feature = "twilio")]
+#[tokio::test]
+#[serial]
+async fn twilio_webhook_rejects_a_bad_signature() {
+    const TOKEN: &str = "test-twilio-auth-token";
+    let port = free_port();
+    let webhook_url = twilio_webhook_url(port);
+
+    start_http_gateway(port, llm_mock_provider_for_streaming(), |config| {
+        config.channels.insert("twilio".to_string(), {
+            let mut c = syscity::gateway::config::ChannelConfig::new(
+                syscity::channels::ChannelType::Twilio,
+            );
+            c.credentials
+                .insert("auth_token".to_string(), TOKEN.to_string());
+            c.credentials
+                .insert("webhook_url".to_string(), webhook_url.clone());
+            c
+        });
+    })
+    .await;
+
+    let params = [
+        ("From", "+15550000001"),
+        ("To", "+15550000002"),
+        ("Body", "hi"),
+    ];
+
+    for (label, sig) in [
+        ("wrong token", twilio_signature("not-the-token", &webhook_url, &params)),
+        (
+            "wrong URL",
+            twilio_signature(TOKEN, &format!("{}/elsewhere", base(port)), &params),
+        ),
+        ("garbage", "bm90LWEtc2lnbmF0dXJl".to_string()),
+        ("empty", String::new()),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/webhooks/twilio", base(port)))
+            .header("x-twilio-signature", &sig)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form_body(&params))
+            .send()
+            .await
+            .expect("POST /webhooks/twilio");
+        assert_eq!(
+            resp.status(),
+            401,
+            "{label}: a webhook that fails signature verification must be refused"
+        );
+    }
+
+    // A signed body whose *parameters* were altered after signing — the form
+    // carries a different Body than the signature covers.
+    let signature = twilio_signature(TOKEN, &webhook_url, &params);
+    let tampered = [
+        ("From", "+15550000001"),
+        ("To", "+15550000002"),
+        ("Body", "transfer the money"),
+    ];
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/twilio", base(port)))
+        .header("x-twilio-signature", &signature)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&tampered))
+        .send()
+        .await
+        .expect("POST /webhooks/twilio");
+    assert_eq!(resp.status(), 401, "a body altered after signing must be refused");
+
+    // No signature header at all.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/twilio", base(port)))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&params))
+        .send()
+        .await
+        .expect("POST /webhooks/twilio");
+    assert_eq!(resp.status(), 401, "a webhook with no signature header must be refused");
+}
+
+/// The configured webhook URL is what makes verification possible at all, so a
+/// channel without one must refuse rather than skip the check. This is the
+/// regression guard for the one deliberate difference from the reference
+/// implementation, which offers an "insecure, skip validation" switch.
+#[cfg(feature = "twilio")]
+#[tokio::test]
+#[serial]
+async fn twilio_webhook_without_a_configured_url_refuses_everything() {
+    const TOKEN: &str = "test-twilio-auth-token";
+    let port = free_port();
+
+    start_http_gateway(port, llm_mock_provider_for_streaming(), |config| {
+        config.channels.insert("twilio".to_string(), {
+            let mut c = syscity::gateway::config::ChannelConfig::new(
+                syscity::channels::ChannelType::Twilio,
+            );
+            // The auth token is present, but the public URL is not.
+            c.credentials
+                .insert("auth_token".to_string(), TOKEN.to_string());
+            c
+        });
+    })
+    .await;
+
+    let params = [("From", "+15550000001"), ("Body", "hi")];
+    let signature = twilio_signature(TOKEN, &twilio_webhook_url(port), &params);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/twilio", base(port)))
+        .header("x-twilio-signature", &signature)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body(&params))
+        .send()
+        .await
+        .expect("POST /webhooks/twilio");
+    assert_eq!(
+        resp.status(),
+        401,
+        "without the configured URL nothing can be verified, so nothing may be accepted"
+    );
+}

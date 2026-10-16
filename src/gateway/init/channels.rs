@@ -307,6 +307,16 @@ pub(crate) async fn init_single_channel(
                 warn!("LINE feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::Twilio => {
+            #[cfg(feature = "twilio")]
+            {
+                init_twilio_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "twilio"))]
+            {
+                warn!("Twilio feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -717,6 +727,61 @@ pub(crate) async fn init_line_channel(
     } else {
         warn!(
             "LINE channel '{}' missing 'channel_access_token'/'channel_secret' in credentials",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Initialize Twilio SMS channel.
+///
+/// Inbound arrives via the signed webhook in `gateway/webhooks.rs`; this only
+/// registers the outbound (Messages API) channel.
+#[cfg(feature = "twilio")]
+pub(crate) async fn init_twilio_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::twilio::{TwilioChannel, TwilioConfig};
+
+    if let (Some(account_sid), Some(auth_token), Some(from_number), Some(webhook_url)) = (
+        channel_cred(&state.secrets, name, config, "account_sid").await,
+        channel_cred(&state.secrets, name, config, "auth_token").await,
+        channel_cred(&state.secrets, name, config, "from_number").await,
+        channel_cred(&state.secrets, name, config, "webhook_url").await,
+    ) {
+        let channel = Arc::new(TwilioChannel::new(TwilioConfig::new(
+            account_sid,
+            auth_token,
+            from_number,
+            webhook_url,
+        )));
+
+        let channel_name = name.to_string();
+        let channel_for_task = channel.clone();
+        let main_handle = tokio::spawn(async move {
+            if let Err(e) = channel_for_task.start().await {
+                error!("Twilio channel {} failed: {}", channel_name, e);
+            }
+        });
+        register_channel_task(&state, name, "main", main_handle).await;
+        state
+            .channels
+            .reply_dispatcher
+            .register_channel(name, channel.clone())
+            .await;
+        state
+            .channels
+            .channels
+            .write()
+            .await
+            .insert(name.to_string(), channel);
+        info!("✅ Twilio SMS channel '{}' initialized (inbound via signed webhook)", name);
+    } else {
+        warn!(
+            "Twilio channel '{}' missing \
+             'account_sid'/'auth_token'/'from_number'/'webhook_url' in credentials",
             name
         );
     }

@@ -27,6 +27,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | Feishu / Lark | `feishu` | ✅ | Event webhook | `/webhooks/feishu` |
 | **WeChat MP (公众号)** | **`wechatmp`** | ✅ | Encrypted webhook | `/webhooks/wechatmp` |
 | **LINE** | **`line`** | ✅ | Messaging API webhook | `/webhooks/line` |
+| **Twilio SMS** | **`twilio`** | ✅ | Messages webhook (form-encoded) | `/webhooks/twilio` |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -83,6 +84,7 @@ Per-channel credential keys:
 | Feishu/Lark | `app_id`, `app_secret`, `verification_token`, `encrypt_key` | `LARK_*` / `FEISHU_*` |
 | WeChat MP | `app_id`, `app_secret`, `token`, `encoding_aes_key` | `WECHAT_MP_*` |
 | LINE | `channel_access_token`, `channel_secret` | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` |
+| Twilio SMS | `account_sid`, `auth_token`, `from_number`, `webhook_url` | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_WEBHOOK_URL` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -144,6 +146,38 @@ cloudflared) to forward e.g. `https://<tunnel>/webhooks/wechatmp` → `http://12
 
 Only text messages are routed. LINE reports follows, joins, leaves and
 postbacks through the same webhook; those are acknowledged and skipped.
+
+### Twilio SMS — the full flow
+
+1. In the [Twilio console](https://console.twilio.com/), take the **Account SID**
+   and **Auth Token** from the account dashboard, and note the Twilio phone
+   number replies should come from.
+2. Configure the channel:
+   ```bash
+   export TWILIO_ACCOUNT_SID=AC...
+   export TWILIO_AUTH_TOKEN=...
+   export TWILIO_FROM_NUMBER=+15551234567
+   export TWILIO_WEBHOOK_URL=https://<public>/webhooks/twilio
+   syscity channels add twilio
+   ```
+   Then `syscity start` to run the gateway.
+3. Under the phone number's **Messaging → A message comes in**, set the webhook
+   to `https://<public>/webhooks/twilio`, method **HTTP POST**.
+
+`TWILIO_WEBHOOK_URL` is not optional, and it must be exactly the URL you entered
+in the console. Twilio signs the URL it dialled plus the request's parameters
+(`X-Twilio-Signature`, HMAC-SHA1, base64); behind a tunnel or a proxy the
+gateway sees `127.0.0.1:<port>` while Twilio signed `https://…`, so the public
+URL cannot be recovered from the request. Without it a delivery cannot be
+authenticated and is refused — there is deliberately no "skip validation"
+switch. Both spellings of the scheme's default port are accepted, since Twilio
+has signed URLs with and without it.
+
+Replies longer than 1600 characters are split into consecutive texts, on a word
+boundary where there is one (SMS has no editing, threading or reply-to, so
+consecutive texts are the closest thing to one reply the medium has). Status
+callbacks — which Twilio posts to the same URL for messages it has already
+handled — carry no body and are acknowledged without becoming a turn.
 
 ## Access control
 
