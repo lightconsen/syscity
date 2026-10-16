@@ -47,6 +47,8 @@ pub enum ChannelType {
     Webchat,
     /// WeChat Official Account (公众号) webhook
     WechatMp,
+    /// LINE Messaging API webhook
+    Line,
 }
 
 #[cfg(feature = "telegram")]
@@ -81,6 +83,9 @@ pub mod webchat;
 
 #[cfg(feature = "wechatmp")]
 pub mod wechatmp;
+
+#[cfg(feature = "line")]
+pub mod line;
 
 pub mod acp_bridge;
 pub mod command_gate;

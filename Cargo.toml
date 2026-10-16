@@ -283,7 +283,7 @@ windows-sys = { version = "=0.59.0", features = [
 ] }
 
 [features]
-default = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "plugins", "hot-reload", "local-embeddings", "browser", "vision", "sqlite-vec"]
+default = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "plugins", "hot-reload", "local-embeddings", "browser", "vision", "sqlite-vec"]
 telegram = ["teloxide"]
 discord = ["serenity"]
 slack = []
@@ -294,7 +294,10 @@ signal = []
 imessage = []
 webchat = []
 wechatmp = ["dep:aes", "dep:cbc", "dep:sha1"]
-all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp"]
+# LINE Messaging API — webhook in, REST out. Needs no extra crate: hmac, sha2,
+# base64 and subtle are already unconditional dependencies.
+line = []
+all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line"]
 web = []
 # Syscity Cloud integration (login + cloud LLM/search/KB/connectors). Default
 # OFF: default builds contain no cloud coupling (§2.7) — a default `cargo
@@ -326,7 +329,7 @@ keyring = ["dep:keyring"]
 # Build with: cargo build --no-default-features --features intel-macos
 intel-macos = [
     "cloud", "telegram", "discord", "slack", "whatsapp", "qq", "feishu",
-    "signal", "imessage", "webchat", "wechatmp", "plugins", "hot-reload",
+    "signal", "imessage", "webchat", "wechatmp", "line", "plugins", "hot-reload",
     "local-embeddings", "browser", "sqlite-vec",
 ]
 

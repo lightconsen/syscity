@@ -395,6 +395,8 @@ pub enum ChannelType {
     Webchat,
     /// WeChat Official Account (公众号) webhook
     WechatMp,
+    /// LINE Messaging API webhook
+    Line,
 }
 
 impl ChannelType {
@@ -418,6 +420,7 @@ impl ChannelType {
             ChannelType::Imessage => "imessage",
             ChannelType::Webchat => "webchat",
             ChannelType::WechatMp => "wechatmp",
+            ChannelType::Line => "line",
         }
     }
 
@@ -435,6 +438,7 @@ impl ChannelType {
             ChannelType::Imessage => "iMessage",
             ChannelType::Webchat => "WebChat",
             ChannelType::WechatMp => "WeChat MP",
+            ChannelType::Line => "LINE",
         }
     }
 
@@ -453,6 +457,7 @@ impl ChannelType {
             ChannelType::Imessage => cfg!(feature = "imessage"),
             ChannelType::Webchat => cfg!(feature = "webchat"),
             ChannelType::WechatMp => cfg!(feature = "wechatmp"),
+            ChannelType::Line => cfg!(feature = "line"),
         }
     }
 }

@@ -397,3 +397,163 @@ async fn slack_webhook_rejects_a_bad_signature() {
         );
     }
 }
+
+/// Compute the LINE `X-Line-Signature`: `base64(HMAC-SHA256(secret, body))`.
+#[cfg(feature = "line")]
+fn line_signature(secret: &str, body: &[u8]) -> String {
+    use base64::Engine as _;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    mac.update(body);
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// Case 7 — a signed LINE webhook drives the same round trip as Slack's, over
+/// a different signature scheme and a batched payload.
+#[cfg(feature = "line")]
+#[tokio::test]
+#[serial]
+async fn line_webhook_round_trip_replies_to_the_channel() {
+    const SECRET: &str = "test-line-channel-secret";
+    let port = free_port();
+
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config.channels.insert("line".to_string(), {
+        let mut c =
+            syscity::gateway::config::ChannelConfig::new(syscity::channels::ChannelType::Line);
+        c.credentials
+            .insert("channel_secret".to_string(), SECRET.to_string());
+        c
+    });
+
+    let gateway = new_test_gateway(config).await;
+    // Register the recording adapter before start, under the name the webhook
+    // provenance carries ("line").
+    let state = gateway.state();
+    let (channel, sent) = HttpTestChannel::new("line");
+    state
+        .channels
+        .reply_dispatcher
+        .register_channel("line", channel)
+        .await;
+    let router = gateway.model_router();
+    register_mock_provider_with_model(&router, llm_mock_provider_for_streaming(), "mock-model")
+        .await;
+
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    // A delivery is a batch, and most of it is not a message: the follow and
+    // the postback must be skipped rather than become turns of their own.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "destination": "U_bot",
+        "events": [
+            { "type": "follow", "source": { "type": "user", "userId": "U_IGNORED" } },
+            {
+                "type": "message",
+                "replyToken": "rt-1",
+                "source": { "type": "user", "userId": "U_HTTP_E2E" },
+                "message": {
+                    "type": "text",
+                    "id": "m1",
+                    "text": "Say exactly 'pong-from-llm' and nothing else."
+                }
+            },
+            {
+                "type": "postback",
+                "source": { "type": "user", "userId": "U_IGNORED_TOO" },
+                "postback": { "data": "x" }
+            }
+        ]
+    }))
+    .expect("serialize");
+    let signature = line_signature(SECRET, &body);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/line", base(port)))
+        .header("x-line-signature", &signature)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("POST /webhooks/line");
+    assert_eq!(resp.status(), 200, "a signed webhook must be accepted");
+
+    // The reply must come out of the same channel.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            dump_captured_logs();
+            panic!("timed out waiting for the webhook reply on channel 'line'");
+        }
+        let snapshot = sent.read().await.clone();
+        if snapshot.iter().any(|m| m.content.contains("pong-from-llm")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Case 8 — a LINE webhook that fails signature verification is refused, and
+/// so is one carrying no signature at all. The route sits in the essential
+/// tier precisely because the per-channel signature *is* its authentication;
+/// a regression here would be an open ingress.
+#[cfg(feature = "line")]
+#[tokio::test]
+#[serial]
+async fn line_webhook_rejects_a_bad_signature() {
+    const SECRET: &str = "test-line-channel-secret";
+    let port = free_port();
+
+    start_http_gateway(port, llm_mock_provider_for_streaming(), |config| {
+        config.channels.insert("line".to_string(), {
+            let mut c =
+                syscity::gateway::config::ChannelConfig::new(syscity::channels::ChannelType::Line);
+            c.credentials
+                .insert("channel_secret".to_string(), SECRET.to_string());
+            c
+        });
+    })
+    .await;
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "events": [{
+            "type": "message",
+            "source": { "type": "user", "userId": "U" },
+            "message": { "type": "text", "id": "m", "text": "hi" }
+        }]
+    }))
+    .expect("serialize");
+
+    for (label, sig) in [
+        ("wrong secret", line_signature("not-the-secret", &body)),
+        ("garbage", "bm90LWEtc2lnbmF0dXJl".to_string()),
+        ("empty", String::new()),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/webhooks/line", base(port)))
+            .header("x-line-signature", &sig)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .expect("POST /webhooks/line");
+        assert_eq!(
+            resp.status(),
+            401,
+            "{label}: a webhook that fails signature verification must be refused"
+        );
+    }
+
+    // No signature header at all is a different path through the handler — it
+    // must refuse rather than fall out of the `if let`.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/line", base(port)))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("POST /webhooks/line");
+    assert_eq!(resp.status(), 401, "a webhook with no signature header must be refused");
+}

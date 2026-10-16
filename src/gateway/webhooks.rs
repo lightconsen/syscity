@@ -238,6 +238,10 @@ pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
         get(wechatmp_verify_handler).post(wechatmp_webhook_handler),
     );
 
+    // LINE Messaging API webhooks (feature-gated channel)
+    #[cfg(feature = "line")]
+    let router = router.route("/webhooks/line", post(line_webhook_handler));
+
     // One guard for the process: a delivery is a replay wherever in the router
     // it arrives.
     router
@@ -737,6 +741,107 @@ async fn feishu_webhook_handler(
                 }
             }
         }
+    }
+
+    Json(WebhookResponse {
+        success: true,
+        message: "OK".to_string(),
+    })
+    .into_response()
+}
+
+/// Handle LINE Messaging API webhooks.
+///
+/// LINE signs the *raw* body with the channel secret and carries the result
+/// base64-encoded in `X-Line-Signature` — which is why the body is verified
+/// before it is parsed, and why the parse takes the bytes rather than a
+/// re-serialised value.
+///
+/// One delivery is a batch of events, and most events are not messages: LINE
+/// reports follows, joins, leaves and postbacks through the same endpoint.
+/// Those are acknowledged and skipped.
+#[cfg(feature = "line")]
+async fn line_webhook_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+    replay: axum::Extension<Arc<ReplayGuard>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    info!("Received LINE webhook");
+
+    let signature = headers
+        .get(crate::channels::line::LINE_SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+
+    // Resolve the channel secret from the secret store, falling back to the
+    // legacy plaintext credentials map. The config guard is released before the
+    // async resolution to avoid holding the lock across `.await`.
+    let secret = {
+        let legacy = {
+            let config = state.config.read().await;
+            config
+                .channels
+                .get("line")
+                .and_then(|c| c.credentials.get("channel_secret"))
+                .cloned()
+        };
+        state
+            .secrets
+            .resolve_channel_credential("line", "channel_secret", legacy.as_deref())
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v.into_inner())
+    };
+
+    // Every piece is required: a missing secret or header means the request
+    // cannot be authenticated, which must refuse it rather than let it through
+    // by falling out of the `if let`.
+    let (secret, signature) = match (secret, signature) {
+        (Some(secret), Some(signature)) => (secret, signature),
+        _ => {
+            warn!("LINE webhook: channel secret or signature header missing — refusing");
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Signature verification requires a configured secret and the signature header",
+            )
+                .into_response();
+        }
+    };
+
+    if !crate::channels::line::verify_signature(&secret, &body, signature) {
+        warn!("LINE webhook: invalid signature");
+        return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+    }
+    debug!("LINE webhook: signature verified");
+
+    // A signature proves where a delivery came from, not that it is new.
+    if !replay.first_sighting(&body) {
+        info!("LINE webhook: duplicate delivery ignored");
+        return Json(WebhookResponse {
+            success: true,
+            message: "duplicate ignored".to_string(),
+        })
+        .into_response();
+    }
+
+    let events = match crate::channels::line::parse_events(&body) {
+        Ok(events) => events,
+        Err(e) => {
+            error!("Failed to parse LINE webhook: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
+        }
+    };
+
+    for event in events {
+        // Verify, extract, hand off — the shared direct-message tail.
+        //
+        // A full queue is logged by the helper and deliberately *not* turned
+        // into a 503, unlike the generic webhook's handler. LINE retries a
+        // non-2xx with the same body, and the replay guard above would then
+        // drop that retry as a duplicate — so the retry cannot recover the
+        // message and a non-2xx would only claim it might.
+        dispatch_direct_webhook(&state, "line", &event.user_id, &event.text).await;
     }
 
     Json(WebhookResponse {

@@ -297,6 +297,16 @@ pub(crate) async fn init_single_channel(
                 warn!("WeChat MP feature not enabled, skipping channel '{}'", name);
             }
         }
+        ChannelType::Line => {
+            #[cfg(feature = "line")]
+            {
+                init_line_channel(state.clone(), name, channel_config).await?;
+            }
+            #[cfg(not(feature = "line"))]
+            {
+                warn!("LINE feature not enabled, skipping channel '{}'", name);
+            }
+        }
     }
 
     // Record a healthy snapshot after successful channel initialization
@@ -660,6 +670,53 @@ pub(crate) async fn init_wechatmp_channel(
         warn!(
             "WeChat MP channel '{}' missing 'app_id'/'app_secret'/'token'/'encoding_aes_key' \
              in credentials",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Initialize LINE channel.
+///
+/// Inbound arrives via the signed webhook in `gateway/webhooks.rs`; this only
+/// registers the outbound (push) channel.
+#[cfg(feature = "line")]
+pub(crate) async fn init_line_channel(
+    state: Arc<GatewayState>,
+    name: &str,
+    config: &ChannelConfig,
+) -> crate::Result<()> {
+    use crate::channels::line::{LineChannel, LineConfig};
+
+    if let (Some(access_token), Some(channel_secret)) = (
+        channel_cred(&state.secrets, name, config, "channel_access_token").await,
+        channel_cred(&state.secrets, name, config, "channel_secret").await,
+    ) {
+        let channel = Arc::new(LineChannel::new(LineConfig::new(access_token, channel_secret)));
+
+        let channel_name = name.to_string();
+        let channel_for_task = channel.clone();
+        let main_handle = tokio::spawn(async move {
+            if let Err(e) = channel_for_task.start().await {
+                error!("LINE channel {} failed: {}", channel_name, e);
+            }
+        });
+        register_channel_task(&state, name, "main", main_handle).await;
+        state
+            .channels
+            .reply_dispatcher
+            .register_channel(name, channel.clone())
+            .await;
+        state
+            .channels
+            .channels
+            .write()
+            .await
+            .insert(name.to_string(), channel);
+        info!("✅ LINE channel '{}' initialized (inbound via signed webhook)", name);
+    } else {
+        warn!(
+            "LINE channel '{}' missing 'channel_access_token'/'channel_secret' in credentials",
             name
         );
     }

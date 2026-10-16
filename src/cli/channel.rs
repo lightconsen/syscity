@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use tracing::warn;
 
 use crate::cli::ChannelType;
@@ -174,6 +174,7 @@ async fn run_channel_add(
         ChannelType::Imessage => add_imessage_channel(token, agent, extra_creds).await,
         ChannelType::Webchat => add_webchat_channel(token, agent, extra_creds).await,
         ChannelType::WechatMp => add_wechatmp_channel(token, agent, extra_creds).await,
+        ChannelType::Line => add_line_channel(token, agent, extra_creds).await,
     }
 }
 
@@ -910,25 +911,89 @@ async fn add_wechatmp_channel(
     Ok(())
 }
 
+/// Add/configure a LINE channel in Gateway
+async fn add_line_channel(
+    token: Option<String>,
+    agent: Option<String>,
+    extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    use crate::channels::ChannelType as GatewayChannelType;
+    use crate::gateway::ChannelConfig;
+
+    // `--token` is the channel *access* token. The channel *secret* is a
+    // separate credential, so it is asked for separately rather than reusing
+    // `--token`: one credential standing in for both would verify nothing and
+    // fail at the first delivery instead of here.
+    let access_token = match token {
+        Some(t) => t,
+        None => std::env::var("LINE_CHANNEL_ACCESS_TOKEN").map_err(|_| {
+            crate::error::ConfigError::Missing(
+                "LINE_CHANNEL_ACCESS_TOKEN environment variable, or --token argument".to_string(),
+            )
+        })?,
+    };
+
+    let channel_secret = std::env::var("LINE_CHANNEL_SECRET")
+        .ok()
+        .or_else(|| {
+            extra_creds
+                .iter()
+                .find(|(k, _)| k == "channel_secret")
+                .map(|(_, v)| v.clone())
+        })
+        .ok_or_else(|| {
+            crate::error::ConfigError::Missing(
+                "LINE_CHANNEL_SECRET environment variable, or --credential channel_secret=..."
+                    .to_string(),
+            )
+        })?;
+
+    println!("🚀 Adding LINE channel to Gateway...");
+
+    let mut config = ensure_gateway_config().await?;
+
+    let mut credentials = HashMap::new();
+    credentials.insert("channel_access_token".to_string(), access_token);
+    credentials.insert("channel_secret".to_string(), channel_secret);
+    for (k, v) in extra_creds {
+        credentials.insert(k, v);
+    }
+
+    let channel_config = ChannelConfig {
+        enabled: true,
+        channel_type: GatewayChannelType::Line,
+        credentials,
+        dm_policy: DmPolicy::Open,
+        require_mention: false,
+        allow_from: vec![],
+        block_from: vec![],
+        agent_id: agent,
+    };
+
+    config.channels.insert("line".to_string(), channel_config);
+    save_gateway_config(&config).await?;
+
+    println!("✅ LINE channel configured in Gateway");
+    println!("   Point the Messaging API webhook at <gateway>/webhooks/line");
+    println!("   Start the Gateway to activate the channel:");
+    println!("   syscity start");
+
+    Ok(())
+}
+
 /// List configured channels
 async fn run_channel_list(all: bool) -> Result<()> {
     println!("📱 Syscity Channels");
     println!("=================");
     println!();
 
-    // All available channels
-    let all_channels = [
-        ("telegram", "Telegram", ChannelType::Telegram),
-        ("discord", "Discord", ChannelType::Discord),
-        ("slack", "Slack", ChannelType::Slack),
-        ("whatsapp", "WhatsApp", ChannelType::Whatsapp),
-        ("qq", "QQ", ChannelType::Qq),
-        ("feishu", "Feishu/Lark", ChannelType::Feishu),
-        ("websocket", "WebSocket", ChannelType::Websocket),
-        ("signal", "Signal", ChannelType::Signal),
-        ("imessage", "iMessage", ChannelType::Imessage),
-        ("webchat", "WebChat", ChannelType::Webchat),
-    ];
+    // Derived from the enum rather than listed again. The hand-written version
+    // this replaces had drifted: it was missing WeChat MP, so `channel list`
+    // could not show a channel the gateway was actually running.
+    let all_channels: Vec<(&str, &str, ChannelType)> = ChannelType::value_variants()
+        .iter()
+        .map(|c| (c.as_str(), c.display_name(), *c))
+        .collect();
 
     // Load gateway config
     let config = load_gateway_config().await;
@@ -971,52 +1036,17 @@ async fn run_channel_list(all: bool) -> Result<()> {
 
     println!();
 
-    // Show compile-time features
+    // Show compile-time features — from the same derived list, and for the
+    // same reason: the `#[cfg]` pairs this replaces had drifted as well.
     println!("Compile-time features:");
-    #[cfg(feature = "telegram")]
-    println!("  ✅ Telegram   - Compiled");
-    #[cfg(not(feature = "telegram"))]
-    println!("  ❌ Telegram   - Not compiled");
-
-    #[cfg(feature = "discord")]
-    println!("  ✅ Discord    - Compiled");
-    #[cfg(not(feature = "discord"))]
-    println!("  ❌ Discord    - Not compiled");
-
-    #[cfg(feature = "slack")]
-    println!("  ✅ Slack      - Compiled");
-    #[cfg(not(feature = "slack"))]
-    println!("  ❌ Slack      - Not compiled");
-
-    #[cfg(feature = "whatsapp")]
-    println!("  ✅ WhatsApp   - Compiled");
-    #[cfg(not(feature = "whatsapp"))]
-    println!("  ❌ WhatsApp   - Not compiled");
-
-    #[cfg(feature = "qq")]
-    println!("  ✅ QQ         - Compiled");
-    #[cfg(not(feature = "qq"))]
-    println!("  ❌ QQ         - Not compiled");
-
-    #[cfg(feature = "feishu")]
-    println!("  ✅ Feishu/Lark - Compiled");
-    #[cfg(not(feature = "feishu"))]
-    println!("  ❌ Feishu/Lark - Not compiled");
-
-    #[cfg(feature = "signal")]
-    println!("  ✅ Signal     - Compiled");
-    #[cfg(not(feature = "signal"))]
-    println!("  ❌ Signal     - Not compiled");
-
-    #[cfg(feature = "imessage")]
-    println!("  ✅ iMessage   - Compiled");
-    #[cfg(not(feature = "imessage"))]
-    println!("  ❌ iMessage   - Not compiled");
-
-    #[cfg(feature = "webchat")]
-    println!("  ✅ WebChat    - Compiled");
-    #[cfg(not(feature = "webchat"))]
-    println!("  ❌ WebChat    - Not compiled");
+    for channel in ChannelType::value_variants() {
+        let (mark, state) = if channel.feature_enabled() {
+            ("✅", "Compiled")
+        } else {
+            ("❌", "Not compiled")
+        };
+        println!("  {} {:<12} - {}", mark, channel.display_name(), state);
+    }
 
     println!();
     println!("Available commands:");
@@ -1027,7 +1057,11 @@ async fn run_channel_list(all: bool) -> Result<()> {
     println!("  syscity channel test <channel> [--agent <AGENT>]");
     println!("  syscity channel list [--all]");
     println!();
-    println!("Channels: telegram, discord, slack, whatsapp, qq, feishu, websocket");
+    let names: Vec<&str> = ChannelType::value_variants()
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+    println!("Channels: {}", names.join(", "));
     println!();
     println!("Environment variables:");
     println!("  TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN");
@@ -1053,15 +1087,10 @@ async fn run_channel_status(
             println!();
 
             if let Some(ref cfg) = config {
-                let channels = [
-                    ("telegram", "Telegram"),
-                    ("discord", "Discord"),
-                    ("slack", "Slack"),
-                    ("whatsapp", "WhatsApp"),
-                    ("qq", "QQ"),
-                    ("feishu", "Feishu/Lark"),
-                    ("websocket", "WebSocket"),
-                ];
+                let channels: Vec<(&str, &str)> = ChannelType::value_variants()
+                    .iter()
+                    .map(|c| (c.as_str(), c.display_name()))
+                    .collect();
 
                 let mut found = false;
                 for (key, name) in &channels {
@@ -1298,6 +1327,9 @@ async fn run_channel_test(channel: ChannelType, agent: Option<String>) -> Result
         }
         ChannelType::WechatMp => {
             println!("    ℹ️  WeChat MP uses the official-account console credentials (AppID/Secret/Token/EncodingAESKey)");
+        }
+        ChannelType::Line => {
+            println!("    ℹ️  LINE uses the Messaging API credentials (channel access token + channel secret)");
         }
     }
 

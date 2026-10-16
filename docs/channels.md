@@ -26,6 +26,7 @@ pipelines, provenance), see [`docs/modules/channels.md`](modules/channels.md).
 | QQ | `qq` | ✅ | go-cqhttp / webhook | — |
 | Feishu / Lark | `feishu` | ✅ | Event webhook | `/webhooks/feishu` |
 | **WeChat MP (公众号)** | **`wechatmp`** | ✅ | Encrypted webhook | `/webhooks/wechatmp` |
+| **LINE** | **`line`** | ✅ | Messaging API webhook | `/webhooks/line` |
 | Signal | `signal` | ✅ | signal-cli daemon | — |
 | iMessage | `imessage` | ✅ | BlueBubbles (macOS) | — |
 | WebChat | `webchat` | ✅ | Browser UI | — |
@@ -81,6 +82,7 @@ Per-channel credential keys:
 | QQ | `app_id`, `app_secret`, `access_token`, `bot_qq` | `QQ_*` |
 | Feishu/Lark | `app_id`, `app_secret`, `verification_token`, `encrypt_key` | `LARK_*` / `FEISHU_*` |
 | WeChat MP | `app_id`, `app_secret`, `token`, `encoding_aes_key` | `WECHAT_MP_*` |
+| LINE | `channel_access_token`, `channel_secret` | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` |
 | Signal | `account` | `SIGNAL_ACCOUNT` |
 | iMessage | — | (BlueBubbles on macOS) |
 
@@ -116,6 +118,32 @@ cloudflared) to forward e.g. `https://<tunnel>/webhooks/wechatmp` → `http://12
    decrypted, and are routed to the agent; replies go out asynchronously via
    the customer-service message API (WeChat's 5-second passive-reply window
    does not apply to LLM turns).
+
+### LINE — the full flow
+
+1. Create a Messaging API channel in the
+   [LINE Developers console](https://developers.line.biz/console/).
+2. Take the **channel secret** from the channel's *Basic settings*, and issue a
+   **channel access token** under *Messaging API*. They are two different
+   credentials: the secret verifies what LINE sends you, the token authorises
+   what you send to LINE.
+3. Configure the channel:
+   ```bash
+   export LINE_CHANNEL_ACCESS_TOKEN=<channel access token>
+   export LINE_CHANNEL_SECRET=<channel secret>
+   syscity channels add line
+   ```
+   Then `syscity start` to run the gateway.
+4. Under *Messaging API → Webhook URL* set `https://<public>/webhooks/line` and
+   press **Verify**. LINE signs the raw body with the channel secret and sends
+   `X-Line-Signature: base64(HMAC-SHA256(secret, body))`; a delivery whose
+   signature does not match is refused with `401`.
+5. Replies go out through `message/push` rather than `message/reply`: a reply
+   token is only valid for the delivery that carried it and expires within a
+   minute, which an agent turn routinely outlives.
+
+Only text messages are routed. LINE reports follows, joins, leaves and
+postbacks through the same webhook; those are acknowledged and skipped.
 
 ## Access control
 
