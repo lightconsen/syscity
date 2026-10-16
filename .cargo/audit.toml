@@ -6,9 +6,21 @@
 # These are all unfixable in the current dependency tree.
 ignore = [
     # rsa (RUSTSEC-2023-0071): timing sidechannel in RSA key operations.
-    # This is a transitive dependency via sqlx-macros -> sqlx-mysql.
-    # Syscity only uses sqlx-sqlite; MySQL support is never enabled at runtime.
-    # The rsa crate is pulled in only for sqlx-macros' compile-time macro expansion.
+    # Two paths reach it, and neither is affected at runtime:
+    #   - sqlx-macros -> sqlx-mysql: a transitive dependency pulled in only for
+    #     compile-time macro expansion. Syscity uses sqlx-sqlite; MySQL support
+    #     is never enabled.
+    #   - jsonwebtoken -> rsa (its `rust_crypto` feature): the RSA backend for
+    #     the Teams / Google Chat bearer-token verifier. The advisory names the
+    #     unfixed part itself — the PKCS#1 v1.5 *padding* path
+    #     (RustCrypto/RSA#626), i.e. the decryption side, which is what the
+    #     Marvin attack targets. This code never decrypts: the key set is
+    #     public data and every operation against it is a public-key signature
+    #     verification. (A later channel may sign with a service-account key
+    #     for outbound OAuth — a different path from unpadding, so the
+    #     reasoning holds; re-read if anything here ever decrypts.)
+    # Upstream reports patched = [], so there is no version to move to; see the
+    # matching entry in deny.toml.
     "RUSTSEC-2023-0071",
 
     # RUSTSEC-2026-0187: stack overflow in lopdf via deeply nested PDF objects.

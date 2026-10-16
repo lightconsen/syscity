@@ -172,6 +172,16 @@ base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["pkcs8"] }
 subtle = "2.5"
 
+# Bearer-token webhook authentication (Teams, Google Chat). These channels are
+# not signed with a shared secret — the platform issues a JWT and publishes the
+# signing keys — so verification is a JOSE job, not an HMAC one. Optional
+# because a build without those channels has nothing to verify.
+#
+# v11 needs a crypto provider chosen explicitly. `rust_crypto` rather than
+# `aws_lc_rs`: the rest of this tree already verifies with RustCrypto
+# (`rsa`, `sha2`, `hmac`), and the other provider binds a C library.
+jsonwebtoken = { version = "11", optional = true, features = ["rust_crypto"] }
+
 # TUI code-block syntax highlighting.
 #
 # Already in the tree transitively (`ppt-rs` → `pdfrs` enables syntect's
@@ -283,7 +293,7 @@ windows-sys = { version = "=0.59.0", features = [
 ] }
 
 [features]
-default = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "plugins", "hot-reload", "local-embeddings", "browser", "vision", "sqlite-vec"]
+default = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "plugins", "hot-reload", "local-embeddings", "browser", "vision", "sqlite-vec"]
 telegram = ["teloxide"]
 discord = ["serenity"]
 slack = []
@@ -300,7 +310,13 @@ line = []
 # Twilio SMS — webhook in, REST out. Signature is HMAC-**SHA1**, so it needs
 # the `sha1` crate that `wechatmp` also pulls.
 twilio = ["dep:sha1"]
-all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio"]
+# Microsoft Teams — webhook in, Bot Framework REST out. Inbound requests are
+# authenticated by a Bot Framework JWT rather than a shared secret.
+teams = ["dep:jsonwebtoken"]
+# Google Chat — webhook in, Chat API out. Inbound requests carry a Google-issued
+# bearer token, so this pulls the same verifier as `teams`.
+googlechat = ["dep:jsonwebtoken"]
+all-channels = ["telegram", "discord", "slack", "whatsapp", "qq", "feishu", "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat"]
 web = []
 # Syscity Cloud integration (login + cloud LLM/search/KB/connectors). Default
 # OFF: default builds contain no cloud coupling (§2.7) — a default `cargo
@@ -332,7 +348,8 @@ keyring = ["dep:keyring"]
 # Build with: cargo build --no-default-features --features intel-macos
 intel-macos = [
     "cloud", "telegram", "discord", "slack", "whatsapp", "qq", "feishu",
-    "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "plugins", "hot-reload",
+    "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat",
+    "plugins", "hot-reload",
     "local-embeddings", "browser", "sqlite-vec",
 ]
 
@@ -371,7 +388,13 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 # Slack webhook signature computation in the HTTP e2e (matches the gateway's own)
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
 hex = "0.4"
+# Minting a real RS256 token against a mock JWKS, for the bearer-token channels.
+# Generates the keypair at test time rather than embedding one — a private key
+# in the repository would trip the commit gate's secret scan, and rightly so.
+# Already in the tree transitively, so this adds no crate.
+rsa = "0.9"
 # Read-back verification of generated xlsx in converter tests
 calamine = "0.36"
 

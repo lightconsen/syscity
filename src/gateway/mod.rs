@@ -66,6 +66,12 @@ pub mod watchdog;
 pub use watchdog::{RepairRecord, RepairState};
 pub mod webhooks;
 pub mod ws;
+
+/// Bearer-token verification for the webhook channels that use one (Teams,
+/// Google Chat). Gated on those features so a build without them carries
+/// neither the module nor its JOSE dependency.
+#[cfg(any(feature = "teams", feature = "googlechat"))]
+pub mod jwt_verify;
 use handlers::*;
 
 // Configuration types live in `gateway::config` (re-exported above).

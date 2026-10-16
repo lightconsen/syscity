@@ -27,6 +27,26 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "transitive via ppt-rs 0.2.25 -> pdfrs -> syntect 5.3 -> bincode 1.3.3, and directly via our own syntect dependency (src/tui/ui/highlight.rs) -> syntect parsing -> bincode; upstream team permanently ceased development, no replacement release" },
     { id = "RUSTSEC-2026-0192", reason = "transitive via ppt-rs 0.2.25 -> pdfrs -> ttf-parser; author confirmed unmaintained, no safe upgrade; only reachable via the pptx pdf-export path we do not use" },
     { id = "RUSTSEC-2024-0320", reason = "transitive via ppt-rs 0.2.25 -> pdfrs -> syntect -> yaml-rust 0.4.5, and directly via our own syntect dependency -> syntect parsing -> yaml-rust; unmaintained, no actionable upgrade; not our YAML stack (serde_yml tracked under RUSTSEC-2025-0068)" },
+    # `rsa` 0.9 arrives two ways and neither is affected: as jsonwebtoken's RSA
+    # backend (its `rust_crypto` feature), and as a dev-dependency that
+    # generates a throwaway key inside tests.
+    #
+    # The advisory names the unfixed part itself: the padding path
+    # (RustCrypto/RSA#626 — "padding still not constant-time"), which is the
+    # decryption side of PKCS#1 v1.5 and what the Marvin attack targets.
+    # Nothing here performs RSA decryption. The key set is public data fetched
+    # over the network and every operation against it is a public-key signature
+    # verification; the dev-dependency generates a throwaway key locally, with
+    # no attacker present.
+    #
+    # A channel added later may *sign* with a service-account key for outbound
+    # OAuth. That is a different code path from unpadding, so the reasoning
+    # still holds — but re-read this entry if anything here ever decrypts.
+    #
+    # This is a waiver rather than a deferred bump because there is nothing to
+    # bump to: upstream reports `patched = []` and lists the work as open
+    # (RustCrypto/RSA#626, #680, #702), and still affected in 0.10.0-rc.18.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 is only jsonwebtoken's verification backend (public-key ops only — the advisory is private-key timing) plus a test-only key generator; upstream reports patched=[], so no upgrade exists" },
 ]
 
 [licenses]
