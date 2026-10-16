@@ -164,6 +164,14 @@ pub struct ProcessRequest {
     /// Stdio wiring for [`ProcessRunner::spawn`]. Ignored by
     /// [`ProcessRunner::run`], which always captures output.
     pub stdio: StdioMode,
+    /// Where this request should actually run.
+    ///
+    /// Defaults to [`ExecutionBackend::Local`], so a request that does not name
+    /// a backend behaves exactly as it did before remote execution existed.
+    /// Naming one is how a caller — not the process, and not the platform —
+    /// decides where the command goes; the fence travels on the request either
+    /// way, and each backend answers for what it does with it.
+    pub backend: ExecutionBackend,
 }
 
 /// Output of a completed [`ProcessRunner::run`].
@@ -487,6 +495,9 @@ mod landlock;
 mod mobile;
 #[cfg(target_os = "linux")]
 mod namespaces;
+pub mod remote;
+
+pub use remote::{DockerBackend, ExecutionBackend, SshBackend};
 #[cfg(target_os = "macos")]
 mod seatbelt;
 #[cfg(any(target_os = "linux", test))]
@@ -563,6 +574,20 @@ fn spawn_err(req: &ProcessRequest, source: std::io::Error) -> ProcessError {
     }
 }
 
+/// The runner a request resolves to.
+///
+/// Selection is per request. The platform runner is still built once and cached
+/// — that part was never the problem — but a request that names a backend now
+/// gets that backend's runner instead, which is what turns "where does this run"
+/// from a property of the process into a property of the call.
+pub fn runner_for(req: &ProcessRequest) -> Arc<dyn ProcessRunner> {
+    match &req.backend {
+        ExecutionBackend::Local => process_runner(),
+        ExecutionBackend::Docker(config) => Arc::new(remote::DockerRunner::new(config.clone())),
+        ExecutionBackend::Ssh(config) => Arc::new(remote::SshRunner::new(config.clone())),
+    }
+}
+
 /// The cached platform-appropriate runner.
 pub fn process_runner() -> Arc<dyn ProcessRunner> {
     static RUNNER: std::sync::LazyLock<Arc<dyn ProcessRunner>> =
@@ -604,17 +629,17 @@ fn default_process_runner() -> Arc<dyn ProcessRunner> {
 
 /// Run a subprocess to completion, capturing output. See [`ProcessRunner::run`].
 pub async fn run(req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {
-    process_runner().run(req).await
+    runner_for(req).run(req).await
 }
 
 /// Run a subprocess to completion via [`ProcessRunner::run_collect`]: on
 /// timeout the child is killed and partial output is returned with
 /// `timed_out: true` rather than an error.
 pub async fn run_collect(req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {
-    process_runner().run_collect(req).await
+    runner_for(req).run_collect(req).await
 }
 
 /// Spawn a detached subprocess. See [`ProcessRunner::spawn`].
 pub async fn spawn(req: &ProcessRequest) -> Result<Box<dyn ProcessChild>, ProcessError> {
-    process_runner().spawn(req).await
+    runner_for(req).spawn(req).await
 }
