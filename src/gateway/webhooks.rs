@@ -136,6 +136,86 @@ async fn reset_session(sessions: &RwLock<HashMap<String, String>>, platform_key:
     new_session
 }
 
+/// What became of a message handed to [`dispatch_direct_webhook`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDisposition {
+    /// Accepted and queued for the agent.
+    Queued,
+    /// Access control refused the sender. The platform is told nothing, so a
+    /// probe cannot tell a blocked sender from an accepted one.
+    Refused,
+    /// The gateway's inbound queue is full; the platform should retry.
+    QueueFull,
+}
+
+/// The tail that every direct-message webhook channel shares.
+///
+/// Once a handler has verified a signature and pulled a `(user_id, text)` pair
+/// out of its platform's payload, what remains is the same everywhere: ask
+/// access control, derive the platform session key, honour `/new`, remember
+/// which channel owns the session so the reply can be routed back, and hand
+/// the message to the unified inbound entry.
+///
+/// Feishu, WeChat MP and the generic webhook had each grown their own copy of
+/// this. Sharing it is what keeps a new channel down to "verify, extract, call
+/// this" — and it is the part easiest to get subtly wrong, because a handler
+/// that forgets the `session_channels` insert still compiles and still accepts
+/// messages; the agent just answers into the void.
+///
+/// Slack and WhatsApp are deliberately not callers: Slack keys sessions by
+/// channel rather than user and has no `/new`, and WhatsApp resets *before*
+/// the access check because it sends the user a confirmation.
+async fn dispatch_direct_webhook(
+    state: &Arc<GatewayState>,
+    channel: &str,
+    user_id: &str,
+    text: &str,
+) -> InboundDisposition {
+    if state
+        .check_incoming_access(
+            channel,
+            user_id,
+            text,
+            &crate::channels::MentionState::DirectMessage,
+        )
+        .await
+        .is_err()
+    {
+        return InboundDisposition::Refused;
+    }
+
+    let platform_key = format!("{}:{}", channel, user_id);
+    let session_id = if text.trim() == "/new" {
+        let new_session = reset_session(&state.channels.webhook_sessions, &platform_key).await;
+        info!("🆕 New {} session started for {}: {}", channel, user_id, new_session);
+        new_session
+    } else {
+        get_or_create_session(&state.channels.webhook_sessions, &platform_key).await
+    };
+
+    // Remember which channel owns this session, so the agent's reply can be
+    // routed back out through it.
+    {
+        let mut sessions = state.channels.session_channels.write().await;
+        sessions.insert(session_id.clone(), (channel.to_string(), user_id.to_string()));
+    }
+
+    let incoming = IncomingMessage::new(user_id, session_id, text).with_provenance(
+        InputProvenance::ExternalUser {
+            channel: channel.to_string(),
+            is_direct: true,
+        },
+    );
+
+    match state.pipelines.inbound_entry.send(incoming).await {
+        Ok(()) => InboundDisposition::Queued,
+        Err(e) => {
+            warn!("Failed to enqueue {} webhook message: {}", channel, e);
+            InboundDisposition::QueueFull
+        }
+    }
+}
+
 /// Create the public webhook router
 pub fn create_webhook_router(state: Arc<GatewayState>) -> Router {
     let router = Router::new()
@@ -645,51 +725,15 @@ async fn feishu_webhook_handler(
                     text.chars().take(50).collect::<String>()
                 );
 
-                // Access control check
-                if state
-                    .check_incoming_access(
-                        "feishu",
-                        user_id,
-                        text,
-                        &crate::channels::MentionState::DirectMessage,
-                    )
-                    .await
-                    .is_err()
+                // Verify, extract, hand off — the shared direct-message tail.
+                if dispatch_direct_webhook(&state, "feishu", user_id, text).await
+                    == InboundDisposition::Refused
                 {
                     return Json(WebhookResponse {
                         success: true,
                         message: "OK".to_string(),
                     })
                     .into_response();
-                }
-
-                // Handle /new command to reset session
-                let platform_key = format!("feishu:{}", user_id);
-                let session_id = if text.trim() == "/new" {
-                    let new_session =
-                        reset_session(&state.channels.webhook_sessions, &platform_key).await;
-                    info!("🆕 New Feishu session started for {}: {}", user_id, new_session);
-                    new_session
-                } else {
-                    // Get or create session UUID
-                    get_or_create_session(&state.channels.webhook_sessions, &platform_key).await
-                };
-
-                // Store session mapping for response routing
-                {
-                    let mut sessions = state.channels.session_channels.write().await;
-                    sessions
-                        .insert(session_id.clone(), ("feishu".to_string(), user_id.to_string()));
-                }
-
-                // Route through unified inbound entry
-                let incoming = IncomingMessage::new(user_id, session_id.clone(), text)
-                    .with_provenance(InputProvenance::ExternalUser {
-                        channel: "feishu".to_string(),
-                        is_direct: true,
-                    });
-                if let Err(e) = state.pipelines.inbound_entry.send(incoming).await {
-                    warn!("Failed to enqueue Feishu message: {}", e);
                 }
             }
         }
@@ -874,42 +918,15 @@ async fn wechatmp_webhook_handler(
         return StatusCode::OK.into_response();
     }
 
-    // Access control + session management (mirrors the feishu handler).
-    if state
-        .check_incoming_access(
-            "wechatmp",
-            &incoming.from_user,
-            &incoming.content,
-            &crate::channels::MentionState::DirectMessage,
-        )
-        .await
-        .is_err()
+    // Verify, extract, hand off — the shared direct-message tail.
+    if dispatch_direct_webhook(&state, "wechatmp", &incoming.from_user, &incoming.content).await
+        == InboundDisposition::Refused
     {
         return Json(WebhookResponse {
             success: true,
             message: "OK".to_string(),
         })
         .into_response();
-    }
-
-    let platform_key = format!("wechatmp:{}", incoming.from_user);
-    let session_id = if incoming.content.trim() == "/new" {
-        reset_session(&state.channels.webhook_sessions, &platform_key).await
-    } else {
-        get_or_create_session(&state.channels.webhook_sessions, &platform_key).await
-    };
-    {
-        let mut sessions = state.channels.session_channels.write().await;
-        sessions.insert(session_id.clone(), ("wechatmp".to_string(), incoming.from_user.clone()));
-    }
-
-    let msg = IncomingMessage::new(&incoming.from_user, session_id.clone(), incoming.content)
-        .with_provenance(InputProvenance::ExternalUser {
-            channel: "wechatmp".to_string(),
-            is_direct: true,
-        });
-    if let Err(e) = state.pipelines.inbound_entry.send(msg).await {
-        warn!("Failed to enqueue WeChat MP message: {e}");
     }
 
     // Respond immediately — WeChat requires a prompt 200; replies flow back
@@ -1194,55 +1211,23 @@ async fn generic_webhook_handler(
         .to_string();
 
     if !content.is_empty() {
-        // Access control check
-        if state
-            .check_incoming_access(
-                &channel,
-                &user_id,
-                &content,
-                &crate::channels::MentionState::DirectMessage,
-            )
-            .await
-            .is_err()
-        {
-            return Json(WebhookResponse {
-                success: true,
-                message: "OK".to_string(),
-            })
-            .into_response();
-        }
-
-        // Handle /new command to reset session
-        let platform_key = format!("{}:{}", channel, user_id);
-        let session_id = if content.trim() == "/new" {
-            let new_session = reset_session(&state.channels.webhook_sessions, &platform_key).await;
-            info!("🆕 New {} session started for {}: {}", channel, user_id, new_session);
-            new_session
-        } else {
-            // Get or create session UUID
-            get_or_create_session(&state.channels.webhook_sessions, &platform_key).await
-        };
-
-        // Store session mapping for response routing
-        {
-            let mut sessions = state.channels.session_channels.write().await;
-            sessions.insert(session_id.clone(), (channel.clone(), user_id.clone()));
-        }
-
-        // Route through unified inbound entry
-        let incoming = IncomingMessage::new(user_id, session_id, content).with_provenance(
-            InputProvenance::ExternalUser {
-                channel: channel.clone(),
-                is_direct: true,
-            },
-        );
-        if let Err(e) = state.pipelines.inbound_entry.send(incoming).await {
-            warn!("Failed to enqueue {} webhook message: {}", channel, e);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Gateway queue full, please retry".to_string(),
-            )
+        // Verify, extract, hand off — the shared direct-message tail.
+        match dispatch_direct_webhook(&state, &channel, &user_id, &content).await {
+            InboundDisposition::Refused => {
+                return Json(WebhookResponse {
+                    success: true,
+                    message: "OK".to_string(),
+                })
                 .into_response();
+            }
+            InboundDisposition::QueueFull => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Gateway queue full, please retry".to_string(),
+                )
+                    .into_response();
+            }
+            InboundDisposition::Queued => {}
         }
     }
 
