@@ -10,6 +10,13 @@ all-features = true
 ignore = [
     # `proc-macro-error2` is unmaintained but used by transitive proc-macro crates.
     { id = "RUSTSEC-2026-0173", reason = "transitive unmaintained dependency; no actionable upgrade path" },
+    # Three zip advisories about `extract()` (symlinks + SUID bits). Syscity reads
+    # entries in memory and never extracts; the only caller of `extract()` in the
+    # tree is tauri-plugin-updater, Windows-only and after signature verification.
+    # Fixed in zip >= 9.0.0, which four dependents pin below.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract()-only advisory; syscity never extracts (reads entries in memory); only caller is tauri-plugin-updater, Windows-only and post-signature-verification" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract()-only advisory; syscity never extracts; safe by the same analysis as RUSTSEC-2026-0367" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract()-only advisory; syscity never extracts; safe by the same analysis as RUSTSEC-2026-0367" },
     # lopdf 0.34 (via pdf-extract 0.7.12) stack overflow; fixed version needs a major bump no released pdf-extract pulls in yet.
     { id = "RUSTSEC-2026-0187", reason = "transitive via pdf-extract 0.7.12 -> lopdf 0.34; fix requires lopdf >=0.42 major bump" },
     # The three below all flow through ppt-rs 0.2.25's default `pdf-native`

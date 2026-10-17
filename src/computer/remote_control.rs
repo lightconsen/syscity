@@ -144,6 +144,35 @@ impl std::fmt::Debug for RemoteControlAdapter {
     }
 }
 
+/// The `ssh` options a command line should carry, given where and how to
+/// connect.
+///
+/// Shared with the process runner's SSH backend (`tools::process_runner::remote`)
+/// so the two cannot drift into connecting differently: same batch mode, same
+/// connect timeout, same host-key policy, same port and key handling. The
+/// *destination* is left to the caller, because the adapter always connects as a
+/// named user while the runner may leave it to the ssh client's own config.
+pub fn ssh_option_args(port: u16, key_path: Option<&str>, extra_args: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-p".to_string(),
+        port.to_string(),
+    ];
+
+    if let Some(key) = key_path {
+        args.push("-i".to_string());
+        args.push(key.to_string());
+    }
+
+    args.extend(extra_args.iter().cloned());
+    args
+}
+
 impl RemoteControlAdapter {
     /// Create a new remote control adapter.
     ///
@@ -210,21 +239,13 @@ impl RemoteControlAdapter {
     /// Build the base SSH command with common flags.
     fn ssh_cmd(&self) -> Command {
         let mut cmd = Command::new("ssh");
-        cmd.arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
-            .arg("-p")
-            .arg(self.config.port.to_string());
 
-        if let RemoteProtocol::Ssh { key_path: Some(ref key) } = self.config.protocol {
-            cmd.arg("-i").arg(key);
-        }
-
-        for extra in &self.config.ssh_extra_args {
-            cmd.arg(extra);
+        // `RemoteProtocol` has one variant, so this destructure cannot fail.
+        let RemoteProtocol::Ssh { key_path } = &self.config.protocol;
+        for arg in
+            ssh_option_args(self.config.port, key_path.as_deref(), &self.config.ssh_extra_args)
+        {
+            cmd.arg(arg);
         }
 
         cmd.arg(format!("{}@{}", self.config.user, self.config.host));

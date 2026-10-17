@@ -193,6 +193,27 @@ impl DockerRunner {
         }
 
         if let Some(cwd) = &req.cwd {
+            // A container sees only what was mounted. A working directory that
+            // the fence did not grant is therefore not merely unwritable, it is
+            // not there — docker would fail with a bare "no such file or
+            // directory", which reads like a typo rather than a fence that was
+            // never going to cover it.
+            if let Some(fence) = &req.fence {
+                let visible = std::iter::once(&fence.workspace_root)
+                    .chain(fence.allowed_paths.iter())
+                    .any(|root| cwd.starts_with(root));
+                if !visible {
+                    return Err(ProcessError::BackendUnavailable {
+                        backend: "docker",
+                        reason: format!(
+                            "the working directory {} is not inside any path the fence grants, so \
+                             the container would not have it",
+                            cwd.display()
+                        ),
+                    });
+                }
+            }
+
             argv.push("-w".to_string());
             argv.push(cwd.to_string_lossy().into_owned());
         }
@@ -240,18 +261,52 @@ impl DockerRunner {
     }
 }
 
+/// Explain a missing client program, so the failure says what to do.
+///
+/// Without this the error is the local runner's `failed to spawn 'docker': No
+/// such file or directory`, which names a program the caller never asked for —
+/// it asked for a *backend* — and says nothing about where that backend was
+/// configured.
+fn explain_missing(backend: &'static str, program: &str, error: ProcessError) -> ProcessError {
+    match error {
+        ProcessError::Spawn { ref source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            ProcessError::BackendUnavailable {
+                backend,
+                reason: format!(
+                    "the `{program}` command was not found — is it installed and on PATH?                      Remove this backend from [security.execution_backends] if it is not meant                      to be available here."
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
 #[async_trait]
 impl ProcessRunner for DockerRunner {
     async fn run(&self, req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {
-        process_runner().run(&self.translate(req)?).await
+        let translated = self.translate(req)?;
+        process_runner()
+            .run(&translated)
+            .await
+            .map_err(|e| explain_missing("docker", "docker", e))
     }
 
     async fn run_collect(&self, req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {
-        process_runner().run_collect(&self.translate(req)?).await
+        let translated = self.translate(req)?;
+        process_runner()
+            .run_collect(&translated)
+            .await
+            .map_err(|e| explain_missing("docker", "docker", e))
     }
 
     async fn spawn(&self, req: &ProcessRequest) -> Result<Box<dyn ProcessChild>, ProcessError> {
-        process_runner().spawn(&self.translate(req)?).await
+        let translated = self.translate(req)?;
+        process_runner()
+            .spawn(&translated)
+            .await
+            .map_err(|e| explain_missing("docker", "docker", e))
     }
 }
 
@@ -303,24 +358,14 @@ impl SshRunner {
         let parts: Vec<String> = req.argv.iter().map(|arg| shell_quote(arg)).collect();
         command.push_str(&parts.join(" "));
 
+        // The options come from one builder shared with `computer::remote_control`,
+        // so the two cannot connect differently.
         let mut argv = vec!["ssh".to_string()];
-        for flag in [
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-p",
-        ] {
-            argv.push(flag.to_string());
-        }
-        argv.push(self.config.port.to_string());
-        if let Some(key) = &self.config.key_path {
-            argv.push("-i".to_string());
-            argv.push(key.clone());
-        }
-        argv.extend(self.config.extra_args.iter().cloned());
+        argv.extend(crate::computer::remote_control::ssh_option_args(
+            self.config.port,
+            self.config.key_path.as_deref(),
+            &self.config.extra_args,
+        ));
 
         let destination = match &self.config.user {
             Some(user) => format!("{}@{}", user, self.config.host),
@@ -347,20 +392,155 @@ impl SshRunner {
 #[async_trait]
 impl ProcessRunner for SshRunner {
     async fn run(&self, req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {
-        process_runner().run(&self.translate(req)?).await
+        let translated = self.translate(req)?;
+        process_runner()
+            .run(&translated)
+            .await
+            .map_err(|e| explain_missing("ssh", "ssh", e))
     }
 
     async fn run_collect(&self, req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {
-        process_runner().run_collect(&self.translate(req)?).await
+        let translated = self.translate(req)?;
+        process_runner()
+            .run_collect(&translated)
+            .await
+            .map_err(|e| explain_missing("ssh", "ssh", e))
     }
 
     async fn spawn(&self, req: &ProcessRequest) -> Result<Box<dyn ProcessChild>, ProcessError> {
-        process_runner().spawn(&self.translate(req)?).await
+        let translated = self.translate(req)?;
+        process_runner()
+            .spawn(&translated)
+            .await
+            .map_err(|e| explain_missing("ssh", "ssh", e))
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The ssh options come from one builder shared with
+    /// `computer::remote_control`, so the two cannot drift into connecting
+    /// differently. This pins the runner to it, which is what makes the sharing
+    /// real rather than a comment.
+    #[test]
+    fn the_ssh_options_come_from_the_shared_builder() {
+        let mut runner = SshRunner::new(SshBackend::new("build.example"));
+        runner.config.port = 2222;
+        runner.config.key_path = Some("/keys/id".to_string());
+        runner.config.extra_args = vec!["-o".to_string(), "Compression=yes".to_string()];
+
+        let translated = runner.translate(&request(None)).expect("it translates");
+
+        let expected = crate::computer::remote_control::ssh_option_args(
+            2222,
+            Some("/keys/id"),
+            &["-o".to_string(), "Compression=yes".to_string()],
+        );
+        assert_eq!(
+            &translated.argv[1..1 + expected.len()],
+            expected.as_slice(),
+            "the options are the shared builder's, in its order: {:?}",
+            translated.argv
+        );
+        // And then the destination and the command.
+        assert_eq!(translated.argv[1 + expected.len()], "build.example");
+    }
+
+    /// A container sees only what was mounted, so a working directory the fence
+    /// did not grant is not merely unwritable — it is absent. Refusing with that
+    /// reason is better than letting docker answer "no such file or directory",
+    /// which reads like a typo rather than a fence that never covered it.
+    #[test]
+    fn a_working_directory_the_fence_does_not_grant_is_refused() {
+        let (dir, fence) = fence_with_git(false);
+        let runner = DockerRunner::new(DockerBackend::new("debian:stable"));
+
+        let mut inside = request(Some(fence.clone()));
+        inside.cwd = Some(dir.path().join("sub"));
+        assert!(
+            runner.translate(&inside).is_ok(),
+            "a directory inside a granted root is visible"
+        );
+
+        let mut outside = request(Some(fence));
+        outside.cwd = Some(PathBuf::from("/etc"));
+        let error = match runner.translate(&outside) {
+            Err(error) => error,
+            Ok(_) => panic!("a directory outside every granted root must be refused"),
+        };
+        assert!(matches!(error, ProcessError::BackendUnavailable { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("/etc"), "{rendered}");
+        assert!(rendered.contains("not inside any path the fence grants"), "{rendered}");
+    }
+
+    /// A backend whose client program is missing says so in terms of the
+    /// backend, not in terms of a program the caller never named.
+    #[tokio::test]
+    async fn a_missing_client_program_names_the_backend() {
+        // `docker` is not guaranteed to exist on a test machine, so this asserts
+        // the shape whichever way it goes: either the backend explains itself, or
+        // the run got as far as the daemon — never a bare `Spawn` about `docker`.
+        let runner = DockerRunner::new(DockerBackend::new("debian:stable"));
+        let mut req = request(None);
+        req.argv = vec!["true".to_string()];
+
+        match runner.run(&req).await {
+            Err(ProcessError::BackendUnavailable { backend, reason }) => {
+                assert_eq!(backend, "docker");
+                assert!(reason.contains("`docker`"), "{reason}");
+                assert!(reason.contains("PATH"), "{reason}");
+            }
+            Err(ProcessError::Spawn { program, .. }) => {
+                panic!("a missing docker must be explained, not surfaced as spawning {program}")
+            }
+            // The daemon answered (or refused) — docker exists on this machine.
+            _ => {}
+        }
+    }
+
+    /// The same for ssh.
+    #[tokio::test]
+    async fn a_missing_ssh_program_names_the_backend() {
+        let runner = SshRunner::new(SshBackend::new("127.0.0.1"));
+        let mut req = request(None);
+        req.argv = vec!["true".to_string()];
+
+        match runner.run(&req).await {
+            Err(ProcessError::BackendUnavailable { backend, reason }) => {
+                assert_eq!(backend, "ssh");
+                assert!(reason.contains("`ssh`"), "{reason}");
+            }
+            Err(ProcessError::Spawn { program, .. }) => {
+                panic!("a missing ssh must be explained, not surfaced as spawning {program}")
+            }
+            _ => {}
+        }
+    }
+
+    /// The explanation is only for a *missing* program: anything else keeps its
+    /// own meaning, so a permission error is not relabelled as "not installed".
+    #[test]
+    fn only_a_missing_program_is_relabelled() {
+        let denied = ProcessError::Spawn {
+            program: "docker".to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert!(matches!(
+            explain_missing("docker", "docker", denied),
+            ProcessError::Spawn { .. }
+        ));
+
+        let missing = ProcessError::Spawn {
+            program: "docker".to_string(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert!(matches!(
+            explain_missing("docker", "docker", missing),
+            ProcessError::BackendUnavailable { .. }
+        ));
+    }
     use super::*;
     use crate::tools::process_runner::{NamespacePosture, StdioMode};
     use std::path::PathBuf;
@@ -467,11 +647,14 @@ mod tests {
 
     #[test]
     fn a_docker_request_becomes_a_docker_run() {
-        let (_dir, fence) = fence_with_git(false);
+        let (dir, fence) = fence_with_git(false);
         let runner = DockerRunner::new(DockerBackend::new("debian:stable"));
 
+        // A working directory inside the granted root, which is the only kind a
+        // container can be given once a fence is in play.
+        let workspace = dir.path().to_path_buf();
         let mut req = request(Some(fence));
-        req.cwd = Some(PathBuf::from("/workspace"));
+        req.cwd = Some(workspace.clone());
         req.env.insert("KEY".to_string(), "value".to_string());
         req.stdin = Some(b"input".to_vec());
 
@@ -479,10 +662,14 @@ mod tests {
         assert_eq!(&translated.argv[..3], ["docker", "run", "--rm"]);
         assert!(translated.argv.contains(&"-i".to_string()), "stdin is kept open");
         assert!(translated.argv.contains(&"KEY=value".to_string()));
-        assert!(translated
-            .argv
-            .windows(2)
-            .any(|w| w == ["-w", "/workspace"]));
+        assert!(
+            translated
+                .argv
+                .windows(2)
+                .any(|w| w[0] == "-w" && w[1] == workspace.to_string_lossy()),
+            "the granted working directory travels as -w: {:?}",
+            translated.argv
+        );
         assert!(translated.argv.contains(&"debian:stable".to_string()));
         assert_eq!(
             &translated.argv[translated.argv.len() - 2..],

@@ -248,6 +248,20 @@ pub enum ProcessError {
     Unsupported,
     #[error("sandbox unavailable: {reason}")]
     Sandbox { reason: String },
+    /// The backend cannot run at all — its client program is missing, or the
+    /// request cannot be expressed for it.
+    ///
+    /// Distinct from [`Spawn`](ProcessError::Spawn), which means "the program we
+    /// were asked to run would not start": this one means the *backend* is
+    /// unusable, and the answer is to fix the deployment rather than the
+    /// command.
+    #[error("the {backend} backend cannot run: {reason}")]
+    BackendUnavailable {
+        /// Which backend refused.
+        backend: &'static str,
+        /// What is wrong, in terms of what to do about it.
+        reason: String,
+    },
 }
 
 /// A spawned child process, abstracted from the concrete spawn mechanism.
