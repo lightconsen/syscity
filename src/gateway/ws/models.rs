@@ -801,10 +801,14 @@ mod tests {
             models_list_url(endpoint_of("openai"), protocol, "https://api.openai.com/v1"),
             "https://api.openai.com/v1/models"
         );
-        // Absolute, because the list is not under the chat base.
+        // Absolute, because the list is not under the chat base. No shipped
+        // preset declares one any more, so the behaviour is pinned with a
+        // variant shaped like one rather than dropped with its vendor.
+        let mut absolute = endpoint_of("openai").expect("openai has a variant").clone();
+        absolute.models_endpoint = Some("https://api.example.test/v1/models".to_string());
         assert_eq!(
-            models_list_url(endpoint_of("upstage"), protocol, "https://api.upstage.ai/v1/solar"),
-            "https://api.upstage.ai/v1/models"
+            models_list_url(Some(&absolute), protocol, "https://api.example.test/v1/solar"),
+            "https://api.example.test/v1/models"
         );
         // Nothing declared: the protocol's own path.
         assert_eq!(

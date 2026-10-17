@@ -331,8 +331,11 @@ async fn image_generate_missing_prompt_fails() {
     );
 }
 
+/// With no provider the tool cannot generate anything, and says that. It used to
+/// ask for an `OPENAI_API_KEY` of its own — media now follows the configured
+/// provider, so there is no separate key to be missing.
 #[tokio::test]
-async fn image_generate_no_api_key_fails() {
+async fn image_generate_without_a_provider_fails() {
     let tool = ImageGenerateTool::new();
     let ctx = test_context();
     let result = tool
@@ -340,11 +343,11 @@ async fn image_generate_no_api_key_fails() {
         .await;
     assert!(result.is_ok());
     let output = result.unwrap();
-    assert!(!output.success, "Expected failure without API key");
+    assert!(!output.success, "Expected failure without a provider");
     let err = output.error.unwrap();
     assert!(
-        err.contains("API key") || err.contains("key"),
-        "Expected API key error, got: {}",
+        err.contains("needs a configured provider"),
+        "Expected a provider error, got: {}",
         err
     );
 }

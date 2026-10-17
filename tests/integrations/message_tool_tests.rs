@@ -169,6 +169,10 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             acp_bridge: None,
             session_channels: Arc::new(RwLock::new(HashMap::new())),
             webhook_sessions: Arc::new(RwLock::new(HashMap::new())),
+            // Only exists when a bearer-token channel is compiled in, which is
+            // why it matches the field's own gate.
+            #[cfg(any(feature = "teams", feature = "googlechat"))]
+            webhook_verifiers: Arc::new(RwLock::new(HashMap::new())),
         },
         memory: syscity::gateway::state::MemoryState {
             vector: tokio::sync::RwLock::new(None),
@@ -209,6 +213,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             sse_streamer,
             routed_tx,
             inbound_entry: inbound_entry_tx,
+            prompt_queue: Arc::new(syscity::gateway::prompt_queue::PendingPrompts::default()),
         },
         events: syscity::gateway::state::EventState {
             tx: event_tx,
@@ -216,6 +221,12 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             hook_registry: Arc::new(syscity::gateway::hooks::EventHookRegistry::new()),
         },
         infra: syscity::gateway::state::InfraState {
+            // Rooted in a throwaway directory: the store writes pre-images next
+            // to its root, and a test must not touch the real home.
+            checkpoints: Arc::new(syscity::agent::checkpoints::CheckpointStore::new(
+                std::env::temp_dir()
+                    .join(format!("syscity_msg_tool_test_ckpt_{}", uuid::Uuid::new_v4())),
+            )),
             storage: Arc::new(RwLock::new(syscity::adapters::InMemoryStorage::new())),
             runtime_settings: Arc::new(RwLock::new(HashMap::new())),
             transcript_store: Arc::new(transcript_store),

@@ -267,18 +267,20 @@ mod tests {
     /// A provider's key names the vendor, so the preset's own defaults apply:
     /// its context window and stream family, not the ones `provider_type`
     /// happened to carry. Before, the *preset* was chosen from `provider_type`
-    /// alone, so a provider keyed `grok` but typed `open_ai` ran on the OpenAI
-    /// preset's 128k window.
+    /// alone, so a provider keyed with one vendor's name but typed `open_ai` ran
+    /// on the OpenAI preset's window instead of its own.
     #[tokio::test]
     async fn provider_key_selects_the_preset() {
         let router = ModelRouter::new(ModelRouterConfig::default());
-        let mut config = test_provider_config(&["grok-4.3"]);
+        // Ollama's window (8k) is not OpenAI's, so a preset chosen by the key
+        // is visible in the number rather than hidden behind a coincidence.
+        let mut config = test_provider_config(&["llama3"]);
         config.provider_type = ProviderType::OpenAi;
-        config.base_url = Some("https://api.x.ai/v1".to_string());
-        router.add_provider("grok", config).await.unwrap();
+        config.base_url = Some("http://localhost:11434/v1".to_string());
+        router.add_provider("ollama", config).await.unwrap();
 
-        let provider = router.get_provider("grok").await.unwrap();
-        assert_eq!(provider.max_context(), 131_072);
+        let provider = router.get_provider("ollama").await.unwrap();
+        assert_eq!(provider.max_context(), 8_192);
     }
 
     /// `provider_type` still chooses the vendor's *endpoint* where the vendor

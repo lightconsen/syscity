@@ -958,10 +958,7 @@ mod tests {
         let legacy = |key: &str| format!("{:?}", presets[key].protocol);
         assert_eq!(legacy("openai"), "OpenAi");
         assert_eq!(legacy("anthropic"), "Anthropic");
-        assert_eq!(legacy("gemini"), "Gemini");
-        assert_eq!(legacy("azure"), "Azure");
         assert_eq!(legacy("ollama"), "Ollama");
-        assert_eq!(legacy("minimax"), "Minimax");
         // Kimi's configs say "moonshot"; the router maps it back to the preset.
         assert_eq!(legacy("kimi"), "Moonshot");
         // An OpenAI-compatible vendor with no legacy variant of its own.

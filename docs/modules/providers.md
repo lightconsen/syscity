@@ -76,41 +76,18 @@ gateway still boots.
 | `qwen` | Qwen | `dashscope.aliyuncs.com/compatible-mode/v1` | Bearer | `qwen3.7-plus` |
 | `kimi` | Moonshot (Kimi) | `api.moonshot.cn/v1` | Bearer | `kimi-k2.6` |
 | `anthropic` | Anthropic | `api.anthropic.com` | `x-api-key` | `claude-sonnet-5` |
-| `azure` | Azure OpenAI | `YOUR_RESOURCE.openai.azure.com` | Bearer | `gpt-5.4` |
-| `gemini` | Gemini | `generativelanguage.googleapis.com/v1beta` | `x-goog-api-key` | `gemini-2.5-flash` |
-| `glm` | GLM (Zhipu) | `open.bigmodel.cn/api/paas/v4` | Bearer | `glm-5.2` |
-| `minimax` | MiniMax | `api.minimax.chat/v1` | Bearer | `MiniMax-M3` |
-| `volcengine` | Volcengine (火山引擎) | `ark.cn-beijing.volces.com/api/v3` | Bearer | `doubao-seed-2-1-pro-260628` |
-| `hunyuan` | Hunyuan (Tencent) | `api.hunyuan.cloud.tencent.com/v1` | Bearer | `hunyuan-turbos-latest` |
-| `grok` | xAI (Grok) | `api.x.ai/v1` | Bearer | `grok-4.3` |
-| `mistral` | Mistral | `api.mistral.ai/v1` | Bearer | `mistral-large-latest` |
-| `cohere` | Cohere | `api.cohere.ai/compatibility/v1` | Bearer | `command-a-plus-05-2026` |
 | `openrouter` | OpenRouter | `openrouter.ai/api/v1` | Bearer | `anthropic/claude-sonnet-5.5` |
-| `ai-gateway` | Vercel AI Gateway | `ai-gateway.vercel.sh/v1` | Bearer | `moonshotai/kimi-k2.6` |
-| `huggingface` | Hugging Face | `router.huggingface.co/v1` | Bearer | `moonshotai/Kimi-K2.6` |
-| `opencode` | OpenCode Zen | `opencode.ai/zen/v1` | Bearer | `kimi-k3` |
-| `kilocode` | Kilo Code | `api.kilo.ai/api/gateway` | Bearer | `anthropic/claude-sonnet-4.6` |
-| `nvidia` | NVIDIA NIM | `integrate.api.nvidia.com/v1` | Bearer | `nvidia/nemotron-3-ultra-550b-a55b` |
-| `fireworks` | Fireworks AI | `api.fireworks.ai/inference/v1` | Bearer | `accounts/fireworks/models/kimi-k2p6` |
-| `novita` | Novita AI | `api.novita.ai/openai/v1` | Bearer | `moonshotai/kimi-k2.5` |
-| `gmi` | GMI Cloud | `api.gmi-serving.com/v1` | Bearer | `deepseek-ai/DeepSeek-V3.2` |
-| `nebius` | Nebius Token Factory | `api.tokenfactory.nebius.com/v1` | Bearer | `nvidia/Nemotron-3-Ultra-550b-a55b` |
-| `deepinfra` | DeepInfra | `api.deepinfra.com/v1/openai` | Bearer | `zai-org/GLM-5.3` |
-| `arcee` | Arcee AI | `api.arcee.ai/api/v1` | Bearer | `trinity-large-thinking` |
-| `upstage` | Upstage | `api.upstage.ai/v1/solar` | Bearer | `solar-pro4` |
-| `groq` | Groq | `api.groq.com/openai/v1` | Bearer | `openai/gpt-oss-120b` |
-| `zai` | Z.AI (GLM) | `api.z.ai/api/paas/v4` | Bearer | `glm-5.3` |
-| `stepfun` | StepFun | `api.stepfun.com/v1` | Bearer | `step-3.7-flash` |
-| `xiaomi` | Xiaomi MiMo | `api.xiaomimimo.com/v1` | Bearer | `mimo-v2.6-pro` |
-| `tencent-tokenhub` | Tencent TokenHub | `tokenhub.tencentmaas.com/v1` | Bearer | `hy4-preview` |
-| `ollama-cloud` | Ollama Cloud | `ollama.com/v1` | Bearer | `kimi-k3` |
-| `lmstudio` | LM Studio | `127.0.0.1:1234/v1` | None | `qwen/qwen3-30b-a3b-2507` |
 
 Only the OpenAI protocol is listed above; `kimi` is the dual-protocol vendor
 (its Anthropic-compatible endpoint is `api.moonshot.cn/anthropic`, selected with
-`protocol = "anthropic"`). `upstage` is the one preset whose model list is not
-under its chat base URL, so its `models_endpoint` is absolute — the only field
-in the file that may be a full URL.
+`protocol = "anthropic"`).
+
+**These seven are the whole list by design.** `presets.toml` had grown to 35 in a
+breadth pass; it is now seven, because a preset buys *convenience*, not
+capability: any OpenAI-compatible endpoint was always reachable through
+`base_url`, and every removed row was another fact that could rot. A vendor added
+back is one TOML table plus a resolver test. `models_endpoint` may be an absolute
+URL — no shipped preset uses that today, but the field still supports it.
 
 
 ### Resolver (`resolver.rs`)

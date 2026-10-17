@@ -172,39 +172,11 @@ mod tests {
         for key in [
             "openai",
             "anthropic",
-            "gemini",
-            "kimi",
             "deepseek",
+            "kimi",
             "ollama",
             "qwen",
-            "minimax",
-            "azure",
-            "glm",
-            "volcengine",
-            "hunyuan",
-            "grok",
-            "mistral",
-            "cohere",
             "openrouter",
-            "ai-gateway",
-            "huggingface",
-            "opencode",
-            "kilocode",
-            "nvidia",
-            "fireworks",
-            "novita",
-            "gmi",
-            "nebius",
-            "deepinfra",
-            "arcee",
-            "upstage",
-            "groq",
-            "zai",
-            "stepfun",
-            "xiaomi",
-            "tencent-tokenhub",
-            "ollama-cloud",
-            "lmstudio",
         ] {
             assert!(providers.contains_key(key), "{key} is missing");
         }
@@ -218,8 +190,8 @@ mod tests {
         // which is what the test above is for.
         let providers = builtin_providers();
         assert!(
-            providers.len() >= 30,
-            "expected full preset set from presets.toml, got {}",
+            providers.len() == 7,
+            "expected the seven presets in presets.toml, got {}",
             providers.len()
         );
     }
@@ -264,25 +236,11 @@ mod tests {
             Some("/v1/models")
         );
         assert_eq!(
-            providers.get("glm").unwrap().variants[0]
+            providers.get("deepseek").unwrap().variants[0]
                 .models_endpoint
                 .as_deref(),
             Some("/models")
         );
-    }
-
-    #[test]
-    fn test_gemini_uses_google_auth() {
-        let providers = builtin_providers();
-        let gemini = providers.get("gemini").unwrap();
-        assert_eq!(gemini.variants[0].auth_method, AuthMethod::GoogleApiKey);
-    }
-
-    #[test]
-    fn test_provider_aliases() {
-        assert_eq!(canonical_provider_name("doubao"), "volcengine");
-        assert_eq!(canonical_provider_name("volcengine"), "volcengine");
-        assert_eq!(canonical_provider_name("openai"), "openai");
     }
 
     #[test]

@@ -247,13 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_gemini_preset() {
-        let provider =
-            resolve_provider("gemini", Some("test-key".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "gemini-2.5-flash");
-    }
-
-    #[test]
     fn test_resolve_kimi_default_variant() {
         // Default Kimi should use OpenAI protocol (first variant)
         let provider = resolve_provider("kimi", Some("sk-test".into()), None, None, None).unwrap();
@@ -310,55 +303,6 @@ mod tests {
     fn test_resolve_ollama_preset() {
         let provider = resolve_provider("ollama", None, None, None, None).unwrap();
         assert_eq!(provider.default_model(), "qwen3");
-    }
-
-    #[test]
-    fn test_resolve_minimax_preset() {
-        let provider =
-            resolve_provider("minimax", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "MiniMax-M3");
-    }
-
-    #[test]
-    fn test_resolve_volcengine_preset() {
-        let provider =
-            resolve_provider("volcengine", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "doubao-seed-2-1-pro-260628");
-    }
-
-    #[test]
-    fn test_resolve_doubao_alias() {
-        // Legacy config key "doubao" must still resolve to the volcengine preset.
-        let provider =
-            resolve_provider("doubao", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "doubao-seed-2-1-pro-260628");
-    }
-
-    #[test]
-    fn test_resolve_hunyuan_preset() {
-        let provider =
-            resolve_provider("hunyuan", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "hunyuan-turbos-latest");
-    }
-
-    #[test]
-    fn test_resolve_grok_preset() {
-        let provider = resolve_provider("grok", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "grok-4.3");
-    }
-
-    #[test]
-    fn test_resolve_mistral_preset() {
-        let provider =
-            resolve_provider("mistral", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "mistral-large-latest");
-    }
-
-    #[test]
-    fn test_resolve_cohere_preset() {
-        let provider =
-            resolve_provider("cohere", Some("sk-test".into()), None, None, None).unwrap();
-        assert_eq!(provider.default_model(), "command-a-plus-05-2026");
     }
 
     #[test]
