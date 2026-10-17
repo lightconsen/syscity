@@ -46,9 +46,7 @@ impl Tool for TtsTool {
     }
 
     fn description(&self) -> &str {
-        "Convert text to speech audio. Use this tool when the user asks to read aloud, speak, \
-         or convert text to speech/audio (文字转语音/朗读). Requires OPENAI_API_KEY or uses \
-         local system TTS."
+        "Convert text to speech audio. Use this tool when the user asks to read aloud, speak,          or convert text to speech/audio (文字转语音/朗读). Uses the configured model provider,          and falls back to the system's own speech binary if that provider cannot speak."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -238,8 +236,7 @@ impl Tool for TtsTool {
             success: false,
             output: String::new(),
             error: Some(
-                "No TTS provider available. Set OPENAI_API_KEY, or install espeak (Linux) / use \
-                 macOS."
+                "No TTS provider is available: the configured model provider could not speak,                  and there is no local speech binary to fall back to (install espeak on Linux, or                  run on macOS)."
                     .to_string(),
             ),
             data: Some(serde_json::json!({

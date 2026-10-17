@@ -51,10 +51,7 @@ impl Tool for SttTool {
     }
 
     fn description(&self) -> &str {
-        "Transcribe audio to text (speech-to-text) using OpenAI Whisper API. Use this tool when \
-         the user asks to transcribe, convert speech to text, or recognize audio content \
-         (转录/语音识别/音频转文字). Requires OPENAI_API_KEY. Accepts common audio formats: mp3, \
-         wav, m4a, ogg, flac, webm, etc."
+        "Transcribe audio to text (speech-to-text), through the configured model provider. Use          this tool when the user asks to transcribe, convert speech to text, or recognize audio          content (转录/语音识别/音频转文字). Needs a provider that supports transcription; there is          no separate key to set. Accepts common audio formats: mp3, wav, m4a, ogg, flac, webm,          etc."
     }
 
     fn parameters_schema(&self) -> Value {
