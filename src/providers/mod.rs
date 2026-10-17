@@ -464,6 +464,22 @@ pub trait Provider: Send + Sync {
         messages.iter().map(|m| m.content.len() / 4).sum()
     }
 
+    /// Generate or transcribe media — an image, speech, a transcript, a video.
+    ///
+    /// Defaulted to a refusal in words rather than left abstract: most providers
+    /// do not do media, and "this provider does not support speech generation"
+    /// is a better answer than a missing method or an opaque failure. A provider
+    /// that does implement it overrides this.
+    ///
+    /// See [`media`] for why this is not folded into `complete`: the inputs and
+    /// outputs are not messages, and the vendor APIs are not the chat protocol.
+    async fn generate_media(
+        &self,
+        request: crate::providers::media::MediaRequest,
+    ) -> crate::Result<crate::providers::media::MediaResponse> {
+        Err(crate::providers::media::unsupported(self.name(), request.kind))
+    }
+
     /// Check if the provider is healthy
     async fn health_check(&self) -> crate::Result<bool>;
 
@@ -563,6 +579,7 @@ pub const DEFAULT_MODEL_PROVIDER: &str = "anthropic";
 pub mod anthropic;
 pub mod fallback;
 pub mod gemini;
+pub mod media;
 pub mod mock;
 pub mod openai;
 pub mod preset;
