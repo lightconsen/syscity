@@ -593,6 +593,7 @@ impl Gateway {
                 optimizer: Arc::new(crate::eval::OptimizerRuntime::default()),
                 #[cfg(feature = "browser")]
                 browser_bridge: tokio::sync::RwLock::new(None),
+                export_pool: tokio::sync::RwLock::new(None),
             },
             sdk: SdkState {
                 provider_sdk: Arc::new(RwLock::new(crate::providers::ProviderSdk::new())),

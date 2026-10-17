@@ -221,6 +221,8 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             hook_registry: Arc::new(syscity::gateway::hooks::EventHookRegistry::new()),
         },
         infra: syscity::gateway::state::InfraState {
+            #[cfg(feature = "browser")]
+            export_pool: tokio::sync::RwLock::new(None),
             // Rooted in a throwaway directory: the store writes pre-images next
             // to its root, and a test must not touch the real home.
             checkpoints: Arc::new(syscity::agent::checkpoints::CheckpointStore::new(

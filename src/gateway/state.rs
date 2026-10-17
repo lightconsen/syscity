@@ -193,6 +193,14 @@ pub struct InfraState {
     /// Browser bridge server (started when browser.bridge_enabled is true).
     #[cfg(feature = "browser")]
     pub browser_bridge: RwLock<Option<crate::browser::BrowserBridge>>,
+    /// The browser pool artifact PDF export renders through.
+    ///
+    /// Separate from the bridge: the export needs a browser whenever the
+    /// `browser` feature is on, not only when the debugging bridge is enabled.
+    /// `None` when the feature is off, and the export says so rather than
+    /// failing obscurely.
+    #[cfg(feature = "browser")]
+    pub export_pool: RwLock<Option<Arc<crate::browser::BrowserPool>>>,
 }
 
 /// Dynamic provider and tool SDK state.

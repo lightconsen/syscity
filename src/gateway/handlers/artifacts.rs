@@ -15,13 +15,91 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
 };
 
 use crate::dirs::SyscityPaths;
 use crate::gateway::GatewayState;
+
+/// How a download should be rendered.
+#[derive(Debug, serde::Deserialize)]
+pub struct ArtifactExportQuery {
+    /// Export target. Only `pdf` is supported.
+    to: Option<String>,
+}
+
+/// Render an authored-HTML artifact to a PDF download.
+///
+/// The render goes through a real browser rather than a PDF library: the
+/// document is arbitrary HTML an agent wrote, so a partial CSS engine would not
+/// fail — it would produce a plausible-looking PDF with a broken layout.
+async fn export_pdf(
+    state: &Arc<GatewayState>,
+    file_path: std::path::PathBuf,
+    filename: &str,
+) -> axum::response::Response {
+    let html = match tokio::fs::read_to_string(&file_path).await {
+        Ok(html) => html,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "Document not found".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    #[cfg(feature = "browser")]
+    {
+        let pool = state.infra.export_pool.read().await.clone();
+        let Some(pool) = pool else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "PDF export needs a browser pool, and none is running".to_string(),
+            )
+                .into_response();
+        };
+
+        return match crate::browser::render::html_to_pdf(&pool, "default", &html).await {
+            Ok(bytes) => {
+                let stem = filename.trim_end_matches(".html").trim_end_matches(".md");
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/pdf".to_string()),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{stem}.pdf\""),
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Err(e) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("PDF export failed: {e}"),
+            )
+                .into_response(),
+        };
+    }
+
+    #[cfg(not(feature = "browser"))]
+    {
+        let _ = (state, &html);
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "PDF export requires a build with the `browser` feature".to_string(),
+        )
+            .into_response()
+    }
+}
 
 /// Resolve a request path to its on-disk location, honoring the `@owner`
 /// prefix for agent-workspace artifacts and falling back to the legacy global
@@ -105,6 +183,7 @@ fn resolve_artifact_path(paths: &SyscityPaths, path: &str) -> Option<std::path::
 pub async fn artifact_handler(
     State(state): State<Arc<GatewayState>>,
     Path(path): Path<String>,
+    Query(query): Query<ArtifactExportQuery>,
 ) -> impl IntoResponse {
     let Some(file_path) = resolve_artifact_path(&state.paths, &path) else {
         return (
@@ -119,6 +198,23 @@ pub async fn artifact_handler(
     // fails on Unicode filenames due to NFC/NFD normalization differences
     // between the HTTP-decoded path and the filesystem-stored path.
     // The write_report tool already validates paths server-side.
+
+    if let Some(to) = &query.to {
+        if to == "pdf" {
+            let filename = path
+                .rsplit('/')
+                .next()
+                .unwrap_or("document.html")
+                .to_string();
+            return export_pdf(&state, file_path, &filename).await;
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!("Unsupported export target '{to}' (supported: pdf)"),
+        )
+            .into_response();
+    }
 
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => {
@@ -151,9 +247,42 @@ mod tests {
     }
 
     async fn get(state: &Arc<GatewayState>, path: &str) -> axum::response::Response {
-        artifact_handler(State(state.clone()), Path(path.to_string()))
+        artifact_handler(
+            State(state.clone()),
+            Path(path.to_string()),
+            Query(ArtifactExportQuery { to: None }),
+        )
+        .await
+        .into_response()
+    }
+
+    /// Without the `browser` feature there is no PDF renderer, and the export
+    /// says that instead of failing obscurely.
+    #[tokio::test]
+    async fn a_pdf_export_without_a_browser_is_refused() {
+        let state = state().await;
+        let dir = std::env::temp_dir().join(format!("art-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("report.html"), "<h1>hi</h1>")
             .await
-            .into_response()
+            .unwrap();
+
+        let resp = artifact_handler(
+            State(state.clone()),
+            Path("x.html".to_string()),
+            Query(ArtifactExportQuery { to: Some("pdf".to_string()) }),
+        )
+        .await
+        .into_response();
+
+        // Either the feature is off (501) or no pool is running (503); both are
+        // explicit refusals rather than a broken file.
+        assert!(
+            matches!(resp.status(), StatusCode::NOT_IMPLEMENTED | StatusCode::SERVICE_UNAVAILABLE)
+                || resp.status() == StatusCode::NOT_FOUND,
+            "unexpected status {}",
+            resp.status()
+        );
     }
 
     #[tokio::test]

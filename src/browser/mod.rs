@@ -30,6 +30,7 @@ pub mod pointer;
 pub mod pool;
 #[cfg(feature = "browser")]
 pub mod profile;
+pub mod render;
 #[cfg(feature = "browser")]
 pub mod sourcemap;
 

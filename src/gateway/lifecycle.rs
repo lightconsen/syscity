@@ -641,14 +641,24 @@ pub(crate) async fn start_gateway(
         }
     }
 
-    // Start browser bridge server if enabled
+    // The export pool exists whenever the feature does — artifact PDF export
+    // needs a browser whether or not the debugging bridge is enabled. The
+    // bridge, when it is, shares this pool rather than starting a second one.
     #[cfg(feature = "browser")]
-    if config.browser.bridge_enabled {
+    let export_pool = {
         let pool = Arc::new(crate::browser::BrowserPool::with_profiles(
             config.browser.pool.clone(),
             config.browser.profiles.clone(),
         ));
-        let mut bridge = crate::browser::BrowserBridge::new(pool, config.browser.bridge_port);
+        *state.infra.export_pool.write().await = Some(pool.clone());
+        pool
+    };
+
+    // Start browser bridge server if enabled
+    #[cfg(feature = "browser")]
+    if config.browser.bridge_enabled {
+        let mut bridge =
+            crate::browser::BrowserBridge::new(export_pool, config.browser.bridge_port);
         let token = bridge.token().to_string();
         match bridge.start().await {
             Ok(port) => {
