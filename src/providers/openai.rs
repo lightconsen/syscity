@@ -245,6 +245,21 @@ impl OpenAiProvider {
     }
 }
 
+/// The MIME type for the container the vendor was asked for.
+///
+/// The caller is told what the bytes are, so the label has to follow the format
+/// rather than being assumed to be mp3.
+fn mime_for(format: &str) -> &'static str {
+    match format {
+        "wav" => "audio/wav",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "pcm" => "audio/pcm",
+        _ => "audio/mpeg",
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
@@ -414,6 +429,94 @@ impl Provider for OpenAiProvider {
         let stream = response.bytes_stream();
         let openai_stream = OpenAiStream::new(stream);
         return Ok(Box::pin(openai_stream));
+    }
+
+    /// Media, for the three kinds this vendor exposes.
+    ///
+    /// This is the point of the abstraction: media now goes through the same
+    /// gateway client as chat, so it uses the *configured* credential, retry,
+    /// timeout and rate limiting instead of a second read of `OPENAI_API_KEY`.
+    ///
+    /// Two of the three ride the client as it stands. Speech returns raw audio,
+    /// which is why `post_json_streaming` is the method — it hands back the
+    /// `Response` itself and auth/retry are still applied. Transcription is not
+    /// implemented here: `/audio/transcriptions` takes a **multipart** body, and
+    /// the retry loop calls its closure repeatedly (`Fn`, not `FnOnce`), so a
+    /// one-shot `Form` cannot be replayed — it needs a rebuildable multipart
+    /// path on the client, which is its own change.
+    async fn generate_media(
+        &self,
+        request: crate::providers::media::MediaRequest,
+    ) -> crate::Result<crate::providers::media::MediaResponse> {
+        use crate::providers::media::{MediaKind, MediaOutput, MediaResponse};
+
+        match request.kind {
+            MediaKind::Image => {
+                let body = serde_json::json!({
+                    "model": request.model.clone().unwrap_or_else(|| "dall-e-3".to_string()),
+                    "prompt": request.prompt,
+                    "n": 1,
+                    // A URL rather than base64: it is what the provider defaults
+                    // to for this model, and the caller decides what to do with it.
+                    "response_format": "url",
+                });
+
+                let response: serde_json::Value = self
+                    .gateway_client
+                    .post_json(&self.url("/images/generations"), &body)
+                    .await?;
+
+                // The vendor answers with a list; this abstraction asks for one
+                // image, so a response with none is a refusal worth reporting
+                // rather than an empty success.
+                let Some(url) = response["data"]
+                    .get(0)
+                    .and_then(|first| first.get("url"))
+                    .and_then(|url| url.as_str())
+                else {
+                    return Err(crate::error::SyscityError::ExternalService {
+                        source: format!("image generation returned no image: {}", response),
+                        cause: None,
+                    });
+                };
+
+                Ok(MediaResponse::url(url))
+            }
+
+            MediaKind::Speech => {
+                let body = serde_json::json!({
+                    "model": request.model.clone().unwrap_or_else(|| "tts-1".to_string()),
+                    "input": request.prompt,
+                    "voice": request.voice.clone().unwrap_or_else(|| "alloy".to_string()),
+                    // The vendor names the container here; the same value is what
+                    // the caller is told the bytes are.
+                    "response_format": request.format.clone().unwrap_or_else(|| "mp3".to_string()),
+                });
+
+                let format = request.format.unwrap_or_else(|| "mp3".to_string());
+                let response = self
+                    .gateway_client
+                    .post_json_streaming(&self.url("/audio/speech"), &body)
+                    .await?;
+                let data = response.bytes().await.map_err(|e| {
+                    crate::error::SyscityError::ExternalService {
+                        source: format!("speech response could not be read: {}", e),
+                        cause: None,
+                    }
+                })?;
+
+                Ok(MediaResponse {
+                    output: MediaOutput::Bytes {
+                        data: data.to_vec(),
+                        mime: Some(mime_for(&format).to_string()),
+                    },
+                    model: None,
+                })
+            }
+
+            // The default refusal, which names the provider and the kind.
+            other => Err(crate::providers::media::unsupported(self.name(), other)),
+        }
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
@@ -790,6 +893,105 @@ impl Stream for OpenAiStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::providers::media::{MediaKind, MediaOutput, MediaRequest};
+
+    /// Media rides the same gateway client as chat, which is the whole point: an
+    /// image URL comes back through it rather than through a second, parallel
+    /// read of an env var.
+    #[tokio::test]
+    async fn image_generation_returns_the_url_the_provider_sent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "url": "https://example.invalid/fox.png" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("the-key", format!("{}/v1", server.uri()))
+            .expect("a provider");
+        let response = provider
+            .generate_media(MediaRequest::new(MediaKind::Image, "a red fox"))
+            .await
+            .expect("an image");
+
+        match response.output {
+            MediaOutput::Url(url) => assert_eq!(url, "https://example.invalid/fox.png"),
+            other => panic!("expected a URL, got {other:?}"),
+        }
+    }
+
+    /// Speech comes back as bytes, which is why it uses the streaming method —
+    /// and the label has to follow the format that was asked for.
+    #[tokio::test]
+    async fn speech_returns_bytes_labelled_with_the_format_asked_for() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"RIFF....WAVE".to_vec()))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("the-key", format!("{}/v1", server.uri()))
+            .expect("a provider");
+
+        let mut request = MediaRequest::new(MediaKind::Speech, "hello there");
+        request.format = Some("wav".to_string());
+
+        let response = provider.generate_media(request).await.expect("speech");
+        match response.output {
+            MediaOutput::Bytes { data, mime } => {
+                assert_eq!(data, b"RIFF....WAVE");
+                assert_eq!(mime.as_deref(), Some("audio/wav"));
+            }
+            other => panic!("expected bytes, got {other:?}"),
+        }
+    }
+
+    /// A provider that answers with no image is a refusal, not an empty success.
+    #[tokio::test]
+    async fn an_image_response_with_no_image_is_an_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("the-key", format!("{}/v1", server.uri()))
+            .expect("a provider");
+
+        assert!(provider
+            .generate_media(MediaRequest::new(MediaKind::Image, "a fox"))
+            .await
+            .is_err());
+    }
+
+    /// Transcription is deliberately not implemented: the endpoint is multipart
+    /// and the retry loop cannot replay a one-shot form. It answers with the
+    /// default refusal rather than pretending.
+    #[tokio::test]
+    async fn transcription_says_it_is_not_supported_yet() {
+        let provider = OpenAiProvider::new("the-key").expect("a provider");
+        let error = provider
+            .generate_media(MediaRequest::new(MediaKind::Transcription, ""))
+            .await
+            .expect_err("transcription is not implemented on this provider yet");
+
+        assert!(error.to_string().contains("audio transcription"), "{error}");
+    }
     use super::*;
 
     #[test]
