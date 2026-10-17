@@ -149,6 +149,12 @@ impl Tool for ProcessTool {
                     "type": "string",
                     "description": "Command to start (required for start)"
                 },
+                "execution": {
+                    "type": "string",
+                    "description": "Optional name of a configured execution backend to start the \
+                                    process on instead of this machine. Named by the deployment; \
+                                    omit it to run locally. Applies to `start` only."
+                },
                 "args": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -198,6 +204,17 @@ impl Tool for ProcessTool {
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let start = std::time::Instant::now();
+
+        // Read the backend name before the arguments are consumed by the action
+        // parse. The action enum does not deny unknown fields, so the key is
+        // simply ignored by it.
+        let execution = args
+            .get("execution")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+
         let action: ProcessAction = match serde_json::from_value(args) {
             Ok(a) => a,
             Err(e) => {
@@ -228,7 +245,7 @@ impl Tool for ProcessTool {
                     });
                 }
 
-                let req = ProcessRequest {
+                let mut req = ProcessRequest {
                     argv: std::iter::once(command.clone())
                         .chain(cmd_args.iter().cloned())
                         .collect(),
@@ -247,6 +264,29 @@ impl Tool for ProcessTool {
                     }),
                     ..Default::default()
                 };
+
+                // Where this runs is named, not described — see the `shell`
+                // tool. A name that is not configured is an error rather than a
+                // quiet fallback to local, because a process that meant to start
+                // elsewhere and started here would have answered a different
+                // question.
+                if let Some(name) = &execution {
+                    match context.execution_backend(name) {
+                        Some(backend) => req.backend = backend,
+                        None => {
+                            let available = context.execution_backend_names();
+                            return Ok(ToolExecutionResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(crate::tools::execution_backend_error(
+                                    &available, name,
+                                )),
+                                data: None,
+                                execution_time: start.elapsed(),
+                            });
+                        }
+                    }
+                }
 
                 match crate::tools::process_runner::spawn(&req).await {
                     Ok(child) => {
@@ -452,6 +492,97 @@ impl Clone for ProcessRegistry {
 
 #[cfg(test)]
 mod tests {
+
+    /// A name the deployment did not configure is an error, not a quiet fallback
+    /// to local — the same rule the `shell` tool follows, so the two do not
+    /// disagree about what a missing backend means.
+    #[tokio::test]
+    async fn an_unknown_execution_backend_is_refused() {
+        let tool = ProcessTool::new();
+        let ctx = ToolContext::new("user", "conv");
+
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "start", "command": "true", "execution": "nowhere" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("nowhere"), "{error}");
+        assert!(error.contains("only run locally"), "{error}");
+    }
+
+    /// The error names what is configured, so the next call can be right.
+    #[tokio::test]
+    async fn an_unknown_backend_lists_the_configured_ones() {
+        let tool = ProcessTool::new();
+        let ctx = ToolContext::new("user", "conv").with_execution_backends(
+            std::collections::HashMap::from([
+                (
+                    "build".to_string(),
+                    crate::gateway::config::ExecutionBackendConfig::Docker {
+                        image: "debian:stable".to_string(),
+                        extra_args: Vec::new(),
+                    },
+                ),
+                (
+                    "staging".to_string(),
+                    crate::gateway::config::ExecutionBackendConfig::Ssh {
+                        host: "build.example".to_string(),
+                        user: None,
+                        port: 22,
+                        key_path: None,
+                        extra_args: Vec::new(),
+                    },
+                ),
+            ]),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "start", "command": "true", "execution": "prod" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("build, staging"), "{error}");
+    }
+
+    /// A backend that refuses the fence fails the call with its own reason —
+    /// and nothing is started.
+    #[tokio::test]
+    async fn a_backend_that_cannot_honour_the_fence_refuses_the_process() {
+        let tool = ProcessTool::new();
+        let ctx = ToolContext::new("user", "conv").with_execution_backends(
+            std::collections::HashMap::from([(
+                "staging".to_string(),
+                crate::gateway::config::ExecutionBackendConfig::Ssh {
+                    host: "build.example".to_string(),
+                    user: None,
+                    port: 22,
+                    key_path: None,
+                    extra_args: Vec::new(),
+                },
+            )]),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "start", "command": "true", "execution": "staging" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("cannot honour a write fence"), "{error}");
+    }
     use super::*;
 
     #[tokio::test]

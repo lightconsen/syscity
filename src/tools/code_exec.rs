@@ -119,6 +119,7 @@ impl CodeExecutionTool {
         code: &str,
         context: &ToolContext,
         timeout_secs: u64,
+        backend: Option<crate::tools::process_runner::ExecutionBackend>,
     ) -> crate::Result<CodeResult> {
         // Create wrapped code with output capture
         let max_size = self.config.max_output_size;
@@ -188,6 +189,10 @@ print(json.dumps(result))
             }),
             ..Default::default()
         };
+
+        if let Some(backend) = backend {
+            req.backend = backend;
+        }
 
         // Apply resource limits via pre_exec (Unix only)
         #[cfg(unix)]
@@ -597,6 +602,12 @@ print(json.dumps({"average": result, "count": len(data)}))
                     "description": "Custom timeout in seconds (max 300)",
                     "minimum": 1,
                     "maximum": 300
+                },
+                "execution": {
+                    "type": "string",
+                    "description": "Optional name of a configured execution backend to run the \
+                                    code on instead of this machine. Named by the deployment; \
+                                    omit it to run locally. Python only."
                 }
             },
             "required": ["code"]
@@ -632,12 +643,36 @@ print(json.dumps({"average": result, "count": len(data)}))
 
         let timeout_secs = args["timeout"].as_u64().unwrap_or(self.config.timeout_secs);
 
+        // Where this runs is named, not described — see the `shell` tool. A name
+        // that is not configured is an error rather than a quiet fallback to
+        // local, because code that meant to run elsewhere and ran here would
+        // have answered a different question.
+        let backend = match args["execution"]
+            .as_str()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            Some(name) => match context.execution_backend(name) {
+                Some(backend) => Some(backend),
+                None => {
+                    let available = context.execution_backend_names();
+                    return Ok(ToolExecutionResult::error(crate::tools::execution_backend_error(
+                        &available, name,
+                    )));
+                }
+            },
+            None => None,
+        };
+
         info!("Executing {} code ({} bytes)", language, code.len());
         debug!("Code: {}", code.chars().take(200).collect::<String>());
 
         // Execute the code
         let result = match language {
-            "python" => self.execute_python(code, context, timeout_secs).await,
+            "python" => {
+                self.execute_python(code, context, timeout_secs, backend)
+                    .await
+            }
             "wasm" => {
                 #[cfg(feature = "plugins")]
                 {
@@ -722,6 +757,52 @@ impl Default for CodeExecutionTool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A name the deployment did not configure is an error, not a quiet fallback
+    /// to local — the same rule `shell` and `process` follow.
+    #[tokio::test]
+    async fn an_unknown_execution_backend_is_refused() {
+        let tool = CodeExecutionTool::new();
+        let ctx = ToolContext::new("user", "conv");
+
+        let result = tool
+            .execute(serde_json::json!({ "code": "print(1)", "execution": "nowhere" }), &ctx)
+            .await
+            .expect("the tool answers");
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("nowhere"));
+    }
+
+    /// A backend that refuses the fence fails the call with its own reason,
+    /// before any interpreter is started.
+    #[tokio::test]
+    async fn a_backend_that_cannot_honour_the_fence_refuses_the_code() {
+        let tool = CodeExecutionTool::new();
+        let ctx = ToolContext::new("user", "conv").with_execution_backends(
+            std::collections::HashMap::from([(
+                "staging".to_string(),
+                crate::gateway::config::ExecutionBackendConfig::Ssh {
+                    host: "build.example".to_string(),
+                    user: None,
+                    port: 22,
+                    key_path: None,
+                    extra_args: Vec::new(),
+                },
+            )]),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({ "code": "print(1)", "execution": "staging" }), &ctx)
+            .await
+            .expect("the tool answers");
+
+        assert!(!result.success, "{result:?}");
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("cannot honour a write fence"));
+    }
     use std::time::Instant;
 
     use super::*;
