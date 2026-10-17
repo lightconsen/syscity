@@ -452,7 +452,7 @@ impl Provider for OpenAiProvider {
 
         match request.kind {
             MediaKind::Image => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "model": request.model.clone().unwrap_or_else(|| "dall-e-3".to_string()),
                     "prompt": request.prompt,
                     "n": 1,
@@ -460,6 +460,13 @@ impl Provider for OpenAiProvider {
                     // to for this model, and the caller decides what to do with it.
                     "response_format": "url",
                 });
+                // The vendor hints, forwarded only when the caller set them.
+                if let Some(size) = &request.size {
+                    body["size"] = serde_json::json!(size);
+                }
+                if let Some(style) = &request.style {
+                    body["style"] = serde_json::json!(style);
+                }
 
                 let response: serde_json::Value = self
                     .gateway_client
@@ -484,7 +491,7 @@ impl Provider for OpenAiProvider {
             }
 
             MediaKind::Speech => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "model": request.model.clone().unwrap_or_else(|| "tts-1".to_string()),
                     "input": request.prompt,
                     "voice": request.voice.clone().unwrap_or_else(|| "alloy".to_string()),
@@ -492,6 +499,9 @@ impl Provider for OpenAiProvider {
                     // the caller is told the bytes are.
                     "response_format": request.format.clone().unwrap_or_else(|| "mp3".to_string()),
                 });
+                if let Some(speed) = request.speed {
+                    body["speed"] = serde_json::json!(speed);
+                }
 
                 let format = request.format.unwrap_or_else(|| "mp3".to_string());
                 let response = self
@@ -537,9 +547,35 @@ impl Provider for OpenAiProvider {
                     },
                     crate::model_router::gateway_client::MultipartPart::Text {
                         name: "response_format".to_string(),
+                        // Always JSON: the abstraction returns text either way,
+                        // so asking for the vendor's plain-text form would only
+                        // make the response harder to read.
                         value: "json".to_string(),
                     },
                 ];
+                let mut parts = parts;
+
+                // The vendor's hints, sent only when the caller set them.
+                if let Some(language) = request.language {
+                    parts.push(crate::model_router::gateway_client::MultipartPart::Text {
+                        name: "language".to_string(),
+                        value: language,
+                    });
+                }
+                if let Some(temperature) = request.temperature {
+                    parts.push(crate::model_router::gateway_client::MultipartPart::Text {
+                        name: "temperature".to_string(),
+                        value: temperature.to_string(),
+                    });
+                }
+                if !request.prompt.is_empty() {
+                    // For a transcription the prompt is a hint about spelling and
+                    // vocabulary, not the thing to be transcribed — the audio is.
+                    parts.push(crate::model_router::gateway_client::MultipartPart::Text {
+                        name: "prompt".to_string(),
+                        value: request.prompt.clone(),
+                    });
+                }
 
                 let response = self
                     .gateway_client

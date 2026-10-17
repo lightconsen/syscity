@@ -119,37 +119,23 @@ impl Tool for TtsTool {
                 .join(format!("tts_{}.mp3", uuid::Uuid::new_v4()))
         };
 
-        // Try OpenAI TTS API first
-        let api_key = context
-            .environment()
-            .get("OPENAI_API_KEY")
-            .cloned()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-        if let Some(api_key) = api_key {
-            let voice = args.voice.as_deref().unwrap_or("alloy");
+        // The configured provider first — the same one the agent uses, with its
+        // credential and fallback chain — and only then the local speech binary.
+        if let Some(provider) = context.media_provider().cloned() {
+            let voice = args.voice.clone().unwrap_or_else(|| "alloy".to_string());
             let speed = args.speed.unwrap_or(1.0).clamp(0.25, 4.0);
 
-            let body = serde_json::json!({
-                "model": "tts-1",
-                "input": args.text,
-                "voice": voice,
-                "speed": speed,
-            });
+            let mut request = crate::providers::media::MediaRequest::new(
+                crate::providers::media::MediaKind::Speech,
+                args.text.clone(),
+            );
+            request.voice = Some(voice.clone());
+            request.speed = Some(f64::from(speed));
 
-            let client = reqwest::Client::new();
-            let response = client
-                .post("https://api.openai.com/v1/audio/speech")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(60))
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Err(e) = tokio::fs::write(&output_path, &bytes).await {
+            match provider.generate_media(request).await {
+                Ok(response) => match response.output {
+                    crate::providers::media::MediaOutput::Bytes { data, .. } => {
+                        if let Err(e) = tokio::fs::write(&output_path, &data).await {
                             return Ok(ToolExecutionResult {
                                 success: false,
                                 output: String::new(),
@@ -159,7 +145,7 @@ impl Tool for TtsTool {
                             });
                         }
 
-                        info!("TTS audio generated via OpenAI: {:?}", output_path);
+                        info!("TTS audio generated via the configured provider: {:?}", output_path);
                         return Ok(ToolExecutionResult {
                             success: true,
                             output: format!("TTS audio saved: {}", output_path.display()),
@@ -168,18 +154,17 @@ impl Tool for TtsTool {
                                 "local_path": output_path.to_string_lossy(),
                                 "voice": voice,
                                 "speed": speed,
-                                "provider": "openai",
+                                "provider": provider.name(),
                             })),
                             execution_time: start.elapsed(),
                         });
                     }
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    warn!("OpenAI TTS API error: {}", status);
-                }
+                    other => {
+                        warn!("TTS provider answered with something other than audio: {:?}", other);
+                    }
+                },
                 Err(e) => {
-                    warn!("OpenAI TTS request failed: {}", e);
+                    warn!("TTS provider failed, falling back to local speech: {}", e);
                 }
             }
         }

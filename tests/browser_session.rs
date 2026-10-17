@@ -26,6 +26,7 @@ fn e2e_enabled() -> bool {
 
 fn tool_context() -> ToolContext {
     ToolContext {
+        media_provider: None,
         identity: ToolIdentity {
             user_id: "e2e".to_string(),
             conversation_id: "e2e".to_string(),

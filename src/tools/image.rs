@@ -305,164 +305,120 @@ impl Tool for ImageGenerateTool {
             }
         };
 
-        let api_key = context
-            .environment()
-            .get("OPENAI_API_KEY")
-            .cloned()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .or_else(|| context.environment().get("DALLE_API_KEY").cloned())
-            .or_else(|| std::env::var("DALLE_API_KEY").ok());
-
-        if api_key.is_none() {
+        // The configured provider, not an environment variable of this tool's
+        // own: media used to reach OpenAI directly, which meant it ignored the
+        // provider the agent was actually configured with — including its
+        // credential and its fallback chain.
+        let Some(provider) = context.media_provider().cloned() else {
             return Ok(ToolExecutionResult {
                 success: false,
                 output: String::new(),
                 error: Some(
-                    "No image generation API key found. Set OPENAI_API_KEY or DALLE_API_KEY."
+                    "Image generation needs a configured provider, and this context has none. \
+                     Run it in an agent turn, or configure a provider."
                         .to_string(),
                 ),
                 data: None,
                 execution_time: start.elapsed(),
             });
-        }
+        };
 
         let size = args.size.as_deref().unwrap_or("1024x1024");
-        let style = args.style.as_deref().unwrap_or("vivid");
 
-        // Build DALL-E 3 request
-        let body = serde_json::json!({
-            "model": "dall-e-3",
-            "prompt": args.prompt,
-            "size": size,
-            "style": style,
-            "n": 1,
-            "response_format": "url",
-        });
+        let mut request = crate::providers::media::MediaRequest::new(
+            crate::providers::media::MediaKind::Image,
+            args.prompt.clone(),
+        );
+        request.model = Some("dall-e-3".to_string());
+        request.size = Some(size.to_string());
+        request.style = args.style.clone();
 
-        let client = reqwest::Client::new();
-        #[allow(clippy::expect_used)] // None case handled by early return above
-        let api_key_str = api_key.expect("api_key presence checked above");
-        let response = client
-            .post("https://api.openai.com/v1/images/generations")
-            .header("Authorization", format!("Bearer {}", api_key_str))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await;
+        let response = match provider.generate_media(request).await {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(ToolExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Image generation failed: {}", e)),
+                    data: None,
+                    execution_time: start.elapsed(),
+                });
+            }
+        };
 
-        match response {
-            Ok(resp) => {
-                let status = resp.status();
-                let json: Value = match resp.json().await {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return Ok(ToolExecutionResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("Failed to parse API response: {}", e)),
-                            data: None,
-                            execution_time: start.elapsed(),
-                        });
-                    }
+        // The provider may answer with a link or with the image itself. Both are
+        // saved the same way, so which one arrived is nobody else's problem.
+        let (bytes, url) = match response.output {
+            crate::providers::media::MediaOutput::Bytes { data, .. } => (Some(data), None),
+            crate::providers::media::MediaOutput::Url(url) => {
+                // Downloading is best-effort: a link the agent can still hand on
+                // is a success even when this process cannot fetch it.
+                let bytes = match reqwest::get(&url).await {
+                    Ok(resp) => resp.bytes().await.ok().map(|bytes| bytes.to_vec()),
+                    Err(_) => None,
+                };
+                (bytes, Some(url))
+            }
+            crate::providers::media::MediaOutput::Text(_) => {
+                return Ok(ToolExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("the provider answered an image request with text".to_string()),
+                    data: None,
+                    execution_time: start.elapsed(),
+                });
+            }
+        };
+
+        match (bytes, url) {
+            (Some(bytes), url) => {
+                let output_path = if let Some(out) = args.output.clone() {
+                    context.resolve_path(std::path::Path::new(&out))
+                } else {
+                    context
+                        .workspace_root()
+                        .join(format!("generated_image_{}.png", uuid::Uuid::new_v4()))
                 };
 
-                if !status.is_success() {
-                    let error_msg = json
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown API error");
+                if let Err(e) = tokio::fs::write(&output_path, &bytes).await {
                     return Ok(ToolExecutionResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Image generation failed: {}", error_msg)),
-                        data: Some(json),
+                        error: Some(format!("Failed to save image: {}", e)),
+                        data: None,
                         execution_time: start.elapsed(),
                     });
                 }
 
-                let image_url = json
-                    .get("data")
-                    .and_then(|d| d.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|item| item.get("url"))
-                    .and_then(|u| u.as_str());
-
-                if let Some(url) = image_url {
-                    // Download the image
-                    let output_path = if let Some(out) = args.output {
-                        context.resolve_path(std::path::Path::new(&out))
-                    } else {
-                        context
-                            .workspace_root()
-                            .join(format!("generated_image_{}.png", uuid::Uuid::new_v4()))
-                    };
-
-                    match client.get(url).send().await {
-                        Ok(img_resp) => {
-                            if let Ok(bytes) = img_resp.bytes().await {
-                                if let Err(e) = tokio::fs::write(&output_path, &bytes).await {
-                                    return Ok(ToolExecutionResult {
-                                        success: false,
-                                        output: String::new(),
-                                        error: Some(format!("Failed to save image: {}", e)),
-                                        data: None,
-                                        execution_time: start.elapsed(),
-                                    });
-                                }
-
-                                info!("Image generated and saved: {:?}", output_path);
-                                Ok(ToolExecutionResult {
-                                    success: true,
-                                    output: format!("Image generated: {}", output_path.display()),
-                                    error: None,
-                                    data: Some(serde_json::json!({
-                                        "url": url,
-                                        "local_path": output_path.to_string_lossy(),
-                                        "prompt": args.prompt,
-                                        "size": size,
-                                    })),
-                                    execution_time: start.elapsed(),
-                                })
-                            } else {
-                                Ok(ToolExecutionResult {
-                                    success: true,
-                                    output: format!("Image generated (URL only): {}", url),
-                                    error: None,
-                                    data: Some(serde_json::json!({
-                                        "url": url,
-                                        "prompt": args.prompt,
-                                    })),
-                                    execution_time: start.elapsed(),
-                                })
-                            }
-                        }
-                        Err(e) => Ok(ToolExecutionResult {
-                            success: true,
-                            output: format!("Image generated (URL only): {}", url),
-                            error: Some(format!("Failed to download image: {}", e)),
-                            data: Some(serde_json::json!({
-                                "url": url,
-                                "prompt": args.prompt,
-                            })),
-                            execution_time: start.elapsed(),
-                        }),
-                    }
-                } else {
-                    Ok(ToolExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some("No image URL in API response".to_string()),
-                        data: Some(json),
-                        execution_time: start.elapsed(),
-                    })
-                }
+                info!("Image generated and saved: {:?}", output_path);
+                Ok(ToolExecutionResult {
+                    success: true,
+                    output: format!("Image generated: {}", output_path.display()),
+                    error: None,
+                    data: Some(serde_json::json!({
+                        "url": url,
+                        "local_path": output_path.to_string_lossy(),
+                        "prompt": args.prompt,
+                        "size": size,
+                    })),
+                    execution_time: start.elapsed(),
+                })
             }
-            Err(e) => Ok(ToolExecutionResult {
+            (None, Some(url)) => Ok(ToolExecutionResult {
+                success: true,
+                output: format!("Image generated (URL only): {}", url),
+                error: None,
+                data: Some(serde_json::json!({
+                    "url": url,
+                    "prompt": args.prompt,
+                    "size": size,
+                })),
+                execution_time: start.elapsed(),
+            }),
+            (None, None) => Ok(ToolExecutionResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("API request failed: {}", e)),
+                error: Some("image generation returned neither an image nor a URL".to_string()),
                 data: None,
                 execution_time: start.elapsed(),
             }),
@@ -552,8 +508,11 @@ mod tests {
         assert!(result.error.unwrap().contains("Invalid arguments"));
     }
 
+    /// With no provider on the context there is no way to generate anything —
+    /// and the tool says that, rather than falling back to reading an
+    /// environment variable of its own, which is what it used to do.
     #[tokio::test]
-    async fn test_image_generate_tool_no_api_key() {
+    async fn test_image_generate_tool_without_a_provider() {
         let tool = ImageGenerateTool::new();
         let ctx = ToolContext::new("user", "conv");
         let result = tool
@@ -562,9 +521,11 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap()
-            .contains("No image generation API key"));
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("needs a configured provider"), "{error}");
+        assert!(
+            !error.contains("API key"),
+            "the tool no longer asks for an environment variable of its own: {error}"
+        );
     }
 }

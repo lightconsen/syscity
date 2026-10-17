@@ -61,7 +61,7 @@ impl MediaKind {
 /// provider's default. Keeping one shape for all four kinds is what lets the
 /// trait carry one method instead of four, and the doc says which field belongs
 /// to which kind rather than leaving a caller to guess.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MediaRequest {
     /// What is being asked for.
     pub kind: MediaKind,
@@ -79,6 +79,33 @@ pub struct MediaRequest {
     /// The container to return (`Speech` only) — `mp3` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// The requested image size (`Image` only).
+    ///
+    /// A vendor hint rather than part of the abstraction: almost every image API
+    /// has some notion of it, and the spelling is theirs. A provider that does
+    /// not understand it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// The requested image style (`Image` only) — DALL·E's `vivid`/`natural`.
+    ///
+    /// A vendor hint for the same reason as [`size`](Self::size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// The spoken language, when the caller knows it (`Transcription` only).
+    ///
+    /// A hint that improves accuracy rather than a constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Sampling temperature (`Transcription` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Speaking rate (`Speech` only), `1.0` being normal.
+    ///
+    /// A vendor hint; the range a vendor accepts is its own. This is why
+    /// `MediaRequest` is `PartialEq` but not `Eq` — a float has no total
+    /// equality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
 }
 
 impl MediaRequest {

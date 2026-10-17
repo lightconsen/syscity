@@ -3,12 +3,10 @@
 //! tool for transcribing audio to text.
 //! Uses OpenAI Whisper API as the backend.
 
-use std::path::Path;
-
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{Tool, ToolContext, ToolExecutionResult};
 use crate::tools::sdk::ToolCapabilities;
@@ -38,31 +36,12 @@ struct SttArgs {
     /// Language code (e.g., "en", "zh") — auto-detected if not set
     #[serde(default)]
     language: Option<String>,
-    /// Response format: text, srt, vtt, json, verbose_json (default: text)
-    #[serde(default)]
-    response_format: Option<String>,
     /// Sampling temperature (0.0 - 1.0)
     #[serde(default)]
     temperature: Option<f32>,
     /// Optional context prompt to guide the transcription
     #[serde(default)]
     prompt: Option<String>,
-}
-
-/// Map file extension to a MIME type for the multipart upload.
-fn mime_for_ext(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("mp3") => "audio/mpeg",
-        Some("mp4") => "audio/mp4",
-        Some("m4a") => "audio/mp4",
-        Some("wav") => "audio/wav",
-        Some("webm") => "audio/webm",
-        Some("ogg") => "audio/ogg",
-        Some("flac") => "audio/flac",
-        Some("aiff") | Some("aif") => "audio/aiff",
-        Some("opus") => "audio/opus",
-        _ => "application/octet-stream",
-    }
 }
 
 #[async_trait]
@@ -94,12 +73,6 @@ impl Tool for SttTool {
                 "language": {
                     "type": "string",
                     "description": "Language code (e.g., 'en', 'zh'). Auto-detected if omitted."
-                },
-                "response_format": {
-                    "type": "string",
-                    "description": "Output format: text, srt, vtt, json, verbose_json",
-                    "default": "text",
-                    "enum": ["text", "srt", "vtt", "json", "verbose_json"]
                 },
                 "temperature": {
                     "type": "number",
@@ -157,124 +130,88 @@ impl Tool for SttTool {
             });
         }
 
-        // Try OpenAI Whisper API
-        let api_key = context
-            .environment()
-            .get("OPENAI_API_KEY")
-            .cloned()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-        if let Some(api_key) = api_key {
-            let model = args.model.as_deref().unwrap_or("whisper-1");
-            let response_format = args.response_format.as_deref().unwrap_or("text");
+        // The configured provider — the same one the agent uses, with its
+        // credential and fallback chain — rather than a second read of
+        // `OPENAI_API_KEY`.
+        let Some(provider) = context.media_provider().cloned() else {
+            return Ok(ToolExecutionResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Audio transcription needs a configured provider, and this context has none. \
+                     Run it in an agent turn, or configure a provider."
+                        .to_string(),
+                ),
+                data: None,
+                execution_time: start.elapsed(),
+            });
+        };
 
-            // Read the audio file
-            let audio_bytes = match tokio::fs::read(&audio_path).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    return Ok(ToolExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to read audio file: {}", e)),
-                        data: None,
-                        execution_time: start.elapsed(),
-                    });
-                }
-            };
-
-            let file_name = audio_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "audio.bin".to_string());
-
-            let mime = mime_for_ext(&audio_path);
-
-            // Build multipart form
-            let mut form = reqwest::multipart::Form::new()
-                .part(
-                    "file",
-                    reqwest::multipart::Part::bytes(audio_bytes)
-                        .file_name(file_name)
-                        .mime_str(mime)
-                        .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new())),
-                )
-                .text("model", model.to_string())
-                .text("response_format", response_format.to_string());
-
-            if let Some(lang) = &args.language {
-                form = form.text("language", lang.clone());
+        let audio_bytes = match tokio::fs::read(&audio_path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(ToolExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read audio file: {}", e)),
+                    data: None,
+                    execution_time: start.elapsed(),
+                });
             }
-            if let Some(temp) = args.temperature {
-                form = form.text("temperature", temp.to_string());
-            }
-            if let Some(prompt_text) = &args.prompt {
-                form = form.text("prompt", prompt_text.clone());
-            }
+        };
 
-            let client = reqwest::Client::new();
-            let response = client
-                .post("https://api.openai.com/v1/audio/transcriptions")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .multipart(form)
-                .timeout(std::time::Duration::from_secs(120))
-                .send()
-                .await;
+        // The container is inferred from the extension, so the file's own
+        // extension is what the provider should be told.
+        let extension = audio_path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| "mp3".to_string());
 
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    let text = resp.text().await.unwrap_or_default();
-                    info!("STT transcription completed via OpenAI Whisper");
+        let mut request = crate::providers::media::MediaRequest::new(
+            crate::providers::media::MediaKind::Transcription,
+            args.prompt.clone().unwrap_or_default(),
+        );
+        request.model = args.model.clone();
+        request.input = Some(audio_bytes);
+        request.format = Some(extension);
+        request.language = args.language.clone();
+        request.temperature = args.temperature.map(f64::from);
 
-                    return Ok(ToolExecutionResult {
+        return match provider.generate_media(request).await {
+            Ok(response) => match response.output {
+                crate::providers::media::MediaOutput::Text(text) => {
+                    info!("STT transcription completed via {}", provider.name());
+                    Ok(ToolExecutionResult {
                         success: true,
                         output: text.clone(),
                         error: None,
                         data: Some(serde_json::json!({
                             "text": text,
-                            "model": model,
-                            "provider": "openai_whisper",
+                            "model": args.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
+                            "provider": provider.name(),
                             "audio_file": audio_path.to_string_lossy(),
                         })),
                         execution_time: start.elapsed(),
-                    });
+                    })
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    warn!("OpenAI Whisper API error {}: {}", status, body);
-                    return Ok(ToolExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("OpenAI Whisper API returned {}: {}", status, body)),
-                        data: None,
-                        execution_time: start.elapsed(),
-                    });
-                }
-                Err(e) => {
-                    warn!("OpenAI Whisper request failed: {}", e);
-                    return Ok(ToolExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("OpenAI Whisper request failed: {}", e)),
-                        data: None,
-                        execution_time: start.elapsed(),
-                    });
-                }
-            }
-        }
-
-        // No API key available
-        Ok(ToolExecutionResult {
-            success: false,
-            output: String::new(),
-            error: Some(
-                "No STT provider available. Set OPENAI_API_KEY to use OpenAI Whisper API."
-                    .to_string(),
-            ),
-            data: Some(serde_json::json!({
-                "audio_file": audio_path.to_string_lossy(),
-            })),
-            execution_time: start.elapsed(),
-        })
+                other => Ok(ToolExecutionResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "the provider answered a transcription with something other than text: {other:?}"
+                    )),
+                    data: None,
+                    execution_time: start.elapsed(),
+                }),
+            },
+            Err(e) => Ok(ToolExecutionResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Transcription failed: {}", e)),
+                data: None,
+                execution_time: start.elapsed(),
+            }),
+        };
     }
 }
 
@@ -291,7 +228,6 @@ mod tests {
         assert_eq!(args.audio, "/tmp/test.mp3");
         assert_eq!(args.model, None);
         assert_eq!(args.language, None);
-        assert_eq!(args.response_format, None);
         assert_eq!(args.temperature, None);
         assert_eq!(args.prompt, None);
     }
@@ -302,7 +238,6 @@ mod tests {
             "audio": "/tmp/speech.wav",
             "model": "whisper-1",
             "language": "zh",
-            "response_format": "json",
             "temperature": 0.5,
             "prompt": "technical conversation"
         }))
@@ -310,7 +245,6 @@ mod tests {
         assert_eq!(args.audio, "/tmp/speech.wav");
         assert_eq!(args.model, Some("whisper-1".to_string()));
         assert_eq!(args.language, Some("zh".to_string()));
-        assert_eq!(args.response_format, Some("json".to_string()));
         assert_eq!(args.temperature, Some(0.5));
         assert_eq!(args.prompt, Some("technical conversation".to_string()));
     }
@@ -367,16 +301,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("No STT provider"));
-    }
-
-    #[test]
-    fn test_mime_for_ext() {
-        assert_eq!(mime_for_ext(Path::new("test.mp3")), "audio/mpeg");
-        assert_eq!(mime_for_ext(Path::new("test.wav")), "audio/wav");
-        assert_eq!(mime_for_ext(Path::new("test.ogg")), "audio/ogg");
-        assert_eq!(mime_for_ext(Path::new("test.flac")), "audio/flac");
-        assert_eq!(mime_for_ext(Path::new("test.m4a")), "audio/mp4");
-        assert_eq!(mime_for_ext(Path::new("test.unknown")), "application/octet-stream");
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("needs a configured provider"),
+            "with no provider the tool says so rather than reading an env var"
+        );
     }
 }
