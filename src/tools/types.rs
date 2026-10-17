@@ -207,6 +207,36 @@ impl SkillTrustCeiling {
 /// The execution context for a tool
 ///
 /// Groups fields into three sub-structs for construction ergonomics:
+/// A provider handle carried on the tool context, so a tool that needs to talk
+/// to the vendor directly — `image_generate`, `tts`, `stt` — uses the
+/// *configured* provider and its credential instead of reading an environment
+/// variable of its own.
+///
+/// A newtype because `ToolContext` derives `Debug` and [`Provider`] does not;
+/// a debug dump wants the provider's name, not its internals.
+#[derive(Clone)]
+pub struct MediaProvider(std::sync::Arc<dyn crate::providers::Provider>);
+
+impl MediaProvider {
+    /// Wrap a provider.
+    pub fn new(provider: std::sync::Arc<dyn crate::providers::Provider>) -> Self {
+        Self(provider)
+    }
+
+    /// The provider itself.
+    pub fn provider(&self) -> &std::sync::Arc<dyn crate::providers::Provider> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for MediaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("MediaProvider")
+            .field(&self.0.name())
+            .finish()
+    }
+}
+
 /// - `identity`: who is making the call (`user_id`, `conversation_id`, etc.)
 /// - `sandbox`: execution environment (working directory, timeouts, limits)
 /// - `model`: LLM / policy metadata (model name, capabilities, trust)
@@ -234,6 +264,12 @@ pub struct ToolContext {
     /// than the turn started with. `None` in contexts built outside an agent
     /// turn (tests, one-off tool use), where nothing can lower it.
     pub skill_trust_ceiling: Option<SkillTrustCeiling>,
+    /// The configured provider, for the tools that generate media.
+    ///
+    /// `None` outside an agent turn — a test or a one-off tool use has no
+    /// router — and those tools then say so rather than reaching for an
+    /// environment variable, which is what they used to do.
+    pub media_provider: Option<MediaProvider>,
 }
 
 /// Allowed environment variables that are safe to forward to child processes.
@@ -399,6 +435,20 @@ impl ToolContext {
 
     /// Attach the turn's skill-trust ceiling, so a tool that loads a
     /// community-trust skill can lower it for the rest of the turn.
+    /// Carry the configured provider onto the context, for the media tools.
+    pub fn with_media_provider(
+        mut self,
+        provider: std::sync::Arc<dyn crate::providers::Provider>,
+    ) -> Self {
+        self.media_provider = Some(MediaProvider::new(provider));
+        self
+    }
+
+    /// The configured provider, when this context has one.
+    pub fn media_provider(&self) -> Option<&std::sync::Arc<dyn crate::providers::Provider>> {
+        self.media_provider.as_ref().map(MediaProvider::provider)
+    }
+
     pub fn with_skill_trust_ceiling(mut self, ceiling: SkillTrustCeiling) -> Self {
         self.skill_trust_ceiling = Some(ceiling);
         self

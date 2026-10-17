@@ -22,6 +22,33 @@ use tracing::warn;
 
 use crate::model_router::Credential;
 
+/// One part of a multipart request.
+///
+/// Described rather than built, because the retry loop calls its closure more
+/// than once and a `reqwest::multipart::Form` is consumed when it is sent — so
+/// the form has to be rebuilt from owned data on every attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartPart {
+    /// A plain form field.
+    Text {
+        /// Field name.
+        name: String,
+        /// Field value.
+        value: String,
+    },
+    /// A file field.
+    File {
+        /// Field name.
+        name: String,
+        /// The filename the server should see.
+        filename: String,
+        /// The file's MIME type, when known.
+        mime: Option<String>,
+        /// The bytes.
+        data: Vec<u8>,
+    },
+}
+
 /// Trait abstracting an HTTP client for a single LLM backend.
 ///
 /// Implementors handle connection pooling, auth header injection,
@@ -52,6 +79,18 @@ pub trait GatewayClient: Send + Sync {
         &self,
         path: &str,
         body: &T,
+    ) -> crate::Result<reqwest::Response>;
+
+    /// POST a multipart body and return the raw `Response`.
+    ///
+    /// Takes a *description* of the parts rather than a built form, because
+    /// retries rebuild the request: a form is consumed when it is sent. Auth
+    /// headers, extra headers, retries and timeouts are applied as for the JSON
+    /// methods.
+    async fn post_multipart_streaming(
+        &self,
+        path: &str,
+        parts: &[MultipartPart],
     ) -> crate::Result<reqwest::Response>;
 
     /// Update the active credential (e.g. after token refresh or key rotation).
@@ -442,6 +481,65 @@ impl GatewayClient for HttpGatewayClient {
                 source: format!("Failed to read response body: {}", e),
                 cause: None,
             })
+    }
+
+    async fn post_multipart_streaming(
+        &self,
+        path: &str,
+        parts: &[MultipartPart],
+    ) -> crate::Result<reqwest::Response> {
+        let url = self.url(path);
+        let credential = self.credential.read().await.clone();
+        let (auth_name, auth_value) = self.auth_for_credential(&credential);
+        let timeout = *self.timeout.read().await;
+        let extra = self.extra_headers.clone();
+
+        self.execute_with_retry(|| {
+            let url = url.clone();
+            let auth_value = auth_value.clone();
+            let extra = extra.clone();
+            // Rebuilt on every attempt: a `Form` is consumed by `multipart()`,
+            // so a retry that reused one would send an empty body.
+            async move {
+                let mut form = reqwest::multipart::Form::new();
+                for part in parts {
+                    match part {
+                        MultipartPart::Text { name, value } => {
+                            form = form.text(name.clone(), value.clone());
+                        }
+                        MultipartPart::File { name, filename, mime, data } => {
+                            let mut piece = reqwest::multipart::Part::bytes(data.clone())
+                                .file_name(filename.clone());
+                            if let Some(mime) = mime {
+                                piece = piece.mime_str(mime).map_err(|e| {
+                                    crate::error::SyscityError::Validation(format!(
+                                        "unusable MIME type for multipart field {name}: {e}"
+                                    ))
+                                })?;
+                            }
+                            form = form.part(name.clone(), piece);
+                        }
+                    }
+                }
+
+                let mut builder = self
+                    .inner
+                    .post(&url)
+                    .timeout(timeout)
+                    .header(auth_name, auth_value);
+
+                for (name, value) in extra.iter() {
+                    builder = builder.header(name, value);
+                }
+
+                builder
+                    .multipart(form)
+                    .send()
+                    .await
+                    .map_err(crate::error::SyscityError::Http)
+            }
+        })
+        .await
     }
 
     async fn post_json_streaming<T: Serialize + Send + Sync>(

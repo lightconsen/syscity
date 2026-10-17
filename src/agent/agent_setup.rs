@@ -225,6 +225,9 @@ impl Agent {
             .with_fence_network(cfg.fence_network)
             .with_fence_namespaces(cfg.fence_namespaces)
             .with_execution_backends(cfg.execution_backends.clone())
+            // The media tools talk to the vendor through this, so they use the
+            // configured credential rather than an environment variable.
+            .with_media_provider(self.provider.clone())
             .with_model_name(self.model.clone().unwrap_or_default())
             .with_provider_name(self.provider.name().to_string())
             .with_sender_id(user_id);

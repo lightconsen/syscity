@@ -514,6 +514,54 @@ impl Provider for OpenAiProvider {
                 })
             }
 
+            MediaKind::Transcription => {
+                let Some(input) = request.input else {
+                    return Err(crate::error::SyscityError::Validation(
+                        "audio transcription needs the audio itself".to_string(),
+                    ));
+                };
+
+                let model = request.model.unwrap_or_else(|| "whisper-1".to_string());
+                let parts = vec![
+                    // The filename is not decoration: the vendor infers the
+                    // container from its extension.
+                    crate::model_router::gateway_client::MultipartPart::File {
+                        name: "file".to_string(),
+                        filename: format!("audio.{}", request.format.as_deref().unwrap_or("mp3")),
+                        mime: None,
+                        data: input,
+                    },
+                    crate::model_router::gateway_client::MultipartPart::Text {
+                        name: "model".to_string(),
+                        value: model,
+                    },
+                    crate::model_router::gateway_client::MultipartPart::Text {
+                        name: "response_format".to_string(),
+                        value: "json".to_string(),
+                    },
+                ];
+
+                let response = self
+                    .gateway_client
+                    .post_multipart_streaming(&self.url("/audio/transcriptions"), &parts)
+                    .await?;
+                let body: serde_json::Value = response.json().await.map_err(|e| {
+                    crate::error::SyscityError::ExternalService {
+                        source: format!("transcription response could not be read: {}", e),
+                        cause: None,
+                    }
+                })?;
+
+                let Some(text) = body.get("text").and_then(|text| text.as_str()) else {
+                    return Err(crate::error::SyscityError::ExternalService {
+                        source: format!("transcription returned no text: {}", body),
+                        cause: None,
+                    });
+                };
+
+                Ok(MediaResponse::text(text))
+            }
+
             // The default refusal, which names the provider and the kind.
             other => Err(crate::providers::media::unsupported(self.name(), other)),
         }
@@ -979,18 +1027,68 @@ mod tests {
             .is_err());
     }
 
-    /// Transcription is deliberately not implemented: the endpoint is multipart
-    /// and the retry loop cannot replay a one-shot form. It answers with the
-    /// default refusal rather than pretending.
+    /// Transcription goes through the multipart path, and the audio is the file
+    /// field — the vendor infers the container from the filename's extension.
     #[tokio::test]
-    async fn transcription_says_it_is_not_supported_yet() {
+    async fn transcription_sends_the_audio_as_a_file_field() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(wiremock::matchers::body_string_contains("name=\"file\""))
+            .and(wiremock::matchers::body_string_contains("filename=\"audio.wav\""))
+            .and(wiremock::matchers::body_string_contains("name=\"model\""))
+            .and(wiremock::matchers::body_string_contains("whisper-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello there" })),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("the-key", format!("{}/v1", server.uri()))
+            .expect("a provider");
+
+        let mut request = MediaRequest::new(MediaKind::Transcription, "");
+        request.input = Some(b"RIFF....WAVE".to_vec());
+        request.format = Some("wav".to_string());
+
+        let response = provider
+            .generate_media(request)
+            .await
+            .expect("a transcript");
+        match response.output {
+            MediaOutput::Text(text) => assert_eq!(text, "hello there"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// Audio is required, and a request without it is refused before any
+    /// network call rather than sending an empty file.
+    #[tokio::test]
+    async fn transcription_without_audio_is_refused() {
         let provider = OpenAiProvider::new("the-key").expect("a provider");
         let error = provider
             .generate_media(MediaRequest::new(MediaKind::Transcription, ""))
             .await
-            .expect_err("transcription is not implemented on this provider yet");
+            .expect_err("there is nothing to transcribe");
 
-        assert!(error.to_string().contains("audio transcription"), "{error}");
+        assert!(error.to_string().contains("needs the audio"), "{error}");
+    }
+
+    /// A provider that does not do media still says so — the default is not
+    /// bypassed by this implementation existing.
+    #[tokio::test]
+    async fn an_unsupported_kind_still_gets_the_default_refusal() {
+        let provider = OpenAiProvider::new("the-key").expect("a provider");
+        let error = provider
+            .generate_media(MediaRequest::new(MediaKind::Video, "a fox"))
+            .await
+            .expect_err("video is not implemented");
+
+        assert!(error.to_string().contains("video generation"), "{error}");
     }
     use super::*;
 

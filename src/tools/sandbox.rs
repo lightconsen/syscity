@@ -300,6 +300,7 @@ mod tests {
 
     fn dummy_context() -> ToolContext {
         ToolContext {
+            media_provider: None,
             identity: crate::tools::ToolIdentity {
                 user_id: "u1".to_string(),
                 conversation_id: "c1".to_string(),
