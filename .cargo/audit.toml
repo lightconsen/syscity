@@ -30,11 +30,13 @@ ignore = [
     # (0.6.6 via ppt-rs, 4.6.1 via tauri-plugin-updater, 8.6.0 via calamine /
     # docx-rs / rust_xlsxwriter, 2.4.2 direct), so there is no single version to
     # move to. Reachability was checked rather than assumed:
-    #   - Syscity itself never calls `extract()`: it reads named entries out of
-    #     an archive in memory (`ZipArchive::new`) or writes one
-    #     (`ZipWriter`), in src/office/*.
-    #   - Neither do calamine 0.36.1, docx-rs 0.4.22 or rust_xlsxwriter 0.99.0
-    #     (grepped for `.extract(`).
+    #   - Syscity itself never calls `extract()` anywhere (grepped): the plugin
+    #     installer reads entries by index and refuses them with
+    #     `enclosed_name()` (zip-slip), the RAG loader reads named entries, and
+    #     the catalog tests write archives (`ZipWriter`). The office converters
+    #     that used three more zip copies are gone, so the graph now holds two.
+    #   - The office crates that carried zip 8.6.0 (calamine, docx-rs,
+    #     rust_xlsxwriter) and zip 0.6.6 (ppt-rs) are no longer dependencies.
     #   - tauri-plugin-updater 2.10.1 does — `updater.rs:904`, from
     #     `extract_zip` — but that path is Windows-only and runs only after
     #     `verify_signature()` at `:712`, so reaching it needs a validly signed

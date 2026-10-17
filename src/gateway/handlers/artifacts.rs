@@ -15,127 +15,13 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, StatusCode},
     response::IntoResponse,
 };
 
 use crate::dirs::SyscityPaths;
 use crate::gateway::GatewayState;
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ArtifactExportQuery {
-    /// Export conversion target (currently only "pptx" for slides canvases).
-    to: Option<String>,
-}
-
-/// Resolve a canvas `<img src>` to bytes, relative to the artifact's own
-/// directory. Anything escaping that directory is skipped (the converter
-/// drops the image rather than failing the export).
-struct ArtifactImageResolver {
-    base: std::path::PathBuf,
-}
-
-impl crate::office::slides::ImageResolver for ArtifactImageResolver {
-    fn resolve(&self, src: &str) -> Option<(Vec<u8>, String)> {
-        if src.starts_with('/') || src.contains("..") || src.starts_with("http") {
-            return None;
-        }
-        let path = self.base.join(src);
-        let canon = path.canonicalize().ok()?;
-        if !canon.starts_with(&self.base) {
-            return None;
-        }
-        let bytes = std::fs::read(&canon).ok()?;
-        let format = canon
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("png")
-            .trim_start_matches('.')
-            .to_string();
-        Some((bytes, format))
-    }
-}
-
-/// Convert an authored-HTML artifact to a real Office file download.
-///
-/// `target` is one of "pptx" | "docx" | "xlsx". The conversion is CPU-bound
-/// and synchronous (HTML parse + OOXML zip), so it runs off the async runtime.
-async fn export_document(
-    file_path: std::path::PathBuf,
-    filename: String,
-    target: &str,
-) -> axum::response::Response {
-    let html = match tokio::fs::read_to_string(&file_path).await {
-        Ok(c) => c,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                "Document not found".to_string(),
-            )
-                .into_response();
-        }
-    };
-
-    let base = file_path.parent().map(|p| p.to_path_buf());
-    let title = filename.clone();
-    let target_owned = target.to_string();
-    let result = tokio::task::spawn_blocking(move || match target_owned.as_str() {
-        "pptx" => {
-            let resolver = ArtifactImageResolver { base: base.unwrap_or_default() };
-            crate::office::slides::canvas_html_to_pptx(&html, &title, &resolver)
-        }
-        "docx" => {
-            let resolver = ArtifactImageResolver {
-                base: base.clone().unwrap_or_default(),
-            };
-            crate::office::docx::flow_html_to_docx(&html, &resolver)
-        }
-        "xlsx" => crate::office::xlsx::tables_html_to_xlsx(&html),
-        _ => Err(format!("unsupported export target '{target_owned}'")),
-    })
-    .await;
-
-    match result {
-        Ok(Ok(bytes)) => {
-            let stem = filename.trim_end_matches(".html").trim_end_matches(".md");
-            let download_name = format!("{stem}.{target}");
-            let content_type = match target {
-                "pptx" => {
-                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                }
-                "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                _ => "application/octet-stream",
-            };
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, content_type.to_string()),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{download_name}\""),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response()
-        }
-        Ok(Err(e)) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("Conversion failed: {e}"),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("Conversion panicked: {e}"),
-        )
-            .into_response(),
-    }
-}
 
 /// Resolve a request path to its on-disk location, honoring the `@owner`
 /// prefix for agent-workspace artifacts and falling back to the legacy global
@@ -211,16 +97,14 @@ fn resolve_artifact_path(paths: &SyscityPaths, path: &str) -> Option<std::path::
     Some(full)
 }
 
-/// GET /api/v1/artifacts/*path  (+ `?to=pptx` for on-demand conversion)
+/// GET /api/v1/artifacts/*path
 ///
 /// Reads a document from the resolved artifacts location and returns it with
 /// the appropriate Content-Type (text/markdown for .md, text/html for .html).
-/// With `?to=pptx|docx|xlsx` the document must be authored HTML and the
 /// response is the converted Office file download instead of the source.
 pub async fn artifact_handler(
     State(state): State<Arc<GatewayState>>,
     Path(path): Path<String>,
-    Query(query): Query<ArtifactExportQuery>,
 ) -> impl IntoResponse {
     let Some(file_path) = resolve_artifact_path(&state.paths, &path) else {
         return (
@@ -235,23 +119,6 @@ pub async fn artifact_handler(
     // fails on Unicode filenames due to NFC/NFD normalization differences
     // between the HTTP-decoded path and the filesystem-stored path.
     // The write_report tool already validates paths server-side.
-
-    if let Some(to) = &query.to {
-        if matches!(to.as_str(), "pptx" | "docx" | "xlsx") {
-            let filename = path
-                .rsplit('/')
-                .next()
-                .unwrap_or("document.html")
-                .to_string();
-            return export_document(file_path, filename, to).await;
-        }
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("Unsupported export target '{to}' (supported: pptx, docx, xlsx)"),
-        )
-            .into_response();
-    }
 
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => {
@@ -283,16 +150,8 @@ mod tests {
         Arc::new(make_test_state(GatewayConfig::default()).await)
     }
 
-    fn query(to: Option<&str>) -> Query<ArtifactExportQuery> {
-        Query(ArtifactExportQuery { to: to.map(str::to_string) })
-    }
-
-    async fn get(
-        state: &Arc<GatewayState>,
-        path: &str,
-        to: Option<&str>,
-    ) -> axum::response::Response {
-        artifact_handler(State(state.clone()), Path(path.to_string()), query(to))
+    async fn get(state: &Arc<GatewayState>, path: &str) -> axum::response::Response {
+        artifact_handler(State(state.clone()), Path(path.to_string()))
             .await
             .into_response()
     }
@@ -311,7 +170,7 @@ mod tests {
             "a\\..\\b.md",
             "./a.md",
         ] {
-            let resp = get(&state, bad, None).await;
+            let resp = get(&state, bad).await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "should reject {:?}", bad);
         }
     }
@@ -332,7 +191,7 @@ mod tests {
         let _ = tokio::fs::remove_file(&link).await;
         tokio::fs::symlink(&outside, &link).await.unwrap();
         assert_eq!(
-            get(&state, "leak.md", None).await.status(),
+            get(&state, "leak.md").await.status(),
             StatusCode::FORBIDDEN,
             "a symlink inside the root must not be followed out of it"
         );
@@ -341,7 +200,7 @@ mod tests {
         let absolute = root.join("hosts.md");
         let _ = tokio::fs::remove_file(&absolute).await;
         tokio::fs::symlink("/etc/hosts", &absolute).await.unwrap();
-        assert_eq!(get(&state, "hosts.md", None).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(get(&state, "hosts.md").await.status(), StatusCode::FORBIDDEN);
     }
 
     /// A symlinked *directory* is the same escape one level up: the join stays
@@ -360,10 +219,7 @@ mod tests {
         let link = root.join("outdir");
         let _ = tokio::fs::remove_file(&link).await;
         tokio::fs::symlink(outside, &link).await.unwrap();
-        assert_eq!(
-            get(&state, "outdir/outside-secret.md", None).await.status(),
-            StatusCode::FORBIDDEN
-        );
+        assert_eq!(get(&state, "outdir/outside-secret.md").await.status(), StatusCode::FORBIDDEN);
     }
 
     /// A name the caller sends in a different Unicode form than the one on
@@ -378,7 +234,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = get(&state, "baogao-报告.md", None).await;
+        let resp = get(&state, "baogao-报告.md").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("报告"));
@@ -395,7 +251,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = get(&state, "root-t/task-t/r.md", None).await;
+        let resp = get(&state, "root-t/task-t/r.md").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("# hi from tree"));
@@ -412,7 +268,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = get(&state, "@default/ws-test.md", None).await;
+        let resp = get(&state, "@default/ws-test.md").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("# hi from workspace"));
@@ -422,87 +278,8 @@ mod tests {
     async fn test_owner_segment_validated() {
         let state = state().await;
         for bad in ["@../x.md", "@a.b/x.md", "@default"] {
-            let resp = get(&state, bad, None).await;
+            let resp = get(&state, bad).await;
             assert_ne!(resp.status(), StatusCode::OK, "should not serve {:?}", bad);
         }
-    }
-
-    #[tokio::test]
-    async fn test_slides_export_returns_pptx() {
-        let state = state().await;
-        let dir = state.paths.artifacts_dir();
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(
-            dir.join("export-deck.html"),
-            r#"<div class="slide"><div style="position:absolute;left:80px;top:60px;width:1120px">标题页</div></div>"#,
-        )
-        .await
-        .unwrap();
-
-        let resp = get(&state, "export-deck.html", Some("pptx")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        assert!(ct.contains("presentationml"), "content-type: {ct}");
-        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        // A pptx is a zip package.
-        assert_eq!(&body[..2], b"PK");
-    }
-
-    #[tokio::test]
-    async fn test_docx_and_xlsx_export() {
-        let state = state().await;
-        let dir = state.paths.artifacts_dir();
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("export-doc.html"), "<h1>标题</h1><p>正文</p>")
-            .await
-            .unwrap();
-        tokio::fs::write(
-            dir.join("export-sheet.html"),
-            "<table><thead><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>",
-        )
-        .await
-        .unwrap();
-
-        let docx = get(&state, "export-doc.html", Some("docx")).await;
-        assert_eq!(docx.status(), StatusCode::OK);
-        let ct = docx
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        assert!(ct.contains("wordprocessingml"), "content-type: {ct}");
-        let body = axum::body::to_bytes(docx.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(&body[..2], b"PK");
-
-        let xlsx = get(&state, "export-sheet.html", Some("xlsx")).await;
-        assert_eq!(xlsx.status(), StatusCode::OK);
-        let ct = xlsx
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        assert!(ct.contains("spreadsheetml"), "content-type: {ct}");
-        let body = axum::body::to_bytes(xlsx.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        assert_eq!(&body[..2], b"PK");
-    }
-
-    #[tokio::test]
-    async fn test_export_rejects_unknown_target() {
-        let state = state().await;
-        let resp = get(&state, "x.md", Some("pdf")).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -189,13 +189,9 @@ jsonwebtoken = { version = "11", optional = true, features = ["rust_crypto"] }
 
 # TUI code-block syntax highlighting.
 #
-# Already in the tree transitively (`ppt-rs` → `pdfrs` enables syntect's
-# `default-fancy`), so this adds no crate, no feature and no compile time —
-# Cargo unions features, and the binary already carries the syntax dumps the
-# crate `include_bytes!`s. Declared with the minimum *we* use rather than
-# `default-fancy`, so that if `pdfrs` ever stops pulling it, we keep only
-# what highlighting needs: no `onig` (C), no theme dump (the theme is
-# synthesised from our own palette), no plist/yaml loaders, no html.
+# Declared with the minimum *we* use rather than `default-fancy`: no `onig`
+# (C), no theme dump (the theme is synthesised from our own palette), no
+# plist/yaml loaders, no html.
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 
 # WeChat Official Account (wechatmp) encrypted-message protocol
@@ -223,10 +219,6 @@ cpal = "0.15"
 rust-embed = { version = "8", optional = true }
 pdf-extract = "0.7"
 
-# Office document generation (canvas-HTML → OOXML converters)
-ppt-rs = "0.2"
-docx-rs = "0.4"
-rust_xlsxwriter = "0.99"
 scraper = "0.27"
 
 # SVG rasterization
@@ -416,8 +408,6 @@ rsa = "0.9"
 # Signing that token with the same crate the library verifies with, so the e2e
 # exercises the real construction rather than a hand-rolled one.
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-# Read-back verification of generated xlsx in converter tests
-calamine = "0.36"
 
 # Concurrency control for tests
 serial_test = "3.0"

@@ -13,7 +13,7 @@ ignore = [
     # Three zip advisories about `extract()` (symlinks + SUID bits). Syscity reads
     # entries in memory and never extracts; the only caller of `extract()` in the
     # tree is tauri-plugin-updater, Windows-only and after signature verification.
-    # Fixed in zip >= 9.0.0, which four dependents pin below.
+    # Removing the office converters dropped the graph from four zip copies to two.
     { id = "RUSTSEC-2026-0367", reason = "zip extract()-only advisory; syscity never extracts (reads entries in memory); only caller is tauri-plugin-updater, Windows-only and post-signature-verification" },
     { id = "RUSTSEC-2026-0368", reason = "zip extract()-only advisory; syscity never extracts; safe by the same analysis as RUSTSEC-2026-0367" },
     { id = "RUSTSEC-2026-0369", reason = "zip extract()-only advisory; syscity never extracts; safe by the same analysis as RUSTSEC-2026-0367" },
