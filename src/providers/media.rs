@@ -99,6 +99,17 @@ pub struct MediaRequest {
     /// Sampling temperature (`Transcription` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// How long the video should be, in seconds (`Video` only).
+    ///
+    /// A vendor hint: each model clamps to the range it supports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    /// The output aspect ratio (`Video` only), e.g. `16:9`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    /// The output resolution (`Video` only), e.g. `720p`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
     /// Speaking rate (`Speech` only), `1.0` being normal.
     ///
     /// A vendor hint; the range a vendor accepts is its own. This is why

@@ -245,6 +245,11 @@ impl OpenAiProvider {
     }
 }
 
+/// How long a video job is given before the wait is abandoned.
+const VIDEO_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long to wait between checks on a video job.
+const VIDEO_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The MIME type for the container the vendor was asked for.
 ///
 /// The caller is told what the bytes are, so the label has to follow the format
@@ -598,8 +603,112 @@ impl Provider for OpenAiProvider {
                 Ok(MediaResponse::text(text))
             }
 
-            // The default refusal, which names the provider and the kind.
-            other => Err(crate::providers::media::unsupported(self.name(), other)),
+            MediaKind::Video => {
+                // Video is not one request: the vendor accepts a job, reports
+                // progress, and serves the result once it is done. The paths are
+                // the OpenRouter-style contract (`/videos`, `/videos/{id}`,
+                // `/videos/{id}/content`), which DeepInfra's OpenAI-compatible
+                // surface mirrors under a different prefix — a per-vendor media
+                // path is the follow-up, not something to guess here.
+                let mut body = serde_json::json!({
+                    "model": request.model.clone().unwrap_or_else(|| "minimax/hailuo-3-max".to_string()),
+                    "prompt": request.prompt,
+                });
+                if let Some(duration) = request.duration {
+                    body["duration"] = serde_json::json!(duration);
+                }
+                if let Some(aspect_ratio) = &request.aspect_ratio {
+                    body["aspect_ratio"] = serde_json::json!(aspect_ratio);
+                }
+                if let Some(resolution) = &request.resolution {
+                    body["resolution"] = serde_json::json!(resolution);
+                }
+
+                let submitted: serde_json::Value = self
+                    .gateway_client
+                    .post_json(&self.url("/videos"), &body)
+                    .await?;
+                let Some(job_id) = submitted.get("id").and_then(|id| id.as_str()) else {
+                    return Err(crate::error::SyscityError::ExternalService {
+                        source: format!("video submit returned no job id: {}", submitted),
+                        cause: None,
+                    });
+                };
+
+                let deadline = std::time::Instant::now() + VIDEO_POLL_DEADLINE;
+                // Assigned at the top of every loop iteration, before any read.
+                let mut last_status;
+                loop {
+                    let job: serde_json::Value = {
+                        let response = self
+                            .gateway_client
+                            .get(&self.url(&format!("/videos/{}", job_id)))
+                            .await?;
+                        response.json().await.map_err(|e| {
+                            crate::error::SyscityError::ExternalService {
+                                source: format!("video job status could not be read: {}", e),
+                                cause: None,
+                            }
+                        })?
+                    };
+
+                    last_status = job
+                        .get("status")
+                        .and_then(|status| status.as_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+
+                    match last_status.as_str() {
+                        "completed" => break,
+                        "failed" | "cancelled" | "canceled" | "expired" => {
+                            let detail = job
+                                .get("error")
+                                .and_then(|error| error.as_str())
+                                .unwrap_or("no reason given");
+                            return Err(crate::error::SyscityError::ExternalService {
+                                source: format!("video job ended {}: {}", last_status, detail),
+                                cause: None,
+                            });
+                        }
+                        _ => {}
+                    }
+
+                    // A video takes minutes, so this waits rather than polls
+                    // hot — but it has a deadline, because a job that never
+                    // finishes must not hold an agent turn open for ever.
+                    if std::time::Instant::now() >= deadline {
+                        return Err(crate::error::SyscityError::ExternalService {
+                            source: format!(
+                                "video job {} did not finish within {}s (last status: {})",
+                                job_id,
+                                VIDEO_POLL_DEADLINE.as_secs(),
+                                last_status
+                            ),
+                            cause: None,
+                        });
+                    }
+                    tokio::time::sleep(VIDEO_POLL_INTERVAL).await;
+                }
+
+                let response = self
+                    .gateway_client
+                    .get(&self.url(&format!("/videos/{}/content", job_id)))
+                    .await?;
+                let data = response.bytes().await.map_err(|e| {
+                    crate::error::SyscityError::ExternalService {
+                        source: format!("video content could not be read: {}", e),
+                        cause: None,
+                    }
+                })?;
+
+                Ok(MediaResponse {
+                    output: MediaOutput::Bytes {
+                        data: data.to_vec(),
+                        mime: Some("video/mp4".to_string()),
+                    },
+                    model: None,
+                })
+            }
         }
     }
 
@@ -977,6 +1086,90 @@ impl Stream for OpenAiStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// Video is a job, not a request: submit, poll, then fetch the content. The
+    /// paths are the OpenRouter-style contract.
+    #[tokio::test]
+    async fn video_submits_polls_and_fetches_the_content() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/videos"))
+            .and(wiremock::matchers::body_string_contains("a fox running"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "job-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/job-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "completed" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/job-1/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ftypisom".to_vec()))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("the-key", format!("{}/v1", server.uri()))
+            .expect("a provider");
+
+        let mut request = MediaRequest::new(MediaKind::Video, "a fox running");
+        request.duration = Some(8);
+        request.aspect_ratio = Some("16:9".to_string());
+
+        let response = provider.generate_media(request).await.expect("a video");
+        match response.output {
+            MediaOutput::Bytes { data, mime } => {
+                assert_eq!(data, b"ftypisom");
+                assert_eq!(mime.as_deref(), Some("video/mp4"));
+            }
+            other => panic!("expected bytes, got {other:?}"),
+        }
+    }
+
+    /// A job that ends badly is an error with the vendor's own reason, not an
+    /// empty success or a hang.
+    #[tokio::test]
+    async fn a_failed_video_job_reports_the_reason() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/videos"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": "job-2" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/job-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "failed",
+                "error": "the model is unavailable"
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("the-key", format!("{}/v1", server.uri()))
+            .expect("a provider");
+
+        let error = provider
+            .generate_media(MediaRequest::new(MediaKind::Video, "a fox"))
+            .await
+            .expect_err("a failed job is an error");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("failed"), "{rendered}");
+        assert!(rendered.contains("the model is unavailable"), "{rendered}");
+    }
     use crate::providers::media::{MediaKind, MediaOutput, MediaRequest};
 
     /// Media rides the same gateway client as chat, which is the whole point: an
@@ -1114,17 +1307,23 @@ mod tests {
         assert!(error.to_string().contains("needs the audio"), "{error}");
     }
 
-    /// A provider that does not do media still says so — the default is not
-    /// bypassed by this implementation existing.
-    #[tokio::test]
-    async fn an_unsupported_kind_still_gets_the_default_refusal() {
-        let provider = OpenAiProvider::new("the-key").expect("a provider");
-        let error = provider
-            .generate_media(MediaRequest::new(MediaKind::Video, "a fox"))
-            .await
-            .expect_err("video is not implemented");
-
-        assert!(error.to_string().contains("video generation"), "{error}");
+    /// Every kind this provider offers is implemented, so there is no
+    /// catch-all left to exercise. The default refusal itself is covered where
+    /// it lives, against a provider that really does not do media.
+    #[test]
+    fn every_media_kind_is_implemented_here() {
+        // A compile-time reminder more than a runtime one: if a kind is added to
+        // `MediaKind`, this file stops compiling until it is handled.
+        fn handles(kind: MediaKind) -> bool {
+            matches!(
+                kind,
+                MediaKind::Image | MediaKind::Speech | MediaKind::Transcription | MediaKind::Video
+            )
+        }
+        assert!(handles(MediaKind::Image));
+        assert!(handles(MediaKind::Speech));
+        assert!(handles(MediaKind::Transcription));
+        assert!(handles(MediaKind::Video));
     }
     use super::*;
 

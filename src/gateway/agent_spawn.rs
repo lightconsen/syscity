@@ -1208,6 +1208,7 @@ pub(crate) async fn create_default_tool_registry(
     // Register image tools
     registry.register(Box::new(ImageTool::new()));
     registry.register(Box::new(ImageGenerateTool::new()));
+    registry.register(Box::new(crate::tools::VideoGenerateTool::new()));
 
     // Register TTS tool
     registry.register(Box::new(TtsTool::new()));

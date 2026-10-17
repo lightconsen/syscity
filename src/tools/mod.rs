@@ -11,6 +11,7 @@ pub mod eval;
 pub mod metadata;
 pub mod permissions;
 pub mod target_lock;
+pub mod video;
 
 // Re-export approval types for convenience
 pub use approval::{
@@ -137,6 +138,7 @@ pub use time::TimeTool;
 pub use todo_tool::{TodoState, TodoTool};
 pub use tts::TtsTool;
 pub use update_plan::UpdatePlanTool;
+pub use video::VideoGenerateTool;
 pub use web::{WebFetchTool, WebSearchTool};
 pub use write_guard::{WriteGuard, WriteGuardError};
 
