@@ -9,7 +9,7 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
-## [Unreleased]
+## [0.3.11] - 2026-10-18
 
 ### Removed
 
