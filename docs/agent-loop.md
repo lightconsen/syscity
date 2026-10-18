@@ -72,8 +72,9 @@ Two structured sources can be filed automatically:
 - `docs/risk-register.md` — open rows (marked ⏳) become issues with
   `--source risk`.
 
-The gaps in `hermes-diffs.local.md` are filed by hand: that file is gitignored,
-so CI and the seeder never see it.
+Gaps recorded in a local comparison note are filed by hand: such a note is
+gitignored, so CI and the seeder never see it. This repository's own comparison
+note has since been folded into the planning document it produced.
 
 ## Running it by hand
 
