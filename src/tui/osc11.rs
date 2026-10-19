@@ -135,7 +135,6 @@ pub fn env_hint() -> Option<ThemeId> {
 pub fn query_background(timeout: Duration) -> Option<ThemeId> {
     use std::io::Write;
     use std::os::fd::AsFd as _;
-    use std::os::fd::AsRawFd;
 
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::unistd::read;
@@ -149,7 +148,7 @@ pub fn query_background(timeout: Duration) -> Option<ThemeId> {
     // 2. Wait for the reply, up to `timeout`.
     let stdin = std::io::stdin();
     // `PollFd` takes a `BorrowedFd` rather than `AsFd`, and the timeout is a
-    // `PollTimeout` rather than an `i32` — both are nix 0.28's shape.
+    // `PollTimeout` rather than an `i32`.
     let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
     let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
     let ready = poll(&mut fds, PollTimeout::try_from(millis).ok()?).ok()?;
@@ -159,7 +158,7 @@ pub fn query_background(timeout: Duration) -> Option<ThemeId> {
 
     // 3. One framed reply fits comfortably in a KiB.
     let mut buf = [0u8; 1024];
-    let n = read(stdin.as_raw_fd(), &mut buf).ok()?;
+    let n = read(stdin.as_fd(), &mut buf).ok()?;
     let bg = parse_response(&buf[..n])?;
     Some(if bg.is_light() {
         ThemeId::Light
