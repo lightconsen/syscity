@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Default token: the branch push below needs only `contents: write`,
           # which this workflow already declares. The PAT is reserved for
@@ -289,7 +289,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-nightly-${{ github.run_number }}
           path: |
