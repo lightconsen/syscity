@@ -8417,7 +8417,7 @@ dependencies = [
  "glob",
  "hex",
  "hf-hub",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "image",
  "insta",
  "ipnet",
