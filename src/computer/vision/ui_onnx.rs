@@ -70,7 +70,8 @@ const CLASS_ROLES: [&str; 10] = [
 impl OmniParserDetector {
     /// Create a detector from an ONNX model file.
     pub fn new(model_path: &str) -> crate::Result<Self> {
-        let model = ort::session::Session::builder()
+        let env = super::ort_environment()?;
+        let model = ort::session::Session::builder(env)
             .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| {

@@ -48,14 +48,15 @@ impl RapidOcr {
     /// * `rec_path` — path to the recognition ONNX model
     /// * `cls_path` — optional path to the classification ONNX model
     pub fn new(det_path: &str, rec_path: &str, cls_path: Option<&str>) -> crate::Result<Self> {
-        let det_model = ort::session::Session::builder()
+        let env = super::ort_environment()?;
+        let det_model = ort::session::Session::builder(env)
             .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
             .commit_from_file(det_path)
             .map_err(|e| {
                 SyscityError::Internal(format!("Failed to load detection model: {}", e))
             })?;
 
-        let rec_model = ort::session::Session::builder()
+        let rec_model = ort::session::Session::builder(env)
             .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
             .commit_from_file(rec_path)
             .map_err(|e| {
@@ -64,7 +65,7 @@ impl RapidOcr {
 
         let cls_model = match cls_path {
             Some(p) => Some(
-                ort::session::Session::builder()
+                ort::session::Session::builder(env)
                     .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
                     .commit_from_file(p)
                     .map_err(|e| {

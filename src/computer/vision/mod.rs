@@ -41,6 +41,32 @@ pub mod ui_onnx;
 #[cfg(feature = "vision")]
 mod preprocess;
 
+/// The process-wide ONNX Runtime environment.
+///
+/// ort 2.0.0-rc.14 made the environment an explicit argument to
+/// `Session::builder`, and ONNX Runtime allows only one environment per
+/// process, so both vision backends share this one.
+#[cfg(feature = "vision")]
+pub(crate) fn ort_environment() -> crate::Result<&'static ort::environment::Environment> {
+    use std::sync::OnceLock;
+
+    use crate::error::SyscityError;
+
+    static ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+
+    if ENV.get().is_none() {
+        let env = ort::init()
+            .build()
+            .map_err(|e| SyscityError::Internal(format!("ORT environment error: {}", e)))?;
+        // Err means another thread initialized the environment first; that
+        // one is the process-wide environment either way.
+        let _ = ENV.set(env);
+    }
+
+    ENV.get()
+        .ok_or_else(|| SyscityError::Internal("ORT environment not initialized".to_string()))
+}
+
 #[cfg(feature = "vision")]
 pub use model_download::{resolve_or_download_vision_models, VisionModelPaths};
 #[cfg(feature = "vision")]
