@@ -219,7 +219,7 @@ fn run_cpal_capture(
     };
 
     let config = device.default_input_config()?;
-    let sample_rate = config.sample_rate().0;
+    let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
 
     info!("Audio capture started: {} @ {} Hz, {} channels", source, sample_rate, channels);
@@ -228,7 +228,7 @@ fn run_cpal_capture(
     let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Vec<f32>>();
     let running_for_callback = running.clone();
 
-    let err_fn = move |err: cpal::StreamError| {
+    let err_fn = move |err: cpal::Error| {
         error!("Audio stream error: {}", err);
     };
 
@@ -236,7 +236,7 @@ fn run_cpal_capture(
     // through a std::sync::mpsc channel — no unsafe required.
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.into(),
+            config.clone().into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if !running_for_callback.load(Ordering::SeqCst) {
                     return;
@@ -253,7 +253,7 @@ fn run_cpal_capture(
         cpal::SampleFormat::I16 => {
             let max = i16::MAX as f32;
             device.build_input_stream(
-                &config.into(),
+                config.clone().into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     if !running_for_callback.load(Ordering::SeqCst) {
                         return;
@@ -272,7 +272,7 @@ fn run_cpal_capture(
             let offset = u16::MAX as f32 / 2.0;
             let scale = offset;
             device.build_input_stream(
-                &config.into(),
+                config.clone().into(),
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     if !running_for_callback.load(Ordering::SeqCst) {
                         return;
