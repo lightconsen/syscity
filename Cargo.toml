@@ -200,7 +200,7 @@ cbc = { version = "0.1", optional = true }
 roxmltree = "0.21"
 
 # Secure secret handling
-zeroize = { version = "1.7", features = ["derive"] }
+zeroize = { version = "1.9", features = ["derive"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
 
 # Encrypted file-store fallback (AES-256-GCM)
