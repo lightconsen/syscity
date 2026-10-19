@@ -12,17 +12,17 @@
   },
   "dependencies": {
     "lucide-react": "^1.57.0",
-    "react": "^19.3.0",
-    "react-dom": "^19.2.7"
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.2.0",
-    "@vitejs/plugin-react": "^4.3.0",
-    "postcss": "^8.4.49",
+    "@vitejs/plugin-react": "^5.2.0",
+    "postcss": "^8.5.29",
     "tailwindcss": "^4.3.1",
-    "typescript": "^5.7.0",
+    "typescript": "^7.0.2",
     "vite": "^6.0.0"
   },
   "pnpm": {
