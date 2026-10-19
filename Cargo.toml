@@ -217,7 +217,7 @@ cpal = "0.18"
 
 # Embed frontend assets into binary for single-file distribution (optional)
 rust-embed = { version = "8", optional = true }
-pdf-extract = "0.7"
+pdf-extract = "0.12"
 
 scraper = "0.27"
 
