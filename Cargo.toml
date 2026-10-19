@@ -75,7 +75,7 @@ anyhow = "1.0"
 
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }
-rustyline = { version = "14.0", default-features = false }
+rustyline = { version = "17.0", default-features = false }
 dialoguer = { version = "0.11", default-features = false, features = ["password"] }
 
 # Serialization
