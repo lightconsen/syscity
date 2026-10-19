@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(feature = "hot-reload")]
 use notify::{RecommendedWatcher, RecursiveMode};
 #[cfg(feature = "hot-reload")]
-use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, FileIdMap};
+use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, RecommendedCache};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -89,7 +89,7 @@ pub struct HotReloadManager {
     change_rx: Arc<RwLock<mpsc::Receiver<ConfigChangeEvent>>>,
     /// File watcher (only available with hot-reload feature)
     #[cfg(feature = "hot-reload")]
-    watcher: Arc<RwLock<Option<Debouncer<RecommendedWatcher, FileIdMap>>>>,
+    watcher: Arc<RwLock<Option<Debouncer<RecommendedWatcher, RecommendedCache>>>>,
 }
 
 impl HotReloadManager {

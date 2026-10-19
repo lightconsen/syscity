@@ -236,7 +236,7 @@ fn run_cpal_capture(
     // through a std::sync::mpsc channel — no unsafe required.
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            config.clone().into(),
+            config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if !running_for_callback.load(Ordering::SeqCst) {
                     return;
@@ -253,7 +253,7 @@ fn run_cpal_capture(
         cpal::SampleFormat::I16 => {
             let max = i16::MAX as f32;
             device.build_input_stream(
-                config.clone().into(),
+                config.into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     if !running_for_callback.load(Ordering::SeqCst) {
                         return;
@@ -272,7 +272,7 @@ fn run_cpal_capture(
             let offset = u16::MAX as f32 / 2.0;
             let scale = offset;
             device.build_input_stream(
-                config.clone().into(),
+                config.into(),
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     if !running_for_callback.load(Ordering::SeqCst) {
                         return;
@@ -336,16 +336,16 @@ fn run_cpal_capture(
 fn find_pulse_monitor_device(
     host: &cpal::Host,
 ) -> Result<cpal::Device, Box<dyn std::error::Error + Send + Sync>> {
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use cpal::traits::HostTrait;
 
     // cpal on Linux with PulseAudio typically names monitor sources
     // similarly to output devices.  Try to find one with "monitor" in
     // the name.
     for device in host.input_devices()? {
-        if let Ok(name) = device.name() {
-            if name.to_lowercase().contains("monitor") {
-                return Ok(device);
-            }
+        // `DeviceTrait::name` was replaced by `Display` in cpal 0.18.
+        let name = device.to_string();
+        if name.to_lowercase().contains("monitor") {
+            return Ok(device);
         }
     }
     // Fallback to default input device (which might be a monitor).
