@@ -690,8 +690,13 @@ pub(crate) async fn start_gateway(
         })?;
 
     let listener = TcpListener::bind(&addr).await.map_err(|e| {
+        // The OS error is in the message, not only in `cause`: `ExternalService`
+        // displays `source` alone, and a bare "Failed to bind gateway" is what an
+        // operator — or a test failure — otherwise gets. "Address already in use"
+        // and "permission denied" are the two answers that matter, and they are
+        // indistinguishable without this.
         crate::error::SyscityError::ExternalService {
-            source: "Failed to bind gateway".to_string(),
+            source: format!("Failed to bind gateway at {}: {}", addr, e),
             cause: Some(Box::new(e)),
         }
     })?;

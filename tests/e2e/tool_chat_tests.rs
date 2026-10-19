@@ -349,8 +349,12 @@ async fn tool_acp_spawn_invoked_via_chat() {
 #[tokio::test]
 #[serial]
 async fn tool_acp_session_invoked_via_chat() {
+    // A port the OS hands out rather than a fixed one: a transient bind failure
+    // here failed CI once and passed on rerun, which is exactly what a hardcoded
+    // port invites. `free_port()` also stays outside the range the hand-written
+    // tests use, so this cannot collide with a sibling.
     let _results = run_tool_chat_test(
-        40100,
+        free_port(),
         "Use ONLY the acp_session tool. List active ACP sessions with action=list. Do not use any \
          other tool.",
         "acp_session",

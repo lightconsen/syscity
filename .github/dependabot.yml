@@ -18,15 +18,24 @@ updates:
 
   # Frontend (web) dependencies
   #
-  # `rebase-strategy: all` because the default does not reach this failure.
+  # `rebase-strategy: all`, but it does **not** fix the failure below — that
+  # was measured on 2026-10-19, and this comment used to claim otherwise.
+  #
   # `pnpm.overrides` in web/package.json and the matching `overrides:` block in
   # the lockfile clash *semantically* and not textually: git merges both sides
   # without complaint, the branch's lockfile ends up without the block, and
   # `pnpm install --frozen-lockfile` then dies with
   # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. Nothing reports a conflict, so nothing
-  # rebases — the PR just sits red. `all` regenerates the branch whenever the
-  # target branch moves, which is what puts the block back. Observed on
-  # 2026-10-08 and again 2026-10-14, six days apart.
+  # rebases — the PR just sits red. `rebase-strategy: all` replays Dependabot's
+  # own commit, lockfile included, so the block stays missing; `@dependabot
+  # recreate` did not restore it either. The only reliable fix is to regenerate
+  # the lockfile on the branch yourself:
+  #
+  #   pnpm install --lockfile-only   # in web/ or site/, then commit the lockfile
+  #
+  # Use the pnpm version CI pins (9, see the packageManager field in each
+  # workspace): regenerating with pnpm 10 produced a lockfile pnpm 9 could not
+  # read — ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY.
   #
   # The two npm entries only: a cargo bump edits Cargo.lock as well, so a clash
   # there *is* a textual conflict and the default already rebases on it.
