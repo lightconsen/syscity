@@ -14,7 +14,7 @@
     "@assistant-ui/react-markdown": "0.14.0",
     "@tanstack/react-virtual": "^3.14.20",
     "@tauri-apps/api": "^2",
-    "i18next": "^26.4.2",
+    "i18next": "^26.4.7",
     "lucide-react": "^1.57.0",
     "react": "^19.3.0",
     "react-dom": "^19.2.7",
