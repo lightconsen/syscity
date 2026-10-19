@@ -214,7 +214,7 @@ impl SessionStore {
         }
         query.push_str(" ORDER BY created_at DESC LIMIT ?");
 
-        let mut sql = sqlx::query(&query);
+        let mut sql = sqlx::query(sqlx::AssertSqlSafe(query.as_str()));
         if let Some(sid) = session_id {
             sql = sql.bind(sid);
         }

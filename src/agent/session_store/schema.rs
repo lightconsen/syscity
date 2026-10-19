@@ -20,9 +20,16 @@ impl SessionStore {
     pub async fn new(database_url: &str) -> Result<Self> {
         info!("Initializing SQLite session store");
 
+        // An in-memory database is opened with SQLite's shared cache, where
+        // concurrent writers take table-level locks; sqlx 0.9 surfaces that as
+        // SQLITE_LOCKED rather than waiting. One connection serialises them,
+        // which is the only shape an in-memory store can keep.
+        let in_memory = database_url.contains(":memory:");
+        let (max_connections, min_connections) = if in_memory { (1, 1) } else { (10, 2) };
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(10)
-            .min_connections(2)
+            .max_connections(max_connections)
+            .min_connections(min_connections)
             .acquire_timeout(Duration::from_secs(30))
             .idle_timeout(Duration::from_secs(600))
             .max_lifetime(Duration::from_secs(3600))
@@ -199,10 +206,12 @@ impl SessionStore {
         // ── Migration: add missing columns to existing session_messages tables
         // CREATE TABLE IF NOT EXISTS won't add columns to existing tables
         for col in &["transcript_id", "run_id", "turn_id"] {
-            let result =
-                sqlx::query(&format!("ALTER TABLE session_messages ADD COLUMN {} TEXT", col))
-                    .execute(&self.pool)
-                    .await;
+            let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE session_messages ADD COLUMN {} TEXT",
+                col
+            )))
+            .execute(&self.pool)
+            .await;
             if let Err(ref e) = result {
                 // "duplicate column name" is expected — ignore it
                 if !e.to_string().contains("duplicate column name") {
@@ -555,11 +564,14 @@ impl SessionStore {
             ("request_snapshots", "idx_request_snapshots_created", "created_at"),
             ("request_snapshots", "idx_request_snapshots_session", "session_id"),
         ] {
-            sqlx::query(&format!("CREATE INDEX IF NOT EXISTS {} ON {}({})", index, table, cols))
-                .execute(&self.pool)
-                .await
-                .map_err(|e| warn!("Failed to create session store index {}: {}", index, e))
-                .ok();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {}({})",
+                index, table, cols
+            )))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| warn!("Failed to create session store index {}: {}", index, e))
+            .ok();
         }
 
         info!("Session storage schema initialized");

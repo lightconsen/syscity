@@ -49,24 +49,26 @@ impl PgVectorStore {
             )",
             quoted, dimension
         );
-        sqlx::query(&create_sql).execute(&pool).await.map_err(|e| {
-            crate::error::SyscityError::Storage {
+        sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str()))
+            .execute(&pool)
+            .await
+            .map_err(|e| crate::error::SyscityError::Storage {
                 context: format!("Failed to create pgvector table {}", table),
                 details: e.to_string(),
-            }
-        })?;
+            })?;
 
         let safe_name = table.replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
         let index_sql = format!(
             "CREATE INDEX IF NOT EXISTS idx_{}_source_id ON {}(source_id)",
             safe_name, quoted
         );
-        sqlx::query(&index_sql).execute(&pool).await.map_err(|e| {
-            crate::error::SyscityError::Storage {
+        sqlx::query(sqlx::AssertSqlSafe(index_sql.as_str()))
+            .execute(&pool)
+            .await
+            .map_err(|e| crate::error::SyscityError::Storage {
                 context: format!("Failed to create pgvector index for {}", table),
                 details: e.to_string(),
-            }
-        })?;
+            })?;
 
         info!("PgVectorStore initialized (table={}, dim={})", table, dimension);
         Ok(Self { pool, dimension, table })
@@ -79,6 +81,11 @@ impl PgVectorStore {
 
 #[async_trait]
 impl VectorStore for PgVectorStore {
+    // Every statement below is built with `format!` because the table name is
+    // configuration. The only interpolated value is the table, and it goes
+    // through `quote_identifier` (which doubles any `"`), never a raw bind —
+    // everything else is a bound parameter. That is the audit sqlx 0.9 asks for
+    // when it refuses a non-`'static` string.
     async fn store_chunk(&self, chunk: EmbeddedChunk) -> crate::Result<()> {
         let embedding = pgvector::Vector::from(chunk.embedding.clone());
         let metadata_json = chunk
@@ -105,7 +112,7 @@ impl VectorStore for PgVectorStore {
                  metadata = EXCLUDED.metadata",
             Self::quote_identifier(&self.table)
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&chunk.id)
             .bind(&chunk.source_id)
             .bind(&chunk.text)
@@ -143,7 +150,7 @@ impl VectorStore for PgVectorStore {
              LIMIT $3",
             Self::quote_identifier(&self.table)
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(embedding)
             .bind(max_distance)
             .bind(limit as i64)
@@ -230,7 +237,7 @@ impl VectorStore for PgVectorStore {
     async fn delete_by_source(&self, source_id: &str) -> crate::Result<usize> {
         let sql =
             format!("DELETE FROM {} WHERE source_id = $1", Self::quote_identifier(&self.table));
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(source_id)
             .execute(&self.pool)
             .await
@@ -250,7 +257,7 @@ impl VectorStore for PgVectorStore {
             "DELETE FROM {} WHERE collection = $1 AND source_id = $2",
             Self::quote_identifier(&self.table)
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(collection)
             .bind(source_id)
             .execute(&self.pool)
@@ -265,7 +272,7 @@ impl VectorStore for PgVectorStore {
     async fn delete_by_collection(&self, collection: &str) -> crate::Result<usize> {
         let sql =
             format!("DELETE FROM {} WHERE collection = $1", Self::quote_identifier(&self.table));
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(collection)
             .execute(&self.pool)
             .await
@@ -278,7 +285,7 @@ impl VectorStore for PgVectorStore {
 
     async fn stats(&self) -> crate::Result<VectorStoreStats> {
         let total_sql = format!("SELECT COUNT(*) FROM {}", Self::quote_identifier(&self.table));
-        let total_vectors: (i64,) = sqlx::query_as(&total_sql)
+        let total_vectors: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(total_sql.as_str()))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| crate::error::SyscityError::Storage {
@@ -290,7 +297,7 @@ impl VectorStore for PgVectorStore {
             "SELECT COUNT(DISTINCT source_id) FROM {}",
             Self::quote_identifier(&self.table)
         );
-        let total_sources: (i64,) = sqlx::query_as(&sources_sql)
+        let total_sources: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(sources_sql.as_str()))
             .fetch_one(&self.pool)
             .await
             .map_err(|e| crate::error::SyscityError::Storage {
@@ -307,12 +314,13 @@ impl VectorStore for PgVectorStore {
 
     async fn clear(&self) -> crate::Result<()> {
         let sql = format!("DELETE FROM {}", Self::quote_identifier(&self.table));
-        sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
-            crate::error::SyscityError::Storage {
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| crate::error::SyscityError::Storage {
                 context: "Failed to clear pgvector table".to_string(),
                 details: e.to_string(),
-            }
-        })?;
+            })?;
         Ok(())
     }
 }

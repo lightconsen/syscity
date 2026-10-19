@@ -202,7 +202,7 @@ impl SessionStore {
                 Option<String>,
                 Option<String>,
             ),
-        >(&query);
+        >(sqlx::AssertSqlSafe(query.as_str()));
 
         if let Some(agent) = agent_id {
             sql_query = sql_query.bind(agent);

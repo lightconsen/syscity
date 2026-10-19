@@ -130,7 +130,9 @@ impl AuthProfileStore {
                 "DELETE FROM auth_profile_states WHERE provider_name = ? AND key_label NOT IN ({})",
                 placeholders
             );
-            let mut query = sqlx::query(&sql).bind(provider);
+            // The only interpolated text is a run of `?` placeholders; every
+            // value is bound below. sqlx 0.9 makes that assertion explicit.
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(provider);
             for label in &labels {
                 query = query.bind(*label);
             }

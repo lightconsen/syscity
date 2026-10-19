@@ -90,12 +90,13 @@ impl SqliteVecStore {
             )",
             dimension
         );
-        sqlx::query(&create_sql).execute(&pool).await.map_err(|e| {
-            crate::error::SyscityError::Storage {
+        sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str()))
+            .execute(&pool)
+            .await
+            .map_err(|e| crate::error::SyscityError::Storage {
                 context: "Failed to create sqlite-vec virtual table".to_string(),
                 details: e.to_string(),
-            }
-        })?;
+            })?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS vec_chunk_collections (

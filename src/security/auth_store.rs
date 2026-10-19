@@ -208,10 +208,12 @@ impl AuthStore {
             ("idx_auth_sessions_expires", "auth_sessions", "expires_at"),
             ("idx_auth_devices_token", "auth_devices", "token_hash"),
         ] {
-            if let Err(e) =
-                sqlx::query(&format!("CREATE INDEX IF NOT EXISTS {} ON {}({})", index, table, cols))
-                    .execute(&self.pool)
-                    .await
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {}({})",
+                index, table, cols
+            )))
+            .execute(&self.pool)
+            .await
             {
                 warn!("Failed to create auth store index {}: {}", index, e);
             }

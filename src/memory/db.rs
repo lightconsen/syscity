@@ -149,7 +149,7 @@ impl DatabaseStore {
         ];
 
         for (pragma, context) in &pragmas {
-            sqlx::query(&format!("PRAGMA {}", pragma))
+            sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA {}", pragma)))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::error::SyscityError::Storage {
@@ -292,7 +292,7 @@ impl DatabaseStore {
         ];
 
         for (name, sql) in indexes {
-            sqlx::query(sql).execute(&self.pool).await.map_err(|e| {
+            sqlx::query(*sql).execute(&self.pool).await.map_err(|e| {
                 crate::error::SyscityError::Storage {
                     context: format!("Failed to create index {}", name),
                     details: e.to_string(),
@@ -347,7 +347,7 @@ impl DatabaseStore {
         ];
 
         for (name, sql) in triggers {
-            sqlx::query(sql).execute(&self.pool).await.map_err(|e| {
+            sqlx::query(*sql).execute(&self.pool).await.map_err(|e| {
                 crate::error::SyscityError::Storage {
                     context: format!("Failed to create trigger {}", name),
                     details: e.to_string(),
@@ -401,7 +401,7 @@ impl DatabaseStore {
             if existing.contains(*column) {
                 continue;
             }
-            sqlx::query(stmt).execute(&self.pool).await.map_err(|e| {
+            sqlx::query(*stmt).execute(&self.pool).await.map_err(|e| {
                 crate::error::SyscityError::Storage {
                     context: format!("Schema migration failed for column {column}"),
                     details: e.to_string(),
@@ -1030,7 +1030,7 @@ impl MemoryStore for DatabaseStore {
 
         sql.push_str(" ORDER BY importance_score DESC, created_at DESC LIMIT ? OFFSET ?");
 
-        let mut db_query = sqlx::query(&sql);
+        let mut db_query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
 
         if let Some(user_id) = &query.user_id {
             db_query = db_query.bind(user_id);

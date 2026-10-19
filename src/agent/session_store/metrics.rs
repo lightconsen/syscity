@@ -144,7 +144,11 @@ impl SessionStore {
     /// (epoch ms). Returns `(llm_calls, tool_call_metrics, turn_outcomes,
     /// request_snapshots)` deleted counts.
     pub async fn delete_metrics_before(&self, cutoff_ms: i64) -> Result<(u64, u64, u64, u64)> {
-        async fn del(pool: &sqlx::Pool<sqlx::Sqlite>, sql: &str, cutoff_ms: i64) -> Result<u64> {
+        async fn del(
+            pool: &sqlx::Pool<sqlx::Sqlite>,
+            sql: &'static str,
+            cutoff_ms: i64,
+        ) -> Result<u64> {
             let res = sqlx::query(sql)
                 .bind(cutoff_ms)
                 .execute(pool)
@@ -193,7 +197,7 @@ impl SessionStore {
                  llm_rounds, tool_calls, cache_hit, model FROM turn_outcomes{}",
                 since_clause
             );
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             if let Some(s) = since_ms {
                 q = q.bind(s);
             }
@@ -230,7 +234,7 @@ impl SessionStore {
                  error FROM llm_calls{}",
                 since_clause
             );
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             if let Some(s) = since_ms {
                 q = q.bind(s);
             }
@@ -266,7 +270,7 @@ impl SessionStore {
                 "SELECT turn_id, name, duration_ms, success FROM tool_call_metrics{}",
                 since_clause
             );
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             if let Some(s) = since_ms {
                 q = q.bind(s);
             }

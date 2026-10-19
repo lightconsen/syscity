@@ -455,7 +455,7 @@ impl SqliteStorage {
             "ALTER TABLE memories ADD COLUMN importance_score REAL NOT NULL DEFAULT 0.5",
             "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'agent'",
         ] {
-            if let Err(e) = sqlx::query(migration).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(*migration).execute(&self.pool).await {
                 // SQLite returns error code 1 for "duplicate column" — this is
                 // expected during startup if the column already exists.
                 // The error message contains "duplicate column name" on SQLite >= 3.36
