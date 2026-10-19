@@ -244,7 +244,7 @@ impl<P: EmbeddingProvider> CachedEmbeddingProvider<P> {
     fn sha256_key(text: &str) -> String {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(text.as_bytes());
-        format!("{:x}", hash)
+        hex::encode(hash)
     }
 
     /// Current number of cached entries.

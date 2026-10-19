@@ -405,7 +405,7 @@ pub fn compute_checksum(content: &[u8]) -> String {
     let prefix = content.len().min(4096);
     hasher.update(&content[..prefix]);
     hasher.update(content.len().to_le_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Detect MIME type from file extension.

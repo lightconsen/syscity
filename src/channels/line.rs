@@ -65,7 +65,7 @@ impl LineConfig {
 /// matching. Comparison is constant-time.
 pub fn verify_signature(channel_secret: &str, body: &[u8], provided: &str) -> bool {
     use base64::Engine as _;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use subtle::ConstantTimeEq;
 
@@ -303,7 +303,7 @@ impl Channel for LineChannel {
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     /// Sign the way LINE does, so the verifier is tested against the documented

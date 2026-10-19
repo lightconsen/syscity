@@ -1597,7 +1597,7 @@ fn verify_slack_signature(secret: &str, timestamp: &str, body: &[u8], signature:
     if !timestamp_is_fresh(timestamp) {
         return false;
     }
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let basestring = format!("v0:{}:", timestamp);
@@ -1842,7 +1842,7 @@ fn timestamp_is_fresh(timestamp: &str) -> bool {
 ///
 /// Used by WhatsApp and generic webhooks
 fn verify_hmac_sha256(secret: &str, body: &[u8], expected_sig: &str) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -1909,7 +1909,7 @@ mod tests {
         let body = b"test message";
 
         // Compute expected signature
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
@@ -2250,7 +2250,7 @@ mod tests {
     }
 
     fn make_slack_signature(secret: &str, timestamp: &str, body: &str) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 

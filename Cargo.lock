@@ -2138,6 +2138,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
 ]
@@ -8417,7 +8418,7 @@ dependencies = [
  "glob",
  "hex",
  "hf-hub",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "image",
  "insta",
  "ipnet",
@@ -8454,8 +8455,8 @@ dependencies = [
  "serde_norway",
  "serenity",
  "serial_test",
- "sha1 0.10.6",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
  "shellexpand",
  "sourcemap",
  "sqlite-vec",

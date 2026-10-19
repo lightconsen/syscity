@@ -169,9 +169,9 @@ lru = "0.18"
 dashmap = "6.0"
 
 # Webhook signature verification
-hmac = "0.12"
-sha2 = "0.10"
-sha1 = { version = "0.10", optional = true }
+hmac = "0.13"
+sha2 = "0.11"
+sha1 = { version = "0.11", optional = true }
 hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = { version = "3.0", features = ["pkcs8"] }
@@ -396,9 +396,9 @@ futures-util = "0.3"
 # HTTP-level e2e (webhooks, OpenAI-compat endpoints, probes, ws-ticket)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 # Slack webhook signature computation in the HTTP e2e (matches the gateway's own)
-hmac = "0.12"
-sha2 = "0.10"
-sha1 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
+sha1 = "0.11"
 hex = "0.4"
 # Minting a real RS256 token against a mock JWKS, for the bearer-token channels.
 # Generates the keypair at test time rather than embedding one — a private key

@@ -109,7 +109,7 @@ fn check_signature(
     provided: &str,
 ) -> bool {
     use base64::Engine as _;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
     use subtle::ConstantTimeEq;
 
@@ -382,7 +382,7 @@ impl Channel for TwilioChannel {
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
 
     /// Sign the way Twilio documents, built independently of the verifier: a

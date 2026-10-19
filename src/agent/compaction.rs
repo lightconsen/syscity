@@ -106,7 +106,7 @@ pub fn compute_context_hash(messages: &[(String, String)]) -> String {
             .join("\x00")
     );
     let hash = Sha256::digest(payload.as_bytes());
-    let hex = format!("{:x}", hash);
+    let hex = hex::encode(hash);
     // Truncate to 16 hex chars (collision-resistant enough for dedup)
     hex.get(..16).unwrap_or(&hex).to_string()
 }

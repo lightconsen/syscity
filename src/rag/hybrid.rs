@@ -359,7 +359,7 @@ fn normalized_content_key(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let hash = Sha256::digest(normalized.as_bytes());
-    format!("{:x}", hash)
+    hex::encode(hash)
 }
 
 // ── Temporal decay

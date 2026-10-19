@@ -949,7 +949,7 @@ fn plugin_package() -> (Vec<u8>, String) {
 
     let mut hasher = Sha256::new();
     hasher.update(&archive);
-    (archive, format!("{:x}", hasher.finalize()))
+    (archive, hex::encode(hasher.finalize()))
 }
 
 /// The wiring a published plugin depends on, on a mock catalog instead of the

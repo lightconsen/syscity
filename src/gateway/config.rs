@@ -1888,7 +1888,7 @@ pub(crate) fn config_json_hash(value: &serde_json::Value) -> String {
 
     let canonical = canonicalize_json(value);
     let digest = Sha256::digest(canonical.to_string().as_bytes());
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 /// Current revision of the whole `GatewayConfig` — the same fingerprint the
