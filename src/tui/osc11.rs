@@ -134,9 +134,10 @@ pub fn env_hint() -> Option<ThemeId> {
 #[cfg(unix)]
 pub fn query_background(timeout: Duration) -> Option<ThemeId> {
     use std::io::Write;
+    use std::os::fd::AsFd as _;
     use std::os::fd::AsRawFd;
 
-    use nix::poll::{poll, PollFd, PollFlags};
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::unistd::read;
 
     // 1. Ask. The reply arrives on stdin even though we asked on stdout.
@@ -147,8 +148,11 @@ pub fn query_background(timeout: Duration) -> Option<ThemeId> {
 
     // 2. Wait for the reply, up to `timeout`.
     let stdin = std::io::stdin();
-    let mut fds = [PollFd::new(&stdin, PollFlags::POLLIN)];
-    let ready = poll(&mut fds, timeout.as_millis().min(i32::MAX as u128) as i32).ok()?;
+    // `PollFd` takes a `BorrowedFd` rather than `AsFd`, and the timeout is a
+    // `PollTimeout` rather than an `i32` — both are nix 0.28's shape.
+    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let ready = poll(&mut fds, PollTimeout::try_from(millis).ok()?).ok()?;
     if ready == 0 {
         return None;
     }
