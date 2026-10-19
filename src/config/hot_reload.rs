@@ -219,11 +219,9 @@ impl HotReloadManager {
         {
             let mut watcher_guard = self.watcher.write().await;
             if let Some(ref mut debouncer) = *watcher_guard {
-                use notify::Watcher;
-                if let Err(e) = debouncer
-                    .watcher()
-                    .watch(&path, RecursiveMode::NonRecursive)
-                {
+                // `Debouncer::watcher()` is a no-op in notify-debouncer-full 0.7;
+                // the debouncer forwards `watch` itself.
+                if let Err(e) = debouncer.watch(&path, RecursiveMode::NonRecursive) {
                     warn!("Failed to add file to watcher: {:?} - {}", path, e);
                 } else {
                     debug!("Added file to notify watcher: {:?}", path);
