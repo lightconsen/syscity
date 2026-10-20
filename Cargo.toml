@@ -279,10 +279,11 @@ nix = { version = "0.31", features = ["signal", "process", "socket", "poll"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 
-# Windows AppContainer write fence (win_appcontainer.rs). Pinned to the
-# version already in the lock file; never built on non-Windows targets.
+# Windows AppContainer write fence (win_appcontainer.rs). Pinned exactly so
+# the `windows-gnu` cross-check in CI and the native MSVC build in the release
+# pipeline compile the same bindings; never built on non-Windows targets.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.59.0", features = [
+windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
   "Win32_Security_Isolation", "Win32_Storage_FileSystem",
   "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading",
