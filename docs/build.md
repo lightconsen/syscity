@@ -158,3 +158,10 @@ cargo test
   binary on `PATH`.
 - **`pnpm: command not found`** — install pnpm (`npm i -g pnpm`) or build the
   Rust binary alone with `cargo build --release`.
+- **macOS release link fails with `Undefined symbols: ___isPlatformVersionAtLeast`**
+  — the `vision` feature links a prebuilt `libonnxruntime.a` whose Objective-C++
+  CoreML objects call that helper for their `@available` checks. It lives in
+  clang's compiler-rt, not libSystem, and rustc links with `-nodefaultlibs`.
+  `build.rs` links `libclang_rt.osx.a` on macOS for exactly this reason; if you
+  see it anyway, `clang` was not on `PATH` during the build (the build script
+  warns with `could not locate clang's resource dir`).
