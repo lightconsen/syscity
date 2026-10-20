@@ -167,6 +167,45 @@ jobs:
             --no-default-features \
             --features "simplex,sqlite-vec,plugins,browser"
 
+  release-link:
+    name: Release Link (macOS)
+    # Every other job runs `cargo check`, which stops at metadata — nothing in
+    # CI ever produced a linked release binary. That is how the
+    # `___isPlatformVersionAtLeast` failure (ort's prebuilt CoreML objects
+    # meeting the release profile's `lto = true` + `-dead_strip`) reached a
+    # local `cargo build --release` unnoticed; see build.rs.
+    #
+    # A cold macOS release build is roughly 40 minutes, so this runs on pushes
+    # rather than on every pull request. The `vision` feature is required (it
+    # is what links ort); `local-embeddings` is left out because llama-cpp-2's
+    # C++ build is the slowest part and has nothing to do with the link.
+    # Verified locally that this exact feature set still reproduces the
+    # original link error on a tree without the build.rs fix.
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system build dependencies
+        run: brew install protobuf
+
+      - name: Ensure web assets directory exists
+        run: mkdir -p dist
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Link the release binary
+        run: |
+          cargo build --release --bin syscity \
+            --no-default-features \
+            --features "simplex,sqlite-vec,plugins,browser,vision"
+
   test:
     name: Test
     runs-on: ubuntu-latest
