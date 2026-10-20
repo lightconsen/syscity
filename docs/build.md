@@ -87,8 +87,22 @@ needed:
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
-cargo check --target x86_64-pc-windows-gnu
+cargo check --target x86_64-pc-windows-gnu --lib \
+  --no-default-features \
+  --features "simplex,sqlite-vec,plugins,browser"
 ```
+
+The feature set is not optional. Two default features cannot cross-compile to
+this target and neither is needed to reach the Windows modules:
+
+- `vision` pulls `ort`, which publishes no prebuilt ONNX Runtime for
+  `x86_64-pc-windows-gnu` (only MSVC), and
+- `local-embeddings` pulls `llama-cpp-2`, whose bindgen run needs mingw
+  headers it is not pointed at.
+
+The remaining features are what the crate needs to compile at all under
+`--no-default-features` today. The CI job of the same name runs exactly this
+command, so a break here is a red check rather than a release-time surprise.
 
 `.cargo/config.toml` wires that target's linker and the target-suffixed
 `CC_`/`AR_` vars to the wrappers in `scripts/cross/` (`zig-cc-…`,

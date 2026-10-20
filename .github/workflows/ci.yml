@@ -124,6 +124,49 @@ jobs:
       - name: Verify MSRV
         run: cargo check --all-features
 
+  windows-cross-check:
+    name: Windows Cross Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure web assets directory exists
+        run: mkdir -p dist
+
+      # zig ships its own mingw-w64 sysroot, so no MinGW install is needed.
+      # `scripts/cross/zig-cc-x86_64-windows-gnu` rewrites the Rust triple into
+      # zig's spelling; `.cargo/config.toml` wires it up as this target's
+      # linker and target-suffixed CC/AR.
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # This is the only job that compiles the `cfg(target_os = "windows")`
+      # modules — `tools/win_appcontainer.rs` in particular. Nothing else in
+      # pull-request CI touches them; the release pipeline does build Windows
+      # natively, but only when a `v*` tag is pushed, which is the worst
+      # moment to discover a Windows-only break.
+      #
+      # The feature set is deliberately not `--all-features`: `vision` (ort)
+      # publishes no prebuilt library for `x86_64-pc-windows-gnu`, and
+      # `local-embeddings` (llama-cpp-2) needs mingw headers bindgen is not
+      # pointed at. Neither is needed to compile the Windows modules.
+      - name: Check the Windows target
+        run: |
+          cargo check --target x86_64-pc-windows-gnu --lib \
+            --no-default-features \
+            --features "simplex,sqlite-vec,plugins,browser"
+
   test:
     name: Test
     runs-on: ubuntu-latest
