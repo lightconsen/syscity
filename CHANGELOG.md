@@ -9,6 +9,28 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
+## [0.3.12] - 2026-10-20
+
+### Highlights
+
+- **The dependency graph is current across the board.** The Rust side moved to sqlx 0.9, rand 0.10, `sha1`/`hmac`/`sha2` on the digest 0.11 stack, ed25519-dalek 3, notify 8, cpal 0.18, nix 0.31, toml 1.1, ort 2.0.0-rc.15 and pdf-extract 0.12 (lopdf 0.42); the frontend to TypeScript 7, React 19.3, Vite 8 in `site/` and vite-plugin-pwa 2. Two of those carry security fixes: **wasmtime 48.0.7** clears RUSTSEC-2026-0378 and RUSTSEC-2026-0379 — the latter a Cranelift aarch64 miscompile, CVSS 9.3 — and **pdf-extract 0.12** moves lopdf to 0.42, clearing GHSA-6fj4-rcr3-r7rr. rand 0.10 splits the OS entropy source into a fallible `SysRng`; the session-token, PKCE and gateway-token paths keep using the OS source, and session creation now reports a failure instead of panicking.
+- **macOS release builds link again.** `cargo build --release` failed with an undefined `___isPlatformVersionAtLeast`: ort's prebuilt `libonnxruntime.a` carries Objective-C++ CoreML objects that call that clang compiler-rt helper, and rustc links with `-nodefaultlibs`. It only surfaced under the release profile's `lto = true` + `-dead_strip`, which walk the whole archive. `build.rs` now links compiler-rt on macOS when `vision` is enabled.
+- **Two CI blind spots are closed.** A `Windows Cross Check` job compiles `x86_64-pc-windows-gnu` on every pull request — `tools/win_appcontainer.rs` previously had no PR-time coverage at all — and a `Release Link (macOS)` job performs a real release link on pushes, because every other job runs `cargo check`, which never links.
+
+### Changed
+
+- Pairing codes are drawn with `random_range` rather than `%` over a full-range value, removing the modulo bias.
+- The stale `RUSTSEC-2026-0187` (lopdf) audit ignore is gone: pdf-extract 0.12 moved to lopdf 0.42, so the advisory no longer matches anything.
+
+### Fixed
+
+- cpal 0.18 and notify-debouncer-full 0.7 compile on Linux — `DeviceTrait::name` is the `Display` impl now, and the debouncer's recommended cache is `NoCache` there — and under clippy.
+- The HMAC e2e helpers import `KeyInit`, which hmac 0.13 moved off `Mac`.
+
+### Removed
+
+- `rustyline`, declared since March but never referenced: interactive input moved to crossterm the same day it was added. Dropping it also removes `clipboard-win`, `error-code` and a duplicate `unicode-width`.
+
 ## [0.3.11] - 2026-10-18
 
 ### Removed
