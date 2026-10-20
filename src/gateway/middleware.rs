@@ -815,9 +815,9 @@ fn is_localhost_ip(ip: Option<IpAddr>) -> bool {
 
 /// Generate a random CSP nonce (16 bytes hex = 32 chars)
 fn generate_nonce() -> String {
-    use rand::RngCore;
+    use rand::Rng as _;
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 

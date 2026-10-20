@@ -78,10 +78,9 @@ pub async fn run_auth_command(command: &AuthCommands) -> Result<()> {
 /// and the `auth.token` WebSocket query parameter without escaping issues.
 fn generate_token() -> String {
     use base64::Engine as _;
-    use rand::RngCore;
 
     let mut bytes = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::utils::fill_os_entropy(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

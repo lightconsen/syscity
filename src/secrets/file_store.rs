@@ -22,7 +22,7 @@ use std::sync::Arc;
 use aes_gcm::aead::{Aead, AeadCore, OsRng};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use base64::Engine as _;
-use rand::RngCore;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use zeroize::Zeroize;
@@ -278,7 +278,7 @@ impl MasterKey {
     /// Generate a fresh random 256-bit key.
     pub(crate) fn random() -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
 

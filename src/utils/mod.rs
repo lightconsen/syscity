@@ -8,10 +8,12 @@ pub mod logging;
 pub mod png;
 pub mod pool;
 pub mod profiling;
+pub mod random;
 pub mod time;
 
 pub use batch::{BatchConfig, BatchProcessor, Batcher, Deduplicator};
 pub use logging::init_logging;
 pub use pool::{global_manager, global_pool, ConnectionPoolManager, HttpClientPool, PoolConfig};
 pub use profiling::{MemoryStats, PerformanceReport, Profiler, TimerStats};
+pub use random::{fill_os_entropy, try_fill_os_entropy};
 pub use time::ms_timestamp;

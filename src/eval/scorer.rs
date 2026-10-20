@@ -252,7 +252,7 @@ impl LayeredScorer {
             };
             // Route low-confidence / conflict cases unconditionally, and
             // ordinary cases with probability `sampling_rate` (§三).
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             if let Err(e) = route_case(
                 store,
                 &case,
@@ -318,7 +318,7 @@ impl LayeredScorer {
             human_verdict: None,
             human_comment: None,
         };
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         route_case(store, &case, base_reason, self.sampling_rate, &mut rng)
     }
 

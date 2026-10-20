@@ -396,7 +396,7 @@ pub async fn run_suite(
     let tasks_to_run: Vec<EvalTask> = if effective_sampling_rate < 1.0 {
         let n = (suite.tasks.len() as f64 * effective_sampling_rate).ceil() as usize;
         let n = n.max(1).min(suite.tasks.len());
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut indices: Vec<usize> = (0..suite.tasks.len()).collect();
         indices.shuffle(&mut rng);
         indices.truncate(n);

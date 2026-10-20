@@ -18,7 +18,7 @@
 
 use std::time::SystemTime;
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 /// Verdict from a version comparison.
@@ -108,7 +108,7 @@ pub fn compare_versions(
 
     // Bootstrap the difference in pass rates
     let mut diffs = Vec::with_capacity(iterations);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     for _ in 0..iterations {
         let boot_old = bootstrap_sample(old_results, &mut rng);
@@ -156,11 +156,11 @@ fn pass_rate(results: &[bool]) -> f64 {
 }
 
 /// Draw a bootstrap resample with replacement and return the pass rate.
-fn bootstrap_sample(results: &[bool], rng: &mut impl Rng) -> f64 {
+fn bootstrap_sample(results: &[bool], rng: &mut impl RngExt) -> f64 {
     let n = results.len();
     let mut passes = 0usize;
     for _ in 0..n {
-        if results[rng.gen_range(0..n)] {
+        if results[rng.random_range(0..n)] {
             passes += 1;
         }
     }

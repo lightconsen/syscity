@@ -22,15 +22,15 @@ const LSH_SEED: u64 = 0x0DEA_D0DE_C0FF_EE42;
 /// signatures for identical inputs (important for reproducible dedup).
 fn hyperplanes(dim: usize) -> Vec<Vec<f32>> {
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     let mut rng = StdRng::seed_from_u64(LSH_SEED);
     let mut planes = Vec::with_capacity(LSH_BITS);
     for _ in 0..LSH_BITS {
         let mut h = Vec::with_capacity(dim);
         for _ in 0..dim {
             // Gaussian ~ N(0,1) via Box-Muller. Clamping u1 avoids log(0).
-            let u1: f32 = rng.gen::<f32>().max(1e-12);
-            let u2: f32 = rng.gen::<f32>();
+            let u1: f32 = rng.random::<f32>().max(1e-12);
+            let u2: f32 = rng.random::<f32>();
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
             h.push(z);
         }

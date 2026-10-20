@@ -592,7 +592,7 @@ fn generate_pairing_code() -> String {
 
     let mut code = String::with_capacity(LEN);
     for _ in 0..LEN {
-        let idx = rand::random::<usize>() % ALPHABET.len();
+        let idx = rand::random_range(0..ALPHABET.len());
         code.push(ALPHABET[idx] as char);
     }
     code

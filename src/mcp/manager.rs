@@ -496,11 +496,9 @@ impl McpManager {
     pub(crate) fn generate_code_verifier() -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        use rand::rngs::OsRng;
-        use rand::RngCore;
 
         let mut bytes = vec![0u8; 64];
-        OsRng.fill_bytes(&mut bytes);
+        crate::utils::fill_os_entropy(&mut bytes);
         URL_SAFE_NO_PAD.encode(&bytes)
     }
 
@@ -518,11 +516,9 @@ impl McpManager {
     pub(crate) fn generate_random_state() -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        use rand::rngs::OsRng;
-        use rand::RngCore;
 
         let mut bytes = vec![0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        crate::utils::fill_os_entropy(&mut bytes);
         URL_SAFE_NO_PAD.encode(&bytes)
     }
 }

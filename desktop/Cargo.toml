@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-rand = "0.8"
+rand = "0.10"
 
 # Desktop builds use syscity's default features plus `cloud` (release
 # artifacts ship cloud — matches the CLI release builds' `--all-features`);

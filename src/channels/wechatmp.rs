@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use async_trait::async_trait;
 use base64::Engine as _;
-use rand::RngCore;
+use rand::Rng as _;
 use sha1::{Digest, Sha1};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -133,7 +133,7 @@ pub fn parse_plaintext(plain: &[u8]) -> crate::Result<(Vec<u8>, String)> {
 
 /// AES-256-CBC encrypt `reply_xml` into the base64 `Encrypt` field.
 pub fn encrypt_reply(key: &[u8; 32], reply_xml: &str, appid: &str) -> crate::Result<String> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut random = [0u8; 16];
     rng.fill_bytes(&mut random);
 

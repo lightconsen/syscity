@@ -189,12 +189,12 @@ impl HumanReviewStore {
 ///
 /// Low-confidence/conflict cases are orthogonal and are always routed by
 /// [`should_route_to_review`] regardless of this decision.
-pub fn sampling_rate_hit(rate: Option<f64>, rng: &mut impl rand::Rng) -> bool {
+pub fn sampling_rate_hit(rate: Option<f64>, rng: &mut impl rand::RngExt) -> bool {
     match rate {
         None => false,
         Some(r) if r <= 0.0 => false,
         Some(r) if r >= 1.0 => true,
-        Some(r) => rng.gen::<f64>() < r,
+        Some(r) => rng.random::<f64>() < r,
     }
 }
 
@@ -206,7 +206,7 @@ pub fn sampling_rate_hit(rate: Option<f64>, rng: &mut impl rand::Rng) -> bool {
 pub fn should_route_to_review(
     base_reason: bool,
     sampling_rate: Option<f64>,
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> bool {
     base_reason || sampling_rate_hit(sampling_rate, rng)
 }
@@ -222,7 +222,7 @@ pub fn route_case(
     case: &HumanReviewCase,
     base_reason: bool,
     sampling_rate: Option<f64>,
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> Result<bool> {
     if !should_route_to_review(base_reason, sampling_rate, rng) {
         return Ok(false);
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn should_route_no_sampling_none_rate() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Ordinary case (base=false) is never routed when sampling is disabled.
         for _ in 0..100 {
             assert!(!should_route_to_review(false, None, &mut rng));
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn should_route_sampling_zero_and_one() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Some(0.0) never routes ordinary cases.
         for _ in 0..50 {
             assert!(!should_route_to_review(false, Some(0.0), &mut rng));
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn should_route_sampling_roughly_half() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut hits = 0usize;
         for _ in 0..100 {
             if should_route_to_review(false, Some(0.5), &mut rng) {
@@ -458,9 +458,9 @@ mod tests {
     #[test]
     fn sampling_rate_hit_deterministic_boundaries() {
         // A stub RNG that always yields the same u64 pins the exact boundary of
-        // `rng.gen::<f64>() < r`.
-        let mut lo = ConstantRng(0); // gen::<f64>() == 0.0
-        let mut hi = ConstantRng(u64::MAX); // gen::<f64>() ≈ 1.0
+        // `rng.random::<f64>() < r`.
+        let mut lo = ConstantRng(0); // random::<f64>() == 0.0
+        let mut hi = ConstantRng(u64::MAX); // random::<f64>() ≈ 1.0
 
         assert!(sampling_rate_hit(Some(0.5), &mut lo));
         assert!(!sampling_rate_hit(Some(0.5), &mut hi));
@@ -476,7 +476,7 @@ mod tests {
         let store = HumanReviewStore::new(dir.path());
         let ordinary = dummy_case("sampled", dummy_scoring_output_pass());
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let routed = route_case(&store, &ordinary, false, Some(1.0), &mut rng).unwrap();
         assert!(routed);
         assert_eq!(store.list_cases(None).unwrap().len(), 1);
@@ -488,7 +488,7 @@ mod tests {
         let store = HumanReviewStore::new(dir.path());
         let ordinary = dummy_case("skipped", dummy_scoring_output_pass());
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let routed = route_case(&store, &ordinary, false, None, &mut rng).unwrap();
         assert!(!routed);
         assert_eq!(store.list_cases(None).unwrap().len(), 0);
@@ -500,32 +500,30 @@ mod tests {
         let store = HumanReviewStore::new(dir.path());
         let low_conf = dummy_case("lowconf", dummy_scoring_output());
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let routed = route_case(&store, &low_conf, true, None, &mut rng).unwrap();
         assert!(routed);
         assert_eq!(store.list_cases(None).unwrap().len(), 1);
     }
 
-    /// Deterministic `RngCore` stub for tests: always returns a fixed value.
+    /// Deterministic RNG stub for tests: always returns a fixed value.
     struct ConstantRng(u64);
 
-    impl rand::RngCore for ConstantRng {
-        fn next_u32(&mut self) -> u32 {
-            self.0 as u32
+    impl rand::TryRng for ConstantRng {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+            Ok(self.0 as u32)
         }
 
-        fn next_u64(&mut self) -> u64 {
-            self.0
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            Ok(self.0)
         }
 
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), Self::Error> {
             for b in dest {
                 *b = self.0 as u8;
             }
-        }
-
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand::Error> {
-            self.fill_bytes(dest);
             Ok(())
         }
     }

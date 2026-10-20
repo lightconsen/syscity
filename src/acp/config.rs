@@ -1,5 +1,4 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for automatic crash recovery of subagents.
@@ -30,7 +29,7 @@ pub struct AcpSessionId(pub String);
 impl AcpSessionId {
     pub fn new() -> Self {
         let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        crate::utils::fill_os_entropy(&mut bytes);
         Self(URL_SAFE_NO_PAD.encode(bytes))
     }
 }

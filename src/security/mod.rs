@@ -8,7 +8,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -217,7 +216,7 @@ impl AuthManager {
         };
 
         let mut token_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut token_bytes);
+        crate::utils::try_fill_os_entropy(&mut token_bytes)?;
         let token = URL_SAFE_NO_PAD.encode(token_bytes);
         let now = chrono::Utc::now();
         let session = Session {

@@ -8453,7 +8453,7 @@ dependencies = [
  "pgvector",
  "portable-pty",
  "qrcode",
- "rand 0.8.6",
+ "rand 0.10.1",
  "ratatui",
  "regex",
  "reqwest 0.12.28",
@@ -8518,7 +8518,7 @@ name = "syscity-desktop"
 version = "0.3.11"
 dependencies = [
  "async-trait",
- "rand 0.8.6",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "syscity",

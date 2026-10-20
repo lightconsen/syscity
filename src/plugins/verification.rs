@@ -224,9 +224,9 @@ mod tests {
     fn test_sign_then_verify() {
         // Generate an ephemeral signing key for testing
         use ed25519_dalek::SigningKey;
-        use rand::Rng;
+        use rand::RngExt;
         let mut secret_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut secret_bytes);
+        rand::rng().fill(&mut secret_bytes);
         let signing_key = SigningKey::from_bytes(&secret_bytes);
         let engine = base64::engine::general_purpose::STANDARD;
         let secret_b64 = engine.encode(signing_key.to_bytes());
@@ -247,9 +247,9 @@ mod tests {
     #[test]
     fn test_tampered_manifest_fails_verification() {
         use ed25519_dalek::SigningKey;
-        use rand::Rng;
+        use rand::RngExt;
         let mut secret_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut secret_bytes);
+        rand::rng().fill(&mut secret_bytes);
         let signing_key = SigningKey::from_bytes(&secret_bytes);
         let engine = base64::engine::general_purpose::STANDARD;
         let secret_b64 = engine.encode(signing_key.to_bytes());
@@ -331,9 +331,9 @@ mod tests {
     /// base64 as the manifest records it.
     fn sign_with_fresh_key(manifest: &mut PluginManifest) -> String {
         use ed25519_dalek::SigningKey;
-        use rand::Rng;
+        use rand::RngExt;
         let mut secret_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut secret_bytes);
+        rand::rng().fill(&mut secret_bytes);
         let engine = base64::engine::general_purpose::STANDARD;
         let secret_b64 = engine.encode(SigningKey::from_bytes(&secret_bytes).to_bytes());
         sign_manifest(manifest, &secret_b64).unwrap();

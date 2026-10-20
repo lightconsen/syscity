@@ -330,11 +330,11 @@ impl DevicePairingStore {
     }
 
     fn generate_code() -> String {
-        use rand::Rng;
+        use rand::RngExt;
         const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..8)
-            .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+            .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
             .collect()
     }
 
