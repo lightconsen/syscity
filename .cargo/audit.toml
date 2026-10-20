@@ -47,10 +47,4 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
-
-    # RUSTSEC-2026-0187: stack overflow in lopdf via deeply nested PDF objects.
-    # Transitive via pdf-extract 0.7.12 (which pins lopdf ^0.34); the fixed
-    # version needs lopdf >=0.42.0, a major API break no released pdf-extract
-    # pulls in yet. Syscity only extracts PDFs on explicit user request.
-    "RUSTSEC-2026-0187",
 ]
