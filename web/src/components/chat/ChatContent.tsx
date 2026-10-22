@@ -2,7 +2,7 @@ import { useRef, useState, useCallback, useEffect } from "react";
 import {
   ThreadPrimitive,
   ComposerPrimitive,
-  useComposerRuntime,
+  useAui,
 } from "@assistant-ui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { MessageBubble } from "./MessageBubble";
@@ -29,7 +29,7 @@ export function ChatContent({ transport }: ChatContentProps) {
   const { t } = useTranslation("chat");
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const composer = useComposerRuntime();
+  const composer = useAui().composer;
   const pendingDraft = useChatStore((s) => s.pendingDraft);
   const setPendingDraft = useChatStore((s) => s.setPendingDraft);
 
