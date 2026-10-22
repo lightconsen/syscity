@@ -180,7 +180,7 @@ fn assert_process_output(result: &serde_json::Value) {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_screenshot_basic() {
     let results = run_tool_chat_test(
-        40310,
+        free_port(),
         "Use the macos_screenshot tool to take a screenshot and describe what you see on my \
          screen. Call ONLY macos_screenshot.",
         "macos_screenshot",
@@ -197,7 +197,7 @@ async fn tool_macos_screenshot_basic() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_screenshot_front_window() {
     let results = run_tool_chat_test(
-        40311,
+        free_port(),
         "Capture the frontmost window using macos_screenshot. Set the window parameter to capture \
          a specific window. Describe its content and layout. Call ONLY macos_screenshot.",
         "macos_screenshot",
@@ -214,7 +214,7 @@ async fn tool_macos_screenshot_front_window() {
 #[ignore = "Opens browser on the desktop"]
 async fn tool_macos_screenshot_after_open_browser() {
     let results = run_multi_tool_chat_test(
-        40326,
+        free_port(),
         "Use applescript to open Google Chrome or Safari. Then use macos_screenshot to take a \
          screenshot and tell me what web page is currently open.",
         &["applescript", "macos_screenshot"],
@@ -237,7 +237,7 @@ async fn tool_macos_screenshot_after_open_browser() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_accessibility_ui_tree() {
     let results = run_tool_chat_test(
-        40312,
+        free_port(),
         "Use the macos_accessibility tool to read the frontmost application's UI structure. List \
          all visible buttons and text fields. Call ONLY macos_accessibility.",
         "macos_accessibility",
@@ -255,7 +255,7 @@ async fn tool_macos_accessibility_ui_tree() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_accessibility_finder() {
     let results = run_tool_chat_test(
-        40313,
+        free_port(),
         "Use the macos_accessibility tool to read the Finder application's window structure. Tell \
          me what folders and files are visible. Call ONLY macos_accessibility.",
         "macos_accessibility",
@@ -277,7 +277,7 @@ async fn tool_macos_accessibility_finder() {
 #[ignore = "Requires display server + accessibility permissions"]
 async fn tool_macos_desktop_control_open_settings() {
     let results = run_multi_tool_chat_test(
-        40314,
+        free_port(),
         "First use applescript to open System Settings (System Preferences). Then use \
          macos_desktop_control with action=inspect to read the settings window. Tell me what \
          options are available.",
@@ -293,7 +293,7 @@ async fn tool_macos_desktop_control_open_settings() {
 #[ignore = "Requires Chrome + display server; performs real web search"]
 async fn tool_macos_desktop_control_chrome_search() {
     let results = run_multi_tool_chat_test(
-        40315,
+        free_port(),
         "Use applescript to open Google Chrome and navigate to a search for 'syscity'. Then use \
          macos_screenshot to capture the browser window showing the search results.",
         &["applescript", "macos_screenshot"],
@@ -317,7 +317,7 @@ async fn tool_macos_desktop_control_chrome_search() {
 #[ignore = "Modifies actual desktop state (creates Notes content)"]
 async fn tool_macos_desktop_control_notes() {
     let results = run_multi_tool_chat_test(
-        40316,
+        free_port(),
         "Use applescript to open the Notes app and create a new note with the content 'Hello from \
          Syscity'. Then use macos_screenshot to capture the Notes window to confirm.",
         &["applescript", "macos_screenshot"],
@@ -336,7 +336,7 @@ async fn tool_macos_desktop_control_notes() {
 #[ignore = "Modifies actual desktop state (opens Calculator)"]
 async fn tool_macos_desktop_control_calculator() {
     let results = run_multi_tool_chat_test(
-        40317,
+        free_port(),
         "Use applescript to open the Calculator app. Then use macos_desktop_control to press the \
          buttons for 128 × 256 =. Finally use macos_screenshot to capture the result.",
         &["applescript", "macos_desktop_control", "macos_screenshot"],
@@ -354,7 +354,7 @@ async fn tool_macos_desktop_control_calculator() {
 #[serial]
 async fn tool_process_cpu() {
     let results = run_tool_chat_test(
-        40318,
+        free_port(),
         "Use the process tool to list running processes sorted by CPU usage. Tell me which \
          processes are consuming the most CPU. Call ONLY process.",
         "process",
@@ -370,7 +370,7 @@ async fn tool_process_cpu() {
 #[serial]
 async fn tool_process_chrome() {
     let results = run_tool_chat_test(
-        40319,
+        free_port(),
         "Use the process tool to find and count how many Chrome processes are currently running. \
          Call ONLY process.",
         "process",
@@ -391,7 +391,7 @@ async fn tool_process_chrome() {
 #[ignore = "Creates a folder on the actual desktop"]
 async fn tool_combo_folder_and_screenshot() {
     let results = run_multi_tool_chat_test(
-        40320,
+        free_port(),
         "First use the shell tool to create a folder called 'test_output' on my desktop (mkdir -p \
          ~/Desktop/test_output). Then use macos_screenshot to take a screenshot to verify the \
          folder was created.",
@@ -418,7 +418,7 @@ async fn tool_combo_folder_and_screenshot() {
 #[ignore = "Requires display server for screenshot"]
 async fn tool_combo_list_files_and_screenshot() {
     let results = run_multi_tool_chat_test(
-        40321,
+        free_port(),
         "First use the shell tool to list the 5 largest files in my Downloads folder (ls -lhS \
          ~/Downloads | head -6). Then use macos_screenshot to show the Downloads folder contents.",
         &["shell", "macos_screenshot"],
@@ -437,7 +437,7 @@ async fn tool_combo_list_files_and_screenshot() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_applescript_finder_path() {
     let results = run_tool_chat_test(
-        40322,
+        free_port(),
         "Use ONLY the applescript tool. Execute: do shell script \"echo syscity_test_ok\". Report \
          the result. Do not use shell or any other tool.",
         "applescript",
@@ -454,7 +454,7 @@ async fn tool_applescript_finder_path() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_applescript_dialog() {
     let results = run_tool_chat_test(
-        40323,
+        free_port(),
         "Use the applescript tool to display a dialog box saying 'Hello from Syscity'. Script: \
          display dialog \"Hello from Syscity\" buttons {\"OK\"} default button \"OK\". Call ONLY \
          applescript.",
@@ -477,7 +477,7 @@ async fn tool_applescript_dialog() {
 #[ignore = "Requires Safari + display server"]
 async fn tool_combo_safari_screenshot_and_ui_tree() {
     let results = run_multi_tool_chat_test(
-        40324,
+        free_port(),
         "First use macos_screenshot to capture my current desktop. Then use macos_accessibility \
          to read Safari's UI tree and tell me what web pages are open in Safari.",
         &["macos_screenshot", "macos_accessibility"],
@@ -499,7 +499,7 @@ async fn tool_combo_safari_screenshot_and_ui_tree() {
 #[ignore = "Requires display server"]
 async fn tool_combo_full_desktop_report() {
     let results = run_multi_tool_chat_test(
-        40325,
+        free_port(),
         "Execute these three steps and give me a summary report: 1. Use macos_screenshot to \
          capture the current desktop 2. Use the process tool to list running processes 3. Use \
          macos_accessibility to read the frontmost application's UI tree",
@@ -522,7 +522,7 @@ async fn tool_combo_full_desktop_report() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Retained from first batch (port 40300-40303)
+// Retained from the first batch
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -530,7 +530,7 @@ async fn tool_combo_full_desktop_report() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_screenshot_via_chat() {
     let results = run_tool_chat_test(
-        40300,
+        free_port(),
         "Use the macos_screenshot tool to take a screenshot and tell me what you see. Call ONLY \
          macos_screenshot.",
         "macos_screenshot",
@@ -546,7 +546,7 @@ async fn tool_macos_screenshot_via_chat() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_accessibility_via_chat() {
     let results = run_tool_chat_test(
-        40301,
+        free_port(),
         "Use the macos_accessibility tool to read the frontmost application's UI tree. List all \
          visible buttons, text fields, and windows. Call ONLY macos_accessibility.",
         "macos_accessibility",
@@ -562,7 +562,7 @@ async fn tool_macos_accessibility_via_chat() {
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_applescript_via_chat() {
     let results = run_tool_chat_test(
-        40302,
+        free_port(),
         "Use the applescript tool to execute: tell application \"Finder\" to get name of every \
          window. Report the output. Call ONLY applescript.",
         "applescript",
@@ -578,7 +578,7 @@ async fn tool_applescript_via_chat() {
 #[ignore = "Requires display server + accessibility permissions; may interact with desktop"]
 async fn tool_macos_desktop_control_inspect() {
     let results = run_tool_chat_test(
-        40303,
+        free_port(),
         "Use the macos_desktop_control tool with action=inspect to inspect the current desktop \
          state. Tell me what applications are open and what UI elements are visible. Call ONLY \
          macos_desktop_control.",
@@ -606,7 +606,7 @@ async fn tool_macos_desktop_control_inspect() {
 #[cfg_attr(not(target_os = "linux"), ignore = "Linux-only test")]
 async fn tool_linux_system_inspect_via_chat() {
     let results = run_tool_chat_test(
-        40140,
+        free_port(),
         "Use ONLY the system_inspect tool. Get the hostname and uptime of this Linux system. Do \
          not use any other tool.",
         "system_inspect",
@@ -624,7 +624,7 @@ async fn tool_linux_system_inspect_via_chat() {
 #[cfg_attr(not(target_os = "linux"), ignore = "Linux-only test")]
 async fn tool_linux_notification_invoked_via_chat() {
     let results = run_tool_chat_test(
-        40141,
+        free_port(),
         "Use ONLY the linux_notification tool. Send a notification with summary='Syscity Test' \
          and body='E2E notification test'. Do not use any other tool.",
         "linux_notification",
@@ -642,7 +642,7 @@ async fn tool_linux_notification_invoked_via_chat() {
 #[cfg_attr(not(target_os = "linux"), ignore = "Linux-only test")]
 async fn tool_linux_multi_system_and_process() {
     let results = run_multi_tool_chat_test(
-        40142,
+        free_port(),
         "First use the system_inspect tool to get the hostname and uptime. Then use the process \
          tool to list the top 5 processes by CPU.",
         &["system_inspect", "process"],
@@ -660,7 +660,7 @@ async fn tool_linux_multi_system_and_process() {
 #[cfg_attr(not(target_os = "windows"), ignore = "Windows-only test")]
 async fn tool_windows_clipboard_invoked_via_chat() {
     let results = run_tool_chat_test(
-        40143,
+        free_port(),
         "Use ONLY the windows_clipboard tool. Get the current clipboard content. Do not use any \
          other tool.",
         "windows_clipboard",
@@ -677,7 +677,7 @@ async fn tool_windows_clipboard_invoked_via_chat() {
 #[ignore = "Requires display server + desktop permissions"]
 async fn tool_windows_screenshot_invoked_via_chat() {
     let results = run_tool_chat_test(
-        40144,
+        free_port(),
         "Use ONLY the windows_screenshot tool. Take a screenshot of the primary display. Do not \
          use any other tool.",
         "windows_screenshot",
@@ -694,7 +694,7 @@ async fn tool_windows_screenshot_invoked_via_chat() {
 #[ignore = "Requires display server + desktop permissions (Windows-only test)"]
 async fn tool_windows_desktop_control_invoked_via_chat() {
     let results = run_tool_chat_test(
-        40145,
+        free_port(),
         "Use ONLY the windows_desktop_control tool. List all open windows. Do not use any other \
          tool.",
         "windows_desktop_control",

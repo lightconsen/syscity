@@ -19,7 +19,8 @@ use super::*;
 async fn goal_planner_fallback_when_no_adapter() {
     // Build a config with computer explicitly disabled so the Agent
     // never gets a GoalPlanner field.
-    let mut config = test_config(40502, false);
+    let port = free_port();
+    let mut config = test_config(port, false);
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
     config.computer.enabled = false;
@@ -30,9 +31,9 @@ async fn goal_planner_fallback_when_no_adapter() {
     let mock = llm_mock_provider_for_streaming();
     register_mock_provider_with_model(&router, mock, "mock-model").await;
 
-    start_gateway_and_wait(40502, gateway).await;
+    start_gateway_and_wait(port, gateway).await;
 
-    let mut client = FrontendSimulator::connect(40502).await;
+    let mut client = FrontendSimulator::connect(port).await;
     let sid = client.create_session().await;
     client.subscribe(vec![sid.clone()]).await;
 
