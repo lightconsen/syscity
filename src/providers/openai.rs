@@ -1090,6 +1090,7 @@ mod tests {
     /// Video is a job, not a request: submit, poll, then fetch the content. The
     /// paths are the OpenRouter-style contract.
     #[tokio::test]
+    #[serial_test::serial]
     async fn video_submits_polls_and_fetches_the_content() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1137,6 +1138,7 @@ mod tests {
     /// A job that ends badly is an error with the vendor's own reason, not an
     /// empty success or a hang.
     #[tokio::test]
+    #[serial_test::serial]
     async fn a_failed_video_job_reports_the_reason() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1176,6 +1178,7 @@ mod tests {
     /// image URL comes back through it rather than through a second, parallel
     /// read of an env var.
     #[tokio::test]
+    #[serial_test::serial]
     async fn image_generation_returns_the_url_the_provider_sent() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1205,6 +1208,7 @@ mod tests {
     /// Speech comes back as bytes, which is why it uses the streaming method —
     /// and the label has to follow the format that was asked for.
     #[tokio::test]
+    #[serial_test::serial]
     async fn speech_returns_bytes_labelled_with_the_format_asked_for() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1234,6 +1238,7 @@ mod tests {
 
     /// A provider that answers with no image is a refusal, not an empty success.
     #[tokio::test]
+    #[serial_test::serial]
     async fn an_image_response_with_no_image_is_an_error() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1259,6 +1264,7 @@ mod tests {
     /// Transcription goes through the multipart path, and the audio is the file
     /// field — the vendor infers the container from the filename's extension.
     #[tokio::test]
+    #[serial_test::serial]
     async fn transcription_sends_the_audio_as_a_file_field() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1349,6 +1355,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_url_building() {
         let provider = OpenAiProvider::new("test-key").unwrap();
         assert_eq!(provider.url("/chat/completions"), "https://api.openai.com/v1/chat/completions");
@@ -1419,17 +1426,36 @@ mod tests {
         assert!(provider.supports_tools());
     }
 
+    /// `SYSCITY_API_PATH` replaces the request path wholesale.
+    ///
+    /// The override is set on the field rather than through the environment:
+    /// the environment is process-global, so a parallel test constructing any
+    /// provider during the window would pick it up. That is exactly how
+    /// `test_url_building` and the wiremock tests used to fail intermittently.
+    /// The wiring itself is covered by `api_path_override_is_read_from_the_environment`.
     #[test]
     fn test_openai_provider_url_with_custom_path() {
-        // SAFETY: Setting/removing an environment variable in a single-threaded
-        // test context is safe. The unsafe block is only to satisfy the deny lint.
+        let mut provider = OpenAiProvider::new("test-key").unwrap();
+        provider.api_path_override = Some("custom/path".to_string());
+        assert_eq!(provider.url("/chat/completions"), "https://api.openai.com/v1/custom/path");
+    }
+
+    /// Construction reads `SYSCITY_API_PATH` once and caches it.
+    ///
+    /// `#[serial]` because the variable is process-global: it must not be set
+    /// while another test is building a provider. Tests that assert on the URL
+    /// or issue a request carry the same attribute for the same reason.
+    #[test]
+    #[serial_test::serial]
+    fn api_path_override_is_read_from_the_environment() {
+        // SAFETY: `#[serial]` keeps env-touching tests off each other; the
+        // process-wide variable is restored before the test returns.
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("SYSCITY_API_PATH", "custom/path")
         };
         let provider = OpenAiProvider::new("test-key").unwrap();
-        let url = provider.url("/chat/completions");
-        assert_eq!(url, "https://api.openai.com/v1/custom/path");
+        assert_eq!(provider.api_path_override.as_deref(), Some("custom/path"));
         // SAFETY: See comment above.
         #[allow(unsafe_code)]
         unsafe {
