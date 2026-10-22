@@ -239,8 +239,20 @@ impl DelegationTaskStore {
             }
         }
 
+        // An in-memory database is opened with SQLite's shared cache, where
+        // concurrent writers take table-level locks; sqlx 0.9 surfaces that as
+        // SQLITE_LOCKED (code 262) rather than waiting. One connection
+        // serialises them, which is the only shape an in-memory store can keep.
+        // File-backed pools keep their three. Same reasoning as
+        // `SessionStore::new`.
+        let max_connections = if database_url.contains(":memory:") {
+            1
+        } else {
+            3
+        };
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(3)
+            .max_connections(max_connections)
             .acquire_timeout(Duration::from_secs(30))
             .connect(database_url)
             .await
