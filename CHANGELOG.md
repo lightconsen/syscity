@@ -9,6 +9,18 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
+## [0.3.13] - 2026-10-22
+
+### Highlights
+
+- **The chat input works again.** Typing a single character into the composer threw `Maximum update depth exceeded. The result of getSnapshot should be cached to avoid an infinite loop.` and swallowed the keystrokes. The guard is assistant-ui's Tap store; the defect is `@assistant-ui/core@0.2.23`, which recomputed the thread-list state into a referentially unstable object while the list was unconnected, so every store read looked like a change (upstream assistant-ui/assistant-ui#6440). `@assistant-ui/react` moves to 0.15.30 and `@assistant-ui/react-markdown` to 0.14.23, the first release on that peer range. The 0.15 line retired `useComposerRuntime`, so the composer is reached through `useAui().composer`.
+
+### Security
+
+- **tokio 1.54.1** clears RUSTSEC-2026-0384, a race in `time::Interval` that arrived with 0.3.12's tokio 1.54.0 bump.
+- **rustls-webpki 0.103.16** clears RUSTSEC-2026-0382 (certificate verification could accept distrusted intermediates); **webpki-roots** and **webpki-root-certs 1.0.10** clear RUSTSEC-2026-0381 and -0383 (bundled roots trusting distrusted emSign intermediates).
+- **vite 6.4.5** clears three `launch-editor` advisories in the `web/` dev dependency.
+
 ## [0.3.12] - 2026-10-20
 
 ### Highlights
