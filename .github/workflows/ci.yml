@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    # `main` only. Work happens on `develop`, which is a scratch branch: giving
+    # it the full matrix charged every intermediate commit — a 15-job run
+    # including the ~45-minute macOS release link — for a branch that is not
+    # deployed. The pull request into `main` is the gate, so that is where the
+    # matrix runs. Do not add `develop` back without an explicit budget reason.
+    branches: [main]
     paths-ignore:
       - 'docs/**'
       - '**.md'
@@ -11,6 +16,14 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
+
+# A push to a pull request branch supersedes the run in flight for that PR;
+# without this, every `git push` during review buys another full matrix.
+# Scoped by PR number (or ref for pushes) so separate PRs never cancel each
+# other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
