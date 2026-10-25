@@ -414,10 +414,18 @@ jobs:
 
   test-macos:
     name: Test (macOS)
+    # Post-merge only. At GitHub's macOS rate this job alone is ~$4.6 per run —
+    # roughly four times the entire Linux matrix — and it was the single
+    # largest line in the metered usage. Pull requests are therefore gated by
+    # the Linux and Windows jobs; the macOS-only code (Seatbelt, the macOS
+    # platform modules) is verified on `main` instead.
+    #
+    # The trade: a macOS-only break now lands on `main` rather than on the
+    # pull request. Move this back to pull requests if that ever costs more
+    # than the minutes it saves.
+    if: github.event_name == 'push'
     runs-on: macos-latest
     needs: check
-    # Drafts skip the expensive half; the cheap jobs below still run.
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
