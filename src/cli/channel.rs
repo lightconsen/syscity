@@ -1482,6 +1482,7 @@ async fn add_irc_channel(
 }
 
 /// Add/configure a SimpleX Chat channel in Gateway
+#[cfg(feature = "simplex")]
 async fn add_simplex_channel(
     agent: Option<String>,
     extra_creds: Vec<(String, String)>,
@@ -1544,6 +1545,16 @@ async fn add_simplex_channel(
     println!("   Start the Gateway to activate the channel:");
     println!("   syscity start");
 
+    Ok(())
+}
+
+#[cfg(not(feature = "simplex"))]
+async fn add_simplex_channel(
+    _agent: Option<String>,
+    _extra_creds: Vec<(String, String)>,
+) -> Result<()> {
+    println!("❌ SimpleX support not compiled in.");
+    println!("   Build with: cargo build --features simplex");
     Ok(())
 }
 
