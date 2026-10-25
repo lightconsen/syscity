@@ -2,11 +2,19 @@ name: CI
 
 on:
   push:
-    # `main` only. Work happens on `develop`, which is a scratch branch: giving
-    # it the full matrix charged every intermediate commit — a 15-job run
-    # including the ~45-minute macOS release link — for a branch that is not
-    # deployed. The pull request into `main` is the gate, so that is where the
-    # matrix runs. Do not add `develop` back without an explicit budget reason.
+    # `main` only, because this is a one-person project and the work lands
+    # directly on `main`. There is no integration branch to keep quiet, and
+    # Actions minutes on a public repository are free, so the earlier idea of
+    # a `develop` scratch branch bought nothing: it only parked unverified
+    # commits until someone opened a pull request.
+    #
+    # What the workflow has to protect is narrower: **do not push a `v*` tag
+    # until the CI run for the commit it points at is green.** The release
+    # pipeline builds artifacts from that tag, and a red main plus a tag is
+    # how the v0.3.13 cycle burned three release runs.
+    #
+    # `pull_request` stays, because Dependabot delivers its updates as pull
+    # requests and those want a gate before they merge.
     branches: [main]
     paths-ignore:
       - 'docs/**'
