@@ -52,6 +52,12 @@ ignore = [
     # bump to: upstream reports `patched = []` and lists the work as open
     # (RustCrypto/RSA#626, #680, #702), and still affected in 0.10.0-rc.18.
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 is only jsonwebtoken's verification backend (public-key ops only — the advisory is private-key timing) plus a test-only key generator; upstream reports patched=[], so no upgrade exists" },
+    # Same reasoning: reached only via jsonwebtoken -> p256 -> elliptic-curve -> crypto-bigint
+    # 0.5.5, where the only runtime use is verifying inbound bearer tokens against public keys,
+    # and the private-key side is a dev-dependency. patched >= 0.7.6, but jsonwebtoken 11.1.0
+    # (latest) still pins elliptic-curve 0.13 / p256 0.13, which use crypto-bigint 0.5.
+    # Drop this waiver when jsonwebtoken moves to p256 0.14, or if we ever sign with a private key.
+    { id = "RUSTSEC-2026-0387", reason = "timing variability in crypto-bigint, reached only through jsonwebtoken's public-key signature verification (and a test-only RSA key generator); no released jsonwebtoken uses the patched 0.7.6 line yet" },
 ]
 
 [licenses]

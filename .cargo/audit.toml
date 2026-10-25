@@ -23,6 +23,26 @@ ignore = [
     # matching entry in deny.toml.
     "RUSTSEC-2023-0071",
 
+    # crypto-bigint (RUSTSEC-2026-0387, 2026-10-23): operations meant to be
+    # constant-time could branch on a secret, depending on compiler and target
+    # CPU — subtraction, zero counting, division, Montgomery multiplication,
+    # and `UintRef` equality.
+    #
+    # Reached only through `jsonwebtoken` -> `p256` -> `elliptic-curve` ->
+    # `crypto-bigint 0.5.5`. The runtime path (the `teams` and `googlechat`
+    # channels) only *verifies* inbound bearer tokens: the key set is public
+    # data and every operation against it is a signature check on public
+    # input. The private-key side (`rsa`) is a dev-dependency used to mint a
+    # token against a mock JWKS. So the same reasoning as RUSTSEC-2023-0071
+    # applies — nothing here holds a secret the timing could leak.
+    #
+    # patched = ">= 0.7.6", but nothing in the chain reaches it yet:
+    # `jsonwebtoken 11.1.0` is the latest release and still pins
+    # `elliptic-curve 0.13` / `p256 0.13`, which are compiled against
+    # crypto-bigint 0.5. Drop this waiver once `p256 0.14` lands in
+    # jsonwebtoken (or if anything here ever signs with a private key).
+    "RUSTSEC-2026-0387",
+
     # RUSTSEC-2026-0367 / -0368 / -0369: three `zip` advisories (2026-10-09/10)
     # about **extraction** — SUID/SGID bits preserved when extracting, symlink
     # targets outside the destination directory, and Unix permissions applied
