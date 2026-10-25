@@ -9,6 +9,32 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
+## [0.3.14] - 2026-10-25
+
+### Highlights
+
+- **CI is hardened for a public repository.** Every workflow now declares `permissions: contents: read` (only the release job elevates, to `contents: write`); all 98 action references are pinned to commit SHAs rather than mutable tags; every job has a `timeout-minutes`; the expensive jobs need the lint job, so a formatting failure no longer spends an hour of macOS runner time; and a new push to a pull request cancels the run it supersedes.
+- **macOS runner time cut.** macOS is 89% of this repository's metered usage — $714.61 of $801.90 for the 25 days in October's report, at ten times the Linux rate. The macOS test suite now runs on `main` only and the macOS arm of the `build` job is gone, so a pull request spends no macOS minutes at all. The release workflow is untouched.
+- **`Eval Nightly` runs again.** It had failed every night, not on an eval but on the build before it: `cargo build --no-default-features --features plugins,sqlite-vec` did not compile.
+
+### Added
+
+- **`Windows Check`**: `cargo check --all-features` on `windows-latest`, i.e. the `x86_64-pc-windows-msvc` target the release pipeline ships. Before this, the only Windows coverage prior to a tag was the mingw cross-check, which cannot link and skips `ort` — 57 `cfg(target_os = "windows")` sites were unexercised on the target users run.
+
+### Fixed
+
+- **The crate compiles without `simplex` and `browser`.** `add_simplex_channel` referenced `crate::channels::simplex` without a feature gate (every other channel pairs a gated implementation with a `#[cfg(not(…))]` stub), and `InfraState`'s initializer set the `browser`-gated `export_pool` field unconditionally. That is what broke `Eval Nightly` nightly.
+- **`MSRV Check` now checks something.** It ran `cargo check --all-features` on toolchain 1.95 — the same compiler every other job uses, since `rust-toolchain.toml`, `Cargo.toml` `rust-version` and the CI `toolchain:` input all say 1.95. It is now a consistency assertion between those three declarations, which is the property that silently breaks when a value drifts.
+
+### Security
+
+- **ctutils 0.4.5** clears RUSTSEC-2026-0385 (non-constant-time mask generation).
+- **RUSTSEC-2026-0387** (crypto-bigint, secret-dependent branches) is waived. The patched line is 0.7.6, but `jsonwebtoken 11.1.0` — the latest release — still pins `elliptic-curve 0.13` / `p256 0.13`, which are built against crypto-bigint 0.5. The waiver follows the reasoning already recorded for RUSTSEC-2023-0071 on the same chain: the runtime path only verifies inbound bearer tokens against public keys, and the private-key side is a dev-dependency minting a token for a mock JWKS. Both files say when to revisit it.
+
+### Changed
+
+- **Work lands directly on `main`; `develop` is gone.** Actions minutes are free on a public repository, so the integration branch only parked unverified commits until a pull request opened. The one rule that matters is written down in `ci.yml`: no `v*` tag until the CI run for the commit it points at is green.
+
 ## [0.3.13] - 2026-10-22
 
 ### Highlights
