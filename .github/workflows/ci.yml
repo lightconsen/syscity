@@ -164,11 +164,11 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      # This is the only job that compiles the `cfg(target_os = "windows")`
-      # modules — `tools/win_appcontainer.rs` in particular. Nothing else in
-      # pull-request CI touches them; the release pipeline does build Windows
-      # natively, but only when a `v*` tag is pushed, which is the worst
-      # moment to discover a Windows-only break.
+      # Until `windows` below was added, this was the only job that compiled
+      # the `cfg(target_os = "windows")` modules under the `gnu` target. The
+      # release pipeline builds Windows natively, but only when a `v*` tag is
+      # pushed, which is the worst moment to discover a Windows-only break;
+      # the native job now covers the `msvc` target on every run.
       #
       # The feature set is deliberately not `--all-features`: `vision` (ort)
       # publishes no prebuilt library for `x86_64-pc-windows-gnu`, and
@@ -179,6 +179,37 @@ jobs:
           cargo check --target x86_64-pc-windows-gnu --lib \
             --no-default-features \
             --features "simplex,sqlite-vec,plugins,browser"
+
+  windows:
+    name: Windows Check
+    # The `gnu` cross-check above proves the Windows modules compile against
+    # mingw, but it cannot link, cannot use `ort` (no prebuilt for that
+    # target) and never runs a Windows toolchain. This job is the real MSVC
+    # target, on a Windows host — the same target the release pipeline ships.
+    #
+    # `--all-features` to match the Linux `Check` job. That pulls llama-cpp-2,
+    # which is the slow part; if this job's wall clock ever needs cutting,
+    # drop `local-embeddings` first — it has nothing to do with Windows.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # `--all-features` enables `embedded-assets`, which rust-embeds `dist/`
+      # at compile time; the directory must exist even though nothing builds
+      # the frontend here.
+      - name: Ensure web assets directory exists
+        run: New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --all-features
 
   release-link:
     name: Release Link (macOS)
