@@ -138,5 +138,7 @@
   "AgentRenameDialog.emojiLabel": "Emoji",
   "AgentRenameDialog.hint": "Saved to the agent's IDENTITY.md and SOUL.md.",
   "AgentRenameDialog.cancel": "Cancel",
-  "AgentRenameDialog.save": "Save"
+  "AgentRenameDialog.save": "Save",
+  "AccountButton.loginFailed": "Cloud sign-in failed:",
+  "AccountButton.loginTimedOut": "Cloud sign-in did not complete. If the network needs a proxy, start the gateway with HTTPS_PROXY set — it could not reach the cloud API."
 }

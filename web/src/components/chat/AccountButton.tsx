@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import i18n from "@/i18n";
+import { pushToast } from "@/components/ui/Toast";
 import {
   CalendarCheck,
   Check,
@@ -124,6 +126,13 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
     if (pendingRef.current && Date.now() - pendingSince.current > LOGIN_TIMEOUT_MS) {
       stopPolling();
       setPending(false);
+      // Nothing was reported back. On a bad network the likely cause is the
+      // gateway not reaching the cloud API, so say that rather than leaving
+      // the button spinning for three minutes and then going quiet.
+      pushToast(
+        "error",
+        i18n.t("AccountButton.loginTimedOut", { ns: "chat" }),
+      );
     }
   }, [setPending, stopPolling]);
 
@@ -142,11 +151,24 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
       } catch {
         return;
       }
+      // A failed submit closes the loop right here instead of waiting out the
+      // three-minute poll: the callback page knows *why* it failed, and that
+      // reason is the only actionable thing the user can get.
+      if (e.data.ok === false) {
+        stopPolling();
+        setPending(false);
+        const lead = i18n.t("AccountButton.loginFailed", { ns: "chat" });
+        pushToast(
+          "error",
+          e.data.message ? `${lead} ${e.data.message}` : lead,
+        );
+        return;
+      }
       void checkAndMaybeStop();
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [checkAndMaybeStop]);
+  }, [checkAndMaybeStop, setPending, stopPolling]);
 
   const beginLogin = useCallback(() => {
     if (pendingRef.current) return;

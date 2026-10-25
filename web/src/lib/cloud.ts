@@ -140,10 +140,24 @@ export function cloudLogin(provider = "github") {
   window.location.href = cloudLoginUrl(provider);
 }
 
+/** Outcome of persisting the token from the OAuth callback.
+ *
+ *  `message` carries the gateway's reason on failure — a network error from
+ *  the gateway's own call to the cloud API reads very differently from an
+ *  expired token, and both used to arrive here as a bare `false`. */
+export interface SubmitTokenResult {
+  ok: boolean;
+  message?: string;
+}
+
 /** Persist a session token returned by the cloud OAuth callback. */
-export async function cloudSubmitToken(token: string): Promise<boolean> {
+export async function cloudSubmitToken(
+  token: string,
+): Promise<SubmitTokenResult> {
   const transport = getActiveTransport();
-  if (!transport) return false;
+  if (!transport) {
+    return { ok: false, message: "No gateway connection" };
+  }
   // The OAuth callback page submits on mount, racing the transport's WS
   // handshake; sendRequestAndWait fails fast while the socket is still
   // CONNECTING. Wait for "connected" first (onStatusChange fires immediately
@@ -161,12 +175,20 @@ export async function cloudSubmitToken(token: string): Promise<boolean> {
       }
     });
   });
-  if (!ready) return false;
+  if (!ready) {
+    return {
+      ok: false,
+      message: "The gateway did not answer in time — is it still running?",
+    };
+  }
   try {
     const r = (await transport.submitCloudToken(token)) as { ok?: boolean };
-    return r?.ok ?? true;
-  } catch {
-    return false;
+    return { ok: r?.ok ?? true };
+  } catch (e) {
+    return {
+      ok: false,
+      message: e instanceof Error ? e.message : String(e),
+    };
   }
 }
 

@@ -129,7 +129,15 @@ pub(crate) async fn handle_cloud_token(req: &WsRequest, state: &Arc<GatewayState
                 WsResponse::ok(&req.id, serde_json::json!({ "ok": true, "user": user }))
             }
             Ok(None) => WsResponse::err(&req.id, "UNAUTHORIZED", "invalid cloud token"),
-            Err(e) => WsResponse::err(&req.id, "BAD_GATEWAY", e.to_string()),
+            // A transport failure and a rejected token are different problems
+            // and only one of them is the user's fault. Name the API host so
+            // the message points at the thing that could not be reached —
+            // on a network that needs a proxy this is what the UI shows.
+            Err(e) => WsResponse::err(
+                &req.id,
+                "BAD_GATEWAY",
+                format!("could not reach the cloud API ({}): {e}", cfg.api_base),
+            ),
         }
     }
     #[cfg(not(feature = "cloud"))]

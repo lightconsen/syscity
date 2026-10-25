@@ -9,6 +9,7 @@ import {
   type ChatMessage,
 } from "@/SyscityWebSocketTransport";
 import { useTranslation } from "react-i18next";
+import i18n from "@/i18n";
 import { cloudSubmitToken } from "@/lib/cloud";
 import { useChatStore } from "@/stores/chatStore";
 import { Titlebar } from "@/components/chrome/Titlebar";
@@ -225,33 +226,41 @@ function ChatApp() {
         }
       };
       if (token) {
-        cloudSubmitToken(token)
-          .then((ok) => {
-            // First-login guidance: surface the newly-enabled cloud
-            // capabilities banner on the home view after a successful login.
-            if (ok) {
-              try {
-                localStorage.setItem("syscity_cloud_enabled_hint", "1");
-              } catch {
-                /* ignore */
-              }
+        cloudSubmitToken(token).then(({ ok, message }) => {
+          // First-login guidance: surface the newly-enabled cloud
+          // capabilities banner on the home view after a successful login.
+          if (ok) {
+            try {
+              localStorage.setItem("syscity_cloud_enabled_hint", "1");
+            } catch {
+              /* ignore */
             }
-            if (isPopup) {
-              // Tell the opener the flow finished (it polls /api/v1/status as
-              // the reliable fallback). targetOrigin "*": the opener may be on
-              // 127.0.0.1 while this callback is on localhost — the receiver
-              // validates the origin.
-              try {
-                window.opener.postMessage(
-                  { type: "syscity:login", ok },
-                  "*",
-                );
-              } catch {
-                /* ignore */
-              }
+          }
+          if (isPopup) {
+            // Tell the opener the flow finished (it polls /api/v1/status as
+            // the reliable fallback). targetOrigin "*": the opener may be on
+            // 127.0.0.1 while this callback is on localhost — the receiver
+            // validates the origin.
+            try {
+              window.opener.postMessage(
+                { type: "syscity:login", ok, message },
+                "*",
+              );
+            } catch {
+              /* ignore */
             }
-          })
-          .finally(finish);
+          }
+          if (ok) {
+            finish();
+            return;
+          }
+          // The failure used to be swallowed here: the popup closed and the
+          // user was simply still signed out. Keep the page, say why, and let
+          // the toast carry the gateway's own message (a network error reads
+          // very differently from an expired token).
+          const lead = i18n.t("AccountButton.loginFailed", { ns: "chat" });
+          pushToast("error", message ? `${lead} ${message}` : lead);
+        });
       } else {
         finish();
       }

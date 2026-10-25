@@ -42,7 +42,13 @@ impl CloudClient {
         token: String,
         secrets: std::sync::Arc<SecretStoreHandle>,
     ) -> Self {
+        // A bound on the WAN round trip. Without one, an unreachable cloud
+        // holds the caller — `cloud.token` waits out the whole WebSocket
+        // request timeout and the user is told only "Request timeout". Ten
+        // seconds lets a working (if slow) reply through and makes a broken
+        // route fail here, where the error can name what could not be reached.
         let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

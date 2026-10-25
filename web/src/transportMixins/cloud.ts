@@ -4,20 +4,25 @@ import type { SyscityWebSocketTransport } from "../transportCore";
 // the facade `SyscityWebSocketTransport.ts`). Signatures are merged onto the
 // class type in `transportCore.ts`.
 export function install(proto: typeof SyscityWebSocketTransport.prototype): void {
+  // These traverse the WAN to the cloud API, like the KB and credits calls
+  // below — the 5 s local default is too tight for them. Sign-in is the case
+  // that matters most: the gateway's own request to the cloud (`/auth/me`)
+  // gets 10 s before it gives up with a BAD_GATEWAY naming the failure, and
+  // the client has to still be waiting when that answer arrives.
   proto.getCloudStatus = async function (this: SyscityWebSocketTransport,): Promise<unknown> {
-    return this.sendRequestAndWait("cloud.status", {});
+    return this.sendRequestAndWait("cloud.status", {}, 15_000);
   };
   proto.getCloudSubscription = async function (this: SyscityWebSocketTransport,): Promise<unknown> {
-    return this.sendRequestAndWait("cloud.subscription", {});
+    return this.sendRequestAndWait("cloud.subscription", {}, 15_000);
   };
   proto.getCloudUsage = async function (this: SyscityWebSocketTransport,days = 30): Promise<unknown> {
-    return this.sendRequestAndWait("cloud.usage", { days });
+    return this.sendRequestAndWait("cloud.usage", { days }, 15_000);
   };
   proto.submitCloudToken = async function (this: SyscityWebSocketTransport,token: string): Promise<unknown> {
-    return this.sendRequestAndWait("cloud.token", { token });
+    return this.sendRequestAndWait("cloud.token", { token }, 20_000);
   };
   proto.cloudLogout = async function (this: SyscityWebSocketTransport,): Promise<void> {
-    await this.sendRequestAndWait("cloud.logout", {});
+    await this.sendRequestAndWait("cloud.logout", {}, 15_000);
   };
   // Cloud knowledge bases — thin passthroughs to the cloud server. Reads get
   // a relaxed timeout: unlike local RPCs they traverse the WAN to Syscity

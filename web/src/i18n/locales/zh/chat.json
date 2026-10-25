@@ -138,5 +138,7 @@
   "AgentRenameDialog.emojiLabel": "图标",
   "AgentRenameDialog.hint": "会写入该 Agent 的 IDENTITY.md 与 SOUL.md。",
   "AgentRenameDialog.cancel": "取消",
-  "AgentRenameDialog.save": "保存"
+  "AgentRenameDialog.save": "保存",
+  "AccountButton.loginFailed": "云端登录失败：",
+  "AccountButton.loginTimedOut": "云端登录未完成。如果网络需要代理，请带 HTTPS_PROXY 启动网关——网关无法连接云端 API。"
 }
