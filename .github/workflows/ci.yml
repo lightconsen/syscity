@@ -25,6 +25,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Least privilege. This repository is public and accepts pull requests from
+# forks, so the default token must not be able to write anything: a compromised
+# action or a poisoned dependency step would otherwise get a write-scoped
+# GITHUB_TOKEN. No job here needs more than reading the checkout.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -33,8 +40,9 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies
         run: |
@@ -42,7 +50,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler pkg-config libasound2-dev libdbus-1-dev
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -52,7 +60,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -60,7 +68,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -71,7 +79,7 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           # Pinned toolchain (matches local dev) so CI clippy does not drift
           # onto newly-released lints between stable releases.
@@ -79,7 +87,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -113,35 +121,50 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   msrv:
-    name: MSRV Check
+    name: MSRV Consistency
+    # This used to run `cargo check --all-features` on toolchain 1.95 — but so
+    # does `check`, and 1.95 *is* the MSRV (`Cargo.toml` `rust-version`,
+    # `rust-toolchain.toml`, and every job here all say 1.95). The job was
+    # therefore a duplicate build, not an MSRV test.
+    #
+    # What is worth guarding is the property that made the old job look
+    # meaningful: the three declarations agreeing. If one drifts, the CI
+    # toolchain stops representing the MSRV, and no amount of compiling will
+    # say so. This takes seconds instead of eight minutes.
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Install system build dependencies
+      - name: Pinned toolchain, rust-version, and CI toolchain agree
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libasound2-dev libdbus-1-dev
-
-      - name: Ensure web assets directory exists
-        run: mkdir -p dist
-
-      - name: Install Rust MSRV
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95"
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Verify MSRV
-        run: cargo check --all-features
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rust_version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          ci_version=$(sed -n 's/^ *toolchain: "\(.*\)"/\1/p' .github/workflows/ci.yml | sort -u | tr '\n' ' ')
+          echo "rust-toolchain.toml channel : $toolchain"
+          echo "Cargo.toml rust-version      : $rust_version"
+          echo "CI toolchain: lines          : $ci_version"
+          if [ "$toolchain" != "$rust_version" ]; then
+            echo "::error::rust-toolchain.toml ($toolchain) and Cargo.toml rust-version ($rust_version) disagree"
+            exit 1
+          fi
+          for v in $ci_version; do
+            if [ "$v" != "$toolchain" ]; then
+              echo "::error::CI uses toolchain $v but the project pins $toolchain"
+              exit 1
+            fi
+          done
 
   windows-cross-check:
     name: Windows Cross Check
     runs-on: ubuntu-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Ensure web assets directory exists
         run: mkdir -p dist
@@ -151,18 +174,18 @@ jobs:
       # zig's spelling; `.cargo/config.toml` wires it up as this target's
       # linker and target-suffixed CC/AR.
       - name: Install zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
           targets: x86_64-pc-windows-gnu
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Until `windows` below was added, this was the only job that compiled
       # the `cfg(target_os = "windows")` modules under the `gnu` target. The
@@ -191,8 +214,12 @@ jobs:
     # which is the slow part; if this job's wall clock ever needs cutting,
     # drop `local-embeddings` first — it has nothing to do with Windows.
     runs-on: windows-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # `--all-features` enables `embedded-assets`, which rust-embeds `dist/`
       # at compile time; the directory must exist even though nothing builds
@@ -201,12 +228,12 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path dist | Out-Null
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check
         run: cargo check --all-features
@@ -226,9 +253,11 @@ jobs:
     # Verified locally that this exact feature set still reproduces the
     # original link error on a tree without the build.rs fix.
     if: github.event_name == 'push'
+    needs: check
     runs-on: macos-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies
         run: brew install protobuf
@@ -237,12 +266,12 @@ jobs:
         run: mkdir -p dist
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Link the release binary
         run: |
@@ -253,8 +282,12 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies
         run: |
@@ -262,7 +295,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler pkg-config libasound2-dev libdbus-1-dev
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -272,7 +305,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -280,7 +313,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -291,12 +324,12 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Verify python3 (for MCP E2E tests)
         run: python3 --version
@@ -320,8 +353,12 @@ jobs:
   test-local-embeddings:
     name: Test local-embeddings feature
     runs-on: ubuntu-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies
         run: |
@@ -332,7 +369,7 @@ jobs:
         run: mkdir -p dist
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -342,7 +379,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -350,7 +387,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -365,12 +402,12 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run local-embeddings tests
         run: "cargo test --features local-embeddings -- --skip e2e::"
@@ -378,14 +415,18 @@ jobs:
   test-macos:
     name: Test (macOS)
     runs-on: macos-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies
         run: brew install protobuf
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -395,7 +436,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -403,7 +444,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -414,12 +455,12 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run tests
         run: "cargo test --all-features -- --skip e2e:: --nocapture"
@@ -427,12 +468,19 @@ jobs:
   build:
     name: Build
     runs-on: ${{ matrix.os }}
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 25
+    # `default` only. The `all-features` half was a duplicate: `check` already
+    # runs `cargo check --all-features` on Ubuntu, and both `test-macos` and
+    # `windows` compile the all-features set on their own platform. A default
+    # build on each OS is the combination nothing else covers.
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        features: [default, all-features]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies (Ubuntu)
         if: runner.os == 'Linux'
@@ -445,7 +493,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -455,7 +503,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -463,7 +511,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -474,29 +522,25 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - name: Check (default)
-        if: matrix.features == 'default'
+      - name: Check
         run: cargo check
-
-      - name: Check (all features)
-        if: matrix.features == 'all-features'
-        run: cargo check --all-features
 
   frontend:
     name: Frontend Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -506,7 +550,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -514,7 +558,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -533,22 +577,25 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run cargo audit
-        uses: actions-rust-lang/audit@v1
+        uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@63300d694c674b6bd0e1ca77d202a2bc41c4b623 # cargo-deny
+        with:
+          tool: cargo-deny
 
       - name: Run cargo-deny
         run: cargo deny check
@@ -558,7 +605,7 @@ jobs:
       # for a commit that bypassed the local hook — `--no-verify`, or a clone
       # that never ran `git config core.hooksPath .githooks`.
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -568,8 +615,12 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system build dependencies
         run: |
@@ -577,7 +628,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler pkg-config libasound2-dev libdbus-1-dev
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
 
@@ -587,7 +638,7 @@ jobs:
         run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -595,7 +646,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -606,16 +657,18 @@ jobs:
           pnpm run build
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
           components: llvm-tools-preview
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@c3076e6fa5aeb9a93daf1bd8eff73345250a8a9c # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov
 
       - name: Generate coverage report
         # Source-based coverage via llvm-cov. tarpaulin's ptrace instrumentation
@@ -632,7 +685,7 @@ jobs:
         run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --fail-under-lines 55 --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           files: ./lcov.info
           fail_ci_if_error: false
@@ -641,8 +694,9 @@ jobs:
   plugin-boundary:
     name: Plugin SDK Boundary
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check plugin SDK boundary
         run: |
           chmod +x scripts/check-plugin-boundary.sh
