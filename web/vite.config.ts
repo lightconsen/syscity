@@ -17,6 +17,13 @@ const replaceVersionPlaceholder: Plugin = {
 export default defineConfig({
   plugins: [replaceVersionPlaceholder, react(), VitePWA({
       registerType: 'autoUpdate',
+      // Registered by hand in `src/main.tsx`. The injected script uses a
+      // *relative* URL (`./sw.js`, scope `./`), which resolves against the
+      // document's path — so on a nested route such as
+      // `/cloud/login/callback` it asks for `/cloud/login/sw.js` and 404s.
+      // This app does have nested routes (the cloud OAuth callback), so the
+      // registration has to use absolute paths.
+      injectRegister: false,
       workbox: {
         globPatterns: ['**/*.{js,css,html,png,svg,ico}'],
         maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
