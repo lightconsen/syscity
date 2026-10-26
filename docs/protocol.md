@@ -82,6 +82,14 @@ Query 参数：
 适配器发 0.7），`agent` 模式忽略该字段、沿用内置 Agent 自己的采样配置。越界取值在 `raw`
 模式返回 400，而不是让 provider 报一个调用方分辨不出的 502。
 
+`tools[].function.parameters` 在 `raw` 模式下会被规整成合法 JSON Schema 后再下发：
+Python 风格的 `type` 名（`dict` → `object`、`list`/`tuple` → `array`、`float` → `number`、
+`str` → `string`、`int` → `integer`、`bool` → `boolean`）按语义替换，`any`/`mixed` 这种
+不构成约束的取值整项去掉，未识别的名字保持原样。工具名、描述、参数名、`required` 等
+一律不动。这样做的原因是 OpenAI 线格式要求 JSON Schema，而 Python 侧（BFCL、`inspect`
+风格的工具导出）会把 Python 类型名直接写进 `type`；provider 按 JSON Schema 解析，
+非法的类型名会让参数约束失效。规整只作用于 `type` 字段，因此调用方声明的工具契约不变。
+
 缺省规则的由来：带 `tools` 的请求按 OpenAI 语义是"调用方自己执行工具"，而基准 harness
 只发 `tools`、不发 `mode`；若缺省成 `agent`，它们的工具定义会被静默丢弃、每一轮都拿不到
 `tool_calls`。不带 `tools` 的请求保持原有 `agent` 行为，既有聊天调用方无感。显式写

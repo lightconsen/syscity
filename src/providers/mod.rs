@@ -426,6 +426,98 @@ pub struct FunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// The primitive type names JSON Schema defines. Anything else in a `type`
+/// field is not a schema constraint a provider can honour.
+const JSON_SCHEMA_TYPES: [&str; 7] = [
+    "string", "number", "integer", "boolean", "array", "object", "null",
+];
+
+/// What `type` should become for a given non-schema type name.
+enum TypeRewrite {
+    /// A JSON Schema name the provider understands.
+    Mapped(&'static str),
+    /// No constraint at all — the entry is dropped.
+    Unconstrained,
+}
+
+/// Map a Python-flavoured type name to JSON Schema. Callers that build their
+/// tool list in Python (`inspect`, pydantic-ish helpers, BFCL) write `dict`,
+/// `float`, `tuple`, … straight into `type`. Returns `None` for names this
+/// module does not recognise, which are left untouched rather than guessed at.
+fn rewrite_for(type_name: &str) -> Option<TypeRewrite> {
+    Some(match type_name.to_ascii_lowercase().as_str() {
+        "dict" | "mapping" => TypeRewrite::Mapped("object"),
+        "list" | "tuple" | "set" | "frozenset" | "sequence" => TypeRewrite::Mapped("array"),
+        "float" | "double" | "decimal" => TypeRewrite::Mapped("number"),
+        "int" | "long" => TypeRewrite::Mapped("integer"),
+        "str" | "text" => TypeRewrite::Mapped("string"),
+        "bool" => TypeRewrite::Mapped("boolean"),
+        // Not a constraint at all: `type: any` says nothing, and providers may
+        // reject the schema outright for it.
+        "any" | "mixed" => TypeRewrite::Unconstrained,
+        _ => return None,
+    })
+}
+
+/// Rewrite Python-flavoured `type` names in a tool parameter schema into their
+/// JSON Schema equivalents, recursively.
+///
+/// The OpenAI wire carries a JSON Schema and providers parse it as one, so a
+/// schema that says `"type": "dict"` or `"type": ["float"]` is malformed
+/// there. The mapping is deliberately conservative — it only touches `type`
+/// fields, never renames or drops parameters — so the caller's tool contract
+/// survives.
+pub fn normalize_tool_parameters(parameters: &mut serde_json::Value) {
+    match parameters {
+        serde_json::Value::Object(map) => {
+            match map.get("type") {
+                Some(serde_json::Value::String(name))
+                    if !JSON_SCHEMA_TYPES.contains(&name.as_str()) =>
+                {
+                    match rewrite_for(name) {
+                        Some(TypeRewrite::Mapped(mapped)) => {
+                            map.insert("type".into(), mapped.into());
+                        }
+                        Some(TypeRewrite::Unconstrained) => {
+                            map.remove("type");
+                        }
+                        None => {}
+                    }
+                }
+                // A union, e.g. `["string", "null"]` or `["float", "null"]`.
+                Some(serde_json::Value::Array(names)) => {
+                    let mapped: Vec<serde_json::Value> = names
+                        .iter()
+                        .filter_map(|name| match name.as_str() {
+                            Some(name) => match rewrite_for(name) {
+                                Some(TypeRewrite::Mapped(mapped)) => Some(mapped.into()),
+                                Some(TypeRewrite::Unconstrained) => None,
+                                None => Some(name.into()),
+                            },
+                            None => Some(name.clone()),
+                        })
+                        .collect();
+                    if mapped.is_empty() {
+                        map.remove("type");
+                    } else {
+                        map.insert("type".into(), serde_json::Value::Array(mapped));
+                    }
+                }
+                _ => {}
+            }
+            for value in map.values_mut() {
+                normalize_tool_parameters(value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_tool_parameters(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A stream of completion chunks
 pub type CompletionStream =
     std::pin::Pin<Box<dyn tokio_stream::Stream<Item = CompletionChunk> + Send>>;
@@ -718,6 +810,59 @@ pub fn merge_extra(body: &mut serde_json::Value, extra: Option<serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_tool_parameters_maps_python_type_names() {
+        let mut schema = serde_json::json!({
+            "type": "dict",
+            "properties": {
+                "volume": {"type": "float", "description": "cubic metres"},
+                "tags": {"type": "list", "items": {"type": "str"}},
+                "interval": {"type": "array", "items": {"type": "float"}},
+                "count": {"type": "integer"},
+                "ratio": {"type": ["float", "null"]},
+                "payload": {"type": "any"},
+                "custom": {"type": "MyClass"}
+            },
+            "required": ["volume"]
+        });
+
+        normalize_tool_parameters(&mut schema);
+
+        // Root and nested Python names are rewritten.
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["volume"]["type"], "number");
+        assert_eq!(schema["properties"]["tags"]["type"], "array");
+        assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(schema["properties"]["interval"]["items"]["type"], "number");
+        // Valid names and unrecognised ones are left alone.
+        assert_eq!(schema["properties"]["count"]["type"], "integer");
+        assert_eq!(schema["properties"]["custom"]["type"], "MyClass");
+        // A union maps member by member.
+        assert_eq!(schema["properties"]["ratio"]["type"][0], "number");
+        assert_eq!(schema["properties"]["ratio"]["type"][1], "null");
+        // `any` is not a constraint, so it is dropped rather than guessed at.
+        assert!(schema["properties"]["payload"].get("type").is_none());
+        // Nothing else about the schema moves.
+        assert_eq!(schema["required"][0], "volume");
+        assert_eq!(schema["properties"]["volume"]["description"], "cubic metres");
+    }
+
+    #[test]
+    fn normalize_tool_parameters_leaves_valid_schemas_alone() {
+        let original = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "days": {"type": "integer", "minimum": 1}
+            },
+            "required": ["city"],
+            "additionalProperties": false
+        });
+        let mut schema = original.clone();
+        normalize_tool_parameters(&mut schema);
+        assert_eq!(schema, original);
+    }
 
     #[test]
     fn test_message_creation() {

@@ -121,7 +121,15 @@ async fn raw_completion(
     let tools = if req.tools.is_empty() {
         None
     } else {
-        Some(req.tools)
+        // Callers outside the OpenAI ecosystem fill `type` with Python names
+        // (`dict`, `float`, `tuple`, `any`). Providers parse the schema as
+        // JSON Schema, so map them before the request leaves the gateway; the
+        // parameters themselves are passed through untouched.
+        let mut tools = req.tools;
+        for tool in &mut tools {
+            crate::providers::normalize_tool_parameters(&mut tool.function.parameters);
+        }
+        Some(tools)
     };
 
     // Same bound as the agent path: a provider that never answers must not hold
@@ -686,7 +694,9 @@ mod tests {
             "tools": [{"type": "function", "function": {
                 "name": "get_weather",
                 "description": "Get the weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                // Python-flavoured types, as BFCL and other Python harnesses
+                // emit them.
+                "parameters": {"type": "dict", "properties": {"city": {"type": "str"}}}
             }}]
         }))
         .expect("request parses");
@@ -716,6 +726,11 @@ mod tests {
         let tools = calls[0].tools.as_ref().expect("tools were passed through");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(
+            tools[0].function.parameters["type"], "object",
+            "Python type names must be rewritten to JSON Schema before the provider sees them"
+        );
+        assert_eq!(tools[0].function.parameters["properties"]["city"]["type"], "string");
         assert_eq!(
             calls[0].temperature,
             Some(0.001),
