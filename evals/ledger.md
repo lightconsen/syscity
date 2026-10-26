@@ -21,6 +21,14 @@ evaluator** 给出，不自写判分器（见 `docs/benchmark.md`）。
 | 2026-10-26 | BFCL | bfcl-eval 2026.3.23 | `syscity-agent` → deepseek-v4-flash | 0c362599 | simple_python | 367/400 | 91.75% | 失败几乎全是参数值：`value_error:string` 13、`value_error:others` 9、`value_error:list/tuple` 5、`type_error:nested` 4、`wrong_count` 2 |
 | 2026-10-26 | BFCL | bfcl-eval 2026.3.23 | 同上 | 0c362599 | irrelevance | 172/240 | 71.67% | 68 条全部是 `irrelevance_error:decoder_success`——不该调工具时调了 |
 | 2026-10-26 | BFCL | bfcl-eval 2026.3.23 | 同上 | 0c362599 | multi_turn_base | 123/200 | 61.50% | 多轮 `role: tool` 结果经网关往返；部分轮次出现 `Failed to decode the model response` |
+| 2026-10-26 | BFCL | bfcl-eval 2026.3.23 | 同上 | 27f9bcb6 | simple_python | 366/400 | 91.50% | 复跑：`temperature` 透传修复后 t=0.001 真正生效（首轮被丢弃、实际 0.7）。7 条翻对、8 条翻错 |
+| 2026-10-26 | BFCL | bfcl-eval 2026.3.23 | 同上 | 27f9bcb6 | irrelevance | 175/240 | 72.92% | 65 条仍是 `irrelevance_error:decoder_success`。17 条翻对、14 条翻错 |
+| 2026-10-26 | BFCL | bfcl-eval 2026.3.23 | 同上 | 27f9bcb6 | multi_turn_base | 132/200 | 66.00% | 22 条翻对、13 条翻错；`instance_state_mismatch` 63→60、`execution_response_mismatch` 8→4、`empty_turn_model_response` 6→4 |
+
+**两轮合计**：662/840 = 78.81% → 673/840 = 80.12%，+11 条 ≈ 0.9 个标准误。结论是
+**temperature 不是失分主因**；逐题比对同时给出了**噪声地板**——即使 t=0.001 近贪婪解码，
+两轮仍有 15/400、31/240、35/200 条判定翻转，即单轮类目分数自带 ±2–4pt 抖动。因此本表
+两轮之间的差值不可当作"改进"，且今后任何 A/B 都需重复 3 轮以上再下判断。
 
 口径：`raw` 模式，网关只做 provider 透传、工具由 BFCL 自己执行，所以这组数字衡量的是
 "默认模型 + OpenAI 兼容线格式"，**不是** syscity 内置 Agent 循环的水平。复现步骤见
