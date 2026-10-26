@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::providers::ToolDefinition;
+
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 /// Query parameters for WebSocket connection
@@ -210,10 +212,39 @@ pub struct McpReadResourceRequest {
 // ── OpenAI-compatible API
 // ─────────────────────────────────────────────────────
 
+/// Request-side chat message, OpenAI wire shape.
+///
+/// `content` is optional because an assistant turn that only calls tools
+/// carries `"content": null`, and a `tool` turn carries `tool_call_id` with no
+/// tool calls of its own. A plain `String` here would fail to deserialize the
+/// second and third turn of every tool-using conversation.
 #[derive(Debug, Deserialize)]
 pub struct OpenAiMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<OpenAiToolCall>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Which side runs the agent loop. Defaults to `agent`, so existing callers
+/// are unaffected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAiMode {
+    /// Route the last user message through the built-in Syscity agent, which
+    /// uses its own tool registry. Tools in the request are ignored.
+    #[default]
+    Agent,
+    /// One model turn: the caller's `messages` and `tools` are passed straight
+    /// to the provider and `tool_calls` come straight back. The caller executes
+    /// the tools and sends the results in the next request. This is the shape
+    /// external benchmarks (BFCL, τ²-bench, …) drive an agent with.
+    Raw,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +253,16 @@ pub struct OpenAiChatRequest {
     pub messages: Vec<OpenAiMessage>,
     #[serde(default)]
     pub stream: bool,
+    /// Tools the caller executes itself. Only honoured in `raw` mode.
+    #[serde(default)]
+    pub tools: Vec<ToolDefinition>,
+    /// Accepted for wire compatibility and ignored: a `raw` call is never
+    /// forced to produce a tool call, and the agent mode owns its tool choice.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    /// Agent loop placement. Defaults to [`OpenAiMode::Agent`].
+    #[serde(default)]
+    pub mode: OpenAiMode,
 }
 
 /// Query parameters for model override.
@@ -251,7 +292,30 @@ pub struct OpenAiChoice {
 #[derive(Debug, Serialize)]
 pub struct OpenAiResponseMessage {
     pub role: String,
-    pub content: String,
+    /// `null` when the turn is tool calls only, matching the OpenAI wire shape.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiToolCall>>,
+}
+
+/// Response-side tool call, OpenAI wire shape (`"type": "function"`).
+///
+/// Distinct from [`crate::providers::ToolCall`], which serializes its type as
+/// `call_type` and carries harness-only fields (`index`, `result`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: OpenAiFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiFunctionCall {
+    pub name: String,
+    /// JSON-encoded arguments, as a string (not an object) — the OpenAI wire
+    /// contract.
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]

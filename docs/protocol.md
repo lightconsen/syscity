@@ -65,11 +65,22 @@ Query 参数：
 |--------|------|---------|
 | GET | `/health` | 存活探针 |
 | GET | `/ready` | 就绪探针 |
-| POST | `/v1/chat/completions` | OpenAI 兼容 API (SSE 流式) |
+| POST | `/v1/chat/completions` | OpenAI 兼容 API (SSE 流式)；`mode: "raw"` 为单轮模型调用，透传 `tools` 并返回 `tool_calls` |
 | GET | `/v1/models` | OpenAI 兼容模型列表 |
 | GET | `/api/v1/artifacts/*path` | 文档预览产物（`write_report` 生成的报告） |
 
 > 其余 `/api/*` 与 `/api/v1/*` 端点已在迁移中移除；上表就是保留的全部 HTTP 面。
+
+**`/v1/chat/completions` 的 `mode`**（缺省 `agent`，既有调用方无感）：
+
+| mode | 行为 | 适用 |
+|------|------|------|
+| `agent` | 取最后一条 user 消息交给内置 Agent（自带工具注册表），请求里的 `tools` 忽略；支持 `stream` | 人类聊天、OpenAI 客户端 |
+| `raw` | 完整 `messages` + `tools` 原样下发 provider，`tool_calls` 原样返回，**工具由调用方执行**；不支持 `stream` | 外部 Agent 基准（BFCL、τ²-bench 等） |
+
+`raw` 模式的 `model` 可用 `syscity-agent` / `syscity` / `default` 表示"网关默认模型"，
+无需知道运维方配置的具体模型 id。请求里任一条消息的 `role` 不在
+`system|developer|user|assistant|tool|function` 之内时返回 400。
 
 **产物 URL 形态**（通配路由，只读）：
 
