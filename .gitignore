@@ -100,3 +100,6 @@ audit/
 # evals/importers/gaia.py; attachments live outside the repo.
 evals/capability/gaia_l1.yaml
 evals/capability/gaia_l1_answers.json
+
+# Python bytecode from the benchmark importers
+__pycache__/

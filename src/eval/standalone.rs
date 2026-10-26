@@ -33,7 +33,10 @@ use crate::tools::shell::ShellTool;
 use crate::tools::time::TimeTool;
 use crate::tools::todo_tool::TodoTool;
 use crate::tools::web::{WebFetchTool, WebSearchTool};
-use crate::tools::{AcpSessionTool, AcpSpawnTool, SessionsSendTool, ToolRegistry};
+use crate::tools::{
+    AcpSessionTool, AcpSpawnTool, PermissionsConfig, PermissionsRuntime, SessionsSendTool,
+    ToolRegistry,
+};
 use crate::Result;
 
 /// Which provider a CLI-driven eval run should use; every field left as
@@ -778,6 +781,12 @@ async fn try_load_gateway_config() -> Option<GatewayConfig> {
 /// Registers shell, file operations, search, web, browser, todo, time tools,
 /// and optionally ACP tools (acp_spawn, acp_session, sessions_send) when an
 /// `AcpControlPlane` is provided.
+///
+/// The set this function registers is the eval run's permission boundary: an
+/// unattended run has no human to answer an approval prompt, so every tool it
+/// registers is pre-approved by name (see [`eval_permissions`]). Anything not
+/// registered here is simply absent — that, not the approval gate, is what
+/// keeps an eval run inside its tool set.
 fn create_eval_tool_registry(
     acp: Option<Arc<AcpControlPlane>>,
     search_cfg: Option<&crate::gateway::config::SearchConfig>,
@@ -807,7 +816,25 @@ fn create_eval_tool_registry(
         registry.register(Box::new(SessionsSendTool::new(acp)));
     }
 
-    registry
+    let allow = registry.list();
+    registry.with_permissions(eval_permissions(allow))
+}
+
+/// Permissions for an unattended eval run: every tool the eval registry
+/// registered is pre-approved, nothing else is granted.
+///
+/// Without this the run inherits `ToolRegistry::new()`'s empty rule set, so
+/// each `requires_approval` tool (`shell`, `file_write`, `browser`, …) fails
+/// closed with "no human is present to grant it" — and a benchmark measuring
+/// a tool-less agent measures the approval policy, not the model. The rules
+/// are derived from the registry itself rather than hard-coded, so a tool
+/// added to (or removed from) the eval set cannot silently drift out of
+/// sync with its permissions.
+fn eval_permissions(allow: Vec<String>) -> Arc<PermissionsRuntime> {
+    Arc::new(PermissionsRuntime::from_config(&PermissionsConfig {
+        allow,
+        ..Default::default()
+    }))
 }
 
 /// Pick search providers for the eval agent: an explicit `[web_search]`
@@ -948,5 +975,48 @@ mod tests {
         let section_at = content.find("## 外部基准").expect("section kept");
         assert!(row_at < section_at, "eval rows belong above the benchmark section:\n{content}");
         assert!(content.contains("| 2026-01-01 | BFCL |"), "section intact");
+    }
+
+    /// An unattended run must not be judged on the local approval policy:
+    /// every tool the eval registry registers is pre-approved, so
+    /// `requires_approval` tools run instead of failing closed.
+    #[test]
+    fn every_eval_tool_is_pre_approved() {
+        let registry = create_eval_tool_registry(None, None);
+        let names = registry.list();
+        assert!(names.contains(&"shell".to_string()), "shell is part of the eval set");
+        assert!(names.contains(&"file_read".to_string()), "file_read is part of the eval set");
+
+        for name in names {
+            let decision = registry.permissions().evaluate(
+                &name,
+                &serde_json::json!({ "command": "true", "path": "/tmp/x" }),
+                "eval",
+                false,
+                &[],
+            );
+            assert!(
+                matches!(decision, crate::tools::EngineDecision::AllowNow),
+                "{name} must be pre-approved, got {decision:?}"
+            );
+        }
+    }
+
+    /// The permission rules track the registry rather than a second list, so
+    /// a tool that was not registered cannot be reachable by name.
+    #[test]
+    fn unregistered_tools_stay_out_of_the_allow_list() {
+        let registry = create_eval_tool_registry(None, None);
+        let decision = registry.permissions().evaluate(
+            "desktop_screenshot",
+            &serde_json::json!({}),
+            "eval",
+            false,
+            &[],
+        );
+        assert!(
+            !matches!(decision, crate::tools::EngineDecision::AllowNow),
+            "desktop tools are not part of the eval set"
+        );
     }
 }
