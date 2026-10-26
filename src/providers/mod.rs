@@ -445,16 +445,24 @@ enum TypeRewrite {
 /// `float`, `tuple`, … straight into `type`. Returns `None` for names this
 /// module does not recognise, which are left untouched rather than guessed at.
 fn rewrite_for(type_name: &str) -> Option<TypeRewrite> {
-    Some(match type_name.to_ascii_lowercase().as_str() {
-        "dict" | "mapping" => TypeRewrite::Mapped("object"),
-        "list" | "tuple" | "set" | "frozenset" | "sequence" => TypeRewrite::Mapped("array"),
+    let name = type_name.trim().to_ascii_lowercase();
+    // A schema name that differs only in case (`String`, `Array`) is still a
+    // schema name; canonicalise it rather than reject it.
+    if let Some(canonical) = JSON_SCHEMA_TYPES.iter().find(|t| **t == name) {
+        return Some(TypeRewrite::Mapped(canonical));
+    }
+    Some(match name.as_str() {
+        "dict" | "mapping" | "hashmap" => TypeRewrite::Mapped("object"),
+        "list" | "tuple" | "set" | "frozenset" | "sequence" | "arraylist" => {
+            TypeRewrite::Mapped("array")
+        }
         "float" | "double" | "decimal" => TypeRewrite::Mapped("number"),
-        "int" | "long" => TypeRewrite::Mapped("integer"),
-        "str" | "text" => TypeRewrite::Mapped("string"),
+        "int" | "long" | "short" | "byte" => TypeRewrite::Mapped("integer"),
+        "str" | "text" | "char" | "character" => TypeRewrite::Mapped("string"),
         "bool" => TypeRewrite::Mapped("boolean"),
         // Not a constraint at all: `type: any` says nothing, and providers may
-        // reject the schema outright for it.
-        "any" | "mixed" => TypeRewrite::Unconstrained,
+        // reject the schema outright for it. An empty name is the same case.
+        "any" | "mixed" | "" => TypeRewrite::Unconstrained,
         _ => return None,
     })
 }
@@ -471,19 +479,15 @@ pub fn normalize_tool_parameters(parameters: &mut serde_json::Value) {
     match parameters {
         serde_json::Value::Object(map) => {
             match map.get("type") {
-                Some(serde_json::Value::String(name))
-                    if !JSON_SCHEMA_TYPES.contains(&name.as_str()) =>
-                {
-                    match rewrite_for(name) {
-                        Some(TypeRewrite::Mapped(mapped)) => {
-                            map.insert("type".into(), mapped.into());
-                        }
-                        Some(TypeRewrite::Unconstrained) => {
-                            map.remove("type");
-                        }
-                        None => {}
+                Some(serde_json::Value::String(name)) => match rewrite_for(name) {
+                    Some(TypeRewrite::Mapped(mapped)) => {
+                        map.insert("type".into(), mapped.into());
                     }
-                }
+                    Some(TypeRewrite::Unconstrained) => {
+                        map.remove("type");
+                    }
+                    None => {}
+                },
                 // A union, e.g. `["string", "null"]` or `["float", "null"]`.
                 Some(serde_json::Value::Array(names)) => {
                     let mapped: Vec<serde_json::Value> = names
@@ -822,7 +826,12 @@ mod tests {
                 "count": {"type": "integer"},
                 "ratio": {"type": ["float", "null"]},
                 "payload": {"type": "any"},
-                "custom": {"type": "MyClass"}
+                "custom": {"type": "MyClass"},
+                "label": {"type": "String"},
+                "matrix": {"type": "Array", "items": {"type": "double"}},
+                "headers": {"type": "HashMap"},
+                "letter": {"type": "char"},
+                "blank": {"type": ""}
             },
             "required": ["volume"]
         });
@@ -843,6 +852,15 @@ mod tests {
         assert_eq!(schema["properties"]["ratio"]["type"][1], "null");
         // `any` is not a constraint, so it is dropped rather than guessed at.
         assert!(schema["properties"]["payload"].get("type").is_none());
+        // Case is not a distinction the schema makes.
+        assert_eq!(schema["properties"]["label"]["type"], "string");
+        assert_eq!(schema["properties"]["matrix"]["type"], "array");
+        assert_eq!(schema["properties"]["matrix"]["items"]["type"], "number");
+        // Java-flavoured names show up in the same datasets.
+        assert_eq!(schema["properties"]["headers"]["type"], "object");
+        assert_eq!(schema["properties"]["letter"]["type"], "string");
+        // An empty type says nothing either.
+        assert!(schema["properties"]["blank"].get("type").is_none());
         // Nothing else about the schema moves.
         assert_eq!(schema["required"][0], "volume");
         assert_eq!(schema["properties"]["volume"]["description"], "cubic metres");
