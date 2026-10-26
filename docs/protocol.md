@@ -71,12 +71,17 @@ Query 参数：
 
 > 其余 `/api/*` 与 `/api/v1/*` 端点已在迁移中移除；上表就是保留的全部 HTTP 面。
 
-**`/v1/chat/completions` 的 `mode`**（缺省 `agent`，既有调用方无感）：
+**`/v1/chat/completions` 的 `mode`**（不传时：带 `tools` 走 `raw`，不带 `tools` 走 `agent`）：
 
 | mode | 行为 | 适用 |
 |------|------|------|
 | `agent` | 取最后一条 user 消息交给内置 Agent（自带工具注册表），请求里的 `tools` 忽略；支持 `stream` | 人类聊天、OpenAI 客户端 |
 | `raw` | 完整 `messages` + `tools` 原样下发 provider，`tool_calls` 原样返回，**工具由调用方执行**；不支持 `stream` | 外部 Agent 基准（BFCL、τ²-bench 等） |
+
+缺省规则的由来：带 `tools` 的请求按 OpenAI 语义是"调用方自己执行工具"，而基准 harness
+只发 `tools`、不发 `mode`；若缺省成 `agent`，它们的工具定义会被静默丢弃、每一轮都拿不到
+`tool_calls`。不带 `tools` 的请求保持原有 `agent` 行为，既有聊天调用方无感。显式写
+`mode` 时以显式值为准。
 
 `raw` 模式的 `model` 可用 `syscity-agent` / `syscity` / `default` 表示"网关默认模型"，
 无需知道运维方配置的具体模型 id。请求里任一条消息的 `role` 不在

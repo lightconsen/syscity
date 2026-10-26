@@ -109,7 +109,10 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 
 1. `src/gateway/types.rs`
    - `OpenAiChatRequest` 增加 `tools: Vec<ToolDefinition>`、`tool_choice: Option<Value>`
-     （接受但不强制）、`mode: OpenAiMode`（`agent` 缺省 / `raw`）。
+     （接受但不强制）、`mode: Option<OpenAiMode>`。缺省规则见
+     `effective_mode()`：**带 `tools` 缺省 `raw`，不带 `tools` 缺省 `agent`**，显式 `mode`
+     优先。补这条是因为 BFCL 这类 harness 只发 `tools`、不发 `mode`——最初把缺省定成
+     `agent`，M1 一开始就撞上了"工具被静默丢弃"。
    - `OpenAiMessage` 的 `content` 改为 `Option<String>`，并增加 `tool_calls` / `tool_call_id` /
      `name` —— 否则 `"content": null` 的 assistant 轮和带 `tool_call_id` 的 tool 轮都解析失败。
    - `OpenAiResponseMessage` 增加 `tool_calls`，`content` 改为 `Option<String>`（纯工具调用轮
@@ -131,7 +134,9 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
    - `provider_messages_keep_tool_calls_and_results` — 多轮不丢工具结果
    - `response_tool_calls_use_the_openai_type_field` — 线格式（`type`、arguments 为字符串、
      不泄漏 `call_type` / `result`）
-   - `mode_defaults_to_agent`、`agent_mode_response_omits_tool_calls`、`no_default_agent_returns_503`
+   - `mode_defaults_to_agent`、`mode_defaults_to_raw_when_tools_are_present`、
+     `explicit_mode_wins_over_the_tools_default`、
+     `agent_mode_response_omits_tool_calls`、`no_default_agent_returns_503`
      — 缺省行为不变（回归）
    - `raw_mode_does_not_need_a_default_agent`、`raw_mode_rejects_streaming`、
      `raw_mode_rejects_unknown_roles`
@@ -139,17 +144,29 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 **验收**：原计划是 `curl` 打通。实际用进程内 handler 测试覆盖了同一条路径（真实
 `ModelRouter` + mock provider），比 curl 更严格，也不需要起网关。真正的对外验证留给 M1。
 
-### M1 — BFCL（0.5 天）
+### M1 — BFCL（0.5 天）✅ 已打通
 
 选它作第一步，因为它**只验证 M0 是否正确**，不引入任何环境。
 
-1. `pip install bfcl-eval`，把 `OPENAI_BASE_URL` 指向 `http://127.0.0.1:18080/v1`，
-   `model` 填 `syscity-agent`，`mode=raw`。
-2. 先跑 `BFCL_v4_simple_python`（最基础的一档），确认解析通过；再跑 `multi_turn` 和
-   `irrelevance`（后者能顺带暴露"不该调工具时乱调"的问题）。
-3. 结果进 `evals/ledger.md`，标注日期、模型、commit。
+实际做法（脚本已入库：`evals/benchmarks/bfcl_syscity.py`，文件头有完整用法）：
 
-**验收**：官方 evaluator 输出 accuracy 报告，无需人工看任何一条输出。
+1. 隔离安装 `bfcl-eval`（`~/.cache/syscity-bench/bfcl`），`BFCL_PROJECT_ROOT` 指到仓库外，
+   跑分与结果都不入仓。PyPI 包漏声明了 `soundfile`（经 `qwen_agent` 间接 import），
+   不装则 `bfcl` 命令直接 import 失败。
+2. `bfcl_eval` 只认它自己 `model_config.py` 里注册过的模型，自建网关必须先把条目注入
+   `MODEL_CONFIG_MAPPING`。`bfcl_syscity.py` 就做这一件事，之后原样转交上游 CLI，
+   所以打印出来的数字就是官方 evaluator 的结果。
+3. `OPENAI_BASE_URL` 指向网关，`model` 填 `syscity-agent`（哨兵值 → 网关默认模型），
+   `tools` 自动触发 `raw` 模式。
+
+过程中被基准逼出来的两个约定：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 工具定义被静默丢弃，每轮只回文本 | harness 只发 `tools`、不发 `mode` | 缺省规则改为"带 `tools` 即 `raw`"（见 M0） |
+| `math.factorial` 明明调对了却判错 | OpenAI 线格式不许函数名带 `.`，BFCL 发的是 `math_factorial`；checker 默认按带点的名字找 | 注册条目里 `underscore_to_dot=True` |
+
+**验收**：官方 evaluator 输出 accuracy 报告，无需人工看任何一条输出。✅
 
 ### M2 — GAIA Level 1（1–2 天）
 

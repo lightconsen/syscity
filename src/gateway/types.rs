@@ -260,9 +260,28 @@ pub struct OpenAiChatRequest {
     /// forced to produce a tool call, and the agent mode owns its tool choice.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    /// Agent loop placement. Defaults to [`OpenAiMode::Agent`].
+    /// Agent loop placement. Omitted → see [`OpenAiChatRequest::effective_mode`].
     #[serde(default)]
-    pub mode: OpenAiMode,
+    pub mode: Option<OpenAiMode>,
+}
+
+impl OpenAiChatRequest {
+    /// Which mode to run.
+    ///
+    /// An explicit `mode` wins. Otherwise a request that carries `tools` is
+    /// taken to be a caller-supplied tool contract — exactly the OpenAI
+    /// semantics, where the client executes the calls — so it runs in
+    /// [`OpenAiMode::Raw`]. Benchmark harnesses (BFCL, τ²-bench) send `tools`
+    /// and no `mode`; without this they would silently fall into agent mode and
+    /// have their tools dropped. Requests without tools keep the historical
+    /// agent behaviour, so plain chat callers are unaffected.
+    pub fn effective_mode(&self) -> OpenAiMode {
+        self.mode.unwrap_or(if self.tools.is_empty() {
+            OpenAiMode::Agent
+        } else {
+            OpenAiMode::Raw
+        })
+    }
 }
 
 /// Query parameters for model override.

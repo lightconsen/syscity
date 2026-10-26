@@ -14,16 +14,18 @@ use crate::providers::{FunctionCall, Message, Role, ToolCall};
 
 /// `POST /v1/chat/completions`
 ///
-/// OpenAI-compatible chat completions endpoint. Two modes, selected by the
-/// request's `mode` field:
+/// OpenAI-compatible chat completions endpoint. Two modes:
 ///
-/// - `agent` (default): routes the last user message through the default
-///   Syscity agent and returns the result. Supports streaming (`stream: true`
-///   → SSE) and non-streaming.
-/// - `raw`: one model turn. The caller's full `messages` history and `tools`
-///   are passed straight to the provider, and `tool_calls` come back in the
-///   response for the caller to execute. This is the shape external agent
-///   benchmarks drive a model with.
+/// - `agent` (the default when the request carries no `tools`): routes the
+///   last user message through the default Syscity agent and returns the
+///   result. Supports streaming (`stream: true` → SSE) and non-streaming.
+/// - `raw` (the default when the request carries `tools`): one model turn. The
+///   caller's full `messages` history and `tools` are passed straight to the
+///   provider, and `tool_calls` come back in the response for the caller to
+///   execute. This is the shape external agent benchmarks drive a model with.
+///
+/// An explicit `mode` field overrides either default — see
+/// [`OpenAiChatRequest::effective_mode`].
 pub async fn openai_chat_completions_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ModelOverrideQuery>,
@@ -38,7 +40,7 @@ pub async fn openai_chat_completions_handler(
         req.model = query_model;
     }
 
-    match req.mode {
+    match req.effective_mode() {
         OpenAiMode::Raw => raw_completion(state, req).await,
         OpenAiMode::Agent => agent_completion(state, req).await,
     }
@@ -475,7 +477,7 @@ mod tests {
             stream,
             tools: Vec::new(),
             tool_choice: None,
-            mode: OpenAiMode::Agent,
+            mode: Some(OpenAiMode::Agent),
         })
     }
 
@@ -486,7 +488,7 @@ mod tests {
             stream: false,
             tools: Vec::new(),
             tool_choice: None,
-            mode: OpenAiMode::Raw,
+            mode: Some(OpenAiMode::Raw),
         })
     }
 
@@ -704,7 +706,7 @@ mod tests {
         });
 
         let req: OpenAiChatRequest = serde_json::from_value(body).expect("request parses");
-        assert_eq!(req.mode, OpenAiMode::Raw);
+        assert_eq!(req.mode, Some(OpenAiMode::Raw));
         assert_eq!(req.tools.len(), 1);
         assert_eq!(req.tools[0].function.name, "get_weather");
         assert!(req.messages[2].content.is_none());
@@ -724,8 +726,43 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .expect("request parses");
-        assert_eq!(req.mode, OpenAiMode::Agent);
+        assert_eq!(req.mode, None);
+        assert_eq!(req.effective_mode(), OpenAiMode::Agent);
         assert!(req.tools.is_empty());
+    }
+
+    /// Benchmark harnesses send `tools` and no `mode`; without this default
+    /// their tools would be dropped and every call turn would come back empty.
+    #[test]
+    fn mode_defaults_to_raw_when_tools_are_present() {
+        let req: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "syscity-agent",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object", "properties": {}}
+            }}]
+        }))
+        .expect("request parses");
+        assert_eq!(req.mode, None);
+        assert_eq!(req.effective_mode(), OpenAiMode::Raw);
+    }
+
+    #[test]
+    fn explicit_mode_wins_over_the_tools_default() {
+        let req: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "syscity-agent",
+            "mode": "agent",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object", "properties": {}}
+            }}]
+        }))
+        .expect("request parses");
+        assert_eq!(req.effective_mode(), OpenAiMode::Agent);
     }
 
     #[test]
