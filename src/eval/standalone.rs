@@ -717,9 +717,17 @@ fn append_eval_ledger(
                  |------|--------|-------|----------|-------|------|--------|------|------|--------------|\n",
             )?;
         }
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
-        f.write_all(row.as_bytes())
+        // A row belongs to the run table at the top of the file. The ledger now
+        // carries later sections (external benchmarks, which have their own
+        // columns), so appending to EOF would file an eval run under the wrong
+        // heading — insert before the first section instead.
+        let existing = std::fs::read_to_string(&path)?;
+        let at = existing.find("\n## ").unwrap_or(existing.len());
+        let mut updated = String::with_capacity(existing.len() + row.len());
+        updated.push_str(&existing[..at]);
+        updated.push_str(&row);
+        updated.push_str(&existing[at..]);
+        std::fs::write(&path, updated)
     })();
     if let Err(e) = write {
         warn!("Failed to append eval ledger row: {}", e);
@@ -767,8 +775,8 @@ async fn try_load_gateway_config() -> Option<GatewayConfig> {
 
 /// Create a tool registry for eval tasks.
 ///
-/// Registers shell, file operations, search, web, todo, time tools, and
-/// optionally ACP tools (acp_spawn, acp_session, sessions_send) when an
+/// Registers shell, file operations, search, web, browser, todo, time tools,
+/// and optionally ACP tools (acp_spawn, acp_session, sessions_send) when an
 /// `AcpControlPlane` is provided.
 fn create_eval_tool_registry(
     acp: Option<Arc<AcpControlPlane>>,
@@ -785,6 +793,11 @@ fn create_eval_tool_registry(
     let shared = std::sync::Arc::new(tokio::sync::RwLock::new(search_providers));
     registry.register(Box::new(WebSearchTool::new().with_providers_arc(shared)));
     registry.register(Box::new(WebFetchTool::new()));
+    // End-to-end tasks (GAIA L1) browse pages that `web_fetch` cannot reduce to
+    // text — JS-rendered content, a click away from a file. Same SSRF policy as
+    // the gateway; the permissive variant stays an explicit opt-in.
+    #[cfg(feature = "browser")]
+    registry.register(Box::new(crate::tools::browser::BrowserTool::new()));
     registry.register(Box::new(TodoTool::new()));
     registry.register(Box::new(TimeTool::new()));
 
@@ -902,5 +915,38 @@ mod tests {
         assert!(data_rows[1].contains("only:2"));
         assert!(data_rows[1].contains("2/2"));
         assert!(data_rows[1].contains("100.0%"));
+    }
+
+    #[test]
+    fn test_append_eval_ledger_inserts_before_later_sections() {
+        let dir = std::env::temp_dir().join(format!(
+            "syscity-ledger-section-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp ledger dir");
+        std::fs::write(
+            dir.join("ledger.md"),
+            "# Eval Ledger\n\n\
+             | Date | Commit | Suite | Executor | Judge | Mode | Passed | Rate \
+             | Gate | Failed tasks |\n\
+             |------|--------|-------|----------|-------|------|--------|------|------|--------------|\n\n\
+             ## 外部基准（benchmark）\n\n\
+             | Date | Benchmark |\n|------|-----------|\n| 2026-01-01 | BFCL |\n",
+        )
+        .expect("seed ledger");
+
+        append_eval_ledger(&dir, "unit_suite", "m", "j", "full", 1, 1, 1.0, true, &[]);
+
+        let content = std::fs::read_to_string(dir.join("ledger.md")).expect("ledger written");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let row_at = content.find("unit_suite").expect("row written");
+        let section_at = content.find("## 外部基准").expect("section kept");
+        assert!(row_at < section_at, "eval rows belong above the benchmark section:\n{content}");
+        assert!(content.contains("| 2026-01-01 | BFCL |"), "section intact");
     }
 }

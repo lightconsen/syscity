@@ -1,6 +1,7 @@
 # 公开基准（Benchmark）接入计划
 
-> 状态：M0（契约补全）与 M1（BFCL）已落地；M2–M4 仍是计划。
+> 状态：M0（契约补全）、M1（BFCL）、M2（GAIA 接入）已落地；M2 的基线分数待数据集
+> 访问权，M3–M4 仍是计划。
 > 最后更新：2026-10-26
 > 相关文档：[`harness.md`](harness.md)（评测闭环设计）、[`eval-status.md`](eval-status.md)（方法论与落地状态）、
 > [`../evals/README.md`](../evals/README.md)（本地套件用法）
@@ -224,31 +225,53 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 `syscity model switch`。因此全量 × pro 的正式数字没有跑完，探针结论足够回答"值不值"。
 要重开这个决定，用上表的配对子集重测，不要凭单轮全量分数。
 
-### M2 — GAIA Level 1（1–2 天）
+### M2 — GAIA Level 1（接入已完成，基线待数据集访问权）
 
 单轮任务 + 官方 scorer，是"端到端能不能干完活"最直接的可比数字。
 
-1. 新增 `evals/importers/gaia.py`：读 HF 上的 `gaia-benchmark/GAIA` validation 集，
-   过滤 `Level == 1`（53 条），生成 `evals/capability/gaia_l1.yaml`。
-   每条映射为：
+落地结果（相对计划改了两处，理由见下）：
 
-   ```yaml
-   - id: gaia_l1_0001
-     input: "<question>"
-     conditions:
-       - type: script
-         command: >-
-           python3 evals/importers/gaia_score.py --task ${task_id}
-           --answer ${trial_dir}/response.txt
-         expected: 0
-   ```
+1. `evals/importers/gaia.py` — 读 HF 的 `2023/validation/metadata.level1.parquet`
+   （validation 的 Level 1，53 条），生成 `evals/capability/gaia_l1.yaml` 和
+   `gaia_l1_answers.json`，并把题目引用的附件下载到仓库外
+   （默认 `~/.cache/syscity-bench/gaia/files`）。**两个生成文件都不入仓**：GAIA 的使用
+   条款禁止再分发，附件路径又是本机绝对路径。任务 id 取 `gaia_l1_<task_id 前 8 位>`，
+   重跑后仍能对回官方 `task_id`。
+2. `evals/importers/gaia_scorer.py` — 官方 `question_scorer`，取自 GAIA leaderboard
+   Space 的 `scorer.py`（2026-10-26），逐行保留，只删掉上游未使用的 `numpy` import，
+   让裸 Python 也能跑。**没有自写判分逻辑。**
+3. `evals/importers/gaia_score.py` — 退出码映射（命中 0、未命中 1、无法判分 2；2 单独
+   分出来，是为了不让"harness 坏了"被记成"模型答错"），外加**答案抽取**：每条题目的
+   prompt 都要求以 `FINAL ANSWER: <答案>` 结尾，包装层取该行交给官方 scorer；没有标记时
+   整段回退给 scorer，与上游行为一致。抽取不是判分，但它决定了喂给 scorer 的字符串，
+   所以对 53 条一视同仁，原始回复仍留在 `${trial_dir}/response.txt` 里可回查。
+   `--self-test` 不需要数据集就能验证 vendoring 与抽取。
+4. `evals/suites/gaia_l1.yaml`（清单，入仓；`trials: 3`、`min_pass_rate: 0.0`，首轮只做
+   基线不定阈值）与 `evals/suites/registry.yaml` 的 `benchmark` 分组。
+5. 评测工具注册表补上 `browser`（`src/eval/standalone.rs` 的
+   `create_eval_tool_registry`，与网关同一 SSRF 策略）。`file_read`、`shell`、`web_fetch`、
+   `web_search` 本来就在。PDF 走 `shell`（`pdftotext`）——`file_read` 不解析二进制，这是
+   已知限制，PDF/音频/图片类条目的失分要按此读。
 
-2. `evals/importers/gaia_score.py`：薄封装官方 `question_scorer`，只做 CLAUDE.md 风格的
-   退出码映射（命中 0，未命中 1）。
-3. 注册到 `evals/suites/registry.yaml`，`trials: 3`、`min_pass_rate` 先留空（首轮只做
-   基线，不定阈值）。
-4. 注意：L1 有相当比例需要下载文件/读 PDF，确认 `file_read`、`browser` 在评测工具注册表里
-   （`create_eval_tool_registry`），否则这批任务会系统性失败——那测的就不是模型了。
+数据集是 gated 的，所以任务文件在本机生成。用 `~/.cache/huggingface/token` 对应的账号
+在 <https://huggingface.co/datasets/gaia-benchmark/GAIA> 点一次授权（该数据集是
+auto-approve），然后：
+
+```bash
+python3 -m venv ~/.cache/syscity-bench/gaia/venv
+~/.cache/syscity-bench/gaia/venv/bin/pip install pyarrow pyyaml
+~/.cache/syscity-bench/gaia/venv/bin/python evals/importers/gaia.py
+syscity eval run gaia_l1 --full --trials 3
+```
+
+`pyarrow` 是读 parquet 的最低要求（Python 没有标准库实现）；导入器对 401/403 会直接
+打印授权地址，不会静默产出空套件。
+
+**当前状态（2026-10-26）**：`landoyjx` 这个 HF 账号尚未拿到 GAIA 访问权，元数据请求
+返回 `403 ... not in the authorized list`，所以 53 条真实题目一次都没跑，ledger 里
+也就没有 GAIA 行。导入器已用合成数据跑通整条链路：生成 YAML → Rust loader 正常加载
+（2 任务 × 3 trials）→ `--full` 实跑一条 → `gaia_score.py` 判分并退出 0。拿到访问权后，
+缺的只有上面最后一行。
 
 **验收**：`syscity eval run gaia_l1 --full --trials 3` 跑完，产出 pass rate 与逐条结果。
 
@@ -326,7 +349,9 @@ M0 完成即视为"可自动化"达成，判断依据：
 
 M2/M3 完成视为"有对外可比的数字"达成：
 
-- [ ] GAIA L1 pass rate 进 ledger
+- [x] GAIA L1 套件可由 `syscity eval run gaia_l1 --full` 驱动，判分走官方 scorer
+      （合成数据端到端验证过）
+- [ ] GAIA L1 pass rate 进 ledger —— 阻塞在 HF 数据集访问权，见 M2 末段
 - [ ] τ²-bench airline/retail 判分结果进 ledger
 - [ ] 任一基准重跑一次，差异在 ±5% 内（说明可复现）
 
@@ -349,7 +374,7 @@ M2/M3 完成视为"有对外可比的数字"达成：
 ```
 M0 契约补全 ✅
   └─ M1 BFCL ✅ ─────────────── 验证契约，最快拿到一个可比数字
-       └─ M2 GAIA L1（1–2d）──── 端到端能力，进 ledger
+       └─ M2 GAIA L1 接入 ✅ ── 端到端能力；基线待 HF 访问权，跑完进 ledger
             └─ M3 τ²-bench（3–5d）── 多轮 + 策略，最像真实使用的场景
                  └─ M4 Terminal-bench（可选）
 ```

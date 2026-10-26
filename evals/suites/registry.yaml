@@ -114,3 +114,20 @@ skills:
       weight: 0.6
       min_pass_rate: 0.6
       trials: 3
+
+# ── 外部基准：与公开榜单口径一致 ────────────────────────────────────────
+# 任务文件不入仓（数据条款禁止再分发，附件路径是本机的）。先运行
+#   ~/.cache/syscity-bench/gaia/venv/bin/python evals/importers/gaia.py
+# 生成 evals/capability/gaia_l1.yaml，再跑 `syscity eval run gaia_l1 --full`。
+# min_pass_rate 为 0：首批跑分是基线，不是门禁。
+benchmark:
+  name: "外部基准"
+  category: benchmark
+  description: "官方 evaluator 判分的公开基准（GAIA 等）"
+  schedule: "发版前 / 夜间"
+  suites:
+    - id: gaia_l1
+      path: "../capability/gaia_l1.yaml"
+      weight: 1.0
+      min_pass_rate: 0.0
+      trials: 3

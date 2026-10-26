@@ -70,7 +70,8 @@ A single pass carries ±2–4 points of run-to-run noise per category, so smalle
 deltas are not signal. Reproduce with
 [`evals/benchmarks/bfcl_syscity.py`](evals/benchmarks/bfcl_syscity.py); the
 method and the noise measurement are in [docs/benchmark.md](docs/benchmark.md).
-More benchmarks (τ²-bench, GAIA) are planned in the same doc.
+GAIA Level 1 is wired up and waiting on its first baseline; τ²-bench is next.
+Status for both is in the same doc.
 
 ## Overview
 

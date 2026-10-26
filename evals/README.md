@@ -400,6 +400,11 @@ evals/
 ├── skills/              # Skill 专项评测
 ├── calibration/         # Judge 校准集
 │   └── default.yaml
+├── importers/           # 外部基准 → 本地套件（GAIA 等）
 ├── badcases/            # 收集的 badcase（运行时生成）
 └── review/              # 人工复核记录（运行时生成）
 ```
+
+外部基准不是本地套件：任务文件由 `importers/` 生成、判分由各基准的官方 evaluator 给出。
+GAIA Level 1 的生成步骤和判分口径见 [`../docs/benchmark.md`](../docs/benchmark.md) §M2；
+生成后直接 `syscity eval run gaia_l1 --full --trials 3`。

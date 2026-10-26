@@ -1,0 +1,26 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# GAIA Level 1 (validation split, 53 questions) — external benchmark
+#
+# Tasks are GENERATED, not committed: the GAIA terms of use forbid
+# redistribution, and attachment paths are machine-specific. Generate them once
+# per machine before running this suite:
+#
+#   ~/.cache/syscity-bench/gaia/venv/bin/python evals/importers/gaia.py
+#
+# Judging is the official GAIA `question_scorer`, wrapped by
+# `evals/importers/gaia_score.py` as an exit-code condition per task — there is
+# no hand-written scorer. Method and results: docs/benchmark.md §M2.
+#
+# `min_pass_rate: 0.0` is deliberate: the first runs are a baseline, not a gate.
+# Raise it once there is a measured floor to regress against.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: "GAIA Level 1 (validation)"
+description: "端到端任务完成能力：GAIA validation Level 1，官方 question_scorer 判分"
+category: benchmark
+trials: 3
+min_pass_rate: 0.0
+
+tasks:
+  - id: gaia_l1
+    path: "../capability/gaia_l1.yaml"

@@ -319,7 +319,15 @@ pub struct LoadedTaskFile {
 /// Each YAML file contains a `tasks:` list. Returns a `LoadedTaskFile` with
 /// one entry per task and an optional skill evaluation design.
 pub fn load_tasks(yaml_path: &Path) -> Result<LoadedTaskFile> {
-    let content = std::fs::read_to_string(yaml_path).map_err(crate::error::SyscityError::Io)?;
+    // Name the file in the error: a missing task file is the expected first-run
+    // state for generated suites (GAIA), and a bare "I/O error" hides that.
+    let content = std::fs::read_to_string(yaml_path).map_err(|e| {
+        crate::error::SyscityError::Validation(format!(
+            "Cannot read task file {}: {}",
+            yaml_path.display(),
+            e
+        ))
+    })?;
     let file: YamlTaskFile = serde_norway::from_str(&content).map_err(|e| {
         crate::error::SyscityError::Validation(format!(
             "Cannot parse {}: {}",
@@ -840,5 +848,17 @@ mod tests {
     fn test_parse_dimension_custom() {
         let d = parse_dimension("custom_metric");
         assert_eq!(d, QualityDimension::Custom("custom_metric".to_string()));
+    }
+
+    #[test]
+    fn load_tasks_names_a_missing_file() {
+        // Generated suites (GAIA) have no task file until the importer runs;
+        // the error must point at the file rather than say "I/O error".
+        let missing = std::env::temp_dir().join("syscity-no-such-suite.yaml");
+        let err = match load_tasks(&missing) {
+            Ok(_) => panic!("expected a missing-file error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("syscity-no-such-suite.yaml"), "{err}");
     }
 }

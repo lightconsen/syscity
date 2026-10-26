@@ -95,3 +95,8 @@ lcov.info
 *.local.md
 audit/
 
+# GAIA task files are generated per machine: the dataset's terms of use forbid
+# redistribution and attachment paths are absolute. Regenerate with
+# evals/importers/gaia.py; attachments live outside the repo.
+evals/capability/gaia_l1.yaml
+evals/capability/gaia_l1_answers.json
