@@ -1,8 +1,8 @@
 # 公开基准（Benchmark）接入计划
 
-> 状态：M0（契约补全）、M1（BFCL）、M2（GAIA 接入）已落地；M2 的基线分数待数据集
-> 访问权，M3–M4 仍是计划。
-> 最后更新：2026-10-26
+> 状态：M0（契约补全）、M1（BFCL）、M2（GAIA 接入 + 首个基线 70.4%）已落地；
+> M3–M4 仍是计划。
+> 最后更新：2026-10-27
 > 相关文档：[`harness.md`](harness.md)（评测闭环设计）、[`eval-status.md`](eval-status.md)（方法论与落地状态）、
 > [`../evals/README.md`](../evals/README.md)（本地套件用法）
 
@@ -225,7 +225,7 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 `syscity model switch`。因此全量 × pro 的正式数字没有跑完，探针结论足够回答"值不值"。
 要重开这个决定，用上表的配对子集重测，不要凭单轮全量分数。
 
-### M2 — GAIA Level 1（接入已完成，基线待数据集访问权）
+### M2 — GAIA Level 1（✅ 已接入，基线 70.4%）
 
 单轮任务 + 官方 scorer，是"端到端能不能干完活"最直接的可比数字。
 
@@ -244,7 +244,8 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
    分出来，是为了不让"harness 坏了"被记成"模型答错"），外加**答案抽取**：每条题目的
    prompt 都要求以 `FINAL ANSWER: <答案>` 结尾，包装层取该行交给官方 scorer；没有标记时
    整段回退给 scorer，与上游行为一致。抽取不是判分，但它决定了喂给 scorer 的字符串，
-   所以对 53 条一视同仁，原始回复仍留在 `${trial_dir}/response.txt` 里可回查。
+   所以对 53 条一视同仁；原始回复写在 `${trial_dir}/response.txt`（trial 目录在系统临时
+   目录下，跑完即弃；要留证据用 `--collect-badcases`，失败轨迹会落到 `evals/badcases/`）。
    `--self-test` 不需要数据集就能验证 vendoring 与抽取。
 4. `evals/suites/gaia_l1.yaml`（清单，入仓；`trials: 3`、`min_pass_rate: 0.0`，首轮只做
    基线不定阈值）与 `evals/suites/registry.yaml` 的 `benchmark` 分组。
@@ -252,26 +253,63 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
    `create_eval_tool_registry`，与网关同一 SSRF 策略）。`file_read`、`shell`、`web_fetch`、
    `web_search` 本来就在。PDF 走 `shell`（`pdftotext`）——`file_read` 不解析二进制，这是
    已知限制，PDF/音频/图片类条目的失分要按此读。
+6. **评测工具集在无人值守下预批准**（`eval_permissions`）。第一次真跑就撞上了这一点：
+   无头评测没有人类在审批队列另一头，`shell`、`file_write`、`browser` 这类
+   `requires_approval` 工具会 fail closed，日志里是
+   `Tool 'shell' denied: … no human is present to grant it`。若不修，测的是本机
+   `[permissions]` 配置而不是模型——正是上面第 5 条要避免的那类系统性失分。
+   规则**由注册表自身导出**（`registry.list()` → 每条一个 allow 规则），而不是另写一份
+   工具名清单，所以增删工具不会和权限悄悄脱节；未注册的工具名字照样不可达。
+   用户自己的 `~/.syscity/config.toml` 不参与评测运行，也不会被改写。
 
-数据集是 gated 的，所以任务文件在本机生成。用 `~/.cache/huggingface/token` 对应的账号
-在 <https://huggingface.co/datasets/gaia-benchmark/GAIA> 点一次授权（该数据集是
-auto-approve），然后：
+数据集是 gated 的，所以任务文件在本机生成。用一个已在
+<https://huggingface.co/datasets/gaia-benchmark/GAIA> 点过授权的账号，token 走
+`HF_TOKEN`（或 `--token`）传给导入器，然后：
 
 ```bash
 python3 -m venv ~/.cache/syscity-bench/gaia/venv
 ~/.cache/syscity-bench/gaia/venv/bin/pip install pyarrow pyyaml
-~/.cache/syscity-bench/gaia/venv/bin/python evals/importers/gaia.py
+HF_TOKEN=... ~/.cache/syscity-bench/gaia/venv/bin/python evals/importers/gaia.py
 syscity eval run gaia_l1 --full --trials 3
 ```
 
 `pyarrow` 是读 parquet 的最低要求（Python 没有标准库实现）；导入器对 401/403 会直接
-打印授权地址，不会静默产出空套件。
+打印授权地址，不会静默产出空套件。token 只经环境变量传入，本机的凭据文件在仓库根
+（`hf.secret`，被 `*.secret` 规则 gitignore），不入仓。
 
-**当前状态（2026-10-26）**：`landoyjx` 这个 HF 账号尚未拿到 GAIA 访问权，元数据请求
-返回 `403 ... not in the authorized list`，所以 53 条真实题目一次都没跑，ledger 里
-也就没有 GAIA 行。导入器已用合成数据跑通整条链路：生成 YAML → Rust loader 正常加载
-（2 任务 × 3 trials）→ `--full` 实跑一条 → `gaia_score.py` 判分并退出 0。拿到访问权后，
-缺的只有上面最后一行。
+**基线（2026-10-26，`deepseek-v4-flash`，内置 Agent 循环，53 条 × 3 trials = 159）**：
+
+| 指标 | 数值 |
+|---|---|
+| trial 通过 | **112/159 = 70.4%** |
+| 3 次全过的任务 | 29/53 = 54.7% |
+| 至少过 1 次的任务 | 45/53 = 84.9% |
+| 3 次全挂的任务 | 8/53 |
+| 耗时 / 成本 | 3h39m，49.8M token（约 313k/trial，含每轮重传的上下文） |
+
+trial 口径不是独立样本（同题 3 次共享 prompt 与模型），**稳定读数是任务口径的 54.7% /
+84.9%**；70.4% 用于和其他 harness 的汇总口径对齐，不要拿它做小样本 A/B。分数也不能与
+公开 leaderboard 直接比——GAIA 对 scaffolding（工具集、迭代上限、重试）极敏感。
+
+失分结构（24 个任务至少挂 1 次：8 全挂、7 个 1/3、9 个 2/3）：
+
+- 带附件的 11 条 **78.8%**（26/33）高于纯文本 42 条的 68.3%（86/126）。瓶颈不是解析文件，
+  而是多跳检索加计算——8 个全挂任务里 7 个是"查网页 → 再查 → 算/比"型。
+- 剩下那个全挂任务是**图片题**（`9318445f`，读图里的分数）：`image` 工具只返回尺寸/格式
+  等元数据，并没有把像素交给模型的通道，agent 只能拿 `shell` 试 OCR（Swift/Apple Vision、
+  tesseract 均不可用），3 次全挂。这不是模型视力问题，是评测工具集缺一条"看图"通道，
+  在补上之前，带图条的分数按低估计。
+- 6 次 trial 撞到 30 轮工具上限（5 挂 1 过）。上限本身不是主因，但长搜索链会吃掉预算。
+- 调用量：`shell` 462、`web_fetch` 293、`browser` 118（均成功调用）。`browser` 在 L1
+  不是可选项——有题的文件只有点击/JS 渲染后才出现。
+- **已知环境偏差**：`shell` 用生产白名单环境（`env_clear` + PATH/HOME 等），不含
+  `http_proxy`；本机对部分站点必须走代理（`example.com` 直连可通，`archive.org` /
+  `bbc.co.uk` 直连 20s 超时，代理下 429 / 200）。于是 shell 里的 `curl` 下载路线会挂：
+  4 个失败 trial 出现 exit 28（`23dd907f` 2 次 —— 该题 3 次全挂，`4b6bb5f7`、`99c9cc74`
+  各 1 次），另有 4 个 trial 同样超时但改走 `web_fetch`/`browser` 后通过。换到 shell 能
+  直连（或注入代理）的机器复跑，可以把这部分偏差剥掉。
+- 用户级 personality memory 目录为空，未混入 prompt；系统提示来自本机
+  `default_agent` 配置（评测附加了一段工具使用指引），换机器复跑前应对一下配置差异。
 
 **验收**：`syscity eval run gaia_l1 --full --trials 3` 跑完，产出 pass rate 与逐条结果。
 
@@ -316,6 +354,9 @@ syscity eval run gaia_l1 --full --trials 3
 | τ²-bench | 发版前 / 手动 | 20 条 × 5 trials | 否 |
 | 全量 | 发版前 | 全跑 | 否 |
 
+按 M2 实测折算：GAIA L1 一条 trial 约 83 秒、313k token，所以夜跑 10 条 × 1 trial ≈ 14
+分钟 / 3.1M token；全量 53 条 × 3 trials 是 3h39m / 49.8M token（2026-10-26 基线）。
+
 ### 必须的三件套
 
 1. **固定口径**：seed、trials、任务子集，写进 `registry.yaml`，不靠命令行记忆。
@@ -329,8 +370,9 @@ syscity eval run gaia_l1 --full --trials 3
 - **不自写判分器**。BFCL / τ² / GAIA 都有官方 evaluator；自写的判分器往往比被测系统
   更不可靠，是这类项目最常见的坑。
 - **不把跑分体积进仓库**。目前每次 trial 的输出写在系统临时目录
-  （`src/eval/harness.rs:670`，`eval_<task_id>_<trial>`），跑完即弃；外部基准若需要留存轨迹，
-  应显式加 `--output <path>` 写到仓库外的目录，ledger 只留汇总行。
+  （`src/eval/harness.rs:670`，`eval_<task_id>_<trial>`），跑完即弃；只有
+  `--collect-badcases` 会把失败轨迹落到 `evals/badcases/`（已 gitignore），ledger 只留
+  汇总行。
 
 ---
 
@@ -351,7 +393,7 @@ M2/M3 完成视为"有对外可比的数字"达成：
 
 - [x] GAIA L1 套件可由 `syscity eval run gaia_l1 --full` 驱动，判分走官方 scorer
       （合成数据端到端验证过）
-- [ ] GAIA L1 pass rate 进 ledger —— 阻塞在 HF 数据集访问权，见 M2 末段
+- [x] GAIA L1 pass rate 进 ledger —— 112/159 = 70.4%，任务口径 29/53 全过、45/53 至少过 1 次
 - [ ] τ²-bench airline/retail 判分结果进 ledger
 - [ ] 任一基准重跑一次，差异在 ±5% 内（说明可复现）
 

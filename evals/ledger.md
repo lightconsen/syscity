@@ -9,6 +9,7 @@ compare against this ledger, not memory. See `docs/harness.md` §8.
 
 | Date | Commit | Suite | Executor | Judge | Mode | Passed | Rate | Gate | Failed tasks |
 |------|--------|-------|----------|-------|------|--------|------|------|--------------|
+| 2026-10-27 02:25 | cc03c7b7 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | full | 112/159 | 70.4% | PASS | gaia_l1_0383a3ee, gaia_l1_1f975693, gaia_l1_23dd907f, gaia_l1_305ac316, gaia_l1_3cef3a44, gaia_l1_46719c30, gaia_l1_4b650a35, gaia_l1_4b6bb5f7, gaia_l1_5d0080c… |
 
 ## 外部基准（benchmark）
 
@@ -39,3 +40,39 @@ evaluator** 给出，不自写判分器（见 `docs/benchmark.md`）。
 口径：`raw` 模式，网关只做 provider 透传、工具由 BFCL 自己执行，所以这组数字衡量的是
 "默认模型 + OpenAI 兼容线格式"，**不是** syscity 内置 Agent 循环的水平。复现步骤见
 [`docs/benchmark.md`](../docs/benchmark.md) M1，注册脚本 `evals/benchmarks/bfcl_syscity.py`。
+
+### GAIA Level 1（validation，53 条 × 3 trials）
+
+| Date | Benchmark | Version | Executor | Commit | Trials | Passed | Rate | Notes |
+|------|-----------|---------|----------|--------|--------|--------|------|-------|
+| 2026-10-26 | GAIA L1 | validation（HF `gaia-benchmark/GAIA`） | syscity 内置 Agent 循环 → deepseek-v4-flash | cc03c7b7 | 159 | 112 | 70.4% | 29/53 任务 3 次全过，45/53 至少过 1 次，8/53 全挂；3h39m、49.8M token |
+
+口径：与 BFCL 相反，这里跑的是 **syscity 自己的 Agent 循环**（工具由 syscity 执行，
+`file_read` / `shell` / `web_search` / `web_fetch` / `browser` 等），判分是 GAIA 官方
+`question_scorer`。所以它衡量的是整条栈：系统提示、工具描述、循环终止条件、模型。
+
+**读法**：同一题的 3 次 trial 高度相关（同一份 prompt、同一个模型），所以 70.4% 的
+trial 口径不是独立样本；稳定的读数是任务口径——**3 次全过 54.7%，至少过 1 次 84.9%**。
+这个数字**不能和公开 leaderboard 直接比**：GAIA 的分数对 scaffolding（工具集、重试、
+迭代上限、是否允许多次提交）高度敏感，换一套 harness 就是另一个数。它的用途是给本仓库
+自己定基线，看改动是升还是降。
+
+失分结构（24 个任务至少挂 1 次：8 个全挂、7 个 1/3、9 个 2/3）：
+
+- 带附件的 11 条反而更高（26/33 = 78.8%），纯文本 42 条是 68.3%（86/126）。瓶颈不在
+  读文件，而在多跳检索 + 计算：8 个全挂任务里 7 个是"查网页 → 再查 → 计算/比对"型。
+- 第 8 个是图片题（`9318445f`）：`image` 工具只返元数据，没有把图像交给模型的通道，
+  agent 只能 `shell` 试 OCR，3 次全挂。评测工具集的已知缺口，带图条按低估计。
+- 6 次 trial 撞到 30 轮工具上限（5 挂 1 过）；上限本身不是主因，但长搜索链会吃掉预算。
+- 工具用量：`shell` 462 次、`web_fetch` 293 次、`browser` 118 次成功调用——`browser`
+  在 L1 是必需项（JS 渲染、点击后才出现的文件），没有它这批题会系统性失分。
+- **已知环境偏差**：`shell` 用生产白名单环境（`env_clear` + PATH/HOME 等），不含
+  `http_proxy`；本机对部分站点必须走代理（实测 `example.com` 直连 200，但 `archive.org`、
+  `bbc.co.uk` 直连 20s 超时，走 127.0.0.1:1087 分别 429/200）。因此 shell 里的
+  `curl` 下载类路线会挂：4 个失败 trial 出现 exit 28（`23dd907f` 2 次、`4b6bb5f7` 1 次、
+  `99c9cc74` 1 次），另有 4 个 trial 同样超时但改走 `web_fetch`/`browser` 后通过。
+  `web_fetch`/`browser` 走进程环境带代理，能兜住一部分；要彻底剥掉这部分偏差，得在
+  shell 能直连（或注入代理）的机器上复跑。
+
+复现：`syscity eval run gaia_l1 --full --trials 3`（任务文件按 `docs/benchmark.md` §M2
+在本机生成）。

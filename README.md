@@ -50,10 +50,10 @@ curl -sSL https://syscity.net/install.sh | bash
 ## Benchmarks
 
 Scores come from each benchmark's **official evaluator**, never a homegrown
-scorer. Model: **`deepseek-v4-flash`**, driven through the gateway's
+scorer. Model: **`deepseek-v4-flash`** throughout. BFCL drives the gateway's
 OpenAI-compatible endpoint in `raw` mode — the caller's messages and tools are
-passed through and the harness executes the calls — so the numbers measure the
-model plus the wire, not the built-in agent loop.
+passed through and the harness executes the calls — so it measures the model
+plus the wire. GAIA runs syscity's built-in agent loop end to end.
 
 ### BFCL
 
@@ -70,8 +70,25 @@ A single pass carries ±2–4 points of run-to-run noise per category, so smalle
 deltas are not signal. Reproduce with
 [`evals/benchmarks/bfcl_syscity.py`](evals/benchmarks/bfcl_syscity.py); the
 method and the noise measurement are in [docs/benchmark.md](docs/benchmark.md).
-GAIA Level 1 is wired up and waiting on its first baseline; τ²-bench is next.
-Status for both is in the same doc.
+
+### GAIA
+
+[GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1,
+53 tasks × 3 trials, judged by the benchmark's official `question_scorer`:
+
+| Metric | Score |
+|---|---|
+| Trials passed | **70.4%** (112/159) |
+| Tasks passing all three trials | **54.7%** (29/53) |
+| Tasks passing at least once | **84.9%** (45/53) |
+
+Unlike BFCL, this runs syscity's **own agent loop** — reading attachments,
+searching, fetching and browsing — so the number covers the whole stack:
+system prompt, tool descriptions, iteration budget, and the model. Trials of
+the same task share a prompt and are not independent samples; the task-level
+figures are the stable readout. It is also not comparable to the public
+leaderboard, where scaffolding differs per entry. τ²-bench is next; method and
+the failure breakdown are in [docs/benchmark.md](docs/benchmark.md) §M2.
 
 ## Overview
 
