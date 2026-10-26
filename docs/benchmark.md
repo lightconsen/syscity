@@ -1,6 +1,6 @@
 # 公开基准（Benchmark）接入计划
 
-> 状态：计划稿，尚未实施。
+> 状态：M0（契约补全）与 M1（BFCL）已落地；M2–M4 仍是计划。
 > 最后更新：2026-10-26
 > 相关文档：[`harness.md`](harness.md)（评测闭环设计）、[`eval-status.md`](eval-status.md)（方法论与落地状态）、
 > [`../evals/README.md`](../evals/README.md)（本地套件用法）
@@ -168,6 +168,20 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 
 **验收**：官方 evaluator 输出 accuracy 报告，无需人工看任何一条输出。✅
 
+首轮结果（2026-10-26，`bfcl-eval 2026.3.23`，网关 commit `0c362599`，
+`syscity-agent` → deepseek-v4-flash，835 条全部跑完、无人工干预）：
+
+| 子类目 | 正确/总数 | Accuracy |
+|---|---|---|
+| `simple_python` | 367/400 | 91.75% |
+| `irrelevance` | 172/240 | 71.67% |
+| `multi_turn_base` | 123/200 | 61.50% |
+
+读法见 `evals/ledger.md` 的"外部基准"一节：`raw` 模式测的是"默认模型 + OpenAI 兼容线格式"，
+不是 syscity 内置 Agent 循环的水平。`simple_python` 的失分几乎全在参数值（类型/枚举），
+`irrelevance` 的失分全部是"不该调工具时调了"——两者都是模型行为的基线，与网关实现无关，
+今后正是拿来对照"换模型 / 改提示词有没有变好"的那个数。
+
 ### M2 — GAIA Level 1（1–2 天）
 
 单轮任务 + 官方 scorer，是"端到端能不能干完活"最直接的可比数字。
@@ -264,7 +278,8 @@ M0 完成即视为"可自动化"达成，判断依据：
 - [x] 多轮 `role: tool` 消息不丢失 —— 由 `tool_turns_deserialize_from_the_openai_wire` /
       `provider_messages_keep_tool_calls_and_results` 覆盖
 - [x] 缺省行为不变（现有 OpenAI 兼容调用方无感）—— `mode_defaults_to_agent` 等回归测试
-- [ ] BFCL `simple_python` 能在无人工干预下跑出 accuracy 数字（M1，尚未做）
+- [x] BFCL `simple_python` 能在无人工干预下跑出 accuracy 数字 —— 91.75%（367/400），
+      同批还跑了 `irrelevance` 71.67%、`multi_turn_base` 61.50%
 
 M2/M3 完成视为"有对外可比的数字"达成：
 
@@ -290,7 +305,7 @@ M2/M3 完成视为"有对外可比的数字"达成：
 
 ```
 M0 契约补全 ✅
-  └─ M1 BFCL（0.5d）──────────── 验证契约，最快拿到一个可比数字
+  └─ M1 BFCL ✅ ─────────────── 验证契约，最快拿到一个可比数字
        └─ M2 GAIA L1（1–2d）──── 端到端能力，进 ledger
             └─ M3 τ²-bench（3–5d）── 多轮 + 策略，最像真实使用的场景
                  └─ M4 Terminal-bench（可选）
