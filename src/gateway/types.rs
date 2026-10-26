@@ -260,6 +260,10 @@ pub struct OpenAiChatRequest {
     /// forced to produce a tool call, and the agent mode owns its tool choice.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Sampling temperature, 0.0–2.0 as on the OpenAI wire. Honoured by `raw`
+    /// mode; the built-in agent keeps its own sampling settings.
+    #[serde(default)]
+    pub temperature: Option<f32>,
     /// Agent loop placement. Omitted → see [`OpenAiChatRequest::effective_mode`].
     #[serde(default)]
     pub mode: Option<OpenAiMode>,

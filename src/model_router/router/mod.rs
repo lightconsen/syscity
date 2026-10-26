@@ -57,6 +57,19 @@ use crate::providers::{
     Usage,
 };
 
+/// Sampling parameters a caller may pin for a single completion.
+///
+/// Only knobs a caller genuinely owns live here — everything else stays on the
+/// router's own configuration. `None` means "let the provider apply its
+/// default", which is what every in-tree caller other than the OpenAI-compatible
+/// route does.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CompletionParams {
+    /// Sampling temperature. Validated by the caller against the wire
+    /// contract's range; the router passes it through untouched.
+    pub temperature: Option<f32>,
+}
+
 // ------------------------------------------------------------------
 // ModelRouter
 // ------------------------------------------------------------------

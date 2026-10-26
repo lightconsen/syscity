@@ -78,6 +78,10 @@ Query 参数：
 | `agent` | 取最后一条 user 消息交给内置 Agent（自带工具注册表），请求里的 `tools` 忽略；支持 `stream` | 人类聊天、OpenAI 客户端 |
 | `raw` | 完整 `messages` + `tools` 原样下发 provider，`tool_calls` 原样返回，**工具由调用方执行**；不支持 `stream` | 外部 Agent 基准（BFCL、τ²-bench 等） |
 
+`temperature`（0.0–2.0）只在 `raw` 模式透传；不传时由 provider 适配器决定（OpenAI 兼容
+适配器发 0.7），`agent` 模式忽略该字段、沿用内置 Agent 自己的采样配置。越界取值在 `raw`
+模式返回 400，而不是让 provider 报一个调用方分辨不出的 502。
+
 缺省规则的由来：带 `tools` 的请求按 OpenAI 语义是"调用方自己执行工具"，而基准 harness
 只发 `tools`、不发 `mode`；若缺省成 `agent`，它们的工具定义会被静默丢弃、每一轮都拿不到
 `tool_calls`。不带 `tools` 的请求保持原有 `agent` 行为，既有聊天调用方无感。显式写

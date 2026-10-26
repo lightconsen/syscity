@@ -10,6 +10,7 @@ use tracing::warn;
 
 use crate::gateway::GatewayState;
 use crate::gateway::*;
+use crate::model_router::CompletionParams;
 use crate::providers::{FunctionCall, Message, Role, ToolCall};
 
 /// `POST /v1/chat/completions`
@@ -82,6 +83,18 @@ async fn raw_completion(
         );
     }
 
+    // The OpenAI wire documents 0.0–2.0. Rejecting here turns a provider's
+    // opaque 400 into an error the caller can act on.
+    if let Some(temperature) = req.temperature {
+        if !(0.0..=2.0).contains(&temperature) {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("temperature must be between 0 and 2, got {temperature}"),
+            );
+        }
+    }
+
     let messages = match to_provider_messages(&req.messages) {
         Ok(messages) => messages,
         Err(err) => return error_body(StatusCode::BAD_REQUEST, "invalid_request_error", err),
@@ -113,9 +126,13 @@ async fn raw_completion(
 
     // Same bound as the agent path: a provider that never answers must not hold
     // the HTTP request open forever.
+    let params = CompletionParams { temperature: req.temperature };
     let completion = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        state.infra.model_router.complete(&model, messages, tools),
+        state
+            .infra
+            .model_router
+            .complete_with_params(&model, messages, tools, params),
     )
     .await
     .unwrap_or_else(|_| {
@@ -477,6 +494,7 @@ mod tests {
             stream,
             tools: Vec::new(),
             tool_choice: None,
+            temperature: None,
             mode: Some(OpenAiMode::Agent),
         })
     }
@@ -488,6 +506,7 @@ mod tests {
             stream: false,
             tools: Vec::new(),
             tool_choice: None,
+            temperature: None,
             mode: Some(OpenAiMode::Raw),
         })
     }
@@ -579,6 +598,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_mode_rejects_out_of_range_temperature() {
+        let state = state().await;
+        let mut body = raw_req("syscity-agent", vec![user_msg("hello")]);
+        body.0.temperature = Some(2.5);
+        let resp = openai_chat_completions_handler(
+            State(state),
+            Query(ModelOverrideQuery { model: None }),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("temperature must be between 0 and 2"));
+    }
+
+    #[tokio::test]
     async fn raw_mode_rejects_unknown_roles() {
         let state = state().await;
         let message = OpenAiMessage {
@@ -639,6 +678,7 @@ mod tests {
         let body: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
             "model": "mock-tool-model",
             "mode": "raw",
+            "temperature": 0.001,
             "messages": [
                 {"role": "system", "content": "you are a test"},
                 {"role": "user", "content": "what is the weather in Paris?"}
@@ -676,6 +716,11 @@ mod tests {
         let tools = calls[0].tools.as_ref().expect("tools were passed through");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(
+            calls[0].temperature,
+            Some(0.001),
+            "the caller's temperature must reach the provider, not its default"
+        );
         assert_eq!(calls[0].messages.len(), 2);
         assert_eq!(calls[0].messages[0].role, Role::System);
         assert_eq!(calls[0].messages[1].role, Role::User);

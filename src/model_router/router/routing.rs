@@ -25,6 +25,24 @@ impl ModelRouter {
         Ok(self.complete_with_route(model_id, messages, tools).await?.0)
     }
 
+    /// Complete a request with caller-supplied sampling parameters.
+    ///
+    /// Used by the OpenAI-compatible route, where `temperature` is part of the
+    /// wire contract: dropping it silently runs the caller's request at the
+    /// provider's default and makes the output irreproducible.
+    pub async fn complete_with_params(
+        &self,
+        model_id: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        params: CompletionParams,
+    ) -> crate::Result<CompletionResponse> {
+        Ok(self
+            .complete_with_route_and_params(model_id, messages, tools, params)
+            .await?
+            .0)
+    }
+
     /// Complete a request via the router, returning the response together with
     /// the [`RouteRecord`] describing the route decision (candidate chain,
     /// chosen model, fallback). The record feeds per-turn observability.
@@ -34,9 +52,24 @@ impl ModelRouter {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> crate::Result<(CompletionResponse, RouteRecord)> {
+        self.complete_with_route_and_params(model_id, messages, tools, CompletionParams::default())
+            .await
+    }
+
+    /// [`Self::complete_with_route`] with caller-supplied sampling parameters.
+    pub async fn complete_with_route_and_params(
+        &self,
+        model_id: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        params: CompletionParams,
+    ) -> crate::Result<(CompletionResponse, RouteRecord)> {
         let requested = model_id.to_string();
-        let (provider, model_id, request) =
+        let (provider, model_id, mut request) =
             self.build_request(model_id, messages, tools, false).await?;
+        // Applied after `build_request` because capability resolution there
+        // looks at the model, not the sampling knobs.
+        request.temperature = params.temperature;
         let providers_to_try = self
             .get_providers_to_try(&provider, &model_id, &request)
             .await;

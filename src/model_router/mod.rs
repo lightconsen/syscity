@@ -52,7 +52,7 @@ pub use oauth_credential::{Credential, RefreshOutcome};
 pub use oauth_flow::OAuthFlow;
 pub use pkce::{challenge_from_verifier, generate_verifier};
 pub use provider_oauth::{AuthStatus, ProviderOAuthFlows, StartedFlow, CALLBACK_PATH};
-pub use router::ModelRouter;
+pub use router::{CompletionParams, ModelRouter};
 pub use usage_fetcher::{
     LocalBudgetFetcher, OpenAiUsageFetcher, UsageFetcher, UsageFetcherRegistry,
 };
