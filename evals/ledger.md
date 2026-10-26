@@ -30,6 +30,12 @@ evaluator** 给出，不自写判分器（见 `docs/benchmark.md`）。
 两轮仍有 15/400、31/240、35/200 条判定翻转，即单轮类目分数自带 ±2–4pt 抖动。因此本表
 两轮之间的差值不可当作"改进"，且今后任何 A/B 都需重复 3 轮以上再下判断。
 
+**配对子集探针（不进上表）**：子集 = 已知错题 + 等量随机对照，绝对分数被构造成 50%，只用
+"修好 / 弄坏"计数。`deepseek-v4-pro` 对 `deepseek-v4-flash`：`irrelevance` 18 修好 / 1 弄坏，
+`simple_python` 17 修好 / 2 弄坏；JSON Schema 类型名规整（`75275de8`）对 `simple_python`
+11、12 修好 / 各 1 弄坏（两次同向），对 `irrelevance` 12/5 与 8/7（噪声）。**2026-10-26 决定：
+默认模型保持 flash**——差距真实，但默认模型是成本/延迟决策；全量 × pro 未跑完，探针足够。
+
 口径：`raw` 模式，网关只做 provider 透传、工具由 BFCL 自己执行，所以这组数字衡量的是
 "默认模型 + OpenAI 兼容线格式"，**不是** syscity 内置 Agent 循环的水平。复现步骤见
 [`docs/benchmark.md`](../docs/benchmark.md) M1，注册脚本 `evals/benchmarks/bfcl_syscity.py`。
