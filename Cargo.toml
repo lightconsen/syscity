@@ -133,7 +133,7 @@ async-stream = "0.3"
 rand = "0.10"
 
 # Cron expression parsing
-cron = "0.14"
+cron = "0.17"
 
 # Glob patterns
 glob = "0.3"
