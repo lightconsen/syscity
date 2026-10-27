@@ -463,6 +463,7 @@ mod tests {
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             execution_backends: std::collections::HashMap::new(),
+            tool_environment: std::collections::HashMap::new(),
             heartbeat: Some(crate::heartbeat::HeartbeatConfig {
                 enabled: true,
                 interval_seconds: 120,

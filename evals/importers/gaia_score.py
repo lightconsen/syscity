@@ -20,9 +20,11 @@ The scorer itself is `gaia_scorer.py`, vendored from the GAIA leaderboard
 Space. This file adds no scoring logic of its own. The one thing it does add is
 *answer extraction*: the agent's message is free-form, while the scorer expects
 just the answer. If the message contains a `FINAL ANSWER:` line (every task
-prompt asks for one) the text after the marker is scored; otherwise the whole
-message is scored, exactly as upstream would. Extraction is uniform across
-tasks, and the raw message stays in the trial directory for audit.
+prompt asks for one) the text after the marker is scored. If it does not, the
+last non-empty line is tried first and the whole message second — the same
+order a human reader would use, and both candidates go through the untouched
+official scorer. Extraction is uniform across tasks, and the raw message stays
+in the trial directory for audit.
 
 Answers live in `evals/capability/gaia_l1_answers.json` (written by `gaia.py`,
 gitignored along with the generated task file). `--answers` overrides it.
@@ -43,6 +45,11 @@ from gaia_scorer import question_scorer
 # `FINAL ANSWER: x` — the marker the generated task prompts ask for. The value
 # continues until a blank line, so a wrapped answer still scores.
 _FINAL_ANSWER = re.compile(r"(?im)^[ \t>*#]*FINAL ANSWER:[ \t]*(.*)$")
+
+# Lead-ins a reply may put in front of a bare answer when it forgot the marker.
+_ANSWER_LEAD_IN = re.compile(
+    r"(?i)^(?:the\s+)?(?:final\s+)?answer\s*(?:is|:)\s*|^答案\s*(?:是|为)?\s*[:：]?\s*"
+)
 
 
 def extract_answer(response: str) -> str:
@@ -75,6 +82,32 @@ def extract_answer(response: str) -> str:
     return answer.strip()
 
 
+def fallback_candidates(response: str) -> list[str]:
+    """Candidates to try when the reply carries no `FINAL ANSWER:` marker.
+
+    Ordered most-specific first: the last non-empty line (what a human would
+    read as the answer), then the whole message (the pre-existing behaviour).
+    The last line is only offered when it is short enough to *be* an answer —
+    a concluding paragraph is not a candidate.
+    """
+    lines = [line.strip() for line in response.splitlines() if line.strip()]
+    candidates = []
+    if lines:
+        last = lines[-1].lstrip(">*#- ").strip()
+        if 0 < len(last) <= 300:
+            candidates.append(last)
+            # "The answer is X." / "答案：X" — the official scorer compares the
+            # normalized string exactly, so a lead-in would otherwise ensure a
+            # miss even though the answer is right there.
+            stripped = _ANSWER_LEAD_IN.sub("", last).strip("`*_ .。")
+            if stripped and stripped != last:
+                candidates.append(stripped)
+    whole = response.strip()
+    if whole and whole not in candidates:
+        candidates.append(whole)
+    return candidates
+
+
 def default_answers_path() -> Path:
     return Path(__file__).resolve().parent.parent / "capability" / "gaia_l1_answers.json"
 
@@ -90,16 +123,25 @@ def score(task_id: str, answer_text: str, answers: dict, *, show_expected: bool)
         print(f"GAIA task {task_id}: ERROR — no ground truth in the answers file")
         return 2
     expected = record["answer"]
-    got = extract_answer(answer_text)
+    if _FINAL_ANSWER.search(answer_text):
+        candidates = [extract_answer(answer_text)]
+    else:
+        candidates = fallback_candidates(answer_text)
 
-    # The official scorer narrates on stdout; keep this command's output to a
-    # single line so the harness log stays readable.
-    with contextlib.redirect_stdout(io.StringIO()):
-        hit = question_scorer(got, expected)
+    scored: list[tuple[str, bool]] = []
+    for candidate in candidates:
+        # The official scorer narrates on stdout; keep this command's output to
+        # a single line so the harness log stays readable.
+        with contextlib.redirect_stdout(io.StringIO()):
+            scored.append((candidate, bool(question_scorer(candidate, expected))))
+    hit = any(passed for _, passed in scored)
+    got = next((text for text, passed in scored if passed), candidates[0] if candidates else "")
 
     verdict = "PASS" if hit else "FAIL"
     print(f"GAIA task {task_id}: {verdict}")
     print(f"  scored: {got!r}"[:2000])
+    if len(scored) > 1 and not hit:
+        print(f"  also tried: {scored[-1][0]!r}"[:2000])
     if show_expected:
         print(f"  expected: {expected!r}")
     return 0 if hit else 1
@@ -134,7 +176,24 @@ def self_test() -> int:
     if wrapped != "New York City (state, not the state)":
         print(f"FAIL wrapped extraction -> {wrapped!r}")
         failures += 1
-    print(f"{len(cases) + 1 - failures}/{len(cases) + 1} self-tests passed")
+
+    # Without the marker, the last line is tried before the whole message.
+    no_marker = fallback_candidates("I checked several sources.\nThe answer is **Madrid**.")
+    if not no_marker or no_marker[0] != "The answer is **Madrid**.":
+        print(f"FAIL fallback candidates -> {no_marker!r}")
+        failures += 1
+    cleaned = [c for c in no_marker if c == "Madrid"]
+    if not cleaned:
+        print(f"FAIL lead-in strip -> {no_marker!r}")
+        failures += 1
+    else:
+        with contextlib.redirect_stdout(io.StringIO()):
+            if not question_scorer(cleaned[0], "Madrid"):
+                print("FAIL fallback scoring")
+                failures += 1
+
+    total = len(cases) + 3
+    print(f"{total - failures}/{total} self-tests passed")
     return 0 if failures == 0 else 1
 
 

@@ -243,7 +243,8 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 3. `evals/importers/gaia_score.py` — 退出码映射（命中 0、未命中 1、无法判分 2；2 单独
    分出来，是为了不让"harness 坏了"被记成"模型答错"），外加**答案抽取**：每条题目的
    prompt 都要求以 `FINAL ANSWER: <答案>` 结尾，包装层取该行交给官方 scorer；没有标记时
-   整段回退给 scorer，与上游行为一致。抽取不是判分，但它决定了喂给 scorer 的字符串，
+   先试最后一行（去掉 `The answer is` / `答案：` 之类引导语后再试一次），最后才整段回退，
+   每个候选都交给同一个官方 scorer，命中即过。抽取不是判分，但它决定了喂给 scorer 的字符串，
    所以对 53 条一视同仁；原始回复写在 `${trial_dir}/response.txt`（trial 目录在系统临时
    目录下，跑完即弃；要留证据用 `--collect-badcases`，失败轨迹会落到 `evals/badcases/`）。
    `--self-test` 不需要数据集就能验证 vendoring 与抽取。
@@ -252,7 +253,7 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
 5. 评测工具注册表补上 `browser`（`src/eval/standalone.rs` 的
    `create_eval_tool_registry`，与网关同一 SSRF 策略）。`file_read`、`shell`、`web_fetch`、
    `web_search` 本来就在。PDF 走 `shell`（`pdftotext`）——`file_read` 不解析二进制，这是
-   已知限制，PDF/音频/图片类条目的失分要按此读。
+   已知限制。图片条目走 `image` 工具的本地 OCR（见下），不再只有元数据。
 6. **评测工具集在无人值守下预批准**（`eval_permissions`）。第一次真跑就撞上了这一点：
    无头评测没有人类在审批队列另一头，`shell`、`file_write`、`browser` 这类
    `requires_approval` 工具会 fail closed，日志里是
@@ -307,9 +308,56 @@ trial 口径不是独立样本（同题 3 次共享 prompt 与模型），**稳�
   `bbc.co.uk` 直连 20s 超时，代理下 429 / 200）。于是 shell 里的 `curl` 下载路线会挂：
   4 个失败 trial 出现 exit 28（`23dd907f` 2 次 —— 该题 3 次全挂，`4b6bb5f7`、`99c9cc74`
   各 1 次），另有 4 个 trial 同样超时但改走 `web_fetch`/`browser` 后通过。换到 shell 能
-  直连（或注入代理）的机器复跑，可以把这部分偏差剥掉。
+  直连（或注入代理）的机器复跑，可以把这部分偏差剥掉——**2026-10-27 起父进程的代理变量会
+  自动注入 shell 工具环境**，复跑时在启动 eval 的 shell 里 `export` 即可。
 - 用户级 personality memory 目录为空，未混入 prompt；系统提示来自本机
   `default_agent` 配置（评测附加了一段工具使用指引），换机器复跑前应对一下配置差异。
+
+**提分改造（2026-10-27，P0–P3）**
+
+基线里 84.9% 的题至少过过一次、只有 54.7% 三次全过，说明**主要缺口是可靠性，不是能力**。
+这一轮按这个判断改了四组东西，判分口径未动（官方 scorer 仍是唯一裁判）：
+
+- **P0 确定性**：评测运行固定 `temperature = 0.0`（此前 0.7）；工具预算 30 → 60 轮，并在用掉
+  70% 时给一条"该收口"的提醒；预算耗尽时的合成结果明确要求按题面格式作答；系统提示改为由
+  注册表导出**真实**工具名（此前写死了五个并未注册的工具名），并说明 shell 环境受限、联网优先
+  用 `web_fetch`。父进程的 `http_proxy`/`https_proxy` 现在注入 shell 工具环境
+  （`AgentConfig.tool_environment` → `ToolContext`），curl 路线不再因这个环境偏差失分。
+- **P1 检索质量**：`web_search` 新增 `depth=advanced`（Tavily 走 advanced + raw content，一次
+  拿到正文）和 `fetch_top=N`（一次调用把前 N 个结果页正文读回来，复用 `web_fetch` 的 SSRF
+  守卫与 HTML→markdown），`limit` 上限 10 → 20；`web_fetch` 对超时/连接失败/5xx 重试一次；
+  JS 渲染的空壳页面会提示改用 `browser`，而不是让模型以为页面没内容。
+- **P2 能力缺口**：`image` 工具不再只返回元数据——开着 `vision` 特性时用本地 RapidOCR 读出图
+  上文字并按阅读顺序返回（模型自动缓存到 `~/.syscity/models/vision/`，下载很轻，不含
+  OmniParser）。基线里唯一一个非检索类零通过任务就是图片题。这一轮顺带把 OCR 自身修到能用：
+  - 识别模型换成 PP-OCRv3 English。v5 mobile 在本 crate 链接的 ONNX Runtime 上会把一行干净
+    的 `Invoice total: 1234.50 USD` 读成 `In)Ce tOtal: 1234.5O USD`（同一输入在 Python 侧
+    的各版本 ORT 上逐位一致），v3 在同一个 runtime 上退化成 `1234.5o USD`，可以用。
+  - 字符表与模型绑定并从磁盘加载：识别模型输出的是类别下标，用猜的字母表解码只会得到
+    "自信的乱码"。类别数与字符表不匹配时直接报错，而不是继续解出碎片。
+  - DBNet 的框改成按 `unclip_ratio · area / perimeter` 各边外扩（原来是宽高各乘 1.5，长行
+    会被横向拉长、纵向压扁，识别裁剪把字切掉）；识别输入宽度上限 1600 → 4096，长行此前
+    被压扁是文档截图读错的主因——同一张 GAIA 截图整图置信度 0.75 → 0.80，正文从乱码变成
+    可读（`3/4`、`1/4`、`2/4`、`5/35`、`7/21`、`30/5` 全部读对）。
+  - **`9318445f` 仍不在这一轮能解决的范围**：题面要读的是竖式分数（分子/横线/分母），检测
+    会把它们拆成独立小块，且 10px 高的数字连 `8`/`0`、`340`/`30` 都分不清，答案是"每个分数
+    + 化简结果"，需要判断而不只是识字。这要靠多模态通道（把图片交给模型），属于产品决策，
+    本轮只记录结论：`image` 的 OCR 负责"文档截图里的字"，不负责"看懂图表"。附件
+    （xlsx/docx/pptx/mp3）解析不是瓶颈（带附件条目 78.8% > 纯文本 68.3%），本轮未改。换模型
+    （`deepseek-v4-pro`）的收益已由前面的配对探针量化，默认模型仍保持 flash，理由见上文。
+- **P3 度量**：suite 摘要增加任务口径——三次全过 / 至少一次 / 零通过（附任务清单）。trial
+  口径会把"1/3 通过"和"0/3 通过"混在一起，而这两类要修的东西完全不同。
+
+复跑与留证：
+
+```bash
+export http_proxy=http://127.0.0.1:1087 https_proxy=http://127.0.0.1:1087
+syscity eval run gaia_l1 --full --trials 3 --collect-badcases
+```
+
+`--collect-badcases` 把失败 trial 的输入、回复和工具轨迹落到 `evals/badcases/`（已 gitignore）；
+`--only <id>,<id>` 可以只跑摘要里列出的零通过/抖动题做快速回归。**先读任务口径，再读 trial
+口径**：任务口径回答"整份套件能解多少"，trial 口径回答"一次运行有多稳"。
 
 **验收**：`syscity eval run gaia_l1 --full --trials 3` 跑完，产出 pass rate 与逐条结果。
 

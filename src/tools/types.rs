@@ -396,6 +396,20 @@ impl ToolContext {
         self
     }
 
+    /// Add one variable to the environment handed to this context's commands.
+    ///
+    /// The shell tool clears the environment and re-adds only the allowlisted
+    /// names, so a variable set here is the *only* way a command such as `curl`
+    /// sees it (a proxy, for instance). Last write wins.
+    pub fn with_environment_var(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.sandbox.environment.insert(key.into(), value.into());
+        self
+    }
+
     /// Set workspace-only mode (restrict file ops to workspace_root)
     pub fn with_workspace_only(mut self, enabled: bool) -> Self {
         self.sandbox.workspace_only = enabled;

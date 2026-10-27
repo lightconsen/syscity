@@ -24,6 +24,34 @@ fn tool_mutates_filesystem(name: &str) -> bool {
 const NOT_EXECUTED_NOTE: &str = "[Not executed — provide your final answer now \
                                  using results already gathered.]";
 
+/// Fraction of the tool-iteration budget after which every subsequent tool
+/// batch carries a "converge now" reminder.
+///
+/// Multi-step research tasks routinely spend their last third of the budget on
+/// exploration they cannot finish; the reminder is a nudge, not a hard stop —
+/// the hard stop remains `increment_tool_iteration`.
+const BUDGET_REMINDER_AT_PERCENT: usize = 70;
+
+/// The reminder appended to the last tool result of a batch, when the agent has
+/// spent [`BUDGET_REMINDER_AT_PERCENT`] of its tool-iteration budget.
+fn budget_reminder(context: &Context) -> Option<String> {
+    let max = context.max_tool_iterations();
+    if max == 0 {
+        return None;
+    }
+    let used = context.tool_iterations();
+    if used * 100 < max * BUDGET_REMINDER_AT_PERCENT {
+        return None;
+    }
+    let left = max.saturating_sub(used);
+    Some(format!(
+        "\n\n[Tool budget: {used} of {max} calls used, {left} left. Stop opening new lines of \
+         investigation. Consolidate what you already have, verify only the specific fact you \
+         still need, and deliver the final answer — in the exact format the user's message \
+         asked for.]"
+    ))
+}
+
 impl Agent {
     /// Handle tool calls from the LLM
     pub(crate) async fn handle_tool_calls(
@@ -50,7 +78,8 @@ impl Agent {
             pending_assistant.tool_calls = Some(tool_calls.to_vec());
 
             let not_executed = "[Not executed — tool-iteration budget exhausted. Provide your \
-                                final answer now using results already gathered.]";
+                                final answer now using results already gathered, in the format \
+                                the user's message asked for.]";
             let mut batch = Vec::with_capacity(1 + tool_calls.len());
             batch.push(pending_assistant);
             for call in tool_calls {
@@ -187,6 +216,13 @@ impl Agent {
             results.push(result);
         }
 
+        // Soft budget reminder, carried on the last result of the batch.
+        if let Some(note) = budget_reminder(context) {
+            if let Some(last) = results.last_mut() {
+                last.content.push_str(&note);
+            }
+        }
+
         // NOW add assistant message with ONLY non-duplicate tool calls,
         // immediately followed by tool results as a single atomic batch.
         // This prevents prune_if_needed() from removing the assistant before
@@ -270,7 +306,8 @@ impl Agent {
             pending_assistant.tool_calls = Some(tool_calls.to_vec());
 
             let not_executed = "[Not executed — tool-iteration budget exhausted. Provide your \
-                                final answer now using results already gathered.]";
+                                final answer now using results already gathered, in the format \
+                                the user's message asked for.]";
             let mut batch = Vec::with_capacity(1 + tool_calls.len());
             batch.push(pending_assistant);
             for call in tool_calls {
@@ -463,6 +500,13 @@ impl Agent {
             .iter()
             .map(|r| (r.tool_call_id.clone(), r.content.clone()))
             .collect();
+
+        // Soft budget reminder, carried on the last result of the batch.
+        if let Some(note) = budget_reminder(context) {
+            if let Some(last) = results.last_mut() {
+                last.content.push_str(&note);
+            }
+        }
 
         // NOW add assistant message with ONLY non-duplicate tool calls,
         // immediately followed by tool results as a single atomic batch.

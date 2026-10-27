@@ -35,13 +35,23 @@ use crate::tools::sdk::ToolCapabilities;
 /// Maximum content size to fetch (100KB)
 const MAX_CONTENT_SIZE: usize = 100 * 1024;
 
-/// Default timeout for web requests
-const WEB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Default timeout for web requests.
+///
+/// 30s rather than 15s: at 15s, archive.org-style slow hosts and proxied
+/// requests were timing out on real benchmark runs (`curl` exit 28 in four
+/// GAIA trials), and every one of those was a lost trial rather than a wrong
+/// answer.
+const WEB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Per-provider request timeout. Each provider gets a strict, shorter budget
 /// so that a fallback chain has time to try more than one backend before the
 /// tool-level wrapper times out.
-const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One retry for a transient failure (transport error, 429, or a 5xx) before
+/// the provider chain moves on. Backoff is linear and short — the tool-level
+/// budget, not this retry, is what bounds total latency.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maximum number of redirects [`WebFetchTool`] follows manually.
 ///
@@ -237,6 +247,38 @@ impl WebFetchTool {
         self
     }
 
+    /// GET a URL, retrying once on a transport error, 429, or 5xx.
+    ///
+    /// The retry is deliberately narrow: a 404 or a connection refused is a
+    /// fact about the URL, not noise, and retrying it only spends the tool
+    /// budget. A dropped connection or an exhausted rate limit is noise.
+    async fn get_with_retry(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        for attempt in 0..=1u32 {
+            match self.client.get(url.clone()).send().await {
+                Ok(response) if attempt == 0 && Self::is_transient_status(response.status()) => {
+                    debug!("Transient HTTP {} from {}, retrying once", response.status(), url);
+                    drop(response);
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == 0 => {
+                    debug!("Transient transport error from {}: {}; retrying once", url, error);
+                }
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(RETRY_BACKOFF).await;
+        }
+        // Unreachable in practice: every path above returns or retries once.
+        self.client.get(url.clone()).send().await
+    }
+
+    /// Statuses worth one retry: rate limiting and server-side failures.
+    fn is_transient_status(status: reqwest::StatusCode) -> bool {
+        status.as_u16() == 429 || status.is_server_error()
+    }
+
     /// True for the redirect statuses this tool follows (301/302/303/307/308).
     ///
     /// Deliberately excludes other 3xx statuses such as 300 and 304, which
@@ -364,7 +406,7 @@ impl Tool for WebFetchTool {
                 ));
             }
 
-            let response = match self.client.get(current.clone()).send().await {
+            let response = match self.get_with_retry(&current).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!("Failed to fetch URL: {}", e);
@@ -445,7 +487,21 @@ impl Tool for WebFetchTool {
         };
 
         // Truncate if needed
-        let truncated = Self::truncate_content(final_content);
+        let mut truncated = Self::truncate_content(final_content);
+
+        // A JS-rendered page arrives as a shell: plenty of HTML, almost no
+        // text. Say so, and point at the tool that can render it, rather than
+        // let the model conclude the page said nothing.
+        if Self::is_html(content_type.as_deref())
+            && bytes.len() > 2_000
+            && truncated.trim().chars().count() < 400
+        {
+            truncated.push_str(
+                "\n\n[This page returned almost no readable text from its raw HTML — it most \
+                 likely renders its content with JavaScript. Use the `browser` tool to load \
+                 and read it.]",
+            );
+        }
 
         info!(
             "Fetched {} bytes from {} (HTTP {}, {} redirect hop(s))",
@@ -484,6 +540,51 @@ impl Tool for WebFetchTool {
     }
 }
 
+/// How much work a search provider should do.
+///
+/// `Basic` is the default: one round-trip and snippets. `Advanced` asks
+/// providers that support it for full page text (`Tavily`: `search_depth:
+/// advanced` + `include_raw_content`), so a single search call can answer a
+/// question that would otherwise need a follow-up fetch. It costs more tokens
+/// per call, which is why it is opt-in per invocation rather than the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchDepth {
+    #[default]
+    Basic,
+    Advanced,
+}
+
+impl SearchDepth {
+    fn parse(value: Option<&serde_json::Value>) -> Self {
+        match value.and_then(|v| v.as_str()).map(str::trim) {
+            Some("advanced") => Self::Advanced,
+            _ => Self::Basic,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Advanced => "advanced",
+        }
+    }
+}
+
+/// Per-page text budget when `fetch_top` asks the search tool to read pages.
+/// Enough for an article body; several pages ride in one tool result, so the
+/// cap keeps a single result from crowding out the rest of the context.
+const FETCHED_PAGE_CHARS: usize = 8_000;
+
+/// Cut `text` to at most `max` characters, appending a marker when it had to.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max).collect();
+    cut.push_str("\n… [truncated]");
+    cut
+}
+
 /// Web search tool
 #[derive(Debug)]
 pub struct WebSearchTool {
@@ -496,6 +597,9 @@ pub struct WebSearchTool {
     /// Secret-store handle for the cloud search provider's session token.
     /// `None` until wired by the gateway (`with_secrets`).
     secrets: Option<std::sync::Arc<crate::secrets::SecretStoreHandle>>,
+    /// SSRF policy applied to pages read by `fetch_top`. Mirrors the
+    /// `WebFetchTool` policy so both tools accept the same URLs.
+    fetch_policy: NavigationPolicy,
 }
 
 /// Search provider configuration
@@ -577,6 +681,7 @@ impl Default for WebSearchTool {
                 SearchProvider::DuckDuckGo,
             ])),
             secrets: None,
+            fetch_policy: NavigationPolicy::default(),
         }
     }
 }
@@ -623,6 +728,15 @@ impl WebSearchTool {
         self.secrets = Some(secrets);
         self
     }
+
+    /// Override the SSRF policy for pages read by `fetch_top`.
+    ///
+    /// Set this alongside the `WebFetchTool` policy so both tools accept the
+    /// same URLs; the default is the restrictive public-only policy.
+    pub fn with_fetch_policy(mut self, policy: NavigationPolicy) -> Self {
+        self.fetch_policy = policy;
+        self
+    }
 }
 
 /// Return a human-readable provider name for logging.
@@ -643,6 +757,55 @@ fn provider_name(provider: &SearchProvider) -> &'static str {
 }
 
 impl WebSearchTool {
+    /// Read the top `count` result pages concurrently and format them for the
+    /// search response.
+    ///
+    /// Per-page failures are non-fatal: a dead link still leaves the other
+    /// pages readable, and the snippet list above already covers it. Reuses
+    /// `WebFetchTool`, so the SSRF guard, redirect walking and HTML-to-markdown
+    /// conversion are identical to a plain `web_fetch` call.
+    async fn fetch_top_pages(
+        &self,
+        results: &[SearchResult],
+        count: usize,
+        context: &ToolContext,
+    ) -> String {
+        let fetcher = WebFetchTool::new().with_navigation_policy(self.fetch_policy.clone());
+        let pages = results.iter().take(count).map(|result| {
+            let fetcher = &fetcher;
+            async move {
+                let args = serde_json::json!({ "url": result.url });
+                match fetcher.execute(args, context).await {
+                    Ok(exec) if exec.success && !exec.output.trim().is_empty() => Some(format!(
+                        "### {}\n{}\n\n{}",
+                        result.url,
+                        result.title,
+                        truncate_chars(exec.output.trim(), FETCHED_PAGE_CHARS)
+                    )),
+                    Ok(exec) => {
+                        debug!(
+                            "fetch_top: {} produced no text: {}",
+                            result.url,
+                            exec.error.unwrap_or_else(|| "empty page".to_string())
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        debug!("fetch_top: {} failed: {}", result.url, e);
+                        None
+                    }
+                }
+            }
+        });
+
+        futures::future::join_all(pages)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Execute a search against a single provider.
     /// Each provider request is wrapped with its own timeout so that a slow
     /// backend does not consume the entire tool-level budget.
@@ -651,6 +814,7 @@ impl WebSearchTool {
         provider: &SearchProvider,
         query: &str,
         limit: usize,
+        depth: SearchDepth,
     ) -> crate::Result<Vec<SearchResult>> {
         let provider_name = provider_name(provider);
         let start = std::time::Instant::now();
@@ -659,7 +823,7 @@ impl WebSearchTool {
                 SearchProvider::DuckDuckGo => self.search_duckduckgo(query, limit).await,
                 SearchProvider::Brave { api_key } => self.search_brave(api_key, query, limit).await,
                 SearchProvider::Tavily { api_key } => {
-                    self.search_tavily(api_key, query, limit).await
+                    self.search_tavily(api_key, query, limit, depth).await
                 }
                 SearchProvider::SerpApi { api_key } => {
                     self.search_serpapi(api_key, query, limit).await
@@ -954,15 +1118,21 @@ impl WebSearchTool {
         api_key: &str,
         query: &str,
         limit: usize,
+        depth: SearchDepth,
     ) -> crate::Result<Vec<SearchResult>> {
         let start = std::time::Instant::now();
-        debug!("Tavily search starting for query: {}", query);
+        debug!("Tavily search starting for query: {} (depth {:?})", query, depth);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "query": query,
-            "search_depth": "basic",
+            "search_depth": depth.as_str(),
             "max_results": limit.min(20),
         });
+        if depth == SearchDepth::Advanced {
+            // Full page text in the response: the point of an advanced search
+            // is to save the follow-up `web_fetch` round-trip.
+            body["include_raw_content"] = serde_json::json!(true);
+        }
 
         let request_start = std::time::Instant::now();
         let response = self
@@ -995,10 +1165,18 @@ impl WebSearchTool {
         let mut results = Vec::new();
         if let Some(items) = data["results"].as_array() {
             for item in items.iter().take(limit) {
+                // Advanced depth asks for the page text; a short "snippet" is
+                // precisely what an advanced search exists to avoid.
+                let text = match (depth, item["raw_content"].as_str()) {
+                    (SearchDepth::Advanced, Some(raw)) if !raw.trim().is_empty() => {
+                        truncate_chars(raw.trim(), FETCHED_PAGE_CHARS)
+                    }
+                    _ => item["content"].as_str().unwrap_or("").to_string(),
+                };
                 results.push(SearchResult {
                     title: item["title"].as_str().unwrap_or("").to_string(),
                     url: item["url"].as_str().unwrap_or("").to_string(),
-                    snippet: item["content"].as_str().unwrap_or("").to_string(),
+                    snippet: text,
                 });
             }
         }
@@ -1463,7 +1641,9 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Returns a list of search results."
+        "Search the web for information. Returns a list of search results with titles, URLs and \
+         snippets. Set fetch_top to have the top results' pages read and included in the same \
+         response — one call instead of search-then-fetch."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1476,8 +1656,23 @@ impl Tool for WebSearchTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results (default: 5, max: 10)",
+                    "description": "Maximum number of results (default: 5, max: 20)",
                     "default": 5
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["basic", "advanced"],
+                    "description": "Search effort. 'advanced' asks the provider for full page \
+                                    text where supported (slower, more tokens, more detail). \
+                                    Default: basic",
+                    "default": "basic"
+                },
+                "fetch_top": {
+                    "type": "integer",
+                    "description": "After searching, fetch the top N result pages and include \
+                                    their text (default: 0, max: 5). Use when snippets alone \
+                                    cannot answer the question.",
+                    "default": 0
                 }
             }),
             vec!["query"],
@@ -1497,7 +1692,7 @@ impl Tool for WebSearchTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let query = args["query"].as_str().ok_or_else(|| {
             crate::error::SyscityError::Validation("Missing 'query' argument".to_string())
@@ -1507,7 +1702,13 @@ impl Tool for WebSearchTool {
             .as_u64()
             .map(|l| l as usize)
             .unwrap_or(5)
-            .clamp(1, 10);
+            .clamp(1, 20);
+        let depth = SearchDepth::parse(args.get("depth"));
+        let fetch_top = args["fetch_top"]
+            .as_u64()
+            .map(|n| n as usize)
+            .unwrap_or(0)
+            .clamp(0, 5);
 
         if query.len() > 500 {
             return Ok(ToolExecutionResult::error(
@@ -1543,7 +1744,10 @@ impl Tool for WebSearchTool {
             }
 
             info!("Trying provider {} ({}): {}", idx + 1, providers.len(), provider_name);
-            match self.search_with_provider(provider, query, limit).await {
+            match self
+                .search_with_provider(provider, query, limit, depth)
+                .await
+            {
                 Ok(results) if !results.is_empty() => {
                     if idx > 0 {
                         info!(
@@ -1561,7 +1765,14 @@ impl Tool for WebSearchTool {
                         })
                         .collect();
 
-                    let output = formatted.join("\n\n");
+                    let mut output = formatted.join("\n\n");
+                    if fetch_top > 0 {
+                        let fetched = self.fetch_top_pages(&results, fetch_top, context).await;
+                        if !fetched.is_empty() {
+                            output.push_str("\n\n## Page contents\n\n");
+                            output.push_str(&fetched);
+                        }
+                    }
                     debug!("Formatted search results in {:?}", format_start.elapsed());
                     info!(
                         "web_search completed in {:?} with {} results from {}",
@@ -1646,6 +1857,27 @@ mod tests {
     /// Canned per-path raw HTTP responses served by [`spawn_http_server`].
     type Routes = std::collections::HashMap<String, String>;
 
+    /// Recompute `Content-Length` after `{port}` substitution resized the body.
+    fn fix_content_length(response: String) -> String {
+        let Some(head_end) = response.find("\r\n\r\n") else {
+            return response;
+        };
+        let (head, body) = response.split_at(head_end + 4);
+        let body_len = body.len();
+        let mut fixed = String::with_capacity(response.len());
+        for line in head.trim_end_matches("\r\n").split("\r\n") {
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                fixed.push_str(&format!("Content-Length: {body_len}"));
+            } else {
+                fixed.push_str(line);
+            }
+            fixed.push_str("\r\n");
+        }
+        fixed.push_str("\r\n");
+        fixed.push_str(body);
+        fixed
+    }
+
     /// Build a raw HTTP/1.1 response with correct Content-Length.
     fn http_response(status_line: &str, headers: &[(&str, &str)], body: &str) -> String {
         let mut response = format!("{status_line}\r\n");
@@ -1712,6 +1944,7 @@ mod tests {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         });
         let response = response.replace("{port}", &port.to_string());
+        let response = fix_content_length(response);
         if let Err(err) = socket.write_all(response.as_bytes()).await {
             debug!("test server write failed: {}", err);
         }
@@ -1779,6 +2012,42 @@ mod tests {
         assert_eq!(results[0].title, "Test Title");
         assert_eq!(results[0].url, "http://example.com");
         assert_eq!(results[0].snippet, "Test snippet here");
+    }
+
+    #[test]
+    fn test_search_depth_parse() {
+        assert_eq!(SearchDepth::parse(None), SearchDepth::Basic);
+        assert_eq!(SearchDepth::parse(Some(&serde_json::json!("advanced"))), SearchDepth::Advanced);
+        // Surrounding whitespace from a model-composed argument is harmless.
+        assert_eq!(
+            SearchDepth::parse(Some(&serde_json::json!(" advanced "))),
+            SearchDepth::Advanced
+        );
+        assert_eq!(SearchDepth::parse(Some(&serde_json::json!("deep"))), SearchDepth::Basic);
+        assert_eq!(SearchDepth::parse(Some(&serde_json::json!(3))), SearchDepth::Basic);
+        assert_eq!(SearchDepth::Basic.as_str(), "basic");
+        assert_eq!(SearchDepth::Advanced.as_str(), "advanced");
+    }
+
+    #[test]
+    fn test_truncate_chars_is_char_boundary_safe() {
+        let text = "é".repeat(10);
+        assert_eq!(truncate_chars(&text, 20), text);
+        let cut = truncate_chars(&text, 4);
+        assert!(cut.starts_with("éééé\n"));
+        assert!(cut.contains("[truncated]"));
+    }
+
+    #[test]
+    fn test_search_schema_advertises_depth_and_fetch_top() {
+        let schema = WebSearchTool::new().parameters_schema();
+        let properties = &schema["properties"];
+        assert!(properties["depth"]["enum"].is_array());
+        assert!(properties["fetch_top"].is_object());
+        assert!(properties["limit"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max: 20"));
     }
 
     #[test]
@@ -2157,5 +2426,78 @@ mod tests {
         let data = result.data.unwrap();
         assert_eq!(data["code"], "AMBIGUOUS");
         assert_eq!(data["attempts"].as_array().unwrap().len(), 2);
+    }
+
+    // ── Search: fetch_top page reading ──────────────────────────────────────
+
+    /// A search provider plus the page it points at, both served locally.
+    async fn fetch_top_server() -> u16 {
+        let port = spawn_http_server(
+            [
+                (
+                    "/search".to_string(),
+                    http_response(
+                        "HTTP/1.1 200 OK",
+                        &[("Content-Type", "application/json")],
+                        r#"{"results":[{"title":"Local Page","url":"http://127.0.0.1:{port}/page","snippet":"a snippet"}]}"#,
+                    ),
+                ),
+                (
+                    "/page".to_string(),
+                    http_response(
+                        "HTTP/1.1 200 OK",
+                        &[("Content-Type", "text/html; charset=utf-8")],
+                        "<html><body><h1>Report</h1><p>The distinctive body sentence.</p></body></html>",
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+        port
+    }
+
+    fn local_search_tool(port: u16) -> WebSearchTool {
+        WebSearchTool::new()
+            .with_provider(SearchProvider::Custom {
+                url: format!("http://127.0.0.1:{port}/search?q={{query}}"),
+                api_key: None,
+                headers: None,
+                result_parser: None,
+            })
+            .with_fetch_policy(NavigationPolicy::permissive())
+    }
+
+    #[tokio::test]
+    async fn search_fetch_top_includes_page_text() {
+        let port = fetch_top_server().await;
+        let result = local_search_tool(port)
+            .execute(
+                serde_json::json!({ "query": "syscity", "fetch_top": 1 }),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got {:?}", result.error);
+        assert!(result.output.contains("Local Page"), "snippet list missing");
+        assert!(result.output.contains("## Page contents"), "page section missing");
+        assert!(
+            result.output.contains("The distinctive body sentence."),
+            "page text missing: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn search_without_fetch_top_skips_page_fetch() {
+        let port = fetch_top_server().await;
+        let result = local_search_tool(port)
+            .execute(serde_json::json!({ "query": "syscity" }), &ToolContext::default())
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got {:?}", result.error);
+        assert!(!result.output.contains("## Page contents"));
+        assert!(!result.output.contains("The distinctive body sentence."));
     }
 }

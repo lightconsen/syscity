@@ -52,6 +52,16 @@ pub struct AgentConfig {
     #[serde(default)]
     pub execution_backends:
         std::collections::HashMap<String, crate::gateway::config::ExecutionBackendConfig>,
+    /// Extra environment variables handed to this agent's command tools.
+    ///
+    /// The shell tool runs with a cleared environment plus a fixed allowlist
+    /// (`PATH`, `HOME`, …); nothing here is inherited from the gateway process.
+    /// A deployment that reaches the network through a proxy (or an evaluation
+    /// harness that wants `curl` to take the same route as `web_fetch`) sets
+    /// the variables here. Empty by default, so behaviour is unchanged unless
+    /// configured.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub tool_environment: std::collections::HashMap<String, String>,
     /// Model to use for LLM-powered context compaction.
     ///
     /// When `None`, the agent's primary model is used.  Set to a cheaper/faster
@@ -140,6 +150,7 @@ Use rich formatting for lists, structured data, and technical content:
             fence_network: false,
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             execution_backends: std::collections::HashMap::new(),
+            tool_environment: std::collections::HashMap::new(),
             heartbeat: None,
             agent_id: None,
             reflection_config: None,

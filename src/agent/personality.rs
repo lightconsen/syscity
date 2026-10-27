@@ -374,6 +374,7 @@ impl AgentPersonality {
             // `fence_network`.
             fence_namespaces: crate::tools::process_runner::NamespacePosture::Auto,
             execution_backends: std::collections::HashMap::new(),
+            tool_environment: std::collections::HashMap::new(),
             heartbeat: None,
             agent_id: None,
             reflection_config: None,

@@ -161,8 +161,14 @@ pub async fn run_suite(
 
     // Eval-only tool-iteration budget (改动2): give multi-step eval tasks enough
     // tool budget to actually finish; overridable via the env var at launch.
+    //
+    // 60 rather than 30: on the GAIA L1 baseline six trials hit the old cap and
+    // five of them lost, and the failures were mid-chain (search → fetch →
+    // search), not runaway loops. The agent also gets a "converge now" reminder
+    // at 70% of the budget (`agent/engine/tools.rs`), so a larger cap does not
+    // mean a larger spend for tasks that finish early.
     if std::env::var("SYSCITY_MAX_TOOL_ITERATIONS").is_err() {
-        std::env::set_var("SYSCITY_MAX_TOOL_ITERATIONS", "30");
+        std::env::set_var("SYSCITY_MAX_TOOL_ITERATIONS", "60");
     }
 
     println!("\n═══ Eval Suite: {} ═══", suite.name);
@@ -279,15 +285,43 @@ pub async fn run_suite(
     // multi-step summaries aren't truncated mid-sentence (judge measures
     // capability, not the 2048-token default). Production default unchanged.
     agent_config.max_tokens = 8192;
-    agent_config.system_prompt.push_str(
-        "\n\n## Tool Usage Guidelines\n\n\
-         Always prefer using dedicated tools over shell commands. \
-         Each tool is purpose-built for its specific task. When a dedicated \
-         tool exists for what the user is asking, use it instead of the shell. \
-         For example: use 'pdf' for PDF generation, 'image' for image viewing, \
-         'image_generate' for image creation, 'tts' for text-to-speech, \
-         'stt' for transcription, and 'browser' for web automation.",
-    );
+    // Sampling is off in evaluation. On the GAIA L1 baseline 16 of 53 tasks
+    // passed some trials but not all; that flakiness is the largest source of
+    // lost points, and factual question answering gains nothing from sampling
+    // diversity. Production agents keep their configured temperature.
+    agent_config.temperature = 0.0;
+    // The registry is both the permission boundary and the only tool list the
+    // model is given, so the guidance must be generated from it. It used to
+    // name tools this registry never registers (`pdf`, `image`,
+    // `image_generate`, `tts`, `stt`), which pointed the agent at tools that do
+    // not exist in an eval run.
+    let available_tools = tool_registry.list().join(", ");
+    agent_config.system_prompt.push_str(&format!(
+        "\n\n## Evaluation Run\n\n\
+         The tools available in this run are: {available_tools}.\n\n\
+         Those are the only tools; do not call any other name.\n\
+         For web pages prefer `web_fetch` / `web_search` over `curl` in the shell: \
+         the shell runs with a restricted environment and may not reach the network.\n\
+         You have a limited tool-call budget. Once the evidence you have supports an \
+         answer, stop searching and answer.\n\
+         If the task specifies a final-answer format, follow it exactly."
+    ));
+    // Hand the eval agent the same proxy this process uses. The shell tool
+    // clears its environment, so without this a `curl` inside a trial cannot
+    // reach hosts that are only reachable through the proxy while `web_fetch`
+    // (in-process) can — an environment bias, not a capability difference.
+    for key in [
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            agent_config.tool_environment.insert(key.to_string(), value);
+        }
+    }
 
     let agent = Arc::new(Agent::new(agent_config, provider.clone(), tool_registry.clone()));
 
@@ -434,6 +468,13 @@ pub async fn run_suite(
     let mut suite_completion_tokens: u64 = 0;
     let mut trials_with_usage = 0usize;
     let mut ledger_failed_tasks: Vec<String> = Vec::new();
+    // Task-level outcomes. The trial rate hides reliability: a task that
+    // passes 1 of 3 trials looks like 33% on the trial axis but is a
+    // different problem from a task that never passes at all.
+    let mut tasks_all_passed: Vec<String> = Vec::new();
+    let mut tasks_any_passed: Vec<String> = Vec::new();
+    let mut tasks_zero_passed: Vec<String> = Vec::new();
+    let mut tasks_run = 0usize;
 
     for task in &tasks_to_run {
         println!("── Task: {} — {} ──", task.id, task.description);
@@ -523,6 +564,16 @@ pub async fn run_suite(
                 total_trials += summary.total_trials;
                 total_passed += (summary.pass_rate * summary.total_trials as f64).round() as usize;
 
+                tasks_run += 1;
+                if summary.at_least_once_success {
+                    tasks_any_passed.push(task.id.clone());
+                    if summary.continuous_success {
+                        tasks_all_passed.push(task.id.clone());
+                    }
+                } else {
+                    tasks_zero_passed.push(task.id.clone());
+                }
+
                 // Cost axis: accumulate executor-token spend across trials.
                 for trial in &summary.per_trial {
                     if let Some(tu) = &trial.token_usage {
@@ -561,6 +612,30 @@ pub async fn run_suite(
     println!("  Overall pass rate: {:.1}%", overall_pass_rate * 100.0);
     println!("  Total trials:      {}", total_trials);
     println!("  Total passed:      {}", total_passed);
+    if tasks_run > 0 {
+        // Trial rate answers "how often does a run pass"; the task split
+        // answers "how much of the suite do we solve at all". The gap between
+        // the two is flakiness, which is where reliability work pays off.
+        println!(
+            "  Tasks all trials:  {}/{} ({:.1}%)",
+            tasks_all_passed.len(),
+            tasks_run,
+            tasks_all_passed.len() as f64 / tasks_run as f64 * 100.0
+        );
+        println!(
+            "  Tasks any trial:   {}/{} ({:.1}%)",
+            tasks_any_passed.len(),
+            tasks_run,
+            tasks_any_passed.len() as f64 / tasks_run as f64 * 100.0
+        );
+        if !tasks_zero_passed.is_empty() {
+            println!(
+                "  Tasks zero-pass:   {} — {}",
+                tasks_zero_passed.len(),
+                tasks_zero_passed.join(", ")
+            );
+        }
+    }
     println!("  Min required:      {:.0}%", suite.min_pass_rate * 100.0);
     println!("  Result:            {}", if gate_passed { "PASS" } else { "FAIL" });
     if trials_with_usage > 0 {

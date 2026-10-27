@@ -17,8 +17,36 @@ if no section matches, the release falls back to auto-generated notes.
   eval harness, with a first 53-task × 3-trial baseline of 70.4% (112/159) recorded
   in `evals/ledger.md`. See `docs/benchmark.md` §M2 for the method and the failure
   breakdown.
+- **`web_search` can read the pages it finds.** `fetch_top: N` fetches the top N
+  results in the same call (through `web_fetch`, so the SSRF guard applies), and
+  `depth: "advanced"` asks the provider for full page text where supported
+  (Tavily `search_depth` + `include_raw_content`). The result cap moves from 10
+  to 20.
+- **`image` reads text out of images** via the local RapidOCR models when the
+  `vision` feature is on: the tool now returns recognized text in reading order
+  alongside the existing metadata, instead of dimensions only. The OCR models are
+  resolved on their own, without pulling the OmniParser detector.
+- **OCR decodes with the model's own dictionary.** The recognition model emits
+  class indices, so the english PP-OCRv3 dictionary is downloaded and pinned to
+  the model; a class count that does not match it is an error, not a guess.
+  Detection boxes expand by `ratio·area/perimeter` (the standard DBNet unclip)
+  and long lines are no longer squeezed into a 1600 px recognition input, which
+  is what made dense document screenshots read as fragments.
+- **Suite summaries report task-level outcomes**: all trials passed / at least one
+  / zero, with the zero-pass task ids listed. Trial-level rates hide flakiness.
+- **Eval runs inherit the caller's proxy** through the new
+  `AgentConfig.tool_environment`, so shell `curl` in an eval can reach sites that
+  need it.
 
 ### Changed
+
+- **Eval runs are deterministic and less budget-bound**: temperature 0.0 (was
+  0.7), 60 tool iterations (was 30) with a soft "wrap up" reminder at 70%, and a
+  system prompt built from the registered tool list (it previously named five
+  tools that were not registered).
+- **`web_fetch` retries transient failures once** and tells the model when a page
+  looks JavaScript-rendered, instead of returning an empty body as if the page
+  had nothing to say.
 
 - **MSRV is now Rust 1.97** (was 1.95), required by wasmtime 50. `Cargo.toml`,
   `rust-toolchain.toml`, the CI workflows, the CI Dockerfile, `README.md` and

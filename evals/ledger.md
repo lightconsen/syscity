@@ -10,6 +10,7 @@ compare against this ledger, not memory. See `docs/harness.md` §8.
 | Date | Commit | Suite | Executor | Judge | Mode | Passed | Rate | Gate | Failed tasks |
 |------|--------|-------|----------|-------|------|--------|------|------|--------------|
 | 2026-10-27 02:25 | cc03c7b7 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | full | 112/159 | 70.4% | PASS | gaia_l1_0383a3ee, gaia_l1_1f975693, gaia_l1_23dd907f, gaia_l1_305ac316, gaia_l1_3cef3a44, gaia_l1_46719c30, gaia_l1_4b650a35, gaia_l1_4b6bb5f7, gaia_l1_5d0080c… |
+| 2026-10-27 10:55 | 448bd3d8 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:2 | 1/2 | 50.0% | PASS | gaia_l1_9318445f |
 
 ## 外部基准（benchmark）
 

@@ -47,9 +47,11 @@ impl Tool for ImageTool {
     }
 
     fn description(&self) -> &str {
-        "View or inspect image file information — dimensions, format, file size, metadata. \
-         Use this tool when the user asks to view, check, read, or inspect images (查看/读取图片信息). \
-         Supports common formats: PNG, JPG, GIF, WebP, SVG."
+        "View an image file: dimensions, format, file size, and — when the build supports it — \
+         the text found in the image via local OCR, in reading order. Use this tool when the \
+         user asks to view, read, or inspect an image, or when an answer depends on what an \
+         image or screenshot says (查看/读取图片内容). Supports common formats: PNG, JPG, GIF, \
+         WebP, BMP, TIFF. OCR reads text only; it does not describe pictures or photos."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -167,7 +169,69 @@ impl Tool for ImageTool {
             }
         }
 
-        let info = serde_json::json!({
+        let dim_str = match (width, height) {
+            (Some(w), Some(h)) => format!("{}x{}", w, h),
+            _ => "unknown dimensions".to_string(),
+        };
+
+        let mut output = format!(
+            "{} image: {} ({} bytes, {})",
+            format,
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            file_size,
+            dim_str
+        );
+
+        // Text extraction is the only way this tool answers a question about
+        // an image's contents: the model has no pixel channel for tool
+        // results. Run it here rather than making the agent hunt for an OCR
+        // utility it cannot install.
+        #[cfg(feature = "vision")]
+        let ocr_text: Option<String> =
+            match crate::computer::vision::ocr_file::ocr_image_file(&path).await {
+                Ok(ocr) if !ocr.text.trim().is_empty() => {
+                    let text = truncate_ocr(ocr.text.trim());
+                    output.push_str("\n\nText found in the image (OCR, reading order):\n");
+                    output.push_str(&text);
+                    if !ocr.is_reliable() {
+                        // Low-confidence OCR on a busy page produces plausible
+                        // fragments in the wrong order. Say so, or the model
+                        // will treat them as quoted evidence.
+                        output.push_str(&format!(
+                            "\n\n[OCR confidence is low ({:.0}% mean over {} block(s)); treat \
+                             this text as a rough hint, not as quoted content. Verify anything \
+                             you rely on.]",
+                            ocr.mean_confidence * 100.0,
+                            ocr.blocks
+                        ));
+                    }
+                    Some(text)
+                }
+                Ok(_) => {
+                    output.push_str(
+                        "\n\nOCR ran and found no text in this image. It may be a photo, diagram, \
+                     or picture without machine-readable text — reason about it from other \
+                     evidence instead.",
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("OCR failed for {}: {}", path.display(), e);
+                    output.push_str(
+                        "\n\nText extraction (OCR) is unavailable for this image; only file \
+                     metadata is reported.",
+                    );
+                    None
+                }
+            };
+
+        #[cfg(not(feature = "vision"))]
+        let ocr_text: Option<String> = {
+            output.push_str("\n\nThis build has no OCR support; only file metadata is reported.");
+            None
+        };
+
+        let mut info = serde_json::json!({
             "path": path.to_string_lossy(),
             "format": format,
             "file_size": file_size,
@@ -175,26 +239,33 @@ impl Tool for ImageTool {
             "width": width,
             "height": height,
         });
-
-        let dim_str = match (width, height) {
-            (Some(w), Some(h)) => format!("{}x{}", w, h),
-            _ => "unknown dimensions".to_string(),
-        };
+        if let Some(text) = &ocr_text {
+            info["text"] = serde_json::json!(text);
+        }
 
         Ok(ToolExecutionResult {
             success: true,
-            output: format!(
-                "{} image: {} ({} bytes, {})",
-                format,
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                file_size,
-                dim_str
-            ),
+            output,
             error: None,
             data: Some(info),
             execution_time: start.elapsed(),
         })
     }
+}
+
+/// OCR text is model input, so it is capped like any other tool output.
+#[cfg(feature = "vision")]
+const MAX_OCR_CHARS: usize = 20_000;
+
+/// Cap OCR text at [`MAX_OCR_CHARS`], keeping the beginning.
+#[cfg(feature = "vision")]
+fn truncate_ocr(text: &str) -> String {
+    if text.chars().count() <= MAX_OCR_CHARS {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(MAX_OCR_CHARS).collect();
+    cut.push_str("\n… [OCR output truncated]");
+    cut
 }
 
 fn format_file_size(size: u64) -> String {

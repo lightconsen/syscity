@@ -6,10 +6,11 @@
 //!
 //! Model files required:
 //! - `det.onnx` — text detection (DBNet)
-//! - `rec.onnx` — text recognition (CRNN)
-//! - `cls.onnx` — optional direction classification
+//! - `rec_ppocrv3.onnx` — text recognition (SVTR/CRNN), PP-OCRv3 english
+//! - `rec_dict_ppocrv3.txt` — that model's character dictionary
 //!
-//! These can be downloaded from the RapidOCR releases or HuggingFace hub.
+//! These can be downloaded from the RapidOCR releases or HuggingFace hub;
+//! [`super::resolve_or_download_vision_models`] fetches them on first use.
 
 use super::{Rect, TextBlock};
 use crate::computer::types::Screenshot;
@@ -18,23 +19,23 @@ use crate::error::SyscityError;
 
 /// RapidOCR engine using ONNX Runtime.
 ///
-/// Loads three ONNX models and runs a full OCR pipeline:
+/// Loads two ONNX models and runs the OCR pipeline:
 /// 1. Detection — find text regions in the image
-/// 2. (Optional) Classification — correct text orientation
-/// 3. Recognition — read the characters in each region
+/// 2. Recognition — read the characters in each region
 #[derive(Debug)]
 pub struct RapidOcr {
     det_model: ort::session::Session,
     rec_model: ort::session::Session,
-    #[allow(dead_code)]
-    cls_model: Option<ort::session::Session>,
+    /// Character dictionary: output class `i` decodes to `dict[i - 1]`.
+    dict: Vec<char>,
     /// Detection threshold for the DBNet probability map.
     det_threshold: f32,
     /// Box expansion ratio (dilate detected boxes by this factor).
     box_expand: f32,
     /// Recognition model input height (CRNN typically uses 48).
     rec_height: u32,
-    /// Maximum recognition width.
+    /// Maximum recognition width. The model accepts a dynamic width, so this
+    /// only bounds the cost of a pathologically wide line.
     rec_max_width: u32,
     /// Minimum confidence for a text block to be included.
     min_confidence: f32,
@@ -46,8 +47,12 @@ impl RapidOcr {
     /// # Arguments
     /// * `det_path` — path to the detection ONNX model
     /// * `rec_path` — path to the recognition ONNX model
-    /// * `cls_path` — optional path to the classification ONNX model
-    pub fn new(det_path: &str, rec_path: &str, cls_path: Option<&str>) -> crate::Result<Self> {
+    /// * `dict_path` — path to the recognition model's character dictionary
+    ///
+    /// The dictionary is required: the recognition model emits class indices,
+    /// and decoding them with a guessed alphabet produces confident garbage.
+    pub fn new(det_path: &str, rec_path: &str, dict_path: &str) -> crate::Result<Self> {
+        let dict = Self::load_dict(dict_path)?;
         let env = super::ort_environment()?;
         let det_model = ort::session::Session::builder(env)
             .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
@@ -63,27 +68,18 @@ impl RapidOcr {
                 SyscityError::Internal(format!("Failed to load recognition model: {}", e))
             })?;
 
-        let cls_model = match cls_path {
-            Some(p) => Some(
-                ort::session::Session::builder(env)
-                    .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
-                    .commit_from_file(p)
-                    .map_err(|e| {
-                        SyscityError::Internal(format!("Failed to load cls model: {}", e))
-                    })?,
-            ),
-            None => None,
-        };
-
         Ok(Self {
             det_model,
             rec_model,
-            cls_model,
+            dict,
             det_threshold: 0.3,
             box_expand: 1.5,
             rec_height: 48,
-            rec_max_width: 320,
-            min_confidence: 0.5,
+            rec_max_width: 4096,
+            // Block confidence is detection × recognition, and a clean line
+            // often scores ~0.6–0.7 on the recognition side alone; 0.5 threw
+            // away readable text.
+            min_confidence: 0.3,
         })
     }
 
@@ -101,7 +97,11 @@ impl RapidOcr {
             .rec
             .to_str()
             .ok_or_else(|| SyscityError::Validation("rec model path is not valid UTF-8".into()))?;
-        Self::new(det, rec, paths.cls.as_ref().and_then(|p| p.to_str()))
+        let dict = paths
+            .rec_dict
+            .to_str()
+            .ok_or_else(|| SyscityError::Validation("dict path is not valid UTF-8".into()))?;
+        Self::new(det, rec, dict)
     }
 
     /// Set detection threshold (default 0.3).
@@ -116,7 +116,7 @@ impl RapidOcr {
         self
     }
 
-    /// Set minimum confidence for text blocks (default 0.5).
+    /// Set minimum confidence for text blocks (default 0.3).
     pub fn with_min_confidence(mut self, min: f32) -> Self {
         self.min_confidence = min;
         self
@@ -239,22 +239,29 @@ impl RapidOcr {
 
                 let avg_prob = sum_prob / count as f32;
 
-                // Scale back to original image coordinates
-                let x1 = (min_x as f32 * scale_x) as i32;
-                let y1 = (min_y as f32 * scale_y) as i32;
-                let x2 = ((max_x + 1) as f32 * scale_x) as i32;
-                let y2 = ((max_y + 1) as f32 * scale_y) as i32;
+                // Scale back to original image coordinates. DBNet predicts a
+                // region smaller than the glyphs, so unclip it — by
+                // `ratio * area / perimeter` on every side, the standard
+                // expansion. Scaling width and height by a factor instead
+                // stretches a long line sideways while leaving it too short
+                // vertically, and the recognition crop then cuts the glyphs.
+                let x1 = min_x as f32 * scale_x;
+                let y1 = min_y as f32 * scale_y;
+                let x2 = (max_x + 1) as f32 * scale_x;
+                let y2 = (max_y + 1) as f32 * scale_y;
+                let (w0, h0) = ((x2 - x1).max(1.0), (y2 - y1).max(1.0));
+                let pad = self.box_expand * (w0 * h0) / (2.0 * (w0 + h0));
 
-                let cx = (x1 + x2) / 2;
-                let cy = (y1 + y2) / 2;
-                let w = ((x2 - x1) as f32 * self.box_expand) as u32;
-                let h = ((y2 - y1) as f32 * self.box_expand) as u32;
+                let left = (x1 - pad).clamp(0.0, orig_w as f32);
+                let top = (y1 - pad).clamp(0.0, orig_h as f32);
+                let right = (x2 + pad).clamp(left + 1.0, orig_w as f32);
+                let bottom = (y2 + pad).clamp(top + 1.0, orig_h as f32);
 
                 let bounds = Rect::new(
-                    (cx - w as i32 / 2).max(0),
-                    (cy - h as i32 / 2).max(0),
-                    w.min(orig_w),
-                    h.min(orig_h),
+                    left as i32,
+                    top as i32,
+                    (right - left) as u32,
+                    (bottom - top) as u32,
                 );
 
                 boxes.push((bounds, avg_prob));
@@ -338,85 +345,119 @@ impl RapidOcr {
 
         // Maintain aspect ratio, resize to fixed height
         let scale = self.rec_height as f32 / crop_h as f32;
-        let new_w = ((crop_w as f32 * scale) as u32).clamp(1, self.rec_max_width);
+        let content_w = ((crop_w as f32 * scale) as u32).clamp(1, self.rec_max_width);
         let new_h = self.rec_height;
+        // Pad the width up to a multiple of 32: ONNX Runtime's handling of a
+        // free dynamic width depends on the build (the same tensor reads
+        // correctly under one onnxruntime and loses characters under
+        // another), while a stride-aligned width is handled identically
+        // everywhere. Padding is black, matching what PaddleOCR pads with.
+        let new_w = content_w.div_ceil(32) * 32;
 
-        let resized = crop.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+        let resized = crop.resize_exact(content_w, new_h, image::imageops::FilterType::Triangle);
+        let resized = if new_w > content_w {
+            let mut canvas = image::RgbImage::new(new_w, new_h);
+            image::imageops::replace(&mut canvas, &resized.to_rgb8(), 0, 0);
+            image::DynamicImage::ImageRgb8(canvas)
+        } else {
+            resized
+        };
 
-        // CRNN typically uses grayscale or RGB with simple normalization
-        let normalized = normalize_image(&resized, [0.5; 3], [0.5; 3]);
+        // Plain [0, 1] scaling: these PP-OCR recognition exports are trained
+        // without mean/std normalization (feeding [-1, 1] instead degrades
+        // recognition to fragments of the right letters).
+        let normalized = normalize_image(&resized, [0.0; 3], [1.0; 3]);
         let input_tensor = image_to_nchw_tensor(normalized, new_w as usize, new_h as usize)?;
 
         let input = ort::value::Tensor::from_array(input_tensor)
             .map_err(|e| SyscityError::Internal(format!("Tensor creation failed: {}", e)))?;
 
-        let outputs = self
-            .rec_model
-            .run(ort::inputs!["x" => input])
-            .map_err(|e| SyscityError::Internal(format!("Recognition inference failed: {}", e)))?;
+        // Greedy CTC decoding. The scoped block releases the borrow on
+        // `self.rec_model` before the dictionary lookup below needs `self`.
+        let dict_len = self.dict.len();
+        let (text_chars, total_confidence, valid_steps) = {
+            let outputs = self
+                .rec_model
+                .run(ort::inputs!["x" => input])
+                .map_err(|e| {
+                    SyscityError::Internal(format!("Recognition inference failed: {}", e))
+                })?;
 
-        let output_name = outputs
-            .iter()
-            .next()
-            .map(|(name, _)| name.to_string())
-            .ok_or_else(|| {
-                SyscityError::Internal("Recognition model produced no outputs".to_string())
-            })?;
+            let output_name = outputs
+                .iter()
+                .next()
+                .map(|(name, _)| name.to_string())
+                .ok_or_else(|| {
+                    SyscityError::Internal("Recognition model produced no outputs".to_string())
+                })?;
 
-        let output = outputs[output_name.as_str()]
-            .try_extract_array::<f32>()
-            .map_err(|e| SyscityError::Internal(format!("Tensor extraction failed: {}", e)))?;
+            let output = outputs[output_name.as_str()]
+                .try_extract_array::<f32>()
+                .map_err(|e| SyscityError::Internal(format!("Tensor extraction failed: {}", e)))?;
 
-        // CRNN output shape: [T, 1, num_classes] or [1, T, num_classes]
-        let shape = output.shape();
-        let (seq_len, num_classes) = if shape.len() == 3 && shape[1] == 1 {
-            (shape[0], shape[2])
-        } else if shape.len() == 3 {
-            (shape[1], shape[2])
-        } else {
-            return Err(SyscityError::Internal(format!(
-                "Unexpected recognition output shape: {:?}",
-                shape
-            )));
+            // CRNN output shape: [T, 1, num_classes] or [1, T, num_classes]
+            let shape = output.shape();
+            let (seq_len, num_classes) = if shape.len() == 3 && shape[1] == 1 {
+                (shape[0], shape[2])
+            } else if shape.len() == 3 {
+                (shape[1], shape[2])
+            } else {
+                return Err(SyscityError::Internal(format!(
+                    "Unexpected recognition output shape: {:?}",
+                    shape
+                )));
+            };
+
+            // A model emits one class per dictionary entry, plus the CTC
+            // blank, plus the appended space when it was trained with
+            // `use_space_char`. Any other count means this dictionary belongs
+            // to a different model — and decoding with it would return
+            // fragments of the right characters rather than nothing.
+            if num_classes != dict_len + 1 && num_classes != dict_len + 2 {
+                return Err(SyscityError::Internal(format!(
+                    "OCR dictionary has {} entries but the recognition model emits {} classes",
+                    dict_len, num_classes
+                )));
+            }
+
+            let mut prev_class = 0usize;
+            let mut text_chars = Vec::new();
+            let mut total_confidence = 0.0;
+            let mut valid_steps = 0;
+
+            for t in 0..seq_len {
+                let mut max_prob = f32::NEG_INFINITY;
+                let mut best_class = 0usize;
+
+                for c in 0..num_classes {
+                    let prob = if shape.len() == 3 && shape[1] == 1 {
+                        output[[t, 0, c]]
+                    } else {
+                        output[[0, t, c]]
+                    };
+
+                    if prob > max_prob {
+                        max_prob = prob;
+                        best_class = c;
+                    }
+                }
+
+                if best_class != 0 && best_class != prev_class {
+                    // Class 0 is the CTC blank; the output is already softmaxed.
+                    text_chars.push(best_class);
+                    total_confidence += max_prob;
+                    valid_steps += 1;
+                }
+                prev_class = best_class;
+            }
+
+            (text_chars, total_confidence, valid_steps)
         };
 
-        // Greedy CTC decoding
-        let mut prev_class = 0usize;
-        let mut text_chars = Vec::new();
-        let mut total_confidence = 0.0;
-        let mut valid_steps = 0;
-
-        for t in 0..seq_len {
-            let mut max_prob = f32::NEG_INFINITY;
-            let mut best_class = 0usize;
-
-            for c in 0..num_classes {
-                let prob = if shape.len() == 3 && shape[1] == 1 {
-                    output[[t, 0, c]]
-                } else {
-                    output[[0, t, c]]
-                };
-
-                if prob > max_prob {
-                    max_prob = prob;
-                    best_class = c;
-                }
-            }
-
-            if best_class != 0 && best_class != prev_class {
-                // 0 is typically the CTC blank token
-                text_chars.push(best_class);
-                total_confidence += max_prob.exp();
-                valid_steps += 1;
-            }
-            prev_class = best_class;
-        }
-
-        // Map class indices to characters using a basic ASCII alphabet
-        // In a real deployment, this should come from the model's dictionary file.
+        // Map class indices through the model's dictionary.
         let text = text_chars
             .iter()
-            .filter_map(|&idx| Self::class_to_char(idx))
+            .filter_map(|&idx| self.class_to_char(idx))
             .collect::<String>();
 
         let confidence = if valid_steps > 0 {
@@ -428,57 +469,51 @@ impl RapidOcr {
         Ok((text, confidence))
     }
 
-    /// Map a CRNN class index to a character.
-    ///
-    /// This uses a basic alphanumeric + punctuation alphabet.
-    /// For production use, load the exact dictionary file that matches the
-    /// model.
-    fn class_to_char(idx: usize) -> Option<char> {
-        // Standard RapidOCR/PP-OCR dictionary mapping:
-        // 0 = blank (CTC)
-        // 1-10 = '0'-'9'
-        // 11-36 = 'a'-'z'
-        // 37-62 = 'A'-'Z'
-        // 63+ = punctuation and special chars
-        match idx {
-            1..=10 => Some((b'0' + (idx - 1) as u8) as char),
-            11..=36 => Some((b'a' + (idx - 11) as u8) as char),
-            37..=62 => Some((b'A' + (idx - 37) as u8) as char),
-            63 => Some(' '),
-            64 => Some('.'),
-            65 => Some(','),
-            66 => Some('!'),
-            67 => Some('?'),
-            68 => Some('-'),
-            69 => Some('_'),
-            70 => Some(':'),
-            71 => Some(';'),
-            72 => Some('\''),
-            73 => Some('"'),
-            74 => Some('('),
-            75 => Some(')'),
-            76 => Some('['),
-            77 => Some(']'),
-            78 => Some('{'),
-            79 => Some('}'),
-            80 => Some('/'),
-            81 => Some('\\'),
-            82 => Some('@'),
-            83 => Some('#'),
-            84 => Some('$'),
-            85 => Some('%'),
-            86 => Some('&'),
-            87 => Some('*'),
-            88 => Some('+'),
-            89 => Some('='),
-            90 => Some('<'),
-            91 => Some('>'),
-            92 => Some('~'),
-            93 => Some('`'),
-            94 => Some('^'),
-            95 => Some('|'),
-            _ => None,
+    /// Read the dictionary file the recognition model was trained with.
+    fn load_dict(path: &str) -> crate::Result<Vec<char>> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            SyscityError::Internal(format!("Failed to read OCR dictionary {}: {}", path, e))
+        })?;
+        let dict = Self::parse_dict(&raw);
+        if dict.is_empty() {
+            return Err(SyscityError::Internal(format!("OCR dictionary {} is empty", path)));
         }
+        Ok(dict)
+    }
+
+    /// Parse a PaddleOCR character dictionary: one entry per line, in the
+    /// model's output-class order.
+    ///
+    /// Class index `i` (1-based) decodes to entry `i - 1`; class 0 is the CTC
+    /// blank and has no entry. Only the first character of a line is used —
+    /// the english dictionary is one character per line, and a multi-character
+    /// entry would mean a word-level model this pipeline does not support.
+    /// A genuinely empty line keeps its slot (as a space) so every later
+    /// index stays aligned with the model's classes.
+    fn parse_dict(raw: &str) -> Vec<char> {
+        raw.lines()
+            .map(|line| line.chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    /// Map a CRNN class index to a character via the loaded dictionary.
+    fn class_to_char(&self, idx: usize) -> Option<char> {
+        decode_class(&self.dict, idx)
+    }
+}
+
+/// Decode a recognition class index against a dictionary.
+///
+/// Class 0 is the CTC blank. Class `i` (1-based) is dictionary entry `i - 1`.
+/// PaddleOCR trains recognition models with `use_space_char`, which appends a
+/// space after the dictionary, so the one class past the last entry is `' '`;
+/// anything beyond that is not a real class.
+fn decode_class(dict: &[char], idx: usize) -> Option<char> {
+    match idx.checked_sub(1) {
+        None => None,
+        Some(i) if i < dict.len() => dict.get(i).copied(),
+        Some(i) if i == dict.len() => Some(' '),
+        _ => None,
     }
 }
 
@@ -487,14 +522,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_class_to_char() {
-        assert_eq!(RapidOcr::class_to_char(1), Some('0'));
-        assert_eq!(RapidOcr::class_to_char(10), Some('9'));
-        assert_eq!(RapidOcr::class_to_char(11), Some('a'));
-        assert_eq!(RapidOcr::class_to_char(36), Some('z'));
-        assert_eq!(RapidOcr::class_to_char(37), Some('A'));
-        assert_eq!(RapidOcr::class_to_char(62), Some('Z'));
-        assert_eq!(RapidOcr::class_to_char(63), Some(' '));
+    fn parse_dict_keeps_class_order() {
+        // The english PP-OCR dictionary starts with the digits, then upper
+        // case, then lower case — not the other way round.
+        let dict = RapidOcr::parse_dict("0\n1\n9\nA\nZ\na\nz\n/\n");
+        assert_eq!(dict, vec!['0', '1', '9', 'A', 'Z', 'a', 'z', '/']);
+    }
+
+    #[test]
+    fn decode_class_maps_blank_dict_and_appended_space() {
+        let dict = RapidOcr::parse_dict("0\n1\nA\na\n");
+        assert_eq!(decode_class(&dict, 0), None, "class 0 is the CTC blank");
+        assert_eq!(decode_class(&dict, 1), Some('0'));
+        assert_eq!(decode_class(&dict, 3), Some('A'));
+        assert_eq!(decode_class(&dict, 4), Some('a'));
+        assert_eq!(decode_class(&dict, 5), Some(' '), "use_space_char appends one");
+        assert_eq!(decode_class(&dict, 6), None);
+    }
+
+    #[test]
+    fn parse_dict_preserves_index_alignment() {
+        // A blank line still occupies its class slot.
+        let dict = RapidOcr::parse_dict("0\n\nA\n");
+        assert_eq!(dict.len(), 3);
+        assert_eq!(dict[1], ' ');
+        assert_eq!(dict[2], 'A');
     }
 
     #[test]

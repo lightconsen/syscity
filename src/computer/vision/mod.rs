@@ -33,6 +33,8 @@ pub struct DetectedElement {
 #[cfg(feature = "vision")]
 pub mod model_download;
 #[cfg(feature = "vision")]
+pub mod ocr_file;
+#[cfg(feature = "vision")]
 pub mod ocr_rapid;
 pub mod screen_state;
 #[cfg(feature = "vision")]

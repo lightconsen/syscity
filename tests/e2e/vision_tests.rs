@@ -49,7 +49,9 @@ fn model_dir() -> PathBuf {
 
 fn has_ocr_models() -> bool {
     let dir = model_dir();
-    dir.join("det.onnx").exists() && dir.join("rec.onnx").exists()
+    dir.join("det.onnx").exists()
+        && dir.join("rec_ppocrv3.onnx").exists()
+        && dir.join("rec_dict_ppocrv3.txt").exists()
 }
 
 fn has_omniparser_models() -> bool {
@@ -59,11 +61,12 @@ fn has_omniparser_models() -> bool {
 fn load_ocr() -> Option<RapidOcr> {
     let dir = model_dir();
     let det = dir.join("det.onnx");
-    let rec = dir.join("rec.onnx");
-    if !det.exists() || !rec.exists() {
+    let rec = dir.join("rec_ppocrv3.onnx");
+    let dict = dir.join("rec_dict_ppocrv3.txt");
+    if !det.exists() || !rec.exists() || !dict.exists() {
         return None;
     }
-    RapidOcr::new(det.to_str().unwrap(), rec.to_str().unwrap(), None).ok()
+    RapidOcr::new(det.to_str().unwrap(), rec.to_str().unwrap(), dict.to_str().unwrap()).ok()
 }
 
 fn load_omniparser() -> Option<OmniParserDetector> {
@@ -253,7 +256,11 @@ async fn test_omniparser_to_ui_elements() {
 
 #[tokio::test]
 async fn test_ocr_model_not_found_graceful() {
-    let result = RapidOcr::new("/nonexistent/det.onnx", "/nonexistent/rec.onnx", None);
+    let result = RapidOcr::new(
+        "/nonexistent/det.onnx",
+        "/nonexistent/rec.onnx",
+        "/nonexistent/rec_dict.txt",
+    );
     assert!(result.is_err(), "Loading OCR from nonexistent paths should fail");
 }
 
@@ -282,7 +289,8 @@ async fn test_model_download_cache_dir_resolution() {
         let paths = result.unwrap();
         assert!(paths.omniparser.exists(), "omniparser.onnx should exist");
         assert!(paths.det.exists(), "det.onnx should exist");
-        assert!(paths.rec.exists(), "rec.onnx should exist");
+        assert!(paths.rec.exists(), "recognition model should exist");
+        assert!(paths.rec_dict.exists(), "recognition dictionary should exist");
     }
     // If download fails (no network), the test is still valid — we just
     // verify it doesn't panic.
@@ -300,5 +308,6 @@ async fn test_model_download_from_scratch() {
     let paths = result.unwrap();
     assert!(paths.omniparser.exists(), "omniparser.onnx should exist after download");
     assert!(paths.det.exists(), "det.onnx should exist after download");
-    assert!(paths.rec.exists(), "rec.onnx should exist after download");
+    assert!(paths.rec.exists(), "recognition model should exist after download");
+    assert!(paths.rec_dict.exists(), "recognition dictionary should exist after download");
 }

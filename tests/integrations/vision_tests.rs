@@ -156,9 +156,9 @@ fn test_full_preprocess_pipeline() {
     assert!((tensor[[0, 2, 0, 0]] - 1.0).abs() < 0.01);
 }
 
-// ── RapidOCR Class-to-Char Mapping (tested via the in-module test) ─────
-// The class_to_char function is private; unit tests cover it inside the
-// module at src/computer/vision/ocr_rapid.rs.
+// ── RapidOCR Dictionary Decoding (tested via the in-module tests) ──────
+// The dictionary parsing and class decoding are private; unit tests cover
+// them inside the module at src/computer/vision/ocr_rapid.rs.
 
 // ── OmniParser Post-processing Tests ──────────────────────────────────
 

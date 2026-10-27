@@ -232,6 +232,12 @@ impl Agent {
             .with_provider_name(self.provider.name().to_string())
             .with_sender_id(user_id);
 
+        // Configured extra variables (e.g. a proxy for the eval harness). Empty
+        // unless `[default_agent] tool_environment` says otherwise.
+        for (key, value) in &cfg.tool_environment {
+            ctx = ctx.with_environment_var(key.clone(), value.clone());
+        }
+
         // A delegated child operates inside its delegation tree's shared
         // workspace: relative file paths resolve into this task's scratch dir,
         // while the whole tree plus the agent's own workspace stay reachable by
