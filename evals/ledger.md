@@ -14,6 +14,7 @@ compare against this ledger, not memory. See `docs/harness.md` §8.
 | 2026-10-27 14:01 | b7922116 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:1 | 1/1 | 100.0% | PASS | - |
 | 2026-10-27 20:02 | d71cb378 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:1 | 0/1 | 0.0% | PASS | gaia_l1_9318445f |
 | 2026-10-27 23:12 | d71cb378 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | full | 124/159 | 78.0% | PASS | gaia_l1_0383a3ee, gaia_l1_1f975693, gaia_l1_23dd907f, gaia_l1_305ac316, gaia_l1_46719c30, gaia_l1_4b6bb5f7, gaia_l1_5cfb274c, gaia_l1_5d0080cb, gaia_l1_7673d77… |
+| 2026-10-28 00:13 | fc61feb2 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:9 | 22/27 | 81.5% | PASS | gaia_l1_23dd907f, gaia_l1_4b6bb5f7, gaia_l1_935e2cff |
 
 ## 备注：被剔除的运行
 

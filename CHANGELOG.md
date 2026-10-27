@@ -46,6 +46,14 @@ if no section matches, the release falls back to auto-generated notes.
   0.7), 60 tool iterations (was 30) with a soft "wrap up" reminder at 70%, and a
   system prompt built from the registered tool list (it previously named five
   tools that were not registered).
+- **Eval runs state the answer contract explicitly.** The appended prompt now
+  says the `FINAL ANSWER:` line is read by an automatic checker, not a person:
+  the value alone, no unit, no explanation, no parentheticals, lists in the
+  requested order with repeats kept. On the GAIA run that motivated it, ~10
+  failing trials were answers the model knew but wrapped in prose or units
+  (`22 years` for `22`, `No — Earl cannot do it; …` for `No`). Measured on the
+  9-task subset drawn from those: 40.7% → 81.5% over 3 trials each, 7 tasks up,
+  none down.
 - **`web_fetch` retries transient failures once** and tells the model when a page
   looks JavaScript-rendered, instead of returning an empty body as if the page
   had nothing to say.
@@ -82,6 +90,14 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **Tool-call markup no longer reaches the user as an answer.** When the
+  tool-iteration budget is spent, the closing round runs without tools — exactly
+  when a model is most likely to emit one more call as plain text. A provider
+  that streams that attempt as template markup (deepseek-v4 through a relay)
+  left `</｜｜DSML｜｜ calls>` as the reply; two GAIA trials answered with it.
+  The guard that catches this on ordinary rounds did not cover the closing
+  round, which has no round left to nudge. The markup is now stripped from that
+  reply, so the answer is whatever prose surrounded it.
 - **A provider outage is no longer recorded as a score.** Three consecutive tasks whose
   every trial failed without spending a token now abort the run with an explicit error and
   write no ledger row — no model answered, so there is nothing to measure. On 2026-10-27 an

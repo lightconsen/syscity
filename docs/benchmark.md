@@ -1,8 +1,8 @@
 # 公开基准（Benchmark）接入计划
 
-> 状态：M0（契约补全）、M1（BFCL）、M2（GAIA 接入，基线 70.4% → P0–P3 后 78.0%）已落地；
-> M3–M4 仍是计划。
-> 最后更新：2026-10-27
+> 状态：M0（契约补全）、M1（BFCL）、M2（GAIA 接入，基线 70.4% → P0–P3 后 78.0%，
+> 答案格式契约已在 9 题子集上验证）已落地；M3–M4 仍是计划。
+> 最后更新：2026-10-28
 > 相关文档：[`harness.md`](harness.md)（评测闭环设计）、[`eval-status.md`](eval-status.md)（方法论与落地状态）、
 > [`../evals/README.md`](../evals/README.md)（本地套件用法）
 
@@ -384,17 +384,48 @@ P0–P3 之后同口径复跑为 78.0% / 62.3% / 94.3%，对照见本节末尾�
 
 这与基线"7/8 全挂都是多跳检索"的结构不同：检索类只剩 1 个，另外 2 个是格式与 OCR。
 
-**下一轮的最大杠杆是答案格式，不是能力。** 把 28 条失败回复逐条交给官方 scorer 判定：
-6 条只要去掉括号补充或破折号后的解释就能过（`Rockhopper penguin (Eudyptes chrysocome)`
-→ `Rockhopper penguin`、`No — Earl cannot do it; …` → `No`、`Research (as in "No original
-research")` → `Research`）；另有 4 条是"数值 + 单位"型（`22 years`、`90 participants`、
-`0.1777 m³`、`INT. THE CASTLE - DAY`），模型显然知道值，只是没按题面要求只写值。合计约
-10 个 trial ≈ 6pt，修法是在评测提示里把输出契约写死：`FINAL ANSWER:` 之后只放题面要的
-那个值，不带单位、不带解释、不带从句。这属于包装层，不改判分器。
+**答案格式那一轮（2026-10-28）**：把 28 条失败回复逐条交给官方 scorer 复核，发现损失
+主要不在能力而在包装——6 条只要去掉括号补充或破折号后的解释就能过
+（`Rockhopper penguin (Eudyptes chrysocome)` → `Rockhopper penguin`、
+`No — Earl cannot do it; …` → `No`、`Research (as in "No original research")` →
+`Research`），另有 4 条是"数值 + 单位"型（`22 years`、`90 participants`、`0.1777 m³`、
+`INT. THE CASTLE - DAY`）。于是把其中 9 道挂过的题做成题集，先改提示再验证：评测提示里
+新增 `## Final Answer Format`，明确 `FINAL ANSWER:` 之后由自动判分器读，只放题面要的值：
+不带单位（`22` 而非 `22 years`）、不带解释、不带括号补充、列表按题面要求的顺序与分隔符
+且**重复项要保留**；题面自带格式时以题面为准。判分器不动。
 
-另有一个真 bug：`935e2cff` 的一次回复把 DeepSeek 的工具调用标记当成正文吐了出来
-（`</｜｜DSML｜｜ calls>` 落进了 FINAL ANSWER 行）。这不是评测问题，是 agent 解析
-provider 原生工具语法的缺口，值得单独修。
+9 题 × 3 trials 的前后对比（同一批题，`--only` 跑）：
+
+| 任务 | 改前 | 改后 |
+|---|---|---|
+| `7d4a7d1d` | 0% | **100%** |
+| `a0068077` | 33% | **100%** |
+| `9d191bce` | 33% | **100%** |
+| `5cfb274c` | 67% | **100%** |
+| `5d0080cb` | 67% | **100%** |
+| `0383a3ee` | 67% | **100%** |
+| `935e2cff` | 33% | 67% |
+| `23dd907f` | 33% | 33% |
+| `4b6bb5f7` | 33% | 33% |
+| **合计** | **40.7%** | **81.5%** |
+
+7 题变好、0 题变差，trial 口径 22/27 = 81.5%。剩下 5 个失败 trial 逐条看过：
+
+| 任务 | 失败 trial 的 `FINAL ANSWER` | 标准答案 | 性质 |
+|---|---|---|---|
+| `23dd907f` | `</｜｜DSML｜｜ calls>` | `2` | DSML 收口 bug（已修） |
+| `23dd907f` | `4` | `2` | 数错了节号——读了诗但定位错，非格式 |
+| `4b6bb5f7` | `INT. THE CASTLE - DAY` ×2 | `THE CASTLE` | 答了整个场景标题，题面要的是标题里的地点 |
+| `935e2cff` | `</｜｜DSML｜｜ calls>` | `research` | DSML 收口 bug（已修） |
+
+也就是说格式契约把"值对、包装错"这一类基本清掉了：剩下的两个 DSML 是收口轮缺守卫（已在
+`strip_tool_markup` 修掉，`935e2cff` 因此下次应到 100%），一个是真的数错，只有
+`4b6bb5f7` 仍属"答多了"——它把 `INT.` / `- DAY` 也带上，而题面说的是"first scene
+heading 里的 setting"。这条在提示里加"不要场景前缀后缀"也未必管用，因为模型是**根本没
+把标题拆成地点**，属于理解，不是包装。
+
+注意这是**被挑出来的 9 题**，前测本来就 40.7%，不能当成全量提分；要报全量数字需要重跑
+53 题。测得的结论是：格式契约有效，且没有把这 9 题弄坏。
 
 环境偏差这一项确认修好了：基线里 shell 的 `curl` 有 4 次 exit 28（代理不通），本轮
 只有 1 次；工具调用量为 `shell` 837、`web_search` 652、`web_fetch` 494、`browser` 104

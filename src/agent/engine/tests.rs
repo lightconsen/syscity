@@ -320,6 +320,32 @@ fn markup_detection_covers_the_mangled_and_plain_forms_only_at_the_start() {
     assert!(!looks_like_unparsed_tool_markup("final answer"));
 }
 
+#[test]
+fn strip_removes_markup_and_keeps_the_prose_around_it() {
+    use super::completion::strip_tool_markup;
+
+    // A leaked call followed by the answer the model meant to give.
+    let leaked = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"web_search\">\n\
+                  <｜｜DSML｜｜ parameter name=\"query\">x</｜｜DSML｜｜ parameter>\n\
+                  </｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\n\n\
+                  FINAL ANSWER: research";
+    assert_eq!(strip_tool_markup(leaked).as_deref(), Some("FINAL ANSWER: research"));
+
+    // The exact thing two GAIA trials answered with: a truncated closing tag
+    // and nothing else. Stripping it leaves an empty answer, which the caller
+    // treats as "no answer" rather than as text.
+    assert_eq!(strip_tool_markup("</｜｜DSML｜｜ calls>").as_deref(), Some(""));
+
+    // Plain content is untouched — `None` means "nothing to strip", so the
+    // caller keeps the original response.
+    assert_eq!(strip_tool_markup("FINAL ANSWER: 22"), None);
+    // An answer that talks about the syntax is prose, not a leak.
+    assert_eq!(
+        strip_tool_markup("The DSML markup has a calls tag.\nFINAL ANSWER: markup"),
+        None
+    );
+}
+
 #[tokio::test]
 async fn test_get_completion_nudges_once_on_empty_reply() {
     let provider = Arc::new(EmptyThenOk { calls: AtomicUsize::new(0) });

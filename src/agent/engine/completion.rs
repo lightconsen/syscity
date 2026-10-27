@@ -47,6 +47,53 @@ pub(crate) fn looks_like_unparsed_tool_markup(content: &str) -> bool {
         .any(|marker| head.contains(marker))
 }
 
+/// Remove unparsed tool-call markup from a reply that also carries prose.
+///
+/// Returns `None` when there is nothing to strip, and `Some("")` when the
+/// reply was nothing but markup and no answer survives. The markup arrives in
+/// two shapes: whole `<…DSML…>` elements, and the closing tag fragments a
+/// truncated stream leaves behind (`</｜｜DSML｜｜ calls>`, seen verbatim as a
+/// GAIA answer). Everything from the first marker to the end of its line is
+/// dropped, along with any line that is only tag punctuation.
+pub(crate) fn strip_tool_markup(content: &str) -> Option<String> {
+    if !UNPARSED_TOOL_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
+    {
+        return None;
+    }
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            !UNPARSED_TOOL_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker))
+        })
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() < 120)
+        })
+        .collect();
+    let joined = kept.join("\n");
+    // Collapse the blank runs a removed block leaves behind, so the answer
+    // reads as the prose that was around it.
+    let mut out = String::with_capacity(joined.len());
+    let mut blanks = 0usize;
+    for line in joined.lines() {
+        if line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out.trim().to_string())
+}
+
 /// Injected when a round's only output is unparsed tool-call markup (see
 /// [`looks_like_unparsed_tool_markup`]). The next round runs without tools,
 /// so whatever the model wanted to call, the honest move is to answer with
@@ -325,6 +372,19 @@ impl Agent {
                 context.add_message(Message::user(MARKUP_NUDGE.to_string()));
                 return Box::pin(self.get_completion_inner(context, user_id, true)).await;
             }
+        } else if let Some(cleaned) = strip_tool_markup(&response.message.content) {
+            // The final round is reached precisely when the budget is spent,
+            // which is when a model is most likely to try one more call it is
+            // no longer allowed to make — and some providers (deepseek-v4 via
+            // a relay) emit that attempt as template text. There is no round
+            // left to nudge, so strip the markup instead of storing it as the
+            // answer: two GAIA trials answered with `</｜｜DSML｜｜ calls>`.
+            warn!("LLM's final-round reply carried unparsed tool-call markup; stripped it");
+            let mut cleaned_response = response;
+            cleaned_response.message.content = cleaned;
+            cleaned_response.message.tool_calls = None;
+            context.add_message(cleaned_response.message.clone());
+            return Ok(cleaned_response);
         }
 
         // Add assistant message to context (final round never carries dangling
@@ -948,6 +1008,16 @@ impl Agent {
                 ))
                 .await;
             }
+        } else if let Some(cleaned) = strip_tool_markup(&response.message.content) {
+            // Same final-round strip as the plain path: with the budget spent
+            // there is no round left to nudge, and storing the markup would
+            // hand the caller a template as the answer.
+            warn!("LLM's final-round reply carried unparsed tool-call markup; stripped it");
+            let mut cleaned_response = response;
+            cleaned_response.message.content = cleaned;
+            cleaned_response.message.tool_calls = None;
+            context.add_message(cleaned_response.message.clone());
+            return Ok(cleaned_response);
         }
 
         // Add assistant message to context (final round never carries dangling

@@ -296,16 +296,9 @@ pub async fn run_suite(
     // `image_generate`, `tts`, `stt`), which pointed the agent at tools that do
     // not exist in an eval run.
     let available_tools = tool_registry.list().join(", ");
-    agent_config.system_prompt.push_str(&format!(
-        "\n\n## Evaluation Run\n\n\
-         The tools available in this run are: {available_tools}.\n\n\
-         Those are the only tools; do not call any other name.\n\
-         For web pages prefer `web_fetch` / `web_search` over `curl` in the shell: \
-         the shell runs with a restricted environment and may not reach the network.\n\
-         You have a limited tool-call budget. Once the evidence you have supports an \
-         answer, stop searching and answer.\n\
-         If the task specifies a final-answer format, follow it exactly."
-    ));
+    agent_config
+        .system_prompt
+        .push_str(&eval_system_prompt_suffix(&available_tools));
     // Hand the eval agent the same proxy this process uses. The shell tool
     // clears its environment, so without this a `curl` inside a trial cannot
     // reach hosts that are only reachable through the proxy while `web_fetch`
@@ -978,6 +971,47 @@ fn eval_search_providers(
     vec![SearchProvider::DuckDuckGo]
 }
 
+/// Text appended to the agent's system prompt for an eval run.
+///
+/// Two sections earned their place from measured losses rather than taste:
+///
+/// - The tool list is generated from the registry, because the hand-written
+///   version named five tools an eval run does not register.
+/// - The answer-format section exists because the 2026-10-27 GAIA run lost
+///   roughly ten trials to answers the model clearly knew but wrapped in prose
+///   or units — `22 years` where the expected value was `22`,
+///   `No — Earl cannot do it; …` where it was `No`, `Rockhopper penguin
+///   (Eudyptes chrysocome)` where it was `Rockhopper penguin`. The checker is
+///   the benchmark's official scorer and compares values, so it cannot accept
+///   those; a person would have.
+fn eval_system_prompt_suffix(available_tools: &str) -> String {
+    format!(
+        "\n\n## Evaluation Run\n\n\
+         The tools available in this run are: {available_tools}.\n\n\
+         Those are the only tools; do not call any other name.\n\
+         For web pages prefer `web_fetch` / `web_search` over `curl` in the shell: \
+         the shell runs with a restricted environment and may not reach the network.\n\
+         You have a limited tool-call budget. Once the evidence you have supports an \
+         answer, stop searching and answer.\n\n\
+         ## Final Answer Format\n\n\
+         If the task specifies a final-answer line, an automatic checker reads that \
+         line — not a person. Put the requested value on it and nothing else:\n\
+         - No unit, currency word or label unless the task asks for one: `22`, not \
+         `22 years`; `90`, not `90 participants`.\n\
+         - No explanation, heading or restatement on the line; a useful clarification \
+         belongs in the prose above it.\n\
+         - No surrounding quotes, markdown or sentence: `Rockhopper penguin`, not \
+         `The answer is \"Rockhopper penguin\".`\n\
+         - Parentheticals are part of the value only if the task asks for them: \
+         `Rockhopper penguin (Eudyptes chrysocome)` fails when `Rockhopper penguin` \
+         is expected.\n\
+         - For a list, use exactly the separators and order the task asks for, and \
+         keep repeated items repeated.\n\
+         Where the task states a format of its own, that format wins over this \
+         guidance."
+    )
+}
+
 /// Whether a task's trials never reached the model at all.
 ///
 /// A task that failed every trial without the provider reporting token usage
@@ -994,6 +1028,22 @@ fn provider_silent(total_trials: usize, any_success: bool, any_usage: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_prompt_names_the_registered_tools_and_the_answer_contract() {
+        let prompt = eval_system_prompt_suffix("web_search, shell");
+        assert!(prompt.contains("web_search, shell"), "tool list must come from the registry");
+        assert!(prompt.contains("Final Answer Format"), "answer contract must be present");
+        assert!(prompt.contains("`22`, not `22 years`"), "the unit rule must be concrete");
+        assert!(
+            prompt.contains("keep repeated items repeated"),
+            "the list rule must cover the GAIA fraction task"
+        );
+        assert!(
+            prompt.contains("that format wins over this guidance"),
+            "the task's own format must win"
+        );
+    }
 
     #[test]
     fn provider_silent_detects_a_refused_trial_set() {
