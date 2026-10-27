@@ -14,9 +14,11 @@ if no section matches, the release falls back to auto-generated notes.
 ### Added
 
 - **GAIA Level 1 benchmark.** The official `question_scorer` is wired through the
-  eval harness, with a first 53-task × 3-trial baseline of 70.4% (112/159) recorded
-  in `evals/ledger.md`. See `docs/benchmark.md` §M2 for the method and the failure
-  breakdown.
+  eval harness. The 53-task × 3-trial baseline was 70.4% (112/159); after the
+  determinism, retrieval and OCR work below, a repeat run scores 78.0% (124/159),
+  with tasks passing all three trials rising from 29/53 to 33/53 and zero-pass
+  tasks falling from 8 to 3. Both runs are recorded in `evals/ledger.md`. See
+  `docs/benchmark.md` §M2 for the method and the failure breakdown.
 - **`web_search` can read the pages it finds.** `fetch_top: N` fetches the top N
   results in the same call (through `web_fetch`, so the SSRF guard applies), and
   `depth: "advanced"` asks the provider for full page text where supported

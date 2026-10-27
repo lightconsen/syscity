@@ -12,6 +12,8 @@ compare against this ledger, not memory. See `docs/harness.md` §8.
 | 2026-10-27 02:25 | cc03c7b7 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | full | 112/159 | 70.4% | PASS | gaia_l1_0383a3ee, gaia_l1_1f975693, gaia_l1_23dd907f, gaia_l1_305ac316, gaia_l1_3cef3a44, gaia_l1_46719c30, gaia_l1_4b650a35, gaia_l1_4b6bb5f7, gaia_l1_5d0080c… |
 | 2026-10-27 10:55 | 448bd3d8 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:2 | 1/2 | 50.0% | PASS | gaia_l1_9318445f |
 | 2026-10-27 14:01 | b7922116 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:1 | 1/1 | 100.0% | PASS | - |
+| 2026-10-27 20:02 | d71cb378 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:1 | 0/1 | 0.0% | PASS | gaia_l1_9318445f |
+| 2026-10-27 23:12 | d71cb378 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | full | 124/159 | 78.0% | PASS | gaia_l1_0383a3ee, gaia_l1_1f975693, gaia_l1_23dd907f, gaia_l1_305ac316, gaia_l1_46719c30, gaia_l1_4b6bb5f7, gaia_l1_5cfb274c, gaia_l1_5d0080cb, gaia_l1_7673d77… |
 
 ## 备注：被剔除的运行
 
@@ -25,8 +27,8 @@ provider 余额耗尽（DeepSeek HTTP 402 `insufficient_balance_error`），159 
 开始 402），其余 49 个任务全部零通过。产出行 `7/159 = 4.4%` 已从表中删除——它衡量的是
 账单，不是能力。harness 已加闸：连续 3 个任务的所有 trial 都零 token 时直接报错退出、
 不写 ledger 行（`src/eval/standalone.rs` 的 `provider_silent`），所以同样的故障下次会在
-第 7 个任务前后停下，而不是安静跑完 53 个。**验收跑需在充值后重跑**：
-`syscity eval run gaia_l1 --full --trials 3 --collect-badcases`。
+第 7 个任务前后停下，而不是安静跑完 53 个。充值后已重跑，结果即表中
+`2026-10-27 23:12 | 124/159 | 78.0%`。
 
 ## 外部基准（benchmark）
 
@@ -63,13 +65,15 @@ evaluator** 给出，不自写判分器（见 `docs/benchmark.md`）。
 | Date | Benchmark | Version | Executor | Commit | Trials | Passed | Rate | Notes |
 |------|-----------|---------|----------|--------|--------|--------|------|-------|
 | 2026-10-26 | GAIA L1 | validation（HF `gaia-benchmark/GAIA`） | syscity 内置 Agent 循环 → deepseek-v4-flash | cc03c7b7 | 159 | 112 | 70.4% | 29/53 任务 3 次全过，45/53 至少过 1 次，8/53 全挂；3h39m、49.8M token |
+| 2026-10-27 | GAIA L1 | 同上 | 同上 | d71cb378 | 159 | 124 | **78.0%** | P0–P3 后复跑：33/53 全过，50/53 至少过 1 次，3/53 全挂（`7d4a7d1d` 格式、`9318445f` OCR、`46719c30` 检索）；3h09m、58.6M token。配对 13 题变好 / 5 题变坏，符号检验 p=0.048 |
 
 口径：与 BFCL 相反，这里跑的是 **syscity 自己的 Agent 循环**（工具由 syscity 执行，
 `file_read` / `shell` / `web_search` / `web_fetch` / `browser` 等），判分是 GAIA 官方
 `question_scorer`。所以它衡量的是整条栈：系统提示、工具描述、循环终止条件、模型。
 
 **读法**：同一题的 3 次 trial 高度相关（同一份 prompt、同一个模型），所以 70.4% 的
-trial 口径不是独立样本；稳定的读数是任务口径——**3 次全过 54.7%，至少过 1 次 84.9%**。
+trial 口径不是独立样本；稳定的读数是任务口径——**3 次全过 54.7%，至少过 1 次 84.9%**
+（P0–P3 后为 62.3% / 94.3%）。
 这个数字**不能和公开 leaderboard 直接比**：GAIA 的分数对 scaffolding（工具集、重试、
 迭代上限、是否允许多次提交）高度敏感，换一套 harness 就是另一个数。它的用途是给本仓库
 自己定基线，看改动是升还是降。
