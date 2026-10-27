@@ -4,7 +4,7 @@
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Rust | 1.75+ (MSRV) | Install via [rustup](https://rustup.rs) |
+| Rust | 1.97+ (MSRV) | Install via [rustup](https://rustup.rs); `rust-toolchain.toml` pins it |
 | Node.js | 22 | Only needed to build the web UI |
 | pnpm | latest | `npm i -g pnpm` — used by the web build |
 

@@ -1,5 +1,5 @@
 # The project MSRV, pinned as the working toolchain so local builds match
-# `rust-version` in Cargo.toml and the CI jobs. wasmtime 48 (RUSTSEC-2026-0314/
-# 0316 fixes) requires 1.95.
+# `rust-version` in Cargo.toml and the CI jobs. wasmtime 50 (with zip 9, the
+# RUSTSEC-2026-0391/0398/0403 zstd fixes) requires 1.97.
 [toolchain]
-channel = "1.95"
+channel = "1.97"

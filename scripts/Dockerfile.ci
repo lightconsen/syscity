@@ -34,11 +34,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 # ── Rust toolchains (ci.yml: check / msrv jobs) ─────────────────────────────
 # stable+clippy+rustfmt for `cargo clippy` / `cargo fmt -- --check`,
-# 1.93 for the MSRV job.
+# 1.97 for the MSRV job.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
         --profile minimal --default-toolchain stable \
     && rustup component add clippy rustfmt llvm-tools-preview \
-    && rustup toolchain install 1.93 --profile minimal
+    && rustup toolchain install 1.97 --profile minimal
 
 # ── CI helper tools (ci.yml: security / coverage jobs) ──────────────────────
 RUN cargo install cargo-audit --locked \

@@ -91,7 +91,7 @@ jobs:
         with:
           # Pinned toolchain (matches local dev) so CI clippy does not drift
           # onto newly-released lints between stable releases.
-          toolchain: "1.95"
+          toolchain: "1.97"
           components: clippy, rustfmt
 
       - name: Cache Rust dependencies
@@ -130,9 +130,9 @@ jobs:
 
   msrv:
     name: MSRV Consistency
-    # This used to run `cargo check --all-features` on toolchain 1.95 — but so
-    # does `check`, and 1.95 *is* the MSRV (`Cargo.toml` `rust-version`,
-    # `rust-toolchain.toml`, and every job here all say 1.95). The job was
+    # This used to run `cargo check --all-features` on toolchain 1.97 — but so
+    # does `check`, and 1.97 *is* the MSRV (`Cargo.toml` `rust-version`,
+    # `rust-toolchain.toml`, and every job here all say 1.97). The job was
     # therefore a duplicate build, not an MSRV test.
     #
     # What is worth guarding is the property that made the old job look
@@ -189,7 +189,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
           targets: x86_64-pc-windows-gnu
 
       - name: Cache Rust dependencies
@@ -238,7 +238,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -276,7 +276,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -334,7 +334,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -412,7 +412,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -473,7 +473,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -535,7 +535,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -595,7 +595,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -670,7 +670,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
           components: llvm-tools-preview
 
       - name: Cache Rust dependencies

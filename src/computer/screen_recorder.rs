@@ -148,7 +148,10 @@ async fn download_ffmpeg(dest: &Path) -> crate::computer::Result<()> {
         let mut entry = archive.by_index(i).map_err(|e| {
             crate::computer::ComputerError::Other(format!("Zip entry {}: {}", i, e))
         })?;
-        if entry.name() == "ffmpeg" {
+        let name = entry.name().map_err(|e| {
+            crate::computer::ComputerError::Other(format!("Zip entry name {}: {}", i, e))
+        })?;
+        if name == "ffmpeg" {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(|e| {
                 crate::computer::ComputerError::Other(format!("Read zip entry: {}", e))

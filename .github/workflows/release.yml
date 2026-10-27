@@ -83,7 +83,7 @@ jobs:
           # matrix target onto whatever stable happens to be and the build
           # then runs on an auto-installed toolchain that lacks it —
           # "Target x86_64-apple-darwin is not installed".
-          toolchain: "1.95"
+          toolchain: "1.97"
           targets: ${{ matrix.target }}
 
       - name: Install system dependencies
@@ -280,7 +280,7 @@ jobs:
           # matrix target onto whatever stable happens to be and the build
           # then runs on an auto-installed toolchain that lacks it —
           # "Target x86_64-apple-darwin is not installed".
-          toolchain: "1.95"
+          toolchain: "1.97"
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies

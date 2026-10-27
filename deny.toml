@@ -10,13 +10,9 @@ all-features = true
 ignore = [
     # `proc-macro-error2` is unmaintained but used by transitive proc-macro crates.
     { id = "RUSTSEC-2026-0173", reason = "transitive unmaintained dependency; no actionable upgrade path" },
-    # Three zip advisories about `extract()` (symlinks + SUID bits). Syscity reads
-    # entries in memory and never extracts; the only caller of `extract()` in the
-    # tree is tauri-plugin-updater, Windows-only and after signature verification.
-    # Removing the office converters dropped the graph from four zip copies to two.
-    { id = "RUSTSEC-2026-0367", reason = "zip extract()-only advisory; syscity never extracts (reads entries in memory); only caller is tauri-plugin-updater, Windows-only and post-signature-verification" },
-    { id = "RUSTSEC-2026-0368", reason = "zip extract()-only advisory; syscity never extracts; safe by the same analysis as RUSTSEC-2026-0367" },
-    { id = "RUSTSEC-2026-0369", reason = "zip extract()-only advisory; syscity never extracts; safe by the same analysis as RUSTSEC-2026-0367" },
+    # The three zip `extract()` advisories (RUSTSEC-2026-0367/0368/0369) are no
+    # longer waived: zip 9 fixes them, and the remaining zip 4.6.1 copy (pulled
+    # by tauri-plugin-updater, Windows-only) is outside their affected range.
     # The three below all flow through ppt-rs 0.2.25's default `pdf-native`
     # feature (pdfrs -> syntect/bincode/yaml-rust, pdfrs -> ttf-parser). We do
     # not use pptx→pdf export, and ppt-rs's default-features=false build is
@@ -78,6 +74,9 @@ allow = [
     "CDLA-Permissive-2.0",
     "0BSD",
     "GPL-3.0",
+    # zip 9's bzip2 feature pulls libbz2-rs-sys (bzip2 v0.6) for reading
+    # bzip2-compressed archives; the license is permissive and GPL-compatible.
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
 
@@ -99,7 +98,7 @@ skip-tree = [
     # config 0.14 uses toml 0.8; other crates pull toml 0.9
     { crate = "config@0.14.1", depth = 5 },
     # wasmtime ecosystem pulls in multiple versions of wasm-encoder, wasmparser, hashbrown, etc.
-    { crate = "wasmtime@48.0.5", depth = 10 },
+    { crate = "wasmtime@50.0.0", depth = 10 },
     # dialoguer pulls console 0.16 alongside our console 0.15 (via other deps)
     { crate = "dialoguer@0.11.0", depth = 5 },
     # itertools duplicates from different upstream crates

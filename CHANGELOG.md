@@ -9,6 +9,35 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
+## [Unreleased]
+
+### Added
+
+- **GAIA Level 1 benchmark.** The official `question_scorer` is wired through the
+  eval harness, with a first 53-task × 3-trial baseline of 70.4% (112/159) recorded
+  in `evals/ledger.md`. See `docs/benchmark.md` §M2 for the method and the failure
+  breakdown.
+
+### Changed
+
+- **MSRV is now Rust 1.97** (was 1.95), required by wasmtime 50. `Cargo.toml`,
+  `rust-toolchain.toml`, the CI workflows, the CI Dockerfile, `README.md` and
+  `docs/build.md` all move together — the MSRV job asserts they agree.
+- **wasmtime 48 → 50, zip 2 → 9** (locked at 9.1.2). zip 9's `ZipFile::name()`
+  returns a `Result<Cow<str>>`; `screen_recorder` now propagates that error instead
+  of comparing the name directly.
+
+### Security
+
+- **The zstd 0.13 advisories are gone** (RUSTSEC-2026-0391/0398/0403). They came
+  from wasmtime's `cache` feature, which syscity never configures — it pulls
+  `wasmtime-internal-cache` → zstd 0.13, a line with no patched release. Building
+  wasmtime with `default-features = false` and without `cache` leaves zstd 0.14
+  (via zip 9.1.2) as the only copy.
+- **The three zip `extract()` waivers (RUSTSEC-2026-0367/0368/0369) are removed**
+  from `deny.toml`: zip 9 fixes them, and `deny.toml`'s `wasmtime@48.0.5`
+  duplicate-tree skip now names `wasmtime@50.0.0`.
+
 ## [0.3.14] - 2026-10-25
 
 ### Highlights
