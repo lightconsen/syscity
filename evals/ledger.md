@@ -11,6 +11,22 @@ compare against this ledger, not memory. See `docs/harness.md` §8.
 |------|--------|-------|----------|-------|------|--------|------|------|--------------|
 | 2026-10-27 02:25 | cc03c7b7 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | full | 112/159 | 70.4% | PASS | gaia_l1_0383a3ee, gaia_l1_1f975693, gaia_l1_23dd907f, gaia_l1_305ac316, gaia_l1_3cef3a44, gaia_l1_46719c30, gaia_l1_4b650a35, gaia_l1_4b6bb5f7, gaia_l1_5d0080c… |
 | 2026-10-27 10:55 | 448bd3d8 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:2 | 1/2 | 50.0% | PASS | gaia_l1_9318445f |
+| 2026-10-27 14:01 | b7922116 | GAIA Level 1 (validation) | deepseek/deepseek-v4-flash | none | only:1 | 1/1 | 100.0% | PASS | - |
+
+## 备注：被剔除的运行
+
+新行由 `append_eval_ledger` 插在本节之前，所以上表可以继续向下追加；本节只记
+"跑了但没有测量的运行"，它们不进表，免得被当成分数。
+
+**被剔除的一次运行（2026-10-27 14:53）**：同 commit 的 P0–P3 验收全量跑在 06:48Z 撞上
+provider 余额耗尽（DeepSeek HTTP 402 `insufficient_balance_error`），159 个 trial 里有
+148 个是瞬时失败、零 token（日志 148 条 402）。只有前 4 个任务有模型参与：
+`0383a3ee` 0%、`11af4e1a` 100%、`1f975693` 100%、`23dd907f` 33.3%（该题第 3 个 trial
+开始 402），其余 49 个任务全部零通过。产出行 `7/159 = 4.4%` 已从表中删除——它衡量的是
+账单，不是能力。harness 已加闸：连续 3 个任务的所有 trial 都零 token 时直接报错退出、
+不写 ledger 行（`src/eval/standalone.rs` 的 `provider_silent`），所以同样的故障下次会在
+第 7 个任务前后停下，而不是安静跑完 53 个。**验收跑需在充值后重跑**：
+`syscity eval run gaia_l1 --full --trials 3 --collect-badcases`。
 
 ## 外部基准（benchmark）
 

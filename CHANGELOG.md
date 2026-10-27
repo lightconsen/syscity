@@ -80,6 +80,11 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **A provider outage is no longer recorded as a score.** Three consecutive tasks whose
+  every trial failed without spending a token now abort the run with an explicit error and
+  write no ledger row — no model answered, so there is nothing to measure. On 2026-10-27 an
+  exhausted DeepSeek balance (HTTP 402) turned 148 of 159 GAIA trials into instant failures
+  and the summary reported `7/159 = 4.4%` as if it were a capability number.
 - **The crate compiles without `simplex` and `browser`.** `add_simplex_channel` referenced `crate::channels::simplex` without a feature gate (every other channel pairs a gated implementation with a `#[cfg(not(…))]` stub), and `InfraState`'s initializer set the `browser`-gated `export_pool` field unconditionally. That is what broke `Eval Nightly` nightly.
 - **`MSRV Check` now checks something.** It ran `cargo check --all-features` on toolchain 1.95 — the same compiler every other job uses, since `rust-toolchain.toml`, `Cargo.toml` `rust-version` and the CI `toolchain:` input all say 1.95. It is now a consistency assertion between those three declarations, which is the property that silently breaks when a value drifts.
 

@@ -475,6 +475,9 @@ pub async fn run_suite(
     let mut tasks_any_passed: Vec<String> = Vec::new();
     let mut tasks_zero_passed: Vec<String> = Vec::new();
     let mut tasks_run = 0usize;
+    // Consecutive tasks whose every trial failed without spending a token —
+    // the signature of a provider that is not answering at all.
+    let mut consecutive_blank_tasks = 0usize;
 
     for task in &tasks_to_run {
         println!("── Task: {} — {} ──", task.id, task.description);
@@ -586,6 +589,24 @@ pub async fn run_suite(
                 if summary.pass_rate < 1.0 {
                     ledger_failed_tasks.push(task.id.clone());
                 }
+
+                // A suite that cannot reach the provider must not be written
+                // down as a score (see `provider_silent`).
+                let answered = summary.per_trial.iter().any(|t| t.token_usage.is_some());
+                if provider_silent(summary.total_trials, summary.at_least_once_success, answered) {
+                    consecutive_blank_tasks += 1;
+                } else {
+                    consecutive_blank_tasks = 0;
+                }
+                if consecutive_blank_tasks >= 3 {
+                    agent.shutdown().await?;
+                    return Err(crate::error::SyscityError::Internal(format!(
+                        "aborting: the last {consecutive_blank_tasks} tasks failed every trial \
+                         without a single model response — the provider is not answering \
+                         (balance, auth or quota). No ledger row was written, because a run \
+                         that never reached the model is not a measurement."
+                    )));
+                }
             }
             Err(e) => {
                 println!(" failed\n");
@@ -655,18 +676,24 @@ pub async fn run_suite(
     } else {
         "full".to_string()
     };
-    append_eval_ledger(
-        &evals_dir,
-        &suite.name,
-        &executor_label,
-        &judge_label,
-        &run_mode,
-        total_passed,
-        total_trials,
-        overall_pass_rate,
-        gate_passed,
-        &ledger_failed_tasks,
-    );
+    if total_trials == 0 {
+        // Every task failed to run, so there is no measurement to record —
+        // a `0/0` row would read as a score of zero.
+        warn!("No trial ran; skipping the ledger row");
+    } else {
+        append_eval_ledger(
+            &evals_dir,
+            &suite.name,
+            &executor_label,
+            &judge_label,
+            &run_mode,
+            total_passed,
+            total_trials,
+            overall_pass_rate,
+            gate_passed,
+            &ledger_failed_tasks,
+        );
+    }
 
     // ── Step 10: Shutdown ──────────────────────────────────────────────────
     agent.shutdown().await?;
@@ -951,9 +978,40 @@ fn eval_search_providers(
     vec![SearchProvider::DuckDuckGo]
 }
 
+/// Whether a task's trials never reached the model at all.
+///
+/// A task that failed every trial without the provider reporting token usage
+/// for any of them was not judged, it was refused — an exhausted balance, a
+/// revoked key, a quota. On 2026-10-27 exactly this turned 148 of 159 trials
+/// into instant HTTP 402 failures, and the run would have recorded 4.4%: a
+/// number about billing, not capability. Real attempts always spend tokens
+/// (the prompt alone is billed), so a full trial set with none is a reliable
+/// signal regardless of how the provider phrased the refusal.
+fn provider_silent(total_trials: usize, any_success: bool, any_usage: bool) -> bool {
+    total_trials > 0 && !any_success && !any_usage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_silent_detects_a_refused_trial_set() {
+        // Every trial failed, and none of them spent a token: the provider
+        // never answered, so the result must not be recorded as a score.
+        assert!(provider_silent(3, false, false));
+    }
+
+    #[test]
+    fn provider_silent_clears_when_the_model_was_reached() {
+        // Failed, but tokens were spent — the provider answered and the
+        // answer was wrong. That is a capability result, not an outage.
+        assert!(!provider_silent(3, false, true));
+        // Passed: the provider obviously answered.
+        assert!(!provider_silent(3, true, true));
+        // No trials ran at all — nothing to conclude.
+        assert!(!provider_silent(0, false, false));
+    }
 
     #[test]
     fn test_append_eval_ledger_creates_and_appends() {
