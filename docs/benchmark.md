@@ -1,16 +1,62 @@
-# 公开基准（Benchmark）接入计划
+# 公开基准（Benchmark）分数与接入
 
 > 状态：M0（契约补全）、M1（BFCL）、M2（GAIA 接入，基线 70.4% → P0–P3 后 78.0%，
 > 答案格式契约已在 9 题子集上验证）已落地；M3–M4 仍是计划。
 > 最后更新：2026-10-28
 > 相关文档：[`harness.md`](harness.md)（评测闭环设计）、[`eval-status.md`](eval-status.md)（方法论与落地状态）、
 > [`../evals/README.md`](../evals/README.md)（本地套件用法）
+>
+> 只想看分数：跳到 [〇、当前分数](#〇当前分数先看这里)。下面是分数背后的选择与做法。
 
 本文回答一个问题：**如何把 τ²-bench、GAIA、BFCL 之类的公开基准接进来，做到通用、自动、不依赖人工判读。**
 
 结论先给：通用性不来自"为每个基准写一套集成"，而来自**一个最小的接口契约**——把
 syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。契约补全后，接入新基准的
 边际成本主要是胶水代码。
+
+---
+
+## 〇、当前分数（先看这里）
+
+分数全部来自各基准的**官方 evaluator**，没有自写判分器。模型统一是
+**`deepseek-v4-flash`**。两套数字的口径不同，不要混着比：
+
+- **BFCL** 走网关的 OpenAI 兼容端点、`raw` 模式——调用方的消息与工具原样透传、由 BFCL
+  自己执行工具，测的是**模型 + 线格式**。
+- **GAIA** 跑 syscity 自己的 Agent 循环——读附件、搜索、抓取、浏览都由 syscity 完成，
+  测的是**整条栈**：系统提示、工具描述、迭代预算、模型。
+
+### BFCL
+
+[Berkeley Function Calling Leaderboard](https://gorilla.cs.berkeley.edu/leaderboard.html)，
+`bfcl-eval 2026.3.23`，840 条，全程无人工干预：
+
+| 子类目 | 准确率 |
+|---|---|
+| `simple_python` — 单次调用，Python 风格类型 | **91.50%** (366/400) |
+| `irrelevance` — 不调用才是正确答案 | **72.92%** (175/240) |
+| `multi_turn_base` — 五轮携带工具状态 | **66.00%** (132/200) |
+
+单轮运行的类目分数自带 ±2–4 个百分点的抖动（下方 §M1 有逐题翻转的实测），所以更小的
+差值不是信号。复现脚本：`evals/benchmarks/bfcl_syscity.py`。
+
+### GAIA
+
+[GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1，
+53 题 × 3 trials，判分用基准官方的 `question_scorer`：
+
+| 指标 | 基线 `cc03c7b7` | P0–P3 后 `d71cb378` |
+|---|---|---|
+| trial 通过 | 70.4% (112/159) | **78.0%** (124/159) |
+| 3 次全过的题 | 54.7% (29/53) | **62.3%** (33/53) |
+| 至少过 1 次的题 | 84.9% (45/53) | **94.3%** (50/53) |
+
+同一题的 3 个 trial 共享提示与模型，不是独立样本，**任务口径是稳定读数**。这个数字也
+不能直接和公开 leaderboard 比：GAIA 对 scaffolding 极度敏感，换一套 harness 就是另一个
+数。它的用途是给本仓库自己定基线，看改动是升还是降。方法与失败拆解见 §M2，逐行记录见
+[`../evals/ledger.md`](../evals/ledger.md)。
+
+τ²-bench 是下一步（§M3）。
 
 ---
 

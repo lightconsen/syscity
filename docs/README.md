@@ -27,6 +27,14 @@ agents perceive and act on your computer.
 | [State Snapshot](state-snapshot.md) | State capture / restore |
 | [Tools Testing](tools_testing.md) | How tools are tested |
 
+## Benchmarks & evals
+
+| Doc | What it covers |
+|-----|----------------|
+| [Benchmark Results](benchmark.md) | Current BFCL / GAIA scores first, then the plan and method for public benchmarks |
+| [Eval Harness](harness.md) | The eval loop: suites, trials, judges, badcases, the ledger |
+| [Eval Status](eval-status.md) | Methodology and what is landed |
+
 ## Module reference
 
 Per-module design docs live in [`modules/`](modules/). Each maps to a

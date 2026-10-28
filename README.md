@@ -50,45 +50,16 @@ curl -sSL https://syscity.net/install.sh | bash
 ## Benchmarks
 
 Scores come from each benchmark's **official evaluator**, never a homegrown
-scorer. Model: **`deepseek-v4-flash`** throughout. BFCL drives the gateway's
-OpenAI-compatible endpoint in `raw` mode — the caller's messages and tools are
-passed through and the harness executes the calls — so it measures the model
-plus the wire. GAIA runs syscity's built-in agent loop end to end.
+scorer. Model: **`deepseek-v4-flash`** throughout.
 
-### BFCL
+| Benchmark | What it measures | Score |
+|---|---|---|
+| [BFCL](https://gorilla.cs.berkeley.edu/leaderboard.html) `bfcl-eval 2026.3.23` | the model plus the OpenAI-compatible wire (`raw` mode) | **80.12%** (673/840) over two runs (78.81% then 80.12%, a difference inside the noise floor) |
+| [GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1 | syscity's own agent loop, end to end | **78.0%** (124/159 trials), from a 70.4% baseline before the retrieval and answer-format work |
 
-[Berkeley Function Calling Leaderboard](https://gorilla.cs.berkeley.edu/leaderboard.html),
-`bfcl-eval 2026.3.23`, 840 entries, no human in the loop:
-
-| Category | Accuracy |
-|---|---|
-| `simple_python` — one call, Python-style types | **91.50%** (366/400) |
-| `irrelevance` — no call is the right answer | **72.92%** (175/240) |
-| `multi_turn_base` — five turns carrying tool state | **66.00%** (132/200) |
-
-A single pass carries ±2–4 points of run-to-run noise per category, so smaller
-deltas are not signal. Reproduce with
-[`evals/benchmarks/bfcl_syscity.py`](evals/benchmarks/bfcl_syscity.py); the
-method and the noise measurement are in [docs/benchmark.md](docs/benchmark.md).
-
-### GAIA
-
-[GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1,
-53 tasks × 3 trials, judged by the benchmark's official `question_scorer`:
-
-| Metric | Score |
-|---|---|
-| Trials passed | **70.4%** (112/159) |
-| Tasks passing all three trials | **54.7%** (29/53) |
-| Tasks passing at least once | **84.9%** (45/53) |
-
-Unlike BFCL, this runs syscity's **own agent loop** — reading attachments,
-searching, fetching and browsing — so the number covers the whole stack:
-system prompt, tool descriptions, iteration budget, and the model. Trials of
-the same task share a prompt and are not independent samples; the task-level
-figures are the stable readout. It is also not comparable to the public
-leaderboard, where scaffolding differs per entry. τ²-bench is next; method and
-the failure breakdown are in [docs/benchmark.md](docs/benchmark.md) §M2.
+Finer-grained tables, the method behind each number, the measured noise floor,
+reproduction steps and the failure breakdown are in
+**[docs/benchmark.md](docs/benchmark.md)**. τ²-bench is next.
 
 ## Overview
 
