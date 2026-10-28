@@ -59,6 +59,7 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
                 "has_api_key": !config.search.api_key.is_empty(),
                 "keys": {
                     "tavily": (!config.search.keys.get("tavily").is_none_or(|k| k.is_empty())).to_string(),
+                    "deepseek": (!config.search.keys.get("deepseek").is_none_or(|k| k.is_empty())).to_string(),
                     "serpapi": (!config.search.keys.get("serpapi").is_none_or(|k| k.is_empty())).to_string(),
                     "exa": (!config.search.keys.get("exa").is_none_or(|k| k.is_empty())).to_string(),
                     "firecrawl": (!config.search.keys.get("firecrawl").is_none_or(|k| k.is_empty())).to_string(),

@@ -6,6 +6,7 @@ import { Section } from "@/components/ui/Section";
 const SEARCH_PROVIDERS = [
   { id: "duckduckgo", label: "DuckDuckGo", needsKey: false },
   { id: "tavily", label: "Tavily", needsKey: true },
+  { id: "deepseek", label: "DeepSeek", needsKey: true },
   { id: "serpapi", label: "SerpAPI", needsKey: true },
   { id: "exa", label: "Exa", needsKey: true },
   { id: "firecrawl", label: "Firecrawl", needsKey: true },

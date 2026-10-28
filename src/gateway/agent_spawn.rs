@@ -981,6 +981,11 @@ pub(crate) struct ToolRegistryArgs {
     pub content_filter: Option<Arc<crate::security::content_filter::ContentFilter>>,
     /// Search provider configuration.
     pub search_config: crate::gateway::config::SearchConfig,
+    /// The DeepSeek API key, when one is configured for a DeepSeek model
+    /// provider. DeepSeek's Search API takes the same key, so a deployment
+    /// that lists `deepseek` in `[search] providers` need not repeat it in
+    /// `[search.keys]`. `None` on every other deployment.
+    pub deepseek_search_key: Option<String>,
     /// Browser configuration (`[browser]`: pool sizing and profiles).
     #[cfg(feature = "browser")]
     pub browser_config: crate::config::BrowserConfig,
@@ -1026,6 +1031,7 @@ pub(crate) async fn create_default_tool_registry(
         audit_log,
         content_filter,
         search_config,
+        deepseek_search_key,
         #[cfg(feature = "browser")]
         browser_config,
         #[cfg(feature = "cloud")]
@@ -1092,9 +1098,11 @@ pub(crate) async fn create_default_tool_registry(
     // provider so logged-in sessions search via `/v1/search` (session token
     // resolved dynamically) — no local search key needed.
     #[cfg(feature = "cloud")]
-    let mut search_providers = search_config.to_providers();
+    let mut search_providers =
+        search_config.to_providers_with_model_key(deepseek_search_key.as_deref());
     #[cfg(not(feature = "cloud"))]
-    let search_providers = search_config.to_providers();
+    let search_providers =
+        search_config.to_providers_with_model_key(deepseek_search_key.as_deref());
     #[cfg(feature = "cloud")]
     if cloud_config.enabled {
         search_providers.insert(

@@ -475,7 +475,19 @@ pub(crate) async fn register_hot_reload_handlers(
                         info!("Search config changed, updating web_search tool...");
                         let search_providers = {
                             let cfg = state.config.read().await;
-                            cfg.search.to_providers()
+                            // Re-resolve the DeepSeek key from the provider
+                            // config the reload just applied. Without this a
+                            // reload would rebuild the chain keyless and
+                            // silently drop the DeepSeek search provider.
+                            let deepseek_key = match cfg.providers.get("deepseek") {
+                                Some(p) => {
+                                    let key = p.effective_key(Some(&state.secrets)).await;
+                                    (!key.trim().is_empty()).then_some(key)
+                                }
+                                None => None,
+                            };
+                            cfg.search
+                                .to_providers_with_model_key(deepseek_key.as_deref())
                         };
 
                         if let Some(providers) = state.tools.registry.web_search_providers() {

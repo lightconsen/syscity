@@ -257,8 +257,18 @@ pub async fn run_suite(
     let acp = Arc::new(AcpControlPlane::new(50));
 
     // ── Step 5: Create tool registry ────────────────────────────────────────
-    let tool_registry =
-        create_eval_tool_registry(Some(acp.clone()), gateway_cfg.as_ref().map(|g| &g.search));
+    // The model key doubles as the search key when the model provider is
+    // DeepSeek: its Search API takes the same bearer token.
+    let deepseek_search_key = if provider_type == "deepseek" {
+        api_key.as_deref()
+    } else {
+        None
+    };
+    let tool_registry = create_eval_tool_registry(
+        Some(acp.clone()),
+        gateway_cfg.as_ref().map(|g| &g.search),
+        deepseek_search_key,
+    );
     let tool_registry = Arc::new(tool_registry);
 
     // ── Step 6: Set up agent builder on ACP (needed for acp_spawn) ──────────
@@ -885,6 +895,7 @@ async fn try_load_gateway_config() -> Option<GatewayConfig> {
 fn create_eval_tool_registry(
     acp: Option<Arc<AcpControlPlane>>,
     search_cfg: Option<&crate::gateway::config::SearchConfig>,
+    deepseek_search_key: Option<&str>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ShellTool::new()));
@@ -893,7 +904,7 @@ fn create_eval_tool_registry(
     registry.register(Box::new(FileEditTool::new()));
     registry.register(Box::new(GrepTool::new()));
     registry.register(Box::new(GlobTool::new()));
-    let search_providers = eval_search_providers(search_cfg);
+    let search_providers = eval_search_providers(search_cfg, deepseek_search_key);
     let shared = std::sync::Arc::new(tokio::sync::RwLock::new(search_providers));
     registry.register(Box::new(WebSearchTool::new().with_providers_arc(shared)));
     registry.register(Box::new(WebFetchTool::new()));
@@ -939,39 +950,66 @@ fn eval_permissions(allow: Vec<String>) -> Arc<PermissionsRuntime> {
 /// config wins; otherwise any `*_API_KEY` env var for a known provider
 /// enables it (CI path — DuckDuckGo HTML scraping is blocked on datacenter
 /// IPs); DuckDuckGo remains the last-resort fallback.
+///
+/// `model_search_key` is the DeepSeek key already resolved for the model
+/// provider, or `None` when the run is not on DeepSeek. DeepSeek's Search API
+/// is authenticated by that same key, so an eval run on DeepSeek has a working
+/// search backend without a second subscription. When it is present and the
+/// configured chain does not already name `deepseek`, it is appended before
+/// the DuckDuckGo fallback — a benchmark should not measure a search quota
+/// rather than the agent.
 fn eval_search_providers(
     search_cfg: Option<&crate::gateway::config::SearchConfig>,
+    model_search_key: Option<&str>,
 ) -> Vec<crate::tools::web::SearchProvider> {
     use crate::tools::web::SearchProvider;
 
-    if let Some(cfg) = search_cfg {
-        return cfg.to_providers();
-    }
+    let mut providers = match search_cfg {
+        Some(cfg) => cfg.to_providers_with_model_key(model_search_key),
+        None => {
+            const ENV_KEYS: &[(&str, &str)] = &[
+                ("tavily", "TAVILY_API_KEY"),
+                ("brave", "BRAVE_API_KEY"),
+                ("serper", "SERPER_API_KEY"),
+                ("exa", "EXA_API_KEY"),
+                ("firecrawl", "FIRECRAWL_API_KEY"),
+                ("bocha", "BOCHA_API_KEY"),
+                ("serpapi", "SERPAPI_API_KEY"),
+            ];
+            let detected: Vec<SearchProvider> = ENV_KEYS
+                .iter()
+                .filter_map(|(name, var)| {
+                    std::env::var(var)
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .and_then(|k| SearchProvider::from_config_name(name, Some(k)))
+                })
+                .collect();
+            if detected.is_empty() {
+                vec![SearchProvider::DuckDuckGo]
+            } else {
+                detected
+            }
+        }
+    };
 
-    const ENV_KEYS: &[(&str, &str)] = &[
-        ("tavily", "TAVILY_API_KEY"),
-        ("brave", "BRAVE_API_KEY"),
-        ("serper", "SERPER_API_KEY"),
-        ("exa", "EXA_API_KEY"),
-        ("firecrawl", "FIRECRAWL_API_KEY"),
-        ("bocha", "BOCHA_API_KEY"),
-        ("serpapi", "SERPAPI_API_KEY"),
-    ];
-    let mut providers: Vec<SearchProvider> = ENV_KEYS
+    let Some(key) = model_search_key.filter(|k| !k.trim().is_empty()) else {
+        return providers;
+    };
+    if providers
         .iter()
-        .filter_map(|(name, var)| {
-            std::env::var(var)
-                .ok()
-                .filter(|k| !k.trim().is_empty())
-                .and_then(|k| SearchProvider::from_config_name(name, Some(k)))
-        })
-        .collect();
-    if !providers.is_empty() {
-        providers.push(SearchProvider::DuckDuckGo);
+        .any(|p| matches!(p, SearchProvider::DeepSeek { .. }))
+    {
         return providers;
     }
-
-    vec![SearchProvider::DuckDuckGo]
+    // Ahead of DuckDuckGo: scraping is the fallback of last resort, and on a
+    // datacenter IP (CI) it returns a block page rather than results.
+    let at = providers
+        .iter()
+        .position(|p| matches!(p, SearchProvider::DuckDuckGo))
+        .unwrap_or(providers.len());
+    providers.insert(at, SearchProvider::DeepSeek { api_key: key.to_string() });
+    providers
 }
 
 /// Text appended to the agent's system prompt for an eval run.
@@ -1046,6 +1084,106 @@ mod tests {
             prompt.contains("that format wins over this guidance"),
             "the task's own format must win"
         );
+    }
+
+    /// An eval run on DeepSeek must be able to search even when `[search]`
+    /// names only a provider whose quota is gone. The DeepSeek key is already
+    /// in hand, and its Search API takes it directly.
+    #[test]
+    fn deepseek_search_sits_ahead_of_the_duckduckgo_fallback() {
+        use crate::gateway::config::SearchConfig;
+        use crate::tools::web::SearchProvider;
+
+        let cfg = SearchConfig {
+            provider: "tavily".to_string(),
+            providers: vec!["tavily".to_string()],
+            api_key: String::new(),
+            keys: [("tavily".to_string(), "tvly-key".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let providers = eval_search_providers(Some(&cfg), Some("sk-deepseek"));
+
+        let names: Vec<&str> = providers
+            .iter()
+            .map(|p| match p {
+                SearchProvider::Tavily { .. } => "tavily",
+                SearchProvider::DeepSeek { .. } => "deepseek",
+                SearchProvider::DuckDuckGo => "duckduckgo",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(names, vec!["tavily", "deepseek"], "deepseek must follow the configured chain");
+    }
+
+    /// When the chain already ends in scraping, the keyed provider goes
+    /// ahead of it: DuckDuckGo returns a block page on datacenter IPs, so it
+    /// is the fallback of last resort, not a peer.
+    #[test]
+    fn deepseek_precedes_an_explicit_duckduckgo_entry() {
+        use crate::gateway::config::SearchConfig;
+        use crate::tools::web::SearchProvider;
+
+        let cfg = SearchConfig {
+            provider: "duckduckgo".to_string(),
+            providers: vec!["duckduckgo".to_string()],
+            api_key: String::new(),
+            keys: Default::default(),
+        };
+        let providers = eval_search_providers(Some(&cfg), Some("sk-deepseek"));
+        match providers.as_slice() {
+            [SearchProvider::DeepSeek { api_key }, SearchProvider::DuckDuckGo] => {
+                assert_eq!(api_key, "sk-deepseek")
+            }
+            other => panic!("expected deepseek then duckduckgo, got {other:?}"),
+        }
+    }
+
+    /// Without the key (a run on some other provider) nothing is invented —
+    /// a keyless DeepSeek entry would be a doomed round-trip per search.
+    #[test]
+    fn no_deepseek_entry_without_a_key() {
+        use crate::gateway::config::SearchConfig;
+        use crate::tools::web::SearchProvider;
+
+        let cfg = SearchConfig {
+            provider: "tavily".to_string(),
+            providers: vec!["tavily".to_string()],
+            api_key: String::new(),
+            keys: [("tavily".to_string(), "tvly-key".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let providers = eval_search_providers(Some(&cfg), None);
+        assert!(
+            !providers
+                .iter()
+                .any(|p| matches!(p, SearchProvider::DeepSeek { .. })),
+            "no key, no DeepSeek provider"
+        );
+    }
+
+    /// A chain that already names `deepseek` must not get a second copy, and
+    /// an explicit `[search.keys].deepseek` wins over the model key.
+    #[test]
+    fn explicit_deepseek_configuration_is_not_duplicated() {
+        use crate::gateway::config::SearchConfig;
+        use crate::tools::web::SearchProvider;
+
+        let cfg = SearchConfig {
+            provider: "deepseek".to_string(),
+            providers: vec!["deepseek".to_string()],
+            api_key: String::new(),
+            keys: [("deepseek".to_string(), "sk-explicit".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let providers = eval_search_providers(Some(&cfg), Some("sk-model"));
+        assert_eq!(providers.len(), 1, "one entry, not two: {providers:?}");
+        match &providers[0] {
+            SearchProvider::DeepSeek { api_key } => assert_eq!(api_key, "sk-explicit"),
+            other => panic!("expected DeepSeek, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1168,7 +1306,7 @@ mod tests {
     /// `requires_approval` tools run instead of failing closed.
     #[test]
     fn every_eval_tool_is_pre_approved() {
-        let registry = create_eval_tool_registry(None, None);
+        let registry = create_eval_tool_registry(None, None, None);
         let names = registry.list();
         assert!(names.contains(&"shell".to_string()), "shell is part of the eval set");
         assert!(names.contains(&"file_read".to_string()), "file_read is part of the eval set");
@@ -1192,7 +1330,7 @@ mod tests {
     /// a tool that was not registered cannot be reachable by name.
     #[test]
     fn unregistered_tools_stay_out_of_the_allow_list() {
-        let registry = create_eval_tool_registry(None, None);
+        let registry = create_eval_tool_registry(None, None, None);
         let decision = registry.permissions().evaluate(
             "desktop_screenshot",
             &serde_json::json!({}),

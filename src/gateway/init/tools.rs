@@ -370,6 +370,17 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 audit_log: audit_log_dyn,
                 content_filter: Some(Arc::new(ContentFilter::default())),
                 search_config: config.search.clone(),
+                // DeepSeek's Search API is authenticated by the same key as
+                // its chat models. Resolve it once, here, so `[search]` does
+                // not have to repeat a key the config already holds (possibly
+                // behind a secret-store reference).
+                deepseek_search_key: match config.providers.get("deepseek") {
+                    Some(p) => {
+                        let key = p.effective_key(Some(&secrets)).await;
+                        (!key.trim().is_empty()).then_some(key)
+                    }
+                    None => None,
+                },
                 #[cfg(feature = "browser")]
                 browser_config: config.browser.clone(),
                 #[cfg(feature = "cloud")]

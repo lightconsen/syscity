@@ -197,7 +197,8 @@ fn missing_credential(provider: &SearchProvider) -> Option<&'static str> {
         | SearchProvider::Exa { api_key }
         | SearchProvider::Firecrawl { api_key }
         | SearchProvider::Serper { api_key }
-        | SearchProvider::Bocha { api_key } => api_key.trim().is_empty().then_some("api_key"),
+        | SearchProvider::Bocha { api_key }
+        | SearchProvider::DeepSeek { api_key } => api_key.trim().is_empty().then_some("api_key"),
         #[cfg(feature = "cloud")]
         SearchProvider::Cloud { .. } => None,
         SearchProvider::Custom { url, .. } => url.trim().is_empty().then_some("url"),
@@ -636,6 +637,10 @@ pub enum SearchProvider {
     /// Bocha AI Web Search API (requires key)
     /// <https://bochaai.com/>
     Bocha { api_key: String },
+    /// DeepSeek Search API (requires key — the same DeepSeek API key the model
+    /// provider uses).
+    /// <https://api-docs.deepseek.com/zh-cn/guides/search>
+    DeepSeek { api_key: String },
     /// Syscity Cloud web search (`/v1/search`, session-token auth; feature
     /// `cloud`). Normalized results identical in shape to the local providers.
     #[cfg(feature = "cloud")]
@@ -657,6 +662,7 @@ impl SearchProvider {
             "firecrawl" => Some(SearchProvider::Firecrawl { api_key: key }),
             "serper" => Some(SearchProvider::Serper { api_key: key }),
             "bocha" => Some(SearchProvider::Bocha { api_key: key }),
+            "deepseek" => Some(SearchProvider::DeepSeek { api_key: key }),
             "duckduckgo" => Some(SearchProvider::DuckDuckGo),
             "brave" => Some(SearchProvider::Brave { api_key: key }),
             _ => None,
@@ -750,10 +756,63 @@ fn provider_name(provider: &SearchProvider) -> &'static str {
         SearchProvider::Firecrawl { .. } => "firecrawl",
         SearchProvider::Serper { .. } => "serper",
         SearchProvider::Bocha { .. } => "bocha",
+        SearchProvider::DeepSeek { .. } => "deepseek",
         #[cfg(feature = "cloud")]
         SearchProvider::Cloud { .. } => "cloud",
         SearchProvider::Custom { .. } => "custom",
     }
+}
+
+/// Normalize a DeepSeek `/v1/tools/search` response into [`SearchResult`]s.
+///
+/// Split out from the request so the field mapping — three text fields with
+/// different audiences, and a `content` that is empty whenever the caller did
+/// not ask for it — is testable without a network round-trip.
+///
+/// `snippet` vs `summary`: DeepSeek documents `snippet` as 100–200 chars for a
+/// UI and `summary` as 600–800 chars "for a model to read". Every caller here
+/// is a model, so `summary` wins and `snippet` is the fallback. Advanced depth
+/// prefers `content` (the page body) over both, and falls back when the page
+/// had no extractable text.
+fn parse_deepseek_results(
+    data: &serde_json::Value,
+    limit: usize,
+    depth: SearchDepth,
+) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let Some(items) = data["results"].as_array() else {
+        return results;
+    };
+    for item in items.iter() {
+        let title = item["title"].as_str().unwrap_or("");
+        let url = item["url"].as_str().unwrap_or("");
+        // A result with no title or no link cannot be cited or fetched, and
+        // would render as an empty line in the tool output. Skipped before the
+        // limit is counted, so an unusable result does not consume a slot.
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        if results.len() >= limit {
+            break;
+        }
+        let snippet = match (depth, item["content"].as_str()) {
+            (SearchDepth::Advanced, Some(body)) if !body.trim().is_empty() => {
+                truncate_chars(body.trim(), FETCHED_PAGE_CHARS)
+            }
+            _ => item["summary"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| item["snippet"].as_str())
+                .unwrap_or("")
+                .to_string(),
+        };
+        results.push(SearchResult {
+            title: title.to_string(),
+            url: url.to_string(),
+            snippet,
+        });
+    }
+    results
 }
 
 impl WebSearchTool {
@@ -836,6 +895,9 @@ impl WebSearchTool {
                     self.search_serper(api_key, query, limit).await
                 }
                 SearchProvider::Bocha { api_key } => self.search_bocha(api_key, query, limit).await,
+                SearchProvider::DeepSeek { api_key } => {
+                    self.search_deepseek(api_key, query, limit, depth).await
+                }
                 #[cfg(feature = "cloud")]
                 SearchProvider::Cloud { api_base } => {
                     self.search_cloud(api_base, query, limit).await
@@ -1443,6 +1505,64 @@ impl WebSearchTool {
         }
 
         Ok(results)
+    }
+
+    /// Search via DeepSeek's Search API.
+    ///
+    /// Authenticated with the same bearer key the model provider uses, so a
+    /// DeepSeek-backed deployment needs no separate search subscription.
+    /// `count` is capped at 50 by the API; `need_content` is what makes an
+    /// Advanced search worth its extra tokens — it returns page text in
+    /// `content`, saving the follow-up fetch.
+    ///
+    /// The response also carries `summary` (600–800 chars, written for a model
+    /// to read) alongside `snippet` (100–200 chars, written for a UI). Basic
+    /// depth prefers `summary`: the caller here is always a model, and the
+    /// longer text is the reason to pay for a structured search provider at
+    /// all. `snippet` is the fallback when `summary` is absent.
+    async fn search_deepseek(
+        &self,
+        api_key: &str,
+        query: &str,
+        limit: usize,
+        depth: SearchDepth,
+    ) -> crate::Result<Vec<SearchResult>> {
+        let mut body = serde_json::json!({
+            "query": query,
+            "count": limit.clamp(1, 50),
+        });
+        if depth == SearchDepth::Advanced {
+            body["need_content"] = serde_json::json!(true);
+        }
+
+        let response = self
+            .client
+            .post("https://api.deepseek.com/v1/tools/search")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::error::SyscityError::Internal(format!("DeepSeek search failed: {}", e))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(crate::error::SyscityError::Internal(format!(
+                "DeepSeek search failed: HTTP {} - {}",
+                status, body_text
+            )));
+        }
+
+        let data: serde_json::Value = response.json().await.map_err(|e| {
+            crate::error::SyscityError::Internal(format!(
+                "Failed to parse DeepSeek search response: {}",
+                e
+            ))
+        })?;
+
+        Ok(parse_deepseek_results(&data, limit, depth))
     }
 
     /// Search via Syscity Cloud `/v1/search` (feature `cloud`). Requires a
@@ -2153,6 +2273,112 @@ mod tests {
                 result_parser: None
             }),
             Some("url")
+        );
+    }
+
+    // ── DeepSeek search ─────────────────────────────────────────────────────
+
+    /// Basic depth reads `summary` (the long, model-facing text), not
+    /// `snippet` (the short, UI-facing one). Getting this backwards silently
+    /// costs every result its context without failing anything.
+    #[test]
+    fn deepseek_basic_depth_prefers_summary_over_snippet() {
+        let data = serde_json::json!({
+            "results": [{
+                "title": "DeepSeek V4",
+                "url": "https://example.com/v4",
+                "snippet": "short ui text",
+                "summary": "the long summary written for the model",
+                "content": "",
+            }]
+        });
+        let results = parse_deepseek_results(&data, 10, SearchDepth::Basic);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].snippet, "the long summary written for the model");
+    }
+
+    /// Advanced depth asked for `need_content`; the page body must replace the
+    /// summary, since avoiding a follow-up `web_fetch` is the whole point.
+    #[test]
+    fn deepseek_advanced_depth_prefers_content() {
+        let data = serde_json::json!({
+            "results": [{
+                "title": "T",
+                "url": "https://example.com/a",
+                "snippet": "s",
+                "summary": "the summary",
+                "content": "the full page body",
+            }]
+        });
+        let results = parse_deepseek_results(&data, 10, SearchDepth::Advanced);
+        assert_eq!(results[0].snippet, "the full page body");
+    }
+
+    /// An Advanced search whose page had no extractable text comes back with
+    /// `content: ""`. It must fall back rather than hand the model an empty
+    /// snippet.
+    #[test]
+    fn deepseek_empty_content_falls_back_to_summary() {
+        let data = serde_json::json!({
+            "results": [{
+                "title": "T",
+                "url": "https://example.com/a",
+                "snippet": "s",
+                "summary": "the summary",
+                "content": "   ",
+            }]
+        });
+        let results = parse_deepseek_results(&data, 10, SearchDepth::Advanced);
+        assert_eq!(results[0].snippet, "the summary");
+    }
+
+    /// Missing `summary` falls through to `snippet`; a result with no title or
+    /// no url is dropped, and `limit` is honoured.
+    #[test]
+    fn deepseek_skips_unusable_results_and_respects_limit() {
+        let data = serde_json::json!({
+            "results": [
+                { "title": "", "url": "https://example.com/1", "snippet": "no title" },
+                { "title": "no url", "url": "", "snippet": "x" },
+                { "title": "A", "url": "https://example.com/a", "snippet": "fallback text" },
+                { "title": "B", "url": "https://example.com/b", "snippet": "second" },
+            ]
+        });
+        let results = parse_deepseek_results(&data, 1, SearchDepth::Basic);
+        assert_eq!(results.len(), 1, "limit must cap the returned results");
+        assert_eq!(results[0].title, "A");
+        assert_eq!(results[0].snippet, "fallback text");
+    }
+
+    /// A malformed payload (no `results` key, or the wrong type) is an empty
+    /// result set, not a panic.
+    #[test]
+    fn deepseek_malformed_payload_yields_no_results() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({ "results": "not an array" }),
+            serde_json::json!({ "results": [] }),
+        ] {
+            assert!(parse_deepseek_results(&data, 10, SearchDepth::Basic).is_empty());
+        }
+    }
+
+    /// The same DeepSeek key serves both roles; an absent one is a config gap
+    /// the caller reports without spending a round-trip.
+    #[test]
+    fn deepseek_requires_a_key() {
+        assert_eq!(
+            missing_credential(&SearchProvider::DeepSeek { api_key: "  ".to_string() }),
+            Some("api_key")
+        );
+        assert_eq!(
+            missing_credential(&SearchProvider::DeepSeek { api_key: "sk-x".to_string() }),
+            None
+        );
+        assert_eq!(
+            SearchProvider::from_config_name("deepseek", Some("sk-x".into()))
+                .map(|p| provider_name(&p)),
+            Some("deepseek")
         );
     }
 

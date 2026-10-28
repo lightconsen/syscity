@@ -747,14 +747,32 @@ impl SearchConfig {
     /// Unknown names are skipped with a warning; an empty result falls back
     /// to DuckDuckGo so the search tool is never left provider-less.
     pub fn to_providers(&self) -> Vec<crate::tools::web::SearchProvider> {
+        self.to_providers_with_model_key(None)
+    }
+
+    /// [`Self::to_providers`], plus a fallback key for the DeepSeek search
+    /// provider.
+    ///
+    /// DeepSeek's Search API is authenticated by the same key as its chat
+    /// models, so a deployment already running DeepSeek has a working search
+    /// backend without configuring `[search]` a second time. The key cannot be
+    /// read here — it lives on the provider config, possibly behind a secret
+    /// store reference — so the caller resolves it and passes it in. When it
+    /// is absent the provider is dropped rather than added keyless, which
+    /// would turn a missing credential into a doomed round-trip on every
+    /// search.
+    pub fn to_providers_with_model_key(
+        &self,
+        deepseek_key: Option<&str>,
+    ) -> Vec<crate::tools::web::SearchProvider> {
         let mut providers: Vec<crate::tools::web::SearchProvider> = self
             .provider_list()
             .iter()
             .filter_map(|name| {
-                match crate::tools::web::SearchProvider::from_config_name(
-                    name,
-                    self.api_key_for(name),
-                ) {
+                let key = self.api_key_for(name).or_else(|| {
+                    (name == "deepseek").then(|| deepseek_key.unwrap_or_default().to_string())
+                });
+                match crate::tools::web::SearchProvider::from_config_name(name, key) {
                     Some(p) => Some(p),
                     None => {
                         tracing::warn!("Unknown search provider '{}', skipping", name);
