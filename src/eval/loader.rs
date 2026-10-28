@@ -215,6 +215,13 @@ struct YamlManifest {
     sampling_rate: Option<f64>,
     #[serde(default)]
     agent_type: Option<String>,
+    /// The task files this manifest references are generated on the local
+    /// machine rather than committed (GAIA: the dataset's terms forbid
+    /// redistribution, and attachment paths are absolute). The manifest itself
+    /// is committed so `eval run <suite>` works, but validation must not treat
+    /// a fresh clone as a broken manifest.
+    #[serde(default)]
+    generated_tasks: bool,
     #[serde(default)]
     tasks: Vec<YamlTaskRef>,
     #[serde(flatten)]
@@ -343,6 +350,46 @@ pub fn load_tasks(yaml_path: &Path) -> Result<LoadedTaskFile> {
     })
 }
 
+/// Whether a suite manifest declares its task files as machine-generated
+/// (`generated_tasks: true`).
+///
+/// Such a manifest is committed while its task files are not, so callers that
+/// validate the repository (as opposed to running a suite) must skip it on a
+/// machine where the importer has not run. Returns `false` for a manifest that
+/// does not exist or cannot be parsed — the caller's own load will report why.
+pub fn suite_declares_generated_tasks(manifest_path: &Path) -> bool {
+    std::fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|content| serde_norway::from_str::<YamlManifest>(&content).ok())
+        .is_some_and(|manifest| manifest.generated_tasks)
+}
+
+/// Load a task file, naming the importer when the manifest said its files are
+/// generated. A generated suite's task file is absent until the importer runs,
+/// and "No such file or directory" does not tell anyone what to do about it.
+/// A present-but-unparseable file keeps its own error: that is a different
+/// problem, and pointing at the importer would send the reader down the wrong
+/// path.
+fn load_tasks_with_hint(yaml_path: &Path, generated_tasks: bool) -> Result<LoadedTaskFile> {
+    load_tasks(yaml_path).map_err(|e| {
+        if generated_tasks && !yaml_path.exists() {
+            // Append to the message rather than wrapping it: `Validation`
+            // already renders a "Validation error:" prefix, and nesting one
+            // inside another reads as a stutter.
+            let hint = " — this suite's task files are generated per machine, not \
+                        committed; run the importer named in the manifest header first";
+            match e {
+                crate::error::SyscityError::Validation(message) => {
+                    crate::error::SyscityError::Validation(format!("{message}{hint}"))
+                }
+                other => other,
+            }
+        } else {
+            e
+        }
+    })
+}
+
 /// Load a named suite from a manifest file, resolving all referenced task
 /// files and building a single [`EvalSuite`].
 ///
@@ -370,7 +417,7 @@ pub fn load_suite(manifest_path: &Path, suite_name: &str) -> Result<EvalSuite> {
     // 1. Flat `tasks:` list (ci_smoke.yaml style)
     for task_ref in &manifest.tasks {
         let task_path = resolve_path(manifest_dir, &task_ref.path);
-        let loaded = load_tasks(&task_path)?;
+        let loaded = load_tasks_with_hint(&task_path, manifest.generated_tasks)?;
         let filtered: Vec<(String, String)> = loaded
             .tasks
             .into_iter()
@@ -434,11 +481,13 @@ pub fn load_suite(manifest_path: &Path, suite_name: &str) -> Result<EvalSuite> {
     });
     all_entries.dedup_by(|a, b| a.task_path == b.task_path && a.task_filter == b.task_filter);
 
-    // Load all tasks
+    // Load all tasks. A manifest that declares `generated_tasks` references
+    // files produced on the local machine, so a missing one is the expected
+    // first-run state and gets the regeneration hint rather than a bare ENOENT.
     let mut tasks = Vec::new();
     let mut skill_designs = Vec::new();
     for entry in &all_entries {
-        let loaded = load_tasks(&entry.task_path)?;
+        let loaded = load_tasks_with_hint(&entry.task_path, manifest.generated_tasks)?;
         if let Some(skill) = loaded.skill_design {
             skill_designs.push(skill);
         }
@@ -860,5 +909,40 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("syscity-no-such-suite.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_declares_whether_its_task_files_are_generated() {
+        let dir = std::env::temp_dir().join(format!("syscity-gen-tasks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let generated = dir.join("generated.yaml");
+        std::fs::write(
+            &generated,
+            "name: G\ntrials: 1\ngenerated_tasks: true\ntasks:\n  - id: g\n    path: \"nope.yaml\"\n",
+        )
+        .expect("write");
+        assert!(suite_declares_generated_tasks(&generated));
+
+        let committed = dir.join("committed.yaml");
+        std::fs::write(
+            &committed,
+            "name: C\ntrials: 1\ntasks:\n  - id: c\n    path: \"nope.yaml\"\n",
+        )
+        .expect("write");
+        assert!(!suite_declares_generated_tasks(&committed));
+
+        // An unreadable manifest is not "generated": the load will report it.
+        assert!(!suite_declares_generated_tasks(&dir.join("absent.yaml")));
+
+        // Load names the importer instead of a bare ENOENT, so a first-run
+        // failure on a fresh clone says what to do.
+        let err = match load_suite(&generated, "generated") {
+            Ok(_) => panic!("expected a missing task file"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("generated per machine"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -90,6 +90,18 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **A fresh clone no longer fails suite validation on a suite nobody has
+  generated.** `evals/suites/gaia_l1.yaml` is committed, but the task file it
+  points at is generated per machine and gitignored (GAIA's terms forbid
+  redistribution), so `tests/eval_suites_validate.rs` failed in CI on every
+  commit since the GAIA wiring landed. A manifest now declares
+  `generated_tasks: true` and validation skips it only when the absence is
+  declared — an unparseable manifest still fails. Running the suite before the
+  importer has run now names the importer instead of returning a bare ENOENT.
+- **The Windows ffmpeg download compiles again.** zip 9's `ZipFile::name()`
+  returns `Result<Cow<str>>`; the Unix path was updated but the
+  `cfg(target_os = "windows")` path was not, and only the Windows job compiles
+  it. `Windows Check` and `Windows Cross Check` both failed on it.
 - **Tool-call markup no longer reaches the user as an answer.** When the
   tool-iteration budget is spent, the closing round runs without tools — exactly
   when a model is most likely to emit one more call as plain text. A provider

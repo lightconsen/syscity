@@ -259,7 +259,14 @@ async fn download_ffmpeg(dest: &Path) -> crate::computer::Result<()> {
         let mut entry = archive.by_index(i).map_err(|e| {
             crate::computer::ComputerError::Other(format!("Zip entry {}: {}", i, e))
         })?;
-        let name = entry.name().to_string();
+        // zip 9 returns `Result<Cow<str>>` here; a name that is not valid
+        // UTF-8 is a real failure, not something to lossily stringify.
+        let name = entry
+            .name()
+            .map_err(|e| {
+                crate::computer::ComputerError::Other(format!("Zip entry name {}: {}", i, e))
+            })?
+            .to_string();
         if entry.is_dir() {
             std::fs::create_dir_all(extract_dir.join(&name)).ok();
         } else {

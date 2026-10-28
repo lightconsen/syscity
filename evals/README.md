@@ -407,5 +407,9 @@ evals/
 
 外部基准不是本地套件：任务文件由 `importers/` 生成、判分由各基准的官方 evaluator 给出。
 GAIA Level 1 的生成步骤和判分口径见 [`../docs/benchmark.md`](../docs/benchmark.md) §M2；
-生成后直接 `syscity eval run gaia_l1 --full --trials 3`。当前基线 112/159 = 70.4%
-（3 次全过 29/53），见 `ledger.md` 的"外部基准"一节。
+生成后直接 `syscity eval run gaia_l1 --full --trials 3`。当前基线 124/159 = 78.0%
+（3 次全过 33/53），见 `ledger.md` 的"外部基准"一节。
+
+`evals/suites/gaia_l1.yaml` 里写着 `generated_tasks: true`：清单入仓、任务文件不入仓，
+所以没跑过生成器的机器上 `tests/eval_suites_validate.rs` 会跳过它而不是判失败；要跑套件
+本身仍需先跑生成器，否则 `eval run` 会报错并提示这一步。

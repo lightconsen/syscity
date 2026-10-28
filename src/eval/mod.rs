@@ -88,7 +88,10 @@ pub use harness::{
     EarlyStopConfig, EvalHarness, EvalSummary, ToolCallSummary, TrialResult, TurnResult,
 };
 pub use human_review::{HumanReviewCase, HumanReviewStore, ReviewStatus};
-pub use loader::{default_evals_dir, list_suites, load_suite, load_tasks, LoadedTaskFile};
+pub use loader::{
+    default_evals_dir, list_suites, load_suite, load_tasks, suite_declares_generated_tasks,
+    LoadedTaskFile,
+};
 pub use multi_judge::{
     AggregatedResult, AggregatedVerdict, AggregationMode, JudgeConfig, JudgeResult,
     MultiJudgeConfig, MultiJudgeScorer,

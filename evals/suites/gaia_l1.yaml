@@ -13,6 +13,10 @@
 #
 # `min_pass_rate: 0.0` is deliberate: the first runs are a baseline, not a gate.
 # Raise it once there is a measured floor to regress against.
+#
+# `generated_tasks: true` below tells repository validation that a missing task
+# file is expected here rather than broken — without it, a fresh clone (and CI)
+# fails `tests/eval_suites_validate.rs` on a suite nobody has generated yet.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 name: "GAIA Level 1 (validation)"
@@ -20,6 +24,11 @@ description: "端到端任务完成能力：GAIA validation Level 1，官方 que
 category: benchmark
 trials: 3
 min_pass_rate: 0.0
+# The task file this manifest points at is generated per machine and not
+# committed, so validation skips a manifest whose tasks are absent instead of
+# failing a fresh clone. `eval run gaia_l1` still errors — with the importer
+# command — if you try to run it before generating.
+generated_tasks: true
 
 tasks:
   - id: gaia_l1
