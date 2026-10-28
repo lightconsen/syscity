@@ -590,6 +590,56 @@ impl PromptBuilder {
         }
     }
 
+    /// Add computer-use discipline when the desktop tools are available.
+    ///
+    /// GUI automation is the most expensive and least reliable way to change a
+    /// machine's state: it depends on pixels, focus, and timing, and it fails
+    /// silently. So the guidance is ordered — prefer the program's own state,
+    /// then its own interface, and only then the screen.
+    pub fn add_computer_use_guidance(&mut self, tools: &[FunctionDefinition]) {
+        const DESKTOP_TOOLS: [&str; 4] =
+            ["computer", "screen_state", "screen_ocr", "screen_ui_detect"];
+        if !tools
+            .iter()
+            .any(|t| DESKTOP_TOOLS.contains(&t.name.as_str()))
+        {
+            return;
+        }
+
+        let content = r#"## Desktop Control
+
+Program state beats GUI, always. Prefer, in this order:
+1. A deterministic interface to the program itself — its CLI, its config files,
+   an API, or `shell`. Same result, no focus or timing dependence.
+2. The app's own structured interface (a command palette, a URL, a documented
+   keyboard shortcut) over clicking through its menus.
+3. GUI interaction via `computer` — the last resort, for programs that expose
+   nothing else.
+
+When you do use the GUI:
+- Call `screen_state` first. Act from the returned tree, not from memory of the
+  previous screen.
+- Address elements by their `[id=…]` rather than guessing coordinates. An id is
+  bound to one snapshot: after any action that changes the screen, re-read the
+  tree instead of reusing the old ids. A stale id errors — that is a signal to
+  re-observe, not to retry.
+- One action, then observe. The tool result reports `verification` / `effect`:
+  `confirmed` means the screen actually changed, `suspected_noop` means the input
+  did not land, `unverifiable` means nothing could be checked. Only act again on
+  a `suspected_noop`; on `unverifiable`, take a fresh `screen_state` first.
+- Lines marked `[sensitive: …]` (password, payment, destructive confirmation,
+  privilege escalation) are stop points: confirm with the user before typing
+  into or clicking them.
+- For long tasks, pin facts that the screen no longer shows — `computer` with
+  action `note` — and they will be echoed back on later observations."#;
+
+        self.add_section(
+            PromptSection::new("computer_use", content)
+                .with_priority(7)
+                .dynamic(),
+        );
+    }
+
     /// Add conversation phase context
     pub fn add_phase_context(&mut self, phase: ConversationPhase) {
         self.add_section(
@@ -721,6 +771,7 @@ impl PromptBuilder {
         // Add tool guidance if tools are available
         if !ctx.available_tools.is_empty() {
             builder.add_tool_guidance(&ctx.available_tools, ctx.task_type);
+            builder.add_computer_use_guidance(&ctx.available_tools);
         }
 
         // Add task context if present
@@ -870,6 +921,35 @@ mod tests {
         assert!(prompt.contains("Base prompt"));
         assert!(prompt.contains("Content 1"));
         assert!(prompt.contains("Content 2"));
+    }
+
+    fn tool_definition(name: &str) -> FunctionDefinition {
+        FunctionDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn computer_use_guidance_needs_a_desktop_tool() {
+        let mut builder = PromptBuilder::new("Base");
+        builder.add_computer_use_guidance(&[tool_definition("shell")]);
+        assert!(!builder.build().contains("Desktop Control"));
+    }
+
+    #[test]
+    fn computer_use_guidance_puts_program_state_before_the_gui() {
+        let mut builder = PromptBuilder::new("Base");
+        builder.add_computer_use_guidance(&[
+            tool_definition("shell"),
+            tool_definition("computer"),
+            tool_definition("screen_state"),
+        ]);
+        let prompt = builder.build();
+        assert!(prompt.contains("Program state beats GUI"), "{prompt}");
+        assert!(prompt.contains("Address elements by their `[id=…]`"));
+        assert!(prompt.contains("[sensitive: …]"));
     }
 
     #[test]

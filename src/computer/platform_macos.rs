@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use tracing::info;
 
+use crate::computer::element_index::{parse_element_id, ActionTarget, ResolveError, SnapshotCache};
 use crate::computer::{
-    ActionResult, ClickTarget, ComputerAdapter, ComputerError, DesktopAction, Rect, Result,
-    Screenshot, UiElement, WaitCondition,
+    ActionEffect, ActionEvidence, ActionResult, AxAction, ClickTarget, ComputerAdapter,
+    ComputerError, DesktopAction, Rect, Result, Rung, Screenshot, UiElement, WaitCondition,
 };
 use crate::tools::ToolRegistry;
 
@@ -30,11 +31,17 @@ fn apple_script_output(result: &crate::tools::ToolExecutionResult) -> &str {
 /// `macos_desktop_control`, and `macos_applescript` tools.
 pub struct MacosComputerAdapter {
     registry: Arc<ToolRegistry>,
+    /// Trees handed to callers, so an element id can be resolved back to the
+    /// element it named. See [`crate::computer::element_index`].
+    snapshots: SnapshotCache,
 }
 
 impl MacosComputerAdapter {
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            snapshots: SnapshotCache::new(8),
+        }
     }
 }
 
@@ -107,6 +114,7 @@ impl ComputerAdapter for MacosComputerAdapter {
 
         let elements: Vec<UiElement> = result
             .data
+            .as_ref()
             .and_then(|d| {
                 d.get("elements")?
                     .as_array()
@@ -114,7 +122,16 @@ impl ComputerAdapter for MacosComputerAdapter {
             })
             .unwrap_or_default();
 
-        Ok(elements)
+        let app_name = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("app"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // Store the tree before returning it: the ids in the returned elements
+        // are the ones a caller can hand back to `execute`.
+        Ok(self.snapshots.store(elements, app_name).await.roots)
     }
 
     async fn execute(&self, action: DesktopAction) -> Result<ActionResult> {
@@ -146,7 +163,7 @@ impl ComputerAdapter for MacosComputerAdapter {
                 Ok(ActionResult::success("screenshot captured").with_data(data))
             }
             DesktopAction::Click { target, button: _ } => {
-                let (x, y) = self.resolve_click_target(target).await?;
+                let (x, y) = self.resolve_click_point(target).await?;
                 let script =
                     format!(r#"tell application "System Events" to click at {{ {}, {} }}"#, x, y);
                 let apple_args = serde_json::json!({ "script": script });
@@ -161,7 +178,7 @@ impl ComputerAdapter for MacosComputerAdapter {
                 Ok(ActionResult::success(apple_script_output(&result).to_string()))
             }
             DesktopAction::DoubleClick { target, button: _ } => {
-                let (x, y) = self.resolve_click_target(target).await?;
+                let (x, y) = self.resolve_click_point(target).await?;
                 let script = format!(
                     r#"tell application "System Events"
     click at {{ {}, {} }}
@@ -207,8 +224,8 @@ end tell"#,
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Drag { from, to } => {
-                let (from_x, from_y) = self.resolve_click_target(from).await?;
-                let (to_x, to_y) = self.resolve_click_target(to).await?;
+                let (from_x, from_y) = self.resolve_click_point(from).await?;
+                let (to_x, to_y) = self.resolve_click_point(to).await?;
                 let script = format!(
                     r#"tell application "System Events"
     click at {{ {}, {} }}
@@ -624,6 +641,102 @@ end tell"#,
         }
     }
 
+    async fn resolve_target(&self, target: &ClickTarget) -> Result<ActionTarget> {
+        if let ClickTarget::Coordinate(p) = target {
+            return Ok(ActionTarget::point(p.x, p.y));
+        }
+
+        // Snapshot-path ids must resolve against the snapshot that produced
+        // them. Only a platform id or a label may trigger a lazy re-read,
+        // because those are meant to be looked up in the current tree.
+        let lazy = match target {
+            ClickTarget::ElementId(id) => parse_element_id(id).is_none(),
+            _ => true,
+        };
+
+        let mut resolution = self.snapshots.resolve(target).await;
+        if lazy
+            && matches!(resolution, Err(ResolveError::NotFound(_)) | Err(ResolveError::NoSnapshot))
+        {
+            // The caller may act on a label without having read the tree.
+            self.read_ui_tree(None).await?;
+            resolution = self.snapshots.resolve(target).await;
+        }
+
+        resolution.map_err(|e| match e {
+            ResolveError::Stale(snapshot) => ComputerError::StaleElement(format!(
+                "element id belongs to snapshot {snapshot:08x}, which is no longer cached; \
+                 re-read the UI tree and use a fresh id"
+            )),
+            other => ComputerError::ElementNotFound(other.to_string()),
+        })
+    }
+
+    async fn perform_ax_action(
+        &self,
+        target: &ActionTarget,
+        action: AxAction,
+    ) -> Result<ActionResult> {
+        let Some(element) = target.element.as_ref() else {
+            return Err(ComputerError::UnsupportedPlatform(
+                "an accessibility action needs an element target".to_string(),
+            ));
+        };
+        if element.path.is_empty() {
+            return Err(ComputerError::UnsupportedPlatform(
+                "element has no addressable path".to_string(),
+            ));
+        }
+        let Some(app) = target.app.clone() else {
+            return Err(ComputerError::UnsupportedPlatform(
+                "the snapshot did not record which application it came from".to_string(),
+            ));
+        };
+
+        let action_name = match &action {
+            AxAction::Press => "press",
+            AxAction::Focus => "focus",
+            AxAction::SetValue { .. } => "set_value",
+        };
+        let mut args = serde_json::json!({
+            "action": action_name,
+            "app": app,
+            "path": element.path,
+        });
+        if let AxAction::SetValue { value } = &action {
+            args["value"] = serde_json::json!(value);
+        }
+
+        let result = self
+            .registry
+            .execute("macos_accessibility", args, &crate::tools::ToolContext::default())
+            .await
+            .ok_or_else(|| ComputerError::ToolFailed("accessibility tool not found".to_string()))?
+            .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+
+        if result.success {
+            Ok(ActionResult::success(
+                result
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("result"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ok")
+                    .to_string(),
+            )
+            .with_evidence(ActionEvidence::new(Rung::AxAction, ActionEffect::Confirmed)))
+        } else {
+            let message = result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("accessibility action failed")
+                .to_string();
+            Err(ComputerError::ToolFailed(message))
+        }
+    }
+
     async fn wait_for(&self, condition: WaitCondition, timeout: Duration) -> Result<bool> {
         let deadline = std::time::Instant::now() + timeout;
         let poll_interval = Duration::from_millis(500);
@@ -685,48 +798,10 @@ end tell"#,
 }
 
 impl MacosComputerAdapter {
-    async fn resolve_click_target(&self, target: ClickTarget) -> Result<(i32, i32)> {
-        match target {
-            ClickTarget::Coordinate(p) => Ok((p.x, p.y)),
-            ClickTarget::ElementId(id) => {
-                let tree = self.read_ui_tree(None).await?;
-                let el = tree
-                    .iter()
-                    .find(|e| e.id == id)
-                    .ok_or_else(|| ComputerError::ElementNotFound(id.clone()))?;
-                let center = el.center();
-                Ok((center.x, center.y))
-            }
-            ClickTarget::ElementLabel(label) => {
-                let tree = self.read_ui_tree(None).await?;
-                let el = tree
-                    .iter()
-                    .find(|e| {
-                        e.label
-                            .as_ref()
-                            .map(|l| l.contains(&label))
-                            .unwrap_or(false)
-                    })
-                    .ok_or_else(|| ComputerError::ElementNotFound(label.clone()))?;
-                let center = el.center();
-                Ok((center.x, center.y))
-            }
-            ClickTarget::ElementRoleLabel { role, label } => {
-                let tree = self.read_ui_tree(None).await?;
-                let el = tree
-                    .iter()
-                    .find(|e| {
-                        e.role == role
-                            && e.label
-                                .as_ref()
-                                .map(|l| l.contains(&label))
-                                .unwrap_or(false)
-                    })
-                    .ok_or_else(|| ComputerError::ElementNotFound(format!("{}:{}", role, label)))?;
-                let center = el.center();
-                Ok((center.x, center.y))
-            }
-        }
+    /// Resolve a target and return only its coordinates.
+    async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
+        let resolved = self.resolve_target(&target).await?;
+        Ok((resolved.x, resolved.y))
     }
 }
 
@@ -754,7 +829,13 @@ fn ui_element_from_macos_json(value: &serde_json::Value) -> Option<UiElement> {
         .unwrap_or_default();
 
     Some(UiElement {
-        id: String::new(),
+        // AXIdentifier, when the application publishes one; the snapshot
+        // cache fills in a path id for everything else.
+        id: obj
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         role,
         label: if name.is_empty() {
             None

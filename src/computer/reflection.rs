@@ -39,7 +39,7 @@ pub enum FailureRootCause {
 }
 
 /// Structured output of a failure analysis.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailureAnalysis {
     pub root_cause: FailureRootCause,
     pub confidence: f32,

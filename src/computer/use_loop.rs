@@ -14,13 +14,11 @@
 //!     ok         = verifier.verify(criteria)     // validate
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
+use crate::computer::session::{ComputerSession, SessionConfig};
 use crate::computer::{
-    ActionResult, ComputerAdapter, ComputerError, DesktopAction, Result, Screenshot, UiElement,
-    VerificationConfig, VerificationCriteria, VerificationEngine,
+    ActionResult, ComputerAdapter, DesktopAction, Result, Screenshot, VerificationConfig,
 };
 
 /// Configuration for the Computer Use loop.
@@ -114,7 +112,7 @@ pub enum StepVerification {
 impl StepVerification {
     /// A `VerificationEngine` answer, whose false means the criterion was
     /// checked and not met — never "unknown".
-    fn from_checked(verified: bool) -> Self {
+    pub fn from_checked(verified: bool) -> Self {
         if verified {
             StepVerification::Verified
         } else {
@@ -145,47 +143,49 @@ pub struct LoopResult {
 /// The canonical Computer Use orchestrator.
 pub struct ComputerUseLoop {
     adapter: Arc<dyn ComputerAdapter>,
-    verifier: VerificationEngine,
     config: LoopConfig,
+    /// Verification / rollback / settle / memory settings, handed to the
+    /// session that runs each step.
+    session_config: SessionConfig,
+    rollback_manager: Option<Arc<tokio::sync::Mutex<crate::computer::RollbackManager>>>,
     /// Optional execution controller for pause / resume / step / cancel.
     execution_controller: Option<Arc<crate::acp::ExecutionController>>,
-    /// Optional rollback manager for auto-rollback and step-by-step undo.
-    rollback_manager: Option<Arc<tokio::sync::Mutex<crate::computer::RollbackManager>>>,
-    /// Paths to snapshot before each action (workspace dirs, config files,
-    /// etc.).
-    snapshot_paths: Vec<String>,
-    /// Consecutive-failure threshold that triggers auto-rollback.
-    auto_rollback_threshold: usize,
-    /// Guards against repeatedly triggering auto-rollback between the
-    /// threshold and escalation (set true on first rollback, reset on
-    /// success).
-    rollback_already_triggered: AtomicBool,
-    /// Tracks how many snapshots were taken for each step (index = step
-    /// number).
-    step_snapshot_counts: Arc<tokio::sync::Mutex<Vec<usize>>>,
+    /// The step engine. Shared with the `computer` tool's code path, so the
+    /// loop and the tool cannot drift apart in what "verified" means.
+    session: Arc<ComputerSession>,
 }
 
 impl ComputerUseLoop {
     pub fn new(adapter: Arc<dyn ComputerAdapter>) -> Self {
-        let verifier =
-            VerificationEngine::new(adapter.clone()).with_config(VerificationConfig::default());
+        let session_config = SessionConfig::default();
+        let session =
+            Arc::new(ComputerSession::new(adapter.clone()).with_config(session_config.clone()));
         Self {
             adapter,
-            verifier,
             config: LoopConfig::default(),
-            execution_controller: None,
+            session_config,
             rollback_manager: None,
-            snapshot_paths: Vec::new(),
-            auto_rollback_threshold: 3,
-            rollback_already_triggered: AtomicBool::new(false),
-            step_snapshot_counts: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            execution_controller: None,
+            session,
         }
     }
 
+    /// Rebuild the step engine after a setting changed.
+    fn rebuild_session(&mut self) {
+        let mut session =
+            ComputerSession::new(self.adapter.clone()).with_config(self.session_config.clone());
+        if let Some(mgr) = self.rollback_manager.clone() {
+            session = session.with_rollback_manager(mgr);
+        }
+        self.session = Arc::new(session);
+    }
+
     pub fn with_config(mut self, config: LoopConfig) -> Self {
-        self.verifier =
-            VerificationEngine::new(self.adapter.clone()).with_config(config.verification);
         self.config = config;
+        self.session_config.verification = config.verification;
+        self.session_config.settle.initial_delay_ms = config.settle_delay_ms;
+        self.session_config.verify = config.verify_after_each;
+        self.rebuild_session();
         self
     }
 
@@ -204,19 +204,22 @@ impl ComputerUseLoop {
         manager: Arc<tokio::sync::Mutex<crate::computer::RollbackManager>>,
     ) -> Self {
         self.rollback_manager = Some(manager);
+        self.rebuild_session();
         self
     }
 
     /// Paths to snapshot before each action (directories or files).
     pub fn with_snapshot_paths(mut self, paths: Vec<String>) -> Self {
-        self.snapshot_paths = paths;
+        self.session_config.snapshot_paths = paths;
+        self.rebuild_session();
         self
     }
 
     /// Set the consecutive-failure threshold for auto-rollback.
     /// Default is 3.
     pub fn with_auto_rollback_threshold(mut self, threshold: usize) -> Self {
-        self.auto_rollback_threshold = threshold;
+        self.session_config.auto_rollback_threshold = threshold;
+        self.rebuild_session();
         self
     }
 
@@ -224,31 +227,12 @@ impl ComputerUseLoop {
     ///
     /// Returns the number of steps actually undone.
     pub async fn undo_steps(&self, n: usize) -> Result<usize> {
-        let counts = self.step_snapshot_counts.lock().await;
-        let n = n.min(counts.len());
-        if n == 0 {
-            return Ok(0);
-        }
-        let total_snapshots: usize = counts[counts.len().saturating_sub(n)..].iter().sum();
-        drop(counts);
-
-        if let Some(ref mgr) = self.rollback_manager {
-            let mut mgr = mgr.lock().await;
-            mgr.rollback_last(total_snapshots)
-                .await
-                .map_err(|e| ComputerError::Other(format!("Rollback failed: {}", e)))?;
-        }
-
-        let mut counts = self.step_snapshot_counts.lock().await;
-        let new_len = counts.len().saturating_sub(n);
-        counts.truncate(new_len);
-
-        Ok(n)
+        self.session.undo_steps(n).await
     }
 
     /// Undo the most recent step.
     pub async fn undo_last_step(&self) -> Result<bool> {
-        self.undo_steps(1).await.map(|n| n > 0)
+        self.session.undo_last_step().await
     }
 
     /// Run the Computer Use loop.
@@ -264,10 +248,9 @@ impl ComputerUseLoop {
         let mut last_verified: Option<bool> = None;
         let mut last_error: Option<String> = None;
         let mut consecutive_failures: usize = 0;
-        let mut current_settle_delay_ms = self.config.settle_delay_ms;
 
-        // Reset per-run snapshot tracking.
-        self.step_snapshot_counts.lock().await.clear();
+        // A run is a task: failure counters and memory start clean.
+        self.session.reset().await;
 
         for step in 0..self.config.max_steps {
             // Check execution controller for pause / resume / step / cancel.
@@ -281,26 +264,6 @@ impl ComputerUseLoop {
                         final_screenshot,
                         message: reason.to_string(),
                     });
-                }
-            }
-
-            // Auto-rollback: trigger exactly once when threshold is reached.
-            if consecutive_failures == self.auto_rollback_threshold
-                && !self.rollback_already_triggered.load(Ordering::Relaxed)
-            {
-                self.rollback_already_triggered
-                    .store(true, Ordering::Relaxed);
-                tracing::warn!(
-                    "Auto-rollback triggered after {} consecutive failures",
-                    consecutive_failures
-                );
-                if let Some(ref mgr) = self.rollback_manager {
-                    let mut mgr = mgr.lock().await;
-                    if let Err(e) = mgr.rollback().await {
-                        tracing::error!("Auto-rollback failed: {}", e);
-                    } else {
-                        tracing::info!("Auto-rollback completed successfully");
-                    }
                 }
             }
 
@@ -356,155 +319,52 @@ impl ComputerUseLoop {
                     });
                 }
                 LoopDecision::Action(action) => {
-                    // 3. Snapshot configured paths before acting.
-                    let mut snapshots_taken = 0;
-                    if !self.snapshot_paths.is_empty() {
-                        if let Some(ref mgr) = self.rollback_manager {
-                            let mut mgr = mgr.lock().await;
-                            for path_str in &self.snapshot_paths {
-                                let path = std::path::Path::new(path_str);
-                                let snap_result = if tokio::fs::metadata(path)
-                                    .await
-                                    .map(|m| m.is_dir())
-                                    .unwrap_or(false)
-                                {
-                                    mgr.snapshot_directory(path).await
-                                } else {
-                                    mgr.snapshot_file(path).await
-                                };
-                                if let Err(e) = snap_result {
-                                    tracing::warn!(
-                                        "Failed to snapshot '{}' before step {}: {}",
-                                        path_str,
-                                        step,
-                                        e
-                                    );
-                                } else {
-                                    snapshots_taken += 1;
-                                }
-                            }
-                        }
-                    }
-                    self.step_snapshot_counts.lock().await.push(snapshots_taken);
-
-                    // 4. Act — execute the action.
-                    let screenshot_before = Some(screenshot);
-                    // Capture the pre-action UI tree for diff-based
-                    // verification of screen-mutating actions.
-                    let tree_before = if crate::computer::vision::is_screen_mutating_action(&action)
-                    {
-                        self.adapter.read_ui_tree(None).await.ok()
-                    } else {
-                        None
-                    };
-                    let result = self.adapter.execute(action.clone()).await;
-
-                    match result {
-                        Ok(result) => {
-                            // 5. Validate — verify the outcome.
-                            tokio::time::sleep(Duration::from_millis(current_settle_delay_ms))
-                                .await;
-
-                            let screenshot_after = self
-                                .adapter
-                                .screenshot(self.config.screenshot_region)
-                                .await
-                                .ok();
-
-                            let verification = if self.config.verify_after_each {
-                                self.verify_action(
-                                    &action,
-                                    &result,
-                                    tree_before.as_deref(),
-                                    screenshot_before.as_ref(),
-                                    screenshot_after.as_ref(),
-                                )
-                                .await
-                                // A check that errored established nothing. It
-                                // is not evidence that the action failed.
-                                .unwrap_or(StepVerification::Unverifiable)
-                            } else {
-                                StepVerification::Unverifiable
-                            };
-
-                            match verification {
-                                StepVerification::Verified => {
-                                    consecutive_failures = 0;
-                                    self.rollback_already_triggered
-                                        .store(false, Ordering::Relaxed);
-                                    current_settle_delay_ms = self.config.settle_delay_ms;
-                                    last_error = None;
-                                }
-                                StepVerification::Failed => {
-                                    consecutive_failures += 1;
-                                    last_error = Some("Verification failed".to_string());
-                                }
-                                // Neither counter moves: counting it as a
-                                // failure would roll back work that may be
-                                // fine, and counting it as a success would
-                                // reset the failures that were real. The
-                                // previous error, if any, stands.
-                                StepVerification::Unverifiable => {
-                                    tracing::info!(
-                                        "verification: nothing established for this step"
-                                    );
-                                }
-                            }
+                    // Act → settle → verify, in the session. Snapshots before
+                    // the step, three-state verification after it, failure
+                    // accounting, auto-rollback and reflection all happen
+                    // there — the loop only decides what to do next.
+                    match self.session.execute(action.clone()).await {
+                        Ok(outcome) => {
+                            let verification = outcome.verification;
+                            consecutive_failures = self.session.consecutive_failures().await;
+                            last_error = self.session.last_error().await;
                             last_verified = match verification {
                                 StepVerification::Verified => Some(true),
                                 StepVerification::Failed => Some(false),
                                 StepVerification::Unverifiable => None,
                             };
-
-                            history.push(StepRecord {
-                                step,
-                                action,
-                                result,
-                                verification,
-                                screenshot_before,
-                                screenshot_after,
-                                snapshots_taken,
-                            });
-                        }
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            last_verified = Some(false);
-                            last_error = Some(e.to_string());
-
-                            // Adaptive settle delay: if multiple consecutive failures look
-                            // like timing issues, wait longer before next action.
-                            if consecutive_failures >= 3 {
-                                let err_lower = e.to_string().to_lowercase();
-                                let is_timing = err_lower.contains("timeout")
-                                    || err_lower.contains("not ready")
-                                    || err_lower.contains("not found")
-                                    || err_lower.contains("empty");
-                                if is_timing {
-                                    let new_delay =
-                                        current_settle_delay_ms.saturating_mul(2).min(5000);
-                                    if new_delay > current_settle_delay_ms {
-                                        tracing::warn!(
-                                            "Increasing settle delay from {}ms to {}ms after {} \
-                                             consecutive timing failures",
-                                            current_settle_delay_ms,
-                                            new_delay,
-                                            consecutive_failures
-                                        );
-                                        current_settle_delay_ms = new_delay;
-                                    }
-                                }
+                            if outcome.rolled_back {
+                                tracing::warn!("step rolled back automatically");
                             }
 
                             history.push(StepRecord {
                                 step,
                                 action,
+                                result: outcome.result,
+                                verification,
+                                // The session keeps the pre-action capture for
+                                // its own diff; the record carries what the
+                                // caller may want to look at afterwards.
+                                screenshot_before: None,
+                                screenshot_after: outcome.state_after.map(|state| state.screenshot),
+                                snapshots_taken: outcome.snapshots_taken,
+                            });
+                        }
+                        Err(e) => {
+                            consecutive_failures = self.session.record_error(&e.to_string()).await;
+                            last_verified = Some(false);
+                            last_error = Some(e.to_string());
+
+                            history.push(StepRecord {
+                                step,
+                                action,
                                 result: ActionResult::error(e.to_string()),
-                                // The action itself errored: that is a failure, not
-                                // an absent check.
+                                // The action itself errored: that is a failure,
+                                // not an absent check.
                                 verification: StepVerification::Failed,
-                                screenshot_before,
+                                screenshot_before: None,
                                 screenshot_after: None,
-                                snapshots_taken,
+                                snapshots_taken: 0,
                             });
                         }
                     }
@@ -523,100 +383,6 @@ impl ComputerUseLoop {
         })
     }
 
-    /// Verify a single action.
-    ///
-    /// Actions with targeted criteria (LaunchApp, ActivateWindow, KillProcess)
-    /// use the [`VerificationEngine`]; other screen-mutating actions are
-    /// verified by diffing the pre/post [`ScreenState`] — if nothing visible
-    /// changed, the action likely did not land.
-    async fn verify_action(
-        &self,
-        action: &DesktopAction,
-        _result: &ActionResult,
-        tree_before: Option<&[UiElement]>,
-        screenshot_before: Option<&Screenshot>,
-        screenshot_after: Option<&Screenshot>,
-    ) -> Result<StepVerification> {
-        match action {
-            DesktopAction::Screenshot { .. } => {
-                // A screenshot is the thing the action was for.
-                Ok(StepVerification::Verified)
-            }
-            DesktopAction::LaunchApp { name, wait_for_ready, .. } => {
-                if *wait_for_ready {
-                    self.verifier
-                        .verify(
-                            &VerificationCriteria::ProcessRunning { name: name.clone() },
-                            &ActionResult::success(""),
-                            None,
-                        )
-                        .await
-                        .map(StepVerification::from_checked)
-                } else {
-                    // The caller asked not to wait for it, so nothing was
-                    // checked.
-                    Ok(StepVerification::Unverifiable)
-                }
-            }
-            DesktopAction::Wait { .. } => Ok(StepVerification::Verified),
-            DesktopAction::ActivateWindow { title_pattern } => self
-                .verifier
-                .verify(
-                    &VerificationCriteria::WindowTitleContains { pattern: title_pattern.clone() },
-                    &ActionResult::success(""),
-                    None,
-                )
-                .await
-                .map(StepVerification::from_checked),
-            _ if crate::computer::vision::is_screen_mutating_action(action) => {
-                self.verify_by_diff(tree_before, screenshot_before, screenshot_after)
-                    .await
-            }
-            // No check exists for this action. Saying so is the only honest
-            // option: the previous `Ok(true)` here was a claim of success that
-            // nothing had established.
-            _ => Ok(StepVerification::Unverifiable),
-        }
-    }
-
-    /// Verify by diffing pre/post screen state: pixel diff on the screenshots
-    /// plus tree diff on the accessibility trees. Any meaningful visible
-    /// change counts as verified.
-    async fn verify_by_diff(
-        &self,
-        tree_before: Option<&[UiElement]>,
-        screenshot_before: Option<&Screenshot>,
-        screenshot_after: Option<&Screenshot>,
-    ) -> Result<StepVerification> {
-        let (Some(shot_before), Some(shot_after)) = (screenshot_before, screenshot_after) else {
-            // No screenshots to compare (e.g. headless). That is not a pass:
-            // nothing was checked, and claiming otherwise is what this enum
-            // exists to stop.
-            return Ok(StepVerification::Unverifiable);
-        };
-        if shot_before.base64.is_empty() || shot_after.base64.is_empty() {
-            return Ok(StepVerification::Unverifiable);
-        }
-
-        let tree_after = self.adapter.read_ui_tree(None).await.unwrap_or_default();
-        let before = crate::computer::vision::ScreenState::from_parts(
-            tree_before.unwrap_or(&[]).to_vec(),
-            shot_before.clone(),
-        );
-        let after =
-            crate::computer::vision::ScreenState::from_parts(tree_after, shot_after.clone());
-        let diff = before.diff(&after);
-        let changed = diff.has_meaningful_changes();
-        if !changed {
-            tracing::info!("verification: no visible change ({})", diff.summary());
-        }
-        Ok(if changed {
-            StepVerification::Verified
-        } else {
-            StepVerification::Failed
-        })
-    }
-
     /// Take a screenshot, falling back to an empty placeholder when the
     /// display is not available (e.g. headless / CI).
     async fn fallback_screenshot(&self) -> Screenshot {
@@ -629,47 +395,9 @@ impl ComputerUseLoop {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn a_check_that_cannot_run_establishes_nothing() {
-        // The bug this replaces: `verify_by_diff` answered `true` when it had no
-        // screenshots to compare, so "could not tell" and "it worked" were the
-        // same answer, and the loop reset its failure counter on both.
-        let loop_ = ComputerUseLoop::new(Arc::new(
-            crate::computer::headless::HeadlessComputerAdapter::new(),
-        ));
-
-        let outcome = loop_.verify_by_diff(None, None, None).await.unwrap();
-        assert_eq!(outcome, StepVerification::Unverifiable);
-        assert!(!outcome.verified(), "unverifiable is not verified");
-
-        // An empty screenshot is the same situation: nothing to compare.
-        let empty = Screenshot::new(String::new(), 0, 0);
-        let outcome = loop_
-            .verify_by_diff(None, Some(&empty), Some(&empty))
-            .await
-            .unwrap();
-        assert_eq!(outcome, StepVerification::Unverifiable);
-    }
-
-    #[tokio::test]
-    async fn an_action_with_no_check_is_unverifiable_not_successful() {
-        // `_ => Ok(true), // Other actions: assume success.` was a claim of
-        // success that nothing had established.
-        let loop_ = ComputerUseLoop::new(Arc::new(
-            crate::computer::headless::HeadlessComputerAdapter::new(),
-        ));
-        let outcome = loop_
-            .verify_action(
-                &crate::computer::types::DesktopAction::GetSystemStatus,
-                &crate::computer::types::ActionResult::success(""),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome, StepVerification::Unverifiable);
-    }
+    // The verification rules that used to live here now live in
+    // `computer::session`, which the loop delegates to. Their tests moved
+    // with them.
 
     use super::*;
 
@@ -766,11 +494,8 @@ mod tests {
         tokio::fs::write(&file, "after-step-1").await.unwrap();
 
         // Simulate two steps, each taking one snapshot.
-        {
-            let mut counts = loop_.step_snapshot_counts.lock().await;
-            counts.push(1); // step 0: 1 snapshot
-            counts.push(1); // step 1: 1 snapshot
-        }
+        loop_.session.push_snapshot_count(1).await; // step 0
+        loop_.session.push_snapshot_count(1).await; // step 1
 
         let undone = loop_.undo_steps(1).await.unwrap();
         assert_eq!(undone, 1);
@@ -809,8 +534,8 @@ mod tests {
             .with_snapshot_paths(vec!["/tmp/workspace".to_string()])
             .with_auto_rollback_threshold(5);
 
-        assert_eq!(loop_.snapshot_paths.len(), 1);
-        assert_eq!(loop_.auto_rollback_threshold, 5);
+        assert_eq!(loop_.session_config.snapshot_paths.len(), 1);
+        assert_eq!(loop_.session_config.auto_rollback_threshold, 5);
         assert!(loop_.rollback_manager.is_some());
     }
 }

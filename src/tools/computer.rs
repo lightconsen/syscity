@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::computer::vision::{is_screen_mutating_action, ScreenState};
+use crate::computer::session::{render_notes, ComputerSession, StepOutcome};
 use crate::computer::{
     ActionResult, ClickTarget, ComputerAdapter, ComputerError, DesktopAction, MouseButton, Point,
     Rect, ScrollDirection,
@@ -27,11 +27,39 @@ use crate::tools::{
 /// adapter is configured, preventing the LLM from calling it.
 pub struct ComputerTool {
     adapter: Option<Arc<dyn ComputerAdapter>>,
+    /// One session per conversation: step counters, pinned notes and the
+    /// rollback bookkeeping belong to the task, not to the process.
+    sessions: tokio::sync::Mutex<std::collections::HashMap<String, Arc<ComputerSession>>>,
 }
 
 impl ComputerTool {
     pub fn new(adapter: Option<Arc<dyn ComputerAdapter>>) -> Self {
-        Self { adapter }
+        Self {
+            adapter,
+            sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The session for this conversation, created on first use.
+    async fn session_for(&self, context: &ToolContext) -> Option<Arc<ComputerSession>> {
+        let adapter = self.adapter.clone()?;
+        let key = if context.conversation_id.is_empty() {
+            "default".to_string()
+        } else {
+            context.conversation_id.clone()
+        };
+        let mut sessions = self.sessions.lock().await;
+        // Bound the map: a long-lived gateway sees many conversations, and a
+        // session is only worth keeping while its task is live.
+        if sessions.len() > 64 {
+            sessions.clear();
+        }
+        Some(
+            sessions
+                .entry(key)
+                .or_insert_with(|| Arc::new(ComputerSession::new(adapter)))
+                .clone(),
+        )
     }
 }
 
@@ -70,9 +98,18 @@ Common workflows:
                         "list_processes", "kill_process",
                         "restart_process", "set_process_priority",
                         "list_windows", "get_window_geometry", "move_window",
-                        "resize_window", "minimize_window", "maximize_window"
+                        "resize_window", "minimize_window", "maximize_window",
+                        "note", "recall_notes", "undo"
                     ],
                     "description": "The desktop operation to perform"
+                },
+                "element_id": {
+                    "type": "string",
+                    "description": "Element id from read_ui_tree / screen output, e.g. \"s0000001f:0.1\". Preferred over x/y for click and double_click: it resolves inside the application instead of at screen pixels, and survives the window moving. An id from an older snapshot is rejected — re-read the tree."
+                },
+                "note_key": {
+                    "type": "string",
+                    "description": "Key for action=note: the name this value is stored under (e.g. \"invoice_total\")."
                 },
                 // ── Common positional parameters ──────────────────────────
                 "x": { "type": "integer", "description": "X coordinate (for click, double_click, scroll, drag_from, drag_to)" },
@@ -151,61 +188,92 @@ Common workflows:
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let adapter = self.adapter.as_ref().ok_or_else(|| {
-            crate::error::SyscityError::Unsupported(
-                "Computer adapter is not configured".to_string(),
-            )
-        })?;
-
         let _t_start = std::time::Instant::now();
         let action = args["action"]
             .as_str()
             .ok_or_else(|| crate::error::SyscityError::Validation("Missing action".to_string()))?;
 
-        let desktop_action = action_to_desktop_action(action, &args)?;
-
-        // Transparent verification: for screen-mutating actions, capture a
-        // lightweight pre-snapshot so we can diff against the post-state and
-        // tell the LLM whether the action had a visible effect.
-        let verify = is_screen_mutating_action(&desktop_action);
-        let pre_state = if verify {
-            ScreenState::capture_light(adapter.as_ref()).await.ok()
-        } else {
-            None
+        let Some(session) = self.session_for(_context).await else {
+            return Err(crate::error::SyscityError::Unsupported(
+                "Computer adapter is not configured".to_string(),
+            ));
         };
 
+        // Session actions are the agent's own memory, not desktop operations.
+        match action {
+            "note" => {
+                let key = args["note_key"]
+                    .as_str()
+                    .or_else(|| args["name"].as_str())
+                    .ok_or_else(|| {
+                        crate::error::SyscityError::Validation(
+                            "Missing 'name' (the key) for note".to_string(),
+                        )
+                    })?;
+                let value = args["text"].as_str().unwrap_or("");
+                session.note(key, value).await;
+                let notes = session.notes().await;
+                return Ok(ToolExecutionResult::success(format!(
+                    "Noted.\n{}",
+                    render_notes(&notes)
+                ))
+                .with_data(json!({ "notes": serde_json::to_value(&notes).unwrap_or_default() })));
+            }
+            "recall_notes" => {
+                let notes = session.notes().await;
+                let rendered = if notes.is_empty() {
+                    "No pinned notes.".to_string()
+                } else {
+                    render_notes(&notes)
+                };
+                return Ok(ToolExecutionResult::success(rendered).with_data(
+                    json!({ "notes": serde_json::to_value(&notes).unwrap_or_default() }),
+                ));
+            }
+            "undo" => {
+                let undone = session.undo_last_step().await.map_err(to_syscity_err)?;
+                let message = if undone {
+                    "Rolled back the last snapshotted step."
+                } else {
+                    "Nothing to undo: no step in this session took a snapshot."
+                };
+                return Ok(
+                    ToolExecutionResult::success(message).with_data(json!({ "undone": undone }))
+                );
+            }
+            _ => {}
+        }
+
+        let desktop_action = action_to_desktop_action(action, &args)?;
+
         let adapter_start = std::time::Instant::now();
-        let result = adapter
+        let outcome = session
             .execute(desktop_action)
             .await
             .map_err(to_syscity_err)?;
-        let adapter_elapsed = adapter_start.elapsed();
         info!(
-            "[ComputerTool] action={} adapter.execute() took {:?} (total so far: {:?})",
+            "[ComputerTool] action={} session.execute() took {:?} (total so far: {:?})",
             action,
-            adapter_elapsed,
+            adapter_start.elapsed(),
             _t_start.elapsed()
         );
 
-        let mut tool_result = action_result_to_tool_result(result).await;
+        let mut tool_result = build_tool_result(outcome, action).await;
 
-        if let Some(pre) = pre_state {
-            // Brief settle delay so the UI has time to react to the action.
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            match ScreenState::capture_light(adapter.as_ref()).await {
-                Ok(post) => {
-                    let diff = pre.diff(&post);
-                    tool_result
-                        .output
-                        .push_str(&format!("\n\n[verification] {}", diff.summary()));
-                    let diff_json = serde_json::to_value(&diff).unwrap_or_default();
-                    let data = tool_result.data.get_or_insert_with(|| json!({}));
-                    if let Some(obj) = data.as_object_mut() {
-                        obj.insert("verification".to_string(), diff_json);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("post-action verification capture failed: {}", e);
+        // Re-perception is when memory earns its keep: a model that reads the
+        // screen again after 200 steps gets its earlier findings back.
+        if matches!(action, "screenshot" | "read_ui_tree") {
+            let notes = session.notes().await;
+            if !notes.is_empty() {
+                tool_result
+                    .output
+                    .push_str(&format!("\n\n{}", render_notes(&notes)));
+                let data = tool_result.data.get_or_insert_with(|| json!({}));
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert(
+                        "notes".to_string(),
+                        serde_json::to_value(&notes).unwrap_or_default(),
+                    );
                 }
             }
         }
@@ -434,6 +502,11 @@ fn parse_title_pattern(args: &Value, action: &str) -> crate::Result<String> {
 
 /// Parse a click target from coordinates (x, y) or element parameters.
 fn parse_click_target(args: &Value) -> crate::Result<ClickTarget> {
+    // An element id is the most precise target: it names an element in a
+    // tree the caller was shown, not a pixel on a screen that may move.
+    if let Some(id) = args["element_id"].as_str().filter(|s| !s.is_empty()) {
+        return Ok(ClickTarget::ElementId(id.to_string()));
+    }
     // If x/y are provided, use coordinate target.
     if args.get("x").and_then(Value::as_i64).is_some()
         && args.get("y").and_then(Value::as_i64).is_some()
@@ -470,6 +543,125 @@ fn parse_string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Render a [`StepOutcome`] for the model.
+///
+/// The payload carries machine-readable `effect` / `escalation` / `rung`, and
+/// the text carries the same facts in one line each, because the model reads
+/// the text and the harness reads the data.
+async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionResult {
+    let StepOutcome {
+        result,
+        diff,
+        evidence,
+        sensitive_after,
+        sensitive_target,
+        reflection,
+        verification,
+        ..
+    } = outcome;
+
+    let mut tool_result = action_result_to_tool_result(result).await;
+
+    if let Some(diff) = &diff {
+        tool_result
+            .output
+            .push_str(&format!("\n\n[verification] {}", diff.summary()));
+    }
+
+    if let Some(evidence) = &evidence {
+        tool_result
+            .output
+            .push_str(&format!("\n[action] {}", evidence.summary()));
+    }
+
+    if let Some(analysis) = &reflection {
+        tool_result.output.push_str(&format!(
+            "\n[failure] cause={:?} confidence={:.2}: {}",
+            analysis.root_cause, analysis.confidence, analysis.details
+        ));
+        if let Some(fix) = &analysis.suggested_fix {
+            tool_result
+                .output
+                .push_str(&format!("\n[suggested] {}", fix));
+        }
+    }
+
+    if sensitive_target || !sensitive_after.is_empty() {
+        let categories: Vec<String> = sensitive_after
+            .iter()
+            .map(|f| f.category.as_str().to_string())
+            .collect();
+        let mut line = String::from("\n[sensitive-ui]");
+        if sensitive_target {
+            line.push_str(" this action touched a sensitive control.");
+        }
+        if !categories.is_empty() {
+            line.push_str(&format!(" detected: {}", categories.join(", ")));
+        }
+        line.push_str(" Do not enter credentials or confirm payments/destructive prompts unless the user asked for it.");
+        tool_result.output.push_str(&line);
+    }
+
+    let data = tool_result.data.get_or_insert_with(|| json!({}));
+    if let Some(obj) = data.as_object_mut() {
+        if let Some(diff) = &diff {
+            obj.insert("verification".to_string(), serde_json::to_value(diff).unwrap_or_default());
+        }
+        if let Some(evidence) = &evidence {
+            obj.insert("rung".to_string(), json!(rung_name(evidence.rung)));
+            obj.insert("effect".to_string(), json!(evidence.effect.as_str()));
+            if let Some(next) = evidence.escalation {
+                obj.insert("escalation".to_string(), json!(escalation_name(next)));
+            }
+            obj.insert(
+                "tried".to_string(),
+                serde_json::to_value(&evidence.tried).unwrap_or_default(),
+            );
+        }
+        obj.insert("verification_state".to_string(), json!(verification_name(verification)));
+        if !sensitive_after.is_empty() || sensitive_target {
+            obj.insert("sensitive_target".to_string(), json!(sensitive_target));
+            obj.insert(
+                "sensitive_ui".to_string(),
+                serde_json::to_value(&sensitive_after).unwrap_or_default(),
+            );
+        }
+        if let Some(analysis) = &reflection {
+            obj.insert(
+                "reflection".to_string(),
+                serde_json::to_value(analysis).unwrap_or_default(),
+            );
+        }
+        obj.insert("action".to_string(), json!(action));
+    }
+
+    tool_result
+}
+
+fn rung_name(rung: crate::computer::Rung) -> &'static str {
+    match rung {
+        crate::computer::Rung::AxAction => "ax_action",
+        crate::computer::Rung::Pixel => "pixel",
+        crate::computer::Rung::Keyboard => "keyboard",
+    }
+}
+
+fn escalation_name(escalation: crate::computer::Escalation) -> &'static str {
+    match escalation {
+        crate::computer::Escalation::Px => "px",
+        crate::computer::Escalation::Foreground => "foreground",
+        crate::computer::Escalation::Page => "page",
+    }
+}
+
+fn verification_name(state: crate::computer::use_loop::StepVerification) -> &'static str {
+    match state {
+        crate::computer::use_loop::StepVerification::Verified => "verified",
+        crate::computer::use_loop::StepVerification::Failed => "failed",
+        crate::computer::use_loop::StepVerification::Unverifiable => "unverifiable",
+    }
 }
 
 /// Convert an [`ActionResult`] to a [`ToolExecutionResult`].
@@ -626,6 +818,47 @@ mod tests {
         // Structured diff attached to data.
         let data = result.data.expect("data should be present");
         assert!(data.get("verification").is_some());
+        // ... and so is a machine-readable verdict. The mock's screen never
+        // changes, so the click is a suspected no-op with a next rung to try.
+        assert_eq!(data["effect"], json!("suspected_noop"));
+        assert_eq!(data["rung"], json!("pixel"));
+        assert_eq!(data["escalation"], json!("foreground"));
+        assert_eq!(data["verification_state"], json!("failed"));
+    }
+
+    #[tokio::test]
+    async fn pinned_notes_come_back_on_reperception() {
+        let tool = mock_tool();
+        let ctx = ToolContext::default();
+        tool.execute(json!({"action": "note", "note_key": "invoice", "text": "INV-42"}), &ctx)
+            .await
+            .unwrap();
+        let result = tool
+            .execute(json!({"action": "read_ui_tree"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.output.contains("invoice = INV-42"), "{}", result.output);
+        let data = result.data.expect("data should be present");
+        assert_eq!(data["notes"][0]["key"], json!("invoice"));
+    }
+
+    #[tokio::test]
+    async fn sessions_are_scoped_to_a_conversation() {
+        let tool = mock_tool();
+        let mut alice = ToolContext::default();
+        alice.identity.conversation_id = "alice".to_string();
+        let mut bob = ToolContext::default();
+        bob.identity.conversation_id = "bob".to_string();
+
+        tool.execute(json!({"action": "note", "note_key": "secret", "text": "one"}), &alice)
+            .await
+            .unwrap();
+
+        let bob_notes = tool
+            .execute(json!({"action": "recall_notes"}), &bob)
+            .await
+            .unwrap();
+        assert!(!bob_notes.output.contains("secret"), "{}", bob_notes.output);
     }
 
     #[tokio::test]

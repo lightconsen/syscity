@@ -32,10 +32,13 @@
 //! }
 //! ```
 
+use serde::{Deserialize, Serialize};
+
 use crate::computer::types::UiElement;
 
 /// Category of sensitive UI detected.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SensitiveUiType {
     /// Password / passphrase input field.
     PasswordField,
@@ -49,8 +52,21 @@ pub enum SensitiveUiType {
     PrivilegeEscalation,
 }
 
+impl SensitiveUiType {
+    /// Stable, model-facing name (matches the serde representation).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PasswordField => "password_field",
+            Self::PaymentField => "payment_field",
+            Self::PaymentPage => "payment_page",
+            Self::DestructiveConfirmation => "destructive_confirmation",
+            Self::PrivilegeEscalation => "privilege_escalation",
+        }
+    }
+}
+
 /// A single detection result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensitiveUiFinding {
     pub category: SensitiveUiType,
     pub description: String,

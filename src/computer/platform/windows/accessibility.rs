@@ -23,6 +23,9 @@ pub struct UiElement {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// UIA `AutomationId`, when the application publishes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
     pub children: Vec<UiElement>,
 }
 
@@ -73,6 +76,7 @@ function Export-Element {
         y      = [int]$r.BoundingRectangle.Y
         width  = [int]$r.BoundingRectangle.Width
         height = [int]$r.BoundingRectangle.Height
+        identifier = $r.AutomationId
         children = @()
     }
     if ($depth -lt 3) {
@@ -143,8 +147,137 @@ if ($target) {
             y: obj.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             width: obj.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             height: obj.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            identifier: obj
+                .get("identifier")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
             children,
         })
+    }
+
+    /// Build a PowerShell script that performs a native UIA action on the
+    /// element at `path` (a child-index path from the target window).
+    fn build_action_script(
+        action: &str,
+        app: Option<&str>,
+        path: &[usize],
+        value: Option<&str>,
+    ) -> String {
+        let path_list = path
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Single quotes inside a PowerShell single-quoted string are doubled.
+        let app_pattern = app.unwrap_or("").replace('\'', "''");
+        let value_literal = value.unwrap_or("").replace('\'', "''");
+
+        let action_body = match action {
+            "press" => r#"
+try { $p = $elem.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); '{"ok":true,"result":"invoked"}' }
+catch {
+    try { $p = $elem.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); $p.Select(); '{"ok":true,"result":"selected"}' }
+    catch {
+        try { $p = $elem.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern); $p.DoDefaultAction(); '{"ok":true,"result":"default_action"}' }
+        catch { '{"ok":false,"error":"element exposes no invoke pattern"}' }
+    }
+}"#
+                .to_string(),
+            "focus" => r#"
+try { $elem.SetFocus(); '{"ok":true,"result":"focused"}' }
+catch { '{"ok":false,"error":"element cannot take focus"}' }"#
+                .to_string(),
+            "set_value" => format!(
+                r#"
+try {{ $p = $elem.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); $p.SetValue('{value_literal}'); '{{"ok":true,"result":"value_set"}}' }}
+catch {{ '{{"ok":false,"error":"element has no settable value"}}' }}"#
+            ),
+            _ => String::new(),
+        };
+
+        format!(
+            r#"
+Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+
+$path = @({path_list})
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = [System.Windows.Automation.ControlTypeCondition]::Window
+$windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+
+$target = $null
+if ('{app_pattern}' -ne '') {{
+    for ($i = 0; $i -lt $windows.Count; $i++) {{
+        if ($windows[$i].Current.Name -like '*{app_pattern}*') {{ $target = $windows[$i]; break }}
+    }}
+}}
+if (-not $target) {{
+    for ($i = 0; $i -lt $windows.Count; $i++) {{
+        if ($windows[$i].Current.NativeWindowHandle -ne 0) {{ $target = $windows[$i]; break }}
+    }}
+}}
+if (-not $target -and $windows.Count -gt 0) {{ $target = $windows[0] }}
+if (-not $target) {{ '{{"ok":false,"error":"no window"}}'; exit }}
+
+$elem = $target
+foreach ($i in $path) {{
+    $kids = $elem.FindAll([System.Windows.Automation.TreeScope]::Children,
+                          [System.Windows.Automation.Condition]::TrueCondition)
+    if ($i -ge $kids.Count) {{ '{{"ok":false,"error":"path out of range"}}'; exit }}
+    $elem = $kids[$i]
+}}
+{action_body}
+"#
+        )
+    }
+
+    /// Run a native UIA action against an element path.
+    async fn run_action(action: &str, args: &Value) -> crate::Result<ToolExecutionResult> {
+        let Some(path) = args["path"].as_array().and_then(|values| {
+            values
+                .iter()
+                .map(|v| v.as_u64().map(|n| n as usize))
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            return Ok(ToolExecutionResult::error(
+                "an accessibility action needs a child-index `path`",
+            ));
+        };
+
+        let script =
+            Self::build_action_script(action, args["app"].as_str(), &path, args["value"].as_str());
+        if script.is_empty() {
+            return Ok(ToolExecutionResult::error(format!(
+                "unsupported accessibility action '{action}'"
+            )));
+        }
+
+        let (success, stdout, stderr) = Self::run_ps(&script).await?;
+        let parsed: Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+            serde_json::json!({ "ok": false, "error": if stderr.is_empty() { stdout.clone() } else { stderr.clone() } })
+        });
+        let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if success && ok {
+            Ok(ToolExecutionResult::success("ok").with_data(serde_json::json!({
+                "success": true,
+                "action": action,
+                "path": path,
+                "result": parsed.get("result").cloned().unwrap_or_default(),
+            })))
+        } else {
+            let error = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("accessibility action failed")
+                .to_string();
+            Ok(ToolExecutionResult::error(error.clone()).with_data(serde_json::json!({
+                "success": false,
+                "action": action,
+                "path": path,
+                "error": error,
+            })))
+        }
     }
 
     async fn run_ps(script: &str) -> crate::Result<(bool, String, String)> {
@@ -192,6 +325,20 @@ impl Tool for WindowsAccessibilityTool {
                 "app": {
                     "type": "string",
                     "description": "Window title pattern to inspect (partial match). If omitted, inspects the foreground window."
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["tree", "press", "focus", "set_value"],
+                    "description": "tree (default) reads the element tree; the others act on the element at `path`."
+                },
+                "path": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "Child-index path to the element: [window, child, grandchild, ...], 0-based."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to set, for action=set_value."
                 }
             }),
             Vec::<String>::new(),
@@ -200,9 +347,13 @@ impl Tool for WindowsAccessibilityTool {
 
     async fn execute(
         &self,
-        _args: Value,
+        args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        if let Some(action) = args["action"].as_str().filter(|a| *a != "tree") {
+            return Self::run_action(action, &args).await;
+        }
+
         info!("Querying Windows accessibility tree");
 
         let (success, stdout, stderr) = Self::run_ps(&Self::build_ui_tree_script()).await?;

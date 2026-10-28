@@ -3,9 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::computer::element_index::{parse_element_id, ActionTarget, ResolveError, SnapshotCache};
 use crate::computer::{
-    ActionResult, ClickTarget, ComputerAdapter, ComputerError, DesktopAction, MouseButton, Rect,
-    Result, Screenshot, UiElement, WaitCondition,
+    ActionEffect, ActionEvidence, ActionResult, AxAction, ClickTarget, ComputerAdapter,
+    ComputerError, DesktopAction, MouseButton, Rect, Result, Rung, Screenshot, UiElement,
+    WaitCondition,
 };
 use crate::tools::ToolRegistry;
 
@@ -14,6 +16,9 @@ use crate::tools::ToolRegistry;
 pub struct WindowsComputerAdapter {
     registry: Arc<ToolRegistry>,
     file_watcher: tokio::sync::Mutex<Option<crate::computer::FileWatcher>>,
+    /// Trees handed to callers, so an element id can be resolved back to the
+    /// element it named. See [`crate::computer::element_index`].
+    snapshots: SnapshotCache,
 }
 
 impl WindowsComputerAdapter {
@@ -21,7 +26,14 @@ impl WindowsComputerAdapter {
         Self {
             registry,
             file_watcher: tokio::sync::Mutex::new(None),
+            snapshots: SnapshotCache::new(8),
         }
+    }
+
+    /// Resolve a target and return only its coordinates.
+    async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
+        let resolved = self.resolve_target(&target).await?;
+        Ok((resolved.x, resolved.y))
     }
 }
 
@@ -89,7 +101,15 @@ impl ComputerAdapter for WindowsComputerAdapter {
         }
 
         let elements = crate::computer::parse_accessibility_elements(result.data.as_ref());
-        Ok(elements)
+        let app_name = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("app"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // The returned ids are only resolvable because the tree is cached.
+        Ok(self.snapshots.store(elements, app_name).await.roots)
     }
 
     async fn execute(&self, action: DesktopAction) -> Result<ActionResult> {
@@ -100,7 +120,7 @@ impl ComputerAdapter for WindowsComputerAdapter {
                     .with_data(serde_json::to_value(&ss).unwrap_or_default()))
             }
             DesktopAction::Click { target, button } => {
-                let (x, y) = self.resolve_click_target(target).await?;
+                let (x, y) = self.resolve_click_point(target).await?;
                 let btn_num = match button {
                     MouseButton::Left => 1,
                     MouseButton::Middle => 2,
@@ -120,7 +140,7 @@ impl ComputerAdapter for WindowsComputerAdapter {
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::DoubleClick { target, button } => {
-                let (x, y) = self.resolve_click_target(target).await?;
+                let (x, y) = self.resolve_click_point(target).await?;
                 let btn_num = match button {
                     MouseButton::Left => 1,
                     MouseButton::Middle => 2,
@@ -140,7 +160,7 @@ impl ComputerAdapter for WindowsComputerAdapter {
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Scroll { target, direction, amount } => {
-                let (x, y) = self.resolve_click_target(target).await?;
+                let (x, y) = self.resolve_click_point(target).await?;
                 let dir_str = match direction {
                     crate::computer::ScrollDirection::Up => "up",
                     crate::computer::ScrollDirection::Down => "down",
@@ -161,8 +181,8 @@ impl ComputerAdapter for WindowsComputerAdapter {
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Drag { from, to } => {
-                let (from_x, from_y) = self.resolve_click_target(from).await?;
-                let (to_x, to_y) = self.resolve_click_target(to).await?;
+                let (from_x, from_y) = self.resolve_click_point(from).await?;
+                let (to_x, to_y) = self.resolve_click_point(to).await?;
                 let args = serde_json::json!({
                     "action": "drag", "from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y,
                 });
@@ -478,47 +498,84 @@ impl ComputerAdapter for WindowsComputerAdapter {
 }
 
 impl WindowsComputerAdapter {
-    async fn resolve_click_target(&self, target: ClickTarget) -> Result<(i32, i32)> {
-        match target {
-            ClickTarget::Coordinate(p) => Ok((p.x, p.y)),
-            ClickTarget::ElementId(id) => {
-                let tree = self.read_ui_tree(None).await?;
-                let el = tree
-                    .iter()
-                    .find(|e| e.id == id)
-                    .ok_or_else(|| ComputerError::ElementNotFound(id.clone()))?;
-                let center = el.center();
-                Ok((center.x, center.y))
-            }
-            ClickTarget::ElementLabel(label) => {
-                let tree = self.read_ui_tree(None).await?;
-                let el = tree
-                    .iter()
-                    .find(|e| {
-                        e.label
-                            .as_ref()
-                            .map(|l| l.contains(&label))
-                            .unwrap_or(false)
-                    })
-                    .ok_or_else(|| ComputerError::ElementNotFound(label.clone()))?;
-                let center = el.center();
-                Ok((center.x, center.y))
-            }
-            ClickTarget::ElementRoleLabel { role, label } => {
-                let tree = self.read_ui_tree(None).await?;
-                let el = tree
-                    .iter()
-                    .find(|e| {
-                        e.role == role
-                            && e.label
-                                .as_ref()
-                                .map(|l| l.contains(&label))
-                                .unwrap_or(false)
-                    })
-                    .ok_or_else(|| ComputerError::ElementNotFound(format!("{}:{}", role, label)))?;
-                let center = el.center();
-                Ok((center.x, center.y))
-            }
+    async fn resolve_target(&self, target: &ClickTarget) -> Result<ActionTarget> {
+        if let ClickTarget::Coordinate(p) = target {
+            return Ok(ActionTarget::point(p.x, p.y));
+        }
+
+        let lazy = match target {
+            ClickTarget::ElementId(id) => parse_element_id(id).is_none(),
+            _ => true,
+        };
+
+        let mut resolution = self.snapshots.resolve(target).await;
+        if lazy
+            && matches!(resolution, Err(ResolveError::NotFound(_)) | Err(ResolveError::NoSnapshot))
+        {
+            self.read_ui_tree(None).await?;
+            resolution = self.snapshots.resolve(target).await;
+        }
+
+        resolution.map_err(|e| match e {
+            ResolveError::Stale(snapshot) => ComputerError::StaleElement(format!(
+                "element id belongs to snapshot {snapshot:08x}, which is no longer cached; \
+                 re-read the UI tree and use a fresh id"
+            )),
+            other => ComputerError::ElementNotFound(other.to_string()),
+        })
+    }
+
+    async fn perform_ax_action(
+        &self,
+        target: &ActionTarget,
+        action: AxAction,
+    ) -> Result<ActionResult> {
+        let Some(element) = target.element.as_ref() else {
+            return Err(ComputerError::UnsupportedPlatform(
+                "an accessibility action needs an element target".to_string(),
+            ));
+        };
+        if element.path.is_empty() {
+            return Err(ComputerError::UnsupportedPlatform(
+                "element has no addressable path".to_string(),
+            ));
+        }
+
+        let action_name = match &action {
+            AxAction::Press => "press",
+            AxAction::Focus => "focus",
+            AxAction::SetValue { .. } => "set_value",
+        };
+        let mut args = serde_json::json!({
+            "action": action_name,
+            "path": element.path,
+        });
+        if let Some(app) = target.app.as_deref() {
+            args["app"] = serde_json::json!(app);
+        }
+        if let AxAction::SetValue { value } = &action {
+            args["value"] = serde_json::json!(value);
+        }
+
+        let result = self
+            .registry
+            .execute("windows_accessibility", args, &crate::tools::ToolContext::default())
+            .await
+            .ok_or_else(|| ComputerError::ToolFailed("accessibility tool not found".to_string()))?
+            .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+
+        if result.success {
+            Ok(ActionResult::success("ok")
+                .with_evidence(ActionEvidence::new(Rung::AxAction, ActionEffect::Confirmed)))
+        } else {
+            let message = result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("accessibility action failed")
+                .to_string();
+            Err(ComputerError::ToolFailed(message))
         }
     }
 }

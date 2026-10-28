@@ -10,12 +10,14 @@
 //!   detection (buttons, text fields, checkboxes, icons) via ONNX (OmniParser),
 //!   for when the accessibility tree is empty or incomplete.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::computer::sensitive_ui::SensitiveUiDetector;
 use crate::computer::vision::ScreenState;
 #[cfg(feature = "vision")]
 use crate::computer::Rect;
@@ -239,11 +241,29 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
             }
         }
 
+        // Sensitive-UI scan runs over the tree the model is about to see, so
+        // the warning is attached to the exact lines it applies to. Keyed by
+        // element id; elements without a snapshot id cannot be targeted by id
+        // anyway, so they are only counted in the header.
+        let detector = SensitiveUiDetector::new();
+        let mut findings = Vec::new();
+        for root in &state.ui_tree {
+            findings.extend(detector.scan_tree(root));
+        }
+        let mut sensitive: HashMap<String, &'static str> = HashMap::new();
+        for finding in &findings {
+            if !finding.element_id.is_empty() {
+                sensitive
+                    .entry(finding.element_id.clone())
+                    .or_insert(finding.category.as_str());
+            }
+        }
+
         // Format: indented UI-tree outline + OCR text + screenshot in data.
         let mut output = String::from("UI tree:\n");
         let mut lines = 0usize;
         for root in &state.ui_tree {
-            format_element(root, 0, &mut output, &mut lines, max_lines);
+            format_element(root, 0, &mut output, &mut lines, max_lines, &sensitive);
         }
         if state.ui_tree.is_empty() {
             output.push_str("(empty — no accessibility tree available)\n");
@@ -260,6 +280,29 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
             if lines >= max_lines {
                 output.push_str("… (tree truncated)\n");
             }
+            // Trust labeling: the model must know how far it can rely on this
+            // tree before it acts on it. Accessibility comes from the OS's own
+            // semantic tree; OmniParser infers boxes from pixels, with no
+            // roles, names or ids — a click there is a guess at coordinates.
+            output.push_str(&format!(
+                "(tree source: {}; {})\n",
+                ui_source,
+                match ui_source {
+                    "omniparser" =>
+                        "inferred from pixels — treat roles/names as guesses, verify visually",
+                    _ => "authoritative — element ids address real accessibility elements",
+                }
+            ));
+        }
+        if !findings.is_empty() {
+            output.push_str(&format!(
+                "(⚠ sensitive UI detected: {}) — pause and confirm before typing or clicking here\n",
+                findings
+                    .iter()
+                    .map(|f| format!("{} ({})", f.category.as_str(), f.description))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         if !state.ocr_text.is_empty() {
             output.push_str("\nOCR text:\n");
@@ -274,6 +317,12 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
             "screenshot_height": state.screenshot.height,
             "ui_tree": serde_json::to_value(&state.ui_tree).unwrap_or_default(),
             "ui_source": ui_source,
+            "ui_trust": if ui_source == "omniparser" {
+                "inferred"
+            } else {
+                "authoritative"
+            },
+            "sensitive_ui": serde_json::to_value(&findings).unwrap_or_default(),
             "ocr_text": state.ocr_text,
             "ocr_regions": serde_json::to_value(&state.ocr_regions).unwrap_or_default(),
         });
@@ -319,6 +368,7 @@ fn format_element(
     out: &mut String,
     lines: &mut usize,
     max_lines: usize,
+    sensitive: &HashMap<String, &'static str>,
 ) {
     if *lines >= max_lines {
         return;
@@ -330,8 +380,21 @@ fn format_element(
     let label = el.label.as_deref().filter(|l| !l.is_empty());
     let label_part = label.map(|l| format!(" {:?}", l)).unwrap_or_default();
     let state = if el.enabled { "" } else { " [disabled]" };
+    // The id is what lets the model act on this exact element later: it is
+    // snapshot-bound, and `computer` resolves it or reports it as stale.
+    let id_part = if el.id.is_empty() {
+        String::new()
+    } else {
+        format!(" [id={}]", el.id)
+    };
+    // Inline the reason the model must slow down on *this* line, rather than
+    // leaving it to a header it may skim past.
+    let sensitive_part = sensitive
+        .get(&el.id)
+        .map(|kind| format!(" [sensitive: {kind}]"))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "{}{}{}{} at ({},{}) {}x{}\n",
+        "{}{}{}{} at ({},{}) {}x{}{}{}\n",
         indent,
         el.role,
         label_part,
@@ -339,10 +402,12 @@ fn format_element(
         el.bounds.x,
         el.bounds.y,
         el.bounds.width,
-        el.bounds.height
+        el.bounds.height,
+        id_part,
+        sensitive_part
     ));
     for child in &el.children {
-        format_element(child, depth + 1, out, lines, max_lines);
+        format_element(child, depth + 1, out, lines, max_lines, sensitive);
     }
 }
 
@@ -626,6 +691,10 @@ mod tests {
     use super::*;
     use crate::computer::types::Rect;
 
+    fn no_sensitive() -> HashMap<String, &'static str> {
+        HashMap::new()
+    }
+
     fn el(role: &str, label: Option<&str>, children: Vec<UiElement>) -> UiElement {
         UiElement {
             id: String::new(),
@@ -644,10 +713,32 @@ mod tests {
         let tree = el("window", Some("App"), vec![el("button", Some("OK"), vec![])]);
         let mut out = String::new();
         let mut lines = 0;
-        format_element(&tree, 0, &mut out, &mut lines, 100);
+        format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
         assert!(out.contains("window \"App\" at (10,20) 100x30"));
         assert!(out.contains("  button \"OK\""));
         assert_eq!(lines, 2);
+    }
+
+    #[test]
+    fn format_element_appends_the_element_id() {
+        let mut tree = el("button", Some("Save"), vec![]);
+        tree.id = "s0000002a:0.1".to_string();
+        let mut out = String::new();
+        let mut lines = 0;
+        format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
+        assert!(out.contains("[id=s0000002a:0.1]"), "{out}");
+    }
+
+    #[test]
+    fn format_element_marks_sensitive_elements() {
+        let mut tree = el("text_field", Some("Password"), vec![]);
+        tree.id = "s00000003:0.2".to_string();
+        let mut sensitive = HashMap::new();
+        sensitive.insert("s00000003:0.2".to_string(), "password_field");
+        let mut out = String::new();
+        let mut lines = 0;
+        format_element(&tree, 0, &mut out, &mut lines, 100, &sensitive);
+        assert!(out.contains("[sensitive: password_field]"), "{out}");
     }
 
     #[test]
@@ -656,7 +747,7 @@ mod tests {
         let tree = el("button", None, vec![]);
         let mut out = String::new();
         let mut lines = 0;
-        format_element(&tree, 0, &mut out, &mut lines, 100);
+        format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
         assert_eq!(out, "button at (10,20) 100x30\n");
         assert!(!out.contains("\"\""));
     }
@@ -669,7 +760,7 @@ mod tests {
         let tree = el("window", Some("App"), children);
         let mut out = String::new();
         let mut lines = 0;
-        format_element(&tree, 0, &mut out, &mut lines, 5);
+        format_element(&tree, 0, &mut out, &mut lines, 5, &no_sensitive());
         assert_eq!(lines, 5);
         // Caller appends the truncation notice when the cap is hit.
         if lines >= 5 {

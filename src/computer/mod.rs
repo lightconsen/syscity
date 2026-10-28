@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::tools::ToolRegistry;
 
 pub mod audio;
+pub mod element_index;
 pub mod fs_watch;
 pub mod headless;
 pub mod log_aggregator;
@@ -32,6 +33,7 @@ pub mod rollback;
 pub mod screen_recorder;
 pub mod screenshot_encoder;
 pub mod sensitive_ui;
+pub mod session;
 pub mod system;
 pub mod types;
 pub mod use_loop;
@@ -52,6 +54,7 @@ pub mod platform_windows;
 pub mod platform;
 
 pub use audio::{AudioCapture, AudioSegment, AudioSource, DetectedAudioEvent};
+pub use element_index::{ActionTarget, ResolveError, ResolvedElement, SnapshotCache, UiSnapshot};
 pub use fs_watch::{FileChangeEvent, FileChangeKind, FileWatchResult, FileWatcher};
 pub use headless::{HeadlessComputerAdapter, VirtualDisplay};
 pub use log_aggregator::{
@@ -80,6 +83,8 @@ pub enum ComputerError {
     ToolFailed(String),
     #[error("Element not found: {0}")]
     ElementNotFound(String),
+    #[error("{0}")]
+    StaleElement(String),
     #[error("Timeout waiting for condition")]
     Timeout,
     #[error("Screenshot failed: {0}")]
@@ -114,6 +119,37 @@ pub trait ComputerAdapter: Send + Sync {
 
     /// Wait until a condition becomes true or timeout expires.
     async fn wait_for(&self, condition: WaitCondition, timeout: Duration) -> Result<bool>;
+
+    /// Resolve a click target to concrete coordinates and, when the target
+    /// names an element, to the element itself.
+    ///
+    /// This is what makes an element id usable: the adapter that handed out
+    /// the id is the one that can resolve it back. The default implementation
+    /// handles bare coordinates and refuses everything else, so an adapter
+    /// opts into semantic addressing by overriding it.
+    async fn resolve_target(&self, target: &ClickTarget) -> Result<ActionTarget> {
+        match target {
+            ClickTarget::Coordinate(p) => Ok(ActionTarget::point(p.x, p.y)),
+            other => Err(ComputerError::UnsupportedPlatform(format!(
+                "element targeting is not supported by this adapter ({other:?})"
+            ))),
+        }
+    }
+
+    /// Perform a native accessibility action on an already-resolved element.
+    ///
+    /// Returning an error is the contract for "this platform cannot do it":
+    /// the action ladder treats that as "the rung was unavailable" and drops
+    /// to the next one, rather than as a failed action.
+    async fn perform_ax_action(
+        &self,
+        _target: &ActionTarget,
+        _action: AxAction,
+    ) -> Result<ActionResult> {
+        Err(ComputerError::UnsupportedPlatform(
+            "accessibility actions are not supported by this adapter".to_string(),
+        ))
+    }
 
     /// Convenience: click at a logical coordinate.
     async fn click_at(&self, point: Point, button: MouseButton) -> Result<ActionResult> {

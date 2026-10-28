@@ -17,6 +17,10 @@ pub struct UiElement {
     pub enabled: Option<bool>,
     pub position: Option<String>,
     pub size: Option<String>,
+    /// `AXIdentifier`, when the application publishes one. It is stable
+    /// across snapshots, which makes it a better handle than a child path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
     pub children: Vec<UiElement>,
 }
 
@@ -55,7 +59,7 @@ impl AccessibilityTool {
             r#"tell application "System Events"
     tell application process "{}"
         set frontmost to true
-        set _output to ""
+        set _output to "app|{}" & "\n"
         set _indent to "  "
 
         repeat with _win in (get every window)
@@ -102,15 +106,20 @@ on describe_elements(_container, _indent)
                 on error
                     set _sz to ""
                 end try
+                try
+                    set _idn to value of attribute "AXIdentifier" of _elem as string
+                on error
+                    set _idn to ""
+                end try
 
-                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "\n"
+                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "|" & _idn & "\n"
                 set _result to _result & my describe_elements(_elem, _indent & "  ")
             end repeat
         end try
         return _result
     end tell
 end describe_elements"#,
-            app_name
+            app_name, app_name
         )
     }
 
@@ -170,8 +179,13 @@ on describe_elements(_container, _indent)
                 on error
                     set _sz to ""
                 end try
+                try
+                    set _idn to value of attribute "AXIdentifier" of _elem as string
+                on error
+                    set _idn to ""
+                end try
 
-                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "\n"
+                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "|" & _idn & "\n"
                 set _result to _result & my describe_elements(_elem, _indent & "  ")
             end repeat
         end try
@@ -179,6 +193,82 @@ on describe_elements(_container, _indent)
     end tell
 end describe_elements"#
         .to_string()
+    }
+
+    /// Escape a value for an AppleScript string literal.
+    fn escape(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    /// Build an AppleScript element reference from a child-index path.
+    ///
+    /// `[0, 2, 1]` is the 1st window's 3rd child's 2nd child, written
+    /// innermost-first the way AppleScript spells it:
+    /// `UI element 2 of UI element 3 of window 1`.
+    fn element_reference(path: &[usize]) -> Option<String> {
+        let (window, rest) = path.split_first()?;
+        let mut reference = format!("window {}", window + 1);
+        for index in rest {
+            reference = format!("UI element {} of {}", index + 1, reference);
+        }
+        Some(reference)
+    }
+
+    /// Build an AppleScript that performs a native accessibility action on
+    /// one element.
+    ///
+    /// The action rung exists because `click at {x, y}` depends on z-order,
+    /// on the window being frontmost, and on nothing covering the point.
+    /// `perform action "AXPress"` depends on none of those.
+    fn build_action_script(app: &str, path: &[usize], action: &str, value: Option<&str>) -> String {
+        let Some(reference) = Self::element_reference(path) else {
+            return String::new();
+        };
+        let body = match action {
+            "press" => r#"try
+            perform action "AXPress" of _elem
+            return "pressed"
+        on error
+            try
+                click _elem
+                return "clicked"
+            on error _err
+                return "error: " & _err
+            end try
+        end try"#
+                .to_string(),
+            "focus" => r#"try
+            set value of attribute "AXFocused" of _elem to true
+            return "focused"
+        on error _err
+            return "error: " & _err
+        end try"#
+                .to_string(),
+            "set_value" => format!(
+                r#"try
+            set value of _elem to "{}"
+            return "value set"
+        on error _err
+            return "error: " & _err
+        end try"#,
+                Self::escape(value.unwrap_or(""))
+            ),
+            _ => return String::new(),
+        };
+
+        format!(
+            r#"tell application "System Events"
+    tell application process "{}"
+        try
+            set _elem to {reference}
+        on error _err
+            return "error: " & _err
+        end try
+        {body}
+    end tell
+end tell"#,
+            Self::escape(app)
+        )
     }
 
     /// Parse the pipe-delimited, indented output from AppleScript into a tree.
@@ -202,6 +292,7 @@ end describe_elements"#
             enabled: Option<bool>,
             position: Option<String>,
             size: Option<String>,
+            identifier: Option<String>,
         }
 
         let entries: Vec<Entry> = output
@@ -242,6 +333,10 @@ end describe_elements"#
                         .get(5)
                         .map(|s| s.to_string())
                         .filter(|s| !s.is_empty()),
+                    identifier: parts
+                        .get(6)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 })
             })
             .collect();
@@ -264,6 +359,7 @@ end describe_elements"#
                     enabled: entries[i].enabled,
                     position: entries[i].position.clone(),
                     size: entries[i].size.clone(),
+                    identifier: entries[i].identifier.clone(),
                     children,
                 });
                 i = next;
@@ -273,6 +369,56 @@ end describe_elements"#
 
         let (result, _) = build(&entries, 0, 0);
         result
+    }
+
+    /// Run a native accessibility action against an element path.
+    async fn run_action(action: &str, args: &Value) -> crate::Result<ToolExecutionResult> {
+        let Some(app) = args["app"].as_str().filter(|a| !a.is_empty()) else {
+            return Ok(ToolExecutionResult::error("an accessibility action needs an app name"));
+        };
+        let Some(path) = args["path"].as_array().and_then(|values| {
+            values
+                .iter()
+                .map(|v| v.as_u64().map(|n| n as usize))
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            return Ok(ToolExecutionResult::error(
+                "an accessibility action needs a child-index `path`",
+            ));
+        };
+
+        let script = Self::build_action_script(app, &path, action, args["value"].as_str());
+        if script.is_empty() {
+            return Ok(ToolExecutionResult::error(format!(
+                "unsupported accessibility action '{action}'"
+            )));
+        }
+
+        let timeout_secs = args["timeout"].as_u64().unwrap_or(10);
+        let as_result = AppleScriptTool::execute_script(&script, timeout_secs).await;
+        let output = as_result.output.trim().to_string();
+        if as_result.success && !output.starts_with("error:") {
+            Ok(ToolExecutionResult::success(&output).with_data(serde_json::json!({
+                "success": true,
+                "action": action,
+                "app": app,
+                "path": path,
+                "result": output,
+            })))
+        } else {
+            let error = as_result
+                .error
+                .clone()
+                .filter(|e| !e.is_empty())
+                .unwrap_or(output);
+            Ok(ToolExecutionResult::error(error.clone()).with_data(serde_json::json!({
+                "success": false,
+                "action": action,
+                "app": app,
+                "path": path,
+                "error": error,
+            })))
+        }
     }
 }
 
@@ -301,6 +447,20 @@ impl Tool for AccessibilityTool {
                     "type": "integer",
                     "description": "Maximum recursion depth (AppleScript may time out for deep trees)",
                     "default": 3
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["tree", "press", "focus", "set_value"],
+                    "description": "tree (default) reads the element tree; the others act on the element at `path`."
+                },
+                "path": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "Child-index path to the element: [window, child, grandchild, ...], 0-based."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to set, for action=set_value."
                 }
             }),
             Vec::<String>::new(),
@@ -326,6 +486,13 @@ impl Tool for AccessibilityTool {
                 "error": err_msg,
                 "needs_permission": true,
             })));
+        }
+
+        // Native accessibility actions (the ladder's `ax` rung) share this
+        // tool because they share its permission check and its process
+        // addressing.
+        if let Some(action) = args["action"].as_str().filter(|a| *a != "tree") {
+            return Self::run_action(action, &args).await;
         }
 
         let script = if let Some(app) = args["app"].as_str() {

@@ -291,7 +291,13 @@ pub fn ui_element_from_accessibility_json(value: &serde_json::Value) -> Option<U
         .unwrap_or_default();
 
     Some(UiElement {
-        id: String::new(),
+        // `AutomationId` when the application publishes one; snapshot-path
+        // ids are filled in by `element_index::assign_ids` for the rest.
+        id: obj
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         role,
         label: if name.is_empty() { None } else { Some(name) },
         value,
@@ -544,6 +550,163 @@ pub struct FileEntry {
     pub is_directory: bool,
 }
 
+/// Which rung of the action ladder produced a result.
+///
+/// The ladder is about *how the action was aimed*, not about how the screen
+/// was captured: the same snapshot supports an accessibility action on an
+/// element and a click on its center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rung {
+    /// Accessibility action on the element itself
+    /// (`AXPress` / UIA `Invoke` / AT-SPI `doAction`). Independent of
+    /// z-order and of where the window happens to be.
+    AxAction,
+    /// A click at the element's center, or at a coordinate.
+    Pixel,
+    /// Keyboard: focus the element, then drive it with keys.
+    Keyboard,
+}
+
+/// A native accessibility action to perform on an element.
+///
+/// These map onto the platform's own action vocabulary: `AXPress` /
+/// UIA `Invoke` / AT-SPI `doAction("click")`, and the value-setting action
+/// that lets a text field be filled without keystrokes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AxAction {
+    /// Press the element as its control type understands it.
+    Press,
+    /// Set the element's value (text fields, editable combos).
+    SetValue { value: String },
+    /// Give the element keyboard focus.
+    Focus,
+}
+
+impl AxAction {
+    /// Short name, for evidence and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Press => "press",
+            Self::SetValue { .. } => "set_value",
+            Self::Focus => "focus",
+        }
+    }
+}
+
+/// What is known about whether an action took effect.
+///
+/// Three values, because two cannot hold the truth — the same reason
+/// [`crate::computer::use_loop::StepVerification`] has three. `Confirmed` is
+/// reserved for an effect the driver actually observed: an accessibility
+/// action that reported no error, or a screen that changed. A pixel click
+/// that "succeeded" in the sense that the pointer moved is `Unverifiable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionEffect {
+    /// The effect was observed.
+    Confirmed,
+    /// Nothing was established: no read-back was possible.
+    Unverifiable,
+    /// The action was delivered but the screen did not change when it should
+    /// have.
+    SuspectedNoop,
+}
+
+impl ActionEffect {
+    /// Machine-readable effect name, for the tool result payload.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unverifiable => "unverifiable",
+            Self::SuspectedNoop => "suspected_noop",
+        }
+    }
+
+    /// Whether this effect means the caller should try a higher rung.
+    pub fn should_escalate(self) -> bool {
+        matches!(self, Self::SuspectedNoop | Self::Unverifiable)
+    }
+}
+
+/// The next rung to try when an action did not take.
+///
+/// Mirrors the escalation hints Cua emits: a pixel rung is offered when an
+/// accessibility action failed, a foreground rung when a pixel click may have
+/// gone to the wrong window, and a page rung when neither worked and the
+/// caller should re-observe instead of retrying blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Escalation {
+    /// Retry aimed at the element's pixels.
+    Px,
+    /// Bring the window to the front, then retry.
+    Foreground,
+    /// Stop retrying this action; re-read the page/tree.
+    Page,
+}
+
+/// Evidence attached to an action result: which rung ran and what it
+/// established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionEvidence {
+    pub rung: Rung,
+    pub effect: ActionEffect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<Escalation>,
+    /// Rungs that were tried and rejected, lowest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tried: Vec<Rung>,
+}
+
+impl ActionEvidence {
+    pub fn new(rung: Rung, effect: ActionEffect) -> Self {
+        Self {
+            rung,
+            effect,
+            escalation: None,
+            tried: Vec::new(),
+        }
+    }
+
+    pub fn with_escalation(mut self, escalation: Escalation) -> Self {
+        self.escalation = Some(escalation);
+        self
+    }
+
+    pub fn with_tried(mut self, tried: Vec<Rung>) -> Self {
+        self.tried = tried;
+        self
+    }
+
+    /// One-line rendering for the tool output the model reads.
+    pub fn summary(&self) -> String {
+        let mut line = format!("rung={} effect={}", rung_name(self.rung), self.effect.as_str());
+        if !self.tried.is_empty() {
+            let previous: Vec<&str> = self.tried.iter().map(|r| rung_name(*r)).collect();
+            line.push_str(&format!(" tried={}", previous.join(",")));
+        }
+        if let Some(next) = self.escalation {
+            let next = match next {
+                Escalation::Px => "px",
+                Escalation::Foreground => "foreground",
+                Escalation::Page => "page",
+            };
+            line.push_str(&format!(" escalate={next}"));
+        }
+        line
+    }
+}
+
+fn rung_name(rung: Rung) -> &'static str {
+    match rung {
+        Rung::AxAction => "ax_action",
+        Rung::Pixel => "pixel",
+        Rung::Keyboard => "keyboard",
+    }
+}
+
 /// Result of executing a desktop action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {
@@ -553,6 +716,9 @@ pub struct ActionResult {
     pub screenshot_after: Option<Screenshot>,
     /// Structured data (e.g. UI tree after the action).
     pub data: Option<serde_json::Value>,
+    /// Which rung ran and what it established, when the adapter can say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ActionEvidence>,
 }
 
 impl ActionResult {
@@ -562,6 +728,7 @@ impl ActionResult {
             message: message.into(),
             screenshot_after: None,
             data: None,
+            evidence: None,
         }
     }
 
@@ -571,6 +738,7 @@ impl ActionResult {
             message: message.into(),
             screenshot_after: None,
             data: None,
+            evidence: None,
         }
     }
 
@@ -581,6 +749,11 @@ impl ActionResult {
 
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    pub fn with_evidence(mut self, evidence: ActionEvidence) -> Self {
+        self.evidence = Some(evidence);
         self
     }
 }
