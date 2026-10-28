@@ -55,7 +55,7 @@ scorer. Model: **`deepseek-v4-flash`** throughout.
 | Benchmark | What it measures | Score |
 |---|---|---|
 | [BFCL](https://gorilla.cs.berkeley.edu/leaderboard.html) `bfcl-eval 2026.3.23` | the model plus the OpenAI-compatible wire (`raw` mode) | **80.12%** (673/840) over two runs (78.81% then 80.12%, a difference inside the noise floor) |
-| [GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1 | syscity's own agent loop, end to end | **78.0%** (124/159 trials), from a 70.4% baseline before the retrieval and answer-format work |
+| [GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1 | syscity's own agent loop, end to end | **90.6%** (144/159 trials); 70.4% → 78.0% → 90.6% over three runs (the last bundles two changes — see the notes) |
 
 Finer-grained tables, the method behind each number, the measured noise floor,
 reproduction steps and the failure breakdown are in
