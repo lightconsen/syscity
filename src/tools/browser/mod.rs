@@ -98,9 +98,42 @@ impl Default for BrowserTool {
 }
 
 impl BrowserTool {
-    /// Create a new browser tool
+    /// Create a new browser tool with no pool.
+    ///
+    /// Every action then launches a Chrome, runs, and lets it die. This exists
+    /// for tests and one-off use; the shipped registries build the tool with
+    /// [`BrowserTool::for_gateway`] or [`BrowserTool::for_eval`], which give it
+    /// a pool so a conversation keeps one browser and one tab between calls.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build the tool the way a running gateway needs it: one shared pool,
+    /// sized from `[browser]`, that outlives any single conversation.
+    ///
+    /// The pool is owned by the tool rather than passed in at spawn time. A
+    /// gateway builds its tool registry once and shares it with every
+    /// conversation, so a pool handed to the tool here is the same pool for
+    /// all of them — and pages are attributed to a conversation by id, so a
+    /// shared pool does not mean shared tabs.
+    #[cfg(feature = "browser")]
+    pub fn for_gateway(config: &crate::config::BrowserConfig) -> Self {
+        let pool = std::sync::Arc::new(crate::browser::BrowserPool::with_profiles(
+            config.pool.clone(),
+            config.profiles.clone(),
+        ));
+        Self::default().with_pool(pool)
+    }
+
+    /// Build the tool the way a standalone eval run needs it: a pool with the
+    /// default profile, so a task's tool calls do not each start a browser.
+    #[cfg(feature = "browser")]
+    pub fn for_eval() -> Self {
+        let pool = std::sync::Arc::new(crate::browser::BrowserPool::with_profiles(
+            crate::browser::BrowserPoolConfig::default(),
+            vec![crate::browser::BrowserProfile::default()],
+        ));
+        Self::default().with_pool(pool)
     }
 
     /// Set Chrome/Chromium executable path

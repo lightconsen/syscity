@@ -899,9 +899,12 @@ fn create_eval_tool_registry(
     registry.register(Box::new(WebFetchTool::new()));
     // End-to-end tasks (GAIA L1) browse pages that `web_fetch` cannot reduce to
     // text — JS-rendered content, a click away from a file. Same SSRF policy as
-    // the gateway; the permissive variant stays an explicit opt-in.
+    // the gateway; the permissive variant stays an explicit opt-in. The pool
+    // is what keeps a task's browsing in one browser: a cold start per tool
+    // call was the difference between a 30-turn budget spent searching and one
+    // spent relaunching Chrome.
     #[cfg(feature = "browser")]
-    registry.register(Box::new(crate::tools::browser::BrowserTool::new()));
+    registry.register(Box::new(crate::tools::browser::BrowserTool::for_eval()));
     registry.register(Box::new(TodoTool::new()));
     registry.register(Box::new(TimeTool::new()));
 

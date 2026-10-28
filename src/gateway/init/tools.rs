@@ -370,6 +370,8 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 audit_log: audit_log_dyn,
                 content_filter: Some(Arc::new(ContentFilter::default())),
                 search_config: config.search.clone(),
+                #[cfg(feature = "browser")]
+                browser_config: config.browser.clone(),
                 #[cfg(feature = "cloud")]
                 cloud_config: config.cloud.clone(),
                 device_bridge,

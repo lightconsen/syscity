@@ -65,6 +65,11 @@ fn pooled_tool(name: &str) -> (BrowserTool, Arc<BrowserPool>) {
 
 const CONTENT_PAGE: &str = "data:text/html,<title>persist</title><p>survives</p>";
 
+/// The conversation every test in this file acts as. Pages are attributed to
+/// the conversation that opened them, so a test that inspects the pool has to
+/// name the same one the tool call used.
+const E2E_CONVERSATION: &str = "e2e";
+
 /// The regression behind the empty-page failures: a Navigate in one tool call
 /// and a read in the next must land on the SAME page. Every call used to open
 /// a fresh `about:blank`, so the second call saw an empty document, the Type
@@ -142,7 +147,13 @@ async fn a_dead_tracked_page_is_replaced_not_reused() {
 
     // Close the tracked page out from under the tool.
     let instance = pool.get_or_create("dead-page").await.expect("instance");
-    let dead = instance.most_recent_page().await.expect("tracked page");
+    // The page is owned by the conversation that opened it, so the test asks
+    // as that conversation — `most_recent_page()` would also match the
+    // renderer's or another conversation's pages in a shared pool.
+    let dead = instance
+        .most_recent_page_of(E2E_CONVERSATION)
+        .await
+        .expect("tracked page");
     assert!(instance.close_page(&dead.target_id).await.expect("closes"), "page closed");
 
     let next = tool
@@ -153,5 +164,64 @@ async fn a_dead_tracked_page_is_replaced_not_reused() {
         next.success,
         "a dead tracked page must not poison the next call: {:?}",
         next.error
+    );
+}
+
+/// The pool is shared by every conversation in a gateway, so the page one
+/// conversation leaves behind must not become another's. Before pages had an
+/// owner, `most_recent_page()` returned the globally newest tab and the second
+/// conversation's first read landed in the first conversation's page.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_conversations_page_is_not_anothers() {
+    if !e2e_enabled() {
+        eprintln!("skipped: set SYSCITY_BROWSER_E2E=1 to run browser e2e tests");
+        return;
+    }
+    let (tool, _pool) = pooled_tool("isolation");
+
+    let first = tool_context();
+    let second = ToolContext {
+        identity: ToolIdentity {
+            conversation_id: "someone-else".to_string(),
+            ..first.identity.clone()
+        },
+        ..first.clone()
+    };
+
+    tool.execute(json!({ "actions": [{ "Navigate": { "url": CONTENT_PAGE } }] }), &first)
+        .await
+        .expect("first conversation navigates");
+
+    // The second conversation must not see the first one's text.
+    let read = tool
+        .execute(json!({ "actions": [{ "GetText": {} }] }), &second)
+        .await
+        .expect("second conversation reads");
+    assert!(
+        !read.output.contains("survives"),
+        "one conversation read another's page: {}",
+        read.output
+    );
+
+    // Nor may it see the tab in its own listing.
+    let tabs = tool
+        .execute(json!({ "actions": ["list_tabs"] }), &second)
+        .await
+        .expect("second conversation lists tabs");
+    assert!(
+        !tabs.output.contains("survives"),
+        "one conversation saw another's tab: {}",
+        tabs.output
+    );
+
+    // The first conversation still has its page.
+    let again = tool
+        .execute(json!({ "actions": [{ "GetText": {} }] }), &first)
+        .await
+        .expect("first conversation reads again");
+    assert!(
+        again.output.contains("survives"),
+        "the owning conversation lost its own page: {}",
+        again.output
     );
 }

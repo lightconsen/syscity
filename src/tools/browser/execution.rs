@@ -61,6 +61,7 @@ impl BrowserTool {
         &self,
         actions: Vec<BrowserAction>,
         pool: &std::sync::Arc<crate::browser::BrowserPool>,
+        owner: &str,
     ) -> crate::Result<ToolExecutionResult> {
         let instance = pool.get_or_create(&self.profile).await?;
         // Reuse the page a previous call left behind. Every call used to open
@@ -69,16 +70,26 @@ impl BrowserTool {
         // every read returned an empty page. A one-line probe detects a page
         // that died since (closed externally, crashed) and falls back to a
         // fresh one.
-        let mut current_handle = match instance.most_recent_page().await {
+        //
+        // Only this conversation's pages qualify: the pool is shared, and
+        // picking the globally most-recent page would hand this call a tab
+        // another conversation is working in.
+        let mut current_handle = match instance.most_recent_page_of(owner).await {
             Some(handle) if handle.page.evaluate("1").await.is_ok() => handle,
             Some(handle) => {
                 warn!(
                     target_id = %handle.target_id,
                     "Tracked browser page is gone; opening a fresh one"
                 );
-                instance.new_page("about:blank").await?
+                instance
+                    .new_page_owned_by("about:blank", Some(owner.to_string()))
+                    .await?
             }
-            None => instance.new_page("about:blank").await?,
+            None => {
+                instance
+                    .new_page_owned_by("about:blank", Some(owner.to_string()))
+                    .await?
+            }
         };
         instance.touch_page(&current_handle.target_id).await;
         if let Err(e) = crate::browser::instrument::ensure_instrumented(&current_handle.page).await
@@ -96,7 +107,7 @@ impl BrowserTool {
             debug!("Executing browser action (pool): {:?}", action);
             let result = match action {
                 BrowserAction::ListTabs => {
-                    let tabs = instance.list_pages().await;
+                    let tabs = instance.list_pages_of(Some(owner)).await;
                     let tabs_json: Vec<Value> = tabs
                         .into_iter()
                         .map(
@@ -110,11 +121,11 @@ impl BrowserTool {
                     }))
                 }
                 BrowserAction::SwitchTab { index, title } => {
-                    let tabs = instance.list_pages().await;
+                    let tabs = instance.list_pages_of(Some(owner)).await;
                     let target_id = if let Some(idx) = index {
                         tabs.get(idx).map(|(id, _, _)| id.clone())
                     } else if let Some(ref t) = title {
-                        instance.find_page_by_title(t).await
+                        instance.find_page_by_title_of(t, Some(owner)).await
                     } else {
                         None
                     };
@@ -134,11 +145,11 @@ impl BrowserTool {
                     }
                 }
                 BrowserAction::CloseTab { index, title } => {
-                    let tabs = instance.list_pages().await;
+                    let tabs = instance.list_pages_of(Some(owner)).await;
                     let target_id = if let Some(idx) = index {
                         tabs.get(idx).map(|(id, _, _)| id.clone())
                     } else if let Some(ref t) = title {
-                        instance.find_page_by_title(t).await
+                        instance.find_page_by_title_of(t, Some(owner)).await
                     } else {
                         None
                     };
@@ -261,11 +272,15 @@ impl BrowserTool {
     pub(super) async fn execute_actions(
         &self,
         actions: Vec<BrowserAction>,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         // Use pool if available
         if let Some(ref pool) = self.pool {
-            return self.execute_actions_pool(actions, pool).await;
+            // The conversation owns the tab. A gateway shares this tool — and
+            // therefore its pool — with every conversation, so without this
+            // the next caller would inherit the previous one's page.
+            let owner = context.identity.conversation_id.clone();
+            return self.execute_actions_pool(actions, pool, &owner).await;
         }
 
         // Fall back to legacy per-call launch

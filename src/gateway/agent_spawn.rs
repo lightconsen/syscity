@@ -981,6 +981,9 @@ pub(crate) struct ToolRegistryArgs {
     pub content_filter: Option<Arc<crate::security::content_filter::ContentFilter>>,
     /// Search provider configuration.
     pub search_config: crate::gateway::config::SearchConfig,
+    /// Browser configuration (`[browser]`: pool sizing and profiles).
+    #[cfg(feature = "browser")]
+    pub browser_config: crate::config::BrowserConfig,
     /// Syscity Cloud config (feature `cloud`) — used to register the cloud
     /// search provider when enabled.
     #[cfg(feature = "cloud")]
@@ -1023,6 +1026,8 @@ pub(crate) async fn create_default_tool_registry(
         audit_log,
         content_filter,
         search_config,
+        #[cfg(feature = "browser")]
+        browser_config,
         #[cfg(feature = "cloud")]
         cloud_config,
         device_bridge,
@@ -1135,8 +1140,15 @@ pub(crate) async fn create_default_tool_registry(
     // Register browser tool (if browser feature enabled). The navigation
     // policy is the SSRF guard web_fetch has always run; permissive is the
     // opt-in for a deployment that drives its own dev server.
+    //
+    // The pool matters as much as the policy: without one, every tool call
+    // launched a Chrome, ran, and let it die — so a Navigate in one call and
+    // a read in the next were two different browsers, and each call paid a
+    // cold start. `for_gateway` builds the pool from `[browser]`; pages in it
+    // are attributed to the calling conversation, so the shared registry does
+    // not mean shared tabs.
     #[cfg(feature = "browser")]
-    registry.register(Box::new(BrowserTool::new().with_navigation_policy(
+    registry.register(Box::new(BrowserTool::for_gateway(&browser_config).with_navigation_policy(
         if browser_allow_private {
             crate::browser::NavigationPolicy::permissive()
         } else {

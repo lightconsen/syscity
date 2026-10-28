@@ -22,6 +22,16 @@ pub struct PageHandle {
     pub page: Arc<chromiumoxide::Page>,
     /// When this page was last used
     pub last_used: Instant,
+    /// Which conversation opened this page, when one did.
+    ///
+    /// A gateway shares one tool registry — and therefore one pool — across
+    /// every conversation. Without an owner, `most_recent_page()` hands the
+    /// next conversation the tab the previous one was reading, and
+    /// `list_pages()` shows it their tabs. `None` marks a page created by
+    /// something that is not a conversation (the PDF renderer, the remote
+    /// bridge); those callers address their pages by target id and no
+    /// conversation may adopt one.
+    pub owner: Option<String>,
 }
 
 /// A browser instance in the pool
@@ -152,6 +162,17 @@ impl BrowserInstance {
     /// Create a new page and add it to this instance
     #[cfg(feature = "browser")]
     pub async fn new_page(&self, url: &str) -> crate::Result<PageHandle> {
+        self.new_page_owned_by(url, None).await
+    }
+
+    /// Create a new page owned by `owner` (a conversation id, or `None` for a
+    /// caller that is not a conversation).
+    #[cfg(feature = "browser")]
+    pub async fn new_page_owned_by(
+        &self,
+        url: &str,
+        owner: Option<String>,
+    ) -> crate::Result<PageHandle> {
         let page = self.browser.new_page(url).await.map_err(|e| {
             crate::error::SyscityError::ExternalService {
                 source: "Failed to create browser page".to_string(),
@@ -164,6 +185,7 @@ impl BrowserInstance {
             target_id: target_id.clone(),
             page: Arc::new(page),
             last_used: Instant::now(),
+            owner,
         };
 
         {
@@ -191,6 +213,20 @@ impl BrowserInstance {
     pub async fn most_recent_page(&self) -> Option<PageHandle> {
         let pages = self.pages.read().await;
         pages.values().max_by_key(|h| h.last_used).cloned()
+    }
+
+    /// The most recently used page `owner` left behind, if any.
+    ///
+    /// This is what a conversation-scoped caller wants: pages belonging to
+    /// another conversation are invisible here, so one user's tab cannot
+    /// become another's starting point.
+    pub async fn most_recent_page_of(&self, owner: &str) -> Option<PageHandle> {
+        let pages = self.pages.read().await;
+        pages
+            .values()
+            .filter(|h| h.owner.as_deref() == Some(owner))
+            .max_by_key(|h| h.last_used)
+            .cloned()
     }
 
     /// Mark a page as just used, so the next reuse picks it over older ones.
@@ -253,9 +289,22 @@ impl BrowserInstance {
     /// List all pages with their target_id, title, and url
     #[cfg(feature = "browser")]
     pub async fn list_pages(&self) -> Vec<(String, String, String)> {
+        self.list_pages_of(None).await
+    }
+
+    /// List the pages `owner` can see: its own, and — for the unrestricted
+    /// `None` — every page in the instance.
+    ///
+    /// `None` is what the bridge and the renderer want: they address pages by
+    /// explicit target id and have no conversation to scope to.
+    #[cfg(feature = "browser")]
+    pub async fn list_pages_of(&self, owner: Option<&str>) -> Vec<(String, String, String)> {
         let pages = self.pages.read().await;
         let mut result = Vec::new();
         for (target_id, handle) in pages.iter() {
+            if !visible_to(handle.owner.as_deref(), owner) {
+                continue;
+            }
             let title = handle
                 .page
                 .get_title()
@@ -294,8 +343,17 @@ impl BrowserInstance {
     /// Find a page target_id by title (fuzzy match)
     #[cfg(feature = "browser")]
     pub async fn find_page_by_title(&self, title: &str) -> Option<String> {
+        self.find_page_by_title_of(title, None).await
+    }
+
+    /// Find a page target_id by title, restricted to what `owner` can see.
+    #[cfg(feature = "browser")]
+    pub async fn find_page_by_title_of(&self, title: &str, owner: Option<&str>) -> Option<String> {
         let pages = self.pages.read().await;
         for (target_id, handle) in pages.iter() {
+            if !visible_to(handle.owner.as_deref(), owner) {
+                continue;
+            }
             if let Ok(Some(page_title)) = handle.page.get_title().await {
                 if page_title.contains(title) {
                     return Some(target_id.clone());
@@ -303,6 +361,23 @@ impl BrowserInstance {
             }
         }
         None
+    }
+}
+
+/// Whether a viewer may see a page whose owner is `owner`.
+///
+/// A conversation (`Some(viewer)`) sees only the pages it opened. Pages it did
+/// not open belong to another conversation or to the renderer and the bridge,
+/// and those address their pages by explicit target id — they never list. So
+/// showing them here buys a conversation nothing, and costs it a tab list that
+/// names another subsystem's page for `SwitchTab` to adopt.
+///
+/// An unrestricted viewer (`None`) is the bridge and the renderer themselves,
+/// which see everything.
+fn visible_to(owner: Option<&str>, viewer: Option<&str>) -> bool {
+    match viewer {
+        None => true,
+        Some(viewer) => owner == Some(viewer),
     }
 }
 
@@ -558,7 +633,7 @@ impl BrowserPool {
             let mut evict = Vec::new();
             for (name, instance) in instances.iter() {
                 let last_used = *instance.last_used.read().await;
-                if last_used.elapsed() > idle_timeout && instance.page_count().await == 0 {
+                if last_used.elapsed() > idle_timeout {
                     evict.push(name.clone());
                 }
             }
@@ -566,6 +641,14 @@ impl BrowserPool {
         };
 
         for name in to_evict {
+            // Idle means no tool call has touched this instance for the whole
+            // timeout, and open pages do not change that — they are what an
+            // idle browser *looks like*, not evidence someone is using it.
+            // This used to require `page_count() == 0`, which mattered only
+            // while pages were discarded at the end of every call; once the
+            // pool kept a page alive between calls, no instance ever met the
+            // condition and every Chrome it had launched ran until the
+            // process exited.
             debug!(profile = %name, "Evicting idle browser instance");
             let inst = {
                 let mut instances = instances.write().await;
@@ -677,5 +760,24 @@ mod tests {
         let pool = BrowserPool::new(config);
         let result = pool.close_page("nonexistent", "target-1").await.unwrap();
         assert!(!result);
+    }
+
+    /// The visibility rule the shared pool rests on. A gateway shares one tool
+    /// registry — and so one pool — across every conversation; if this rule is
+    /// wrong, one user's tab becomes another's starting point.
+    #[test]
+    fn a_conversation_sees_only_the_pages_it_opened() {
+        // Its own page: yes. Another conversation's: no.
+        assert!(visible_to(Some("conv-a"), Some("conv-a")));
+        assert!(!visible_to(Some("conv-a"), Some("conv-b")));
+        // An unowned page belongs to the renderer or the bridge. It is not the
+        // conversation's to adopt, and listing it would put a foreign tab in
+        // reach of `SwitchTab`.
+        assert!(!visible_to(None, Some("conv-a")));
+
+        // An unrestricted viewer is the bridge and the renderer themselves,
+        // which address pages by explicit target id and see all of them.
+        assert!(visible_to(Some("conv-a"), None));
+        assert!(visible_to(None, None));
     }
 }
