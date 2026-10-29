@@ -194,7 +194,7 @@ jsonwebtoken = { version = "11", optional = true, features = ["rust_crypto"] }
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 
 # WeChat Official Account (wechatmp) encrypted-message protocol
-aes = { version = "0.8", optional = true }
+aes = { version = "0.9", optional = true }
 cbc = { version = "0.1", optional = true }
 roxmltree = "0.21"
 

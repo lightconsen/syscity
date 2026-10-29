@@ -8297,7 +8297,7 @@ dependencies = [
 name = "syscity"
 version = "0.3.16"
 dependencies = [
- "aes 0.8.4",
+ "aes 0.9.3",
  "aes-gcm",
  "anyhow",
  "async-stream",
