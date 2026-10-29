@@ -11,7 +11,74 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-10-29
+
+### Highlights
+
+- **Computer Use can be scored on a public benchmark.** `syscity bench run`
+  drives a remote desktop over OSWorld's HTTP desktop contract, `bench serve`
+  steps one action at a time so the harness's own loop decides when the next
+  observation is taken, and `bench probe` checks a VM's endpoints in seconds
+  instead of three model rounds into a scored task. The OSWorld glue, the plan,
+  the host runbook and a one-command KVM provisioning script land together.
+- **The desktop tools act on structure, not just pixels.** Elements are
+  addressed by snapshot id and by platform id, the action ladder escalates from
+  accessibility to pixels to the keyboard only when a step is *observed* not to
+  have taken effect, every step is verified, and a fourth rung acts inside the
+  conversation's own browser page by role and accessible name.
+- **The x86_64 Linux CLI is built on Ubuntu 22.04.** The release binary's glibc
+  floor drops from 2.39 to 2.35, so it starts on every 22.04 machine — the
+  benchmark host included — instead of only on 24.04.
+
 ### Added
+
+- **`syscity bench run`**: one Computer Use task against a remote desktop.
+  `OsworldDesktop` implements `ComputerAdapter` over the VM's HTTP service
+  (`/screenshot`, `/accessibility`, `/screen_size`, `/execute`), so the action
+  ladder, element ids and effect verification run unmodified — they are what the
+  benchmark is supposed to measure. The agent's tool set is only
+  `computer`/`screen_state`/`time`/`todo` (shell, file, browser and web act on
+  the host, not the VM) and pre-approved, because no human answers approval
+  prompts; the result file is the schema the Python glue reads. A fake VM covers
+  the cache-and-invalidate rule, AT-SPI parsing, stale ids and action codegen.
+- **`syscity bench serve`**: the step protocol. syscity sends one pyautogui
+  snippet over stdout, blocks until the harness has run it, and only then looks
+  at the screen — the ordering OSWorld's own loop has. In step mode `/execute`
+  is never called, and a test asserts it. Logging for bench subcommands now goes
+  to stderr, because stdout is the protocol's channel; the test holds that line
+  with the real binary.
+- **`syscity bench probe`**: `/screen_size`, `/screenshot`, `/accessibility` and
+  (with `--execute`) a read-only snippet through `/execute`, reported per
+  endpoint in seconds. Failures name the endpoint and exit non-zero; an empty
+  accessibility tree and a screenshot whose size disagrees with `/screen_size`
+  are warnings, because neither stops a run but both change how the agent works.
+- **OSWorld glue and a runbook** (`bench/osworld/`): `run.py --mode
+  replay|step` joins OSWorld's evaluator to syscity's own observe/act loop,
+  with `--split`/`--domain`/`--ids`/`--resume` and a per-run `summary` that keeps
+  infrastructure errors out of the denominator. `docs/computer-use-benchmark.md`
+  is the plan, `docs/osworld-kvm-server.md` the host runbook, and
+  `scripts/osworld-bench-setup.sh` provisions a KVM host in one idempotent
+  command (dependencies, Rust, Docker, OSWorld, the 12 GiB VM image, the
+  binary, then the container self-check and probe).
+- **Element addressing and an action ladder** (`computer/element_index.rs`,
+  `computer/session.rs`): snapshots carry a monotonic id and every element a
+  `s{snapshot:08x}:{path}` id; ids from an earlier snapshot are rejected as
+  stale rather than remapped. Actions escalate `ax_action` → `pixel` →
+  `keyboard`, and only an observed `SuspectedNoop` escalates — `Unverifiable`
+  stops instead, so a click that could not be checked never fires twice.
+  `ComputerSession` is now the one step engine (settle, three-state
+  verification, failure accounting, rollback, reflection, sensitive-UI
+  scanning); `ComputerUseLoop` delegates to it instead of keeping a copy.
+- **The ladder reaches the page, the role and the background.** A fourth rung
+  asks the conversation's own browser tab, by role and accessible name, through
+  a fresh ARIA snapshot — no name match means no action, never a neighbouring
+  control. Screenshots report the display geometry they were taken on and every
+  coordinate-taking tool says which space it is in, so a click on a scaled or
+  secondary display lands where the box was. `ActionEffect::{Partial, Refused}`
+  separate a half-done step from one the platform declined; refusal is terminal.
+  `delivery: "background"` acts through accessibility scripting without taking
+  the screen, and refuses with the reason when only an input-layer mechanism
+  exists.
 
 - **GAIA Level 1 benchmark.** The official `question_scorer` is wired through the
   eval harness. The 53-task × 3-trial baseline was 70.4% (112/159); after the
@@ -42,6 +109,11 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Changed
 
+- **The x86_64 Linux CLI is built on `ubuntu-22.04`**, which pins the binary's
+  glibc floor at 2.35. Built on `ubuntu-latest` (24.04) it required GLIBC_2.39
+  and could not start on Ubuntu 22.04 at all — including the OSWorld benchmark
+  host, whose runbook installs the released binary. The arm64 Linux CLI keeps
+  the 24.04 runner.
 - **Eval runs are deterministic and less budget-bound**: temperature 0.0 (was
   0.7), 60 tool iterations (was 30) with a soft "wrap up" reminder at 70%, and a
   system prompt built from the registered tool list (it previously named five
