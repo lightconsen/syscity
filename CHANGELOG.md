@@ -117,6 +117,13 @@ if no section matches, the release falls back to auto-generated notes.
   22.04 at all — including the OSWorld benchmark host, whose runbook installs
   the released binary. The profile is default features plus `cloud`, minus
   `vision`; the arm64 Linux CLI and both macOS CLIs keep `vision`.
+- **The benchmark setup script installs only runtime packages by default**, and
+  declares `libgomp1`. It used to pull the full build-dependency set (clang,
+  llvm, the X11/atspi headers, CMake) on every host, although the download path
+  compiles nothing; those now come in only with `--from-source`. `libgomp1` is
+  the release binary's one undeclared runtime dependency — llama.cpp links
+  OpenMP — so on a minimal host `syscity --version` failed with
+  `libgomp.so.1: cannot open shared object file` until it was installed.
 - **Eval runs are deterministic and less budget-bound**: temperature 0.0 (was
   0.7), 60 tool iterations (was 30) with a soft "wrap up" reminder at 70%, and a
   system prompt built from the registered tool list (it previously named five

@@ -108,15 +108,28 @@ export RUNS=/opt/bench/results           # 结果目录
 
 ### 2.1 基础依赖
 
+装 release 二进制时只要下面这一行（脚本自己会装）：
+
 ```bash
 apt-get update
-apt-get install -y build-essential cmake pkg-config git curl unzip \
+apt-get install -y ca-certificates curl unzip git psmisc libgomp1
+```
+
+| 包 | 谁要它 |
+|---|---|
+| `curl` / `unzip` / `ca-certificates` | 下二进制、下 `bench/` 源码包、下 12 GiB 的 `Ubuntu.qcow2.zip` |
+| `git` | `git clone` OSWorld |
+| `psmisc` | 脚本等 `dpkg` 锁用的 `fuser`（没有就只等，不影响成败） |
+| **`libgomp1`** | 二进制运行时依赖：`local-embeddings` 里的 llama.cpp 链接 OpenMP，缺了就是 `libgomp.so.1: cannot open shared object file`，`--version` 都起不来 |
+
+**只有 `--from-source` 才需要**下面这些编译期依赖：
+
+```bash
+apt-get install -y build-essential cmake pkg-config \
   libssl-dev libclang-dev clang libcurl4-openssl-dev \
   libasound2-dev libx11-dev libxdo-dev libxcb1-dev libxrandr-dev libxi-dev \
   libxtst-dev libatspi2.0-dev libdbus-1-dev
 ```
-
-每一个都不是凑数：
 
 | 包 | 谁要它 |
 |---|---|
@@ -150,6 +163,9 @@ $BIN --version            # syscity 0.3.16
   或者用 arm64 产物。
 - **glibc 下限 2.35**：v0.3.16 起这个产物在 `ubuntu-22.04` runner 上编，22.04 能直接跑。
   v0.3.14 及更早是在 24.04 上编的，要 GLIBC_2.39，22.04 上连 `--version` 都起不来。
+- **运行时要 `libgomp1`**：不是在 CI 里编进去的，也不是 glibc；缺了报
+  `libgomp.so.1: cannot open shared object file`。`ldd $BIN | grep 'not found'` 只有这一条时，
+  `apt-get install -y libgomp1` 即可（脚本已包含）。
 - 指定版本：把两处 `latest/download` 换成 `download/v0.3.16`；脚本用
   `SYSCITY_VERSION=v0.3.16`。
 - **`bench/` 是 Python，不在二进制里**。脚本会再从同一个 tag 的源码包里取出
@@ -451,6 +467,7 @@ done
 | 容器越积越多、磁盘吃满 | 中断后没清理 | `docker stop $(docker ps -q) && docker rm $(docker ps -a -q)`；删 `.qcow2.zip` 和旧 results 里的 png/mp4 |
 | SSH 中途 exit 255 | 连接抖动 | 用 `tmux`/`nohup` 跑，断线只影响观察不影响评测 |
 | `$BIN --version`：`version 'GLIBC_2.39' not found` | 装的是 24.04 runner 编的旧产物（v0.3.14 及更早） | 换 v0.3.16+：`SYSCITY_VERSION=v0.3.16`，或删掉 `$BIN` 后 `--refetch` |
+| `$BIN`：`libgomp.so.1: cannot open shared object file` | 最小化安装的系统没有 OpenMP 运行库（llama.cpp 需要） | `apt-get install -y libgomp1`；`ldd $BIN \| grep 'not found'` 应只剩空 |
 | 下 GitHub 超时 / 403 | 网络 | 先 `export https_proxy=…`，或 `SYSCITY_BIN_URL=<镜像>`；`file://` 也可 |
 | `sha256sum -c` 失败 | 下载被截断，或代理返回了错误页 | `--refetch` 重下；还失败就换源 |
 | `run.py` 不存在 | 只装了二进制，没取 `bench/` 胶水 | 重跑脚本（会自动取同 tag 的 `bench/`），见 2.2 |

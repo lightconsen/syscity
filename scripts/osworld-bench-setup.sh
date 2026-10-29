@@ -225,28 +225,52 @@ apt_install() {
 }
 
 # ── 1. native dependencies ──────────────────────────────────────────────────
-# Every package here is a build-script dependency of the release binary:
-# openssl-sys, alsa-sys, the X11/atspi bindings, and llama.cpp's CMake+bindgen.
+# Two sets, because downloading the release and compiling it need very
+# different things. The runtime set is small; the build set is only pulled in
+# by `--from-source`.
 install_deps() {
     log "native dependencies"
     if $SKIP_DEPS; then
         skip "native dependencies (--skip-deps)"
         return 0
     fi
+    local packages
+    packages=$(deps_packages)
     if $DRY_RUN; then
-        plan "apt-get update && apt-get install -y $(deps_packages | tr '\n' ' ')"
+        plan "apt-get update && apt-get install -y $(echo "$packages" | tr '\n' ' ')"
         return 0
     fi
     wait_for_dpkg
     apt-get update -qq
-    # shellcheck disable=SC2046
-    apt_install $(deps_packages)
+    # shellcheck disable=SC2086
+    apt_install $packages
     ok "apt dependencies"
 }
 
 deps_packages() {
+    runtime_packages
+    if $FROM_SOURCE; then
+        build_packages
+    fi
+    return 0
+}
+
+# What the release binary and this script need on a host that only *runs*
+# syscity: the download tools (`curl`, `unzip`), `git` for the OSWorld clone,
+# `fuser` from psmisc for the dpkg-lock wait, and `libgomp1` — llama.cpp (the
+# `local-embeddings` feature) links OpenMP, so the binary has a DT_NEEDED on
+# libgomp.so.1 and dies at startup with "cannot open shared object file" on a
+# minimal host.
+runtime_packages() {
+    printf '%s\n' ca-certificates curl unzip git psmisc libgomp1
+}
+
+# Build-script dependencies of the crate: openssl-sys, alsa-sys, the X11/atspi
+# bindings, and llama.cpp's CMake + bindgen. None are linked by the release
+# binary, so none are installed unless `--from-source`.
+build_packages() {
     printf '%s\n' \
-        build-essential cmake pkg-config git curl unzip ca-certificates psmisc \
+        build-essential cmake pkg-config \
         libssl-dev libclang-dev clang libcurl4-openssl-dev \
         libasound2-dev libx11-dev libxdo-dev libxcb1-dev libxrandr-dev libxi-dev \
         libxtst-dev libatspi2.0-dev libdbus-1-dev
