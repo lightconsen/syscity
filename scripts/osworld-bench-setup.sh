@@ -3,23 +3,28 @@
 # One-shot provisioning + verification for the OSWorld × syscity benchmark.
 #
 # This is the executable version of docs/osworld-kvm-server.md: install the
-# native dependencies, Rust, Docker, uv, OSWorld and its Python environment,
-# fetch the 12 GiB VM image, build the release binary, then prove the VM works
+# native dependencies, Docker, uv, OSWorld and its Python environment, fetch the
+# 12 GiB VM image and the released syscity binary, then prove the VM works
 # (container self-check + `syscity bench probe`). --smoke goes one task further
 # and runs a scored OSWorld task end to end.
 #
 # Every phase is idempotent: re-running after a failure resumes where it stopped
-# and never re-downloads or rebuilds what is already there.
+# and never re-downloads what is already there.
 #
 # Usage (on the KVM host, as root):
 #   sudo ./scripts/osworld-bench-setup.sh              # provision + verify
 #   sudo ./scripts/osworld-bench-setup.sh --smoke      # ... and run one task
 #   sudo ./scripts/osworld-bench-setup.sh --dry-run    # print the plan, run nothing
 #   sudo ./scripts/osworld-bench-setup.sh --verify-only
-#   sudo ./scripts/osworld-bench-setup.sh --skip-image --skip-build
+#   sudo ./scripts/osworld-bench-setup.sh --skip-image --skip-binary
+#   sudo ./scripts/osworld-bench-setup.sh --from-source   # build instead of download
 #
 # Environment:
-#   BENCH_ROOT         /opt/bench                  root for OSWorld, source, results
+#   BENCH_ROOT         /opt/bench                  root for OSWorld, binary, results
+#   SYSCITY_VERSION    latest                      release to install (e.g. v0.3.15)
+#   SYSCITY_BIN_URL    (unset)                     full tarball URL (mirror, file://)
+#   SYSCITY_SRC_URL    (unset)                     source archive URL for bench/ glue
+#   RELEASE_REPO       lightconsen/syscity         GitHub repo the release lives in
 #   SYS_SRC            (unset)                     syscity tree to copy into $SYS
 #   HF_TOKEN_FILE      /root/.hf_token             Hugging Face token for the image
 #   PROVIDER_KEY_FILE  /root/.deepseek_key         LLM key (needed by --smoke)
@@ -33,9 +38,10 @@
 #   0 — every requested phase passed
 #   1 — a phase failed (the message names it); re-run to resume
 #
-# The syscity source tree is NOT downloaded here: this script provisions the
-# machine. Put the tree at $SYS first (docs/osworld-kvm-server.md §2.2), or point
-# SYS_SRC at a local checkout.
+# The day-to-day path needs no Rust toolchain: it installs the release tarball
+# (checksum-verified) into $BIN. --from-source builds the tree at $SYS instead,
+# for a checkout that is newer than the last release; that path needs Rust and
+# the libclang/GUI development packages.
 
 set -euo pipefail
 
@@ -48,8 +54,12 @@ RESET=$'\033[0m'
 BENCH_ROOT="${BENCH_ROOT:-/opt/bench}"
 SYS="${SYS:-$BENCH_ROOT/syscity}"
 OSW="${OSW:-$BENCH_ROOT/OSWorld}"
-BIN="$SYS/target/release/syscity"
+BIN="${BIN:-$BENCH_ROOT/bin/syscity}"
 RUNS="${RUNS:-$BENCH_ROOT/results}"
+RELEASE_REPO="${RELEASE_REPO:-lightconsen/syscity}"
+SYSCITY_VERSION="${SYSCITY_VERSION:-latest}"
+RELEASE_ASSET="syscity-linux-amd64.tar.gz"
+SYSCITY_TAG=""
 QCOW2="$OSW/docker_vm_data/Ubuntu.qcow2"
 IMG_ZIP="$OSW/docker_vm_data/Ubuntu.qcow2.zip"
 IMG_URL="https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip"
@@ -70,10 +80,11 @@ SMOKE=false
 VERIFY_ONLY=false
 SKIP_DEPS=false
 SKIP_IMAGE=false
-SKIP_BUILD=false
+SKIP_BINARY=false
 SKIP_VERIFY=false
 SKIP_PROBE=false
-REBUILD=false
+REFETCH=false
+FROM_SOURCE=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -82,10 +93,13 @@ for arg in "$@"; do
         --verify-only) VERIFY_ONLY=true ;;
         --skip-deps) SKIP_DEPS=true ;;
         --skip-image) SKIP_IMAGE=true ;;
-        --skip-build) SKIP_BUILD=true ;;
+        # --skip-build/--rebuild are the pre-download names, kept so a command
+        # line copied from an older runbook still means what it says.
+        --skip-binary|--skip-build) SKIP_BINARY=true ;;
         --skip-verify) SKIP_VERIFY=true ;;
         --skip-probe) SKIP_PROBE=true ;;
-        --rebuild) REBUILD=true ;;
+        --refetch|--rebuild) REFETCH=true ;;
+        --from-source) FROM_SOURCE=true ;;
         -h|--help)
             awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"
             exit 0
@@ -126,10 +140,14 @@ run() {
 plan() { printf '   + %s\n' "$*"; }
 
 HOLD_PID=""
+DL_TMP=""
 cleanup() {
     if [ -n "$HOLD_PID" ]; then
         kill "$HOLD_PID" 2>/dev/null || true
         wait "$HOLD_PID" 2>/dev/null || true
+    fi
+    if [ -n "$DL_TMP" ]; then
+        rm -rf "$DL_TMP"
     fi
 }
 trap cleanup EXIT
@@ -427,23 +445,141 @@ fetch_image() {
     ok "$QCOW2 ($(du -h "$QCOW2" | cut -f1))"
 }
 
-# ── 7. syscity release binary ───────────────────────────────────────────────
-build_syscity() {
-    log "syscity release binary"
-    if $SKIP_BUILD; then
-        skip "build (--skip-build)"
-        [ -x "$BIN" ] || must "--skip-build but $BIN does not exist"
+# ── 7. syscity binary ───────────────────────────────────────────────────────
+# The released CLI, not a local build: release.yml builds the x86_64 artifact on
+# an Ubuntu 22.04 runner precisely so its glibc floor matches this host, and
+# downloading it spares the machine a Rust toolchain and a ten-minute compile.
+# --from-source is for a checkout newer than the last release.
+release_tarball_url() {
+    if [ -n "${SYSCITY_BIN_URL:-}" ]; then
+        printf '%s' "$SYSCITY_BIN_URL"
+    elif [ "$SYSCITY_VERSION" = "latest" ]; then
+        printf 'https://github.com/%s/releases/latest/download/%s' \
+            "$RELEASE_REPO" "$RELEASE_ASSET"
+    else
+        printf 'https://github.com/%s/releases/download/%s/%s' \
+            "$RELEASE_REPO" "$SYSCITY_VERSION" "$RELEASE_ASSET"
+    fi
+}
+
+# Both installers land at $BIN, so every later phase has one path to use.
+fetch_binary() {
+    if $FROM_SOURCE; then
+        log "syscity binary (from source)"
+    else
+        log "syscity binary ($SYSCITY_VERSION)"
+    fi
+    if $SKIP_BINARY; then
+        skip "syscity binary (--skip-binary)"
+        [ -x "$BIN" ] || must "--skip-binary but $BIN does not exist"
         return 0
     fi
-    if [ -x "$BIN" ] && ! $REBUILD; then
-        skip "$BIN ($(du -h "$BIN" | cut -f1)); use --rebuild to replace"
+    if $FROM_SOURCE; then
+        build_syscity
+        return 0
+    fi
+    if [ "$SYSCITY_VERSION" != "latest" ]; then
+        SYSCITY_TAG="$SYSCITY_VERSION"
+    fi
+    if [ -x "$BIN" ] && ! $REFETCH; then
+        skip "$BIN ($(du -h "$BIN" | cut -f1)); use --refetch to replace"
+        return 0
+    fi
+
+    local url
+    url=$(release_tarball_url)
+    if $DRY_RUN; then
+        plan "curl -fL $url -> $RELEASE_ASSET"
+        plan "curl -fL $url.sha256, then sha256sum -c $RELEASE_ASSET.sha256"
+        plan "tar xzf $RELEASE_ASSET syscity -C $(dirname "$BIN")"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$BIN")"
+    DL_TMP=$(mktemp -d)
+    log "downloading $url"
+    curl -fL --retry 3 --retry-delay 5 -o "$DL_TMP/$RELEASE_ASSET" "$url"
+    curl -fL --retry 3 --retry-delay 5 -o "$DL_TMP/$RELEASE_ASSET.sha256" "$url.sha256"
+    # The publisher's checksum, not ours: a truncated or substituted tarball is
+    # caught here rather than by a segfault four phases later.
+    (cd "$DL_TMP" && sha256sum -c "$RELEASE_ASSET.sha256" >/dev/null) ||
+        die "checksum mismatch for $RELEASE_ASSET ($(cat "$DL_TMP/$RELEASE_ASSET.sha256" 2>/dev/null))"
+    tar xzf "$DL_TMP/$RELEASE_ASSET" -C "$(dirname "$BIN")" syscity
+    chmod +x "$BIN"
+    rm -rf "$DL_TMP"
+    DL_TMP=""
+
+    local version
+    if ! version=$("$BIN" --version 2>&1); then
+        die "$BIN does not run on this host: $version
+     (the release needs x86_64 Linux with glibc >= 2.35)"
+    fi
+    SYSCITY_TAG="v${version##* }"   # "syscity 0.3.15" -> v0.3.15
+    ok "$BIN ($version)"
+}
+
+# ── 7b. harness glue ────────────────────────────────────────────────────────
+# `bench/osworld/run.py` is Python from the repository, not a file in the
+# release tarball, and a machine that installed only the binary has no checkout.
+# Take bench/ out of the source archive of the same tag, so the glue and the
+# binary always speak the same stdio protocol.
+# Same mirror escape hatch as the binary: SYSCITY_SRC_URL replaces the archive.
+release_source_url() {
+    if [ -n "${SYSCITY_SRC_URL:-}" ]; then
+        printf '%s' "$SYSCITY_SRC_URL"
+    else
+        printf 'https://github.com/%s/archive/refs/tags/%s.tar.gz' "$RELEASE_REPO" "$1"
+    fi
+}
+
+fetch_glue() {
+    log "OSWorld glue"
+    if [ -f "$SYS/bench/osworld/run.py" ]; then
+        skip "bench/osworld at $SYS"
+        return 0
+    fi
+    if $DRY_RUN; then
+        local shown_tag="${SYSCITY_TAG:-$SYSCITY_VERSION}"
+        [ "$shown_tag" = "latest" ] && shown_tag="<tag>"
+        plan "curl -fL $(release_source_url "$shown_tag"), copy bench/ -> $SYS/bench"
+        return 0
+    fi
+
+    local tag="$SYSCITY_TAG"
+    if [ -z "$tag" ]; then
+        local version
+        version=$("$BIN" --version 2>/dev/null) || die "cannot tell which release $BIN is; set SYSCITY_VERSION"
+        tag="v${version##* }"
+    fi
+    local url
+    url=$(release_source_url "$tag")
+    DL_TMP=$(mktemp -d)
+    curl -fL --retry 3 --retry-delay 5 -o "$DL_TMP/src.tar.gz" "$url" ||
+        die "no source archive for $tag at $url (set SYSCITY_VERSION to the release $BIN came from)"
+    mkdir -p "$DL_TMP/src" "$SYS"
+    tar xzf "$DL_TMP/src.tar.gz" -C "$DL_TMP/src"
+    cp -a "$DL_TMP/src/"*/bench "$SYS/"
+    rm -rf "$DL_TMP"
+    DL_TMP=""
+    [ -f "$SYS/bench/osworld/run.py" ] || die "the $tag archive has no bench/osworld/run.py"
+    ok "$SYS/bench (glue from $tag)"
+}
+
+build_syscity() {
+    log "building syscity from source ($SYS)"
+    if [ -x "$BIN" ] && ! $REFETCH; then
+        skip "$BIN ($(du -h "$BIN" | cut -f1)); use --refetch to rebuild"
         return 0
     fi
     if $DRY_RUN; then
         plan "cargo build --release --bin syscity (cwd $SYS, LIBCLANG_PATH from find_libclang_dir)"
+        plan "install $SYS/target/release/syscity -> $BIN"
         return 0
     fi
-    [ -f "$SYS/Cargo.toml" ] || die "no syscity source at $SYS (rsync the tree or set SYS_SRC)"
+    if [ ! -f "$SYS/Cargo.toml" ]; then
+        die "no syscity source at $SYS (rsync the tree or set SYS_SRC); \
+drop --from-source to install the release instead"
+    fi
     local libclang
     if libclang=$(find_libclang_dir); then
         export LIBCLANG_PATH="$libclang"
@@ -454,8 +590,10 @@ build_syscity() {
     source_cargo_env
     log "building (first build ~10 min on 4 vCPU)"
     (cd "$SYS" && cargo build --release --bin syscity)
-    [ -x "$BIN" ] || die "build finished without $BIN"
-    ok "$BIN"
+    [ -x "$SYS/target/release/syscity" ] || die "build finished without $SYS/target/release/syscity"
+    mkdir -p "$(dirname "$BIN")"
+    install -m 0755 "$SYS/target/release/syscity" "$BIN"
+    ok "$BIN (built from $SYS)"
 }
 
 # ── 8. VM self-check ────────────────────────────────────────────────────────
@@ -641,12 +779,15 @@ main() {
 
     if ! $VERIFY_ONLY; then
         install_deps
-        install_rust
+        if $FROM_SOURCE; then
+            install_rust   # only the source build needs cargo
+        fi
         install_docker
         install_uv
         setup_osworld
         fetch_image
-        build_syscity
+        fetch_binary
+        fetch_glue
     fi
 
     verify_vm

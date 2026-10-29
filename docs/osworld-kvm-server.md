@@ -20,17 +20,26 @@ x86_64 Linux 且 `/dev/kvm` 可用（`computer-use-benchmark.md` §六 有反例
 sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh --smoke
 ```
 
-它按下面八步的顺序分阶段跑完：依赖 → Rust → Docker → uv → OSWorld → 12 GiB 镜像 →
-release 二进制 → 容器/VM 自检 → 探针 →（`--smoke`）一题真实评分。每个阶段幂等，
-失败了重跑就从中断处继续，不会重下镜像或重编。
+它按下面的顺序分阶段跑完：依赖 → Docker → uv → OSWorld → 12 GiB 镜像 →
+下载 release 二进制和 `bench/` 胶水 → 容器/VM 自检 → 探针 →
+（`--smoke`）一题真实评分。每个阶段幂等，失败了重跑就从中断处继续，不会重下镜像。
 
 | 用法 | 作用 |
 |---|---|
 | `--dry-run` | 只打印每个阶段要执行的命令，什么都不改（在笔记本上也能跑） |
-| `--verify-only` | 跳过安装与构建，只做自检 + 探针（+ `--smoke`） |
-| `--skip-image` / `--skip-build` / `--skip-probe` / `--skip-verify` | 跳过已知完成的部分 |
-| `--rebuild` | 源码变了，强制重编 |
+| `--verify-only` | 跳过安装，只做自检 + 探针（+ `--smoke`） |
+| `--skip-image` / `--skip-binary` / `--skip-probe` / `--skip-verify` | 跳过已知完成的部分 |
+| `--refetch` | 强制重新下载二进制（`--from-source` 时是重编） |
+| `--from-source` | 不用 release，在 `$SYS` 编源码；要 Rust 和 2.1 的依赖 |
+| `SYSCITY_VERSION=v0.3.15` | 装指定版本，默认 `latest` |
+| `SYSCITY_BIN_URL=…` | 换下载源（镜像或 `file://`），校验文件取 `<url>.sha256` |
+| `SYSCITY_SRC_URL=…` | 换 `bench/` 胶水用的源码包地址（镜像或 `file://`） |
 | `SYS_SRC=/path/to/syscity` | 顺手把本地源码树 rsync 到 `$SYS` |
+
+默认装的是 GitHub release 里的 `syscity-linux-amd64.tar.gz`（校验 `sha256` 后才安装），
+**不需要在那台机器上装 Rust 或编译**。v0.3.15 起这个产物是在 Ubuntu 22.04 runner 上
+编的，glibc 下限 2.35；v0.3.14 及更早是在 24.04 上编的，需要 GLIBC_2.39，在 22.04 上
+根本起不来——所以别手抄旧教程里的下载链接。
 
 下面各节是它每一步的**理由**和手工等价命令：脚本某个阶段报错时，对着看那一节。
 
@@ -41,7 +50,7 @@ release 二进制 → 容器/VM 自检 → 探针 →（`--smoke`）一题真实
 ls -l /dev/kvm; egrep -c '(vmx|svm)' /proc/cpuinfo
 
 # 1. 系统依赖（2.1）
-# 2. Rust + syscity（2.2）
+# 2. 下载 syscity 二进制（2.2；要自己编就 --from-source）
 # 3. Docker + happysixd/osworld-docker（2.3）
 # 4. OSWorld + Python 3.12 环境（2.4）
 # 5. 12 GB 的 Ubuntu.qcow2（2.5）
@@ -67,8 +76,8 @@ Host bench
 ```bash
 export BENCH_HOST=bench                 # ssh 别名；没有别名就写 root@<host> 并自己加 -p
 export OSW=/opt/bench/OSWorld           # OSWorld 检出目录
-export SYS=/opt/bench/syscity           # syscity 源码目录
-export BIN=$SYS/target/release/syscity   # 编出来的二进制
+export SYS=/opt/bench/syscity           # bench/ 胶水所在的目录（源码或解包）
+export BIN=/opt/bench/bin/syscity        # 安装的 release 二进制
 export RUNS=/opt/bench/results           # 结果目录
 ```
 
@@ -86,7 +95,7 @@ export RUNS=/opt/bench/results           # 结果目录
 | 磁盘 | ≥ 60 GB 空闲 | `df -h /` | `Ubuntu.qcow2` 12 GiB + 下载中的 12 GiB 压缩包 + 容器 `DISK_SIZE=32G` + 录屏和截图 |
 | Docker | Engine ≥ 24 | `docker info` | docker provider 用 Python docker SDK 建容器 |
 | Python | ≥ 3.12 | `.venv/bin/python -V` | OSWorld 依赖（用 uv 装 3.12 最省事） |
-| Rust | stable | `cargo -V` | 编 syscity |
+| Rust | 只有 `--from-source` 需要 | `cargo -V` | 默认装 release，不在机器上编译 |
 
 云主机先确认嵌套虚拟化。反例（2026-10-29 实测）：某云 Ubuntu 22.04、8 vCPU EPYC、
 `systemd-detect-virt` 显示 `kvm`，但 `/proc/cpuinfo` 里 0 个 `vmx|svm`，没有 `/dev/kvm`，
@@ -118,24 +127,58 @@ apt-get install -y build-essential cmake pkg-config git curl unzip \
 | `libx11-dev` `libxdo-dev` `libxcb1-dev` `libxrandr-dev` `libxi-dev` `libxtst-dev` | 桌面控制的 X11 绑定 |
 | `libatspi2.0-dev` `libdbus-1-dev` | a11y 树 / D-Bus |
 
-### 2.2 Rust 与 syscity
+### 2.2 syscity 二进制
+
+不要编。装 GitHub release 里的产物，脚本做的就是这件事：
+
+```bash
+mkdir -p /opt/bench/bin
+curl -fL --retry 3 \
+  -o /tmp/syscity-linux-amd64.tar.gz \
+  https://github.com/lightconsen/syscity/releases/latest/download/syscity-linux-amd64.tar.gz
+curl -fL -o /tmp/syscity-linux-amd64.tar.gz.sha256 \
+  https://github.com/lightconsen/syscity/releases/latest/download/syscity-linux-amd64.tar.gz.sha256
+(cd /tmp && sha256sum -c syscity-linux-amd64.tar.gz.sha256)
+tar xzf /tmp/syscity-linux-amd64.tar.gz -C /opt/bench/bin syscity
+chmod +x $BIN
+$BIN --version            # syscity 0.3.15
+```
+
+- **glibc 下限 2.35**：v0.3.15 起这个产物在 `ubuntu-22.04` runner 上编，22.04 能直接跑。
+  v0.3.14 及更早是在 24.04 上编的，要 GLIBC_2.39，22.04 上连 `--version` 都起不来。
+- 指定版本：把两处 `latest/download` 换成 `download/v0.3.15`；脚本用
+  `SYSCITY_VERSION=v0.3.15`。
+- **`bench/` 是 Python，不在二进制里**。脚本会再从同一个 tag 的源码包里取出
+  `bench/` 放到 `$SYS/bench`（`run.py` 靠它驱动）。手动做：
+
+```bash
+curl -fL -o /tmp/syscity-src.tar.gz \
+  https://github.com/lightconsen/syscity/archive/refs/tags/v0.3.15.tar.gz
+mkdir -p /tmp/syscity-src && tar xzf /tmp/syscity-src.tar.gz -C /tmp/syscity-src
+mkdir -p $SYS && cp -a /tmp/syscity-src/*/bench $SYS/
+```
+
+- GitHub 慢或不通时，用 `SYSCITY_BIN_URL` 换源（镜像、内网、`file://` 都行），
+  `.sha256` 会按 `<url>.sha256` 取：
+
+```bash
+export https_proxy=http://127.0.0.1:1087 http_proxy=http://127.0.0.1:1087   # 或者
+export SYSCITY_BIN_URL=https://<镜像>/syscity-linux-amd64.tar.gz
+```
+
+**要自己编**（源码比最后一个 release 新）：`--from-source`，或者手动
 
 ```bash
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
-
-# 只同步源码，不带 target/.git/node_modules：
-rsync -az --delete --exclude=target --exclude=node_modules --exclude=.git \
-  ./ $BENCH_HOST:$SYS/          # 在 syscity 仓库根目录执行
-
 cd $SYS
 LIBCLANG_PATH=/usr/lib/llvm-14/lib cargo build --release --bin syscity
-ls -l $BIN
+install -m 0755 target/release/syscity $BIN
 ```
 
 `LIBCLANG_PATH` 在 Ubuntu 22.04 上是 `/usr/lib/llvm-14/lib`；装在别处就
 `ls /usr/lib/llvm-*/lib/libclang.so` 找。4–5 vCPU 上第一次 release 构建约 10 分钟，
-失败信息在 `/opt/bench/syscity-build.log` 这类日志里（自己重定向），先看 `--- stderr`。
+失败信息先看 `--- stderr`。
 
 ### 2.3 Docker 与 OSWorld 镜像
 
@@ -403,6 +446,10 @@ done
 | 端口连不上 | 端口是动态分配的 | 从 `PORT <n>` 或日志 `Started container with ports - VNC: …, Server: …` 取真实端口 |
 | 容器越积越多、磁盘吃满 | 中断后没清理 | `docker stop $(docker ps -q) && docker rm $(docker ps -a -q)`；删 `.qcow2.zip` 和旧 results 里的 png/mp4 |
 | SSH 中途 exit 255 | 连接抖动 | 用 `tmux`/`nohup` 跑，断线只影响观察不影响评测 |
+| `$BIN --version`：`version 'GLIBC_2.39' not found` | 装的是 24.04 runner 编的旧产物（v0.3.14 及更早） | 换 v0.3.15+：`SYSCITY_VERSION=v0.3.15`，或删掉 `$BIN` 后 `--refetch` |
+| 下 GitHub 超时 / 403 | 网络 | 先 `export https_proxy=…`，或 `SYSCITY_BIN_URL=<镜像>`；`file://` 也可 |
+| `sha256sum -c` 失败 | 下载被截断，或代理返回了错误页 | `--refetch` 重下；还失败就换源 |
+| `run.py` 不存在 | 只装了二进制，没取 `bench/` 胶水 | 重跑脚本（会自动取同 tag 的 `bench/`），见 2.2 |
 
 Docker provider **没有快照**（`save_state` 直接 `NotImplemented`）：`revert_to_snapshot`
 等于停掉容器重建，所以每道题都要重新等 QEMU 启动 1–2 分钟。这是 OSWorld 的行为，
@@ -423,6 +470,9 @@ Docker provider **没有快照**（`save_state` 直接 `NotImplemented`）：`re
 
 所以顺序永远是 探针 → 一题 → `test_small` → 全量，别反过来。省钱的三件事：
 探针不花模型钱；`--max-steps` 是真的预算上限；先只跑一个 domain 看趋势。
+
+准备阶段本身现在很快：不编 Rust、不装工具链，二进制 47 MB 十分钟内下完；
+真正的时间花在 12 GiB 镜像和每一题的 VM 重启上。
 
 主分数用哪个模型（`deepseek-v4-flash` 无 vision，只有 a11y 下限分；接 vision 模型是
 官方口径）见 `computer-use-benchmark.md` §六 的两个待定项——两种都要记，报告里分开列。
