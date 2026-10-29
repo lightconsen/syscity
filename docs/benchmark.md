@@ -105,6 +105,8 @@ syscity 暴露成一个可被外部驱动的 agent，工具由调用方注入。
   设成 PR 阻塞条件只会带来误报。定位是"夜跑趋势 + 发版前人工看一眼"。
 - **不先做 B 类重环境基准**（WebArena / OSWorld / SWE-bench）。它们各自需要自建站点或
   VM 镜像，投入以周计，而覆盖的能力（浏览器、shell）已经能被 GAIA / Terminal-bench 部分覆盖。
+  OSWorld 与 Cua Bench 是这条规则的例外：它们评的是 Computer Use，而这一项没有别的替代品，
+  单独成篇——见 [`computer-use-benchmark.md`](computer-use-benchmark.md)。
 
 ---
 
