@@ -32,6 +32,8 @@ agents perceive and act on your computer.
 | Doc | What it covers |
 |-----|----------------|
 | [Benchmark Results](benchmark.md) | Current BFCL / GAIA scores first, then the plan and method for public benchmarks |
+| [Computer Use Benchmark](computer-use-benchmark.md) | Plan for scoring syscity on OSWorld-Verified and Cua Bench (Chinese) |
+| [OSWorld on a KVM Server](osworld-kvm-server.md) | Runbook: provision a KVM host, verify the VM, run the OSWorld × syscity harness (Chinese) |
 | [Eval Harness](harness.md) | The eval loop: suites, trials, judges, badcases, the ledger |
 | [Eval Status](eval-status.md) | Methodology and what is landed |
 
