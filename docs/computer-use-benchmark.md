@@ -1,6 +1,7 @@
 # Computer Use 基准接入：OSWorld-Verified 与 Cua Bench
 
-> 状态：M0、M1 已落地（远程桌面适配器 + `syscity bench run`）；M2–M5 是计划。
+> 状态：M0、M1 已落地（远程桌面适配器 + `syscity bench run`）；M2 的 Python 胶水已写完并
+> 过了单测，**还没在真 VM 上跑过**；M3–M5 是计划。
 > 最后更新：2026-10-29
 > 相关文档：[`benchmark.md`](benchmark.md)（GAIA/BFCL 的接入方法与本仓库的基准口径）、
 > [`modules/computer.md`](modules/computer.md)（动作阶梯、五种效果、后台投递）、
@@ -78,16 +79,32 @@ Python（基准仓库）                         Rust（syscity）
 
 ### 2.1 OSWorld-Verified
 
-一次完整的评测长这样（`run.py` 的结构）：
+一次完整的评测长这样（`lib_run_single.run_single_example`，`run.py` 只是它的批处理外壳）：
 
 ```python
-obs = env.reset(task_config)                 # 起/还原 VM，返回初始观测
-score = 0
-while not done:
-    action = agent.predict(instruction, obs)  # 你的 agent 说下一步做什么
-    obs, reward, done, info = env.step(action, sleep=0.5)
-score = env.evaluate()                        # 每个任务自己的 evaluator
+env.reset(task_config=example)                     # 还原 VM
+agent.reset(vm_ip=env.vm_ip)                       # agent 拿到地址
+obs = env._get_obs()                               # 截图 / a11y 树 / 终端
+while not done and step_idx < max_steps:
+    response, actions = agent.predict(instruction, obs)   # 返回 (文本, 动作列表)
+    for action in actions:
+        obs, reward, done, info = env.step(action, args.sleep_after_execution)
+result = env.evaluate()                            # 任务自己的 evaluator
 ```
+
+**核对到的上游事实（commit `044bc33`，2026-10-24）**——和本文早先按 README 写的不一样：
+
+- 没有 `Agent` 基类。agent 是**鸭子类型**：只要 `predict(instruction, obs)` 和
+  `reset(_logger=None, vm_ip=None, **kwargs)` 存在就行；`PromptAgent`（`mm_agents/agent.py`）
+  也是普通类，不是继承来的。
+- `predict` 返回**二元组** `(response, actions)`，`actions` 是 pyautogui 代码字符串的列表；
+  特殊动作是字符串 `"WAIT"` / `"DONE"` / `"FAIL"`（或 `{"action_type": ...}`）。
+- `run.py` 顶部注释说"almost deprecated，用 `run_multienv_*.py`"，但**仓库里没有这些文件**。
+  现在能用的就是 `run.py` + `lib_run_single.py`。
+- 每题的 `result.txt`、`traj.jsonl`、`step_*.png` 都由 `lib_run_single` 写；基础设施错误走
+  `record_example_error`，不记分。
+- 桌面服务的端口来自 `env.server_port`（默认 5000，云 provider 会从地址串里解析），
+  不要硬编码 5000。
 
 对 syscity 来说，`predict` 需要的能力只有三样：**看**（截图、可访问性树）、**做**
 （点、输入、按键、滚动、拖拽）、**等**。这三样正好是 `ComputerAdapter` 的接口。
@@ -126,8 +143,21 @@ cb run cua-bench-basic \
   --attempts 1 --retries 1
 ```
 
-- agent 接口是 `BaseAgent.perform_task(task_description, session, logging_dir, tracer)`：
-  基准给一个 `session`（截图 / 点击 / 输入），agent 做完返回。
+已核对的接口（`libs/cua-bench/cua_bench/agents/base.py`，2026-10-29）：
+
+```python
+@register_agent("syscity")            # 从 ..agents 导入，名字即 --agent 参数
+class SyscityAgent(BaseAgent):
+    @staticmethod
+    def name() -> str: ...
+
+    async def perform_task(self, task_description: str, session: DesktopSession,
+                           logging_dir: Path | None = None, tracer=None) -> AgentResult: ...
+```
+
+- `AgentResult(total_input_tokens, total_output_tokens, failure_mode)`，
+  `failure_mode` 是 `FailureMode` 枚举：`NONE` / `MAX_STEPS_EXCEEDED` / `API_ERROR` / `UNKNOWN`。
+  基础设施问题应报 `API_ERROR`/`UNKNOWN`，不要伪装成"任务做错了"。
 - 结果在 `~/.local/share/cua-bench/runs/<run id>/<task>_v<n>/`：
   `result.json`、`trajectory.json`（ATIF v1.8）、`summary.json`（`schema_version: 2`，
   含 `pass_at_k`）。
@@ -136,8 +166,9 @@ cb run cua-bench-basic \
 - 容器 sandbox 需要 `cua-spacesd`；`cb` 本身要先装（以官方 README 为准）。
 - `cua-bench-basic` 是 13 题的冒烟集，够判断"接得通、能跑、不崩"，不足以谈能力。
 
-`session` 的具体方法名（`screenshot` / `click` / `type` / `key`）随版本可能变；胶水层以
-运行时 introspection 为准，不硬编码。
+`session` 暴露的是 cua SDK 的 `DesktopSession`（`sandbox` / `spacesd`），**不是** OSWorld 的
+HTTP 桌面协议，所以 M4 的胶水要先把 session 接成一个 `syscity bench run --computer-url`
+够得着的地址；这一步必须在真 sandbox 上做，不能靠猜——这也是胶水留到 M4 的原因。
 
 ---
 
@@ -289,6 +320,7 @@ syscity bench run \
   "stop_reason": "final_answer | max_steps | error",
   "steps": 17,
   "tool_calls": 24,
+  "actions": ["import pyautogui\npyautogui.click(100, 56, button='left')\n", "..."],
   "elapsed_ms": 183000,
   "provider": "deepseek",
   "model": "deepseek-v4-flash",
@@ -298,6 +330,9 @@ syscity bench run \
 ```
 
 - 同时 stdout 打印 `### ANSWER ###\n<answer>\n### END ANSWER ###`，方便人肉看日志。
+- `actions` 是**发给 VM 的每段 `/execute` 片段，按执行顺序**。它不是调试信息：回放形态的
+  胶水就是把它逐条塞回基准自己的 `env.step`。为空时这个字段不出现（`skip_serializing_if`），
+  schema 仍是 1。
 - `--max-steps` 写进 `SYSCITY_MAX_TOOL_ITERATIONS`。默认 60，与 eval 一致。
 - **工具集刻意最小**：`computer`、`screen_state`、`time`、`todo`。
   不注册 `shell` / `file` / `browser` / `web`——它们作用在**宿主机**上，注册了等于允许
@@ -307,33 +342,43 @@ syscity bench run \
 **创建 adapter**：`RemoteDesktop::osworld(url)` → `Arc<dyn ComputerAdapter>` → `ComputerTool::new(Some(adapter))`。
 不挂 page actor（VM 里没有 syscity 的 browser pool）。
 
-### 4.4 `bench/osworld/run.py`
+### 4.4 `bench/osworld/`（已写完，未在 VM 上验证）
 
-薄胶水，依赖上游 OSWorld checkout（`pip install -e .`）：
+薄胶水，依赖上游 OSWorld checkout（`pip install -e .`），不 vendor 任何东西：
 
-- `class SyscityAgent(Agent)`：实现 `predict(instruction, obs)`。
-- **M2 形态（回放）**：第一次 `predict` 时把整条 instruction 交给 `syscity bench run`，
-  跑完后把 agent 记录下来的每一步（`click/type/key/scroll/wait`）排进队列；之后每次
-  `predict` 弹一条，转成 pyautogui 片段返回，队列空则 `{"action_type": "DONE"}`。
-  - 优点：一次进程跑完整题，没有 50 次进程启动的 1–2 分钟开销。
+| 文件 | 作用 |
+|---|---|
+| `sycity_agent.py` | `class SyscityAgent`：鸭子类型的 OSWorld agent（`predict` + `reset`） |
+| `run.py` | 批处理外壳，直接调上游 `lib_run_single.run_single_example` |
+| `test_sycity_agent.py` | 单测：用假 syscity 可执行文件，无 VM、无模型、无 Rust 构建 |
+
+- **回放**：第一次 `predict` 把 instruction 交给 `syscity bench run`（对着
+  `http://<vm_ip>:<env.server_port>`），读回结果文件的 `actions` 排进队列；之后每次弹一条，
+  队列空时返回 `"DONE"`（`stop_reason == final_answer`）或 `"FAIL"`（预算耗尽/出错）。
+  - 优点：一次进程跑完整题，没有几十次进程启动的开销。
   - 缺点：syscity 的观测是它当初决策时的截图，不是 `predict` 当时的 `obs`；涉及
-    "等页面加载完再看"的任务会吃亏。**这一条必须在报告里写明。**
+    "等页面加载完再看"的任务会吃亏。报告里必须写明形态。
+- **边界**：syscity 起不来、进程非零退出、结果文件缺失、结果里 `error` 非空——一律抛
+  `SyscityRunFailed`，走上游的 `record_example_error`，**不计入分母**。不返回 `FAIL`，
+  因为在 infeasible 题里 `FAIL` 是满分。
+- 支持 `--split test_small|test_all|test_nogdrive|test_infeasible`、`--meta`、`--domain`、
+  `--ids`、`--resume`；报告写 `<result-dir>/summary/syscity.json`。
 - **M3 形态（步进）**：`syscity bench serve --computer-url ...` 用 stdin/stdout JSON-lines：
   `{"obs": {...}}` → `{"action": ...}`。步进语义与 OSWorld 完全对齐，回放模式的偏差消失。
-  两个形态共用适配器，只换外层。
-- 支持 `--split test_small|test_all|test_nogdrive|test_infeasible`、`--domain`、`--ids`、
-  `--parallel`、`--resume`。每题写 `result.txt`（OSWorld 约定）与 `traj.jsonl`。
-- infra 错误（VM 起不来、服务 500、超时）单独计 `infra_errors`，**不计入失败率的分母**，
-  但在报告里单列——否则一次网络抖动看起来像模型变笨。
+  落地位置就是同一个 `sycity_agent.py`，只换 `predict` 里那一段。
 
-### 4.5 `bench/cua/sycity_agent.py`
+怎么跑、每题产出什么文件，见 [`bench/README.md`](../bench/README.md)。
 
-- `SyscityAgent(BaseAgent)`，`perform_task` 里：
-  - 优先走 `syscity bench serve` 的 stdio 协议（M3）；
-  - 否则 `syscity bench run` 一次跑完，再按轨迹回放（M2）。
+### 4.5 `bench/cua/sycity_agent.py`（M4）
+
+- `@register_agent("syscity") class SyscityAgent(BaseAgent)`，实现 `name()` 与
+  `async perform_task(...)`，返回 `AgentResult`（token 数 + `FailureMode`）。
+- 先把 `session` 接成一个 `syscity bench run --computer-url` 够得着的 HTTP 地址，剩下的
+  与 OSWorld 完全一样：一次跑完，按 `actions` 回放。
 - 轨迹、ATIF、`summary.json` 都由 `cb` 写，不自己造。
-- `session` 的方法名用 `getattr` 探测（`screenshot`/`click`/`type_text`/`press_key`），
-  上游改名时只改一个映射表。
+- 为什么不在 M2 一起写：`session` 是 cua SDK 的 `DesktopSession`，不是 OSWorld 的 HTTP
+  协议，地址怎么接出来只有在真 sandbox 里试过才算数。照文档猜一遍接口，正是本文最不想要
+  的那种"看起来写完了"。
 
 ---
 
@@ -343,7 +388,7 @@ syscity bench run \
 |---|---|---|---|
 | **M0** ✅ | `src/computer/remote/{mod,osworld}.rs`；fake HTTP server 单测（截图、a11y XML、执行、过期 id、错误信封） | `cargo test` 全绿；假服务器上能完成"读树 → 按 id 点击 → 截图变化" | 1–2 天 |
 | **M1** ✅ | `syscity bench run` + `### ANSWER ###` 契约 | 对着假服务器跑通一次完整 Agent 任务；输出 JSON 可被 `jq` 读 | 0.5 天 |
-| **M2** | `bench/osworld/run.py` 回放模式 | `test_small` 抽 5 题手跑，动作真的落在 VM 上（截图对比 + 人工看） | 1 天 |
+| **M2** ⏳ | `bench/osworld/run.py` 回放模式（代码写完，单测过；等 VM） | `test_small` 抽 5 题手跑，动作真的落在 VM 上（截图对比 + 人工看） | 1 天 |
 | **M3** | `syscity bench serve` 步进协议；可选 `pyatspi` ax 动作 | 同一批 5 题在步进模式下重跑，结果与回放模式差异可解释 | 1–1.5 天 |
 | **M4** | `bench/cua/sycity_agent.py` + `cua-bench-basic` | 13 题跑完，`summary.json` 有 `pass_at_k` | 0.5–1 天 |
 | **M5** | 全量：OSWorld 369 题 × 1 trial（先 a11y-only），结果进 ledger | 分数、infra 错误、阶梯分布三张表齐全 | 人工触发 |
@@ -361,6 +406,21 @@ syscity bench run \
   不可用后阶梯降到 `pixel`，动作后验证为 `suspected_noop`——假 VM 画面本来就不会变，这个
   判定是对的。
 
+### 胶水层（2026-10-29，M2 未验证）
+
+- `bench/osworld/sycity_agent.py`：第一次 `predict` 跑一次 `syscity bench run`，之后逐条回放
+  结果文件的 `actions`，队列空时给 `DONE`/`FAIL`。syscity 起不来或报错一律抛
+  `SyscityRunFailed`，走上游 `record_example_error`，不进分母。
+- `bench/osworld/run.py`：直接复用上游 `lib_run_single.run_single_example`，只换 agent；
+  支持 split/domain/ids/resume，产出 `<result-dir>/summary/syscity.json`。
+- `bench/osworld/test_sycity_agent.py`：7 个用例，用假 syscity 可执行文件验证命令行、
+  回放顺序、`FAIL` 与 `DONE` 的分界、infra 错误不进分母。全部通过。
+- 为了回放，`OsworldDesktop` 现在记录每一段 `/execute` 片段，`bench run` 写进结果文件的
+  `actions` 字段（可选字段，schema 仍是 1）。
+- 用假的 OSWorld 目录（同 `lib_run_single` 接口）端到端跑过一遍：2 题里 1 题成功、
+  1 题模拟进程失败 → `scored=1, passed=1, infra_errors=1`，`traj.jsonl` 里是
+  `click → write → DONE`。
+
 **顺序理由**：M0 的适配器是唯一的新代码，也是唯一能在这台机器上验证的部分（假服务器）。
 M1 让适配器进入真实 Agent 循环。M2 才需要 VM。M3 修 M2 已知的形态偏差。M4 是第二个
 基准，验证"一个适配器"的说法。
@@ -371,9 +431,19 @@ M1 让适配器进入真实 Agent 循环。M2 才需要 VM。M3 修 M2 已知的
 
 ### 这台开发机（macOS 15.6 / Apple M2 Pro）
 
+这台机器只能当控制面。OSWorld 镜像是 x86_64，M2 Pro 是 arm64，VMware Fusion /
+VirtualBox 在 Apple Silicon 上只跑 arm64 客户机，OrbStack 没有嵌套虚拟化；QEMU 的 TCG 能起
+x86_64，但慢 10–50 倍，跑 LibreOffice/Chrome 没有意义。结论：**宿主机必须是 x86_64 Linux
+且 `/dev/kvm` 可用**。
+
+已验证的反例（2026-10-29）：腾讯云 Ubuntu 22.04 实例（8 vCPU AMD EPYC 9K65、15 GiB、
+`systemd-detect-virt` = kvm）——`/proc/cpuinfo` 里 0 个 `vmx|svm`，没有 `/dev/kvm`，
+`modprobe kvm_amd` 报 "could not insert"，dmesg 是 "kvm: no hardware support"。普通云主机
+默认不开嵌套虚拟化，**租之前先 `ls /dev/kvm`**。
+
 | 需求 | 现状 | 结论 |
 |---|---|---|
-| VMware Fusion / KVM 跑 OSWorld 镜像 | 都没有（`vmrun` 不存在，Docker 未启） | OSWorld 跑在 **AWS**（官方 AMI）或装 Fusion（许可成本） |
+| VMware Fusion / KVM 跑 OSWorld 镜像 | 都没有（`vmrun` 不存在，Docker 未启） | 换一台 x86_64 + `/dev/kvm` 的机器（裸金属或开了嵌套虚拟化的云主机） |
 | Docker（Cua container 模式） | OrbStack 已装、未启 | 启用后可用 `--runtime gvisor` |
 | `cb` / `cua-spacesd` | 未装 | M4 前 `uv tool install`（以官方 README 为准） |
 | `uv` | 有 | — |
@@ -381,8 +451,10 @@ M1 让适配器进入真实 Agent 循环。M2 才需要 VM。M3 修 M2 已知的
 
 ### 两个待定项（实施到 M2 前必须定）
 
-1. **OSWorld 跑在哪**：AWS 官方 AMI（按小时计费，最省事）还是本机装 VMware Fusion。
-   推荐 AWS：`test_all` 369 题串行要几十小时，本机的睡眠/网络都会打断。
+1. **OSWorld 跑在哪**：AWS 官方 AMI（按小时计费，最省事）还是自备 x86_64 + KVM 的机器。
+   国内云主机的普通实例不给嵌套虚拟化（见上），要么开嵌套虚拟化的机型/裸金属，要么做
+   香港/海外 VPS。`test_all` 369 题串行要几十小时，本机的睡眠/网络都会打断，所以不放在
+   开发机上。
 2. **主分数用哪个模型**：`deepseek-v4-flash`（a11y-only，便宜，可复现）还是接一个带
    vision 的模型（官方口径，贵）。建议**两个都记**，报告里分开列，不混着比。
 

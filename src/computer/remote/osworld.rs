@@ -46,6 +46,14 @@ pub struct OsworldDesktop {
     /// Last capture, reused only until an action invalidates it.
     shot: tokio::sync::Mutex<Option<(Instant, Screenshot)>>,
     screenshot_ttl: Duration,
+    /// Every snippet sent to `/execute`, in the order the VM saw it.
+    ///
+    /// The OSWorld and Cua glue runs a whole task through `syscity bench run`
+    /// and then replays these snippets inside the harness's own step loop, so
+    /// this log is contract rather than diagnostics. Snippets that only read
+    /// (the clipboard) are in it too: replaying them keeps the ordering honest
+    /// and costs nothing.
+    executed: tokio::sync::Mutex<Vec<String>>,
 }
 
 impl OsworldDesktop {
@@ -56,7 +64,13 @@ impl OsworldDesktop {
             snapshots: SnapshotCache::new(8),
             shot: tokio::sync::Mutex::new(None),
             screenshot_ttl: config.screenshot_ttl,
+            executed: tokio::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// The snippets sent to the VM so far, oldest first.
+    pub async fn executed_snippets(&self) -> Vec<String> {
+        self.executed.lock().await.clone()
     }
 
     /// The last capture, when it is fresh enough to stand in for a new one.
@@ -95,6 +109,7 @@ impl OsworldDesktop {
 
     /// Run a Python snippet on the VM and return its stdout.
     async fn run_python(&self, code: &str) -> Result<String> {
+        self.executed.lock().await.push(code.to_string());
         let (_, bytes) = self
             .transport
             .post_json(EXECUTE_PATH, &json!({ "command": code, "shell": false }))
@@ -905,6 +920,8 @@ mod tests {
             vm.commands.lock().unwrap()[0],
             "import pyautogui\npyautogui.click(110, 60, button='left')\n"
         );
+        // The replay log is what the VM saw, so the harness glue can re-send it.
+        assert_eq!(desktop.executed_snippets().await, *vm.commands.lock().unwrap());
     }
 
     #[tokio::test]

@@ -75,6 +75,12 @@ pub struct BenchResult {
     pub steps: usize,
     /// Individual tool invocations, including non-desktop ones.
     pub tool_calls: usize,
+    /// The snippets the remote desktop was asked to run, in order.
+    ///
+    /// The harness glue replays these through its own step loop
+    /// (`bench/osworld/sycity_agent.py`), so this is contract, not debug output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
     pub elapsed_ms: u64,
     pub provider: String,
     pub model: String,
@@ -135,7 +141,8 @@ async fn run_with_provider(
     if let Some(token) = &opts.auth_token {
         desktop_config = desktop_config.with_token(token.clone());
     }
-    let adapter: Arc<dyn ComputerAdapter> = Arc::new(OsworldDesktop::new(desktop_config)?);
+    let desktop = Arc::new(OsworldDesktop::new(desktop_config)?);
+    let adapter: Arc<dyn ComputerAdapter> = desktop.clone();
 
     // One adapter per task: the VM was reset to the task's initial state, and
     // element ids are addresses inside that state only.
@@ -181,6 +188,7 @@ async fn run_with_provider(
         Err(e) => (String::new(), Some(e.to_string())),
     };
     let counts = collect_counts(&agent, &conversation).await;
+    let actions = desktop.executed_snippets().await;
 
     let stop_reason = if error.is_some() {
         "error"
@@ -200,6 +208,7 @@ async fn run_with_provider(
         stop_reason: stop_reason.to_string(),
         steps: counts.steps,
         tool_calls: counts.tool_calls,
+        actions,
         elapsed_ms: started.elapsed().as_millis() as u64,
         provider: provider_name.to_string(),
         model: model_name.to_string(),
@@ -429,6 +438,7 @@ mod tests {
             stop_reason: "final_answer".into(),
             steps: 17,
             tool_calls: 24,
+            actions: vec!["pyautogui.click(100, 56)".into()],
             elapsed_ms: 183_000,
             provider: "deepseek".into(),
             model: "deepseek-v4-flash".into(),
@@ -536,24 +546,24 @@ mod tests {
 
         let (url, vm) = start_fake_desktop().await;
 
-        // First round: look at the screen. Second round: report.
+        // First round: act on the desktop. Second round: report. The action is a
+        // key press rather than a click so the test does not have to know an
+        // element id from a tree it did not read.
         let provider = Arc::new(MockProvider::new().with_callback(|messages| {
             let saw_tool = messages.iter().any(|m| m.role == Role::Tool);
             if saw_tool {
-                Message::assistant("I read the screen and clicked Save.")
+                Message::assistant("I saved the file with Ctrl+S.")
             } else {
-                Message::assistant("Let me look at the screen first.").with_tool_calls(vec![
-                    ToolCall {
-                        id: "call_1".to_string(),
-                        call_type: "function".to_string(),
-                        function: FunctionCall {
-                            name: "computer".to_string(),
-                            arguments: r#"{"action":"screenshot"}"#.to_string(),
-                        },
-                        index: None,
-                        result: None,
+                Message::assistant("Let me save the file.").with_tool_calls(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "computer".to_string(),
+                        arguments: r#"{"action":"key_press","keys":["ctrl","s"]}"#.to_string(),
                     },
-                ])
+                    index: None,
+                    result: None,
+                }])
             }
         }));
 
@@ -586,16 +596,25 @@ mod tests {
         .expect("the task runs to completion");
 
         assert_eq!(result.stop_reason, "final_answer");
-        assert!(result.answer.contains("clicked Save"), "answer: {}", result.answer);
+        assert!(result.answer.contains("Ctrl+S"), "answer: {}", result.answer);
         assert!(result.steps >= 1, "the tool round is counted");
         assert!(result.tool_calls >= 1, "the tool call is counted");
         assert!(*vm.screens.lock().unwrap() >= 1, "the agent really looked");
+        assert!(
+            result.actions.iter().any(|a| a.contains("pyautogui")),
+            "the replay log holds what the VM was asked to run: {:?}",
+            result.actions
+        );
 
         let written = tokio::fs::read_to_string(&out).await.unwrap();
         let json: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(json["schema"], 1);
         assert_eq!(json["task_id"], "t1");
         assert_eq!(json["stop_reason"], "final_answer");
+        assert!(
+            json["actions"].as_array().is_some_and(|a| !a.is_empty()),
+            "the action log reaches the file: {json}"
+        );
         let _ = tokio::fs::remove_dir_all(out.parent().unwrap()).await;
     }
 }
