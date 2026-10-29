@@ -21,7 +21,7 @@
 #
 # Environment:
 #   BENCH_ROOT         /opt/bench                  root for OSWorld, binary, results
-#   SYSCITY_VERSION    latest                      release to install (e.g. v0.3.15)
+#   SYSCITY_VERSION    latest                      release to install (e.g. v0.3.16)
 #   SYSCITY_BIN_URL    (unset)                     full tarball URL (mirror, file://)
 #   SYSCITY_SRC_URL    (unset)                     source archive URL for bench/ glue
 #   RELEASE_REPO       lightconsen/syscity         GitHub repo the release lives in
@@ -514,7 +514,7 @@ fetch_binary() {
         die "$BIN does not run on this host: $version
      (the release needs x86_64 Linux with glibc >= 2.35)"
     fi
-    SYSCITY_TAG="v${version##* }"   # "syscity 0.3.15" -> v0.3.15
+    SYSCITY_TAG="v${version##* }"   # "syscity 0.3.16" -> v0.3.16
     ok "$BIN ($version)"
 }
 

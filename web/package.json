@@ -1,7 +1,7 @@
 {
   "name": "syscity-chat-ui",
   "private": true,
-  "version": "0.3.15",
+  "version": "0.3.16",
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "scripts": {

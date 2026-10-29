@@ -11,7 +11,7 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
-## [0.3.15] - 2026-10-29
+## [0.3.16] - 2026-10-30
 
 ### Highlights
 
@@ -58,8 +58,10 @@ if no section matches, the release falls back to auto-generated notes.
   infrastructure errors out of the denominator. `docs/computer-use-benchmark.md`
   is the plan, `docs/osworld-kvm-server.md` the host runbook, and
   `scripts/osworld-bench-setup.sh` provisions a KVM host in one idempotent
-  command (dependencies, Rust, Docker, OSWorld, the 12 GiB VM image, the
-  binary, then the container self-check and probe).
+  command (dependencies, Docker, OSWorld, the 12 GiB VM image, this release's
+  binary and the `bench/` glue, then the container self-check and probe). It
+  downloads the published tarball and verifies its checksum, so the host needs
+  no Rust toolchain; `--from-source` still builds instead.
 - **Element addressing and an action ladder** (`computer/element_index.rs`,
   `computer/session.rs`): snapshots carry a monotonic id and every element a
   `s{snapshot:08x}:{path}` id; ids from an earlier snapshot are rejected as
@@ -147,6 +149,15 @@ if no section matches, the release falls back to auto-generated notes.
 - **The three zip `extract()` waivers (RUSTSEC-2026-0367/0368/0369) are removed**
   from `deny.toml`: zip 9 fixes them, and `deny.toml`'s `wasmtime@48.0.5`
   duplicate-tree skip now names `wasmtime@50.0.0`.
+
+### Fixed
+
+- **The 22.04 release build links.** Moving the x86_64 CLI job off
+  `ubuntu-latest` left the cargo cache key at `v0-rust-build-Linux-x64-…`, so
+  the job restored the 24.04 job's `target/` — including onnxruntime's C++
+  objects, which reference `__isoc23_strtoll` and `__cxx11::…::_M_replace_cold`,
+  symbols the 22.04 headers never declare. The key now includes the runner
+  image, so the two matrix entries cannot share compiled objects.
 
 ## [0.3.14] - 2026-10-25
 

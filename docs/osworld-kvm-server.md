@@ -31,13 +31,13 @@ sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh --smoke
 | `--skip-image` / `--skip-binary` / `--skip-probe` / `--skip-verify` | 跳过已知完成的部分 |
 | `--refetch` | 强制重新下载二进制（`--from-source` 时是重编） |
 | `--from-source` | 不用 release，在 `$SYS` 编源码；要 Rust 和 2.1 的依赖 |
-| `SYSCITY_VERSION=v0.3.15` | 装指定版本，默认 `latest` |
+| `SYSCITY_VERSION=v0.3.16` | 装指定版本，默认 `latest` |
 | `SYSCITY_BIN_URL=…` | 换下载源（镜像或 `file://`），校验文件取 `<url>.sha256` |
 | `SYSCITY_SRC_URL=…` | 换 `bench/` 胶水用的源码包地址（镜像或 `file://`） |
 | `SYS_SRC=/path/to/syscity` | 顺手把本地源码树 rsync 到 `$SYS` |
 
 默认装的是 GitHub release 里的 `syscity-linux-amd64.tar.gz`（校验 `sha256` 后才安装），
-**不需要在那台机器上装 Rust 或编译**。v0.3.15 起这个产物是在 Ubuntu 22.04 runner 上
+**不需要在那台机器上装 Rust 或编译**。v0.3.16 起这个产物是在 Ubuntu 22.04 runner 上
 编的，glibc 下限 2.35；v0.3.14 及更早是在 24.04 上编的，需要 GLIBC_2.39，在 22.04 上
 根本起不来——所以别手抄旧教程里的下载链接。
 
@@ -141,19 +141,19 @@ curl -fL -o /tmp/syscity-linux-amd64.tar.gz.sha256 \
 (cd /tmp && sha256sum -c syscity-linux-amd64.tar.gz.sha256)
 tar xzf /tmp/syscity-linux-amd64.tar.gz -C /opt/bench/bin syscity
 chmod +x $BIN
-$BIN --version            # syscity 0.3.15
+$BIN --version            # syscity 0.3.16
 ```
 
-- **glibc 下限 2.35**：v0.3.15 起这个产物在 `ubuntu-22.04` runner 上编，22.04 能直接跑。
+- **glibc 下限 2.35**：v0.3.16 起这个产物在 `ubuntu-22.04` runner 上编，22.04 能直接跑。
   v0.3.14 及更早是在 24.04 上编的，要 GLIBC_2.39，22.04 上连 `--version` 都起不来。
-- 指定版本：把两处 `latest/download` 换成 `download/v0.3.15`；脚本用
-  `SYSCITY_VERSION=v0.3.15`。
+- 指定版本：把两处 `latest/download` 换成 `download/v0.3.16`；脚本用
+  `SYSCITY_VERSION=v0.3.16`。
 - **`bench/` 是 Python，不在二进制里**。脚本会再从同一个 tag 的源码包里取出
   `bench/` 放到 `$SYS/bench`（`run.py` 靠它驱动）。手动做：
 
 ```bash
 curl -fL -o /tmp/syscity-src.tar.gz \
-  https://github.com/lightconsen/syscity/archive/refs/tags/v0.3.15.tar.gz
+  https://github.com/lightconsen/syscity/archive/refs/tags/v0.3.16.tar.gz
 mkdir -p /tmp/syscity-src && tar xzf /tmp/syscity-src.tar.gz -C /tmp/syscity-src
 mkdir -p $SYS && cp -a /tmp/syscity-src/*/bench $SYS/
 ```
@@ -446,7 +446,7 @@ done
 | 端口连不上 | 端口是动态分配的 | 从 `PORT <n>` 或日志 `Started container with ports - VNC: …, Server: …` 取真实端口 |
 | 容器越积越多、磁盘吃满 | 中断后没清理 | `docker stop $(docker ps -q) && docker rm $(docker ps -a -q)`；删 `.qcow2.zip` 和旧 results 里的 png/mp4 |
 | SSH 中途 exit 255 | 连接抖动 | 用 `tmux`/`nohup` 跑，断线只影响观察不影响评测 |
-| `$BIN --version`：`version 'GLIBC_2.39' not found` | 装的是 24.04 runner 编的旧产物（v0.3.14 及更早） | 换 v0.3.15+：`SYSCITY_VERSION=v0.3.15`，或删掉 `$BIN` 后 `--refetch` |
+| `$BIN --version`：`version 'GLIBC_2.39' not found` | 装的是 24.04 runner 编的旧产物（v0.3.14 及更早） | 换 v0.3.16+：`SYSCITY_VERSION=v0.3.16`，或删掉 `$BIN` 后 `--refetch` |
 | 下 GitHub 超时 / 403 | 网络 | 先 `export https_proxy=…`，或 `SYSCITY_BIN_URL=<镜像>`；`file://` 也可 |
 | `sha256sum -c` 失败 | 下载被截断，或代理返回了错误页 | `--refetch` 重下；还失败就换源 |
 | `run.py` 不存在 | 只装了二进制，没取 `bench/` 胶水 | 重跑脚本（会自动取同 tag 的 `bench/`），见 2.2 |
