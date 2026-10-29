@@ -134,9 +134,24 @@ impl OsworldDesktop {
         parse_screen_size(content_type.as_deref(), &bytes)
     }
 
-    /// Run a Python snippet on the VM and return its stdout.
+    /// Run a Python snippet on the VM and return its stdout, recording it as
+    /// part of the action log.
     async fn run_python(&self, code: &str) -> Result<String> {
         self.executed.lock().await.push(code.to_string());
+        self.exec_snippet(code).await
+    }
+
+    /// Run a snippet that is not an action: no log entry, no cache change.
+    ///
+    /// `bench probe` uses this to prove `/execute` works before a run spends
+    /// model time on it. Recording it would put a snippet in the `actions`
+    /// field that the agent never decided, which is exactly the replay
+    /// contract's one rule.
+    pub async fn probe_execute(&self, code: &str) -> Result<String> {
+        self.exec_snippet(code).await
+    }
+
+    async fn exec_snippet(&self, code: &str) -> Result<String> {
         let (_, bytes) = self
             .transport
             .post_json(EXECUTE_PATH, &json!({ "command": code, "shell": false }))

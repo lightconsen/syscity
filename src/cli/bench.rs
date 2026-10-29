@@ -57,6 +57,24 @@ pub enum BenchCommands {
         #[arg(long)]
         auth_token: Option<String>,
     },
+    /// Check that a remote desktop answers in the shape the bench expects
+    ///
+    /// Run this before a task, not after: it reports each endpoint in seconds
+    /// and spends no model time. Exits non-zero when any check fails.
+    Probe {
+        /// Base URL of the desktop service (OSWorld VM: `http://<vm_ip>:5000`)
+        #[arg(long)]
+        computer_url: String,
+        /// Bearer token for the desktop service, when it asks for one
+        #[arg(long)]
+        auth_token: Option<String>,
+        /// Also run a read-only snippet through `/execute` (proves pyautogui)
+        #[arg(long)]
+        execute: bool,
+        /// Print the report as JSON instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Step one task over stdin/stdout, one action per harness `env.step`
     ///
     /// The harness owns the loop: it sends `{"type":"task",...}`, receives one
@@ -128,6 +146,36 @@ pub async fn run_bench_command(command: BenchCommands) -> Result<()> {
                 return Err(SyscityError::Validation(format!(
                     "bench task {} failed: {error}",
                     result.task_id
+                )));
+            }
+            Ok(())
+        }
+        BenchCommands::Probe {
+            computer_url,
+            auth_token,
+            execute,
+            json,
+        } => {
+            let report = bench::probe(&bench::ProbeOptions {
+                computer_url,
+                auth_token,
+                execute,
+            })
+            .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", bench::probe::render(&report));
+            }
+
+            if !report.ok {
+                // The report is already on stdout; a non-zero exit is what a
+                // script (or a person reading CI) acts on.
+                return Err(SyscityError::Validation(format!(
+                    "the desktop at {} failed {} check(s)",
+                    report.computer_url,
+                    report.failures.len()
                 )));
             }
             Ok(())

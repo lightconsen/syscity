@@ -342,6 +342,27 @@ syscity bench run \
 **创建 adapter**：`RemoteDesktop::osworld(url)` → `Arc<dyn ComputerAdapter>` → `ComputerTool::new(Some(adapter))`。
 不挂 page actor（VM 里没有 syscity 的 browser pool）。
 
+### 4.3.1 `syscity bench probe`（先问，再花钱）
+
+```bash
+syscity bench probe --computer-url http://<vm_ip>:5000 [--execute] [--json]
+```
+
+四个端点各问一次，几秒出结果；任何一项失败就非零退出，并在失败行里点名是哪个端点。
+
+| 检查 | 端点 | 失败意味着 |
+|---|---|---|
+| `screen` | `/screen_size` | 服务连不上，或它不认这个协议 |
+| `shot` | `/screenshot` | 截图坏了；尺寸与 `screen` 不一致时给 warning（坐标会偏） |
+| `tree` | `/accessibility` | 树取不到/解析不了；**空树只是 warning**（Electron/Canvas 常态，agent 退回坐标档） |
+| `execute` | `/execute`（仅 `--execute`） | 服务跑不了 pyautogui——这条不过，`bench run` 一定白跑 |
+
+`--execute` 只跑一句只读的 `print(pyautogui.size())`，而且**不记进动作日志**：`actions` 是
+agent 自己决定的动作，探针不是。理由直接写在 `OsworldDesktop::probe_execute` 的注释里。
+
+为什么要它：`bench run` 的失败通常发生在模型已经跑了几轮之后（一次任务 = VM 分钟数 +
+token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M2 验收的第一步。
+
 ### 4.4 `bench/osworld/`（已写完，未在 VM 上验证）
 
 薄胶水，依赖上游 OSWorld checkout（`pip install -e .`），不 vendor 任何东西：
@@ -447,6 +468,15 @@ syscity bench run \
   用真二进制守着这条（关掉 stdin 后 stdout 必须恰好一行 `ready`，且非零退出）。
 - 单测 14 个（Python）全过；假 OSWorld 目录下两种形态各端到端跑过一遍，`mode` 字段在
   报告里。
+
+### 探针（2026-10-29）
+
+- `syscity bench probe`（§4.3.1）：四个端点各探一次，失败点名端点并非零退出；`--json`
+  给脚本用。`--execute` 走一句只读的 `pyautogui.size()`，不记进 `actions`。
+- 顺带发现并确认一条契约：`/accessibility` 回的是**裸 AT-SPI XML**（`text/plain`），不是
+  JSON。拿 JSON 假数据去探会直接被拒——探针的价值就在这里，它把这个错误提前到 3 秒内。
+- 单测 5 个（假 VM：健康 / 不执行 / 连不上 / 渲染 / JSON 往返）。真二进制对着本地假服务
+  跑过：四项全绿、退出码 0；把树换成 JSON 后退出码 3，失败行写着 `/accessibility`。
 
 **顺序理由**：M0 的适配器是唯一的新代码，也是唯一能在这台机器上验证的部分（假服务器）。
 M1 让适配器进入真实 Agent 循环。M2 才需要 VM。M3 修 M2 已知的形态偏差。M4 是第二个

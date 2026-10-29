@@ -17,6 +17,22 @@ The syscity side of the contract is `syscity bench run` / `syscity bench serve`
 and their JSON — see [`docs/computer-use-benchmark.md`](../docs/computer-use-benchmark.md)
 §4.3 and §4.4.
 
+## Before a task: probe the desktop
+
+```bash
+syscity bench probe --computer-url http://<vm_ip>:5000 --execute
+```
+
+Four endpoints, a few seconds, no model time: `/screen_size`, `/screenshot`,
+`/accessibility`, and (with `--execute`) a read-only `pyautogui.size()` through
+`/execute`. It exits non-zero and names the endpoint that is wrong, so a broken
+VM is found here rather than three model rounds into a scored task. `--json`
+gives the same report to a script.
+
+The probe never acts: the one snippet it runs reads the screen size and is not
+recorded in `actions` (that field is what the agent decided, and the probe is
+not the agent).
+
 ## OSWorld
 
 Requires an OSWorld checkout with its dependencies installed (`pip install -e .`

@@ -27,13 +27,16 @@
 //!
 //! `bench run` performs the whole task and leaves a replayable action log;
 //! `bench serve` (see [`serve`]) hands one action at a time to the harness and
-//! waits for it, which is the interleaving OSWorld's loop expects.
+//! waits for it, which is the interleaving OSWorld's loop expects; `bench
+//! probe` (see [`probe`]) asks the desktop whether it is ready at all.
 
+pub mod probe;
 pub mod run;
 pub mod serve;
 
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use probe::{probe, ProbeOptions, ProbeReport, PROBE_SCHEMA};
 pub use run::{run_once, BenchOptions, BenchResult, DEFAULT_MAX_STEPS, RESULT_SCHEMA};
 pub use serve::{serve, SERVE_SCHEMA};
