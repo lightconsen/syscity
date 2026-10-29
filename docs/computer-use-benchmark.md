@@ -1,7 +1,7 @@
 # Computer Use 基准接入：OSWorld-Verified 与 Cua Bench
 
-> 状态：M0、M1 已落地（远程桌面适配器 + `syscity bench run`）；M2 的 Python 胶水已写完并
-> 过了单测，**还没在真 VM 上跑过**；M3–M5 是计划。
+> 状态：M0、M1 已落地（远程桌面适配器 + `syscity bench run`）；M2 的 Python 胶水和 M3 的
+> 步进协议都已写完并过了单测，**还没在真 VM 上跑过**；M4、M5 是计划。
 > 最后更新：2026-10-29
 > 相关文档：[`benchmark.md`](benchmark.md)（GAIA/BFCL 的接入方法与本仓库的基准口径）、
 > [`modules/computer.md`](modules/computer.md)（动作阶梯、五种效果、后台投递）、
@@ -348,8 +348,8 @@ syscity bench run \
 
 | 文件 | 作用 |
 |---|---|
-| `sycity_agent.py` | `class SyscityAgent`：鸭子类型的 OSWorld agent（`predict` + `reset`） |
-| `run.py` | 批处理外壳，直接调上游 `lib_run_single.run_single_example` |
+| `sycity_agent.py` | `class SyscityAgent`（回放）与 `class SyscityStepAgent`（步进）：鸭子类型的 OSWorld agent（`predict` + `reset`） |
+| `run.py` | 批处理外壳，直接调上游 `lib_run_single.run_single_example`；`--mode replay\|step` 选形态 |
 | `test_sycity_agent.py` | 单测：用假 syscity 可执行文件，无 VM、无模型、无 Rust 构建 |
 
 - **回放**：第一次 `predict` 把 instruction 交给 `syscity bench run`（对着
@@ -358,14 +358,18 @@ syscity bench run \
   - 优点：一次进程跑完整题，没有几十次进程启动的开销。
   - 缺点：syscity 的观测是它当初决策时的截图，不是 `predict` 当时的 `obs`；涉及
     "等页面加载完再看"的任务会吃亏。报告里必须写明形态。
-- **边界**：syscity 起不来、进程非零退出、结果文件缺失、结果里 `error` 非空——一律抛
-  `SyscityRunFailed`，走上游的 `record_example_error`，**不计入分母**。不返回 `FAIL`，
-  因为在 infeasible 题里 `FAIL` 是满分。
+- **步进**（`--mode step`）：第一次 `predict` 起一个 `syscity bench serve` 并送
+  `task`，之后每一轮拿一条 `action` 交回 `env.step`，下一次 `predict` 先回
+  `{"type":"result","ok":true}` 再读下一条。syscity 在拿到 `result` 之前**阻塞**在
+  发送点，所以它的下一次观测一定发生在 harness 走完这一步之后——这正是要测的顺序。
+  - 一个进程一题、一条 `action` 一次 harness 迭代，所以 `harness_steps = max_steps + 10`。
+  - 每次读都带 deadline（整题一个 `--timeout`），进程挂住时抛 `SyscityRunFailed` 而不是
+    拖住 VM。
+- **边界**：syscity 起不来、进程非零退出、结果文件缺失、结果里 `error` 非空、协议里的
+  `error` 行——一律抛 `SyscityRunFailed`，走上游的 `record_example_error`，**不计入分母**。
+  不返回 `FAIL`，因为在 infeasible 题里 `FAIL` 是满分。两种形态共用这一条。
 - 支持 `--split test_small|test_all|test_nogdrive|test_infeasible`、`--meta`、`--domain`、
-  `--ids`、`--resume`；报告写 `<result-dir>/summary/syscity.json`。
-- **M3 形态（步进）**：`syscity bench serve --computer-url ...` 用 stdin/stdout JSON-lines：
-  `{"obs": {...}}` → `{"action": ...}`。步进语义与 OSWorld 完全对齐，回放模式的偏差消失。
-  落地位置就是同一个 `sycity_agent.py`，只换 `predict` 里那一段。
+  `--ids`、`--resume`；报告写 `<result-dir>/summary/syscity.json`，带 `mode` 字段。
 
 怎么跑、每题产出什么文件，见 [`bench/README.md`](../bench/README.md)。
 
@@ -389,7 +393,7 @@ syscity bench run \
 | **M0** ✅ | `src/computer/remote/{mod,osworld}.rs`；fake HTTP server 单测（截图、a11y XML、执行、过期 id、错误信封） | `cargo test` 全绿；假服务器上能完成"读树 → 按 id 点击 → 截图变化" | 1–2 天 |
 | **M1** ✅ | `syscity bench run` + `### ANSWER ###` 契约 | 对着假服务器跑通一次完整 Agent 任务；输出 JSON 可被 `jq` 读 | 0.5 天 |
 | **M2** ⏳ | `bench/osworld/run.py` 回放模式（代码写完，单测过；等 VM） | `test_small` 抽 5 题手跑，动作真的落在 VM 上（截图对比 + 人工看） | 1 天 |
-| **M3** | `syscity bench serve` 步进协议；可选 `pyatspi` ax 动作 | 同一批 5 题在步进模式下重跑，结果与回放模式差异可解释 | 1–1.5 天 |
+| **M3** ⏳ | `syscity bench serve` 步进协议（代码写完，单测过；等 VM）；可选 `pyatspi` ax 动作 | 同一批 5 题在步进模式下重跑，结果与回放模式差异可解释 | 1–1.5 天 |
 | **M4** | `bench/cua/sycity_agent.py` + `cua-bench-basic` | 13 题跑完，`summary.json` 有 `pass_at_k` | 0.5–1 天 |
 | **M5** | 全量：OSWorld 369 题 × 1 trial（先 a11y-only），结果进 ledger | 分数、infra 错误、阶梯分布三张表齐全 | 人工触发 |
 
@@ -420,6 +424,29 @@ syscity bench run \
 - 用假的 OSWorld 目录（同 `lib_run_single` 接口）端到端跑过一遍：2 题里 1 题成功、
   1 题模拟进程失败 → `scored=1, passed=1, infra_errors=1`，`traj.jsonl` 里是
   `click → write → DONE`。
+
+### 步进层（2026-10-29，M3 未在 VM 上验证）
+
+- `src/bench/serve.rs`：`syscity bench serve`，stdin/stdout 一行一条 JSON。协议是
+  `ready` → `task` → (`action` ⇄ `result`)* → `done` | `error`，两手约定都写进模块文档。
+  一个进程一题（VM 每题还原，元素 id 只在那份状态里有效）。
+- 关键接缝是 `ActionSink`（`src/computer/remote/osworld.rs`）：动作往哪送由它决定，
+  默认走 HTTP（回放形态），`bench serve` 换成「写到 stdio 并等 harness 回话」。观测
+  （`/screenshot`、`/accessibility`）始终走 HTTP，agent 看到的东西不因形态而变。
+- 单测断言了那条不变量：步进模式下一次任务跑完，假 VM 的 `/execute` 计数是 **0**——
+  动作全部经过 harness，一条都没直连 VM。另有「一步失败要回给 agent 且整题照常结束」
+  和「没收到 task 就断管是错误，不是 0 分」两个用例。
+- Python 侧 `SyscityStepAgent`：起子进程、读 `ready`、送 `task`；每次 `predict` 先回上一
+  步的 `result` 再读下一条 `action`；`done` 时把结果写进 `result.json`、让子进程退出、
+  再按 `stop_reason` 给 `DONE`/`FAIL`。读行在后台线程上做，整题一个 deadline，进程哑了
+  就抛错而不是拖住 VM。
+- `bench/osworld/run.py --mode step`：换 agent 类、`harness_steps = max_steps + 10`、
+  finally 里先 `agent.close()` 再 `env.close()`（别让子进程攥着正在拆的 VM）。
+- **stdout 只走协议**：`init_logging` 原来默认写 stdout，那会让每一条 tracing 行都变成
+  对端的解析错误。现在 `bench` 子命令的日志一律走 stderr，`tests/bench_serve_stdio.rs`
+  用真二进制守着这条（关掉 stdin 后 stdout 必须恰好一行 `ready`，且非零退出）。
+- 单测 14 个（Python）全过；假 OSWorld 目录下两种形态各端到端跑过一遍，`mode` 字段在
+  报告里。
 
 **顺序理由**：M0 的适配器是唯一的新代码，也是唯一能在这台机器上验证的部分（假服务器）。
 M1 让适配器进入真实 Agent 循环。M2 才需要 VM。M3 修 M2 已知的形态偏差。M4 是第二个

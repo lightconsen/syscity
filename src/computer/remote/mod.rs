@@ -25,7 +25,7 @@ use crate::computer::Result;
 
 pub mod osworld;
 
-pub use osworld::{parse_at_spi, OsworldDesktop};
+pub use osworld::{parse_at_spi, ActionSink, OsworldDesktop};
 
 /// How to reach a remote desktop and how long to wait for it.
 #[derive(Debug, Clone)]

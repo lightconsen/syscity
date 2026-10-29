@@ -37,6 +37,19 @@ const EXECUTE_PATH: &str = "/execute";
 /// How long a command's output is kept in an action result.
 const MAX_OUTPUT_CHARS: usize = 2_000;
 
+/// Where a planned snippet is delivered.
+///
+/// Normally the VM's `/execute`. In step mode (`syscity bench serve`) it is the
+/// harness itself: the snippet goes out over stdio, the harness runs it inside
+/// its own `env.step` — its pause, its observation — and only then does the
+/// call return. Reads never take this path: captures and the accessibility tree
+/// stay HTTP, so one adapter serves both shapes and the harness owns when an
+/// action happens, not what the agent can see.
+#[async_trait::async_trait]
+pub trait ActionSink: Send + Sync {
+    async fn deliver(&self, code: &str) -> Result<ActionResult>;
+}
+
 /// A desktop reached over the OSWorld VM HTTP protocol.
 pub struct OsworldDesktop {
     transport: Transport,
@@ -54,6 +67,8 @@ pub struct OsworldDesktop {
     /// (the clipboard) are in it too: replaying them keeps the ordering honest
     /// and costs nothing.
     executed: tokio::sync::Mutex<Vec<String>>,
+    /// `None` means "run it on the VM", which is the benchmark's normal shape.
+    sink: Option<std::sync::Arc<dyn ActionSink>>,
 }
 
 impl OsworldDesktop {
@@ -65,10 +80,22 @@ impl OsworldDesktop {
             shot: tokio::sync::Mutex::new(None),
             screenshot_ttl: config.screenshot_ttl,
             executed: tokio::sync::Mutex::new(Vec::new()),
+            sink: None,
         })
     }
 
-    /// The snippets sent to the VM so far, oldest first.
+    /// Hand actions to `sink` instead of running them on the VM.
+    ///
+    /// Observations still come from the VM over HTTP. That asymmetry is the
+    /// point: the harness decides *when* an action is executed and what the
+    /// world looks like afterwards, while the agent reads the same screen it
+    /// would read anyway.
+    pub fn with_action_sink(mut self, sink: std::sync::Arc<dyn ActionSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// The snippets sent so far, oldest first.
     pub async fn executed_snippets(&self) -> Vec<String> {
         self.executed.lock().await.clone()
     }
@@ -126,6 +153,12 @@ impl OsworldDesktop {
     /// Run a snippet that performs an action, and wrap the outcome.
     async fn act(&self, code: &str) -> Result<ActionResult> {
         self.invalidate_screenshot().await;
+        if let Some(sink) = &self.sink {
+            // `run_python` is what records on the HTTP path; here it is not
+            // called, so the log is kept in step with what the harness ran.
+            self.executed.lock().await.push(code.to_string());
+            return sink.deliver(code).await;
+        }
         let output = self.run_python(code).await?;
         let output = output.trim();
         let message = if output.is_empty() {

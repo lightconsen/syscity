@@ -57,6 +57,34 @@ pub enum BenchCommands {
         #[arg(long)]
         auth_token: Option<String>,
     },
+    /// Step one task over stdin/stdout, one action per harness `env.step`
+    ///
+    /// The harness owns the loop: it sends `{"type":"task",...}`, receives one
+    /// `{"type":"action",...}` at a time, answers `{"type":"result",...}` after
+    /// executing it, and reads the final `{"type":"done",...}`.
+    Serve {
+        /// Base URL of the desktop service (OSWorld VM: `http://<vm_ip>:5000`)
+        #[arg(long)]
+        computer_url: String,
+        /// Tool-iteration budget (default 60, or `SYSCITY_MAX_TOOL_ITERATIONS`)
+        #[arg(long)]
+        max_steps: Option<usize>,
+        /// LLM provider preset (e.g. "deepseek", "anthropic")
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model name (defaults to the provider's)
+        #[arg(long)]
+        model: Option<String>,
+        /// API key (overrides env var / config file)
+        #[arg(long)]
+        api_key: Option<String>,
+        /// API base URL (for custom/self-hosted providers)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Bearer token for the desktop service, when it asks for one
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
 }
 
 /// Dispatch a `syscity bench` subcommand.
@@ -102,6 +130,31 @@ pub async fn run_bench_command(command: BenchCommands) -> Result<()> {
                     result.task_id
                 )));
             }
+            Ok(())
+        }
+        BenchCommands::Serve {
+            computer_url,
+            max_steps,
+            provider,
+            model,
+            api_key,
+            base_url,
+            auth_token,
+        } => {
+            // Everything the task needs (instruction, id) arrives on the wire;
+            // the run reports itself with a `done` line, so there is nothing to
+            // print here that the harness does not already have.
+            bench::serve(BenchOptions {
+                computer_url,
+                max_steps,
+                provider,
+                model,
+                api_key,
+                base_url,
+                auth_token,
+                ..Default::default()
+            })
+            .await?;
             Ok(())
         }
     }

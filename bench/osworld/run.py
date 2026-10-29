@@ -3,8 +3,9 @@
 The loop is OSWorld's own: `lib_run_single.run_single_example` resets the VM,
 calls the agent's `predict`, executes what it returns, and finally runs the
 task's official evaluator. The only new thing here is which agent it is driving
-(`SyscityAgent`, see sycity_agent.py) and the report at the end, which keeps
-infrastructure errors out of the success rate's denominator.
+(`SyscityAgent` — replay — or `SyscityStepAgent` — step, see sycity_agent.py)
+and the report at the end, which keeps infrastructure errors out of the success
+rate's denominator.
 
 Usage, from inside an OSWorld checkout (it must be importable — this script
 only adds its root to `sys.path`, it does not vendor it):
@@ -12,11 +13,16 @@ only adds its root to `sys.path`, it does not vendor it):
     cd /path/to/OSWorld
     python /path/to/syscity/bench/osworld/run.py \
         --osworld-root . \
+        --mode step \
         --provider-name docker --path-to-vm /path/to/Ubuntu.vmx \
         --split test_small --max-steps 60 \
         --syscity /path/to/syscity/target/release/syscity \
         --provider deepseek --model deepseek-v4-flash \
         --result-dir ./results/syscity
+
+`--mode replay` (the default) runs the whole task before the harness steps;
+`--mode step` gives the harness the step itself. The latter is the honest one
+for timing-sensitive tasks and costs one extra process per task.
 
 Exit code is 0 when the run completed, whatever the scores were. A run that
 could not start at all (bad path, missing upstream) exits 1.
@@ -31,6 +37,8 @@ import os
 import sys
 import traceback
 
+MODES = ("replay", "step")
+
 SPLITS = {
     "test_small": "test_small.json",
     "test_all": "test_all.json",
@@ -42,7 +50,7 @@ logger = logging.getLogger("desktopenv.syscity")
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="OSWorld × syscity (replay)")
+    parser = argparse.ArgumentParser(description="OSWorld × syscity")
     parser.add_argument(
         "--osworld-root",
         default=".",
@@ -73,6 +81,13 @@ def parse_args(argv=None):
     )
 
     # Agent
+    parser.add_argument(
+        "--mode",
+        choices=MODES,
+        default="replay",
+        help="replay: syscity runs the task, the harness re-sends its actions; "
+        "step: the harness owns each step (default: replay)",
+    )
     parser.add_argument("--syscity", default="syscity", help="path to the syscity binary")
     parser.add_argument("--max-steps", type=int, default=60, help="syscity's tool budget")
     parser.add_argument("--timeout", type=float, default=1800.0, help="seconds per task")
@@ -142,7 +157,13 @@ def main(argv=None):
 
     # Imported after sys.path is set, and from this file's own directory.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from sycity_agent import SyscityAgent, SyscityRunFailed, SyscityUnavailable, summarize
+    from sycity_agent import (
+        SyscityAgent,
+        SyscityRunFailed,
+        SyscityStepAgent,
+        SyscityUnavailable,
+        summarize,
+    )
 
     meta_path = args.meta or os.path.join(
         args.test_config_base_dir, SPLITS[args.split]
@@ -156,7 +177,8 @@ def main(argv=None):
 
     os.makedirs(args.result_dir, exist_ok=True)
 
-    agent = SyscityAgent(
+    agent_class = SyscityStepAgent if args.mode == "step" else SyscityAgent
+    agent = agent_class(
         binary=args.syscity,
         max_steps=args.max_steps,
         provider=args.provider,
@@ -180,9 +202,14 @@ def main(argv=None):
     # The service port is part of the VM address the provider hands back.
     agent.port = getattr(env, "server_port", 5000)
 
-    # One model round can carry several tool calls, so replay needs more loop
-    # iterations than syscity needs model rounds.
-    harness_steps = max(50, args.max_steps * 3)
+    if args.mode == "step":
+        # One action per harness iteration, and syscity's own budget is spent
+        # by actions, so the loop needs only a little slack over it.
+        harness_steps = args.max_steps + 10
+    else:
+        # One model round can carry several tool calls, so replay needs more
+        # loop iterations than syscity needs model rounds.
+        harness_steps = max(50, args.max_steps * 3)
 
     scores = []
     result_paths = []
@@ -235,6 +262,14 @@ def main(argv=None):
                     example, domain, example_id, error, env, example_result_dir, args
                 )
     finally:
+        # The step agent holds a child process; release it before the VM the
+        # child is talking to goes away.
+        close = getattr(agent, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - a failed close must not hide the scores
+                logger.warning("closing the agent failed:\n%s", traceback.format_exc())
         try:
             env.close()
         except Exception:  # noqa: BLE001 - a failed close must not hide the scores
@@ -244,6 +279,7 @@ def main(argv=None):
     report["split"] = args.split if not args.meta else args.meta
     report["domain"] = args.domain
     report["syscity"] = args.syscity
+    report["mode"] = args.mode
     report["provider"] = args.provider
     report["model"] = args.model
     report["max_steps"] = args.max_steps

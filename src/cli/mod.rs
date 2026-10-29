@@ -530,7 +530,7 @@ pub enum StorageType {
     Redis,
 }
 
-fn init_logging(log_level: Option<&str>) {
+fn init_logging(log_level: Option<&str>, to_stderr: bool) {
     let level = log_level.unwrap_or("info");
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(format!("syscity={},hyper=warn,reqwest=warn", level))
@@ -538,10 +538,18 @@ fn init_logging(log_level: Option<&str>) {
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
-        .compact()
-        .finish();
+        .compact();
 
-    if tracing::subscriber::set_global_default(subscriber).is_err() {
+    // The bench subcommands own stdout: `bench serve` speaks a line protocol
+    // there and `bench run` a fenced answer block. A stray log line is a parse
+    // error at the other end, so their logs go to stderr instead.
+    let installed = if to_stderr {
+        subscriber.with_writer(std::io::stderr).try_init()
+    } else {
+        subscriber.try_init()
+    };
+
+    if installed.is_err() {
         eprintln!("warning: failed to set global tracing subscriber");
     }
 }
@@ -561,8 +569,10 @@ impl Cli {
     pub async fn run_parsed(self) -> Result<()> {
         let cli = self;
 
-        // Initialize logging
-        init_logging(cli.log_level.as_deref());
+        // Initialize logging. The bench subcommands keep stdout for their own
+        // output, so their logs are routed elsewhere.
+        let bench = matches!(&cli.command, Commands::Bench { .. });
+        init_logging(cli.log_level.as_deref(), bench);
 
         // Load configuration
         let config = if let Some(config_path) = &cli.config {

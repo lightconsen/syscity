@@ -8,13 +8,14 @@ it would make the numbers incomparable.
 ```
 bench/
 └── osworld/
-    ├── sycity_agent.py      # OSWorld agent: one `syscity bench run`, replayed
+    ├── sycity_agent.py      # OSWorld agents: replay (`bench run`) and step (`bench serve`)
     ├── run.py               # runner over OSWorld's own lib_run_single loop
     └── test_sycity_agent.py # unit tests; no OSWorld checkout, no VM
 ```
 
-The syscity side of the contract is `syscity bench run` and its result file —
-see [`docs/computer-use-benchmark.md`](../docs/computer-use-benchmark.md) §4.3.
+The syscity side of the contract is `syscity bench run` / `syscity bench serve`
+and their JSON — see [`docs/computer-use-benchmark.md`](../docs/computer-use-benchmark.md)
+§4.3 and §4.4.
 
 ## OSWorld
 
@@ -33,29 +34,44 @@ python /path/to/syscity/bench/osworld/run.py \
   --result-dir ./results/syscity
 ```
 
-Each task: the harness resets the VM, syscity runs the instruction once against
-the VM's HTTP desktop service (`http://<vm_ip>:<server_port>`), and then the
-snippets it sent are replayed through OSWorld's own `env.step`, after which the
-task's official evaluator scores the VM.
+Each task: the harness resets the VM, syscity works the instruction against the
+VM's HTTP desktop service (`http://<vm_ip>:<server_port>`), the harness executes
+what it asks for through OSWorld's own `env.step`, and the task's official
+evaluator scores the VM.
+
+### Two modes
+
+`--mode replay` (default) runs the whole task first and replays its action log
+through `env.step` afterwards. One process per task, but the two loops do not
+interleave: syscity decided step N+1 from its own accumulated view, so a next
+step that depends on a load finishing between steps is timed by
+`--sleep-after-execution` rather than by syscity's own waiting.
+
+`--mode step` gives the harness the step itself. One `syscity bench serve`
+process per task; syscity sends one snippet, blocks until the harness has
+executed it and observed, then reads the screen again. That is the same ordering
+OSWorld's own loop has, so use it for anything timing-sensitive.
+
+```bash
+python /path/to/syscity/bench/osworld/run.py --mode step ...   # same flags
+```
 
 Per task, under `--result-dir/<domain>/<id>/`:
 
 | file | written by |
 |---|---|
-| `result.json` | syscity (the run, including `actions` for the replay) |
+| `result.json` | syscity (the run; `actions` is what replay re-sends) |
+| `serve.stderr.log` | syscity, in step mode (empty unless it complained) |
 | `traj.jsonl`, `step_*.png`, `recording.mp4` | OSWorld's `run_single_example` |
 | `result.txt` | OSWorld (the score) |
 | `error.json` | OSWorld, when the task counted as an infrastructure error |
 
-`summary/syscity.json` at the end reports `scored`, `passed`, `success_rate`
-and `infra_errors`. Infrastructure errors (syscity could not start, the VM
-service failed, a timeout) are **not** in the success rate's denominator — they
-are listed separately, because one network blip must not read as a worse model.
-
-Known limitation: replay does not interleave the two loops. syscity decided each
-step from its own accumulated view of the screen, so a next step that depends on
-a load finishing between steps is timed by `--sleep-after-execution` rather than
-by syscity's own waiting. The step protocol (M3 in the plan) removes this.
+`summary/syscity.json` at the end reports `scored`, `passed`, `success_rate`,
+`infra_errors` and `mode`. Infrastructure errors (syscity could not start, the
+VM service failed, a timeout, a protocol `error` line) are **not** in the
+success rate's denominator — they are listed separately, because one network
+blip must not read as a worse model. Neither mode ever returns a `FAIL` action
+for an infrastructure error: on an infeasible task, `FAIL` scores 1.
 
 ## Tests
 
@@ -63,6 +79,7 @@ by syscity's own waiting. The step protocol (M3 in the plan) removes this.
 python3 bench/osworld/test_sycity_agent.py
 ```
 
-They use a scripted stand-in for the syscity binary: the command line, the
-replay order, and the "infrastructure error is not a wrong answer" boundary are
-checked without a VM, a model or a Rust build.
+They use scripted stand-ins for the syscity binary: the command line, the replay
+order, the step protocol's turn order (`task` → `action`/`result`... → `done`),
+and the "infrastructure error is not a wrong answer" boundary are checked without
+a VM, a model or a Rust build.

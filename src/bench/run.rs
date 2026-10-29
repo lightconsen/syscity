@@ -96,6 +96,42 @@ pub struct BenchResult {
 /// the harness always gets a file to read. `Err` is reserved for setup
 /// failures — no URL, no provider, an unwritable output path.
 pub async fn run_once(opts: BenchOptions) -> Result<BenchResult> {
+    let prepared = prepare_run(&opts).await?;
+    run_with_provider(
+        &opts,
+        prepared.provider,
+        &prepared.provider_name,
+        &prepared.model_name,
+        prepared.budget,
+        prepared.started,
+        prepared.started_at,
+    )
+    .await
+}
+
+/// What a run needs before it can start, whichever shape drives it.
+pub(crate) struct PreparedRun {
+    pub provider: Arc<dyn Provider>,
+    pub provider_name: String,
+    pub model_name: String,
+    pub budget: usize,
+    pub started: Instant,
+    pub started_at: String,
+}
+
+/// Validate the options, pick the budget, and build the provider.
+///
+/// Shared by `bench run` and `bench serve` so one task cannot look different
+/// depending on which transport delivered it.
+pub(crate) async fn prepare_run(opts: &BenchOptions) -> Result<PreparedRun> {
+    prepare_run_with(opts, None).await
+}
+
+/// [`prepare_run`], with a provider handed in by a test instead of resolved.
+pub(crate) async fn prepare_run_with(
+    opts: &BenchOptions,
+    provider: Option<Arc<dyn Provider>>,
+) -> Result<PreparedRun> {
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -121,9 +157,34 @@ pub async fn run_once(opts: BenchOptions) -> Result<BenchResult> {
     // is no per-agent field for it. Set it before the Agent exists.
     std::env::set_var("SYSCITY_MAX_TOOL_ITERATIONS", budget.to_string());
 
-    let (provider, provider_name, model_name) = build_provider(&opts).await?;
-    run_with_provider(&opts, provider, &provider_name, &model_name, budget, started, started_at)
-        .await
+    let (provider, provider_name, model_name) = match provider {
+        Some(provider) => {
+            let name = opts.provider.clone().unwrap_or_else(|| "mock".to_string());
+            let model = opts
+                .model
+                .clone()
+                .unwrap_or_else(|| provider.default_model().to_string());
+            (provider, name, model)
+        }
+        None => build_provider(opts).await?,
+    };
+    Ok(PreparedRun {
+        provider,
+        provider_name,
+        model_name,
+        budget,
+        started,
+        started_at,
+    })
+}
+
+/// The desktop a task is driven against: the VM, read and written over HTTP.
+pub(crate) fn build_desktop(opts: &BenchOptions) -> Result<OsworldDesktop> {
+    let mut desktop_config = RemoteDesktopConfig::new(opts.computer_url.trim());
+    if let Some(token) = &opts.auth_token {
+        desktop_config = desktop_config.with_token(token.clone());
+    }
+    Ok(OsworldDesktop::new(desktop_config)?)
 }
 
 /// The part that depends on a provider rather than on how one is chosen, so a
@@ -137,11 +198,35 @@ async fn run_with_provider(
     started: Instant,
     started_at: String,
 ) -> Result<BenchResult> {
-    let mut desktop_config = RemoteDesktopConfig::new(opts.computer_url.trim());
-    if let Some(token) = &opts.auth_token {
-        desktop_config = desktop_config.with_token(token.clone());
-    }
-    let desktop = Arc::new(OsworldDesktop::new(desktop_config)?);
+    let desktop = Arc::new(build_desktop(opts)?);
+    run_with_desktop(
+        opts,
+        desktop,
+        provider,
+        provider_name,
+        model_name,
+        budget,
+        started,
+        started_at,
+    )
+    .await
+}
+
+/// Run the agent over `desktop`.
+///
+/// A prepared desktop rather than an options-derived one, so step mode can hand
+/// over the same adapter with its actions routed to the harness.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_desktop(
+    opts: &BenchOptions,
+    desktop: Arc<OsworldDesktop>,
+    provider: Arc<dyn Provider>,
+    provider_name: &str,
+    model_name: &str,
+    budget: usize,
+    started: Instant,
+    started_at: String,
+) -> Result<BenchResult> {
     let adapter: Arc<dyn ComputerAdapter> = desktop.clone();
 
     // One adapter per task: the VM was reset to the task's initial state, and
@@ -386,6 +471,7 @@ fn bench_prompt_suffix(available: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::testing::start_fake_desktop;
 
     fn test_adapter() -> Arc<dyn ComputerAdapter> {
         Arc::new(
@@ -450,93 +536,6 @@ mod tests {
         assert_eq!(back.schema, 1);
         assert_eq!(back.steps, 17);
         assert!(back.error.is_none());
-    }
-
-    // ── End to end: a scripted model, a fake VM, a written result file ──────
-
-    struct FakeDesktop {
-        screens: std::sync::Mutex<usize>,
-        commands: std::sync::Mutex<Vec<String>>,
-    }
-
-    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
-        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        bytes.extend_from_slice(&13u32.to_be_bytes());
-        bytes.extend_from_slice(b"IHDR");
-        bytes.extend_from_slice(&width.to_be_bytes());
-        bytes.extend_from_slice(&height.to_be_bytes());
-        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
-        bytes
-    }
-
-    async fn start_fake_desktop() -> (String, Arc<FakeDesktop>) {
-        use axum::routing::{get, post};
-        use base64::Engine;
-
-        let state = Arc::new(FakeDesktop {
-            screens: std::sync::Mutex::new(0),
-            commands: std::sync::Mutex::new(Vec::new()),
-        });
-
-        let screenshot = move || async move {
-            axum::Json(serde_json::json!({
-                "screenshot": base64::engine::general_purpose::STANDARD
-                    .encode(png_bytes(1280, 800)),
-                "error": null,
-            }))
-        };
-        let tree = || async {
-            r#"<desktop-frame role="desktop frame" name="Desktop" x="0" y="0"
-                 width="1280" height="800">
-                 <push-button role="push button" name="Save" states="enabled"
-                   x="100" y="50" width="20" height="20"/>
-               </desktop-frame>"#
-        };
-        let counter = state.clone();
-        let app = axum::Router::new()
-            .route(
-                "/screenshot",
-                get(move || {
-                    let counter = counter.clone();
-                    async move {
-                        *counter.screens.lock().unwrap() += 1;
-                        screenshot().await
-                    }
-                }),
-            )
-            .route("/accessibility", get(tree))
-            .route(
-                "/screen_size",
-                post(|| async {
-                    axum::Json(serde_json::json!({
-                        "output": { "width": 1280, "height": 800 },
-                        "error": null,
-                    }))
-                }),
-            )
-            .route(
-                "/execute",
-                post(
-                    |axum::extract::State(state): axum::extract::State<Arc<FakeDesktop>>,
-                     axum::Json(body): axum::Json<serde_json::Value>| async move {
-                        let command = body
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        state.commands.lock().unwrap().push(command);
-                        axum::Json(serde_json::json!({ "output": "", "error": null }))
-                    },
-                ),
-            )
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{address}"), state)
     }
 
     #[tokio::test]
