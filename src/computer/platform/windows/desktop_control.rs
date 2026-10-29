@@ -330,11 +330,13 @@ Add-Type -AssemblyName System.Windows.Forms
                 // Convert to SendKeys format
                 let sendkeys = keys
                     .iter()
-                    .map(|k| match k.as_str() {
+                    .map(|k| match crate::computer::canonical_key(k) {
                         "ctrl" | "control" => "^".to_string(),
                         "alt" => "%".to_string(),
                         "shift" => "+".to_string(),
                         "enter" => "~".to_string(),
+                        "space" => " ".to_string(),
+                        "backspace" => "{BS}".to_string(),
                         "tab" => "{TAB}".to_string(),
                         "escape" => "{ESC}".to_string(),
                         "up" => "{UP}".to_string(),

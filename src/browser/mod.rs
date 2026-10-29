@@ -25,6 +25,8 @@ pub mod keys;
 #[cfg(feature = "browser")]
 pub mod network_log;
 #[cfg(feature = "browser")]
+pub mod page_actor;
+#[cfg(feature = "browser")]
 pub mod pointer;
 #[cfg(feature = "browser")]
 pub mod pool;
@@ -36,6 +38,8 @@ pub mod sourcemap;
 
 #[cfg(feature = "browser")]
 pub use aria_snapshot::{act_by_ref, aria_snapshot, ActKind, AriaNodeLine, AriaSnapshot};
+#[cfg(feature = "browser")]
+pub use page_actor::BrowserPageActor;
 #[cfg(feature = "browser")]
 pub use pool::{BrowserInstance, BrowserPool, PageHandle};
 #[cfg(feature = "browser")]

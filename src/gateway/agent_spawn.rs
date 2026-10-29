@@ -986,9 +986,10 @@ pub(crate) struct ToolRegistryArgs {
     /// that lists `deepseek` in `[search] providers` need not repeat it in
     /// `[search.keys]`. `None` on every other deployment.
     pub deepseek_search_key: Option<String>,
-    /// Browser configuration (`[browser]`: pool sizing and profiles).
+    /// The browser pool, created once so the computer session's page rung and
+    /// the browser tool act on the same pages.
     #[cfg(feature = "browser")]
-    pub browser_config: crate::config::BrowserConfig,
+    pub browser_pool: Arc<crate::browser::BrowserPool>,
     /// Syscity Cloud config (feature `cloud`) — used to register the cloud
     /// search provider when enabled.
     #[cfg(feature = "cloud")]
@@ -1033,7 +1034,7 @@ pub(crate) async fn create_default_tool_registry(
         search_config,
         deepseek_search_key,
         #[cfg(feature = "browser")]
-        browser_config,
+        browser_pool,
         #[cfg(feature = "cloud")]
         cloud_config,
         device_bridge,
@@ -1152,17 +1153,20 @@ pub(crate) async fn create_default_tool_registry(
     // The pool matters as much as the policy: without one, every tool call
     // launched a Chrome, ran, and let it die — so a Navigate in one call and
     // a read in the next were two different browsers, and each call paid a
-    // cold start. `for_gateway` builds the pool from `[browser]`; pages in it
-    // are attributed to the calling conversation, so the shared registry does
-    // not mean shared tabs.
+    // cold start. The pool comes from `[browser]` and is created once, in
+    // `init_tools`, so the computer session's page rung acts on those same
+    // pages; pages in it are attributed to the calling conversation, so the
+    // shared registry does not mean shared tabs.
     #[cfg(feature = "browser")]
-    registry.register(Box::new(BrowserTool::for_gateway(&browser_config).with_navigation_policy(
-        if browser_allow_private {
-            crate::browser::NavigationPolicy::permissive()
-        } else {
-            crate::browser::NavigationPolicy::default()
-        },
-    )));
+    registry.register(Box::new(
+        BrowserTool::for_gateway_with_pool(browser_pool).with_navigation_policy(
+            if browser_allow_private {
+                crate::browser::NavigationPolicy::permissive()
+            } else {
+                crate::browser::NavigationPolicy::default()
+            },
+        ),
+    ));
 
     // Register ACP tools for subagent spawning
     registry.register(Box::new(AcpSpawnTool::new(acp.clone(), session_store.clone())));

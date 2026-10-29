@@ -356,6 +356,15 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
     let memory_manager_holder: Arc<RwLock<Option<Arc<MemoryManager>>>> =
         Arc::new(RwLock::new(None));
 
+    // One browser pool for the whole gateway. The browser tool and the
+    // computer session's page rung have to reach the same pages, and two
+    // pools would be two browsers with no page in common.
+    #[cfg(feature = "browser")]
+    let browser_pool = Arc::new(crate::browser::BrowserPool::with_profiles(
+        config.browser.pool.clone(),
+        config.browser.profiles.clone(),
+    ));
+
     let tool_registry = Arc::new(
         crate::gateway::create_default_tool_registry(
             crate::gateway::agent_spawn::ToolRegistryArgs {
@@ -382,7 +391,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                     None => None,
                 },
                 #[cfg(feature = "browser")]
-                browser_config: config.browser.clone(),
+                browser_pool: browser_pool.clone(),
                 #[cfg(feature = "cloud")]
                 cloud_config: config.cloud.clone(),
                 device_bridge,
@@ -403,9 +412,15 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
 
     // Register ComputerTool with the adapter (or None if unavailable).
     if let Some(ref adapter) = computer_adapter {
-        tool_registry.register_dynamic(Arc::new(crate::tools::computer::ComputerTool::new(Some(
-            adapter.clone(),
-        ))));
+        #[cfg(feature = "browser")]
+        let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
+            .with_page_actor(Arc::new(crate::browser::BrowserPageActor::new(
+                browser_pool.clone(),
+                config.browser.pool.default_profile.clone(),
+            )));
+        #[cfg(not(feature = "browser"))]
+        let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()));
+        tool_registry.register_dynamic(Arc::new(computer));
     } else {
         tool_registry.register_dynamic(Arc::new(crate::tools::computer::ComputerTool::new(None)));
     }

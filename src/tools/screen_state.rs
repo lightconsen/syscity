@@ -21,7 +21,7 @@ use crate::computer::sensitive_ui::SensitiveUiDetector;
 use crate::computer::vision::ScreenState;
 #[cfg(feature = "vision")]
 use crate::computer::Rect;
-use crate::computer::{ComputerAdapter, UiElement};
+use crate::computer::{ComputerAdapter, CoordinateSpace, UiElement};
 use crate::tools::{
     approval::RiskLevel, create_schema, sdk::ToolCapabilities, Tool, ToolContext,
     ToolExecutionResult,
@@ -129,7 +129,9 @@ impl Tool for ScreenStateTool {
 
 Use this BEFORE desktop actions to see what is on screen instead of operating blind. The UI tree gives structured element positions; OCR reads text the tree cannot see (PDFs, image-based UIs). OCR is slow (seconds) — only enable it when the tree is insufficient.
 
-When the accessibility tree is empty (games, image-based UIs, remote desktops, webviews), interactive elements are auto-detected from the screenshot via OmniParser; disable with ui_fallback=false."#
+When the accessibility tree is empty (games, image-based UIs, remote desktops, webviews), interactive elements are auto-detected from the screenshot via OmniParser; disable with ui_fallback=false.
+
+The result states the image's pixel→screen-point mapping (`coordinate_space`) and every display's frame. Read positions off the image, then pass them to `computer` with `from_screenshot=true`, or target elements by their `[id=…]`."#
     }
 
     fn parameters_schema(&self) -> Value {
@@ -241,6 +243,12 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
             }
         }
 
+        // Coordinate contract: say how the image the model is looking at maps
+        // back to the points that clicks use. On a Retina display this is the
+        // difference between a click landing on the button and 900 points away.
+        let geometry = adapter.display_geometry().await.unwrap_or_default();
+        let coordinate_space = CoordinateSpace::from_screenshot(&state.screenshot, &geometry);
+
         // Sensitive-UI scan runs over the tree the model is about to see, so
         // the warning is attached to the exact lines it applies to. Keyed by
         // element id; elements without a snapshot id cannot be targeted by id
@@ -304,6 +312,23 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
                     .join("; ")
             ));
         }
+        match coordinate_space {
+            Some(space) => {
+                output.push_str(&format!(
+                    "\nCoordinates: {}\n(click with from_screenshot=true to use those image pixels; \
+                     x/y without it are screen points. Element ids need no conversion.)\n",
+                    space.summary()
+                ));
+                if geometry.displays.len() > 1 {
+                    output.push_str(&format!("Displays: {}\n", geometry.summary()));
+                }
+            }
+            None => output.push_str(
+                "\nCoordinates: display geometry unavailable — screenshot pixels cannot be \
+                 converted to screen points; target elements by id instead.\n",
+            ),
+        }
+
         if !state.ocr_text.is_empty() {
             output.push_str("\nOCR text:\n");
             output.push_str(&state.ocr_text);
@@ -315,6 +340,10 @@ When the accessibility tree is empty (games, image-based UIs, remote desktops, w
         let mut data = json!({
             "screenshot_width": state.screenshot.width,
             "screenshot_height": state.screenshot.height,
+            "display": serde_json::to_value(&geometry).unwrap_or_default(),
+            "coordinate_space": coordinate_space
+                .map(|space| serde_json::to_value(space).unwrap_or_default())
+                .unwrap_or(Value::Null),
             "ui_tree": serde_json::to_value(&state.ui_tree).unwrap_or_default(),
             "ui_source": ui_source,
             "ui_trust": if ui_source == "omniparser" {

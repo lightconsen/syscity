@@ -260,7 +260,11 @@ impl Tool for DesktopControlTool {
                             .collect()
                     })
                     .unwrap_or_default();
-                let key_str = keys.join("+");
+                let key_str = keys
+                    .iter()
+                    .map(|k| crate::computer::evdev_key_name(k))
+                    .collect::<Vec<_>>()
+                    .join("+");
                 let (ok, _, err) = Self::run_xdotool(&["key", &key_str]).await?;
                 if ok {
                     Ok(ToolExecutionResult::success(format!("Pressed keys: {}", key_str)))

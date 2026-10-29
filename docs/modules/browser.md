@@ -89,7 +89,7 @@ Agent Request  (ToolContext.identity.conversation_id = owner)
     ▼
 BrowserTool::execute → execute_actions
     │
-    ├── pool present (for_gateway / for_eval)
+    ├── pool present (for_gateway_with_pool / for_eval)
     │       │
     │       ▼
     │   BrowserPool::get_or_create(profile)
@@ -128,8 +128,9 @@ pages by explicit target id, so they use the unrestricted `*_of(None)` forms.
   it did not open belong to another conversation or to the PDF renderer and
   the bridge — those address their pages by explicit target id and never
   list, so the unrestricted `*_of(None)` forms are scoped to them.
-- **Pool wired into both registries**: `BrowserTool::for_gateway` (the
-  gateway's registry, sized from `[browser]`) and `BrowserTool::for_eval` (a
+- **Pool wired into both registries**: `BrowserTool::for_gateway_with_pool`
+  (the gateway's registry, on the pool built once in `init_tools` — the same
+  pool the computer session's page rung uses) and `BrowserTool::for_eval` (a
   standalone eval run). `BrowserTool::new()` keeps the pool-less per-call
   behavior for tests and one-off use.
 - ARIA snapshot generation for LLM-friendly page representation

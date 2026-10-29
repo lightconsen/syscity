@@ -259,7 +259,7 @@ end tell"#,
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 Ok(ActionResult::success(result.output))
             }
-            DesktopAction::Type { text } => {
+            DesktopAction::Type { text, .. } => {
                 let args = serde_json::json!({ "action": "type", "text": text });
                 let result = self
                     .registry
@@ -737,6 +737,81 @@ end tell"#,
         }
     }
 
+    /// AppKit accessibility actions reach the app through System Events, which
+    /// is the same path regardless of which window is in front.
+    fn supports_background_input(&self) -> bool {
+        true
+    }
+
+    /// Press an element or set a field's value without bringing the app
+    /// forward.
+    ///
+    /// Both go through System Events' accessibility scripting, which acts on
+    /// the element itself: no key event reaches the event tap, and the app is
+    /// never activated. Coordinates are refused on purpose — `click at {x, y}`
+    /// is an accessibility hit test at a screen point, so if another window is
+    /// in front at that point, the click lands in *that* window.
+    async fn perform_background(
+        &self,
+        action: &DesktopAction,
+        target: Option<&ActionTarget>,
+    ) -> Result<ActionResult> {
+        let Some(target) = target else {
+            return Err(ComputerError::BackgroundInputUnavailable(
+                "this action names no element, so there is nothing to aim at in the background"
+                    .to_string(),
+            ));
+        };
+        let Some(app) = target.app.as_deref() else {
+            return Err(ComputerError::BackgroundInputUnavailable(
+                "the target's application is unknown; a background action has to name the app it \
+                 acts on"
+                    .to_string(),
+            ));
+        };
+        let Some(element) = target.element.as_ref() else {
+            return Err(ComputerError::BackgroundInputUnavailable(
+                "a screen point cannot be clicked in the background — target an element id"
+                    .to_string(),
+            ));
+        };
+        let Some(name) = element
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return Err(ComputerError::BackgroundInputUnavailable(
+                "the element has no accessibility name, so a background action cannot name it"
+                    .to_string(),
+            ));
+        };
+
+        let script = match action {
+            // A double click has no accessibility equivalent: pressing the
+            // element twice is two activations, not one double click.
+            DesktopAction::Click { .. } => background_press_script(app, &element.role, name),
+            DesktopAction::Type { text, .. } => {
+                background_set_value_script(app, &element.role, name, text)
+            }
+            other => {
+                return Err(ComputerError::BackgroundInputUnavailable(format!(
+                    "{} has no background form on macOS — an element press or a field value does",
+                    desktop_action_name(other)
+                )))
+            }
+        };
+
+        let apple_args = serde_json::json!({ "script": script });
+        let result = self
+            .registry
+            .execute("applescript", apple_args, &crate::tools::ToolContext::default())
+            .await
+            .ok_or_else(|| ComputerError::ToolFailed("applescript tool not found".to_string()))?
+            .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+        Ok(ActionResult::success(apple_script_output(&result).to_string()))
+    }
+
     async fn wait_for(&self, condition: WaitCondition, timeout: Duration) -> Result<bool> {
         let deadline = std::time::Instant::now() + timeout;
         let poll_interval = Duration::from_millis(500);
@@ -877,7 +952,95 @@ fn parse_position_size(position: &str, size: &str) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+/// Escape a string for an AppleScript double-quoted literal.
+fn apple_script_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Press an element in an app that is not in front.
+///
+/// The script deliberately does not activate the app and does not touch the
+/// pointer: System Events performs the element's own action.
+fn background_press_script(app: &str, role: &str, name: &str) -> String {
+    format!(
+        r#"tell application "System Events"
+    tell application process "{}"
+        click (first UI element whose role is "{}" and name is "{}")
+    end tell
+end tell"#,
+        apple_script_escape(app),
+        apple_script_escape(role),
+        apple_script_escape(name)
+    )
+}
+
+/// Set a field's value in an app that is not in front.
+///
+/// `set value` is the accessibility value, so no keystroke is delivered and
+/// the field is not focused — focusing would move the selection in an app the
+/// person may be reading.
+fn background_set_value_script(app: &str, role: &str, name: &str, text: &str) -> String {
+    format!(
+        r#"tell application "System Events"
+    tell application process "{}"
+        set value of (first UI element whose role is "{}" and name is "{}") to "{}"
+    end tell
+end tell"#,
+        apple_script_escape(app),
+        apple_script_escape(role),
+        apple_script_escape(name),
+        apple_script_escape(text)
+    )
+}
+
+/// A short name for an action, for refusal messages.
+fn desktop_action_name(action: &DesktopAction) -> &'static str {
+    match action {
+        DesktopAction::Screenshot { .. } => "a screenshot",
+        DesktopAction::Click { .. } => "a click",
+        DesktopAction::DoubleClick { .. } => "a double click",
+        DesktopAction::Type { .. } => "typing",
+        DesktopAction::KeyPress { .. } => "a key press",
+        DesktopAction::Scroll { .. } => "scrolling",
+        DesktopAction::Drag { .. } => "a drag",
+        _ => "this action",
+    }
+}
+
 /// Factory for macOS.
 pub async fn create(registry: Arc<ToolRegistry>) -> Result<Box<dyn ComputerAdapter>> {
     Ok(Box::new(MacosComputerAdapter::new(registry)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_background_press_never_activates_the_app() {
+        let script = background_press_script("Notes", "AXButton", "New Note");
+        assert!(
+            !script.contains("activate"),
+            "activating the app is what takes the foreground: {script}"
+        );
+        assert!(
+            script.contains(r#"first UI element whose role is "AXButton" and name is "New Note""#)
+        );
+    }
+
+    #[test]
+    fn a_background_value_contains_no_keystroke() {
+        let script = background_set_value_script("Notes", "AXTextField", "Title", "Hello");
+        assert!(!script.contains("activate"), "{script}");
+        assert!(!script.contains("keystroke"), "{script}");
+        assert!(script.contains(r#"set value of (first UI element whose role is "AXTextField" and name is "Title") to "Hello""#));
+    }
+
+    #[test]
+    fn quotes_in_names_do_not_end_the_literal() {
+        // A field called `He said "hi"` would otherwise close the string and
+        // turn the rest of the name into script.
+        let script = background_set_value_script("App", "AXTextField", r#"He said "hi""#, "a");
+        assert!(script.contains(r#"name is "He said \"hi\"""#), "{script}");
+    }
 }

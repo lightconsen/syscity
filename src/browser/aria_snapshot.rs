@@ -163,12 +163,34 @@ pub async fn aria_snapshot(
         if (explicit) return explicit;
 
         const tag = el.tagName.toLowerCase();
-        const type = el.getAttribute('type');
+        const type = (el.getAttribute('type') || 'text').toLowerCase();
+
+        // An input's `type` attribute is not its role: `type="text"` is a
+        // textbox and `type="submit"` is a button. Reporting the raw attribute
+        // left the snapshot saying "text" and "submit", which nothing that
+        // matches by role — the page rung included — could act on.
+        const inputRoles = {
+            'text': 'textbox',
+            'email': 'textbox',
+            'tel': 'textbox',
+            'url': 'textbox',
+            'password': 'textbox',
+            'search': 'searchbox',
+            'number': 'spinbutton',
+            'range': 'slider',
+            'checkbox': 'checkbox',
+            'radio': 'radio',
+            'button': 'button',
+            'submit': 'button',
+            'reset': 'button',
+            'image': 'button',
+            'file': 'button',
+        };
 
         const roleMap = {
             'a': 'link',
             'button': 'button',
-            'input': type || 'textbox',
+            'input': inputRoles[type] || 'textbox',
             'select': 'combobox',
             'textarea': 'textbox',
             'h1': 'heading',
@@ -204,7 +226,8 @@ pub async fn aria_snapshot(
     function isInteractive(el) {
         const role = getRole(el);
         const interactive = ['button', 'link', 'textbox', 'checkbox', 'radio',
-            'combobox', 'searchbox', 'menuitem', 'tab', 'option'];
+            'combobox', 'searchbox', 'menuitem', 'tab', 'option',
+            'spinbutton', 'slider'];
         return interactive.includes(role);
     }
 

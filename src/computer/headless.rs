@@ -328,6 +328,13 @@ impl ComputerAdapter for HeadlessComputerAdapter {
         }
     }
 
+    async fn display_geometry(&self) -> Result<crate::computer::display::DisplayGeometry> {
+        // A virtual framebuffer is not this process's own display, and its
+        // size is not exposed here. Reporting the host's monitors would be a
+        // confident lie; unknown keeps pixel→point conversion refused.
+        Ok(crate::computer::display::DisplayGeometry::default())
+    }
+
     async fn read_ui_tree(&self, _app: Option<&str>) -> Result<Vec<UiElement>> {
         // Accessibility tree is not available in headless mode.
         Ok(Vec::new())
@@ -379,7 +386,7 @@ impl ComputerAdapter for HeadlessComputerAdapter {
                 }
                 Ok(ActionResult::success(format!("Clicked at {}, {}", x, y)))
             }
-            DesktopAction::Type { text } => {
+            DesktopAction::Type { text, .. } => {
                 let display = self.display().ok_or_else(|| ComputerError::NoDisplay)?;
                 let output = tokio::process::Command::new("xdotool")
                     .env("DISPLAY", display)
@@ -396,7 +403,11 @@ impl ComputerAdapter for HeadlessComputerAdapter {
             }
             DesktopAction::KeyPress { keys } => {
                 let display = self.display().ok_or_else(|| ComputerError::NoDisplay)?;
-                let key_str = keys.join("+");
+                let key_str = keys
+                    .iter()
+                    .map(|k| crate::computer::evdev_key_name(k))
+                    .collect::<Vec<_>>()
+                    .join("+");
                 let output = tokio::process::Command::new("xdotool")
                     .env("DISPLAY", display)
                     .args(["key", &key_str])

@@ -22,11 +22,13 @@ use std::time::Duration;
 use crate::tools::ToolRegistry;
 
 pub mod audio;
+pub mod display;
 pub mod element_index;
 pub mod fs_watch;
 pub mod headless;
 pub mod log_aggregator;
 pub mod network;
+pub mod page;
 pub mod reflection;
 pub mod remote_control;
 pub mod rollback;
@@ -54,6 +56,7 @@ pub mod platform_windows;
 pub mod platform;
 
 pub use audio::{AudioCapture, AudioSegment, AudioSource, DetectedAudioEvent};
+pub use display::{CoordinateSpace, DisplayGeometry, DisplayInfo};
 pub use element_index::{ActionTarget, ResolveError, ResolvedElement, SnapshotCache, UiSnapshot};
 pub use fs_watch::{FileChangeEvent, FileChangeKind, FileWatchResult, FileWatcher};
 pub use headless::{HeadlessComputerAdapter, VirtualDisplay};
@@ -61,6 +64,7 @@ pub use log_aggregator::{
     AlertAction, AlertEvent, LogAggregator, LogAlertRule, LogEntry, LogLevel, LogSource,
 };
 pub use network::{FirewallRule, NetworkInspector, PingResult, PortEntry, TcpConnectResult};
+pub use page::{PageAction, PageActor, PageTarget};
 pub use remote_control::{RemoteControlAdapter, RemoteControlConfig, RemoteProtocol};
 pub use rollback::{RollbackManager, Snapshot};
 pub use screen_recorder::{
@@ -79,6 +83,8 @@ pub enum ComputerError {
     NoDisplay,
     #[error("Accessibility permission not granted")]
     AccessibilityDenied,
+    #[error("Background input is not available: {0}")]
+    BackgroundInputUnavailable(String),
     #[error("Tool execution failed: {0}")]
     ToolFailed(String),
     #[error("Element not found: {0}")]
@@ -151,6 +157,49 @@ pub trait ComputerAdapter: Send + Sync {
         ))
     }
 
+    /// Whether this adapter can deliver input without taking the foreground.
+    ///
+    /// Accessibility actions and page actions are not input-layer delivery:
+    /// they act on an element and are background by nature on every platform.
+    /// This answers the narrower question — can a *click or keystroke* reach
+    /// the app while another window holds the focus?
+    fn supports_background_input(&self) -> bool {
+        false
+    }
+
+    /// Perform the action without taking the foreground or moving the
+    /// pointer.
+    ///
+    /// `target` is the element the session resolved for the action, when it
+    /// has one; an action that names no element cannot usually be delivered in
+    /// the background, because there is nothing to aim at but a screen point.
+    ///
+    /// The default refuses. An adapter that cannot do this must say so: the
+    /// alternative is silently doing it in the foreground, which is exactly
+    /// what a background-delivery session asked it not to do.
+    async fn perform_background(
+        &self,
+        _action: &DesktopAction,
+        _target: Option<&ActionTarget>,
+    ) -> Result<ActionResult> {
+        Err(ComputerError::BackgroundInputUnavailable(format!(
+            "{} has no way to deliver input to an app that is not in front",
+            std::env::consts::OS
+        )))
+    }
+
+    /// Geometry of the displays this adapter drives, in screen points.
+    ///
+    /// Screenshot pixels and click coordinates are not the same space — a
+    /// Retina capture is twice the point size — so a caller that wants to act
+    /// on a pixel it saw must know the conversion. The default probes the
+    /// local machine; adapters that drive a *different* machine (remote
+    /// control) must override this to report unknown rather than convert with
+    /// the wrong geometry.
+    async fn display_geometry(&self) -> Result<crate::computer::display::DisplayGeometry> {
+        Ok(crate::computer::display::detect().await)
+    }
+
     /// Convenience: click at a logical coordinate.
     async fn click_at(&self, point: Point, button: MouseButton) -> Result<ActionResult> {
         self.execute(DesktopAction::Click {
@@ -162,8 +211,11 @@ pub trait ComputerAdapter: Send + Sync {
 
     /// Convenience: type text.
     async fn type_text(&self, text: &str) -> Result<ActionResult> {
-        self.execute(DesktopAction::Type { text: text.to_string() })
-            .await
+        self.execute(DesktopAction::Type {
+            text: text.to_string(),
+            target: None,
+        })
+        .await
     }
 
     /// Convenience: press a key combination.
@@ -260,6 +312,36 @@ pub fn has_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
 }
 
+/// Canonical name for a key, so callers can say "enter" and each backend gets
+/// the spelling it understands.
+///
+/// The session picks activation keys by element role and hands over lowercase
+/// tokens; xdotool, ydotool and SendKeys each spell those differently, and a
+/// mistranslation is not a no-op — the literal word ends up typed into the
+/// focused field.
+pub fn canonical_key(key: &str) -> &str {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "return" | "enter" => "enter",
+        "space" | "spacebar" => "space",
+        "tab" => "tab",
+        "esc" | "escape" => "escape",
+        "backspace" | "delete" => "backspace",
+        _ => key,
+    }
+}
+
+/// Spelling an X11/Wayland key injector (xdotool, ydotool) accepts.
+pub fn evdev_key_name(key: &str) -> String {
+    match canonical_key(key) {
+        "enter" => "Return".to_string(),
+        "space" => "space".to_string(),
+        "tab" => "Tab".to_string(),
+        "escape" => "Escape".to_string(),
+        "backspace" => "BackSpace".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +394,27 @@ mod tests {
         assert!(r.success);
         assert_eq!(r.message, "done");
         assert!(r.data.is_some());
+    }
+
+    #[test]
+    fn named_keys_have_one_canonical_spelling() {
+        assert_eq!(canonical_key("Return"), "enter");
+        assert_eq!(canonical_key("SPACE"), "space");
+        assert_eq!(canonical_key("Esc"), "escape");
+        assert_eq!(canonical_key("Backspace"), "backspace");
+        // Anything else passes through: a printable character is a character.
+        assert_eq!(canonical_key("a"), "a");
+        assert_eq!(canonical_key("cmd"), "cmd");
+    }
+
+    #[test]
+    fn x11_and_wayland_get_the_spelling_their_injector_understands() {
+        assert_eq!(evdev_key_name("enter"), "Return");
+        assert_eq!(evdev_key_name("space"), "space");
+        assert_eq!(evdev_key_name("tab"), "Tab");
+        assert_eq!(evdev_key_name("escape"), "Escape");
+        assert_eq!(evdev_key_name("Backspace"), "BackSpace");
+        assert_eq!(evdev_key_name("a"), "a");
     }
 
     #[test]

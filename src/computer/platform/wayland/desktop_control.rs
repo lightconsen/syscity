@@ -375,7 +375,11 @@ impl Tool for DesktopControlTool {
                     .unwrap_or_default();
 
                 if tool == "ydotool" {
-                    let key_str = keys.join(" ");
+                    let key_str = keys
+                        .iter()
+                        .map(|k| crate::computer::evdev_key_name(k))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     let (ok, _, err) = Self::run_cmd("ydotool", &["key", &key_str]).await?;
                     if ok {
                         Ok(ToolExecutionResult::success(format!("Pressed: {}", key_str)))

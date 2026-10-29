@@ -587,7 +587,33 @@ $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     }
 
     async fn keypress_remote(&self, keys: &[String]) -> Result<ActionResult> {
-        let joined = keys.join("+");
+        // Each injector spells named keys its own way; a misspelt one types
+        // the word into the focused field instead of pressing the key.
+        let joined = match self.remote_os {
+            RemoteOs::Linux => keys
+                .iter()
+                .map(|k| crate::computer::evdev_key_name(k))
+                .collect::<Vec<_>>()
+                .join("+"),
+            RemoteOs::Macos => keys
+                .iter()
+                .map(|k| match crate::computer::canonical_key(k) {
+                    "enter" => "return".to_string(),
+                    "escape" => "esc".to_string(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("+"),
+            RemoteOs::Windows => keys
+                .iter()
+                .map(|k| match crate::computer::canonical_key(k) {
+                    "enter" => "~".to_string(),
+                    "space" => " ".to_string(),
+                    other => other.to_string(),
+                })
+                .collect::<String>(),
+            _ => keys.join("+"),
+        };
         match self.remote_os {
             RemoteOs::Linux => {
                 self.run_remote_text("xdotool", &["key", &joined]).await?;
@@ -840,6 +866,13 @@ impl ComputerAdapter for RemoteControlAdapter {
         }
     }
 
+    async fn display_geometry(&self) -> Result<crate::computer::display::DisplayGeometry> {
+        // The displays belong to the remote host; probing this machine would
+        // describe the wrong screen. Until the remote side reports its layout,
+        // the honest answer is "unknown" and callers must not convert.
+        Ok(crate::computer::display::DisplayGeometry::default())
+    }
+
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {
         match self.remote_os {
             RemoteOs::Linux => self.read_ui_tree_linux(app).await,
@@ -886,7 +919,7 @@ impl ComputerAdapter for RemoteControlAdapter {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 self.click_remote(point, button).await
             }
-            DesktopAction::Type { text } => self.type_remote(&text).await,
+            DesktopAction::Type { text, .. } => self.type_remote(&text).await,
             DesktopAction::KeyPress { keys } => self.keypress_remote(&keys).await,
             DesktopAction::Wait { milliseconds } => {
                 tokio::time::sleep(Duration::from_millis(milliseconds)).await;

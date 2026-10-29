@@ -210,7 +210,7 @@ impl ComputerAdapter for WindowsComputerAdapter {
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 Ok(ActionResult::success(result.output))
             }
-            DesktopAction::Type { text } => {
+            DesktopAction::Type { text, .. } => {
                 let args = serde_json::json!({ "action": "type", "text": text });
                 let result = self
                     .registry

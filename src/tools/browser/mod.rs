@@ -102,26 +102,23 @@ impl BrowserTool {
     ///
     /// Every action then launches a Chrome, runs, and lets it die. This exists
     /// for tests and one-off use; the shipped registries build the tool with
-    /// [`BrowserTool::for_gateway`] or [`BrowserTool::for_eval`], which give it
-    /// a pool so a conversation keeps one browser and one tab between calls.
+    /// [`BrowserTool::for_gateway_with_pool`] or [`BrowserTool::for_eval`],
+    /// which give it a pool so a conversation keeps one browser and one tab
+    /// between calls.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Build the tool the way a running gateway needs it: one shared pool,
-    /// sized from `[browser]`, that outlives any single conversation.
+    /// Build the tool on a pool someone else created.
     ///
-    /// The pool is owned by the tool rather than passed in at spawn time. A
-    /// gateway builds its tool registry once and shares it with every
-    /// conversation, so a pool handed to the tool here is the same pool for
-    /// all of them — and pages are attributed to a conversation by id, so a
-    /// shared pool does not mean shared tabs.
+    /// The gateway creates the pool once, from `[browser]`, and hands it to
+    /// both this tool and the computer session's page rung: a page opened
+    /// through the browser tool has to be the page the desktop ladder can fall
+    /// back to, and a pool per tool would be a browser per tool. Pages in a
+    /// shared pool are attributed to a conversation, so sharing the pool does
+    /// not share tabs.
     #[cfg(feature = "browser")]
-    pub fn for_gateway(config: &crate::config::BrowserConfig) -> Self {
-        let pool = std::sync::Arc::new(crate::browser::BrowserPool::with_profiles(
-            config.pool.clone(),
-            config.profiles.clone(),
-        ));
+    pub fn for_gateway_with_pool(pool: std::sync::Arc<crate::browser::BrowserPool>) -> Self {
         Self::default().with_pool(pool)
     }
 

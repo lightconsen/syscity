@@ -81,7 +81,7 @@ impl Workflow {
                     *command = command.replace(&format!("{{{{{}}}}}", k), v);
                 }
             }
-            WorkflowAction::Desktop(DesktopAction::Type { text }) => {
+            WorkflowAction::Desktop(DesktopAction::Type { text, .. }) => {
                 for (k, v) in values {
                     *text = text.replace(&format!("{{{{{}}}}}", k), v);
                 }
@@ -201,7 +201,7 @@ impl WorkflowRecorder {
                 WorkflowAction::Shell { command } => {
                     Self::extract_candidates(command, &mut candidates);
                 }
-                WorkflowAction::Desktop(DesktopAction::Type { text }) => {
+                WorkflowAction::Desktop(DesktopAction::Type { text, .. }) => {
                     Self::extract_candidates(text, &mut candidates);
                 }
                 _ => {}

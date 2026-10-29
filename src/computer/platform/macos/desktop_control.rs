@@ -126,6 +126,31 @@ set the clipboard to _clipboard"#,
         )
     }
 
+    /// Virtual key code for the named keys the action ladder presses.
+    ///
+    /// AppKit activates a focused button, check box or tab item on Space and
+    /// submits or activates from Return; those are different virtual keys, so
+    /// the role decides which one is pressed. `None` means "not a named key —
+    /// send the characters instead".
+    fn macos_key_code(name: &str) -> Option<u32> {
+        Some(match name {
+            "enter" => 36,
+            "tab" => 48,
+            "space" => 49,
+            "backspace" => 51,
+            "escape" => 53,
+            "home" => 115,
+            "pageup" => 116,
+            "end" => 119,
+            "pagedown" => 121,
+            "left" => 123,
+            "right" => 124,
+            "down" => 125,
+            "up" => 126,
+            _ => return None,
+        })
+    }
+
     fn build_keystroke_script(app: Option<&str>, keys: &[String]) -> String {
         let app_block = if let Some(name) = app {
             format!("tell application \"{}\" to activate\ndelay 0.2\n", name)
@@ -133,20 +158,25 @@ set the clipboard to _clipboard"#,
             String::new()
         };
 
+        // Named keys must be pressed as key codes: `keystroke "Return"`
+        // types the six letters R-e-t-u-r-n into whatever has focus.
         let key_lines: Vec<String> = keys
             .iter()
-            .map(|k| match k.as_str() {
+            .map(|k| match crate::computer::canonical_key(k) {
                 "cmd" | "command" => "key down command".to_string(),
                 "shift" => "key down shift".to_string(),
                 "option" | "alt" => "key down option".to_string(),
                 "ctrl" | "control" => "key down control".to_string(),
-                _ => format!("keystroke \"{}\"", k.replace('"', "\\\"")),
+                name => match Self::macos_key_code(name) {
+                    Some(code) => format!("key code {}", code),
+                    None => format!("keystroke \"{}\"", k.replace('"', "\\\"")),
+                },
             })
             .collect();
 
         let key_up_lines: Vec<String> = keys
             .iter()
-            .filter_map(|k| match k.as_str() {
+            .filter_map(|k| match crate::computer::canonical_key(k) {
                 "cmd" | "command" => Some("key up command".to_string()),
                 "shift" => Some("key up shift".to_string()),
                 "option" | "alt" => Some("key up option".to_string()),
@@ -459,5 +489,22 @@ mod tests {
         assert!(script.contains("key down command"));
         assert!(script.contains("keystroke \"t\""));
         assert!(script.contains("key up command"));
+    }
+
+    #[test]
+    fn named_keys_are_pressed_not_typed_as_words() {
+        // The bug this pins: `keystroke "Return"` types the six letters of the
+        // word into whatever has focus instead of pressing Return.
+        let script = DesktopControlTool::build_keystroke_script(None, &["space".to_string()]);
+        assert!(script.contains("key code 49"), "{script}");
+        assert!(!script.contains("keystroke \"space\""), "{script}");
+
+        let script = DesktopControlTool::build_keystroke_script(None, &["Return".to_string()]);
+        assert!(script.contains("key code 36"), "{script}");
+        assert!(!script.contains("keystroke \"Return\""), "{script}");
+
+        // Printable characters still go through `keystroke`.
+        let script = DesktopControlTool::build_keystroke_script(None, &["a".to_string()]);
+        assert!(script.contains("keystroke \"a\""), "{script}");
     }
 }

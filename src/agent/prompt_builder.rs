@@ -623,10 +623,27 @@ When you do use the GUI:
   bound to one snapshot: after any action that changes the screen, re-read the
   tree instead of reusing the old ids. A stale id errors — that is a signal to
   re-observe, not to retry.
+- If you must use a position read off the screenshot, pass it with
+  `from_screenshot: true`. Image pixels are not screen points on a Retina
+  display (the image is twice as large); `screen_state` reports the exact
+  `coordinate_space`, and the tool applies it.
+- To type into a field, name it: `type` with the field's `element_id` (or x/y).
+  The tool then sets the value directly through accessibility, or focuses the
+  field before typing — without a target the keystrokes go wherever focus
+  happens to be, which is rarely the field you meant.
 - One action, then observe. The tool result reports `verification` / `effect`:
   `confirmed` means the screen actually changed, `suspected_noop` means the input
   did not land, `unverifiable` means nothing could be checked. Only act again on
   a `suspected_noop`; on `unverifiable`, take a fresh `screen_state` first.
+  `partial` means only part of the effect landed — inspect and clear before
+  retrying, do not repeat the action on top of it. `refused` means it never ran
+  at all and `recovery` names the one thing to change; repeating it unchanged
+  produces the same refusal.
+- When the person at the machine is working, pass `delivery: "background"` and
+  name an `element_id`: the action then reaches the app without raising it. An
+  action that can only be delivered by taking the screen (a bare key press, a
+  click at a point) comes back `refused` with the reason — that is not a
+  failure to retry, it is the answer to "without interrupting me".
 - Lines marked `[sensitive: …]` (password, payment, destructive confirmation,
   privilege escalation) are stop points: confirm with the user before typing
   into or clicking them.
@@ -949,6 +966,7 @@ mod tests {
         let prompt = builder.build();
         assert!(prompt.contains("Program state beats GUI"), "{prompt}");
         assert!(prompt.contains("Address elements by their `[id=…]`"));
+        assert!(prompt.contains("from_screenshot: true"));
         assert!(prompt.contains("[sensitive: …]"));
     }
 

@@ -261,7 +261,10 @@ fn substitute_params(action: &DesktopAction, bindings: &HashMap<String, String>)
         DesktopAction::CloseWindow { title_pattern } => DesktopAction::CloseWindow {
             title_pattern: sub(title_pattern),
         },
-        DesktopAction::Type { text } => DesktopAction::Type { text: sub(text) },
+        DesktopAction::Type { text, target } => DesktopAction::Type {
+            text: sub(text),
+            target: target.clone(),
+        },
         DesktopAction::ClipboardSet { text } => DesktopAction::ClipboardSet { text: sub(text) },
         // For other variants, just clone (no string fields to substitute).
         other => other.clone(),
@@ -284,6 +287,7 @@ mod tests {
                 "Say hello",
                 DesktopAction::Type {
                     text: "hello {{name}}".to_string(),
+                    target: None,
                 },
             );
 
@@ -293,7 +297,8 @@ mod tests {
 
         assert_eq!(tasks.len(), 1);
         match &tasks[0].action {
-            DesktopAction::Type { text } => {
+            DesktopAction::Type { text, target } => {
+                assert!(target.is_none());
                 assert_eq!(text, "hello world");
             }
             _ => panic!("expected Type"),

@@ -460,7 +460,17 @@ pub enum DesktopAction {
         button: MouseButton,
     },
     /// Type text (as if typed by keyboard).
-    Type { text: String },
+    ///
+    /// `target` names the field to type into when the caller has one. The
+    /// session then prefers to set the field's value through accessibility
+    /// (`AXSetValue` / UIA `ValuePattern`) — no focus, no keystroke, no race —
+    /// and falls back to focusing it and typing, and finally to whatever holds
+    /// focus. Without a target there is nothing to set, so it types blind.
+    Type {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<ClickTarget>,
+    },
     /// Press key combination (e.g. ["ctrl", "c"]).
     KeyPress { keys: Vec<String> },
     /// Scroll at a location.
@@ -566,6 +576,10 @@ pub enum Rung {
     Pixel,
     /// Keyboard: focus the element, then drive it with keys.
     Keyboard,
+    /// The page itself, through the browser's protocol: the element is found
+    /// in the document by role and name instead of by picture or by focus.
+    /// Only web content has this rung.
+    Page,
 }
 
 /// A native accessibility action to perform on an element.
@@ -597,11 +611,17 @@ impl AxAction {
 
 /// What is known about whether an action took effect.
 ///
-/// Three values, because two cannot hold the truth — the same reason
-/// [`crate::computer::use_loop::StepVerification`] has three. `Confirmed` is
-/// reserved for an effect the driver actually observed: an accessibility
-/// action that reported no error, or a screen that changed. A pixel click
-/// that "succeeded" in the sense that the pointer moved is `Unverifiable`.
+/// Five values, because fewer cannot hold the truth. `Confirmed` is reserved
+/// for an effect that was actually observed: an accessibility action that
+/// reported no error, or a screen that changed as intended. A pixel click that
+/// "succeeded" in the sense that the pointer moved is `Unverifiable`.
+///
+/// `Partial` and `Refused` separate two failures that used to look alike:
+/// an action that was delivered but only partly applied (the click landed in
+/// the field, only some of the text arrived) must not be retried blindly —
+/// retrying compounds it — while one the platform refused never ran at all,
+/// and needs the *caller* to change something (a fresh element id, a
+/// permission, a different rung) rather than another attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionEffect {
@@ -612,6 +632,13 @@ pub enum ActionEffect {
     /// The action was delivered but the screen did not change when it should
     /// have.
     SuspectedNoop,
+    /// The action was delivered and something changed, but not all of what
+    /// was asked for — inspect before retrying, or the retry doubles it.
+    Partial,
+    /// The action never ran: the platform rejected it (stale element,
+    /// missing permission, unsupported control). The caller must change the
+    /// request; repeating it produces the same refusal.
+    Refused,
 }
 
 impl ActionEffect {
@@ -621,12 +648,24 @@ impl ActionEffect {
             Self::Confirmed => "confirmed",
             Self::Unverifiable => "unverifiable",
             Self::SuspectedNoop => "suspected_noop",
+            Self::Partial => "partial",
+            Self::Refused => "refused",
         }
     }
 
     /// Whether this effect means the caller should try a higher rung.
+    ///
+    /// Not for `Partial` or `Refused`: a partial action already changed
+    /// something (escalating would apply it twice), and a refused one was
+    /// never delivered (escalating re-sends the same refused request).
     pub fn should_escalate(self) -> bool {
         matches!(self, Self::SuspectedNoop | Self::Unverifiable)
+    }
+
+    /// Whether the action needs a human/model decision before anything else
+    /// happens: the screen may now be in a half-applied state.
+    pub fn needs_inspection(self) -> bool {
+        matches!(self, Self::Partial | Self::Refused)
     }
 }
 
@@ -647,6 +686,26 @@ pub enum Escalation {
     Page,
 }
 
+/// How input may be delivered to the machine.
+///
+/// Accessibility actions and the page rung are background by nature: they act
+/// on an element, not on the pointer or the focus. The input-layer rungs
+/// (pixel, keyboard) are not, and on a desktop someone else is using they are
+/// the difference between doing the work and taking over the screen. A
+/// session asked for `Background` must refuse an input-layer action that has
+/// no background mechanism rather than quietly deliver it in the foreground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryMode {
+    /// Deliver wherever the action lands: the pointer may move and the focus
+    /// may change.
+    #[default]
+    Foreground,
+    /// Deliver only if the action can reach the app without taking the
+    /// foreground; otherwise refuse and say why.
+    Background,
+}
+
 /// Evidence attached to an action result: which rung ran and what it
 /// established.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -658,6 +717,10 @@ pub struct ActionEvidence {
     /// Rungs that were tried and rejected, lowest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tried: Vec<Rung>,
+    /// What the caller must change for a refused (or half-applied) action to
+    /// succeed — e.g. "re-read the UI tree and use a fresh element id".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
 }
 
 impl ActionEvidence {
@@ -667,7 +730,13 @@ impl ActionEvidence {
             effect,
             escalation: None,
             tried: Vec::new(),
+            recovery: None,
         }
+    }
+
+    pub fn with_recovery(mut self, recovery: impl Into<String>) -> Self {
+        self.recovery = Some(recovery.into());
+        self
     }
 
     pub fn with_escalation(mut self, escalation: Escalation) -> Self {
@@ -695,6 +764,9 @@ impl ActionEvidence {
             };
             line.push_str(&format!(" escalate={next}"));
         }
+        if let Some(recovery) = &self.recovery {
+            line.push_str(&format!(" recovery={recovery}"));
+        }
         line
     }
 }
@@ -704,6 +776,7 @@ fn rung_name(rung: Rung) -> &'static str {
         Rung::AxAction => "ax_action",
         Rung::Pixel => "pixel",
         Rung::Keyboard => "keyboard",
+        Rung::Page => "page",
     }
 }
 

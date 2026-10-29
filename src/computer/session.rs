@@ -27,7 +27,9 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
+use crate::computer::display::CoordinateSpace;
 use crate::computer::element_index::SnapshotCache;
+use crate::computer::page::{PageAction, PageActor, PageTarget};
 use crate::computer::reflection::{FailureAnalysis, ReflectionEngine};
 use crate::computer::rollback::RollbackManager;
 use crate::computer::sensitive_ui::{SensitiveUiDetector, SensitiveUiFinding};
@@ -36,7 +38,7 @@ use crate::computer::verification::{VerificationConfig, VerificationCriteria, Ve
 use crate::computer::vision::{is_screen_mutating_action, pixel_diff, ScreenDiff, ScreenState};
 use crate::computer::{
     ActionEffect, ActionResult, ActionTarget, ClickTarget, ComputerAdapter, ComputerError,
-    DesktopAction, Escalation, Rung, Screenshot, UiElement,
+    DeliveryMode, DesktopAction, Escalation, Rung, Screenshot, UiElement,
 };
 
 /// How long to wait for the screen to stop changing after an action.
@@ -108,6 +110,8 @@ struct SessionState {
     notes: Vec<PinnedNote>,
     sensitive: Vec<SensitiveUiFinding>,
     snapshot_counts: Vec<usize>,
+    /// Pixel → point mapping of the most recent screenshot the session took.
+    coordinate_space: Option<CoordinateSpace>,
 }
 
 /// Configuration for a [`ComputerSession`].
@@ -122,6 +126,10 @@ pub struct SessionConfig {
     /// Whether to check each action at all. When false every step reports
     /// `Unverifiable`, which is what "not checked" means.
     pub verify: bool,
+    /// Where input may land. `Background` refuses an input-layer action that
+    /// cannot reach the app without taking the foreground, instead of
+    /// delivering it anyway.
+    pub delivery: DeliveryMode,
 }
 
 impl Default for SessionConfig {
@@ -132,6 +140,7 @@ impl Default for SessionConfig {
             auto_rollback_threshold: 3,
             snapshot_paths: Vec::new(),
             verify: true,
+            delivery: DeliveryMode::Foreground,
         }
     }
 }
@@ -145,6 +154,14 @@ pub struct ComputerSession {
     config: SessionConfig,
     state: Mutex<SessionState>,
     snapshots: SnapshotCache,
+    /// The page side of the ladder, when this session may land in a web page.
+    page: Option<PageBinding>,
+}
+
+/// A page actor and the conversation whose tab it may act on.
+struct PageBinding {
+    actor: Arc<dyn PageActor>,
+    owner: String,
 }
 
 impl ComputerSession {
@@ -158,7 +175,21 @@ impl ComputerSession {
             config: SessionConfig::default(),
             state: Mutex::new(SessionState::default()),
             snapshots: SnapshotCache::new(4),
+            page: None,
         }
+    }
+
+    /// Give the ladder a page rung, acting on the browser page that belongs
+    /// to `owner` — a conversation id, the same scope the browser tool uses
+    /// for tabs. Without one the ladder ends at the keyboard.
+    pub fn with_page(mut self, actor: Arc<dyn PageActor>, owner: impl Into<String>) -> Self {
+        self.page = Some(PageBinding { actor, owner: owner.into() });
+        self
+    }
+
+    /// Whether this session can fall back to the page.
+    pub fn has_page(&self) -> bool {
+        self.page.is_some()
     }
 
     pub fn with_config(mut self, config: SessionConfig) -> Self {
@@ -270,6 +301,76 @@ impl ComputerSession {
         })
     }
 
+    // ── Coordinate space ──────────────────────────────────────────────────
+
+    /// Pixel → screen-point mapping of the most recent screenshot.
+    pub async fn coordinate_space(&self) -> Option<CoordinateSpace> {
+        self.state.lock().await.coordinate_space
+    }
+
+    /// Remember the mapping that belongs to a screenshot the caller is about
+    /// to show the model.
+    pub async fn record_coordinate_space(&self, space: Option<CoordinateSpace>) {
+        if space.is_some() {
+            self.state.lock().await.coordinate_space = space;
+        }
+    }
+
+    /// Compute and remember the mapping from the current screen.
+    ///
+    /// Used when an action arrives in screenshot pixels but no screenshot has
+    /// passed through the session yet (e.g. `screen_state` ran first). An
+    /// action in image pixels without a mapping would silently click at half
+    /// the intended position on a Retina display, so the caller gets an error
+    /// instead of a guess.
+    pub async fn refresh_coordinate_space(&self) -> crate::computer::Result<CoordinateSpace> {
+        let screenshot = self.adapter.screenshot(None).await?;
+        let geometry = self.adapter.display_geometry().await?;
+        let space = CoordinateSpace::from_screenshot(&screenshot, &geometry).ok_or_else(|| {
+            ComputerError::Other(
+                "cannot map screenshot pixels to screen points: display geometry unknown \
+                     (use element ids or screen-point coordinates)"
+                    .to_string(),
+            )
+        })?;
+        self.record_coordinate_space(Some(space)).await;
+        Ok(space)
+    }
+
+    /// Best-effort: remember the mapping for a screenshot the session produced.
+    async fn note_space_for(&self, screenshot: &Screenshot) {
+        self.note_space(screenshot.width, screenshot.height).await;
+    }
+
+    /// Best-effort: remember the mapping for an image size the session saw.
+    async fn note_space(&self, image_width: u32, image_height: u32) {
+        if image_width == 0 || image_height == 0 {
+            return;
+        }
+        let geometry = match self.adapter.display_geometry().await {
+            Ok(geometry) => geometry,
+            Err(e) => {
+                tracing::debug!("display geometry unavailable: {e}");
+                return;
+            }
+        };
+        let space = CoordinateSpace::new(image_width, image_height, &geometry);
+        self.record_coordinate_space(space).await;
+    }
+
+    /// Best-effort: an adapter that returns screenshot dimensions as data
+    /// (rather than a `Screenshot`) still tells us which space it showed.
+    async fn note_space_from_result(&self, result: &ActionResult) {
+        let Some(data) = result.data.as_ref() else {
+            return;
+        };
+        let width = data.get("width").and_then(serde_json::Value::as_u64);
+        let height = data.get("height").and_then(serde_json::Value::as_u64);
+        if let (Some(width), Some(height)) = (width, height) {
+            self.note_space(width as u32, height as u32).await;
+        }
+    }
+
     // ── Snapshot bookkeeping (used by the loop's undo) ────────────────────
 
     pub(crate) async fn push_snapshot_count(&self, count: usize) {
@@ -328,6 +429,8 @@ impl ComputerSession {
         let ladder = self.ladder_for(&action).await;
         let mut tried = Vec::new();
         let mut last_error: Option<ComputerError> = None;
+        // The rung that was actually dispatched last, for refusal evidence.
+        let mut attempted: Option<Rung> = None;
 
         for (index, rung) in ladder.iter().copied().enumerate() {
             let last_rung = index + 1 == ladder.len();
@@ -344,18 +447,39 @@ impl ComputerSession {
             } else {
                 None
             };
+            // Every capture the session takes names a coordinate space the
+            // caller may quote back in a later action.
+            if let Some(screenshot) = screenshot_before.as_ref() {
+                self.note_space_for(screenshot).await;
+            }
 
+            attempted = Some(rung);
             let result = match self.dispatch(&action, rung).await {
                 Ok(result) => result,
                 Err(e) => {
                     // A rung that could not run is not a failed action: the
                     // next rung is exactly the answer.
                     tracing::info!("rung {:?} unavailable: {}", rung, e);
+                    // Background delivery was asked for and the platform said
+                    // no. Escalating would deliver the same action in the
+                    // foreground — the one thing that must not happen here.
+                    let terminal = matches!(e, ComputerError::BackgroundInputUnavailable(_));
                     last_error = Some(e);
+                    if terminal {
+                        break;
+                    }
+                    // The keyboard rung presses keys into whatever holds
+                    // focus; it is a fallback for a click that ran but had no
+                    // effect. After a pixel rung that never ran, a stray
+                    // Return would land in some other window — stop instead.
+                    if rung == Rung::Pixel {
+                        break;
+                    }
                     continue;
                 }
             };
             let mut result = result;
+            self.note_space_from_result(&result).await;
             let mut driver_evidence = result.evidence.clone().unwrap_or_else(|| {
                 crate::computer::ActionEvidence::new(rung, ActionEffect::Unverifiable)
             });
@@ -369,7 +493,7 @@ impl ComputerSession {
                 None
             };
 
-            let (verification, diff) = if self.config.verify {
+            let (verification, diff, hint) = if self.config.verify {
                 self.verify_step(
                     &action,
                     &result,
@@ -380,10 +504,17 @@ impl ComputerSession {
                 )
                 .await?
             } else {
-                (StepVerification::Unverifiable, None)
+                (StepVerification::Unverifiable, None, None)
             };
 
-            let evidence = score_evidence(verification, Some(&driver_evidence));
+            let mut evidence = score_evidence(verification, Some(&driver_evidence));
+            // A tree-derived verdict outranks the pixel verdict: the screen
+            // changed, but the field says only half the text arrived.
+            if let Some(hint) = hint {
+                evidence.effect = hint.effect;
+                evidence.escalation = None;
+                evidence.recovery = hint.recovery;
+            }
 
             let keep_going = !last_rung && matches!(evidence.effect, ActionEffect::SuspectedNoop);
 
@@ -434,17 +565,61 @@ impl ComputerSession {
             });
         }
 
-        Err(last_error.unwrap_or_else(|| {
+        let error = last_error.unwrap_or_else(|| {
             ComputerError::ToolFailed("no action rung could be executed".to_string())
-        }))
+        });
+
+        // Every rung failed before delivering anything. When the reason is one
+        // the caller can act on — a stale id, a missing permission — say so as
+        // a refusal: the same request will be refused the same way, so the
+        // model needs to change something, not retry.
+        if let Some(recovery) = refusal_recovery(&error) {
+            let mut evidence = crate::computer::ActionEvidence::new(
+                attempted.unwrap_or(Rung::Pixel),
+                ActionEffect::Refused,
+            )
+            .with_recovery(recovery.to_string())
+            .with_tried(tried);
+            evidence.escalation = None;
+            let message = format!("refused: {error} — {recovery}");
+            let result = ActionResult::error(message);
+            let verification = StepVerification::Failed;
+            let (rolled_back, reflection) = self
+                .account(&action, &result, verification, ActionEffect::Refused)
+                .await;
+            return Ok(StepOutcome {
+                action,
+                result,
+                verification,
+                evidence: Some(evidence),
+                state_after: None,
+                diff: None,
+                sensitive_before: Vec::new(),
+                sensitive_after: self.sensitive_findings().await,
+                sensitive_target: false,
+                reflection,
+                snapshots_taken,
+                rolled_back,
+            });
+        }
+
+        Err(error)
     }
 
     /// Which rungs to try, in order, for this action.
+    ///
+    /// A click on an addressable element walks `ax_action → pixel → keyboard`.
+    /// Typing into a named field walks `set_value → focus, type → type`: the
+    /// accessibility value is exact and needs no focus, clicking the field is
+    /// what a person does, and typing into whatever holds focus is all that
+    /// remains when the field cannot be addressed. When the target is web
+    /// content and a page is attached, `page` is the last resort: the same
+    /// element, found in the document instead of on the screen.
     async fn ladder_for(&self, action: &DesktopAction) -> Vec<Rung> {
         let target = match action {
-            DesktopAction::Click { target, .. } | DesktopAction::DoubleClick { target, .. } => {
-                target
-            }
+            DesktopAction::Click { target, .. }
+            | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Type { target: Some(target), .. } => target,
             _ => return vec![Rung::Pixel],
         };
 
@@ -452,21 +627,28 @@ impl ComputerSession {
             return vec![Rung::Pixel];
         }
 
+        let resolved = self.adapter.resolve_target(target).await.ok();
         let mut ladder = Vec::new();
         // The ax rung needs a resolved element with an addressable path.
-        if let Ok(resolved) = self.adapter.resolve_target(target).await {
-            if resolved
-                .element
-                .as_ref()
-                .map(|e| e.supports_ax_action())
-                .unwrap_or(false)
-            {
-                ladder.push(Rung::AxAction);
-            }
+        if resolved
+            .as_ref()
+            .and_then(|r| r.element.as_ref())
+            .map(|e| e.supports_ax_action())
+            .unwrap_or(false)
+        {
+            ladder.push(Rung::AxAction);
         }
         ladder.push(Rung::Pixel);
-        if matches!(action, DesktopAction::Click { .. }) {
+        // A double click has no keyboard equivalent; a click and a type do.
+        if matches!(action, DesktopAction::Click { .. } | DesktopAction::Type { .. }) {
             ladder.push(Rung::Keyboard);
+
+            // The page rung is only for pages, and only for a target the page
+            // can be asked about by name. A double click stays out: one DOM
+            // click is not a double click.
+            if self.page.is_some() && page_target(target, resolved.as_ref()).is_addressable() {
+                ladder.push(Rung::Page);
+            }
         }
         ladder
     }
@@ -477,6 +659,20 @@ impl ComputerSession {
         action: &DesktopAction,
         rung: Rung,
     ) -> crate::computer::Result<ActionResult> {
+        // The pointer and keyboard rungs are the two that can take the screen
+        // away from whoever is using it. In background mode they go through
+        // the adapter's background path, which refuses when the platform has
+        // no way to reach the app without the foreground.
+        if self.config.delivery == DeliveryMode::Background
+            && matches!(rung, Rung::Pixel | Rung::Keyboard)
+        {
+            let target = self.resolved_target(action).await;
+            return self
+                .adapter
+                .perform_background(action, target.as_ref())
+                .await;
+        }
+
         match (rung, action) {
             (Rung::AxAction, DesktopAction::Click { target, .. })
             | (Rung::AxAction, DesktopAction::DoubleClick { target, .. }) => {
@@ -485,17 +681,111 @@ impl ComputerSession {
                     .perform_ax_action(&resolved, crate::computer::AxAction::Press)
                     .await
             }
-            // The keyboard rung operates on whatever already has focus — the
-            // pixel rung in front of it is what put focus there.
-            (Rung::Keyboard, DesktopAction::Click { .. }) => {
+            // Setting the value needs neither focus nor keystrokes, and it
+            // cannot land in the wrong field.
+            (Rung::AxAction, DesktopAction::Type { text, target: Some(target) }) => {
+                let resolved = self.adapter.resolve_target(target).await?;
                 self.adapter
-                    .execute(DesktopAction::KeyPress {
-                        keys: vec!["Return".to_string()],
-                    })
+                    .perform_ax_action(
+                        &resolved,
+                        crate::computer::AxAction::SetValue { value: text.clone() },
+                    )
+                    .await
+            }
+            // Click into the field, then type. The click is what makes the
+            // keystrokes land in this field and nowhere else; if it fails, the
+            // keyboard rung is not a safe answer, so stop the ladder here.
+            (Rung::Pixel, DesktopAction::Type { text, target: Some(target) }) => {
+                let resolved = self.adapter.resolve_target(target).await?;
+                let focus = self
+                    .adapter
+                    .click_at(
+                        crate::computer::Point::new(resolved.x, resolved.y),
+                        crate::computer::MouseButton::Left,
+                    )
+                    .await?;
+                if !focus.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "could not focus the field before typing: {}",
+                        focus.message
+                    )));
+                }
+                self.adapter.type_text(text).await
+            }
+            (Rung::Keyboard, DesktopAction::Type { text, .. }) => {
+                self.adapter.type_text(text).await
+            }
+            // The keyboard rung operates on whatever already has focus — the
+            // pixel rung in front of it is what put focus there. Which key
+            // activates a control depends on what the control is: a focused
+            // check box answers to Space, and Return on a focused text field
+            // submits the form instead.
+            (Rung::Keyboard, DesktopAction::Click { target, .. }) => {
+                let key = self.activation_key(target).await;
+                self.adapter
+                    .execute(DesktopAction::KeyPress { keys: vec![key.to_string()] })
+                    .await
+            }
+            // The page rung asks the document. It is only reached after the
+            // three screen-level rungs left the page unchanged.
+            (Rung::Page, DesktopAction::Click { .. } | DesktopAction::Type { .. }) => {
+                let Some(binding) = self.page.as_ref() else {
+                    return Err(ComputerError::UnsupportedPlatform(
+                        "no browser page is attached to this session".to_string(),
+                    ));
+                };
+                let target = self.page_target_for(action).await;
+                let page_action = match action {
+                    DesktopAction::Type { text, .. } => PageAction::Type(text.clone()),
+                    _ => PageAction::Click,
+                };
+                binding
+                    .actor
+                    .act(&binding.owner, &target, page_action)
                     .await
             }
             _ => self.adapter.execute(action.clone()).await,
         }
+    }
+
+    /// The element an action names, resolved, for a rung that needs to know
+    /// what it is aiming at.
+    async fn resolved_target(&self, action: &DesktopAction) -> Option<ActionTarget> {
+        let target = match action {
+            DesktopAction::Click { target, .. } | DesktopAction::DoubleClick { target, .. } => {
+                target
+            }
+            DesktopAction::Type { target: Some(target), .. } => target,
+            _ => return None,
+        };
+        self.adapter.resolve_target(target).await.ok()
+    }
+
+    /// The page's name for an action's element, resolved through the same
+    /// tree the other rungs use.
+    async fn page_target_for(&self, action: &DesktopAction) -> PageTarget {
+        let target = match action {
+            DesktopAction::Click { target, .. }
+            | DesktopAction::Type { target: Some(target), .. } => target,
+            _ => return PageTarget::new("", None),
+        };
+        let resolved = if matches!(target, ClickTarget::Coordinate(_)) {
+            None
+        } else {
+            self.adapter.resolve_target(target).await.ok()
+        };
+        page_target(target, resolved.as_ref())
+    }
+
+    /// The key that activates the element a click aims at, once it has focus.
+    async fn activation_key(&self, target: &ClickTarget) -> &'static str {
+        self.adapter
+            .resolve_target(target)
+            .await
+            .ok()
+            .and_then(|resolved| resolved.element)
+            .map(|element| activation_key(&element.role))
+            .unwrap_or("enter")
     }
 
     /// Whether the element this action aims at is one the detector flagged.
@@ -624,10 +914,10 @@ impl ComputerSession {
         screenshot_before: Option<&Screenshot>,
         screenshot_after: Option<&Screenshot>,
         state_after: Option<&ScreenState>,
-    ) -> crate::computer::Result<(StepVerification, Option<ScreenDiff>)> {
+    ) -> crate::computer::Result<(StepVerification, Option<ScreenDiff>, Option<EffectHint>)> {
         match action {
-            DesktopAction::Screenshot { .. } => Ok((StepVerification::Verified, None)),
-            DesktopAction::Wait { .. } => Ok((StepVerification::Verified, None)),
+            DesktopAction::Screenshot { .. } => Ok((StepVerification::Verified, None, None)),
+            DesktopAction::Wait { .. } => Ok((StepVerification::Verified, None, None)),
             DesktopAction::LaunchApp { name, wait_for_ready, .. } => {
                 if *wait_for_ready {
                     self.verifier
@@ -637,9 +927,9 @@ impl ComputerSession {
                             None,
                         )
                         .await
-                        .map(|v| (StepVerification::from_checked(v), None))
+                        .map(|v| (StepVerification::from_checked(v), None, None))
                 } else {
-                    Ok((StepVerification::Unverifiable, None))
+                    Ok((StepVerification::Unverifiable, None, None))
                 }
             }
             DesktopAction::ActivateWindow { title_pattern } => self
@@ -650,12 +940,26 @@ impl ComputerSession {
                     None,
                 )
                 .await
-                .map(|v| (StepVerification::from_checked(v), None)),
-            _ if is_screen_mutating_action(action) => {
+                .map(|v| (StepVerification::from_checked(v), None, None)),
+            // Typing has a precise expected effect — the field's value — and
+            // pixel diffing cannot see the difference between all of the text
+            // and half of it. Use the tree when it carries values; fall back
+            // to pixels when it does not.
+            DesktopAction::Type { text, .. } => {
+                if let (Some(before), Some(state)) = (tree_before, state_after) {
+                    if let Some(hint) = typed_value_hint(before, &state.ui_tree, text) {
+                        return Ok((hint.verification, None, Some(hint)));
+                    }
+                }
                 self.verify_by_diff(tree_before, screenshot_before, screenshot_after, state_after)
                     .await
+                    .map(|(verification, diff)| (verification, diff, None))
             }
-            _ => Ok((StepVerification::Unverifiable, None)),
+            _ if is_screen_mutating_action(action) => self
+                .verify_by_diff(tree_before, screenshot_before, screenshot_after, state_after)
+                .await
+                .map(|(verification, diff)| (verification, diff, None)),
+            _ => Ok((StepVerification::Unverifiable, None, None)),
         }
     }
 
@@ -776,6 +1080,187 @@ impl ComputerSession {
     }
 }
 
+/// A verdict derived from the UI tree rather than from pixels.
+///
+/// The pixel diff can only answer "something changed". Some actions have an
+/// exact expected effect — typing `hello` should leave the field holding
+/// `hello`, not `hel` — and the tree can say whether it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectHint {
+    pub effect: ActionEffect,
+    pub verification: StepVerification,
+    pub recovery: Option<String>,
+}
+
+/// Compare editable field values before and after typing.
+///
+/// Returns `None` when the tree cannot answer — no editable field changed,
+/// more than one did, or a field is masked (a secure field reports bullets,
+/// not the text) — and the caller falls back to the pixel diff.
+pub(crate) fn typed_value_hint(
+    before: &[UiElement],
+    after: &[UiElement],
+    typed: &str,
+) -> Option<EffectHint> {
+    if typed.is_empty() {
+        return None;
+    }
+    let before_fields = editable_values(before);
+    let after_fields = editable_values(after);
+    if before_fields.is_empty() || before_fields.len() != after_fields.len() {
+        return None;
+    }
+    let mut changed: Option<&str> = None;
+    for ((role, before_value), (after_role, after_value)) in before_fields.iter().zip(&after_fields)
+    {
+        if role != after_role || is_masked(role, before_value) || is_masked(role, after_value) {
+            return None;
+        }
+        if before_value != after_value {
+            if changed.is_some() {
+                // More than one field moved: we cannot attribute the text.
+                return None;
+            }
+            changed = Some(after_value);
+        }
+    }
+    let actual = changed?;
+    if actual.contains(typed) {
+        return Some(EffectHint {
+            effect: ActionEffect::Confirmed,
+            verification: StepVerification::Verified,
+            recovery: None,
+        });
+    }
+    Some(EffectHint {
+        effect: ActionEffect::Partial,
+        verification: StepVerification::Failed,
+        recovery: Some(
+            "only part of the text landed in the field — click the field, select all, and retype; \
+             do not retype on top of it without clearing first"
+                .to_string(),
+        ),
+    })
+}
+
+/// Normalized role: lowercase, alphanumerics only, so `AXTextField`,
+/// `text field` and `textfield` compare equal.
+fn normalized_role(role: &str) -> String {
+    role.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Name an element the way a page can be asked about it.
+///
+/// The tree is the better source — it carries the role the page itself
+/// exposed — but a label-only target already says enough to look it up.
+fn page_target(target: &ClickTarget, resolved: Option<&ActionTarget>) -> PageTarget {
+    if let Some(element) = resolved.and_then(|r| r.element.as_ref()) {
+        return PageTarget::new(element.role.clone(), element.label.clone());
+    }
+    match target {
+        ClickTarget::ElementRoleLabel { role, label } => {
+            PageTarget::new(role.clone(), Some(label.clone()))
+        }
+        ClickTarget::ElementLabel(label) => PageTarget::new("", Some(label.clone())),
+        _ => PageTarget::new("", None),
+    }
+}
+
+/// The key that activates an element once it holds focus.
+///
+/// Toggle-like controls — buttons, check boxes, radio buttons, switches, tab
+/// items — answer to Space. Things activated from a menu or a list — links,
+/// menu items, rows — answer to Return. The distinction matters because the
+/// wrong key is not a no-op: Return on a focused text field submits the form.
+fn activation_key(role: &str) -> &'static str {
+    let role = normalized_role(role);
+    let space = role.contains("button")
+        || role.contains("checkbox")
+        || role.contains("radiobutton")
+        || role.contains("switch")
+        || role.contains("toggle")
+        || role.contains("tabitem")
+        || role.contains("segmentedcontrol")
+        || role.ends_with("tab");
+    if space {
+        "space"
+    } else {
+        "enter"
+    }
+}
+
+fn is_editable(role: &str) -> bool {
+    let role = normalized_role(role);
+    role.contains("textfield")
+        || role.contains("textarea")
+        || role.contains("combobox")
+        || role.contains("searchfield")
+        || role == "edit"
+}
+
+fn is_masked(role: &str, value: &str) -> bool {
+    normalized_role(role).contains("secure")
+        || normalized_role(role).contains("password")
+        || value.starts_with('•')
+        || value.starts_with('\u{2022}')
+}
+
+/// `(normalized role, value)` for every editable field, depth-first.
+fn editable_values(tree: &[UiElement]) -> Vec<(String, String)> {
+    fn walk(element: &UiElement, out: &mut Vec<(String, String)>) {
+        if is_editable(&element.role) {
+            out.push((normalized_role(&element.role), element.value.clone().unwrap_or_default()));
+        }
+        for child in &element.children {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    for root in tree {
+        walk(root, &mut out);
+    }
+    out
+}
+
+/// What the caller must change when an action was refused before it ran.
+///
+/// Only errors the *caller* can fix are listed: a timeout or a tool failure
+/// may succeed on retry and must not be turned into a refusal.
+fn refusal_recovery(error: &ComputerError) -> Option<&'static str> {
+    match error {
+        ComputerError::StaleElement(_) => Some(
+            "re-read the UI tree (screen_state) and target a fresh element id — the snapshot this \
+             id came from is gone",
+        ),
+        ComputerError::ElementNotFound(_) => Some(
+            "no element matched — re-read the UI tree and target a current element id, label, or \
+             screen coordinates",
+        ),
+        ComputerError::AccessibilityDenied => Some(
+            "grant Accessibility permission to the gateway (System Settings → Privacy & Security \
+             → Accessibility), then retry",
+        ),
+        ComputerError::UnsupportedPlatform(_) => Some(
+            "this adapter cannot perform the action — target screen coordinates instead of an \
+             element, or use another interface",
+        ),
+        ComputerError::NoDisplay => {
+            Some("no display is available; desktop actions cannot run until one is")
+        }
+        ComputerError::BackgroundInputUnavailable(_) => Some(
+            "this action cannot be delivered without the foreground — target an element the \
+             accessibility tree can act on, use the page rung, or ask for foreground input",
+        ),
+        ComputerError::NotInitialized => {
+            Some("the computer adapter is not initialized; configure desktop access first")
+        }
+        _ => None,
+    }
+}
+
 /// Scan a tree for password / payment / destructive-confirmation UI.
 fn scan_sensitive(tree: &[UiElement]) -> Vec<SensitiveUiFinding> {
     let detector = SensitiveUiDetector::new();
@@ -800,18 +1285,30 @@ pub fn score_evidence(
 
     let effect = match verification {
         StepVerification::Verified => ActionEffect::Confirmed,
-        StepVerification::Failed => ActionEffect::SuspectedNoop,
+        StepVerification::Failed => match driver.map(|d| d.effect) {
+            // The driver knows something the pixels do not: the action was
+            // delivered and partly took, or never ran at all.
+            Some(ActionEffect::Partial) => ActionEffect::Partial,
+            Some(ActionEffect::Refused) => ActionEffect::Refused,
+            _ => ActionEffect::SuspectedNoop,
+        },
         StepVerification::Unverifiable => match driver.map(|d| d.effect) {
             Some(ActionEffect::Confirmed) => ActionEffect::Confirmed,
+            Some(ActionEffect::Partial) => ActionEffect::Partial,
+            Some(ActionEffect::Refused) => ActionEffect::Refused,
             _ => ActionEffect::Unverifiable,
         },
     };
 
     let escalation = match (effect, rung) {
-        (ActionEffect::Confirmed, _) => None,
+        // Partial and Refused never escalate: one already changed the screen,
+        // the other never ran; another rung either doubles or repeats.
+        (ActionEffect::Confirmed | ActionEffect::Partial | ActionEffect::Refused, _) => None,
         (ActionEffect::SuspectedNoop, Rung::AxAction) => Some(Escalation::Px),
         (ActionEffect::SuspectedNoop, Rung::Pixel) => Some(Escalation::Foreground),
         (ActionEffect::SuspectedNoop, Rung::Keyboard) => Some(Escalation::Page),
+        // The page is the last rung there is.
+        (ActionEffect::SuspectedNoop, Rung::Page) => None,
         // A pixel click we could not check may simply have gone to a window
         // that was not frontmost.
         (ActionEffect::Unverifiable, Rung::Pixel) => Some(Escalation::Foreground),
@@ -823,6 +1320,7 @@ pub fn score_evidence(
         effect,
         escalation,
         tried,
+        recovery: driver.and_then(|d| d.recovery.clone()),
     }
 }
 
@@ -855,9 +1353,212 @@ pub fn render_notes(notes: &[PinnedNote]) -> String {
 mod tests {
     use super::*;
     use crate::computer::headless::HeadlessComputerAdapter;
+    use crate::computer::types::{MouseButton, Rect, WaitCondition};
+    use crate::computer::ActionEvidence;
 
     fn headless_session() -> ComputerSession {
         ComputerSession::new(Arc::new(HeadlessComputerAdapter::new()))
+    }
+
+    /// An adapter that refuses every element-targeted click as stale, the way
+    /// a real one does after its snapshot has been evicted.
+    struct StaleAdapter;
+
+    #[async_trait::async_trait]
+    impl ComputerAdapter for StaleAdapter {
+        async fn screenshot(&self, _region: Option<Rect>) -> crate::computer::Result<Screenshot> {
+            Ok(Screenshot::new(String::new(), 100, 100))
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(&self, action: DesktopAction) -> crate::computer::Result<ActionResult> {
+            match action {
+                DesktopAction::Click { target, .. } | DesktopAction::DoubleClick { target, .. } => {
+                    Err(ComputerError::StaleElement(format!("{target:?}")))
+                }
+                _ => Ok(ActionResult::success("ok")),
+            }
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+
+        async fn display_geometry(
+            &self,
+        ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+            Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                0, 0, 100, 100,
+            )
+            .primary()]))
+        }
+    }
+
+    /// An adapter that resolves every element target to one element of a known
+    /// role, records what reached it, and can pretend the accessibility
+    /// set-value rung is unsupported.
+    struct LadderAdapter {
+        role: String,
+        set_value_works: bool,
+        log: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl LadderAdapter {
+        fn new(role: &str, set_value_works: bool) -> Self {
+            Self {
+                role: role.to_string(),
+                set_value_works,
+                log: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn recorded(&self) -> Vec<String> {
+            self.log.lock().await.clone()
+        }
+
+        async fn record(&self, entry: impl Into<String>) {
+            self.log.lock().await.push(entry.into());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerAdapter for LadderAdapter {
+        async fn screenshot(&self, _region: Option<Rect>) -> crate::computer::Result<Screenshot> {
+            Ok(Screenshot::new(String::new(), 100, 100))
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_target(
+            &self,
+            target: &ClickTarget,
+        ) -> crate::computer::Result<ActionTarget> {
+            Ok(ActionTarget {
+                x: 10,
+                y: 20,
+                element: Some(crate::computer::element_index::ResolvedElement {
+                    id: "e1".to_string(),
+                    role: self.role.clone(),
+                    label: Some("Field".to_string()),
+                    center: crate::computer::Point::new(10, 20),
+                    path: vec![0, 0],
+                }),
+                app: Some("Test".to_string()),
+                snapshot: None,
+            })
+            .map(|mut resolved| {
+                if let ClickTarget::Coordinate(point) = target {
+                    resolved.x = point.x;
+                    resolved.y = point.y;
+                }
+                resolved
+            })
+        }
+
+        async fn perform_ax_action(
+            &self,
+            _target: &ActionTarget,
+            action: crate::computer::AxAction,
+        ) -> crate::computer::Result<ActionResult> {
+            let confirmed =
+                || crate::computer::ActionEvidence::new(Rung::AxAction, ActionEffect::Confirmed);
+            match action {
+                crate::computer::AxAction::SetValue { value } => {
+                    self.record(format!("set_value:{value}")).await;
+                    if self.set_value_works {
+                        Ok(ActionResult::success("value set").with_evidence(confirmed()))
+                    } else {
+                        Err(ComputerError::UnsupportedPlatform(
+                            "this control has no settable value".to_string(),
+                        ))
+                    }
+                }
+                crate::computer::AxAction::Press => {
+                    self.record("press").await;
+                    Ok(ActionResult::success("pressed").with_evidence(confirmed()))
+                }
+                crate::computer::AxAction::Focus => {
+                    self.record("focus").await;
+                    Ok(ActionResult::success("focused").with_evidence(confirmed()))
+                }
+            }
+        }
+
+        async fn execute(&self, action: DesktopAction) -> crate::computer::Result<ActionResult> {
+            match action {
+                DesktopAction::Click { target, .. } => {
+                    self.record(format!("click:{target:?}")).await;
+                    Ok(ActionResult::success("clicked"))
+                }
+                DesktopAction::Type { text, .. } => {
+                    self.record(format!("type:{text}")).await;
+                    Ok(ActionResult::success("typed"))
+                }
+                DesktopAction::KeyPress { keys } => {
+                    self.record(format!("key:{}", keys.join("+"))).await;
+                    Ok(ActionResult::success("pressed"))
+                }
+                _ => Ok(ActionResult::success("ok")),
+            }
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+
+        async fn display_geometry(
+            &self,
+        ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+            Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                0, 0, 100, 100,
+            )
+            .primary()]))
+        }
+    }
+
+    /// A session whose settling does no waiting, so ladder tests stay fast.
+    fn ladder_session(adapter: &Arc<LadderAdapter>) -> ComputerSession {
+        ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 0,
+                poll_interval_ms: 0,
+                max_rounds: 1,
+                stable_threshold: 0.5,
+            },
+            ..SessionConfig::default()
+        })
+    }
+
+    fn field(role: &str, value: &str) -> UiElement {
+        UiElement {
+            id: String::new(),
+            role: role.to_string(),
+            label: None,
+            value: Some(value.to_string()),
+            bounds: Rect::new(0, 0, 100, 20),
+            enabled: true,
+            focused: false,
+            children: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -887,7 +1588,7 @@ mod tests {
     async fn an_action_with_no_check_is_unverifiable_not_successful() {
         // `_ => Ok(true)` was a claim of success that nothing had established.
         let session = headless_session();
-        let (outcome, _) = session
+        let (outcome, _, _) = session
             .verify_step(
                 &DesktopAction::GetSystemStatus,
                 &ActionResult::success(""),
@@ -922,7 +1623,7 @@ mod tests {
         for _ in 0..2 {
             session
                 .account(
-                    &DesktopAction::Type { text: "x".into() },
+                    &DesktopAction::Type { text: "x".into(), target: None },
                     &ActionResult::error("boo"),
                     StepVerification::Failed,
                     ActionEffect::SuspectedNoop,
@@ -933,7 +1634,7 @@ mod tests {
 
         session
             .account(
-                &DesktopAction::Type { text: "x".into() },
+                &DesktopAction::Type { text: "x".into(), target: None },
                 &ActionResult::success("ok"),
                 StepVerification::Verified,
                 ActionEffect::Confirmed,
@@ -996,7 +1697,7 @@ mod tests {
         session.note("k", "v").await;
         session
             .account(
-                &DesktopAction::Type { text: "x".into() },
+                &DesktopAction::Type { text: "x".into(), target: None },
                 &ActionResult::error("boo"),
                 StepVerification::Failed,
                 ActionEffect::SuspectedNoop,
@@ -1005,5 +1706,485 @@ mod tests {
         session.reset().await;
         assert_eq!(session.consecutive_failures().await, 0);
         assert!(session.notes().await.is_empty());
+    }
+
+    // ── Partial / refused ─────────────────────────────────────────────────
+
+    #[test]
+    fn typing_that_fully_lands_is_confirmed_by_the_field() {
+        let before = vec![field("AXTextField", "")];
+        let after = vec![field("AXTextField", "hello")];
+        let hint = typed_value_hint(&before, &after, "hello").expect("the field answers");
+        assert_eq!(hint.effect, ActionEffect::Confirmed);
+        assert_eq!(hint.verification, StepVerification::Verified);
+        assert!(hint.recovery.is_none());
+    }
+
+    #[test]
+    fn typing_that_half_lands_is_partial_not_a_noop() {
+        // The screen changed, so a pixel diff would call this verified — but
+        // the field holds three of the five characters.
+        let before = vec![field("AXTextField", "")];
+        let after = vec![field("AXTextField", "hel")];
+        let hint = typed_value_hint(&before, &after, "hello").expect("the field answers");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+        assert_eq!(hint.verification, StepVerification::Failed);
+        let recovery = hint.recovery.expect("partial delivery comes with a hint");
+        assert!(recovery.contains("select all"), "{recovery}");
+        assert!(!recovery.contains("hel"), "the hint must not quote the text");
+    }
+
+    #[test]
+    fn masked_and_ambiguous_fields_fall_back_to_pixels() {
+        // A secure field reports bullets, not the text.
+        let masked_before = vec![field("AXSecureTextField", "")];
+        let masked_after = vec![field("AXSecureTextField", "•••••")];
+        assert!(typed_value_hint(&masked_before, &masked_after, "hello").is_none());
+
+        // Two fields moved: the text cannot be attributed to one of them.
+        let ambiguous_before = vec![field("AXTextField", ""), field("AXTextField", "")];
+        let ambiguous_after = vec![field("AXTextField", "he"), field("AXTextField", "llo")];
+        assert!(typed_value_hint(&ambiguous_before, &ambiguous_after, "hello").is_none());
+
+        // Nothing changed at all.
+        let same = vec![field("AXTextField", "abc")];
+        assert!(typed_value_hint(&same, &same, "hello").is_none());
+    }
+
+    #[test]
+    fn a_partial_driver_verdict_is_not_turned_into_a_noop() {
+        let driver = crate::computer::ActionEvidence::new(Rung::Pixel, ActionEffect::Partial);
+        let evidence = score_evidence(StepVerification::Failed, Some(&driver));
+        assert_eq!(evidence.effect, ActionEffect::Partial);
+        assert!(evidence.escalation.is_none(), "partial must not escalate");
+        assert!(!evidence.effect.should_escalate());
+        assert!(evidence.effect.needs_inspection());
+    }
+
+    #[test]
+    fn a_refused_driver_verdict_never_offers_another_rung() {
+        let driver = crate::computer::ActionEvidence::new(Rung::AxAction, ActionEffect::Refused);
+        let evidence = score_evidence(StepVerification::Unverifiable, Some(&driver));
+        assert_eq!(evidence.effect, ActionEffect::Refused);
+        assert!(evidence.escalation.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_action_that_cannot_resolve_is_refused_with_a_hint() {
+        let session = ComputerSession::new(Arc::new(StaleAdapter));
+        let outcome = session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::ElementId("s00000001:0.1".to_string()),
+                button: MouseButton::Left,
+            })
+            .await
+            .expect("a refusal is an outcome, not a crash");
+        let evidence = outcome.evidence.expect("evidence");
+        assert_eq!(evidence.effect, ActionEffect::Refused);
+        let recovery = evidence.recovery.expect("refusals carry a recovery hint");
+        assert!(recovery.contains("re-read the UI tree"), "{recovery}");
+        assert_eq!(outcome.verification, StepVerification::Failed);
+        assert!(!outcome.result.success);
+        assert!(outcome.result.message.contains("refused"));
+        assert!(outcome.result.message.contains(recovery.as_str()));
+    }
+
+    #[test]
+    fn only_actionable_errors_become_refusals() {
+        assert!(refusal_recovery(&ComputerError::StaleElement("x".into())).is_some());
+        assert!(refusal_recovery(&ComputerError::AccessibilityDenied)
+            .unwrap()
+            .contains("Accessibility permission"));
+        // A timeout may succeed on retry; calling it a refusal would tell the
+        // caller to stop trying when it should try again.
+        assert!(refusal_recovery(&ComputerError::Timeout).is_none());
+        assert!(refusal_recovery(&ComputerError::ToolFailed("x".into())).is_none());
+    }
+
+    // ── Keyboard rung and the typing ladder ──────────────────────────────
+
+    #[test]
+    fn activation_keys_follow_the_control_role() {
+        for role in [
+            "button",
+            "AXButton",
+            "check box",
+            "AXCheckBox",
+            "radio button",
+            "switch",
+            "toggle",
+            "tab",
+            "tab item",
+            "pop up button",
+            "segmented control",
+        ] {
+            assert_eq!(activation_key(role), "space", "{role} answers to Space");
+        }
+        for role in ["link", "menu item", "row", "text field", "unknown"] {
+            assert_eq!(activation_key(role), "enter", "{role} answers to Return");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_keyboard_rung_presses_the_key_the_control_answers_to() {
+        for (role, key) in [("check box", "space"), ("link", "enter")] {
+            let adapter = Arc::new(LadderAdapter::new(role, true));
+            let session = ladder_session(&adapter);
+            session
+                .dispatch(
+                    &DesktopAction::Click {
+                        target: ClickTarget::ElementId("e1".to_string()),
+                        button: MouseButton::Left,
+                    },
+                    Rung::Keyboard,
+                )
+                .await
+                .expect("keyboard rung");
+            let expected = format!("key:{key}");
+            assert_eq!(
+                adapter.recorded().await.last().map(String::as_str),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_pushes_the_value_through_accessibility_when_it_can() {
+        let adapter = Arc::new(LadderAdapter::new("text field", true));
+        let session = ladder_session(&adapter);
+        let outcome = session
+            .execute(DesktopAction::Type {
+                text: "42".to_string(),
+                target: Some(ClickTarget::ElementId("e1".to_string())),
+            })
+            .await
+            .expect("typed");
+        assert_eq!(
+            adapter.recorded().await,
+            vec!["set_value:42".to_string()],
+            "no click and no keystroke when the value can be set directly"
+        );
+        assert_eq!(outcome.evidence.expect("evidence").rung, Rung::AxAction);
+    }
+
+    #[tokio::test]
+    async fn typing_falls_back_to_focusing_the_field_then_typing() {
+        let adapter = Arc::new(LadderAdapter::new("text field", false));
+        let session = ladder_session(&adapter);
+        let outcome = session
+            .execute(DesktopAction::Type {
+                text: "42".to_string(),
+                target: Some(ClickTarget::ElementId("e1".to_string())),
+            })
+            .await
+            .expect("typed");
+        let log = adapter.recorded().await;
+        assert!(
+            log.iter().any(|entry| entry.starts_with("click:")),
+            "the field is clicked before typing: {log:?}"
+        );
+        assert_eq!(log.last().map(String::as_str), Some("type:42"));
+        assert_eq!(outcome.evidence.expect("evidence").rung, Rung::Pixel);
+    }
+
+    #[tokio::test]
+    async fn typing_without_a_target_types_into_the_current_focus() {
+        let adapter = Arc::new(LadderAdapter::new("text field", true));
+        let session = ladder_session(&adapter);
+        session
+            .execute(DesktopAction::Type {
+                text: "42".to_string(),
+                target: None,
+            })
+            .await
+            .expect("typed");
+        assert_eq!(
+            adapter.recorded().await,
+            vec!["type:42".to_string()],
+            "no target means no click and no set_value"
+        );
+    }
+
+    // ── Page rung ────────────────────────────────────────────────────────
+
+    /// A page that answers whatever it is asked, recording the question.
+    struct FakePage {
+        log: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakePage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                log: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        async fn recorded(&self) -> Vec<String> {
+            self.log.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PageActor for FakePage {
+        async fn act(
+            &self,
+            owner: &str,
+            target: &PageTarget,
+            action: PageAction,
+        ) -> crate::computer::Result<ActionResult> {
+            self.log
+                .lock()
+                .await
+                .push(format!("{owner}:{}:{:?}:{action:?}", target.role, target.label));
+            Ok(ActionResult::success("done")
+                .with_evidence(ActionEvidence::new(Rung::Page, ActionEffect::Confirmed)))
+        }
+    }
+
+    fn click_element(id: &str) -> DesktopAction {
+        DesktopAction::Click {
+            target: ClickTarget::ElementId(id.to_string()),
+            button: MouseButton::Left,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_rung_is_the_last_resort_for_a_named_element() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let session = ladder_session(&adapter).with_page(FakePage::new(), "conv-1");
+        assert_eq!(
+            session.ladder_for(&click_element("e1")).await,
+            vec![Rung::AxAction, Rung::Pixel, Rung::Keyboard, Rung::Page]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_page_stops_at_the_keyboard_rung() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let session = ladder_session(&adapter);
+        let ladder = session.ladder_for(&click_element("e1")).await;
+        assert!(!ladder.contains(&Rung::Page), "{ladder:?}");
+
+        // Dispatching it anyway must refuse, not fall through to a blind
+        // click: "no page" is not "the pixel rung again".
+        let error = session
+            .dispatch(&click_element("e1"), Rung::Page)
+            .await
+            .expect_err("no page is attached");
+        assert!(matches!(error, ComputerError::UnsupportedPlatform(_)));
+    }
+
+    #[tokio::test]
+    async fn a_coordinate_has_no_name_to_ask_the_page_about() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let session = ladder_session(&adapter).with_page(FakePage::new(), "conv-1");
+        let ladder = session
+            .ladder_for(&DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(5, 5)),
+                button: MouseButton::Left,
+            })
+            .await;
+        assert_eq!(ladder, vec![Rung::Pixel]);
+    }
+
+    #[tokio::test]
+    async fn the_page_rung_hands_the_page_a_name_not_a_coordinate() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let page = FakePage::new();
+        let session = ladder_session(&adapter).with_page(page.clone(), "conv-1");
+
+        session
+            .dispatch(&click_element("e1"), Rung::Page)
+            .await
+            .expect("page click");
+        session
+            .dispatch(
+                &DesktopAction::Type {
+                    text: "hello".to_string(),
+                    target: Some(ClickTarget::ElementId("e1".to_string())),
+                },
+                Rung::Page,
+            )
+            .await
+            .expect("page type");
+
+        assert_eq!(
+            page.recorded().await,
+            vec![
+                "conv-1:button:Some(\"Field\"):Click".to_string(),
+                "conv-1:button:Some(\"Field\"):Type(\"hello\")".to_string(),
+            ],
+            "the page is addressed by role and name from the UI tree"
+        );
+    }
+
+    // ── Background delivery ─────────────────────────────────────────────
+
+    /// An adapter whose element has no accessibility path (so the ax rung is
+    /// unavailable) and that records which delivery path ran.
+    struct BackgroundAdapter {
+        supports: bool,
+        log: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl BackgroundAdapter {
+        fn new(supports: bool) -> Arc<Self> {
+            Arc::new(Self {
+                supports,
+                log: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        async fn recorded(&self) -> Vec<String> {
+            self.log.lock().await.clone()
+        }
+
+        async fn record(&self, entry: impl Into<String>) {
+            self.log.lock().await.push(entry.into());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerAdapter for BackgroundAdapter {
+        async fn screenshot(&self, _region: Option<Rect>) -> crate::computer::Result<Screenshot> {
+            Ok(Screenshot::new(String::new(), 100, 100))
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_target(
+            &self,
+            target: &ClickTarget,
+        ) -> crate::computer::Result<ActionTarget> {
+            let mut resolved = ActionTarget {
+                x: 10,
+                y: 20,
+                element: Some(crate::computer::element_index::ResolvedElement {
+                    id: "e1".to_string(),
+                    role: "AXButton".to_string(),
+                    label: Some("Save".to_string()),
+                    center: crate::computer::Point::new(10, 20),
+                    // No path: the accessibility rung cannot run, which is
+                    // the case background delivery has to answer for.
+                    path: Vec::new(),
+                }),
+                app: Some("Test".to_string()),
+                snapshot: None,
+            };
+            if let ClickTarget::Coordinate(point) = target {
+                resolved.x = point.x;
+                resolved.y = point.y;
+            }
+            Ok(resolved)
+        }
+
+        async fn execute(&self, action: DesktopAction) -> crate::computer::Result<ActionResult> {
+            self.record(format!("foreground:{action:?}")).await;
+            Ok(ActionResult::success("done in the foreground"))
+        }
+
+        fn supports_background_input(&self) -> bool {
+            self.supports
+        }
+
+        async fn perform_background(
+            &self,
+            action: &DesktopAction,
+            target: Option<&ActionTarget>,
+        ) -> crate::computer::Result<ActionResult> {
+            if !self.supports {
+                return Err(ComputerError::BackgroundInputUnavailable(
+                    "nothing can reach this app without the foreground".to_string(),
+                ));
+            }
+            let app = target.and_then(|t| t.app.clone()).unwrap_or_default();
+            self.record(format!("background:{app}:{action:?}")).await;
+            Ok(ActionResult::success("done in the background")
+                .with_evidence(ActionEvidence::new(Rung::Pixel, ActionEffect::Confirmed)))
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn background_session(adapter: &Arc<BackgroundAdapter>) -> ComputerSession {
+        ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 0,
+                poll_interval_ms: 0,
+                max_rounds: 1,
+                stable_threshold: 0.5,
+            },
+            delivery: DeliveryMode::Background,
+            ..SessionConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn background_delivery_goes_through_the_background_path() {
+        let adapter = BackgroundAdapter::new(true);
+        let session = background_session(&adapter);
+        let outcome = session
+            .execute(click_element("e1"))
+            .await
+            .expect("delivered");
+
+        assert_eq!(
+            adapter.recorded().await,
+            vec![format!("background:Test:{:?}", click_element("e1"))],
+            "no foreground click and no keystroke"
+        );
+        assert_eq!(outcome.result.message, "done in the background");
+    }
+
+    #[tokio::test]
+    async fn background_delivery_refuses_instead_of_taking_the_foreground() {
+        // The failure this guards against: asking for background delivery and
+        // getting a foreground click anyway, because the ladder "escalated".
+        let adapter = BackgroundAdapter::new(false);
+        let session = background_session(&adapter);
+        let outcome = session
+            .execute(click_element("e1"))
+            .await
+            .expect("a refusal is an outcome, not a crash");
+
+        assert!(adapter.recorded().await.is_empty(), "nothing was delivered");
+        let evidence = outcome.evidence.expect("evidence");
+        assert_eq!(evidence.effect, ActionEffect::Refused);
+        assert!(evidence.escalation.is_none(), "a refusal must not escalate");
+        let recovery = evidence.recovery.expect("refusal carries a hint");
+        assert!(recovery.contains("foreground"), "{recovery}");
+        assert!(!outcome.result.success);
+    }
+
+    #[tokio::test]
+    async fn foreground_delivery_is_unchanged_when_it_is_asked_for() {
+        let adapter = BackgroundAdapter::new(true);
+        let session = ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 0,
+                poll_interval_ms: 0,
+                max_rounds: 1,
+                stable_threshold: 0.5,
+            },
+            ..SessionConfig::default()
+        });
+        session
+            .execute(click_element("e1"))
+            .await
+            .expect("delivered");
+        let log = adapter.recorded().await;
+        assert!(log.iter().any(|entry| entry.starts_with("foreground:")), "{log:?}");
+        assert!(!log.iter().any(|entry| entry.starts_with("background:")), "{log:?}");
     }
 }
