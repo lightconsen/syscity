@@ -99,6 +99,12 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Without this the restore key stops at "Linux-x64", so the 22.04 job
+          # restores the ubuntu-latest job's cached target/ — whose C++ objects
+          # (onnxruntime) were compiled against 24.04 headers. The link then
+          # fails with undefined __isoc23_strtoll / __cxx11::_M_replace_cold.
+          key: ${{ matrix.os }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_args }}
