@@ -41,6 +41,7 @@ pub mod acp;
 pub mod adapters;
 pub mod agent;
 pub mod attachments;
+pub mod bench;
 pub mod browser;
 pub mod canvas;
 pub mod channels;

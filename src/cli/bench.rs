@@ -1,0 +1,108 @@
+//! `syscity bench` — drive one benchmark task over a remote desktop.
+//!
+//! Called once per task by the benchmark glue (`bench/osworld/run.py`,
+//! `bench/cua/sycity_agent.py`). The design and the output contract live in
+//! [`docs/computer-use-benchmark.md`](../../docs/computer-use-benchmark.md).
+//!
+//! ```bash
+//! syscity bench run \
+//!   --instruction "Export the document as PDF" \
+//!   --computer-url http://10.0.2.15:5000 \
+//!   --task-id 7d8a1c \
+//!   --max-steps 60 \
+//!   --out /tmp/traj/7d8a1c/result.json
+//! ```
+
+use std::path::PathBuf;
+
+use clap::Subcommand;
+
+use crate::bench::{self, BenchOptions};
+use crate::error::SyscityError;
+use crate::Result;
+
+/// Bench subcommands
+#[derive(Debug, Clone, Subcommand)]
+pub enum BenchCommands {
+    /// Run one benchmark instruction against a remote desktop
+    Run {
+        /// The benchmark's instruction, verbatim
+        #[arg(long)]
+        instruction: String,
+        /// Base URL of the desktop service (OSWorld VM: `http://<vm_ip>:5000`)
+        #[arg(long)]
+        computer_url: String,
+        /// Benchmark task id — names the conversation and the output file
+        #[arg(long)]
+        task_id: String,
+        /// Tool-iteration budget (default 60, or `SYSCITY_MAX_TOOL_ITERATIONS`)
+        #[arg(long)]
+        max_steps: Option<usize>,
+        /// Write the result JSON (schema 1) here
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// LLM provider preset (e.g. "deepseek", "anthropic")
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model name (defaults to the provider's)
+        #[arg(long)]
+        model: Option<String>,
+        /// API key (overrides env var / config file)
+        #[arg(long)]
+        api_key: Option<String>,
+        /// API base URL (for custom/self-hosted providers)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Bearer token for the desktop service, when it asks for one
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
+}
+
+/// Dispatch a `syscity bench` subcommand.
+pub async fn run_bench_command(command: BenchCommands) -> Result<()> {
+    match command {
+        BenchCommands::Run {
+            instruction,
+            computer_url,
+            task_id,
+            max_steps,
+            out,
+            provider,
+            model,
+            api_key,
+            base_url,
+            auth_token,
+        } => {
+            let result = bench::run_once(BenchOptions {
+                instruction,
+                computer_url,
+                task_id,
+                max_steps,
+                out,
+                provider,
+                model,
+                api_key,
+                base_url,
+                auth_token,
+            })
+            .await?;
+
+            // Human-readable view for whoever is tailing the harness log; the
+            // machine-readable contract is the JSON file.
+            println!("### ANSWER ###");
+            println!("{}", result.answer);
+            println!("### END ANSWER ###");
+
+            if let Some(error) = &result.error {
+                // The result file is already on disk; a non-zero exit tells the
+                // harness this task errored rather than finished.
+                return Err(SyscityError::Validation(format!(
+                    "bench task {} failed: {error}",
+                    result.task_id
+                )));
+            }
+            Ok(())
+        }
+    }
+}

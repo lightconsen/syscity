@@ -30,6 +30,9 @@ pub mod log_aggregator;
 pub mod network;
 pub mod page;
 pub mod reflection;
+/// Clients for a desktop that lives on another machine — the benchmark
+/// harnesses (OSWorld, Cua Bench) own the VM and this side drives it.
+pub mod remote;
 pub mod remote_control;
 pub mod rollback;
 pub mod screen_recorder;

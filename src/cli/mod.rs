@@ -16,6 +16,7 @@ mod agent;
 mod approval;
 mod audit;
 mod auth;
+mod bench;
 mod capability;
 mod channel;
 mod config_cmd;
@@ -47,6 +48,7 @@ pub use agent::AgentCommands;
 pub use approval::ApprovalCommands;
 pub use audit::AuditCommands;
 pub use auth::AuthCommands;
+pub use bench::BenchCommands;
 pub use channel::ChannelCommands;
 pub use config_cmd::ConfigCommands;
 pub use cost::CostCommands;
@@ -104,6 +106,12 @@ pub enum Commands {
         /// Eval subcommand
         #[command(subcommand)]
         command: EvalCommands,
+    },
+    /// Benchmark commands (run one task against a remote desktop)
+    Bench {
+        /// Bench subcommand
+        #[command(subcommand)]
+        command: BenchCommands,
     },
     /// Export conversations and memories to files
     Export {
@@ -571,6 +579,7 @@ impl Cli {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         match &self.command {
             Commands::Eval { command } => command.run(config).await,
+            Commands::Bench { command } => bench::run_bench_command(command.clone()).await,
             Commands::Export { command } => export::run_export_command(command).await,
             Commands::Goal { command } => goal::run_goal_command(command).await,
             Commands::Config { command } => match command {

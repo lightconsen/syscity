@@ -850,7 +850,7 @@ fn append_eval_ledger(
 /// 3. `~/.syscity/config.toml`
 ///
 /// Returns `None` if no config file is found or parsing fails.
-async fn try_load_gateway_config() -> Option<GatewayConfig> {
+pub(crate) async fn try_load_gateway_config() -> Option<GatewayConfig> {
     let candidates = [
         PathBuf::from("config.toml"),
         PathBuf::from(".config/config.toml"),
