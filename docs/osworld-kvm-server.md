@@ -144,6 +144,10 @@ chmod +x $BIN
 $BIN --version            # syscity 0.3.16
 ```
 
+- **不带 `vision`**：x86_64 Linux 的产物用 `linux-amd64` profile 编，去掉了
+  ONNX 的 OCR/UI 检测（那个预编译库要 glibc ≥ 2.38，22.04 上链接都过不去）。
+  benchmark 用不到它；要 OCR 就在 24.04 上用 `--features vision` 自己编，
+  或者用 arm64 产物。
 - **glibc 下限 2.35**：v0.3.16 起这个产物在 `ubuntu-22.04` runner 上编，22.04 能直接跑。
   v0.3.14 及更早是在 24.04 上编的，要 GLIBC_2.39，22.04 上连 `--version` 都起不来。
 - 指定版本：把两处 `latest/download` 换成 `download/v0.3.16`；脚本用

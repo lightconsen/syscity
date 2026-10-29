@@ -373,6 +373,25 @@ intel-macos = [
     "local-embeddings", "browser", "sqlite-vec",
 ]
 
+# Linux x86_64 release profile — default features plus `cloud`, minus `vision`
+# (the same set as `intel-macos`).
+#
+# pyke's prebuilt ONNX Runtime for x86_64-unknown-linux-gnu is compiled against
+# glibc ≥ 2.38 headers. Building with it on ubuntu-22.04 cannot link
+# (`__isoc23_strtoll`, `std::__cxx11::…::_M_replace_cold` are undefined), and
+# building on ubuntu-latest links but needs GLIBC_2.39 at runtime — so the
+# artifact cannot start on 22.04, which is the OSWorld benchmark host and a
+# large share of Linux servers. Drop the ONNX-based OCR/UI detection from this
+# one artifact rather than shipping a binary that only runs on the newest
+# distro; arm64 Linux, macOS and source builds keep `vision`.
+# Build with: cargo build --no-default-features --features linux-amd64
+linux-amd64 = [
+    "cloud", "telegram", "discord", "slack", "whatsapp", "qq", "feishu",
+    "signal", "imessage", "webchat", "wechatmp", "line", "twilio", "teams", "googlechat", "wecom", "dingtalk", "irc", "simplex",
+    "plugins", "hot-reload",
+    "local-embeddings", "browser", "sqlite-vec",
+]
+
 # Mobile profile (Android/iOS) — pruned, sandbox-safe feature set.
 # Build with: cargo build --no-default-features --features mobile
 # Excludes the desktop-shaped defaults (channels, local-embeddings, vision,

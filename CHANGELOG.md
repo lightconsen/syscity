@@ -111,11 +111,12 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Changed
 
-- **The x86_64 Linux CLI is built on `ubuntu-22.04`**, which pins the binary's
-  glibc floor at 2.35. Built on `ubuntu-latest` (24.04) it required GLIBC_2.39
-  and could not start on Ubuntu 22.04 at all — including the OSWorld benchmark
-  host, whose runbook installs the released binary. The arm64 Linux CLI keeps
-  the 24.04 runner.
+- **The x86_64 Linux CLI is built on `ubuntu-22.04` from the new `linux-amd64`
+  feature profile**, which pins the binary's glibc floor at 2.35. Built on
+  `ubuntu-latest` (24.04) it required GLIBC_2.39 and could not start on Ubuntu
+  22.04 at all — including the OSWorld benchmark host, whose runbook installs
+  the released binary. The profile is default features plus `cloud`, minus
+  `vision`; the arm64 Linux CLI and both macOS CLIs keep `vision`.
 - **Eval runs are deterministic and less budget-bound**: temperature 0.0 (was
   0.7), 60 tool iterations (was 30) with a soft "wrap up" reminder at 70%, and a
   system prompt built from the registered tool list (it previously named five
@@ -152,12 +153,18 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
-- **The 22.04 release build links.** Moving the x86_64 CLI job off
-  `ubuntu-latest` left the cargo cache key at `v0-rust-build-Linux-x64-…`, so
-  the job restored the 24.04 job's `target/` — including onnxruntime's C++
-  objects, which reference `__isoc23_strtoll` and `__cxx11::…::_M_replace_cold`,
-  symbols the 22.04 headers never declare. The key now includes the runner
-  image, so the two matrix entries cannot share compiled objects.
+- **The x86_64 Linux CLI links, and starts on 22.04.** Moving the build to
+  `ubuntu-22.04` exposed that the ONNX Runtime `vision` links against — pyke's
+  prebuilt for `x86_64-unknown-linux-gnu` — is compiled against glibc ≥ 2.38
+  headers. On 22.04 the link fails outright (`undefined symbol:
+  __isoc23_strtoll`, `std::__cxx11::…::_M_replace_cold`); on 24.04 it links but
+  produces a GLIBC_2.39-only binary. The release therefore builds the
+  `linux-amd64` profile, which drops the ONNX-based OCR/UI detection on this one
+  target. `--features vision` from source restores it on a 24.04+ host.
+- **The cargo cache is keyed by runner image.** `Swatinem/rust-cache` keys on
+  `Linux-x64`, so the 22.04 job could restore a `target/` produced on 24.04.
+  (It was not this run's failure — the fix landed and a cold build failed the
+  same way — but the two jobs should not be able to share compiled objects.)
 
 ## [0.3.14] - 2026-10-25
 

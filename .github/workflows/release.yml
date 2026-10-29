@@ -26,10 +26,16 @@ jobs:
           # start on 22.04 hosts — the OSWorld benchmark host installs this
           # artifact (docs/osworld-kvm-server.md). Bump with the runbook, not
           # the runner alias.
+          #
+          # `linux-amd64`, not `--all-features`: the prebuilt ONNX Runtime this
+          # target links against is built against glibc ≥ 2.38 headers, so with
+          # `vision` on this cannot link here at all (undefined __isoc23_strtoll)
+          # and on 24.04 it produces a 2.39-only binary. The profile drops the
+          # ONNX-based OCR/UI detection; arm64 Linux and macOS keep it.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset_name: syscity-linux-amd64
-            cargo_args: --all-features
+            cargo_args: --no-default-features --features linux-amd64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_name: syscity-linux-arm64
