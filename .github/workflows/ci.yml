@@ -708,23 +708,46 @@ jobs:
         # replaced; the accumulated tarpaulin-era test skips are dropped — every
         # test that runs in the normal suite runs here too. e2e:: is skipped
         # for the same reason the Test job skips it (spawns gateway processes,
-        # slow/flaky under CI). The 55% gate matches the measured llvm-cov
-        # baseline (~56.3% locally); ratchet it up as coverage improves —
-        # tarpaulin's old fail-under=80 was aspirational and never met.
+        # slow/flaky under CI).
         # syscity-desktop is excluded: its Tauri/glib build needs GTK system
         # libraries that CI doesn't install, and it has no tests anyway.
-        run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --fail-under-lines 55 --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
+        #
+        # The threshold is NOT passed as --fail-under-lines: that exits 1
+        # without printing what it measured, so a red run said nothing beyond
+        # "exit code 1". The floor is enforced by the next step, which always
+        # prints the number first.
+        run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
 
-      # A failing threshold used to print nothing but "exit code 1" — the
-      # percentage it compared against was the one thing the log omitted, so a
-      # red gate could not be acted on without reproducing the whole run. The
-      # coverage data is still on disk at this point, so reporting it costs
-      # seconds.
-      - name: Coverage summary
-        if: always()
+      # Sums the LCOV records rather than trusting a tool's silent exit code,
+      # so the percentage appears in every log — green or red — and the failure
+      # message names both the measurement and the floor.
+      - name: Enforce coverage floor
         run: |
-          cargo llvm-cov report --text \
-            --ignore-filename-regex '(^|/)(tests|target)/' | tail -30
+          python3 - <<'PY'
+          import sys
+          # A file can appear once per test binary; keep the best record per
+          # file rather than summing duplicates, which would weight a file by
+          # how many binaries happen to link it.
+          files = {}
+          current = None
+          for line in open("lcov.info", encoding="utf-8"):
+              if line.startswith("SF:"):
+                  current = line[3:].strip()
+                  files.setdefault(current, [0, 0])
+              elif line.startswith("LH:") and current:
+                  files[current][0] = max(files[current][0], int(line[3:]))
+              elif line.startswith("LF:") and current:
+                  files[current][1] = max(files[current][1], int(line[3:]))
+          hit = sum(h for h, _ in files.values())
+          total = sum(t for _, t in files.values())
+          if not total:
+              sys.exit("no line records in lcov.info — coverage was not measured")
+          pct = 100.0 * hit / total
+          floor = 55.0
+          print(f"line coverage: {hit}/{total} = {pct:.2f}%  (floor {floor:.0f}%)")
+          if pct < floor:
+              sys.exit(f"::error::line coverage {pct:.2f}% is below the {floor:.0f}% floor")
+          PY
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
