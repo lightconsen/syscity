@@ -30,6 +30,12 @@
 //! waits for it, which is the interleaving OSWorld's loop expects; `bench
 //! probe` (see [`probe`]) asks the desktop whether it is ready at all.
 
+// INVARIANTS-NONE: the benchmark drives the same agent and tool stack as a
+// normal session — the runtime invariants live with those components. Nothing
+// here owns shared state: `run` and `serve` each build a session and drop it,
+// and `probe` only issues reads against a remote desktop. Scoring is the
+// benchmark's evaluator, not ours (see above), so there is no counter to keep.
+
 pub mod probe;
 pub mod run;
 pub mod serve;
