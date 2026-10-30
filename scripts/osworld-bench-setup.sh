@@ -25,7 +25,7 @@
 #   SYSCITY_BIN_URL    (unset)                     full tarball URL (mirror, file://)
 #   SYSCITY_SRC_URL    (unset)                     source archive URL for bench/ glue
 #   RELEASE_REPO       lightconsen/syscity         GitHub repo the release lives in
-#   SYS_SRC            (unset)                     syscity tree to copy into $SYS
+#   SYS_SRC            (unset)                     syscity tree on this host to copy into $SYS
 #   HF_TOKEN_FILE      /root/.hf_token             Hugging Face token for the image
 #   PROVIDER_KEY_FILE  /root/.deepseek_key         LLM key (needed by --smoke)
 #   PROVIDER           deepseek                    syscity provider preset

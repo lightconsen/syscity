@@ -166,7 +166,7 @@ cat "$(ls -dt /opt/bench/results/smoke-* | head -1)/summary/syscity.json"
 | `SYSCITY_VERSION=v0.3.16` | 装指定版本，默认 `latest` |
 | `SYSCITY_BIN_URL=…` | 换下载源（镜像或 `file://`），校验文件取 `<url>.sha256` |
 | `SYSCITY_SRC_URL=…` | 换 `bench/` 胶水用的源码包地址（镜像或 `file://`） |
-| `SYS_SRC=/path/to/syscity` | 顺手把本地源码树 rsync 到 `$SYS` |
+| `SYS_SRC=/path/to/syscity` | 把**服务器上**的另一份源码树 rsync 到 `$SYS`（不是笔记本上的路径） |
 
 默认装的是 GitHub release 里的 `syscity-linux-amd64.tar.gz`（校验 `sha256` 后才安装），
 **不需要在那台机器上装 Rust 或编译**。v0.3.16 起这个产物是在 Ubuntu 22.04 runner 上
