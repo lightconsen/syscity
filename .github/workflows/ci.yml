@@ -706,7 +706,7 @@ jobs:
       # coverage data is still on disk at this point, so reporting it costs
       # seconds.
       - name: Coverage summary
-        if: failure()
+        if: always()
         run: |
           cargo llvm-cov report --text \
             --ignore-filename-regex '(^|/)(tests|target)/' | tail -30
