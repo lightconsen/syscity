@@ -317,6 +317,7 @@ async fn run_probe(program: &str, args: &[&str]) -> Option<String> {
 /// JXA one-liner: every screen's frame, converted from AppKit's
 /// bottom-left-origin global space into the top-left-origin space that
 /// CGEvent clicks and accessibility bounds use.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_SCREEN_SCRIPT: &str = r#"
 ObjC.import('AppKit');
 var screens = $.NSScreen.screens.js;
@@ -335,6 +336,7 @@ screens.map(function (s, i) {
 }).join('\n');
 "#;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 async fn probe_macos() -> DisplayGeometry {
     match run_probe("osascript", &["-l", "JavaScript", "-e", MACOS_SCREEN_SCRIPT]).await {
         Some(out) => parse_macos_screens(&out),
@@ -343,6 +345,10 @@ async fn probe_macos() -> DisplayGeometry {
 }
 
 /// Parse the line-delimited JSON emitted by [`MACOS_SCREEN_SCRIPT`].
+///
+/// Only the caller is cfg-gated, so the tests below can cover the parser on
+/// any host.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_macos_screens(output: &str) -> DisplayGeometry {
     let mut displays = Vec::new();
     for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -355,6 +361,7 @@ fn parse_macos_screens(output: &str) -> DisplayGeometry {
     DisplayGeometry::new(displays)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn display_from_json(value: &serde_json::Value) -> Option<DisplayInfo> {
     let x = value.get("x")?.as_i64()? as i32;
     let y = value.get("y")?.as_i64()? as i32;
