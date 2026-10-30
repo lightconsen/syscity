@@ -743,6 +743,10 @@ jobs:
           if not total:
               sys.exit("no line records in lcov.info — coverage was not measured")
           pct = 100.0 * hit / total
+          # Measured 70.38% (152093/216092) on 2026-10-31, the first run that
+          # reported a number. The floor stays where it is until a few runs
+          # show the run-to-run spread; the ~15-point gap is headroom to
+          # ratchet into, not slack to spend.
           floor = 55.0
           print(f"line coverage: {hit}/{total} = {pct:.2f}%  (floor {floor:.0f}%)")
           if pct < floor:
