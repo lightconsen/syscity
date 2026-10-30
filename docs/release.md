@@ -117,7 +117,40 @@ damaged"), so every macOS artifact is Developer ID signed and notarized.
 Rotating the Developer ID certificate: create a new Developer ID Application
 cert in the Apple developer portal, export it with its key as a `.p12`, and
 update `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` /
-`APPLE_SIGNING_IDENTITY`. The current cert expires **2031-09-12**.
+`APPLE_SIGNING_IDENTITY`, plus the notary credentials
+(`APPLE_API_KEY` / `APPLE_API_ISSUER` / `APPLE_API_KEY_P8_BASE64`) if the new
+cert belongs to a different Apple Developer team.
+
+The current cert is **`Developer ID Application: LightConsen LLC
+(7WT4583592)`**, expiring **2027-11-29** — a 13-month cert, not the usual
+five years, so renew it before that date or macOS releases start failing to
+notarize. The team ID is unchanged from the previous individual cert, which is
+why existing installs keep their TCC grants (microphone, screen recording,
+accessibility) after updating.
+
+After updating the secrets, do **not** find out whether they work by cutting a
+release — that is two hours to learn about a typo. Run the
+[`Signing Check`](../.github/workflows/signing-check.yml) workflow instead
+(manual dispatch, ~5 minutes): it imports the `.p12` into a throwaway keychain,
+signs a hello-world Mach-O with the hardened runtime, and has Apple notarize
+it. Green there means the certificate, the identity string and the notary
+credentials are all good.
+
+### Dry-running the release pipeline
+
+Push a tag with a hyphen (`v0.3.17-test1`). The pipeline runs in full — every
+CLI and desktop job, real signing, real notarization — but the publish job then
+takes two decisions differently:
+
+- the release is created as a **prerelease**, so it never becomes `latest`
+  (every `releases/latest/download/...` link, including the OSWorld setup
+  script's, keeps resolving to the real release);
+- the **R2 mirror is skipped** — that bucket backs the download page and the
+  update manifests with `--delete` semantics, so a test build must never land
+  there.
+
+Delete the test tag and its release when done (`gh release delete
+v0.3.17-test1`).
 
 ## Safety rails in the workflow
 

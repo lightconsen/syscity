@@ -582,6 +582,12 @@ jobs:
         with:
           files: artifacts/*
           body_path: release_notes.md
+          # A tag with a hyphen (`v0.3.17-test1`) is a dry run of the pipeline:
+          # it publishes assets so the macOS signature can be checked by hand,
+          # but GitHub keeps it marked pre-release and it must not become
+          # `latest`, which is what every `releases/latest/download/...` link
+          # (the OSWorld setup script among them) resolves to.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
       - name: Create Release (generated notes fallback)
         if: steps.notes.outputs.has_notes != 'true'
@@ -589,6 +595,7 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
       # Mirror every release artifact to Cloudflare R2 (bucket layout is flat)
       # so the marketing site can serve them at https://syscity.net/releases/<file>
@@ -602,6 +609,11 @@ jobs:
       #   R2_SECRET_ACCESS_KEY    — R2 API token secret
       #   (token scope: Object Read & Write on the `syscity-releases` bucket)
       - name: Publish to Cloudflare R2
+        # Prereleases are pipeline dry runs. The bucket feeds the download page
+        # and the update manifests with `--delete` semantics — a test build
+        # synced here would replace every published artifact and point the
+        # update channel at itself.
+        if: ${{ !contains(github.ref_name, '-') }}
         working-directory: artifacts
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
