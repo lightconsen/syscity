@@ -700,6 +700,17 @@ jobs:
         # libraries that CI doesn't install, and it has no tests anyway.
         run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --fail-under-lines 55 --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
 
+      # A failing threshold used to print nothing but "exit code 1" — the
+      # percentage it compared against was the one thing the log omitted, so a
+      # red gate could not be acted on without reproducing the whole run. The
+      # coverage data is still on disk at this point, so reporting it costs
+      # seconds.
+      - name: Coverage summary
+        if: failure()
+        run: |
+          cargo llvm-cov report --text \
+            --ignore-filename-regex '(^|/)(tests|target)/' | tail -30
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
