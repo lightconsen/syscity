@@ -638,6 +638,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # An instrumented `--all-features` build is the largest artifact this
+      # repo produces: llvm-cov writes a second, differently-built tree
+      # (`target/llvm-cov-target`) that the rust-cache entry restored for
+      # `target/` does not help with. The ubuntu-latest image ships ~30 GB of
+      # toolchains this job never touches, and the runner died with
+      # "No space left on device" mid-build — which surfaces as a job that
+      # fails in five minutes with no logs at all, looking exactly like a
+      # coverage regression.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h /
+
       - name: Install system build dependencies
         run: |
           sudo apt-get update
