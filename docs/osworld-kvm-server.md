@@ -12,25 +12,157 @@ x86_64 Linux 且 `/dev/kvm` 可用（`computer-use-benchmark.md` §六 有反例
 
 ---
 
-## 〇、最短路径
+## 〇、从笔记本到第一个分数
 
-**一条命令（推荐）**：把仓库同步到服务器、把两个密钥文件放好（2.6）之后，
+下面六步是在**一台刚开的服务器**上从零走到"一道题被评分"的完整序列。前两步在
+**笔记本**上敲，后面的在服务器上敲（标了 ⬅ 笔记本 / ➡ 服务器）。
 
-```bash
-sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh --smoke
+### 第 0 步 ⬅ 给机器起个 ssh 别名
+
+`~/.ssh/config` 里加一段，之后所有命令都能写成 `ssh bench`，不用每次背 IP 和端口：
+
+```
+Host bench
+  HostName <服务器 ip>
+  User root
+  Port 14513
 ```
 
-它按下面的顺序分阶段跑完：依赖 → Docker → uv → OSWorld → 12 GiB 镜像 →
-下载 release 二进制和 `bench/` 胶水 → 容器/VM 自检 → 探针 →
-（`--smoke`）一题真实评分。每个阶段幂等，失败了重跑就从中断处继续，不会重下镜像。
+`bench` 只是**客户端这边的别名**，服务器自己不知道这个名字。不想加也行，把下文所有
+`bench` 换成 `-p 14513 root@<ip>`，效果一样。
+
+```bash
+ssh bench 'uname -m; free -g | head -2'     # 通了再往下走
+```
+
+### 第 1 步 ⬅ 把仓库同步到服务器
+
+**为什么需要**：要跑的 `scripts/osworld-bench-setup.sh` 和 `bench/` 胶水都在仓库里，
+**release 的产物只有二进制**，没有这两样。同步相当于把"操作手册 + 驱动脚本"送到机器上。
+
+```bash
+cd ~/work/syscity/syscity
+tar -cz --exclude=./target --exclude=./target-linux --exclude=./.git \
+    --exclude='*/node_modules' --exclude=./web/dist . \
+  | ssh bench 'mkdir -p /opt/bench/syscity && tar -xz -C /opt/bench/syscity'
+```
+
+排除的是本地编译产物（`target/` 2.8 GB + `target-linux/` 3.9 GB）和依赖树：整棵树
+7.6 GB，排完只剩 18 MB。走 ssh 的 stdin，不落临时文件，也不要求服务器能连 GitHub。
+
+验证：
+
+```bash
+ssh bench 'ls /opt/bench/syscity/scripts/osworld-bench-setup.sh /opt/bench/syscity/bench/run.py'
+```
+
+想用 rsync 也行，但 `SYS_SRC` 指的是**服务器上**已有的另一份源码树（脚本内部
+`rsync -a $SYS_SRC/ $SYS/`），不是笔记本上的路径——跨机同步仍得走上面的 tar 管道，
+或者 `rsync -az --exclude target --exclude .git . bench:/opt/bench/syscity/`（两端都要有
+rsync）。
+
+### 第 2 步 ⬅ 放两个密钥（走 stdin，不进命令行）
+
+```bash
+# Hugging Face：下 12 GiB 的 Ubuntu.qcow2.zip 用
+sed -n '2p' hf.secret | tr -d '[:space:]' | ssh bench 'umask 077; cat > /root/.hf_token'
+
+# DeepSeek：只有 `--smoke` 的一题评分需要
+ssh bench 'umask 077; cat > /root/.deepseek_key'     # 粘贴 key，Ctrl-D
+```
+
+这两条命令**在笔记本上敲**，数据经 ssh 送进服务器的 `cat`，落到服务器磁盘；本地不留副本。
+
+| 文件 | 谁读 | 不给会怎样 |
+|---|---|---|
+| `/root/.hf_token` | `fetch_image`（`HF_TOKEN_FILE`） | 匿名下载被限速甚至 403 |
+| `/root/.deepseek_key` | `smoke`（`PROVIDER_KEY_FILE`） | 只影响 `--smoke`，其余步骤照常 |
+
+`umask 077` 保证落地是 `-rw-------`；用 stdin 而不是 `ssh bench "echo $KEY > f"`，是因为
+后者会把密钥塞进命令行，两端的 shell 历史和服务器上的 `ps` 都能看到。
+
+验证：
+
+```bash
+ssh bench 'ls -l /root/.hf_token /root/.deepseek_key'    # 期望 -rw------- 1 root root
+```
+
+这两个文件已经在服务器上的话，跳过本步。
+
+### 第 3 步 ➡ 看它要做什么（什么都不改）
+
+```bash
+ssh bench
+tmux new -s bench            # 后面的步骤都在 tmux 里跑，SSH 断线不影响
+sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh --dry-run
+```
+
+预检会硬性卡四件事：`x86_64`、`/proc/cpuinfo` 里有 `vmx|svm`、`/dev/kvm` 可读写、
+≥16 GB 内存 + ≥50 GB 磁盘。`/dev/kvm` 不过就别往下走了——后面全是 TCG 慢放。
+
+### 第 4 步 ➡ 装依赖 + 验二进制（先不下 12 GB 镜像）
+
+```bash
+sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh \
+     --skip-image --skip-verify --skip-probe
+```
+
+装 `ca-certificates curl unzip git psmisc libgomp1` → Docker → uv → clone OSWorld 建 venv
+→ 从 release 下 `syscity-linux-amd64.tar.gz` 校验 sha256 → 取同 tag 的 `bench/` 胶水。
+
+```bash
+ldd /opt/bench/bin/syscity | grep 'not found' || echo "no missing libs"
+/opt/bench/bin/syscity --version                          # syscity 0.3.16
+```
+
+`no missing libs` + 版本号正确，说明二进制和系统依赖这一环通了。这一步故意跳过镜像，
+让"环境不对"在 10 分钟内暴露，而不是等 30 分钟下完 12 GB 之后。
+
+### 第 5 步 ➡ 全量：下镜像、起 VM、跑探针（不花模型钱）
+
+```bash
+sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh --skip-deps
+```
+
+`--skip-deps` 只是省一遍 apt。接着下 `Ubuntu.qcow2.zip`（≈12 GiB，断了重跑会
+`curl -C -` 续传）、解出 qcow2、起容器/VM 自检、跑探针。
+
+验收只有两条：
+
+```
+PR660_FINAL_RESULT {"all_passed": true, "kvm_exists": true}     # 3.1 容器/VM 自检
+ ok all four endpoints answered                                  # 3.2 探针
+```
+
+### 第 6 步 ➡ 一题真实评分（花模型钱，10–30 min）
+
+```bash
+sudo /opt/bench/syscity/scripts/osworld-bench-setup.sh --verify-only --smoke
+```
+
+`--verify-only` 跳过安装，只重做自检 + 探针 + 一题。结果目录每次都是新的，
+名字带时间戳（`$RUNS/smoke-20261030-141203`），脚本会打印 `task <id> -> <dir>`：
+
+```bash
+ls -dt /opt/bench/results/smoke-* | head -1          # 刚才那次
+cat "$(ls -dt /opt/bench/results/smoke-* | head -1)/summary/syscity.json"
+```
+
+- `"scored": 1` —— 真跑完并被 OSWorld 评了分（**分数 0 也算成功**，那才是模型能力）
+- `"infra_errors": 1` —— 环境/配置问题，去 `/opt/bench/results/smoke-<时间戳>/<domain>/<id>/`
+  看 `serve.stderr.log` 和 `error.json`
+
+到这里通关。再往上就是 4.2 的 `test_small`（39 题）和 4.3 的全量。
+
+### 一张表：全部参数
 
 | 用法 | 作用 |
 |---|---|
 | `--dry-run` | 只打印每个阶段要执行的命令，什么都不改（在笔记本上也能跑） |
 | `--verify-only` | 跳过安装，只做自检 + 探针（+ `--smoke`） |
-| `--skip-image` / `--skip-binary` / `--skip-probe` / `--skip-verify` | 跳过已知完成的部分 |
+| `--skip-image` / `--skip-binary` / `--skip-probe` / `--skip-verify` / `--skip-deps` | 跳过已知完成的部分 |
 | `--refetch` | 强制重新下载二进制（`--from-source` 时是重编） |
-| `--from-source` | 不用 release，在 `$SYS` 编源码；要 Rust 和 2.1 的依赖 |
+| `--from-source` | 不用 release，在 `$SYS` 编源码；要 Rust 和 2.1 的编译期依赖 |
 | `SYSCITY_VERSION=v0.3.16` | 装指定版本，默认 `latest` |
 | `SYSCITY_BIN_URL=…` | 换下载源（镜像或 `file://`），校验文件取 `<url>.sha256` |
 | `SYSCITY_SRC_URL=…` | 换 `bench/` 胶水用的源码包地址（镜像或 `file://`） |
@@ -60,18 +192,7 @@ ls -l /dev/kvm; egrep -c '(vmx|svm)' /proc/cpuinfo
 # 8. 跑：一题 → test_small（39）→ test_all（369）（第四节）
 ```
 
-验收通过的标志只有两条：自检脚本打印 `"all_passed": true, "kvm_exists": true`，
-`syscity bench probe --execute` 打印 `ok`。这两条不过，跑任务只会得到一堆 infra error。
-
-下面统一用这几个变量，按自己机器改。建议先在 `~/.ssh/config` 里给机器起个别名，
-免得每条命令都要带端口：
-
-```
-Host bench
-  HostName <host>
-  User root
-  Port 14513
-```
+下面统一用这几个变量，按自己机器改：
 
 ```bash
 export BENCH_HOST=bench                 # ssh 别名；没有别名就写 root@<host> 并自己加 -p
@@ -80,6 +201,9 @@ export SYS=/opt/bench/syscity           # bench/ 胶水所在的目录（源码�
 export BIN=/opt/bench/bin/syscity        # 安装的 release 二进制
 export RUNS=/opt/bench/results           # 结果目录
 ```
+
+验收通过的标志只有两条：自检脚本打印 `"all_passed": true, "kvm_exists": true`，
+`syscity bench probe --execute` 打印 `ok`。这两条不过，跑任务只会得到一堆 infra error。
 
 ---
 
@@ -169,13 +293,24 @@ $BIN --version            # syscity 0.3.16
 - 指定版本：把两处 `latest/download` 换成 `download/v0.3.16`；脚本用
   `SYSCITY_VERSION=v0.3.16`。
 - **`bench/` 是 Python，不在二进制里**。脚本会再从同一个 tag 的源码包里取出
-  `bench/` 放到 `$SYS/bench`（`run.py` 靠它驱动）。手动做：
+  `bench/` 放到 `$SYS/bench`（`run.py` 靠它驱动）。手动做（在服务器上）：
 
 ```bash
 curl -fL -o /tmp/syscity-src.tar.gz \
   https://github.com/lightconsen/syscity/archive/refs/tags/v0.3.16.tar.gz
 mkdir -p /tmp/syscity-src && tar xzf /tmp/syscity-src.tar.gz -C /tmp/syscity-src
 mkdir -p $SYS && cp -a /tmp/syscity-src/*/bench $SYS/
+```
+
+  如果本地工作树比 release 新（比如刚改了 `scripts/` 或 `bench/`），与其等发版，
+  不如直接把树推过去——**也只有这条路能把 `scripts/osworld-bench-setup.sh` 弄上去，
+  它不在 release 产物里**（在笔记本上执行，排除掉编译产物后 7.6 GB 只剩 18 MB）：
+
+```bash
+cd ~/work/syscity/syscity
+tar -cz --exclude=./target --exclude=./target-linux --exclude=./.git \
+    --exclude='*/node_modules' --exclude=./web/dist . \
+  | ssh $BENCH_HOST 'mkdir -p /opt/bench/syscity && tar -xz -C /opt/bench/syscity'
 ```
 
 - GitHub 慢或不通时，用 `SYSCITY_BIN_URL` 换源（镜像、内网、`file://` 都行），
@@ -252,9 +387,28 @@ ls -lh docker_vm_data/Ubuntu.qcow2     # ≈ 12 GiB
 ### 2.6 密钥：走 stdin，不进命令行
 
 ```bash
-# 在能拿到 key 的机器上执行，粘贴后按 Ctrl-D（文件权限 600，不进 shell 历史）
-ssh $BENCH_HOST 'umask 077; cat > /root/.hf_token'
-ssh $BENCH_HOST 'umask 077; cat > /root/.deepseek_key'
+# 在笔记本上执行（不是登录服务器后执行）；粘贴后按 Ctrl-D，文件落在服务器上
+ssh $BENCH_HOST 'umask 077; cat > /root/.hf_token'       # 12 GiB 镜像下载用
+ssh $BENCH_HOST 'umask 077; cat > /root/.deepseek_key'   # 只有 --smoke 的一题评分用
+```
+
+本地有现成文件时用管道，连粘贴都省了（`hf.secret` 第一行是账号，第二行才是 token）：
+
+```bash
+sed -n '2p' hf.secret | tr -d '[:space:]' | ssh $BENCH_HOST 'umask 077; cat > /root/.hf_token'
+```
+
+三个细节：
+
+- `umask 077` 让落地文件是 `-rw-------`；这不是可选项，密钥文件不该让同机其他用户读到。
+- 走 stdin 是因为 `ssh host "echo $KEY > f"` 会把密钥塞进命令行——本地 shell 历史、
+  服务器上的 `ps aux` 都能看到。
+- 别先 `ssh` 进去再 `echo`：那样服务器 shell 历史里也多一条。
+
+验证（`-rw------- 1 root root` 就对了）：
+
+```bash
+ssh $BENCH_HOST 'ls -l /root/.hf_token /root/.deepseek_key'
 ```
 
 syscity 取 key 的顺序（`src/bench/run.rs` `build_provider`）：
