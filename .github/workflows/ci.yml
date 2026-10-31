@@ -590,6 +590,19 @@ jobs:
         working-directory: web
         run: npx tsc --noEmit
 
+      # `site/` is a second, independent pnpm workspace with its own lockfile,
+      # and until now nothing built it before a merge — a dependency bump that
+      # breaks it (a `@vitejs/plugin-react` major, say) passed every PR check
+      # and failed the Pages deploy on main instead. Build it here so the
+      # dependabot PRs that touch it are actually verified.
+      - name: Install site dependencies
+        working-directory: site
+        run: pnpm install --frozen-lockfile
+
+      - name: Build site
+        working-directory: site
+        run: pnpm build
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
