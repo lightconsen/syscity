@@ -718,37 +718,40 @@ jobs:
         # prints the number first.
         run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
 
-      # Sums the LCOV records rather than trusting a tool's silent exit code,
-      # so the percentage appears in every log — green or red — and the failure
-      # message names both the measurement and the floor.
+      # Computes the percentage from the LCOV file and enforces the floor,
+      # so the number appears in every log — green or red — and a failure
+      # names both the measurement and the floor.
+      #
+      # The per-file `LH:`/`LF:` totals cannot be added or maximised across
+      # records: a file appears once per test binary that links it, each
+      # record naming only the lines that binary happened to execute. Doing
+      # either produced a number that swung between 18% and 70% depending on
+      # how many records the run emitted. The count is a union over
+      # `DA:<line>,<hits>` — a line is covered if any binary covered it.
       - name: Enforce coverage floor
         run: |
           python3 - <<'PY'
           import sys
-          # A file can appear once per test binary; keep the best record per
-          # file rather than summing duplicates, which would weight a file by
-          # how many binaries happen to link it.
-          files = {}
+
+          hits = {}  # file -> {line: hits}, union across records
           current = None
-          for line in open("lcov.info", encoding="utf-8"):
-              if line.startswith("SF:"):
-                  current = line[3:].strip()
-                  files.setdefault(current, [0, 0])
-              elif line.startswith("LH:") and current:
-                  files[current][0] = max(files[current][0], int(line[3:]))
-              elif line.startswith("LF:") and current:
-                  files[current][1] = max(files[current][1], int(line[3:]))
-          hit = sum(h for h, _ in files.values())
-          total = sum(t for _, t in files.values())
+          for raw in open("lcov.info", encoding="utf-8"):
+              if raw.startswith("SF:"):
+                  current = hits.setdefault(raw[3:].strip(), {})
+              elif raw.startswith("DA:") and current is not None:
+                  parts = raw[3:].split(",")
+                  line_no, count = int(parts[0]), int(parts[1])
+                  current[line_no] = current.get(line_no, 0) + count
+
+          total = sum(len(lines) for lines in hits.values())
+          covered = sum(1 for lines in hits.values() for c in lines.values() if c > 0)
           if not total:
-              sys.exit("no line records in lcov.info — coverage was not measured")
-          pct = 100.0 * hit / total
-          # Measured 70.38% (152093/216092) on 2026-10-31, the first run that
-          # reported a number. The floor stays where it is until a few runs
-          # show the run-to-run spread; the ~15-point gap is headroom to
-          # ratchet into, not slack to spend.
+              sys.exit("no DA records in lcov.info — coverage was not measured")
+
+          pct = 100.0 * covered / total
           floor = 55.0
-          print(f"line coverage: {hit}/{total} = {pct:.2f}%  (floor {floor:.0f}%)")
+          print(f"line coverage: {covered}/{total} = {pct:.2f}% over "
+                f"{len(hits)} files (floor {floor:.0f}%)")
           if pct < floor:
               sys.exit(f"::error::line coverage {pct:.2f}% is below the {floor:.0f}% floor")
           PY
