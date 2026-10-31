@@ -651,10 +651,10 @@ jobs:
     # of the change. Blocking a pull request on a number that moves on its
     # own blocks merges for no reason; main still gets measured, and the
     # summary step prints the figure either way.
+    # Push-only (see above). The second half is the rule every other expensive
+    # job in this file carries; a job may name `if` once, so both live here.
     if: github.event_name == 'push'
     needs: check
-    # Drafts skip the expensive half; the cheap jobs below still run.
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
