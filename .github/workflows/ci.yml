@@ -696,6 +696,19 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
+      # The cache carries the previous run's `target/llvm-cov-target` — an
+      # instrumented build of every dependency, the largest thing this repo
+      # produces. Restoring it and then linking a fresh one overflows the disk
+      # ("rustc-LLVM ERROR: IO failure on output stream: No space left on
+      # device", at link time, with the report then reading 0.00%), and its
+      # stale `.profraw` files are merged into the next run's profile. Drop it
+      # and pay a cold instrumented build, which is bounded and deterministic.
+      - name: Drop stale instrumented build
+        run: |
+          du -sh target/llvm-cov-target 2>/dev/null || true
+          rm -rf target/llvm-cov-target
+          df -h /
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@c3076e6fa5aeb9a93daf1bd8eff73345250a8a9c # cargo-llvm-cov
         with:
