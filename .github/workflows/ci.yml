@@ -712,49 +712,23 @@ jobs:
         # syscity-desktop is excluded: its Tauri/glib build needs GTK system
         # libraries that CI doesn't install, and it has no tests anyway.
         #
-        # The threshold is NOT passed as --fail-under-lines: that exits 1
-        # without printing what it measured, so a red run said nothing beyond
-        # "exit code 1". The floor is enforced by the next step, which always
-        # prints the number first.
-        run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
+        # The 55% floor is the tool's own; the step below prints the number it
+        # measured so a red run is actionable.
+        run: "cargo llvm-cov --workspace --exclude syscity-desktop --all-features --lcov --output-path lcov.info --fail-under-lines 55 --ignore-filename-regex '(^|/)(tests|target)/' -- --skip e2e::"
 
-      # Computes the percentage from the LCOV file and enforces the floor,
-      # so the number appears in every log — green or red — and a failure
-      # names both the measurement and the floor.
+      # `--fail-under-lines` exits 1 without saying what it measured, so a red
+      # job used to report nothing but "exit code 1". Print llvm-cov's own
+      # summary — the same figure the flag compares against — on every run.
       #
-      # The per-file `LH:`/`LF:` totals cannot be added or maximised across
-      # records: a file appears once per test binary that links it, each
-      # record naming only the lines that binary happened to execute. Doing
-      # either produced a number that swung between 18% and 70% depending on
-      # how many records the run emitted. The count is a union over
-      # `DA:<line>,<hits>` — a line is covered if any binary covered it.
-      - name: Enforce coverage floor
+      # Summing the lcov by hand was tried and abandoned: `DA:`/`LH:` records
+      # repeat per test binary, and neither summing nor per-file maximums
+      # reproduced the tool's number (70.38% and 18.69% on the same code,
+      # against a floor the tool itself kept passing). Use the tool's metric.
+      - name: Coverage summary
+        if: always()
         run: |
-          python3 - <<'PY'
-          import sys
-
-          hits = {}  # file -> {line: hits}, union across records
-          current = None
-          for raw in open("lcov.info", encoding="utf-8"):
-              if raw.startswith("SF:"):
-                  current = hits.setdefault(raw[3:].strip(), {})
-              elif raw.startswith("DA:") and current is not None:
-                  parts = raw[3:].split(",")
-                  line_no, count = int(parts[0]), int(parts[1])
-                  current[line_no] = current.get(line_no, 0) + count
-
-          total = sum(len(lines) for lines in hits.values())
-          covered = sum(1 for lines in hits.values() for c in lines.values() if c > 0)
-          if not total:
-              sys.exit("no DA records in lcov.info — coverage was not measured")
-
-          pct = 100.0 * covered / total
-          floor = 55.0
-          print(f"line coverage: {covered}/{total} = {pct:.2f}% over "
-                f"{len(hits)} files (floor {floor:.0f}%)")
-          if pct < floor:
-              sys.exit(f"::error::line coverage {pct:.2f}% is below the {floor:.0f}% floor")
-          PY
+          cargo llvm-cov report \
+            --ignore-filename-regex '(^|/)(tests|target)/' | tail -4 || true
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
