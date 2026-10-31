@@ -644,6 +644,14 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    # Push-only. The instrumented `--all-features` build is this repo's most
+    # expensive job (~25 min, tens of GB) and its number is not yet
+    # reproducible: identical tests on identical commits have measured 18%
+    # and >55% in different runs, which is a property of the measurement, not
+    # of the change. Blocking a pull request on a number that moves on its
+    # own blocks merges for no reason; main still gets measured, and the
+    # summary step prints the figure either way.
+    if: github.event_name == 'push'
     needs: check
     # Drafts skip the expensive half; the cheap jobs below still run.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
