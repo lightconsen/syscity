@@ -9,6 +9,14 @@
 //! Text input escapes for the *device* shell (a plain `input text '<text>'`
 //! breaks on an embedded quote) and routes non-ASCII through ADBKeyboard, which
 //! `input text` cannot type.
+//!
+//! Two things make the loop shorter rather than just correct. Every action is
+//! followed by a re-read that answers "did the screen change" ([`EFFECT_CHANGED`]
+//! / [`EFFECT_UNCHANGED`] / [`EFFECT_UNKNOWN`]), so the model does not need a
+//! separate observation to learn what its tap did. And every tree read is judged
+//! ([`assess_tree`]): a screen the accessibility API describes nothing useful on
+//! falls back to OCR instead of handing back an empty list that reads like a
+//! blank screen.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -69,6 +77,13 @@ impl PlatformToolSet for AndroidToolset {
             Box::new(AdbAppManagerTool::new()),
             Box::new(AdbUiTreeTool::new()),
             Box::new(AdbVerifyTool::new()),
+            // Higher-level tools: one call where the model would otherwise
+            // spend several turns reading, scrolling and tapping.
+            Box::new(super::android_tools::AdbCollectTool::new()),
+            Box::new(super::android_tools::AdbFindTool::new()),
+            Box::new(super::android_tools::AdbDialogTool::new()),
+            Box::new(super::android_tools::AdbSystemActionTool::new()),
+            Box::new(super::android_tools::AdbOcrTool::new()),
             // Loopback self-pairing (§4.5): pair the phone with its own
             // wireless-debugging adbd and report pairing state.
             Box::new(AdbPairTool::new()),
@@ -84,13 +99,13 @@ impl PlatformToolSet for AndroidToolset {
 // ── Device targeting ───────────────────────────────────────────────────────
 
 /// Schema text for the `device` argument the targeting tools share.
-const DEVICE_PARAM: &str =
+pub(super) const DEVICE_PARAM: &str =
     "Device serial to act on. Omit it and the call uses the only attached device — the result \
      reports which serial was actually used, since that is whatever is attached at the time.";
 
 /// `adb` argv prefix for the target device — no `-s` when none is pinned, in
 /// which case adb resolves the device itself.
-fn adb_args(device: &Option<String>, base: &[&str]) -> Vec<String> {
+pub(super) fn adb_args(device: &Option<String>, base: &[&str]) -> Vec<String> {
     let mut args = Vec::with_capacity(base.len() + 2);
     if let Some(serial) = device {
         args.push("-s".to_string());
@@ -106,7 +121,10 @@ fn adb_args(device: &Option<String>, base: &[&str]) -> Vec<String> {
 /// Omitting `device` does not mean "any device" — adb resolves it to whichever
 /// single device is attached at that moment, so a call made after a swap lands
 /// on the new one without saying so. Passing it pins this call's target.
-fn resolve_device(args: &Value, configured: Option<&str>) -> Result<Option<String>, String> {
+pub(super) fn resolve_device(
+    args: &Value,
+    configured: Option<&str>,
+) -> Result<Option<String>, String> {
     match args.get("device") {
         // Absent, or explicitly null: fall back to the configured serial.
         None | Some(Value::Null) => Ok(configured.map(str::to_string)),
@@ -130,7 +148,7 @@ fn resolve_device(args: &Value, configured: Option<&str>) -> Result<Option<Strin
 /// what turns a silent swap into a visible line in the transcript. Best-effort
 /// by design — nothing about labelling the target is worth failing a call over —
 /// so a failure here surfaces as a null in the result rather than as silence.
-async fn resolved_serial(device: &Option<String>) -> Option<String> {
+pub(super) async fn resolved_serial(device: &Option<String>) -> Option<String> {
     if let Some(serial) = device {
         return Some(serial.clone());
     }
@@ -338,7 +356,26 @@ impl Tool for AdbObserveTool {
         let shot = png_dimensions(&png);
         let consistent = coordinate_space_consistent(dump.screen, shot);
 
+        let quality = assess_tree(&dump.elements);
         let mut summary = format_ui_summary(&dump.elements);
+        let mut ocr_text = None;
+        // The screenshot is already in hand, so reading it costs no extra
+        // capture — only the OCR pass. Do it when the tree describes little or
+        // nothing, and hand back the text as tappable lines.
+        if quality != TreeQuality::Usable {
+            match ocr_png(&png).await {
+                Ok(lines) => {
+                    summary.push_str("\n\n");
+                    summary.push_str(&format_ocr_lines(&lines));
+                    ocr_text = Some(lines);
+                }
+                Err(why) => {
+                    if let Some(advice) = quality.advice() {
+                        summary.push_str(&format!("\n\n{advice} (OCR unavailable: {why})"));
+                    }
+                }
+            }
+        }
         if !consistent {
             let (sw, sh) = dump.screen.unwrap_or((0, 0));
             let (iw, ih) = shot.unwrap_or((0, 0));
@@ -352,6 +389,9 @@ impl Tool for AdbObserveTool {
 
         Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
             "count": dump.elements.len(),
+            "quality": quality.as_str(),
+            "advice": quality.advice(),
+            "ocr": ocr_text,
             "elements": dump.elements,
             "screenshot_base64": base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
@@ -407,18 +447,16 @@ impl AdbInputTool {
         }
     }
 
-    /// Re-read the tree and turn an element index into a tap point.
+    /// Resolve an index against a tree the caller already read.
     ///
-    /// Costs one extra dump, which is the point: tapping the coordinates from an
-    /// earlier read silently hits whatever has moved into place since.
-    async fn resolve_tap_target(
-        &self,
-        device: &Option<String>,
+    /// The before-action read serves two purposes — validating the target and
+    /// judging the effect — so it is done once, not twice.
+    fn tap_point_from(
+        elements: &[UiElement],
         index: usize,
         description: Option<&str>,
     ) -> Result<(i32, i32), String> {
-        let elements = dump_ui_elements(device).await.map_err(|e| e.message)?;
-        validate_target(&elements, index, description).map(|e| e.center)
+        validate_target(elements, index, description).map(|e| e.center)
     }
 }
 
@@ -428,7 +466,7 @@ impl AdbInputTool {
 /// the word, emit an escaped quote and reopen it (`'\''`) — the only escape a
 /// single-quoted shell word supports. Without this a quote in the text ends the
 /// command early and everything after it is parsed as further commands.
-fn sh_quote(s: &str) -> String {
+pub(super) fn sh_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -525,9 +563,11 @@ impl Tool for AdbInputTool {
          `target` (an element index from android_ui_tree): it is re-read from the live screen \
          before dispatch, so a screen that changed under you is reported instead of silently \
          tapping the wrong thing. Use action 'sequence' with several coordinate steps when you \
-         need to hit something that will disappear before your next turn. Success means the \
-         input was dispatched, not that it took effect — observe afterwards to see what the \
-         screen actually did."
+         need to hit something that will disappear before your next turn. The result reports \
+         whether the screen actually changed afterwards (effect: changed / unchanged / unknown) \
+         and what is on it now, so a separate android_observe is usually unnecessary. Set \
+         verify=false when the action is not meant to change the screen and you want to skip \
+         the extra reads."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -565,6 +605,14 @@ impl Tool for AdbInputTool {
                 "y2": { "type": "integer", "description": "End Y (swipe)" },
                 "text": { "type": "string", "description": "Text to type" },
                 "keycode": { "type": "string", "description": "Android keycode name or number" },
+                "verify": {
+                    "type": "boolean",
+                    "description": "Default true: re-read the screen after acting and report whether it changed. Costs two to three extra tree reads; set false to skip them."
+                },
+                "settle_ms": {
+                    "type": "integer",
+                    "description": "How long to wait for the screen to settle when verifying (default 1200, max 4000). Raise it for a slow screen transition."
+                },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             vec!["action"],
@@ -587,17 +635,36 @@ impl Tool for AdbInputTool {
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
 
+        let verify = args.get("verify").and_then(|v| v.as_bool()).unwrap_or(true);
+        let settle_budget = args
+            .get("settle_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(SETTLE_DEFAULT_MS);
+
+        // One read serves both purposes: it validates an indexed tap (the
+        // safety net) and it is the picture the effect is judged against. A
+        // failed read only refuses when the caller pointed at an element —
+        // every other action still dispatches, and reports its effect as
+        // unknown rather than pretending it worked.
+        let before = match dump_ui_elements(&device).await {
+            Ok(elements) => Some(elements),
+            Err(failed) => {
+                if action == "tap" && args.get("target").is_some() {
+                    return Ok(ToolExecutionResult::error(failed.message));
+                }
+                None
+            }
+        };
+
         let shell_cmd = match action {
             "tap" => {
                 match args.get("target").and_then(|v| v.as_u64()) {
-                    // Preferred: an element index, re-checked against the live
-                    // screen before anything is dispatched.
+                    // Preferred: an element index, checked against the read
+                    // taken immediately before dispatch.
                     Some(index) => {
                         let description = args.get("target_description").and_then(|v| v.as_str());
-                        match self
-                            .resolve_tap_target(&device, index as usize, description)
-                            .await
-                        {
+                        let elements = before.as_deref().unwrap_or(&[]);
+                        match Self::tap_point_from(elements, index as usize, description) {
                             Ok((x, y)) => format!("input tap {} {}", x, y),
                             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
                         }
@@ -675,8 +742,34 @@ impl Tool for AdbInputTool {
             return Ok(ToolExecutionResult::error(format!("adb input failed: {}", stderr)));
         }
 
-        Ok(ToolExecutionResult::success(format!("Input '{}' sent", action))
-            .with_data(serde_json::json!({ "device": resolved_serial(&device).await })))
+        let serial = resolved_serial(&device).await;
+        if !verify {
+            return Ok(ToolExecutionResult::success(format!(
+                "Input '{action}' sent (effect not checked)."
+            ))
+            .with_data(serde_json::json!({
+                "device": serial,
+                "effect": "unverified",
+            })));
+        }
+
+        // Judge the effect here rather than leaving it to the model: a dispatch
+        // that was accepted says nothing about whether the tap landed.
+        let before_fingerprint = before.as_ref().map(|elements| tree_fingerprint(elements));
+        let settle = settle_after_action(&device, before_fingerprint, settle_budget).await;
+
+        let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+        if !settle.elements.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&format_ui_summary_limited(&settle.elements, 60));
+        }
+
+        Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+            "device": serial,
+            "effect": settle.effect,
+            "settled_ms": settle.elapsed_ms,
+            "elements": settle.elements,
+        })))
     }
 }
 
@@ -1056,7 +1149,7 @@ impl std::fmt::Display for DumpFailure {
 }
 
 /// One line per element, for the model to read directly.
-fn format_ui_summary(elements: &[UiElement]) -> String {
+pub(super) fn format_ui_summary(elements: &[UiElement]) -> String {
     if elements.is_empty() {
         // A dump that succeeds but yields nothing is not a failure to report —
         // it is a screen the accessibility tree cannot describe (a game, a
@@ -1090,6 +1183,345 @@ fn format_ui_summary(elements: &[UiElement]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+// ── Tree quality ───────────────────────────────────────────────────────────
+
+/// How much of this screen the accessibility tree actually describes.
+///
+/// `uiautomator dump` succeeds on almost anything, including screens it
+/// describes nothing useful on: a game surface, a Flutter canvas, a WebView
+/// exposing one unnamed container. To the model an empty list and a list of
+/// anonymous boxes looked the same, so it re-read the tree instead of switching
+/// to the screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeQuality {
+    /// Enough named, actionable nodes to work from.
+    Usable,
+    /// Readable, but part of the screen is absent from it.
+    Partial,
+    /// Nothing the model can address.
+    Unusable,
+}
+
+impl TreeQuality {
+    /// Stable name for the tool result and for tests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usable => "usable",
+            Self::Partial => "partial",
+            Self::Unusable => "unusable",
+        }
+    }
+
+    /// What to tell the model, or `None` when the tree is fine.
+    pub fn advice(self) -> Option<&'static str> {
+        match self {
+            Self::Usable => None,
+            Self::Partial => Some(
+                "Part of this screen is missing from the tree (unnamed containers, custom-drawn \
+                 views). Anything you cannot find here may still be visible in the screenshot — \
+                 read it, or tap by coordinates.",
+            ),
+            Self::Unusable => Some(
+                "The accessibility tree describes none of this screen — a game, a canvas, or a \
+                 secure surface. Do not re-read the tree; work from the screenshot and tap by \
+                 coordinates.",
+            ),
+        }
+    }
+}
+
+/// The label a person would read for this element, if it has one.
+pub fn element_label(element: &UiElement) -> Option<&str> {
+    element
+        .text
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            element
+                .content_desc
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+        })
+}
+
+/// Judge a parsed tree.
+///
+/// The bar is deliberately low: named nodes at all, and named nodes being a
+/// meaningful share of what was found. Thin trees are normal on Android; the
+/// case worth flagging is a tree that describes *none* of the screen.
+pub fn assess_tree(elements: &[UiElement]) -> TreeQuality {
+    if elements.is_empty() {
+        return TreeQuality::Unusable;
+    }
+    let named = elements
+        .iter()
+        .filter(|e| element_label(e).is_some())
+        .count();
+    if named == 0 {
+        return TreeQuality::Unusable;
+    }
+    let share = named as f32 / elements.len() as f32;
+    if named < 3 || share < 0.25 {
+        TreeQuality::Partial
+    } else {
+        TreeQuality::Usable
+    }
+}
+
+/// A cheap identity of what is on screen.
+///
+/// Used to answer "did my action change anything" without a second tool call.
+/// Bounds are part of it because a list that scrolls keeps the same labels in
+/// different places, and that is a change.
+pub fn tree_fingerprint(elements: &[UiElement]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    elements.len().hash(&mut hasher);
+    for element in elements {
+        element_label(element).unwrap_or_default().hash(&mut hasher);
+        element.class.hash(&mut hasher);
+        element.bounds.hash(&mut hasher);
+        element.clickable.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+// ── Action effect ──────────────────────────────────────────────────────────
+
+/// The screen was different after the action.
+pub const EFFECT_CHANGED: &str = "changed";
+/// The screen was the same after the action.
+pub const EFFECT_UNCHANGED: &str = "unchanged";
+/// The effect could not be judged — the tree could not be read.
+pub const EFFECT_UNKNOWN: &str = "unknown";
+
+/// How often the screen is polled while waiting for it to settle.
+const SETTLE_POLL_MS: u64 = 150;
+/// A screen that keeps this value for one poll is considered settled, rather
+/// than merely "nothing has happened yet".
+const SETTLE_MIN_MS: u64 = 250;
+/// Default budget: long enough for a screen transition, short enough that a
+/// static screen costs one extra read rather than a second.
+pub const SETTLE_DEFAULT_MS: u64 = 1200;
+/// Upper bound on what a caller may ask to wait.
+pub const SETTLE_MAX_MS: u64 = 4000;
+
+/// What the screen looked like after an action.
+#[derive(Debug)]
+pub struct Settle {
+    /// One of the `EFFECT_*` constants.
+    pub effect: &'static str,
+    pub elapsed_ms: u64,
+    pub elements: Vec<UiElement>,
+    /// Why the effect is unknown, when it is.
+    pub note: Option<String>,
+}
+
+impl Settle {
+    /// A one-line verdict for the tool result.
+    pub fn verdict(&self) -> String {
+        match self.effect {
+            EFFECT_CHANGED => format!(
+                "The screen changed (settled in {} ms, {} elements now).",
+                self.elapsed_ms,
+                self.elements.len()
+            ),
+            EFFECT_UNCHANGED => format!(
+                "The screen looks unchanged after {} ms. The action may have missed, or this \
+                 screen changes without changing what the tree exposes (a canvas, or a scroll \
+                 that keeps the same rows). Check the screenshot before repeating it.",
+                self.elapsed_ms
+            ),
+            _ => format!(
+                "Effect unknown: the screen could not be re-read{}. Read it with android_observe \
+                 to see what happened.",
+                self.note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// Watch the screen until it stops changing, or the budget runs out.
+///
+/// `before` is the fingerprint taken before the action, so "changed" is a fact
+/// about the screen rather than an assumption from the command having been
+/// accepted. Two consecutive equal readings mean the screen has settled.
+pub async fn settle_after_action(
+    device: &Option<String>,
+    before: Option<u64>,
+    budget_ms: u64,
+) -> Settle {
+    let started = std::time::Instant::now();
+    let budget = budget_ms.clamp(SETTLE_MIN_MS, SETTLE_MAX_MS);
+    let mut previous: Option<u64> = None;
+    let mut changed = false;
+    let mut last: Option<Vec<UiElement>> = None;
+    let mut failure: Option<String> = None;
+
+    loop {
+        match dump_ui_elements(device).await {
+            Ok(elements) => {
+                let fingerprint = tree_fingerprint(&elements);
+                if before.is_some_and(|before| before != fingerprint) {
+                    changed = true;
+                }
+                let stable = previous == Some(fingerprint);
+                previous = Some(fingerprint);
+                last = Some(elements);
+                if stable && started.elapsed().as_millis() as u64 >= SETTLE_MIN_MS {
+                    break;
+                }
+            }
+            Err(failed) => {
+                failure = Some(failed.code.to_string());
+                break;
+            }
+        }
+        if started.elapsed().as_millis() as u64 >= budget {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(SETTLE_POLL_MS)).await;
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match last {
+        Some(elements) => Settle {
+            effect: match (before, changed) {
+                (None, _) => EFFECT_UNKNOWN,
+                (Some(_), true) => EFFECT_CHANGED,
+                (Some(_), false) => EFFECT_UNCHANGED,
+            },
+            elapsed_ms,
+            elements,
+            note: None,
+        },
+        None => Settle {
+            effect: EFFECT_UNKNOWN,
+            elapsed_ms,
+            elements: Vec::new(),
+            note: failure,
+        },
+    }
+}
+
+/// [`format_ui_summary`] with a ceiling, for results that are a side effect of
+/// another tool rather than the thing the model asked for.
+fn format_ui_summary_limited(elements: &[UiElement], limit: usize) -> String {
+    if elements.len() <= limit {
+        return format_ui_summary(elements);
+    }
+    let mut text = format_ui_summary(&elements[..limit]);
+    text.push_str(&format!(
+        "\n… and {} more element(s); call android_ui_tree for the full list.",
+        elements.len() - limit
+    ));
+    text
+}
+
+// ── OCR fallback ───────────────────────────────────────────────────────────
+
+/// A line of text read from the screenshot, for screens the accessibility tree
+/// cannot describe.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OcrLine {
+    pub text: String,
+    /// Centre in device pixels — the same space as [`UiElement::center`], so a
+    /// line can be tapped by passing these coordinates.
+    pub center: (i32, i32),
+    /// `(x1, y1, x2, y2)` in device pixels.
+    pub bounds: (i32, i32, i32, i32),
+    pub confidence: f32,
+}
+
+/// Turn OCR blocks into the tap-addressable shape above.
+#[cfg(feature = "vision")]
+fn ocr_lines(blocks: Vec<crate::computer::vision::TextBlock>) -> Vec<OcrLine> {
+    blocks
+        .into_iter()
+        .map(|block| {
+            let rect = block.bounds;
+            let x1 = rect.x;
+            let y1 = rect.y;
+            let x2 = rect.x + rect.width as i32;
+            let y2 = rect.y + rect.height as i32;
+            OcrLine {
+                text: block.text,
+                center: ((x1 + x2) / 2, (y1 + y2) / 2),
+                bounds: (x1, y1, x2, y2),
+                confidence: block.confidence,
+            }
+        })
+        .collect()
+}
+
+/// Read text out of an already-captured screenshot with the ONNX OCR model.
+///
+/// The engine is loaded once and kept: constructing it reads two model files,
+/// and the models download on first use.
+#[cfg(feature = "vision")]
+pub async fn ocr_png(png: &[u8]) -> Result<Vec<OcrLine>, String> {
+    use crate::computer::types::Screenshot;
+    use crate::computer::vision::ocr_rapid::RapidOcr;
+    use base64::Engine as _;
+
+    static ENGINE: tokio::sync::Mutex<Option<RapidOcr>> = tokio::sync::Mutex::const_new(None);
+
+    let (width, height) =
+        png_dimensions(png).ok_or_else(|| "the screenshot's size could not be read".to_string())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    let screenshot = Screenshot::new(encoded, width, height);
+
+    let mut guard = ENGINE.lock().await;
+    if guard.is_none() {
+        let engine = RapidOcr::new_auto()
+            .await
+            .map_err(|e| format!("the OCR models could not be loaded ({e})"))?;
+        *guard = Some(engine);
+    }
+    let engine = guard
+        .as_mut()
+        .ok_or_else(|| "the OCR engine is unavailable".to_string())?;
+    let blocks = engine
+        .detect_text(&screenshot)
+        .await
+        .map_err(|e| format!("OCR failed ({e})"))?;
+    Ok(ocr_lines(blocks))
+}
+
+/// Read text out of a screenshot in a build without an OCR engine.
+///
+/// Says so rather than returning an empty list, which would read like "the
+/// screen is blank" and send the model looking for a problem that is not there.
+#[cfg(not(feature = "vision"))]
+pub async fn ocr_png(_png: &[u8]) -> Result<Vec<OcrLine>, String> {
+    Err("this build has no OCR engine (compiled without the `vision` feature)".to_string())
+}
+
+/// Read text out of the device's current screen.
+pub async fn ocr_screen(device: &Option<String>) -> Result<Vec<OcrLine>, String> {
+    let png = capture_png(device).await.map_err(|e| e.to_string())?;
+    ocr_png(&png).await
+}
+
+/// One line per recognised text block, for the model to read.
+pub fn format_ocr_lines(lines: &[OcrLine]) -> String {
+    if lines.is_empty() {
+        return "OCR read no text from this screen.".to_string();
+    }
+    let mut out = vec![format!(
+        "{} text line(s) read from the screenshot:",
+        lines.len()
+    )];
+    for line in lines {
+        out.push(format!("{} (center=({},{}))", line.text, line.center.0, line.center.1));
+    }
+    out.join("\n")
 }
 
 /// Loose label comparison for the safety net.
@@ -1168,12 +1600,14 @@ pub struct UiDump {
     pub screen: Option<(i32, i32)>,
 }
 
-async fn dump_ui_elements(device: &Option<String>) -> Result<Vec<UiElement>, DumpFailure> {
+pub(super) async fn dump_ui_elements(
+    device: &Option<String>,
+) -> Result<Vec<UiElement>, DumpFailure> {
     Ok(dump_ui(device).await?.elements)
 }
 
 /// Dump, pull and parse the tree in one go.
-async fn dump_ui(device: &Option<String>) -> Result<UiDump, DumpFailure> {
+pub(super) async fn dump_ui(device: &Option<String>) -> Result<UiDump, DumpFailure> {
     let xml = pull_ui_xml(device).await?;
     let elements = parse_uiautomator_xml(&xml).map_err(|source| {
         DumpFailure::new(
@@ -1237,7 +1671,10 @@ impl Tool for AdbUiTreeTool {
         "Read the Android device's UI: a numbered list of the elements you can act on, each with \
          its text or content description, whether it is clickable, and the screen coordinates of \
          its centre. Tap an element with android_input by passing that centre as x/y. Bare layout \
-         containers are omitted."
+         containers are omitted. The result says how much of the screen the tree actually \
+         describes (quality: usable / partial / unusable); when it is not usable this reads the \
+         screenshot with OCR instead and returns those lines, so do not re-read hoping for more — \
+         act on the OCR text or the coordinates it gives."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1269,9 +1706,31 @@ impl Tool for AdbUiTreeTool {
                     .with_data(serde_json::json!({ "code": e.code })))
             }
         };
-        let summary = format_ui_summary(&elements);
+        let quality = assess_tree(&elements);
+        let mut summary = format_ui_summary(&elements);
+        let mut ocr_text = None;
+        // When the tree describes little or nothing, reading the screenshot is
+        // the only way to say what is actually on the screen — and saying it
+        // here is what stops the model from re-reading the tree forever.
+        if quality != TreeQuality::Usable {
+            match ocr_screen(&device).await {
+                Ok(lines) => {
+                    summary.push_str("\n\n");
+                    summary.push_str(&format_ocr_lines(&lines));
+                    ocr_text = Some(lines);
+                }
+                Err(why) => {
+                    if let Some(advice) = quality.advice() {
+                        summary.push_str(&format!("\n\n{advice} (OCR unavailable: {why})"));
+                    }
+                }
+            }
+        }
         Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
             "count": elements.len(),
+            "quality": quality.as_str(),
+            "advice": quality.advice(),
+            "ocr": ocr_text,
             "elements": elements,
             "device": resolved_serial(&device).await,
         })))
@@ -2049,6 +2508,161 @@ mod tests {
     fn test_adb_app_manager_tool_name() {
         let tool = AdbAppManagerTool::new();
         assert_eq!(tool.name(), "android_app_manager");
+    }
+
+    // ── Tree quality ────────────────────────────────────────────────────
+    //
+    // `uiautomator dump` succeeds on a game, a canvas and a normal screen
+    // alike; what differs is whether the tree describes any of it.
+
+    fn node(class: &str, text: Option<&str>, bounds: (i32, i32, i32, i32)) -> UiElement {
+        UiElement {
+            index: 1,
+            text: text.map(str::to_string),
+            content_desc: None,
+            resource_id: None,
+            class: class.to_string(),
+            clickable: true,
+            enabled: true,
+            bounds,
+            center: ((bounds.0 + bounds.2) / 2, (bounds.1 + bounds.3) / 2),
+        }
+    }
+
+    #[test]
+    fn an_empty_tree_is_unusable() {
+        assert_eq!(assess_tree(&[]), TreeQuality::Unusable);
+    }
+
+    #[test]
+    fn a_tree_of_anonymous_boxes_is_unusable() {
+        let elements = vec![
+            node("android.widget.FrameLayout", None, (0, 0, 100, 100)),
+            node("android.widget.FrameLayout", None, (0, 0, 100, 50)),
+        ];
+        assert_eq!(assess_tree(&elements), TreeQuality::Unusable);
+    }
+
+    #[test]
+    fn a_mostly_nameless_tree_is_partial() {
+        let elements = vec![
+            node("android.widget.Button", Some("OK"), (0, 0, 10, 10)),
+            node("android.view.View", None, (0, 0, 10, 10)),
+            node("android.view.View", None, (0, 0, 10, 10)),
+            node("android.view.View", None, (0, 0, 10, 10)),
+            node("android.view.View", None, (0, 0, 10, 10)),
+        ];
+        assert_eq!(assess_tree(&elements), TreeQuality::Partial);
+    }
+
+    #[test]
+    fn a_named_screen_is_usable_and_says_nothing() {
+        let elements = (0..5)
+            .map(|i| node("android.widget.TextView", Some("row"), (0, i * 10, 100, i * 10 + 9)))
+            .collect::<Vec<_>>();
+        assert_eq!(assess_tree(&elements), TreeQuality::Usable);
+        assert_eq!(TreeQuality::Usable.advice(), None);
+        assert!(TreeQuality::Unusable.advice().is_some());
+    }
+
+    #[test]
+    fn content_description_counts_as_a_name() {
+        let mut described = node("android.widget.ImageButton", None, (0, 0, 10, 10));
+        described.content_desc = Some("Back".to_string());
+        assert_eq!(element_label(&described), Some("Back"));
+    }
+
+    #[test]
+    fn blank_labels_do_not_count() {
+        let blank = node("android.widget.TextView", Some("   "), (0, 0, 10, 10));
+        assert_eq!(element_label(&blank), None);
+    }
+
+    // ── Action effect ───────────────────────────────────────────────────
+
+    #[test]
+    fn fingerprint_tracks_labels_and_positions() {
+        let base = vec![node("android.widget.TextView", Some("a"), (0, 0, 10, 10))];
+        let same = base.clone();
+        let moved = vec![node("android.widget.TextView", Some("a"), (0, 50, 10, 60))];
+        let renamed = vec![node("android.widget.TextView", Some("b"), (0, 0, 10, 10))];
+
+        assert_eq!(tree_fingerprint(&base), tree_fingerprint(&same));
+        assert_ne!(tree_fingerprint(&base), tree_fingerprint(&moved));
+        assert_ne!(tree_fingerprint(&base), tree_fingerprint(&renamed));
+    }
+
+    #[test]
+    fn an_unknown_effect_says_so_instead_of_claiming_success() {
+        let settle = Settle {
+            effect: EFFECT_UNKNOWN,
+            elapsed_ms: 300,
+            elements: Vec::new(),
+            note: Some("SCREEN_NEVER_IDLE".to_string()),
+        };
+        let verdict = settle.verdict();
+        assert!(verdict.starts_with("Effect unknown"), "{verdict}");
+        assert!(verdict.contains("SCREEN_NEVER_IDLE"), "{verdict}");
+    }
+
+    #[test]
+    fn an_unchanged_screen_points_at_the_screenshot() {
+        let settle = Settle {
+            effect: EFFECT_UNCHANGED,
+            elapsed_ms: 1200,
+            elements: Vec::new(),
+            note: None,
+        };
+        let verdict = settle.verdict();
+        assert!(verdict.contains("unchanged"), "{verdict}");
+        assert!(verdict.contains("screenshot"), "{verdict}");
+    }
+
+    #[test]
+    fn a_changed_screen_reports_how_long_it_took() {
+        let settle = Settle {
+            effect: EFFECT_CHANGED,
+            elapsed_ms: 420,
+            elements: vec![node("android.widget.TextView", Some("a"), (0, 0, 10, 10))],
+            note: None,
+        };
+        let verdict = settle.verdict();
+        assert!(verdict.contains("changed"), "{verdict}");
+        assert!(verdict.contains("420 ms"), "{verdict}");
+        assert!(verdict.contains("1 elements"), "{verdict}");
+    }
+
+    #[test]
+    fn the_summary_ceiling_truncates_instead_of_dumping_everything() {
+        let elements = (0..70)
+            .map(|i| node("android.widget.TextView", Some("row"), (0, i * 10, 100, i * 10 + 9)))
+            .collect::<Vec<_>>();
+        let text = format_ui_summary_limited(&elements, 60);
+        assert!(text.contains("10 more element(s)"), "{text}");
+        assert!(format_ui_summary_limited(&elements[..3], 60).contains("3 actionable element(s)"));
+    }
+
+    #[test]
+    fn ocr_lines_carry_tappable_centres() {
+        let lines = [OcrLine {
+            text: "Settings".to_string(),
+            center: (50, 25),
+            bounds: (0, 0, 100, 50),
+            confidence: 0.9,
+        }];
+        let text = format_ocr_lines(&lines);
+        assert!(text.contains("Settings"), "{text}");
+        assert!(text.contains("center=(50,25)"), "{text}");
+        assert!(format_ocr_lines(&[]).contains("no text"));
+    }
+
+    #[test]
+    fn the_input_tool_documents_the_effect_report() {
+        // The model only learns that `verify` exists from the description; a
+        // silent removal would make it spend a turn on android_observe again.
+        let described = AdbInputTool::new().description().to_string();
+        assert!(described.contains("effect"), "{described}");
+        assert!(described.contains("verify=false"), "{described}");
     }
 
     #[test]

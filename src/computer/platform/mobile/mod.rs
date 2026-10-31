@@ -8,9 +8,13 @@
 //! the corresponding CLI tools are installed.
 
 pub mod android;
+pub mod android_tools;
 pub mod ios;
 
 pub use android::AndroidToolset;
+pub use android_tools::{
+    AdbCollectTool, AdbDialogTool, AdbFindTool, AdbOcrTool, AdbSystemActionTool,
+};
 pub use ios::IosToolset;
 
 /// Check whether a command is available on PATH.

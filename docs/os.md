@@ -160,6 +160,24 @@ re-inspect to verify
 
 These are implemented as additional `PlatformToolSet`s registered alongside desktop/server sets.
 
+The Android set carries five higher-level tools on top of the raw ones, each of
+which replaces a turn the model would otherwise spend driving them by hand:
+
+| Tool | What it removes |
+|---|---|
+| `android_collect` | read-scroll-read over a long list or chat: one call returns the text in screen order, and says why it stopped |
+| `android_find` | scrolling until something appears: returns the coordinates once it does, or says how far it looked |
+| `android_dialog` | describing a dialog: reads its text and buttons, and presses one only if exactly one button matches |
+| `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
+| `android_ocr` | the screenshot reader, for screens whose accessibility tree describes nothing |
+
+Two behaviours apply across the set. Every `android_input` (and `android_dialog`
+press) re-reads the screen afterwards and reports `effect: changed / unchanged /
+unknown`, so "did that tap land" no longer costs an `android_observe` turn. And
+every tree read is graded `usable / partial / unusable`; below usable the tool
+falls back to OCR and returns the text as tappable lines rather than an empty
+list.
+
 ## Capability Registry
 
 `PlatformCapabilityRegistry` holds all registered sets, checks platform constraints at runtime, and exports available tools into `ToolRegistry`.
