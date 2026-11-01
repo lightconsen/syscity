@@ -193,6 +193,36 @@ what you expected should be traceable to where it came from. The in-process path
 is also the prerequisite for reading a display other than the default one, which
 is what a virtual display needs.
 
+### A second screen (`android_display`)
+
+A task can run on its own display, so the user keeps the phone. The agent drives
+it with `android_display`: `start` creates it and returns an id, `launch` opens
+an app on it, `frame` returns a PNG, `tap`/`swipe`/`text`/`key` act on it, `stop`
+tears it down.
+
+Creating a display needs `CAPTURE_VIDEO_OUTPUT`, which is `signature|privileged`
+— an app can never hold it. So the work happens in a helper that runs as
+**shell** (uid 2000), started over the loopback-ADB pairing (§4.5):
+
+```bash
+adb shell CLASSPATH=<app.apk> app_process /system/bin \
+    net.syscity.desktop.helper.HelperMain
+```
+
+`android_display start` does that for you: it asks the helper, starts it if it is
+not there (`pm path` for the APK, then a detached `app_process`), and waits for
+its socket. The helper owns the `ImageReader` behind the display, which is why
+frames leave as PNG — a `Surface` cannot cross a `LocalSocket`.
+
+Known limits, in the order they will bite:
+
+- **Android 13** has no per-display focus, so the user's screen can lose focus
+  briefly while the agent types; 14+ gets `FLAG_OWN_FOCUS`.
+- **Frames cost a PNG each.** Right for one observation per turn, wrong for
+  video.
+- **The accessibility tree still reads the default display.** Reading the
+  virtual one is the next step; until then `frame` + OCR is what sees it.
+
 ## Capability Registry
 
 `PlatformCapabilityRegistry` holds all registered sets, checks platform constraints at runtime, and exports available tools into `ToolRegistry`.

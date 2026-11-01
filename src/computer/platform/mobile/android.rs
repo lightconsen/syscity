@@ -84,6 +84,8 @@ impl PlatformToolSet for AndroidToolset {
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
+            // The second screen: the user keeps the phone while a task runs.
+            Box::new(super::android_tools::AdbDisplayTool::new()),
             // Loopback self-pairing (§4.5): pair the phone with its own
             // wireless-debugging adbd and report pairing state.
             Box::new(AdbPairTool::new()),

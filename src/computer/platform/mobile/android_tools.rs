@@ -1084,6 +1084,257 @@ impl Tool for AdbOcrTool {
     }
 }
 
+// ── Virtual display ────────────────────────────────────────────────────────
+
+/// Create and drive a second display, so the task does not take the phone.
+#[derive(Debug)]
+pub struct AdbDisplayTool {
+    device: Option<String>,
+}
+
+impl Default for AdbDisplayTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbDisplayTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+/// The bridge, or the reason a display cannot be created here.
+///
+/// A virtual display needs a helper running as shell on the device, and the
+/// only thing that can start it is this app. A desktop driving a remote phone
+/// over ADB has no bridge, so the honest answer there is "not available from
+/// this host" rather than a connection error.
+fn display_bridge() -> Result<crate::device::DeviceBridgeRef, String> {
+    crate::device::bridge().cloned().ok_or_else(|| {
+        "A virtual display needs the Syscity app running on the phone itself (it starts the \
+         helper as the shell user). From a desktop driving a remote device, use the ordinary \
+         android_* tools — they act on that phone's own screen."
+            .to_string()
+    })
+}
+
+#[async_trait]
+impl Tool for AdbDisplayTool {
+    fn name(&self) -> &str {
+        "android_display"
+    }
+
+    fn description(&self) -> &str {
+        "Run a task on a second screen so the user keeps using the phone. `start` creates the \
+         display and returns its id; every later call passes that id. Apps opened on it do not \
+         appear on the user's screen, and on Android 14+ it holds its own focus, so typing there \
+         does not steal the user's keyboard. `frame` returns a PNG of that display. This needs \
+         the Syscity app running on the phone; a desktop controlling a remote device has no \
+         second screen to offer."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Create and drive a second Android display",
+            serde_json::json!({
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "start", "stop", "status", "frame", "launch",
+                        "tap", "swipe", "text", "key"
+                    ],
+                    "description": "start creates the display; the rest act on it."
+                },
+                "display": {
+                    "type": "integer",
+                    "description": "Display id returned by `start`. Required except for start/status."
+                },
+                "package": {
+                    "type": "string",
+                    "description": "start / launch: the app to open on the display."
+                },
+                "width": { "type": "integer", "description": "start: display width (default 1080)." },
+                "height": { "type": "integer", "description": "start: display height (default 2400)." },
+                "x": { "type": "integer", "description": "tap / swipe start X." },
+                "y": { "type": "integer", "description": "tap / swipe start Y." },
+                "x2": { "type": "integer", "description": "swipe end X." },
+                "y2": { "type": "integer", "description": "swipe end Y." },
+                "duration": { "type": "integer", "description": "swipe duration in ms (default 300)." },
+                "text": { "type": "string", "description": "text to type on the display." },
+                "keycode": { "type": "string", "description": "key to press, e.g. BACK or ENTER." },
+                "device": { "type": "string", "description": DEVICE_PARAM }
+            }),
+            vec!["action"],
+        )
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let _target = crate::tools::target_lock::TargetLocks::global()
+            .lock(crate::tools::target_lock::ANDROID)
+            .await;
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let bridge = match display_bridge() {
+            Ok(bridge) => bridge,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+        if action == "status" {
+            return Ok(match super::display::VirtualDisplay::status(&bridge).await {
+                Ok(answer) => {
+                    ToolExecutionResult::success(format!("Display helper is running: {}", answer))
+                        .with_data(answer)
+                }
+                Err(failed) => ToolExecutionResult::error(failed.to_string()),
+            });
+        }
+
+        if action == "start" {
+            // The helper is started on demand: nothing creates a shell process
+            // on the phone until a task actually needs a display.
+            if let Err(failed) =
+                super::display::ensure_helper(&device, super::display::ANDROID_PACKAGE, &bridge)
+                    .await
+            {
+                return Ok(ToolExecutionResult::error(failed.to_string()));
+            }
+            let size = match (
+                args.get("width").and_then(|v| v.as_u64()),
+                args.get("height").and_then(|v| v.as_u64()),
+            ) {
+                (Some(width), Some(height)) => {
+                    Some((u32::try_from(width).unwrap_or(0), u32::try_from(height).unwrap_or(0)))
+                }
+                _ => None,
+            };
+            let package = args.get("package").and_then(|v| v.as_str());
+            return Ok(match super::display::VirtualDisplay::open(bridge, size, package).await {
+                Ok(display) => {
+                    let text = format!(
+                        "Second display ready: id {}, {}x{}. Open an app with action 'launch', \
+                         read it with 'frame'. The user's screen is untouched.",
+                        display.id, display.width, display.height
+                    );
+                    ToolExecutionResult::success(text).with_data(serde_json::json!({
+                        "display": display.id,
+                        "width": display.width,
+                        "height": display.height,
+                    }))
+                }
+                Err(failed) => ToolExecutionResult::error(failed.to_string()),
+            });
+        }
+
+        let Some(id) = args.get("display").and_then(|v| v.as_i64()) else {
+            return Ok(ToolExecutionResult::error(
+                "this action needs the `display` id that `start` returned",
+            ));
+        };
+        let id = i32::try_from(id).unwrap_or(-1);
+        // The display is addressed by id alone for every later call: the helper
+        // owns the record, and reconstructing a handle here would need its size.
+        let display = super::display::VirtualDisplay::attach(bridge, id);
+
+        let result = match action {
+            "stop" => display.close().await.map(|_| "Display closed.".to_string()),
+            "launch" => {
+                let package = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
+                display
+                    .launch(package)
+                    .await
+                    .map(|_| format!("Opened {package} on display {id}."))
+            }
+            "frame" => match display.screenshot().await {
+                Ok(frame) => {
+                    let encoded = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &frame.png,
+                    );
+                    return Ok(ToolExecutionResult::success("Frame captured").with_data(
+                        serde_json::json!({
+                            "base64": encoded,
+                            "format": "png",
+                            "width": frame.width,
+                            "height": frame.height,
+                            "display": id,
+                        }),
+                    ));
+                }
+                Err(failed) => Err(failed),
+            },
+            "tap" => {
+                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                display
+                    .tap(i32::try_from(x).unwrap_or(0), i32::try_from(y).unwrap_or(0))
+                    .await
+                    .map(|_| format!("Tapped ({x}, {y}) on display {id}."))
+            }
+            "swipe" => {
+                let value = |key: &str, default: i64| {
+                    args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
+                };
+                let duration = u32::try_from(value("duration", 300).max(1)).unwrap_or(300);
+                display
+                    .swipe(
+                        (
+                            i32::try_from(value("x", 0)).unwrap_or(0),
+                            i32::try_from(value("y", 0)).unwrap_or(0),
+                        ),
+                        (
+                            i32::try_from(value("x2", 0)).unwrap_or(0),
+                            i32::try_from(value("y2", 0)).unwrap_or(0),
+                        ),
+                        duration,
+                    )
+                    .await
+                    .map(|_| format!("Swiped on display {id}."))
+            }
+            "text" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                display.text(text).await.map(|_| {
+                    format!("Typed {} character(s) on display {id}.", text.chars().count())
+                })
+            }
+            "key" => {
+                let keycode = args
+                    .get("keycode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("BACK");
+                display
+                    .key(keycode)
+                    .await
+                    .map(|_| format!("Pressed {keycode} on display {id}."))
+            }
+            other => {
+                return Ok(ToolExecutionResult::error(format!(
+                    "unknown action {other:?}; use start, stop, status, frame, launch, tap, swipe, \
+                     text or key"
+                )))
+            }
+        };
+
+        Ok(match result {
+            Ok(message) => ToolExecutionResult::success(message)
+                .with_data(serde_json::json!({ "display": id, "action": action })),
+            Err(failed) => ToolExecutionResult::error(failed.to_string()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,5 +1419,6 @@ mod tests {
         assert_eq!(AdbDialogTool::new().name(), "android_dialog");
         assert_eq!(AdbSystemActionTool::new().name(), "android_system_action");
         assert_eq!(AdbOcrTool::new().name(), "android_ocr");
+        assert_eq!(AdbDisplayTool::new().name(), "android_display");
     }
 }

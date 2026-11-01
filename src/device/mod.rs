@@ -91,6 +91,14 @@ pub const CMD_A11Y_STATUS: &str = "accessibilityStatus";
 /// Open the system accessibility settings, where the user enables the service.
 pub const CMD_A11Y_SETTINGS: &str = "openAccessibilitySettings";
 
+/// Forward one op to the virtual-display helper (see
+/// [`crate::computer::platform::mobile::display`]).
+///
+/// The payload is the op itself (`{"op": "create", ...}`) and the answer is the
+/// helper's, so the Kotlin side stays a pass-through and the protocol lives in
+/// one place — the Rust client that validates it.
+pub const CMD_VIRTUAL_DISPLAY: &str = "virtualDisplay";
+
 /// The bridge, for code that cannot be handed one.
 ///
 /// The Android toolset reads the accessibility tree from deep inside its read

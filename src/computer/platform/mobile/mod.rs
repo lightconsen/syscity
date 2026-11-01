@@ -10,11 +10,12 @@
 pub mod a11y;
 pub mod android;
 pub mod android_tools;
+pub mod display;
 pub mod ios;
 
 pub use android::AndroidToolset;
 pub use android_tools::{
-    AdbCollectTool, AdbDialogTool, AdbFindTool, AdbOcrTool, AdbSystemActionTool,
+    AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbFindTool, AdbOcrTool, AdbSystemActionTool,
 };
 pub use ios::IosToolset;
 

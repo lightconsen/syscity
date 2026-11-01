@@ -495,4 +495,41 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
     }
     invoke.resolve(out)
   }
+
+  // ─────────────────────────────────────────────
+  // Virtual display (shell helper, second screen)
+  // ─────────────────────────────────────────────
+
+  /**
+   * `virtualDisplay` — forward one op to the shell-side display helper.
+   *
+   * A pass-through on purpose: the protocol lives in
+   * `src/computer/platform/mobile/display.rs`, which is where it is validated
+   * and where the tests are. This side's only jobs are the socket and getting
+   * off the main thread, because a frame is a PNG over a few megabytes.
+   */
+  @Command
+  fun virtualDisplay(invoke: Invoke) {
+    val payload = invoke.getArgs()
+    executor.execute {
+      try {
+        val answer = VDisplayClient.request(payload)
+        // Copy key by key rather than wrapping the string: JSObject is what
+        // Tauri resolves with, and a JSONObject nested inside it would not
+        // cross the bridge intact.
+        val out = JSObject()
+        answer.keys().forEach { key -> out.put(key, answer.get(key)) }
+        mainHandler.post { invoke.resolve(out) }
+      } catch (e: Exception) {
+        mainHandler.post {
+          invoke.reject(
+            "the display helper is not reachable (${e.message}). Start it with " +
+              "`adb shell CLASSPATH=<apk> app_process /system/bin " +
+              "net.syscity.desktop.helper.HelperMain` over the loopback pairing.",
+            "DISPLAY_UNAVAILABLE",
+          )
+        }
+      }
+    }
+  }
 }
