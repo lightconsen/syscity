@@ -1,5 +1,8 @@
 /src/main/**/generated
-/src/main/jniLibs/**/*.so
+# Everything here is generated: the app's own library by the Tauri build, and
+# the adb closure by scripts/fetch-android-adb.sh. The old `*.so` rule missed
+# versioned names (libz.so.1, libzstd.so.1) and let binaries into a commit.
+/src/main/jniLibs/
 /src/main/assets/tauri.conf.json
 /tauri.build.gradle.kts
 /proguard-tauri.pro
