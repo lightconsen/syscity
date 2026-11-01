@@ -211,8 +211,27 @@ adb shell CLASSPATH=<app.apk> app_process /system/bin \
 
 `android_display start` does that for you: it asks the helper, starts it if it is
 not there (`pm path` for the APK, then a detached `app_process`), and waits for
-its socket. The helper owns the `ImageReader` behind the display, which is why
-frames leave as PNG — a `Surface` cannot cross a `LocalSocket`.
+its socket.
+
+Three things about that call are not obvious, and all three fail the same way —
+`SecurityException`, or a display that exists but has nothing on it:
+
+- **`DisplayManagerGlobal` no longer has the shape it used to.** On API 34+ its
+  only `createVirtualDisplay` is `(Context, MediaProjection, VirtualDisplayConfig,
+  Callback, Executor)`; the `(String, int, int, int, Surface, int, …)` overload
+  is gone from that class. The helper uses that one, building the config by
+  reflection, and keeps the older shapes as fallbacks.
+- **The display service attributes the call to a package** and rejects it when
+  that package's uid is not the caller's. A Context without an Activity reports
+  `android` (uid 1000), so the call is refused with `packageName must match the
+  calling uid`; naming `com.android.shell` — the package that actually owns uid
+  2000 — is both true and what the check wants.
+- **A Context needs a Looper.** `ActivityThread.systemMain()`, the way to a
+  Context with no Activity, creates a Handler, and `app_process` starts with no
+  main Looper.
+
+The helper owns the `ImageReader` behind the display, which is why frames leave
+as PNG — a `Surface` cannot cross a `LocalSocket`.
 
 ### Checking it on one device, without the app
 

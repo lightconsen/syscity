@@ -50,6 +50,9 @@
       "infoPlist": "Info.plist",
       "entitlements": "entitlements.plist",
       "minimumSystemVersion": "10.15"
+    },
+    "android": {
+      "minSdkVersion": 26
     }
   },
   "plugins": {

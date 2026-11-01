@@ -1,5 +1,7 @@
 package net.syscity.desktop.helper
 
+import android.content.Context
+import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -8,6 +10,7 @@ import android.media.ImageReader
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.Build
+import android.os.Looper
 import android.os.Process
 import android.util.Base64
 import android.view.Surface
@@ -16,6 +19,37 @@ import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
+
+/**
+ * `DisplayManager.VIRTUAL_DISPLAY_FLAG_*`, by value.
+ *
+ * Only the first five are public API. The rest are `@hide`: they exist in the
+ * platform and it honours them, but they are absent from the SDK stubs, so the
+ * names do not compile. This process runs under `app_process`, outside the
+ * hidden-API check, which is exactly why it can use the values the app cannot.
+ */
+/**
+ * The package that owns uid 2000.
+ *
+ * Creating a display is attributed to a package, and the display service
+ * rejects the call when that package's uid is not the caller's. The system
+ * Context reports `android` (uid 1000), so asking the platform "may I?" on
+ * its behalf fails with `packageName must match the calling uid` — naming
+ * the shell package is both true and what the check wants.
+ */
+private const val SHELL_PACKAGE = "com.android.shell"
+
+private object DisplayFlags {
+  const val PUBLIC = 1 shl 0
+  const val OWN_CONTENT_ONLY = 1 shl 3
+  const val SUPPORTS_TOUCH = 1 shl 6
+  const val ROTATES_WITH_CONTENT = 1 shl 7
+  const val TRUSTED = 1 shl 10
+  const val OWN_DISPLAY_GROUP = 1 shl 11
+  const val ALWAYS_UNLOCKED = 1 shl 12
+  const val OWN_FOCUS = 1 shl 13
+  const val STEAL_TOP_FOCUS_DISABLED = 1 shl 14
+}
 
 /**
  * The process that creates the agent's display.
@@ -57,6 +91,12 @@ object HelperMain {
 
   @JvmStatic
   fun main(args: Array<String>) {
+    // `ActivityThread.systemMain()` — the way to a Context with no Activity —
+    // builds a Handler, and a Handler needs a main Looper. `app_process` starts
+    // with none, so the context creation fails with "Can't create handler
+    // inside thread main that has not called Looper.prepare()".
+    runCatching { Looper.prepareMainLooper() }
+
     val uid = Process.myUid()
     if (uid != SHELL_UID && uid != 0) {
       // Starting it any other way (an app process, the wrong uid) produces a
@@ -68,8 +108,15 @@ object HelperMain {
       System.exit(2)
     }
 
+    // `--hold=<seconds>` keeps the display alive after the self-test, which is
+    // the only way to look at it from the host: `adb shell dumpsys window
+    // displays` can then say whether the app actually landed on it.
+    val holdSeconds = args.firstOrNull { it.startsWith("--hold=") }
+      ?.removePrefix("--hold=")
+      ?.toIntOrNull()
+      ?: 0
     if (args.contains("--selftest")) {
-      System.exit(runSelfTest())
+      System.exit(runSelfTest(holdSeconds))
     }
 
     val server = try {
@@ -115,7 +162,7 @@ object HelperMain {
    * non-default display, and whether frames and input follow the display id
    * rather than the user's screen.
    */
-  private fun runSelfTest(): Int {
+  private fun runSelfTest(holdSeconds: Int): Int {
     println("syscity: selftest — api=${Build.VERSION.SDK_INT} uid=${Process.myUid()}")
 
     val display = try {
@@ -161,6 +208,11 @@ object HelperMain {
       } catch (e: Exception) {
         println("syscity: FAIL tap: ${e.message}")
         failures++
+      }
+      if (holdSeconds > 0) {
+        println("syscity: holding display ${display.id} for ${holdSeconds}s")
+        System.out.flush()
+        Thread.sleep(holdSeconds * 1000L)
       }
     } finally {
       display.release()
@@ -460,20 +512,15 @@ private class AgentDisplay private constructor(
       val densityDpi = if (dpi > 0) dpi else 420
 
       val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-      var flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-        DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-        DisplayManager.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH or
-        DisplayManager.VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT
+      var flags = DisplayFlags.PUBLIC or DisplayFlags.OWN_CONTENT_ONLY or
+        DisplayFlags.SUPPORTS_TOUCH or DisplayFlags.ROTATES_WITH_CONTENT
       if (Build.VERSION.SDK_INT >= 33) {
-        flags = flags or DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED or
-          DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP or
-          DisplayManager.VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED
+        flags = flags or DisplayFlags.TRUSTED or DisplayFlags.OWN_DISPLAY_GROUP or DisplayFlags.ALWAYS_UNLOCKED
       }
       if (Build.VERSION.SDK_INT >= 34) {
         // Separate focus per display: the user keeps typing on their screen
         // while the agent types on this one.
-        flags = flags or DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_FOCUS or
-          DisplayManager.VIRTUAL_DISPLAY_FLAG_STEAL_TOP_FOCUS_DISABLED
+        flags = flags or DisplayFlags.OWN_FOCUS or DisplayFlags.STEAL_TOP_FOCUS_DISABLED
       }
 
       val (display, signature) = createVirtualDisplay(w, h, densityDpi, reader.surface, flags)
@@ -481,13 +528,18 @@ private class AgentDisplay private constructor(
     }
 
     /**
-     * `DisplayManagerGlobal.createVirtualDisplay`, by reflection.
+     * Create the display, preferring the public `DisplayManager` API.
      *
-     * It is a hidden API and its signature has grown across releases (the
-     * package name arrived in API 34), so both shapes are tried and the failure
-     * reports which one was attempted. Running under `app_process` puts this
-     * process outside the hidden-API blocklist, which is why reflection works
-     * here and would not from the app.
+     * The obvious route — `DisplayManagerGlobal.createVirtualDisplay` by
+     * reflection — is the one that broke: on API 34+ that class keeps only a
+     * `(Context, MediaProjection, VirtualDisplayConfig, Callback, Executor)`
+     * overload, and the `(String, int, int, int, Surface, int, …)` shape it
+     * used to have is gone. `DisplayManager` itself still has both, and only
+     * ever needed the one thing a bare `app_process` lacks: a `Context`.
+     *
+     * `ActivityThread.systemMain().getSystemContext()` supplies one without an
+     * Activity or an app — the same trick a shell tool uses to reach system
+     * services at all.
      */
     private fun createVirtualDisplay(
       width: Int,
@@ -496,17 +548,185 @@ private class AgentDisplay private constructor(
       surface: Surface,
       flags: Int,
     ): Pair<VirtualDisplay, String> {
-      val global = Class.forName("android.hardware.display.DisplayManagerGlobal")
-        .getMethod("getInstance")
-        .invoke(null)
-        ?: throw IllegalStateException("DisplayManagerGlobal.getInstance() returned null")
-
       val attempts = mutableListOf<String>()
-      // Newest first: API 34 added the calling package, API 30 added the
-      // VirtualDisplayConfig argument.
+
+      val context = systemContext(attempts)
+      if (context == null) {
+        attempts.add("no system Context")
+      } else {
+        val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        if (displayManager == null) {
+          attempts.add("no DisplayManager from the system Context")
+        } else {
+          // API 34+: (VirtualDisplayConfig, Callback, Handler)
+          viaConfig(displayManager, width, height, dpi, surface, flags)
+            ?.let { return it }
+            ?: attempts.add("DisplayManager#createVirtualDisplay(VirtualDisplayConfig,…) not found")
+
+          // API 1+: (String, int, int, int, Surface, int)
+          runCatching {
+            displayManager.javaClass.methods.first { method ->
+              method.name == "createVirtualDisplay" &&
+                method.parameterCount == 6 &&
+                method.parameterTypes[0] == String::class.java &&
+                method.parameterTypes[4] == Surface::class.java
+            }
+          }.getOrNull()?.let { method ->
+            runCatching {
+              method.invoke(displayManager, "syscity-agent", width, height, dpi, surface, flags)
+            }.onSuccess { created ->
+              if (created is VirtualDisplay) return created to "DisplayManager/6"
+              attempts.add("DisplayManager/6 returned ${created?.javaClass?.name}")
+            }.onFailure { attempts.add("DisplayManager/6: ${it.cause?.message ?: it.message}") }
+          } ?: attempts.add("DisplayManager#createVirtualDisplay(String,…) not found")
+        }
+      }
+
+      // Last resort: the hidden class. On API 34+ its only overload takes a
+      // Context, a MediaProjection and a config; both projections are nullable,
+      // and the Context is there for attribution — so a null one may be enough
+      // for a caller that is already shell.
+      runCatching { createViaDisplayManagerGlobal(width, height, dpi, surface, flags, attempts) }
+        .getOrNull()?.let { return it }
+      runCatching {
+        val shell = shellContext(attempts)
+        createViaConfigGlobal(shell, width, height, dpi, surface, flags, attempts)
+      }.getOrNull()?.let { return it }
+
+      val available = runCatching {
+        val global = Class.forName("android.hardware.display.DisplayManagerGlobal")
+          .getMethod("getInstance").invoke(null)
+        global!!.javaClass.methods
+          .filter { it.name == "createVirtualDisplay" }
+          .joinToString("; ") { "(" + it.parameterTypes.joinToString(", ") { t -> t.simpleName } + ")" }
+      }.getOrDefault("unavailable")
+
+      throw IllegalStateException(
+        "could not create a virtual display on API ${Build.VERSION.SDK_INT} " +
+          "(tried: ${attempts.joinToString("; ").ifEmpty { "nothing" }}; " +
+          "DisplayManagerGlobal has: $available)",
+      )
+    }
+
+    /** The system Context, told to name the shell package. */
+    private fun shellContext(attempts: MutableList<String>): Context? =
+      systemContext(attempts)?.let { ShellContext(it) }
+
+    /** A Context that reports the shell package, so the display service accepts the call. */
+    private class ShellContext(base: Context) : ContextWrapper(base) {
+      override fun getPackageName(): String = SHELL_PACKAGE
+    }
+
+    /** The system Context, without an Activity. */
+    private fun systemContext(attempts: MutableList<String>): Context? {
+      return runCatching {
+        val activityThread = Class.forName("android.app.ActivityThread")
+        val systemMain = activityThread.getMethod("systemMain").invoke(null)
+        systemMain!!.javaClass.getMethod("getSystemContext").invoke(systemMain) as Context
+      }.onFailure {
+        attempts.add("systemContext: ${it.cause?.message ?: it.message}")
+      }.getOrNull()
+    }
+
+    /**
+     * `DisplayManager.createVirtualDisplay(VirtualDisplayConfig, Callback, Handler)`,
+     * with the config built by reflection because the class is `@hide` in the
+     * SDK stubs — the platform still honours it.
+     */
+    private fun viaConfig(
+      displayManager: DisplayManager,
+      width: Int,
+      height: Int,
+      dpi: Int,
+      surface: Surface,
+      flags: Int,
+    ): Pair<VirtualDisplay, String>? = runCatching {
+      val configClass = Class.forName("android.hardware.display.VirtualDisplayConfig")
+      val builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+      val builder = builderClass
+        .getConstructor(
+          String::class.java,
+          Int::class.javaPrimitiveType,
+          Int::class.javaPrimitiveType,
+          Int::class.javaPrimitiveType,
+        )
+        .newInstance("syscity-agent", width, height, dpi)
+      builderClass.getMethod("setSurface", Surface::class.java).invoke(builder, surface)
+      builderClass.getMethod("setFlags", Int::class.javaPrimitiveType).invoke(builder, flags)
+      val config = builderClass.getMethod("build").invoke(builder)
+
+      val method = displayManager.javaClass.methods.firstOrNull { candidate ->
+        candidate.name == "createVirtualDisplay" &&
+          candidate.parameterCount == 3 &&
+          candidate.parameterTypes[0] == configClass
+      } ?: return null
+      val created = method.invoke(displayManager, config, null, null)
+      (created as? VirtualDisplay)?.let { it to "DisplayManager/VirtualDisplayConfig" }
+    }.getOrNull()
+
+    /**
+     * `DisplayManagerGlobal.createVirtualDisplay(Context, MediaProjection,
+     * VirtualDisplayConfig, Callback, Executor)` — the shape API 34+ kept.
+     */
+    private fun createViaConfigGlobal(
+      context: Context?,
+      width: Int,
+      height: Int,
+      dpi: Int,
+      surface: Surface,
+      flags: Int,
+      attempts: MutableList<String>,
+    ): Pair<VirtualDisplay, String>? {
+      val global = Class.forName("android.hardware.display.DisplayManagerGlobal")
+        .getMethod("getInstance").invoke(null)
+        ?: return null
+      val configClass = Class.forName("android.hardware.display.VirtualDisplayConfig")
+      val builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+      val builder = builderClass
+        .getConstructor(
+          String::class.java,
+          Int::class.javaPrimitiveType,
+          Int::class.javaPrimitiveType,
+          Int::class.javaPrimitiveType,
+        )
+        .newInstance("syscity-agent", width, height, dpi)
+      builderClass.getMethod("setSurface", Surface::class.java).invoke(builder, surface)
+      builderClass.getMethod("setFlags", Int::class.javaPrimitiveType).invoke(builder, flags)
+      val config = builderClass.getMethod("build").invoke(builder)
+
+      val method = global.javaClass.methods.firstOrNull { candidate ->
+        candidate.name == "createVirtualDisplay" &&
+          candidate.parameterCount == 5 &&
+          candidate.parameterTypes[2] == configClass
+      } ?: run {
+        attempts.add("Global/config: no 5-arg createVirtualDisplay")
+        return null
+      }
+      val outcome = runCatching { method.invoke(global, context, null, config, null, null) }
+      outcome.onFailure { attempts.add("Global/config: ${it.cause?.message ?: it.message}") }
+      val created = outcome.getOrNull()
+      if (created !is VirtualDisplay) {
+        attempts.add("Global/config returned ${created?.javaClass?.name}")
+        return null
+      }
+      return created to "DisplayManagerGlobal/config"
+    }
+
+    /** The hidden `DisplayManagerGlobal`, for builds that still expose the old shape. */
+    private fun createViaDisplayManagerGlobal(
+      width: Int,
+      height: Int,
+      dpi: Int,
+      surface: Surface,
+      flags: Int,
+      attempts: MutableList<String>,
+    ): Pair<VirtualDisplay, String>? {
+      val global = Class.forName("android.hardware.display.DisplayManagerGlobal")
+        .getMethod("getInstance").invoke(null)
+        ?: return null
       val argumentLists = listOf(
         arrayOf("syscity-agent", width, height, dpi, surface, flags, null, null, null,
-          "net.syscity.desktop"),
+          SHELL_PACKAGE),
         arrayOf("syscity-agent", width, height, dpi, surface, flags, null, null, null),
         arrayOf("syscity-agent", width, height, dpi, surface, flags),
       )
@@ -519,33 +739,21 @@ private class AgentDisplay private constructor(
             else -> Any::class.java
           }
         }
-        try {
-          val method = global.javaClass.methods.firstOrNull { candidate ->
-            candidate.name == "createVirtualDisplay" &&
-              candidate.parameterCount == arguments.size &&
-              candidate.parameterTypes.indices.all { index ->
-                types[index] == Any::class.java || candidate.parameterTypes[index] == types[index]
-              }
-          } ?: continue
-          val created = method.invoke(global, *arguments)
-          if (created is VirtualDisplay) {
-            return created to "${method.parameterCount} args"
+        val method = global.javaClass.methods.firstOrNull { candidate ->
+          candidate.name == "createVirtualDisplay" &&
+            candidate.parameterCount == arguments.size &&
+            candidate.parameterTypes.indices.all { index ->
+              types[index] == Any::class.java || candidate.parameterTypes[index] == types[index]
+            }
+        } ?: continue
+        runCatching { method.invoke(global, *arguments) }
+          .onSuccess { created ->
+            if (created is VirtualDisplay) return created to "DisplayManagerGlobal/${arguments.size}"
+            attempts.add("Global/${arguments.size} returned ${created?.javaClass?.name}")
           }
-          // A method with the right shape that returns something else means the
-          // signature matched but the platform refused — worth naming, or the
-          // failure reads as "no matching method" and sends the reader looking
-          // in the wrong place.
-          attempts.add("${arguments.size} args: returned ${created?.javaClass?.name}")
-        } catch (e: Exception) {
-          attempts.add(
-            "${arguments.size} args: ${e.cause?.message ?: e.message}",
-          )
-        }
+          .onFailure { attempts.add("Global/${arguments.size}: ${it.cause?.message ?: it.message}") }
       }
-      throw IllegalStateException(
-        "could not create a virtual display on API ${Build.VERSION.SDK_INT} " +
-          "(tried: ${attempts.joinToString("; ").ifEmpty { "no matching method" }})",
-      )
+      return null
     }
   }
 }

@@ -303,7 +303,9 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
    *  application accepted the handoff. */
   @Command
   fun openUrl(invoke: Invoke) {
-    val url = invoke.getArgs().getString("url", "")
+    // `getString(key, default)` is nullable in this SDK; optString is not,
+    // and an empty URL is rejected below anyway.
+    val url = invoke.getArgs().optString("url", "")
     val scheme = url.substringBefore(':').lowercase(Locale.US)
     if (url.isEmpty() ||
       url.any { it.isISOControl() } ||

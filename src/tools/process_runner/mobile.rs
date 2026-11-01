@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{CommandOutput, ProcessChild, ProcessError, ProcessRequest, ProcessRunner};
+use super::{
+    CommandOutput, ProcessChild, ProcessError, ProcessRequest, ProcessRunner, StdProcessRunner,
+};
 
 /// Android: the only executable entry points are `/system/bin/sh` (which
 /// resolves the toybox applets by its built-in PATH) and bundled native
@@ -18,7 +20,7 @@ use super::{CommandOutput, ProcessChild, ProcessError, ProcessRequest, ProcessRu
 #[derive(Debug, Clone)]
 pub struct AndroidShellRunner {
     native_library_dir: Option<PathBuf>,
-    whitelist: Arc<std::collections::HashSet<&'static str>>,
+    whitelist: Arc<HashSet<&'static str>>,
     inner: StdProcessRunner,
 }
 
