@@ -59,6 +59,12 @@ PACKAGES=(
 
 JNI_LIB_DIR="${SYSCITY_JNI_DIR:-$REPO_ROOT/desktop/gen/android/app/src/main/jniLibs/arm64-v8a}"
 
+# Two of these ship under a plain `.so` name even though their SONAME keeps the
+# version (`libz.so.1`, `libzstd.so.1`): Android's APK packaging only extracts
+# files whose name ends in `.so`, so a file called `libz.so.1` never reaches the
+# device. The app preloads them by path (see `apply_bundled_library_path`),
+# which registers them under the SONAME the executable asks for.
+#
 # Files to install, mapped from the extracted package layout. "->" rewrites a
 # versioned file to an unversioned SONAME as a real copy (Android APK native
 # lib extraction does not reliably preserve symlinks).
@@ -70,42 +76,33 @@ INSTALL_RULES=(
   "android-tools|data/data/com.termux/files/usr/bin/adb|libadb.so"
   "libprotobuf|data/data/com.termux/files/usr/lib/libprotobuf.so|libprotobuf.so"
   "libprotobuf|data/data/com.termux/files/usr/lib/libutf8_validity.so|libutf8_validity.so"
-  "zlib|data/data/com.termux/files/usr/lib/libz.so.1.3.2|libz.so.1"
+  "zlib|data/data/com.termux/files/usr/lib/libz.so.1.3.2|libz.so"
   "brotli|data/data/com.termux/files/usr/lib/libbrotlicommon.so|libbrotlicommon.so"
   "brotli|data/data/com.termux/files/usr/lib/libbrotlidec.so|libbrotlidec.so"
   "brotli|data/data/com.termux/files/usr/lib/libbrotlienc.so|libbrotlienc.so"
   "liblz4|data/data/com.termux/files/usr/lib/liblz4.so|liblz4.so"
-  "zstd|data/data/com.termux/files/usr/lib/libzstd.so.1.5.7|libzstd.so.1"
+  "zstd|data/data/com.termux/files/usr/lib/libzstd.so.1.5.7|libzstd.so"
+  "fmt|data/data/com.termux/files/usr/lib/libfmt.so|libfmt.so"
+  "libc++|data/data/com.termux/files/usr/lib/libc++_shared.so|libc++_shared.so"
 )
-# NOTE: libc++_shared.so is intentionally NOT installed. The app already ships
-# its own NDK build at jniLibs/arm64-v8a/libc++_shared.so; adb's NEEDED
-# `libc++_shared.so` resolves to it from nativeLibraryDir at exec time. A
-# renamed copy cannot satisfy the SONAME, so installing one would be dead
-# weight (and clobbering the app's own copy risks breaking startup).
+# NOTE: `libc++_shared.so` IS installed, from Termux's package.
+#
+# This used to be skipped on the assumption that the app shipped its own NDK
+# copy, which adb's `NEEDED libc++_shared.so` would resolve. It does not: the
+# Rust build links libc++ statically, so nothing named `libc++_shared.so`
+# existed, and adb failed to start with "library libc++_shared.so not found".
+# The file is only reachable through the bundled-exec path, so it cannot affect
+# the app's own code.
 
 # libprotobuf's abseil dependency closure: every libabsl_*.so it links.
 # Collected with llvm-readelf -d on libprotobuf.so (see fetch script header).
-ABSEIL_DEPS=(
-  "libabsl_base.so"
-  "libabsl_cord.so"
-  "libabsl_cord_internal.so"
-  "libabsl_cordz_info.so"
-  "libabsl_die_if_null.so"
-  "libabsl_hash.so"
-  "libabsl_log_internal_check_op.so"
-  "libabsl_log_internal_conditions.so"
-  "libabsl_log_internal_message.so"
-  "libabsl_log_internal_nullguard.so"
-  "libabsl_raw_hash_set.so"
-  "libabsl_spinlock_wait.so"
-  "libabsl_status.so"
-  "libabsl_statusor.so"
-  "libabsl_str_format_internal.so"
-  "libabsl_strings.so"
-  "libabsl_synchronization.so"
-  "libabsl_time.so"
-  "libabsl_time_zone.so"
-)
+# Every libabsl_*.so the abseil package ships, rather than a hand-kept list.
+#
+# The list used to be read off `libprotobuf.so` with llvm-readelf, which was
+# true until abseil and android-tools moved a major version independently:
+# `adb` then failed at startup with `library "libabsl_vlog_config_internal.so"
+# not found`. The package is the authority on what it provides.
+ABSEIL_GLOB="libabsl_*.so"
 
 # The libraries AndroidShellRunner must make discoverable via LD_LIBRARY_PATH
 # when exec'ing the bundled adb (its RUNPATH points at a Termux path that does
@@ -114,12 +111,12 @@ ABSEIL_DEPS=(
 INSTALLED_LIBS=(
   "libprotobuf.so"
   "libutf8_validity.so"
-  "libz.so.1"
+  "libz.so"
   "libbrotlicommon.so"
   "libbrotlidec.so"
   "libbrotlienc.so"
   "liblz4.so"
-  "libzstd.so.1"
+  "libzstd.so"
 )
 
 help() {
@@ -129,6 +126,7 @@ help() {
 verify_only() {
   local missing=()
   [[ -f "$JNI_LIB_DIR/libadb.so" ]] || missing+=("libadb.so")
+  compgen -G "$JNI_LIB_DIR/libabsl_*.so" >/dev/null || missing+=("libabsl_*.so")
   for lib in "${INSTALLED_LIBS[@]}"; do
     [[ -f "$JNI_LIB_DIR/$lib" ]] || missing+=("$lib")
   done
@@ -226,11 +224,15 @@ for entry in "${INSTALL_RULES[@]}"; do
   install_file "$pkg_dir/$rel" "$JNI_LIB_DIR/$dst"
 done
 
-# abseil closure
+# abseil closure — whatever the package provides
 absl_dir="$STAGE/abseil-cpp"
 [[ -d "$absl_dir" ]] || extract_deb "abseil-cpp" "$absl_dir"
-for lib in "${ABSEIL_DEPS[@]}"; do
-  install_file "$absl_dir/data/data/com.termux/files/usr/lib/$lib" "$JNI_LIB_DIR/$lib"
+absl_libs_dir="$absl_dir/data/data/com.termux/files/usr/lib"
+# shellcheck disable=SC2206  # the glob is meant to expand into the array
+mapfile -t absl_libs < <(compgen -G "$absl_libs_dir/$ABSEIL_GLOB" || true)
+[[ ${#absl_libs[@]} -gt 0 ]] || die "abseil-cpp shipped no libraries — the pin is wrong"
+for lib_path in "${absl_libs[@]}"; do
+  install_file "$lib_path" "$JNI_LIB_DIR/$(basename "$lib_path")"
 done
 
 # ── provenance report ───────────────────────────────────────────────────────

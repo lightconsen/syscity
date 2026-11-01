@@ -128,6 +128,18 @@ impl AndroidShellRunner {
     /// exist here. Bionic honors `LD_LIBRARY_PATH` for non-setuid app
     /// processes, so set it to nativeLibraryDir for the bundled-exec path.
     /// `sh`/toybox need nothing (they only use bionic) and are untouched.
+    /// Where the bundled adb keeps its keys and settings.
+    ///
+    /// adb creates `$HOME/.android` on first use and **aborts** when it cannot
+    /// (`Cannot mkdir '/data/data/com.termux/files/home/.android'`) — that is
+    /// Termux's home baked into the binary, which does not exist here. The app
+    /// sandbox is the only writable place it has.
+    fn bundled_home() -> std::path::PathBuf {
+        std::env::var("SYSCITY_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("data/adb"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("syscity-adb"))
+    }
+
     fn apply_bundled_library_path(&self, eff: &mut ProcessRequest) {
         let Some(dir) = &self.native_library_dir else {
             return;
@@ -136,8 +148,32 @@ impl AndroidShellRunner {
             return;
         };
         if dir.join(program).exists() {
+            let dir_str = dir.to_string_lossy().into_owned();
             eff.env
-                .insert("LD_LIBRARY_PATH".to_string(), dir.to_string_lossy().into_owned());
+                .insert("LD_LIBRARY_PATH".to_string(), dir_str.clone());
+
+            // `libz` and `libzstd` keep a versioned SONAME (`libz.so.1`) that
+            // the executable asks for, but have to ship as plain `libz.so`:
+            // Android's APK packaging only extracts names ending in `.so`.
+            // Preloading them by path registers each under its SONAME, which is
+            // what the dynamic linker then resolves `NEEDED libz.so.1` against.
+            let preload: Vec<String> = ["libz.so", "libzstd.so"]
+                .iter()
+                .map(|name| dir.join(name))
+                .filter(|path| path.exists())
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            if !preload.is_empty() {
+                eff.env.insert("LD_PRELOAD".to_string(), preload.join(":"));
+            }
+
+            // adb's own config root. `HOME` for the older lookup, the
+            // dedicated variable for current adb; both point at the same
+            // sandbox directory, created by the caller before the spawn.
+            let home = Self::bundled_home();
+            let home_str = home.to_string_lossy().into_owned();
+            eff.env.insert("HOME".to_string(), home_str.clone());
+            eff.env.insert("ANDROID_USER_HOME".to_string(), home_str);
         }
     }
 }
@@ -149,6 +185,7 @@ impl ProcessRunner for AndroidShellRunner {
         let mut eff = req.clone();
         eff.argv = self.resolve_argv(req)?;
         self.apply_bundled_library_path(&mut eff);
+        let _ = tokio::fs::create_dir_all(Self::bundled_home()).await;
         self.inner.run(&eff).await
     }
 
@@ -156,6 +193,7 @@ impl ProcessRunner for AndroidShellRunner {
         let mut eff = req.clone();
         eff.argv = self.resolve_argv(req)?;
         self.apply_bundled_library_path(&mut eff);
+        let _ = tokio::fs::create_dir_all(Self::bundled_home()).await;
         self.inner.run_collect(&eff).await
     }
 
