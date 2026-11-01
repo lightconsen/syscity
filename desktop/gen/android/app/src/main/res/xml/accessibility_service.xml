@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Configuration for SyscityAccessibilityService.
+
+  `canRetrieveWindowContent` is what makes the tree available at all;
+  `canPerformGestures` is unused today (input still goes through ADB, and will
+  move here with the virtual display) but turning it on later would otherwise
+  require the user to toggle the service off and on again.
+
+  The event types are deliberately narrow: the service takes snapshots on
+  request and keeps no history, so subscribing to a stream of events would only
+  wake the process for nothing.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

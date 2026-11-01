@@ -178,6 +178,21 @@ every tree read is graded `usable / partial / unusable`; below usable the tool
 falls back to OCR and returns the text as tappable lines rather than an empty
 list.
 
+### Where the tree comes from
+
+Two sources produce the same `UiElement` list, so everything above works
+identically whichever one answered:
+
+| Source | When | Cost |
+|---|---|---|
+| **Accessibility service** (in-process, `SyscityAccessibilityService`) | the host *is* the phone and the user has enabled it in Settings › Accessibility | one bridge call |
+| **`uiautomator dump`** (ADB) | every other case: a desktop driving a remote phone, or the phone with the service off | a subprocess plus an `/sdcard` round trip |
+
+The result says which one it used (`source`), because a read that disagrees with
+what you expected should be traceable to where it came from. The in-process path
+is also the prerequisite for reading a display other than the default one, which
+is what a virtual display needs.
+
 ## Capability Registry
 
 `PlatformCapabilityRegistry` holds all registered sets, checks platform constraints at runtime, and exports available tools into `ToolRegistry`.

@@ -1,4 +1,7 @@
 <resources>
     <string name="app_name">Syscity</string>
+    <!-- Shown on the system accessibility screen: say what it is for, because
+         that screen is the last place a user should have to guess. -->
+    <string name="accessibility_service_description">Lets the Syscity agent read the screen and carry out what you asked for — the same hands you would use, on apps that expose no other way in. Syscity only reads the screen while it is doing a task you started.</string>
     <string name="main_activity_title">Syscity</string>
 </resources>

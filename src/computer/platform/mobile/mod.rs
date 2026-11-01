@@ -7,6 +7,7 @@
 //! Both sets are platform-agnostic — they can run on any host OS as long as
 //! the corresponding CLI tools are installed.
 
+pub mod a11y;
 pub mod android;
 pub mod android_tools;
 pub mod ios;

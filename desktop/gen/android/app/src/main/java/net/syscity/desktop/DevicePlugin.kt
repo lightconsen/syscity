@@ -13,6 +13,7 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.net.Uri
 import android.provider.MediaStore
+import android.provider.Settings
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -441,5 +442,57 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
       out.put("scheduled", jobs.size)
       mainHandler.post { invoke.resolve(out) }
     }
+  }
+
+  // ─────────────────────────────────────────────
+  // Accessibility tree (on-device agent reads the screen)
+  // ─────────────────────────────────────────────
+
+  /**
+   * `accessibilityTree` — the focused window as JSON.
+   *
+   * Answers `{"enabled": false}` when the service is off, which the Rust side
+   * treats as "fall back to ADB" rather than as a failure: the desktop agent
+   * driving a remote phone reaches this same code path with no service at all.
+   */
+  @Command
+  fun accessibilityTree(invoke: Invoke) {
+    val snapshot = A11yBridge.snapshot()
+    if (snapshot == null) {
+      invoke.resolve(JSObject().put("enabled", false))
+      return
+    }
+    invoke.resolve(snapshot)
+  }
+
+  /** `accessibilityStatus` — is the service switched on, and is it connected? */
+  @Command
+  fun accessibilityStatus(invoke: Invoke) {
+    val out = JSObject()
+    out.put("enabled", A11yBridge.isEnabled(appActivity))
+    out.put("connected", A11yBridge.isConnected())
+    invoke.resolve(out)
+  }
+
+  /**
+   * `openAccessibilitySettings` — take the user where they can enable it.
+   *
+   * The grant itself is deliberately not automated: an app that can turn on its
+   * own screen-reading service without the user opening that screen is not
+   * something this should be able to do.
+   */
+  @Command
+  fun openAccessibilitySettings(invoke: Invoke) {
+    val out = JSObject()
+    try {
+      val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      appActivity.startActivity(intent)
+      out.put("opened", true)
+    } catch (e: Exception) {
+      invoke.reject("Could not open the accessibility settings: ${e.message}", "NO_SETTINGS")
+      return
+    }
+    invoke.resolve(out)
   }
 }

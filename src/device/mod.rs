@@ -6,9 +6,10 @@
 //! single seam through which the Rust runtime reaches the platform's native
 //! APIs — camera, geolocation, notifications, haptics, SAF file picking,
 //! loopback-ADB pairing (mobile-migration §4.1/§4.2/§4.5), the
-//! Shortcuts/AppIntents bus (§4.6), and URL handoff to the OS (`tel:`,
+//! Shortcuts/AppIntents bus (§4.6), URL handoff to the OS (`tel:`,
 //! `mailto:`, `sms:`, `https?` — the dialer/mail/messages/browser route,
-//! where the user confirms in the target app).
+//! where the user confirms in the target app), and the accessibility tree
+//! the Android toolset reads other apps through.
 //!
 //! Desktop builds never construct a bridge: `GatewayState.device.bridge`
 //! stays `None`, every `device_*` tool reports unavailable, and each
@@ -75,6 +76,39 @@ pub const CMD_SHORTCUT_INBOX: &str = "shortcutInbox";
 /// Hand a URL to the OS (`tel:`/`mailto:`/`sms:`/`https?` → dialer, mail
 /// composer, messages, browser). The user confirms in the target app.
 pub const CMD_OPEN_URL: &str = "openUrl";
+
+/// Dump the current screen's accessibility tree (Android, in-process only).
+///
+/// The tree is what the platform's own accessibility API sees, which is both
+/// richer than `uiautomator dump` (every node, not only the actionable ones)
+/// and cheaper (no subprocess, no `/sdcard` round trip). It is only available
+/// while Syscity's own [`SyscityAccessibilityService`] is enabled — the
+/// Kotlin side answers `{"enabled": false}` otherwise, and the caller falls
+/// back to ADB.
+pub const CMD_A11Y_TREE: &str = "accessibilityTree";
+/// Whether the accessibility service is enabled and connected.
+pub const CMD_A11Y_STATUS: &str = "accessibilityStatus";
+/// Open the system accessibility settings, where the user enables the service.
+pub const CMD_A11Y_SETTINGS: &str = "openAccessibilitySettings";
+
+/// The bridge, for code that cannot be handed one.
+///
+/// The Android toolset reads the accessibility tree from deep inside its read
+/// path (`dump_ui` → `settle_after_action` → the effect check), which is far
+/// below where a bridge could sensibly be threaded through. On desktop this
+/// stays empty — nothing installs a bridge there — so the lookup costs a
+/// `OnceLock::get` and changes nothing.
+static BRIDGE: std::sync::OnceLock<DeviceBridgeRef> = std::sync::OnceLock::new();
+
+/// Publish `bridge` process-wide. Idempotent: the first call wins.
+pub fn install_bridge(bridge: DeviceBridgeRef) {
+    let _ = BRIDGE.set(bridge);
+}
+
+/// The process-wide bridge, if one was installed.
+pub fn bridge() -> Option<&'static DeviceBridgeRef> {
+    BRIDGE.get()
+}
 
 /// The native device bridge.
 ///

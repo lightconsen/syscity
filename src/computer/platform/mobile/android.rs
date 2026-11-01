@@ -397,6 +397,7 @@ impl Tool for AdbObserveTool {
                 &base64::engine::general_purpose::STANDARD,
                 &png,
             ),
+            "source": dump.source,
             "screenshot": as_size(shot),
             "screen": dump.screen.map(|(w, h)| serde_json::json!({ "width": w, "height": h })),
             "coordinates_consistent": consistent,
@@ -1598,6 +1599,9 @@ pub struct UiDump {
     pub elements: Vec<UiElement>,
     /// Full-display size as the dump reports it (`None` if it had no root bounds).
     pub screen: Option<(i32, i32)>,
+    /// Where the tree came from: `accessibility` (in-process) or `uiautomator`
+    /// (ADB). Reported so a surprising read can be traced to its source.
+    pub source: &'static str,
 }
 
 pub(super) async fn dump_ui_elements(
@@ -1607,7 +1611,40 @@ pub(super) async fn dump_ui_elements(
 }
 
 /// Dump, pull and parse the tree in one go.
+///
+/// The in-process accessibility tree is preferred whenever it is available: one
+/// bridge call instead of a subprocess plus an `/sdcard` round trip, and the
+/// only source that can see a display other than the default one. It exists
+/// only on the phone itself and only while Syscity's accessibility service is
+/// on, so a desktop driving a remote device — and any phone with the service
+/// off — falls through to ADB exactly as before.
 pub(super) async fn dump_ui(device: &Option<String>) -> Result<UiDump, DumpFailure> {
+    if device.is_none() {
+        if let Some(bridge) = crate::device::bridge() {
+            match super::a11y::fetch(bridge).await {
+                Ok(snapshot) if snapshot.is_addressable() => {
+                    return Ok(UiDump {
+                        elements: snapshot.elements,
+                        screen: snapshot.display,
+                        source: "accessibility",
+                    });
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        "accessibility tree had no addressable nodes; falling back to uiautomator"
+                    );
+                }
+                Err(unavailable) => {
+                    tracing::debug!(
+                        code = unavailable.code,
+                        "accessibility tree unavailable: {}",
+                        unavailable.message
+                    );
+                }
+            }
+        }
+    }
+
     let xml = pull_ui_xml(device).await?;
     let elements = parse_uiautomator_xml(&xml).map_err(|source| {
         DumpFailure::new(
@@ -1618,6 +1655,7 @@ pub(super) async fn dump_ui(device: &Option<String>) -> Result<UiDump, DumpFailu
     Ok(UiDump {
         elements,
         screen: parse_screen_bounds(&xml),
+        source: "uiautomator",
     })
 }
 
@@ -1699,13 +1737,14 @@ impl Tool for AdbUiTreeTool {
         // The raw dump is an order of magnitude larger than what the model can
         // use, and the model would have to parse `bounds` itself to act on it.
         // Hand back an indexed list instead; the XML stays out of the context.
-        let elements = match dump_ui_elements(&device).await {
-            Ok(e) => e,
-            Err(e) => {
-                return Ok(ToolExecutionResult::error(e.message)
-                    .with_data(serde_json::json!({ "code": e.code })))
+        let dump = match dump_ui(&device).await {
+            Ok(dump) => dump,
+            Err(failure) => {
+                return Ok(ToolExecutionResult::error(failure.message)
+                    .with_data(serde_json::json!({ "code": failure.code })))
             }
         };
+        let elements = dump.elements;
         let quality = assess_tree(&elements);
         let mut summary = format_ui_summary(&elements);
         let mut ocr_text = None;
@@ -1731,6 +1770,7 @@ impl Tool for AdbUiTreeTool {
             "quality": quality.as_str(),
             "advice": quality.advice(),
             "ocr": ocr_text,
+            "source": dump.source,
             "elements": elements,
             "device": resolved_serial(&device).await,
         })))

@@ -122,8 +122,15 @@ mod mobile_device {
     pub(crate) fn bridge_from_app(
         app: &tauri::AppHandle,
     ) -> Option<Arc<dyn syscity::device::DeviceBridge>> {
-        app.try_state::<TauriDeviceBridge>()
-            .map(|b| Arc::new(b.inner().clone()) as Arc<dyn syscity::device::DeviceBridge>)
+        app.try_state::<TauriDeviceBridge>().map(|b| {
+            let bridge = Arc::new(b.inner().clone()) as Arc<dyn syscity::device::DeviceBridge>;
+            // Also publish it process-wide: the Android toolset reads the
+            // accessibility tree from inside its read path, where a bridge
+            // cannot be threaded through. Idempotent, so repeated calls are
+            // free.
+            syscity::device::install_bridge(bridge.clone());
+            bridge
+        })
     }
 }
 
