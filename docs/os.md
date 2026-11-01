@@ -240,6 +240,17 @@ syscity: SELFTEST OK
 It needs the APK installed but the app **not** running, which is what makes it a
 first checkpoint: if this fails, nothing above it can work.
 
+`scripts/android-display-check.sh` runs the whole sequence — build (which is
+also the first time the Kotlin is compiled), install, self-test — and turns the
+output into a verdict, including a warning if the user's focused window changed
+during the test, which is what a tap landing on the wrong display looks like:
+
+```bash
+./scripts/android-display-check.sh                 # build, install, self-test
+./scripts/android-display-check.sh --skip-build    # reuse the last APK
+./scripts/android-display-check.sh --device emulator-5554
+```
+
 Known limits, in the order they will bite:
 
 - **Android 13** has no per-display focus, so the user's screen can lose focus
