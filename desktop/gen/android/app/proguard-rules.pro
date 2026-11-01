@@ -19,3 +19,7 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+# The display helper is not an Activity or a Service Kotlin references: it is
+# started by name (`app_process ... net.syscity.desktop.helper.HelperMain`), so
+# R8 cannot see the entry point and would rename or drop it in a release build.
+-keep class net.syscity.desktop.helper.** { *; }

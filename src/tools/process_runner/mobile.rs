@@ -92,7 +92,15 @@ impl AndroidShellRunner {
         // Bundled native binary (exec from nativeLibraryDir is the only
         // allowed exec path for same-UID binaries on targetSdk 29+).
         if let Some(dir) = &self.native_library_dir {
-            let bundled = dir.join(program);
+            // APK packaging keeps only `*.so` in jniLibs, so the bundled adb
+            // ships as `libadb.so` (an ELF executable under a library name).
+            // Both spellings are tried: a tree that still has the older `adb`
+            // keeps working.
+            let bundled = if dir.join(program).exists() {
+                dir.join(program)
+            } else {
+                dir.join(format!("lib{program}.so"))
+            };
             if bundled.exists() {
                 let mut argv = vec![bundled.to_string_lossy().into_owned()];
                 argv.extend(req.argv[1..].iter().cloned());

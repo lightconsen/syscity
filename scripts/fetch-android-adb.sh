@@ -41,14 +41,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 #  cryptographically signed by the Termux maintainers.)
 BASE_URL="https://packages.termux.dev/apt/termux-main"
 PACKAGES=(
-  "android-tools|pool/main/a/android-tools/android-tools_36.0.1+really35.0.2_aarch64.deb|82e48bf8038250fb0997b1f2cf5f780730104f2544a5532298c453d94cfe1537"
-  "libprotobuf|pool/main/libp/libprotobuf/libprotobuf_2:35.1_aarch64.deb|a1ba7c7f0e5903a2134662653d3e7b9ffceaa78bdd00e07ac985e2d313ebc738"
-  "abseil-cpp|pool/main/a/abseil-cpp/abseil-cpp_20260526.0_aarch64.deb|e489fac652cddc39d9436141e627285f1034a545a06fbb19c420514a419ad877"
+  # android-tools 37 also needs pcre2 and liblzma (via pcre2), which 36 did
+  # not: the closure below is the transitive Depends of android-tools, taken
+  # from the same index the hashes come from.
+  "android-tools|pool/main/a/android-tools/android-tools_37.0.0p1-3_aarch64.deb|534e90d338bd432c06677cb402d0e9ed98a82a74de4bf5f90e643f15d8fc4274"
+  "libprotobuf|pool/main/libp/libprotobuf/libprotobuf_2:36.2-1_aarch64.deb|daa3b9169e094644ba95c35d40a5cc283473144decc7dae8396c49cc51440815"
+  "abseil-cpp|pool/main/a/abseil-cpp/abseil-cpp_20260817.0_aarch64.deb|b698963bb7096494ad928ce89cd869a53e6adf0b05f5f407b40fda9c85c6e2b0"
   "zlib|pool/main/z/zlib/zlib_1.3.2_aarch64.deb|75e7d0af17fcc3b40004309fdc00a1ddb9ae08346dce5e269902c34ac3966ac9"
-  "brotli|pool/main/b/brotli/brotli_1.2.0_aarch64.deb|db1502601d40fb44e6085ad8bfd9311a8b472e98db831ceec9d404c5708bb52c"
+  "brotli|pool/main/b/brotli/brotli_1.2.1_aarch64.deb|4fba29438b2b44f8470d52173b4548e938542dc2fc632f8699be5a284cbb9485"
   "liblz4|pool/main/libl/liblz4/liblz4_1.10.0-1_aarch64.deb|09b9449418d5c2dc4f5c1c140ba8138d56be3e9ae5fd3be3318825ec9f8a0499"
   "zstd|pool/main/z/zstd/zstd_1.5.7-1_aarch64.deb|e1b4a5113648da8de189620ba1fce74c48b2d0833d9043391b9a1c91fb606fd3"
-  "libc++|pool/main/libc/libc++/libc++_29_aarch64.deb|bb9f12113c137aa0e8513bb51cc49fe77a5ce3ca39ab9e92c57d228ecdf00222"
+  "libc++|pool/main/libc/libc++/libc++_30_aarch64.deb|53d0b84a7ba7459024257cb94d5b136fe13ef858567f65a8064b35950799f2ca"
+  "pcre2|pool/main/p/pcre2/pcre2_10.49_aarch64.deb|c27995e5f52b8ecc9b8b3e662eb08e49f82a18bfd3f34343936acc7b23964724"
+  "liblzma|pool/main/libl/liblzma/liblzma_5.8.4_aarch64.deb|44e95e6e60dddb3705e60a344a4f009a1085a210797342b721eaff41b44033c0"
+  "fmt|pool/main/f/fmt/fmt_1:12.2.0_aarch64.deb|4a2cb43ab167b32daf0d7978f21c5391d17bce47dae6aa2a8b3a8f958e663ce7"
 )
 
 JNI_LIB_DIR="${SYSCITY_JNI_DIR:-$REPO_ROOT/desktop/gen/android/app/src/main/jniLibs/arm64-v8a}"
@@ -57,7 +63,11 @@ JNI_LIB_DIR="${SYSCITY_JNI_DIR:-$REPO_ROOT/desktop/gen/android/app/src/main/jniL
 # versioned file to an unversioned SONAME as a real copy (Android APK native
 # lib extraction does not reliably preserve symlinks).
 INSTALL_RULES=(
-  "android-tools|data/data/com.termux/files/usr/bin/adb|adb"
+  # `adb` is installed as `libadb.so`: Android's APK packaging keeps only
+  # `*.so` in jniLibs, and silently drops anything else — so a file called
+  # `adb` never reaches the device. The executable is an ordinary ELF either
+  # way; `AndroidShellRunner` resolves the name.
+  "android-tools|data/data/com.termux/files/usr/bin/adb|libadb.so"
   "libprotobuf|data/data/com.termux/files/usr/lib/libprotobuf.so|libprotobuf.so"
   "libprotobuf|data/data/com.termux/files/usr/lib/libutf8_validity.so|libutf8_validity.so"
   "zlib|data/data/com.termux/files/usr/lib/libz.so.1.3.2|libz.so.1"
@@ -118,7 +128,7 @@ help() {
 
 verify_only() {
   local missing=()
-  [[ -f "$JNI_LIB_DIR/adb" ]] || missing+=("adb")
+  [[ -f "$JNI_LIB_DIR/libadb.so" ]] || missing+=("libadb.so")
   for lib in "${INSTALLED_LIBS[@]}"; do
     [[ -f "$JNI_LIB_DIR/$lib" ]] || missing+=("$lib")
   done
@@ -226,7 +236,7 @@ done
 # ── provenance report ───────────────────────────────────────────────────────
 echo ""
 echo "Installed into $JNI_LIB_DIR:"
-echo "  adb ($(du -h "$JNI_LIB_DIR/adb" | awk '{print $1}')) — android-tools 36.0.1, sha 82e48bf8038250fb…"
+echo "  libadb.so ($(du -h "$JNI_LIB_DIR/libadb.so" | awk '{print $1}')) — android-tools 37.0.0p1-3"
 echo "  libprotobuf.so + libutf8_validity.so — libprotobuf 2:35.1"
 echo "  $(find "$JNI_LIB_DIR" -maxdepth 1 -name 'libabsl_*.so' | wc -l | tr -d ' ') abseil libs — abseil-cpp 20260526.0 (libprotobuf closure)"
 printf '  %s\n' "${INSTALLED_LIBS[@]}"

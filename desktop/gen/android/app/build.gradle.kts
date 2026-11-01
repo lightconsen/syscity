@@ -21,6 +21,14 @@ val keystoreProperties = Properties().apply {
 }
 
 android {
+    // The bundled adb client is exec'd from `nativeLibraryDir`, which only
+    // exists if the installer extracts the native libraries. The modern
+    // default keeps them inside the APK, where nothing can be executed from —
+    // so the Android tools (and the display helper they start) silently
+    // disappear. `has_adb()` looks for a real file and finds none.
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
     compileSdk = 36
     namespace = "net.syscity.desktop"
     signingConfigs {

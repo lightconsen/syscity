@@ -45,7 +45,10 @@ pub fn bundled_native_dir() -> Option<std::path::PathBuf> {
 /// precedence, falling back to PATH (desktop bridge).
 pub fn has_adb() -> bool {
     bundled_native_dir()
-        .map(|dir| dir.join("adb").is_file())
+        // `libadb.so` is the packaged spelling: Android's APK pipeline keeps
+        // only `*.so` in jniLibs, so a plain `adb` file never reaches the
+        // device. `adb` is still checked for trees built before that.
+        .map(|dir| dir.join("adb").is_file() || dir.join("libadb.so").is_file())
         .unwrap_or(false)
         || has_command("adb")
 }
