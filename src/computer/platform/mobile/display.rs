@@ -33,7 +33,7 @@ pub const DISPLAY_BAD_RESPONSE: &str = "DISPLAY_BAD_RESPONSE";
 pub const DISPLAY_HELPER_ERROR: &str = "DISPLAY_HELPER_ERROR";
 
 /// The helper's main class, as launched by `app_process`.
-pub const HELPER_CLASS: &str = "net.syscity.desktop.helper.HelperMain";
+pub const HELPER_CLASS: &str = "net.syscity.desktop.shell.HelperMain";
 
 /// Why a display operation did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,9 +241,9 @@ async fn call(bridge: &DeviceBridgeRef, request: Value) -> Result<Value, Display
             DisplayError::new(
                 DISPLAY_UNAVAILABLE,
                 format!(
-                    "the display helper is not running — start it with `adb shell {}`, which \
-                     needs the loopback-ADB pairing ({e})",
-                    launch_command("<apk path>")
+                    "no display helper is attached. It is started by `ensure_helper` through \
+                     the loopback-ADB pairing, and it hands its Binder back — a helper started \
+                     by hand cannot do that ({e})"
                 ),
             )
         })?;
@@ -270,19 +270,76 @@ async fn call(bridge: &DeviceBridgeRef, request: Value) -> Result<Value, Display
     }
 }
 
-/// The shell command that starts the helper, given the app's APK path.
+/// The command that starts the helper, given the app's APK path.
 ///
-/// `app_process` runs a Java class with no Activity and no app sandbox: it
-/// inherits the identity of whatever started it, so starting it from `adb
-/// shell` gives the display the `CAPTURE_VIDEO_OUTPUT` it needs. The classpath
-/// is the installed APK — `pm path` reports it, and the shell can read it.
+/// The helper is `app_process`, which inherits the identity of whatever started
+/// it — `adb shell`, uid 2000 — and that identity is the whole point:
+/// `CAPTURE_VIDEO_OUTPUT` is unreachable from an app.
 ///
-/// The helper runs in the `shell` SELinux domain. An untagged app cannot open a
-/// unix socket there (`avc: denied { connectto } … untrusted_app → shell`), so
-/// what the app can reach of it is decided by the transport, not by this
-/// command line — see the module note.
-pub fn launch_command(apk_path: &str) -> String {
-    format!("CLASSPATH={} app_process /system/bin {}", apk_path, HELPER_CLASS)
+/// It cannot then talk to the app over a socket: SELinux forbids an
+/// `untrusted_app` opening a unix socket in the `shell` domain. It hands a
+/// Binder to a ContentProvider the app exports instead, which is the direction
+/// the policy allows.
+///
+/// The nonce arrives in an **environment variable**, not on stdin and not in
+/// argv. argv is out because `/proc/<pid>/cmdline` is world-readable. Stdin is
+/// out because this command is passed through `adb shell sh -c "…"`, and the
+/// quoting `$n` needs to survive two shells here is exactly the kind of thing
+/// that silently becomes the empty string — which is what happened. `adb`
+/// forwards `VAR=value` prefixes to the device shell's environment directly, so
+/// the value needs no quoting at all.
+///
+/// `setsid` detaches the helper from the adb stream's process group, which
+/// `adbd` kills when the stream closes; the trailing `read _` holds `sh` open
+/// until then, so `setsid` has taken effect first.
+pub fn launch_command(apk_path: &str, package: &str, app_uid: u32, nonce: &str) -> String {
+    format!(
+        // No `--nice-name`: on this platform it goes through the same
+        // `setuid` path as `--uid`, which SELinux refuses even for a root adbd
+        // (`failed to change user ID: operation not permitted`). The process
+        // name is a log nicety; starting at all is not.
+        "CLASSPATH={apk} setsid env SYSCITY_HANDOFF_NONCE={nonce} \
+SYSCITY_HANDOFF_PACKAGE={pkg} app_process /system/bin {class} {pkg} {app_uid} \
+>/dev/null 2>&1 & sleep 0.2",
+        nonce = sh_quote(nonce),
+        apk = sh_quote(apk_path),
+        class = HELPER_CLASS,
+        pkg = sh_quote(package),
+    )
+}
+
+/// Ask the app's hub for a nonce it will accept.
+async fn handoff_nonce(bridge: &DeviceBridgeRef) -> Result<String, DisplayError> {
+    let answer = bridge
+        .call(CMD_VIRTUAL_DISPLAY, json!({ "op": "nonce" }))
+        .await
+        .map_err(|e| {
+            DisplayError::new(
+                DISPLAY_UNAVAILABLE,
+                format!("the app could not issue a handoff nonce ({e})"),
+            )
+        })?;
+    answer
+        .get("nonce")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| DisplayError::new(DISPLAY_BAD_RESPONSE, "the app returned no handoff nonce"))
+}
+
+/// A fresh single-use nonce, 32 random bytes as hex.
+///
+/// `rand` is already a dependency (jitter, ids); this uses the OS source
+/// through it rather than pulling in `getrandom` directly.
+pub fn new_nonce() -> String {
+    use rand::RngExt;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill(&mut bytes[..]);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Quote a string as one shell word.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Whether the helper answers at all.
@@ -333,17 +390,28 @@ pub async fn ensure_helper(
     };
 
     let apk = apk_path(&device, package).await?;
-    let command = format!("{} >/dev/null 2>&1 &", launch_command(&apk));
-    let args = super::android::adb_args(&device, &["shell", &command]);
-    let (status, _, stderr) =
-        super::run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-            .await
-            .map_err(|e| {
-                DisplayError::new(
-                    DISPLAY_UNAVAILABLE,
-                    format!("could not reach adb to start the display helper ({e})"),
-                )
-            })?;
+    let app_uid = app_uid(&device, package).await?;
+    // The nonce comes from the app's hub, which is what will accept it. Minting
+    // one here produced a value the hub had never issued, and the handoff was
+    // refused as `BadNonce` — correctly.
+    let nonce = handoff_nonce(bridge).await?;
+    let command = launch_command(&apk, package, app_uid, &nonce);
+
+    // `sh -c` with the script as one word: it contains `&` and a pipeline, and
+    // handed over as separate argv entries it would be split locally. `adb` as
+    // argv[0] because `adb_args` returns only the arguments — `run_cmd`
+    // prepends the program name, but this builds the request by hand.
+    let mut argv: Vec<String> = vec!["adb".into()];
+    argv.extend(super::android::adb_args(&device, &["shell", &command]));
+    let request = crate::tools::process_runner::ProcessRequest::argv(
+        &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let (status, _, stderr) = super::run_cmd_with(&request).await.map_err(|e| {
+        DisplayError::new(
+            DISPLAY_UNAVAILABLE,
+            format!("could not reach adb to start the display helper ({e})"),
+        )
+    })?;
     if !status.success() {
         return Err(DisplayError::new(
             DISPLAY_UNAVAILABLE,
@@ -351,9 +419,8 @@ pub async fn ensure_helper(
         ));
     }
 
-    // `app_process` takes a moment to bind the socket; poll rather than sleep
-    // for a fixed time, so a fast device is not made to wait and a slow one is
-    // not declared broken.
+    // The helper calls back in when it is ready. Poll the bridge — the handoff
+    // happens on the Kotlin side.
     for _ in 0..25 {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if available(bridge).await {
@@ -365,6 +432,42 @@ pub async fn ensure_helper(
         "the display helper was started but never answered on its socket — check `adb shell \
          logcat -s syscity` on the device",
     ))
+}
+
+/// The uid the app runs as, from `pm list packages -U`.
+///
+/// Not `stat /data/data/<pkg>`: that directory has not been readable by the
+/// shell since Android 9, and this runs *as* the shell — the obvious call
+/// answers "Permission denied".
+async fn app_uid(device: &Option<String>, package: &str) -> Result<u32, DisplayError> {
+    let args =
+        super::android::adb_args(device, &["shell", "pm", "list", "packages", "-U", package]);
+    let (status, stdout, stderr) =
+        super::run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .await
+            .map_err(|e| {
+                DisplayError::new(
+                    DISPLAY_UNAVAILABLE,
+                    format!("could not read {package}'s uid ({e})"),
+                )
+            })?;
+    if !status.success() {
+        return Err(DisplayError::new(
+            DISPLAY_UNAVAILABLE,
+            format!("could not read {package}'s uid: {}", stderr.trim()),
+        ));
+    }
+    // `package:net.syscity.desktop uid:10207`
+    stdout
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("uid:"))
+        .and_then(|uid| uid.parse().ok())
+        .ok_or_else(|| {
+            DisplayError::new(
+                DISPLAY_UNAVAILABLE,
+                format!("{package} reported no uid ({})", stdout.trim()),
+            )
+        })
 }
 
 /// Whether adb has a device it can actually talk to, and what to do when it
@@ -472,10 +575,46 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_command_runs_the_helper_as_the_shell() {
-        let command = launch_command("/data/app/~~x/base.apk");
-        assert!(command.starts_with("CLASSPATH=/data/app/~~x/base.apk app_process /system/bin"));
-        assert!(command.ends_with(HELPER_CLASS), "{command}");
+    fn the_launch_command_detaches_and_carries_the_nonce() {
+        let command =
+            launch_command("/data/app/~~x/base.apk", "net.syscity.desktop", 10207, "deadbeef");
+        // Detached: adbd kills the stream's process group when it closes, and
+        // the stream closes as soon as the handoff succeeds.
+        assert!(command.contains("setsid env"), "{command}");
+        assert!(command.contains(HELPER_CLASS), "{command}");
+        assert!(command.contains("sleep 0.2"), "{command}");
+        // The nonce travels in the environment, once, through `env` — a bare
+        // prefix would apply to `sh` and not reach the program `setsid` execs.
+        assert_eq!(command.matches("SYSCITY_HANDOFF_NONCE=").count(), 1, "{command}");
+        assert!(command.contains("app_process /system/bin"), "{command}");
+        assert!(command.contains("10207"), "{command}");
+    }
+
+    #[test]
+    fn the_nonce_travels_in_the_environment_not_argv_or_stdin() {
+        let command = launch_command("/data/app/x/base.apk", "net.syscity.desktop", 1, "abc123");
+        // `env` after `setsid`: a plain VAR=value prefix applies to `sh`, and
+        // `setsid` does not pass it on to the program it execs.
+        assert!(command.contains("setsid env SYSCITY_HANDOFF_NONCE='abc123'"), "{command}");
+        // Nothing else may carry it: /proc cmdline is world-readable, and stdin
+        // does not survive the quoting this string goes through.
+        assert_eq!(command.matches("abc123").count(), 1, "{command}");
+    }
+
+    #[test]
+    fn a_nonce_is_32_random_bytes_as_hex() {
+        let first = new_nonce();
+        let second = new_nonce();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second, "two nonces must not collide");
+    }
+
+    #[test]
+    fn a_quote_in_the_apk_path_cannot_break_out_of_the_command() {
+        let command = launch_command("/data/app/a'b/base.apk", "pkg", 1, "n");
+        // The classic single-quote escape: close, emit an escaped quote, reopen.
+        assert!(command.contains("'\\''"), "{command}");
     }
 
     #[tokio::test]
@@ -490,7 +629,10 @@ mod tests {
         let bridge: DeviceBridgeRef = Arc::new(Down);
         let failed = VirtualDisplay::status(&bridge).await.expect_err("down");
         assert_eq!(failed.code, DISPLAY_UNAVAILABLE);
-        assert!(failed.message.contains("app_process"), "{}", failed.message);
+        // The hint names where the helper comes from, not a command the
+        // caller cannot run: the launch needs a nonce only the app knows.
+        assert!(failed.message.contains("ensure_helper"), "{}", failed.message);
+        assert!(failed.message.contains("Binder"), "{}", failed.message);
         assert!(!available(&bridge).await);
     }
 

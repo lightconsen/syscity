@@ -69,5 +69,19 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service" />
         </service>
+
+        <!-- Where the shell-side display helper's Binder lands.
+
+             `exported="true"` because the caller is a different uid (shell,
+             2000) — and `INTERACT_ACROSS_USERS_FULL` is what keeps ordinary
+             apps out, since only shell and system hold it. The provider's own
+             checks then decide whether the shell that called is *our* helper:
+             uid, pid, APK path, signing certificate and a single-use nonce. -->
+        <provider
+            android:name=".shell.ShellHandoffProvider"
+            android:authorities="${applicationId}.shell"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>

@@ -25,6 +25,7 @@ import androidx.activity.result.ActivityResult
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import app.tauri.PermissionState
+import net.syscity.desktop.shell.ShellServices
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.Permission
@@ -511,29 +512,110 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   /**
    * `virtualDisplay` — forward one op to the shell-side display helper.
    *
+   * The helper is reached over Binder, not a socket: SELinux forbids an
+   * `untrusted_app` from opening a unix socket in the `shell` domain, while a
+   * ContentProvider handoff (the helper calls *us*) is the direction the policy
+   * allows. See `shell/HelperHub.kt`.
+   *
    * A pass-through on purpose: the protocol lives in
    * `src/computer/platform/mobile/display.rs`, which is where it is validated
-   * and where the tests are. This side's only jobs are the socket and getting
-   * off the main thread, because a frame is a PNG over a few megabytes.
+   * and where the tests are. This side's jobs are getting off the main thread
+   * and moving frames — a PNG is over a Binder transaction's size budget, so it
+   * comes back as a file descriptor.
    */
   @Command
   fun virtualDisplay(invoke: Invoke) {
-    val payload = invoke.getArgs()
+    val args = invoke.getArgs()
+    val op = args.optString("op")
+    val displayId = args.optInt("display", -1)
     executor.execute {
+      val shell = ShellServices.shell()
+      val out = JSObject()
       try {
-        val answer = VDisplayClient.request(payload)
-        // Copy key by key rather than wrapping the string: JSObject is what
-        // Tauri resolves with, and a JSONObject nested inside it would not
-        // cross the bridge intact.
-        val out = JSObject()
-        answer.keys().forEach { key -> out.put(key, answer.get(key)) }
+        when (op) {
+          "nonce" -> {
+            // The hub issues it, so the hub is what accepts it: a nonce minted
+            // anywhere else is one this side has never heard of, which is
+            // exactly how a launch looks when the two disagree (`BadNonce`).
+            val hub = ShellServices.hub(appActivity)
+            out.put("ok", true).put("nonce", hub.issueNonce())
+          }
+          "ping" -> {
+            out.put("ok", shell != null)
+            out.put("attached", shell != null)
+          }
+          "create" -> {
+            if (shell == null) {
+              out.put("ok", false).put("code", "NO_HELPER")
+              out.put("error", "no display helper is attached")
+            } else {
+              val id = shell.createDisplay(
+                args.optInt("width", 0), args.optInt("height", 0), args.optInt("dpi", 0),
+              )
+              if (id < 0) {
+                out.put("ok", false).put("code", "CREATE_FAILED")
+                out.put("error", "the helper could not create a display")
+              } else {
+                out.put("ok", true).put("display", id)
+                  .put("width", args.optInt("width", 1080))
+                  .put("height", args.optInt("height", 2400))
+              }
+            }
+          }
+          "destroy" -> {
+            shell?.releaseDisplay(displayId)
+            out.put("ok", true)
+          }
+          "launch" -> {
+            val status = shell?.startApp(displayId, args.optString("package")) ?: -1
+            if (status == 0) out.put("ok", true)
+            else out.put("ok", false).put("code", "LAUNCH_FAILED")
+              .put("error", "the app would not start on display $displayId")
+          }
+          "tap" -> {
+            val ok = shell?.injectTap(displayId, args.optInt("x"), args.optInt("y")) ?: false
+            out.put("ok", ok)
+          }
+          "swipe" -> {
+            val ok = shell?.injectSwipe(
+              displayId,
+              args.optInt("x"), args.optInt("y"), args.optInt("x2"), args.optInt("y2"),
+              args.optInt("duration", 300),
+            ) ?: false
+            out.put("ok", ok)
+          }
+          "text" -> {
+            val ok = shell?.injectText(displayId, args.optString("text")) ?: false
+            out.put("ok", ok)
+          }
+          "key" -> {
+            val keycode = args.optString("keycode")
+            val code = android.view.KeyEvent::class.java
+              .getField(keycode).getInt(null)
+            val ok = shell?.injectKey(displayId, code) ?: false
+            out.put("ok", ok)
+          }
+          "screenshot" -> {
+            val pfd = ShellServices.frame(displayId)
+            if (pfd == null) {
+              out.put("ok", false).put("code", "NO_FRAME")
+              out.put("error", "the display produced no frame")
+            } else {
+              // Read the fd here and hand the bytes back as text: the bridge
+              // carries JSON, and the frame is already a file the app can open.
+              val bytes = android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                .use { it.readBytes() }
+              out.put("ok", true)
+                .put("png", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+            }
+          }
+          else -> out.put("ok", false).put("code", "UNKNOWN_OP").put("error", "unknown op $op")
+        }
         mainHandler.post { invoke.resolve(out) }
       } catch (e: Exception) {
         mainHandler.post {
           invoke.reject(
-            "the display helper is not reachable (${e.message}). Start it with " +
-              "`adb shell CLASSPATH=<apk> app_process /system/bin " +
-              "net.syscity.desktop.helper.HelperMain` over the loopback pairing.",
+            "the display helper call failed: ${e.message}",
             "DISPLAY_UNAVAILABLE",
           )
         }

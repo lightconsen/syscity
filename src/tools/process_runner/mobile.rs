@@ -96,12 +96,18 @@ impl AndroidShellRunner {
             // ships as `libadb.so` (an ELF executable under a library name).
             // Both spellings are tried: a tree that still has the older `adb`
             // keeps working.
-            let bundled = if dir.join(program).exists() {
-                dir.join(program)
-            } else {
-                dir.join(format!("lib{program}.so"))
-            };
-            if bundled.exists() {
+            //
+            // The caller names the program `adb` while the file is `libadb.so`,
+            // so the exact name has to be tried too — not just the prefixed
+            // form of whatever it asked for, which would look for `libadb.so.so`.
+            let bundled = [
+                dir.join(program),
+                dir.join(format!("lib{program}.so")),
+                dir.join(format!("{program}.so")),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists());
+            if let Some(bundled) = bundled {
                 let mut argv = vec![bundled.to_string_lossy().into_owned()];
                 argv.extend(req.argv[1..].iter().cloned());
                 return Ok(argv);
@@ -147,7 +153,10 @@ impl AndroidShellRunner {
         let Some(program) = eff.argv.first().map(String::as_str) else {
             return;
         };
-        if dir.join(program).exists() {
+        // Whether this program is one of the bundled ones — under either name,
+        // because the file is `libadb.so` while the caller says `adb`.
+        let bundled = dir.join(program).exists() || dir.join(format!("lib{program}.so")).exists();
+        if bundled {
             let dir_str = dir.to_string_lossy().into_owned();
             eff.env
                 .insert("LD_LIBRARY_PATH".to_string(), dir_str.clone());
@@ -186,7 +195,16 @@ impl ProcessRunner for AndroidShellRunner {
         eff.argv = self.resolve_argv(req)?;
         self.apply_bundled_library_path(&mut eff);
         let _ = tokio::fs::create_dir_all(Self::bundled_home()).await;
-        self.inner.run(&eff).await
+        // `run_collect` rather than `run`: it is the StdProcessRunner path that
+        // honours `req.stdin`, and the display helper's launch carries a nonce
+        // there. A timed-out run still surfaces as an error, as `run` promises.
+        let out = self.inner.run_collect(&eff).await?;
+        if out.timed_out {
+            return Err(ProcessError::Timeout {
+                duration: req.timeout.unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     async fn run_collect(&self, req: &ProcessRequest) -> Result<CommandOutput, ProcessError> {

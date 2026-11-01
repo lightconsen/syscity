@@ -72,6 +72,11 @@ android {
     }
     buildFeatures {
         buildConfig = true
+        // The shell helper hands a Binder to the app; `ISyscityShell.aidl` is
+        // that interface. SELinux forbids the app opening a socket in the
+        // `shell` domain, and a ContentProvider handoff (the helper calls us)
+        // is the direction the policy allows.
+        aidl = true
     }
 }
 

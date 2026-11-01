@@ -71,11 +71,21 @@ pub async fn run_cmd(
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(cmd.to_string());
     argv.extend(args.iter().map(|s| s.to_string()));
-
     let req = crate::tools::process_runner::ProcessRequest::argv(
         &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     );
-    let out = crate::tools::process_runner::run(&req).await.map_err(|e| {
+    run_cmd_with(&req).await
+}
+
+/// [`run_cmd`] for a request that carries more than argv — stdin, notably.
+///
+/// The display helper's launch sends a one-time nonce on stdin, and that is the
+/// only way the app and the helper agree on it without putting it somewhere
+/// another shell process can read.
+pub async fn run_cmd_with(
+    req: &crate::tools::process_runner::ProcessRequest,
+) -> std::io::Result<(std::process::ExitStatus, String, String)> {
+    let out = crate::tools::process_runner::run(req).await.map_err(|e| {
         // Preserve today's error mapping: a spawn failure surfaces the
         // underlying `io::Error` so callers can wrap it in `ExternalService`.
         match e {
