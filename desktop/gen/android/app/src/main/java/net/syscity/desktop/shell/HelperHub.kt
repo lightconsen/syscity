@@ -7,7 +7,6 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
-import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -222,7 +221,7 @@ object ShellServices {
     /** Read an `ISyscityShell` for a display call, or null when no helper is attached. */
     fun shell(): ISyscityShell? = hubInstance?.shell?.value
 
-    /** Open a display's frame fd, for the bridge to stream back. */
-    fun frame(displayId: Int): ParcelFileDescriptor? =
+    /** The path a display's latest frame was written to, for the caller to open. */
+    fun frame(displayId: Int): String? =
         shell()?.let { runCatching { it.frame(displayId) }.getOrNull() }
 }

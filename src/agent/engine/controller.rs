@@ -41,6 +41,23 @@ impl Agent {
         result
     }
 
+    /// Steer the running turn, if one is running.
+    ///
+    /// Returns `false` when no turn holds a controller — the caller then falls
+    /// back to queueing the message for the next one. This is what
+    /// `QueueMode::Steer` means: keep what the turn has already done and tell
+    /// it the new thing, rather than throwing the turn away.
+    pub async fn steer(&self, message: impl Into<String>) -> bool {
+        let guard = self.execution_controller.read().await;
+        match guard.as_ref() {
+            Some(controller) => {
+                controller.steer(message);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Execute a single tool call, using streaming when the tool advertises
     /// `capabilities.streaming`.
     pub(crate) async fn execute_single_tool(

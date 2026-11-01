@@ -1134,6 +1134,175 @@ impl Tool for AdbOcrTool {
     }
 }
 
+// ── Takeover ───────────────────────────────────────────────────────────────
+
+/// Hand the agent's display to the person, wait, and take it back.
+#[derive(Debug)]
+pub struct AdbHandToUserTool {
+    device: Option<String>,
+}
+
+impl Default for AdbHandToUserTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbHandToUserTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for AdbHandToUserTool {
+    fn name(&self) -> &str {
+        "android_hand_to_user"
+    }
+
+    fn description(&self) -> &str {
+        "Stop and ask the person to do a step you cannot: a login, a captcha, a payment \
+         confirmation. Their app is brought onto their own screen so they can touch it, the \
+         question tells them what is needed, and when they answer it comes back to you — with \
+         the screen re-read, so you can see whether it actually changed before acting on their \
+         word. Use this instead of guessing at a password field or tapping through a captcha; \
+         use it once per blockage, not as a retry loop."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Ask the person to take over",
+            serde_json::json!({
+                "display": {
+                    "type": "integer",
+                    "description": "The display the agent is working on (from android_display start)."
+                },
+                "question": {
+                    "type": "string",
+                    "description": "What you need them to do, in their words. Say what to do and how to tell you it is finished."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "How long to wait (default 300, max 1800)."
+                },
+                "device": { "type": "string", "description": DEVICE_PARAM }
+            }),
+            vec!["display", "question"],
+        )
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let Some(display_id) = args.get("display").and_then(|v| v.as_i64()) else {
+            return Ok(ToolExecutionResult::error(
+                "`display` is required — the id android_display start returned",
+            ));
+        };
+        let display_id = i32::try_from(display_id).unwrap_or(-1);
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Please finish this step, then say what you did.")
+            .to_string();
+        let timeout_secs = args
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300)
+            .clamp(30, 1800);
+
+        // The display is only reachable from the app itself; a desktop driving
+        // a remote phone has no screen to hand over.
+        let Ok(bridge) = display_bridge() else {
+            return Ok(ToolExecutionResult::error(
+                "handing a screen to the user needs the Syscity app on the phone; this host has \
+                 no display helper",
+            ));
+        };
+
+        // No human, no takeover. Refusing beats blocking a background turn for
+        // five minutes waiting for someone who was never there.
+        let Some(queue) = context.ask_queue.clone() else {
+            return Ok(ToolExecutionResult::error(
+                "there is nobody to hand this to in this context (no interactive channel)",
+            ));
+        };
+
+        // The fingerprint *before* the hand-back is what makes "I'm done" a
+        // checkable claim.
+        let before = super::android::dump_ui_elements(
+            &self.device,
+            super::android::Target::Display(display_id),
+        )
+        .await
+        .ok()
+        .map(|elements| super::android::tree_fingerprint(&elements));
+
+        let conversation_id = context.conversation_id.clone();
+        let ask = Box::new(move || {
+            Box::pin(async move {
+                use crate::tools::ask_user::{AskRequest, PendingQuestion};
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let id = queue
+                    .submit(PendingQuestion {
+                        request: AskRequest {
+                            id: format!("takeover-{}", uuid::Uuid::new_v4()),
+                            conversation_id,
+                            question,
+                            options: vec![
+                                "Done".to_string(),
+                                "I'll do the rest myself".to_string(),
+                                "Skip this step".to_string(),
+                            ],
+                            required: true,
+                            default: None,
+                        },
+                        response_tx: Some(tx),
+                    })
+                    .await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    // The bound is the caller's; see `takeover::hand_to_user`.
+                    rx,
+                )
+                .await
+                {
+                    Ok(Ok(answer)) => Some(answer),
+                    // Timed out or the channel closed: either way nobody
+                    // answered. Cancel so the queue does not hold it.
+                    _ => {
+                        queue.cancel(&id).await;
+                        None
+                    }
+                }
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        });
+
+        let outcome = match super::takeover::hand_to_user(&bridge, display_id, before, ask).await {
+            Ok(outcome) => outcome,
+            Err(failed) => return Ok(ToolExecutionResult::error(failed.to_string())),
+        };
+
+        Ok(ToolExecutionResult::success(super::takeover::describe(&outcome)).with_data(
+            serde_json::json!({
+                "verdict": outcome.verdict,
+                "answer": outcome.answer,
+                "screen_changed": outcome.screen_changed,
+                "display": display_id,
+                "elements": outcome.elements,
+            }),
+        ))
+    }
+}
+
 // ── Virtual display ────────────────────────────────────────────────────────
 
 /// Create and drive a second display, so the task does not take the phone.

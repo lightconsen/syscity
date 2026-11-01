@@ -11,7 +11,7 @@ use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{AgentCommand, AgentStatus, BufferedMessage, GatewayEvent, GatewayState};
+use super::{AgentStatus, BufferedMessage, GatewayEvent, GatewayState};
 use crate::agent::session_store::AppendMessageParams;
 use crate::observe::record::ChannelObservation;
 
@@ -185,18 +185,23 @@ pub(crate) async fn dispatch_routed_message(
         }
 
         crate::inbound::QueueMode::Steer => {
-            // Send Cancel to agent (best-effort), then send the steer message
-            {
+            // Append to the running turn, keeping the work it has done. Cancel
+            // and resend used to stand in for this, but `AgentCommand::Cancel`
+            // is a log line rather than an interruption, so the "steer" arrived
+            // as a second turn racing the first.
+            let steered = {
                 let agents = state.agents.agents.read().await;
-                if let Some(agent) = agents.get(&agent_id) {
-                    if let Err(e) = agent.tx.send(AgentCommand::Cancel).await {
-                        warn!("Failed to send cancel to agent {}: {}", agent_id, e);
-                    }
+                match agents.get(&agent_id) {
+                    Some(agent) => agent.agent.steer(routed.incoming.content.clone()).await,
+                    None => false,
                 }
+            };
+            if steered {
+                clear_follow_up_timer(state, &session_id).await;
+                return;
             }
-            clear_follow_up_timer(state, &session_id).await;
-            // Small delay to let cancel take effect
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // No turn running: the message is simply the next turn. That is
+            // also what makes this safe to use with a turn that just finished.
             send_to_agent(
                 state,
                 AgentDispatch {
@@ -213,7 +218,6 @@ pub(crate) async fn dispatch_routed_message(
             )
             .await;
         }
-
         crate::inbound::QueueMode::FollowUp => {
             // Buffer message; flush after a delay if no more arrive.
             let should_flush = {

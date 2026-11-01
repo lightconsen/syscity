@@ -250,6 +250,25 @@ impl Agent {
         {
             let ctrl_guard = self.execution_controller.read().await;
             if let Some(ref ctrl) = *ctrl_guard {
+                // A steer that arrived during this iteration goes in *before*
+                // the gate: the gate can park the turn, and a message sitting
+                // behind a parked turn is a message the model never sees.
+                // Appending it to the conversation keeps everything already
+                // done — that is the difference between steering and
+                // cancelling.
+                let steers = ctrl.drain_steers();
+                if let Some(text) = format_steers(&steers) {
+                    context.add_batch(vec![Message {
+                        role: Role::User,
+                        content: text,
+                        content_blocks: None,
+                        reasoning_content: None,
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        metadata: None,
+                    }]);
+                }
                 if let Err(reason) = ctrl.check_and_wait().await {
                     return Ok(crate::providers::CompletionResponse {
                         message: Message {
@@ -601,5 +620,65 @@ impl Agent {
         }
 
         Ok(final_response)
+    }
+}
+
+/// Turn steers into the message the model sees, or `None` when there are none.
+///
+/// The framing is the whole point: a mid-turn instruction must read as an
+/// amendment — "applies from here" — not as a new request, or the model
+/// re-does work it has already finished. Split out from the loop so that
+/// wording is testable without a running turn.
+fn format_steers(steers: &[String]) -> Option<String> {
+    match steers {
+        [] => None,
+        [one] => Some(format!(
+            "[The user sent this while you were working — it changes nothing already done, \
+             and applies from here] {one}"
+        )),
+        many => Some(format!(
+            "[The user sent {} more instructions while you were working — they change nothing \
+             already done, and apply from here]\n{}",
+            many.len(),
+            many.iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
+}
+
+#[cfg(test)]
+mod steer_format_tests {
+    use super::format_steers;
+
+    #[test]
+    fn no_steers_means_no_message() {
+        assert_eq!(format_steers(&[]), None);
+    }
+
+    #[test]
+    fn one_steer_says_what_it_does_not_change() {
+        let text = format_steers(&["use the other tab".to_string()]).expect("message");
+        assert!(text.contains("use the other tab"), "{text}");
+        // The two clauses that keep the turn from starting over.
+        assert!(text.contains("changes nothing already done"), "{text}");
+        assert!(text.contains("applies from here"), "{text}");
+    }
+
+    #[test]
+    fn several_steers_are_listed_in_order() {
+        let text = format_steers(&["first".to_string(), "second".to_string()]).expect("message");
+        assert!(text.contains("2 more instructions"), "{text}");
+        let first = text.find("- first").expect("first listed");
+        let second = text.find("- second").expect("second listed");
+        assert!(first < second, "{text}");
+    }
+
+    #[test]
+    fn the_users_words_are_not_reworded() {
+        let original = "别管那个了，先存草稿";
+        let text = format_steers(&[original.to_string()]).expect("message");
+        assert!(text.contains(original), "{text}");
     }
 }

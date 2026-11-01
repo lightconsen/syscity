@@ -1,7 +1,5 @@
 package net.syscity.desktop.shell;
 
-import android.os.ParcelFileDescriptor;
-
 /**
  * The display helper's Binder interface, as seen from the app.
  *
@@ -42,13 +40,34 @@ interface ISyscityShell {
     boolean injectText(int displayId, String text) = 8;
 
     /**
-     * The display's current frame as a PNG in a file.
+     * The display's current frame, written to a PNG file.
      *
-     * Returns a read-only fd the caller must close, or null when the display
-     * produced nothing.
+     * Returns the file's path — the reader is the app's own process and opens it
+     * directly — or null when the display produced nothing.
      */
-    ParcelFileDescriptor frame(int displayId) = 9;
+    String frame(int displayId) = 9;
 
     /** The app's own debug surface: which overload created this display, for logs. */
     String describe(int displayId) = 10;
+
+    /**
+     * Move the display's top task onto the user's own screen (display 0), so
+     * they can act on it directly when the agent cannot.
+     */
+    boolean moveToUser(int displayId) = 11;
+
+    /** Move it back to this display after the user is done. */
+    boolean moveToAgent(int displayId) = 12;
+
+    /**
+     * What is on the user's own screen now: `"<taskId>|<package>"`, or `""`.
+     *
+     * An action that starts an app from a background service lands it on the
+     * user's display, not this one, and nothing on this display changes. This
+     * is how that becomes visible.
+     */
+    String mainScreenTop() = 13;
+
+    /** Move an arbitrary task here (used to pull a spilled app back). */
+    boolean moveTaskToMe(int displayId, int taskId) = 14;
 }

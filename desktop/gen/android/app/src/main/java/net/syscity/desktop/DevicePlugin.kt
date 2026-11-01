@@ -595,18 +595,25 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
             val ok = shell?.injectKey(displayId, code) ?: false
             out.put("ok", ok)
           }
+          "main_screen_top" -> {
+            out.put("ok", true).put("top", shell?.mainScreenTop() ?: "")
+          }
+          "move_task" -> {
+            val taskId = args.optInt("task", -1)
+            out.put("ok", shell?.moveTaskToMe(displayId, taskId) ?: false)
+          }
+          "move_to_user" -> out.put("ok", shell?.moveToUser(displayId) ?: false)
+          "move_to_agent" -> out.put("ok", shell?.moveToAgent(displayId) ?: false)
           "screenshot" -> {
-            val pfd = ShellServices.frame(displayId)
-            if (pfd == null) {
+            // The path, not the bytes. The frame is already a PNG on disk, and
+            // the reader is this same app's Rust process: base64 through the
+            // bridge would copy every frame twice for nothing.
+            val path = ShellServices.frame(displayId)
+            if (path == null) {
               out.put("ok", false).put("code", "NO_FRAME")
               out.put("error", "the display produced no frame")
             } else {
-              // Read the fd here and hand the bytes back as text: the bridge
-              // carries JSON, and the frame is already a file the app can open.
-              val bytes = android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd)
-                .use { it.readBytes() }
-              out.put("ok", true)
-                .put("png", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+              out.put("ok", true).put("path", path)
             }
           }
           else -> out.put("ok", false).put("code", "UNKNOWN_OP").put("error", "unknown op $op")

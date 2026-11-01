@@ -7,7 +7,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.os.Build
-import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.view.Surface
 import java.io.File
 import java.io.FileOutputStream
@@ -25,11 +25,16 @@ private object DisplayFlags {
     const val OWN_CONTENT_ONLY = 1 shl 3
     const val SUPPORTS_TOUCH = 1 shl 6
     const val ROTATES_WITH_CONTENT = 1 shl 7
+    const val DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
     const val TRUSTED = 1 shl 10
     const val OWN_DISPLAY_GROUP = 1 shl 11
     const val ALWAYS_UNLOCKED = 1 shl 12
-    const val OWN_FOCUS = 1 shl 13
-    const val STEAL_TOP_FOCUS_DISABLED = 1 shl 14
+    const val TOUCH_FEEDBACK_DISABLED = 1 shl 13
+    // OWN_FOCUS is 1 shl 14, not 13 — the bit below it is
+    // TOUCH_FEEDBACK_DISABLED. Getting this wrong silently sets the wrong
+    // flag: the display still works, it just does not get its own focus.
+    const val OWN_FOCUS = 1 shl 14
+    const val STEAL_TOP_FOCUS_DISABLED = 1 shl 15
 }
 
 /**
@@ -52,6 +57,12 @@ class AgentDisplay private constructor(
 ) {
     val id: Int = display.display.displayId
 
+    /** The last frame written, and when — see [frameFile]. */
+    @Volatile
+    private var lastFrameFile: File? = null
+    @Volatile
+    private var lastFrameAt: Long = 0
+
     fun release() {
         try {
             display.release()
@@ -59,6 +70,81 @@ class AgentDisplay private constructor(
             // Already gone; releasing again is not an error worth reporting.
         }
         reader.close()
+    }
+
+    /**
+     * The task currently on top of this display, or -1.
+     *
+     * `dumpsys activity` is the only way to ask without the hidden
+     * `IActivityTaskManager` binding; the move itself needs the task id.
+     */
+    fun topTaskId(): Int {
+        val output = exec(arrayOf("dumpsys", "activity", "activities"))
+        val header = "Display #$id ("
+        var inDisplay = false
+        for (line in output.lineSequence()) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith(header)) {
+                inDisplay = true
+                continue
+            }
+            if (inDisplay && trimmed.startsWith("Display #")) return -1
+            if (inDisplay && trimmed.startsWith("* Task{")) {
+                // `* Task{df2887c #59 type=standard ...`
+                val afterHash = trimmed.substringAfter('#', "")
+                val taskId = afterHash.takeWhile { it.isDigit() }
+                if (taskId.isNotEmpty()) return taskId.toInt()
+            }
+        }
+        return -1
+    }
+
+    /**
+     * Move this display's top task to `targetDisplay`, or to the user's screen
+     * when `targetDisplay` is 0.
+     *
+     * `am display move-stack` is the shell-visible form of
+     * `IActivityTaskManager.moveRootTaskToDisplay`; it is what `adb shell` uses
+     * for the same operation.
+     */
+    fun moveTopTaskTo(targetDisplay: Int): Boolean {
+        val taskId = topTaskId()
+        if (taskId < 0) return false
+        val output = exec(arrayOf("am", "display", "move-stack", taskId.toString(), targetDisplay.toString()))
+        return !output.contains("Error") && !output.contains("Exception")
+    }
+
+    /**
+     * The package and task now on the user's own screen (display 0).
+     *
+     * An action can start an app that lands on the user's screen rather than
+     * this one — a share sheet, a chooser, an app that ignores `--display` —
+     * and from here that is invisible: the agent's display simply stops
+     * changing. Asking what the user's screen has now is how the spill is seen.
+     */
+    fun topTaskOnMainScreen(): Pair<Int, String? > {
+        val output = exec(arrayOf("dumpsys", "activity", "activities"))
+        var inDisplay = false
+        for (line in output.lineSequence()) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("Display #0 (")) {
+                inDisplay = true
+                continue
+            }
+            if (inDisplay && trimmed.startsWith("Display #")) return -1 to null
+            if (inDisplay && trimmed.startsWith("* Task{")) {
+                val taskId = trimmed.substringAfter('#', "").takeWhile { it.isDigit() }
+                val packageName = Regex("A=\\d+:([^\\s]+)").find(trimmed)?.groupValues?.get(1)
+                return (taskId.toIntOrNull() ?: -1) to packageName
+            }
+        }
+        return -1 to null
+    }
+
+    /** Move `taskId` onto this display. */
+    fun moveTaskTo(taskId: Int): Boolean {
+        val output = exec(arrayOf("am", "display", "move-stack", taskId.toString(), id.toString()))
+        return !output.contains("Error") && !output.contains("Exception")
     }
 
     /** Start `package`'s launcher activity on this display. */
@@ -104,26 +190,53 @@ class AgentDisplay private constructor(
     }
 
     /**
-     * The latest frame, as a file the app reads through a `ParcelFileDescriptor`.
+     * The latest frame, written to a file and returned by path.
      *
-     * A file rather than a byte array because Binder caps a transaction at
-     * 1 MB and a 1080x2400 PNG does not fit. The file is overwritten per call:
-     * the app reads it before asking for the next frame, and one frame in
-     * flight is all an agent loop ever has.
+     * A file rather than bytes because Binder caps a transaction at 1 MB and a
+     * 1080x2400 PNG does not fit. A *path* rather than a `ParcelFileDescriptor`
+     * because the reader is the app's own Rust process, which can open the file
+     * directly — sending an fd through the Tauri bridge only to read it back as
+     * base64 costs two copies of every frame for nothing.
+     *
+     * The file is overwritten per call: the reader takes it before asking for
+     * the next frame, and one frame in flight is all an agent loop ever has.
      */
-    fun frameFile(): ParcelFileDescriptor? {
-        val image = acquire(deadlineMs = 1200) ?: return null
-        try {
-            val bitmap = toBitmap(image)
-            val file = File(frameDir, "frame-$id.png")
-            FileOutputStream(file).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+    fun frameFile(): File? {
+        // Keep the last encoded frame. A virtual display only produces an image
+        // when its content changes, so consuming the one frame it sent and then
+        // asking again on a static screen waits for something that will not
+        // come. Caching means "the screen as of its last change", which is what
+        // an agent observation wants anyway.
+        // Short: a static screen has no frame coming, and the cache answers
+        // immediately. A changing screen delivers within a frame or two.
+        val fresh = acquire(deadlineMs = 60)
+        if (fresh != null) {
+            try {
+                val file = File(frameDir, "frame-$id.png")
+                val bitmap = toBitmap(fresh)
+                try {
+                    FileOutputStream(file).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                } finally {
+                    bitmap.recycle()
+                }
+                lastFrameFile = file
+                lastFrameAt = System.currentTimeMillis()
+                return file
+            } finally {
+                fresh.close()
             }
-            bitmap.recycle()
-            return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        } finally {
-            image.close()
         }
+        // Nothing new: the previous frame is still the current screen. Report
+        // how old it is so a caller can tell a stale view from a fresh one.
+        val cached = lastFrameFile
+        if (cached != null && cached.exists()) {
+            Log.d(FRAME_TAG, "serving cached frame (age ${System.currentTimeMillis() - lastFrameAt}ms)")
+            return cached
+        }
+        Log.w(FRAME_TAG, "no frame and nothing cached")
+        return null
     }
 
     /** A one-line description for logs: which overload created it and with what flags. */
@@ -132,17 +245,25 @@ class AgentDisplay private constructor(
 
     private fun acquire(deadlineMs: Long): android.media.Image? {
         val until = System.currentTimeMillis() + deadlineMs
+        var attempts = 0
+        var lastError: String? = null
         while (System.currentTimeMillis() < until) {
-            val latest = try {
-                reader.acquireLatestImage()
-            } catch (_: IllegalStateException) {
-                // The reader is full because nobody closed an earlier image; the
-                // next frame will do.
-                null
+            attempts++
+            try {
+                // `acquireLatestImage` drops older queued frames itself; the
+                // `IllegalStateException` it throws is "no buffer free", which
+                // means a previous image was never closed.
+                val latest = reader.acquireLatestImage()
+                if (latest != null) {
+                    if (attempts > 2) Log.d(FRAME_TAG, "frame after $attempts attempts")
+                    return latest
+                }
+            } catch (e: IllegalStateException) {
+                lastError = e.message
             }
-            if (latest != null) return latest
             Thread.sleep(40)
         }
+        Log.w(FRAME_TAG, "no frame in ${deadlineMs}ms after $attempts attempts: $lastError")
         return null
     }
 
@@ -201,6 +322,8 @@ class AgentDisplay private constructor(
     }
 
     companion object {
+        private const val FRAME_TAG = "SyscityFrame"
+
         /**
          * Create a display sized like the user's, or at the caller's size.
          *
@@ -216,10 +339,11 @@ class AgentDisplay private constructor(
 
             val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
             var flags = DisplayFlags.PUBLIC or DisplayFlags.OWN_CONTENT_ONLY or
-                DisplayFlags.SUPPORTS_TOUCH or DisplayFlags.ROTATES_WITH_CONTENT
+                DisplayFlags.SUPPORTS_TOUCH or DisplayFlags.ROTATES_WITH_CONTENT or
+                DisplayFlags.DESTROY_CONTENT_ON_REMOVAL
             if (Build.VERSION.SDK_INT >= 33) {
                 flags = flags or DisplayFlags.TRUSTED or DisplayFlags.OWN_DISPLAY_GROUP or
-                    DisplayFlags.ALWAYS_UNLOCKED
+                    DisplayFlags.ALWAYS_UNLOCKED or DisplayFlags.TOUCH_FEEDBACK_DISABLED
             }
             if (Build.VERSION.SDK_INT >= 34) {
                 // Separate focus per display: the user keeps typing on their

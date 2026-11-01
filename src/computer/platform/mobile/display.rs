@@ -152,26 +152,22 @@ impl VirtualDisplay {
     /// not a video stream).
     pub async fn screenshot(&self) -> Result<DisplayFrame, DisplayError> {
         let answer = call(&self.bridge, json!({ "op": "screenshot", "display": self.id })).await?;
-        let encoded = answer
-            .get("png")
+        // The helper wrote a PNG and told us where. Reading the file beats
+        // base64 over the bridge by a copy per frame, which is the difference
+        // between a few hundred microseconds and a few milliseconds once a
+        // long task is taking one observation per step.
+        let path = answer
+            .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| DisplayError::new(DISPLAY_BAD_RESPONSE, "the frame carried no image"))?;
-        use base64::Engine as _;
-        let png = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| {
-                DisplayError::new(
-                    DISPLAY_BAD_RESPONSE,
-                    format!("the frame was not valid base64 ({e})"),
-                )
-            })?;
-        let width = answer.get("width").and_then(Value::as_u64).unwrap_or(0);
-        let height = answer.get("height").and_then(Value::as_u64).unwrap_or(0);
-        Ok(DisplayFrame {
-            png,
-            width: u32::try_from(width).unwrap_or(0),
-            height: u32::try_from(height).unwrap_or(0),
-        })
+            .ok_or_else(|| DisplayError::new(DISPLAY_BAD_RESPONSE, "the frame carried no path"))?;
+        let png = std::fs::read(path).map_err(|e| {
+            DisplayError::new(
+                DISPLAY_BAD_RESPONSE,
+                format!("the frame at {path} could not be read ({e})"),
+            )
+        })?;
+        let (width, height) = super::android::png_dimensions(&png).unwrap_or((0, 0));
+        Ok(DisplayFrame { png, width, height })
     }
 
     /// Tap a point on this display, in its own pixel space.
@@ -222,6 +218,39 @@ impl VirtualDisplay {
     /// left behind would keep an app running that the user never opened.
     pub async fn close(self) -> Result<(), DisplayError> {
         call(&self.bridge, json!({ "op": "destroy", "display": self.id }))
+            .await
+            .map(|_| ())
+    }
+
+    /// What the user's own screen has on top, as `(taskId, package)`.
+    ///
+    /// `None` when there is nothing to report. An action that starts an app
+    /// from a background service — a share sheet, a chooser, an app that
+    /// ignores `--display` — lands it here, not on the agent's display, and
+    /// from the agent's side that is indistinguishable from "nothing happened".
+    pub async fn main_screen_top(&self) -> Result<Option<(i32, Option<String>)>, DisplayError> {
+        let answer = call(&self.bridge, json!({ "op": "main_screen_top" })).await?;
+        let raw = answer.get("top").and_then(Value::as_str).unwrap_or("");
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let (task, package) = match raw.split_once('|') {
+            Some((task, package)) => (task, package),
+            None => (raw, ""),
+        };
+        let task_id = task.parse::<i32>().map_err(|_| {
+            DisplayError::new(
+                DISPLAY_BAD_RESPONSE,
+                format!("the helper reported a task that is not a number ({task})"),
+            )
+        })?;
+        let package = (!package.is_empty()).then(|| package.to_string());
+        Ok(Some((task_id, package)))
+    }
+
+    /// Pull a task from the user's screen back onto this display.
+    pub async fn move_task_here(&self, task_id: i32) -> Result<(), DisplayError> {
+        call(&self.bridge, json!({ "op": "move_task", "display": self.id, "task": task_id }))
             .await
             .map(|_| ())
     }
@@ -672,19 +701,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_frame_is_decoded_from_base64() {
-        use base64::Engine as _;
-        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n");
-        let bridge = bridge(json!({ "ok": true, "png": png, "width": 10, "height": 20 }));
-        let display = VirtualDisplay {
-            bridge,
-            id: 1,
-            width: 10,
-            height: 20,
-        };
+    async fn a_frame_is_read_from_the_path_the_helper_named() {
+        // A real 1x1 PNG header is enough: the size comes from the file, not
+        // from the answer, so a wrong width in the payload cannot mislead.
+        let dir = std::env::temp_dir().join(format!("syscity-frame-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("frame-1.png");
+        // IHDR: width 3, height 5.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        png.extend_from_slice(&3u32.to_be_bytes());
+        png.extend_from_slice(&5u32.to_be_bytes());
+        std::fs::write(&path, &png).expect("write frame");
+
+        let bridge = bridge(json!({ "ok": true, "path": path.to_string_lossy() }));
+        let display = VirtualDisplay::attach(bridge, 1);
         let frame = display.screenshot().await.expect("frame");
-        assert_eq!(frame.png, b"\x89PNG\r\n");
-        assert_eq!((frame.width, frame.height), (10, 20));
+        assert_eq!(frame.png, png);
+        assert_eq!((frame.width, frame.height), (3, 5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_frame_path_that_does_not_exist_is_a_bad_response() {
+        let bridge = bridge(json!({ "ok": true, "path": "/nonexistent/frame.png" }));
+        let display = VirtualDisplay::attach(bridge, 1);
+        let failed = display.screenshot().await.expect_err("missing file");
+        assert_eq!(failed.code, DISPLAY_BAD_RESPONSE);
+        assert!(failed.message.contains("could not be read"), "{}", failed.message);
     }
 
     #[test]

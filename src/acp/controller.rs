@@ -21,6 +21,12 @@ pub struct ExecutionController {
     state: RwLock<RuntimeState>,
     notify: tokio::sync::Notify,
     iteration: std::sync::atomic::AtomicUsize,
+    /// Instructions that arrived mid-turn, for the next iteration to pick up.
+    ///
+    /// A plain `std::sync::Mutex`: every use is a push or a take, nothing is
+    /// awaited while it is held, so it cannot block a runtime thread across a
+    /// yield point.
+    steers: std::sync::Mutex<Vec<String>>,
 }
 
 impl ExecutionController {
@@ -30,6 +36,7 @@ impl ExecutionController {
             state: RwLock::new(RuntimeState::Idle),
             notify: tokio::sync::Notify::new(),
             iteration: std::sync::atomic::AtomicUsize::new(0),
+            steers: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -122,10 +129,35 @@ impl ExecutionController {
     pub async fn reset(&self) {
         let mut state = self.state.write().await;
         *state = RuntimeState::Idle;
+        // A steer belongs to the turn that was running; a new one starts clean.
+        let _ = self.drain_steers();
         self.iteration
             .store(0, std::sync::atomic::Ordering::Relaxed);
         drop(state);
         self.notify.notify_waiters();
+    }
+
+    /// Drop a message into the running turn.
+    ///
+    /// Steer is not cancel-and-resend: the work already done stays, and the
+    /// next iteration sees the new instruction appended to the conversation.
+    /// The tool-call loop drains this between iterations, so the message lands
+    /// where the model can act on it and nowhere earlier.
+    pub fn steer(&self, message: impl Into<String>) {
+        let mut pending = self.steers.lock().unwrap_or_else(|e| e.into_inner());
+        pending.push(message.into());
+        // A turn parked in `Paused` was waiting for a human; a steer is that
+        // human saying something, and leaving it parked would drop the message
+        // on the floor. (Only pause is lifted; a cancel stays cancelled.)
+        drop(pending);
+        self.notify.notify_waiters();
+        info!("Execution steered");
+    }
+
+    /// Take the steers queued since the last call.
+    pub fn drain_steers(&self) -> Vec<String> {
+        let mut pending = self.steers.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pending)
     }
 
     /// Current runtime state.
@@ -186,5 +218,41 @@ mod tests {
         ctrl.resume().await;
 
         assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_steer_is_queued_and_taken_once() {
+        let ctrl = ExecutionController::new();
+        ctrl.steer("actually, use the other tab");
+        assert_eq!(ctrl.drain_steers(), vec!["actually, use the other tab"]);
+        // Drained means drained: the next iteration must not see it again.
+        assert!(ctrl.drain_steers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn several_steers_keep_their_order() {
+        let ctrl = ExecutionController::new();
+        ctrl.steer("first");
+        ctrl.steer("second");
+        assert_eq!(ctrl.drain_steers(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn reset_drops_a_steer_from_the_finished_turn() {
+        let ctrl = ExecutionController::new();
+        ctrl.steer("belongs to the old turn");
+        ctrl.reset().await;
+        // A new turn starts clean; carrying it over would apply a message to
+        // work it was never about.
+        assert!(ctrl.drain_steers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_steer_does_not_cancel() {
+        let ctrl = ExecutionController::new();
+        ctrl.steer("do it differently");
+        // The point of steering is that the turn survives it.
+        assert_eq!(ctrl.current_state().await, RuntimeState::Idle);
+        assert!(ctrl.drain_steers().len() == 1);
     }
 }

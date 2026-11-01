@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::super::{required_str_param, WsRequest, WsResponse};
 use crate::gateway::GatewayState;
+use crate::tools::ask_user::AskQueue;
 
 /// The environment variable that turns [`handle_debug_tool_invoke`] on.
 ///
@@ -27,10 +28,10 @@ pub(super) const DEBUG_TOOL_INVOKE_ENV: &str = "SYSCITY_DEBUG_TOOL_INVOKE";
 /// this cannot become a general "run anything" endpoint.
 pub(crate) async fn handle_debug_tool_invoke(
     req: &WsRequest,
-    _state: &Arc<GatewayState>,
+    state: &Arc<GatewayState>,
 ) -> WsResponse {
     let enabled = debug_enabled(std::env::var(DEBUG_TOOL_INVOKE_ENV).ok().as_deref());
-    invoke_platform_tool(req, enabled).await
+    invoke_platform_tool_with(req, enabled, Some(state.tools.ask_queue.clone())).await
 }
 
 /// Whether the operator switched the method on.
@@ -43,7 +44,16 @@ pub(crate) fn debug_enabled(value: Option<&str>) -> bool {
 }
 
 /// The method proper, with the gate already decided.
-pub(crate) async fn invoke_platform_tool(req: &WsRequest, enabled: bool) -> WsResponse {
+/// The method proper, with the gate decided and an optional ask queue.
+///
+/// `ask_queue` is what makes `android_hand_to_user` reachable here: without it
+/// the tool correctly refuses ("nobody to hand this to"), which is right for a
+/// background context and makes the tool untestable from this surface.
+pub(crate) async fn invoke_platform_tool_with(
+    req: &WsRequest,
+    enabled: bool,
+    ask_queue: Option<Arc<AskQueue>>,
+) -> WsResponse {
     if !enabled {
         return WsResponse::err(
             &req.id,
@@ -68,20 +78,18 @@ pub(crate) async fn invoke_platform_tool(req: &WsRequest, enabled: bool) -> WsRe
         Err(response) => return response,
     };
 
-    let available: Vec<String> = crate::computer::platform::all_known_toolsets()
+    // One construction of the tool sets, not two: building them allocates every
+    // tool and asks `is_available()` (which probes for adb), and this used to do
+    // it twice per call — 1.2s per invocation on a phone, against a 70ms
+    // round-trip.
+    let tools: Vec<Box<dyn crate::tools::Tool>> = crate::computer::platform::all_known_toolsets()
         .into_iter()
         .filter(|set| set.is_available())
         .flat_map(|set| set.tools())
-        .map(|tool| tool.name().to_string())
         .collect();
+    let available: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
 
-    let tool = crate::computer::platform::all_known_toolsets()
-        .into_iter()
-        .filter(|set| set.is_available())
-        .flat_map(|set| set.tools())
-        .find(|tool| tool.name() == tool_name);
-
-    let Some(tool) = tool else {
+    let Some(tool) = tools.into_iter().find(|tool| tool.name() == tool_name) else {
         return WsResponse::err(
             &req.id,
             "TOOL_NOT_FOUND",
@@ -92,9 +100,13 @@ pub(crate) async fn invoke_platform_tool(req: &WsRequest, enabled: bool) -> WsRe
         );
     };
 
-    // A default context: these tools take no identity, no provider, and no
-    // approval queue. That is exactly the caveat above.
-    let context = crate::tools::ToolContext::default();
+    // A default context — these tools take no identity and no provider — plus
+    // the ask queue, so a tool that needs a human can find one. The approval
+    // flow is still absent: that is the caveat this method documents.
+    let context = match ask_queue {
+        Some(queue) => crate::tools::ToolContext::default().with_ask_queue(queue),
+        None => crate::tools::ToolContext::default(),
+    };
     match tool.execute(arguments, &context).await {
         Ok(result) => WsResponse::ok(
             &req.id,

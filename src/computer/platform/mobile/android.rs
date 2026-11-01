@@ -84,8 +84,10 @@ impl PlatformToolSet for AndroidToolset {
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
-            // The second screen: the user keeps the phone while a task runs.
+            // The second screen: the user keeps the phone while a task runs,
+            // and a step they have to do themselves goes back to them.
             Box::new(super::android_tools::AdbDisplayTool::new()),
+            Box::new(super::android_tools::AdbHandToUserTool::new()),
             // Loopback self-pairing (§4.5): pair the phone with its own
             // wireless-debugging adbd and report pairing state.
             Box::new(AdbPairTool::new()),
@@ -825,6 +827,25 @@ impl Tool for AdbInputTool {
         let settle = settle_after_action(&device, target, before_fingerprint, settle_budget).await;
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+
+        // An action can start something that lands on the user's screen — a
+        // share sheet, a chooser, an app that ignores `--display`. The agent's
+        // display then just stops changing, which reads as "nothing happened".
+        // Checking is only possible on a display, and only worth doing when
+        // the action was meant to take effect.
+        let mut spill = None;
+        if let Target::Display(id) = target {
+            if let (true, Ok(bridge)) = (verify, display_bridge()) {
+                spill = super::takeover::check_spill(&bridge, id, None, true).await;
+                if let Some(spill) = &spill {
+                    text.push_str(&format!(
+                        "\n\nWarning: {} ended up on the user's screen ({}) rather than this \
+                         display — {}. The screen above is this display; the app above is not.",
+                        spill.package, spill.task_id, spill.reason
+                    ));
+                }
+            }
+        }
         if !settle.elements.is_empty() {
             text.push_str("\n\n");
             text.push_str(&format_ui_summary_limited(&settle.elements, 60));
@@ -833,6 +854,12 @@ impl Tool for AdbInputTool {
         Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
             "device": serial,
             "effect": settle.effect,
+            "spill": spill.map(|s| serde_json::json!({
+                "task": s.task_id,
+                "package": s.package,
+                "recovered": s.recovered,
+                "reason": s.reason,
+            })),
             "settled_ms": settle.elapsed_ms,
             "elements": settle.elements,
         })))
@@ -1116,7 +1143,7 @@ pub fn parse_screen_bounds(xml: &str) -> Option<(i32, i32)> {
 }
 
 /// Width and height from a PNG's IHDR chunk.
-fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+pub(super) fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if bytes.len() < 24 || bytes[..8] != SIGNATURE || &bytes[12..16] != b"IHDR" {
         return None;

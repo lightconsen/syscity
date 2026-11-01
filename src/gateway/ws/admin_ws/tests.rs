@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 
-use super::debug::{debug_enabled, invoke_platform_tool};
+use super::debug::{debug_enabled, invoke_platform_tool_with};
 use super::*;
 use crate::gateway::state_tests::make_test_state;
 use crate::gateway::GatewayConfig;
@@ -1420,13 +1420,14 @@ fn the_debug_gate_is_on_only_for_an_explicit_one() {
 
 #[tokio::test]
 async fn debug_tool_invoke_is_off_by_default() {
-    let resp = invoke_platform_tool(
+    let resp = invoke_platform_tool_with(
         &req(
             "d1",
             "debug.tool.invoke",
             Some(serde_json::json!({ "tool": "android_ui_tree" })),
         ),
         false,
+        None,
     )
     .await;
     assert!(!resp.ok);
@@ -1435,7 +1436,7 @@ async fn debug_tool_invoke_is_off_by_default() {
 
 #[tokio::test]
 async fn debug_tool_invoke_refuses_a_tool_it_does_not_have() {
-    let resp = invoke_platform_tool(
+    let resp = invoke_platform_tool_with(
         &req(
             "d2",
             "debug.tool.invoke",
@@ -1444,6 +1445,7 @@ async fn debug_tool_invoke_refuses_a_tool_it_does_not_have() {
             Some(serde_json::json!({ "tool": "shell", "arguments": {} })),
         ),
         true,
+        None,
     )
     .await;
     assert!(!resp.ok);

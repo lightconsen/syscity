@@ -12,10 +12,12 @@ pub mod android;
 pub mod android_tools;
 pub mod display;
 pub mod ios;
+pub mod takeover;
 
 pub use android::AndroidToolset;
 pub use android_tools::{
-    AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbFindTool, AdbOcrTool, AdbSystemActionTool,
+    AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbFindTool, AdbHandToUserTool, AdbOcrTool,
+    AdbSystemActionTool,
 };
 pub use ios::IosToolset;
 

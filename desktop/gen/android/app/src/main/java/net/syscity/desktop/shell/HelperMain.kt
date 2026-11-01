@@ -293,11 +293,29 @@ object HelperMain {
         override fun injectText(displayId: Int, text: String): Boolean =
             runCatching { display(displayId)?.type(text) != null }.getOrDefault(false)
 
-        override fun frame(displayId: Int): android.os.ParcelFileDescriptor? =
-            runCatching { display(displayId)?.frameFile() }.getOrNull()
+        override fun frame(displayId: Int): String? =
+            runCatching { display(displayId)?.frameFile()?.absolutePath }.getOrNull()
 
         override fun describe(displayId: Int): String =
             display(displayId)?.describe() ?: "no display $displayId"
+
+        override fun moveToUser(displayId: Int): Boolean =
+            runCatching { display(displayId)?.moveTopTaskTo(0) == true }.getOrDefault(false)
+
+        override fun moveToAgent(displayId: Int): Boolean =
+            runCatching { display(displayId)?.moveTopTaskTo(displayId) == true }.getOrDefault(false)
+
+        override fun mainScreenTop(): String {
+            // Any display knows how to ask; none attached yet means nobody is
+            // looking, which is "nothing to report" rather than an error.
+            val any = synchronized(lock) { displays.values.firstOrNull() }
+                ?: return ""
+            val (taskId, packageName) = any.topTaskOnMainScreen()
+            return if (taskId < 0) "" else "$taskId|${packageName ?: ""}"
+        }
+
+        override fun moveTaskToMe(displayId: Int, taskId: Int): Boolean =
+            runCatching { display(displayId)?.moveTaskTo(taskId) == true }.getOrDefault(false)
 
         /** Tear everything down; called when the app's token dies. */
         fun releaseAll() {
