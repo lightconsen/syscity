@@ -9,13 +9,13 @@ import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.Build
 import android.os.Process
+import android.util.Base64
 import android.view.Surface
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
-import java.util.Base64
 
 /**
  * The process that creates the agent's display.
@@ -68,6 +68,10 @@ object HelperMain {
       System.exit(2)
     }
 
+    if (args.contains("--selftest")) {
+      System.exit(runSelfTest())
+    }
+
     val server = try {
       LocalServerSocket(SOCKET_NAME)
     } catch (e: Exception) {
@@ -92,6 +96,87 @@ object HelperMain {
         System.err.println("syscity: request failed: ${e.message}")
       }
     }
+  }
+
+  /**
+   * Create a display, put an app on it, read a frame from it, tap it, and tear
+   * it down — printing each step.
+   *
+   * This exists so the parts that cannot be tested from a desk can be tested
+   * from one adb command, without the app, the socket, or the Rust side:
+   *
+   * ```
+   * adb shell "CLASSPATH=$APK app_process /system/bin \
+   *     net.syscity.desktop.helper.HelperMain --selftest"
+   * ```
+   *
+   * The fragile pieces are all here — which hidden `createVirtualDisplay`
+   * overload this build of Android accepts, whether an app can be started on a
+   * non-default display, and whether frames and input follow the display id
+   * rather than the user's screen.
+   */
+  private fun runSelfTest(): Int {
+    println("syscity: selftest — api=${Build.VERSION.SDK_INT} uid=${Process.myUid()}")
+
+    val display = try {
+      AgentDisplay.create(0, 0, 0)
+    } catch (e: Exception) {
+      println("syscity: FAIL create: ${e.message}")
+      System.out.flush()
+      return 1
+    }
+    println(
+      "syscity: display id=${display.id} ${display.width}x${display.height} " +
+        "flags=0x${Integer.toHexString(display.flags)} signature=${display.signature}",
+    )
+
+    var failures = 0
+    try {
+      val packageName = "com.android.settings"
+      try {
+        display.launch(packageName)
+        println("syscity: launched $packageName")
+      } catch (e: Exception) {
+        println("syscity: FAIL launch: ${e.message}")
+        failures++
+      }
+
+      // Give the activity a moment to draw; a frame taken immediately after
+      // `am start -W` is usually the splash or an empty surface.
+      Thread.sleep(1500)
+      val frame = display.frame()
+      if (frame.optBoolean("ok")) {
+        println(
+          "syscity: frame ${frame.optInt("width")}x${frame.optInt("height")} " +
+            "png=${frame.optString("png").length} base64 chars",
+        )
+      } else {
+        println("syscity: FAIL frame: ${frame.optString("error")}")
+        failures++
+      }
+
+      try {
+        display.tap(display.width / 2, display.height / 2)
+        println("syscity: tap (${display.width / 2}, ${display.height / 2})")
+      } catch (e: Exception) {
+        println("syscity: FAIL tap: ${e.message}")
+        failures++
+      }
+    } finally {
+      display.release()
+      println("syscity: destroyed")
+    }
+
+    // `adb shell` shows a process's stdout as it is written, but only if it is
+    // flushed before the process exits — exit does not guarantee it.
+    if (failures == 0) {
+      println("syscity: SELFTEST OK")
+      System.out.flush()
+      return 0
+    }
+    println("syscity: SELFTEST FAILED ($failures step(s))")
+    System.out.flush()
+    return 1
   }
 
   private fun handle(socket: LocalSocket) {
@@ -209,6 +294,9 @@ private class AgentDisplay private constructor(
   private val reader: ImageReader,
   val width: Int,
   val height: Int,
+  val flags: Int,
+  /** Which hidden `createVirtualDisplay` overload this build of Android took. */
+  val signature: String,
 ) {
   val id: Int = display.display.displayId
 
@@ -277,7 +365,7 @@ private class AgentDisplay private constructor(
       val out = ByteArrayOutputStream()
       bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
       bitmap.recycle()
-      val encoded = Base64.getEncoder().encodeToString(out.toByteArray())
+      val encoded = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
       return JSONObject()
         .put("ok", true)
         .put("png", encoded)
@@ -388,8 +476,8 @@ private class AgentDisplay private constructor(
           DisplayManager.VIRTUAL_DISPLAY_FLAG_STEAL_TOP_FOCUS_DISABLED
       }
 
-      val display = createVirtualDisplay(w, h, densityDpi, reader.surface, flags)
-      return AgentDisplay(display, reader, w, h)
+      val (display, signature) = createVirtualDisplay(w, h, densityDpi, reader.surface, flags)
+      return AgentDisplay(display, reader, w, h, flags, signature)
     }
 
     /**
@@ -407,7 +495,7 @@ private class AgentDisplay private constructor(
       dpi: Int,
       surface: Surface,
       flags: Int,
-    ): VirtualDisplay {
+    ): Pair<VirtualDisplay, String> {
       val global = Class.forName("android.hardware.display.DisplayManagerGlobal")
         .getMethod("getInstance")
         .invoke(null)
@@ -439,9 +527,15 @@ private class AgentDisplay private constructor(
                 types[index] == Any::class.java || candidate.parameterTypes[index] == types[index]
               }
           } ?: continue
-          attempts.add("${method.parameterCount} args")
           val created = method.invoke(global, *arguments)
-          if (created is VirtualDisplay) return created
+          if (created is VirtualDisplay) {
+            return created to "${method.parameterCount} args"
+          }
+          // A method with the right shape that returns something else means the
+          // signature matched but the platform refused — worth naming, or the
+          // failure reads as "no matching method" and sends the reader looking
+          // in the wrong place.
+          attempts.add("${arguments.size} args: returned ${created?.javaClass?.name}")
         } catch (e: Exception) {
           attempts.add(
             "${arguments.size} args: ${e.cause?.message ?: e.message}",

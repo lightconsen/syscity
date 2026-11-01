@@ -214,6 +214,32 @@ not there (`pm path` for the APK, then a detached `app_process`), and waits for
 its socket. The helper owns the `ImageReader` behind the display, which is why
 frames leave as PNG — a `Surface` cannot cross a `LocalSocket`.
 
+### Checking it on one device, without the app
+
+`--selftest` runs the whole thing once and prints each step, so the parts that
+only a device can answer — which hidden `createVirtualDisplay` overload this
+build accepts, whether an app starts on a non-default display, whether frames
+and input follow the display id — are one adb command away:
+
+```bash
+APK=$(adb shell pm path net.syscity.desktop | sed 's/package://' | tr -d '\r')
+adb shell "CLASSPATH=$APK app_process /system/bin \
+    net.syscity.desktop.helper.HelperMain --selftest"
+```
+
+```
+syscity: selftest — api=34 uid=2000
+syscity: display id=3 1080x2400 flags=0x… signature=9 args
+syscity: launched com.android.settings
+syscity: frame 1080x2400 png=… base64 chars
+syscity: tap (540, 1200)
+syscity: destroyed
+syscity: SELFTEST OK
+```
+
+It needs the APK installed but the app **not** running, which is what makes it a
+first checkpoint: if this fails, nothing above it can work.
+
 Known limits, in the order they will bite:
 
 - **Android 13** has no per-display focus, so the user's screen can lose focus
