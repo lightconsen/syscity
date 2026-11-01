@@ -101,6 +101,10 @@ impl PlatformToolSet for AndroidToolset {
 // ── Device targeting ───────────────────────────────────────────────────────
 
 /// Schema text for the `device` argument the targeting tools share.
+/// Shared description for the `display` argument.
+pub(super) const DISPLAY_PARAM: &str =
+    "Optional: id from android_display start. Omit to act on the phone's own screen.";
+
 pub(super) const DEVICE_PARAM: &str =
     "Device serial to act on. Omit it and the call uses the only attached device — the result \
      reports which serial was actually used, since that is whatever is attached at the time.";
@@ -205,6 +209,7 @@ impl Tool for AdbScreenshotTool {
         create_schema(
             "Capture Android device screenshot",
             serde_json::json!({
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -220,7 +225,11 @@ impl Tool for AdbScreenshotTool {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        let png = match capture_png(&device).await {
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let png = match capture_png(&device, target).await {
             Ok(png) => png,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
@@ -289,6 +298,7 @@ impl Tool for AdbObserveTool {
         create_schema(
             "Observe the Android device",
             serde_json::json!({
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -304,7 +314,11 @@ impl Tool for AdbObserveTool {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        let png = match capture_png(&device).await {
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let png = match capture_png(&device, target).await {
             Ok(png) => png,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
         };
@@ -312,7 +326,7 @@ impl Tool for AdbObserveTool {
             dims.map(|(w, h)| serde_json::json!({ "width": w, "height": h }))
         };
 
-        let dump = match dump_ui(&device).await {
+        let dump = match dump_ui(&device, target).await {
             Ok(dump) => dump,
             // A tree that cannot be read does not fail this call. The screenshot
             // is already in hand and is most of what the tool is for, and every
@@ -502,7 +516,7 @@ fn input_encode(s: &str) -> String {
 /// only appears *because* an earlier one revealed it, so it cannot be validated
 /// against the current tree. Each `input` is its own process on the device,
 /// which spaces the taps by a few tens of milliseconds without needing `sleep`.
-fn encode_tap_sequence(steps: &[(i64, i64)]) -> String {
+fn encode_tap_sequence(steps: &[(i32, i32)]) -> String {
     steps
         .iter()
         .map(|(x, y)| format!("input tap {} {}", x, y))
@@ -616,6 +630,7 @@ impl Tool for AdbInputTool {
                     "type": "integer",
                     "description": "How long to wait for the screen to settle when verifying (default 1200, max 4000). Raise it for a slow screen transition."
                 },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             vec!["action"],
@@ -644,12 +659,17 @@ impl Tool for AdbInputTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(SETTLE_DEFAULT_MS);
 
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+
         // One read serves both purposes: it validates an indexed tap (the
         // safety net) and it is the picture the effect is judged against. A
         // failed read only refuses when the caller pointed at an element —
         // every other action still dispatches, and reports its effect as
         // unknown rather than pretending it worked.
-        let before = match dump_ui_elements(&device).await {
+        let before = match dump_ui_elements(&device, target).await {
             Ok(elements) => Some(elements),
             Err(failed) => {
                 if action == "tap" && args.get("target").is_some() {
@@ -659,33 +679,39 @@ impl Tool for AdbInputTool {
             }
         };
 
-        let shell_cmd = match action {
-            "tap" => {
-                match args.get("target").and_then(|v| v.as_u64()) {
-                    // Preferred: an element index, checked against the read
-                    // taken immediately before dispatch.
-                    Some(index) => {
-                        let description = args.get("target_description").and_then(|v| v.as_str());
-                        let elements = before.as_deref().unwrap_or(&[]);
-                        match Self::tap_point_from(elements, index as usize, description) {
-                            Ok((x, y)) => format!("input tap {} {}", x, y),
-                            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
-                        }
-                    }
-                    // Raw coordinates: no safety net, the caller is on its own.
-                    None => {
-                        let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-                        format!("input tap {} {}", x, y)
+        // The action is resolved once, into something that both dispatchers
+        // understand. Where it goes — the device's screen or the agent's — is
+        // the only thing that differs afterwards.
+        let op = match action {
+            "tap" => match args.get("target").and_then(|v| v.as_u64()) {
+                // Preferred: an element index, checked against the read taken
+                // immediately before dispatch.
+                Some(index) => {
+                    let description = args.get("target_description").and_then(|v| v.as_str());
+                    let elements = before.as_deref().unwrap_or(&[]);
+                    match Self::tap_point_from(elements, index as usize, description) {
+                        Ok(point) => InputOp::Taps(vec![point]),
+                        Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
                     }
                 }
-            }
+                // Raw coordinates: no safety net, the caller is on its own.
+                None => {
+                    let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                    InputOp::Taps(vec![(
+                        i32::try_from(x).unwrap_or(0),
+                        i32::try_from(y).unwrap_or(0),
+                    )])
+                }
+            },
             "swipe" => {
-                let x1 = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                let y1 = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-                let x2 = args.get("x2").and_then(|v| v.as_i64()).unwrap_or(0);
-                let y2 = args.get("y2").and_then(|v| v.as_i64()).unwrap_or(0);
-                format!("input swipe {} {} {} {}", x1, y1, x2, y2)
+                let value = |key: &str| {
+                    i32::try_from(args.get(key).and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0)
+                };
+                InputOp::Swipe {
+                    from: (value("x"), value("y")),
+                    to: (value("x2"), value("y2")),
+                }
             }
             "text" => {
                 let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -694,55 +720,92 @@ impl Tool for AdbInputTool {
                         "action 'text' requires a non-empty 'text' argument",
                     ));
                 }
-                if text.is_ascii() {
-                    encode_input_text(text)
-                } else if self.adbkeyboard_is_active(&device).await {
-                    // ADBKeyboard takes the text base64-encoded over a broadcast,
-                    // which carries any character the device can render.
-                    let payload = base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        text.as_bytes(),
-                    );
-                    format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
-                } else {
-                    // `input text` types through the device's key character map,
-                    // so non-ASCII (CJK in particular) comes out dropped or
-                    // mangled. Fail loudly rather than silently typing the wrong
-                    // thing — the previous behaviour replaced only spaces and
-                    // then sent the text as-is.
-                    return Ok(ToolExecutionResult::error(
-                        "Cannot type non-ASCII text: `input text` only types ASCII reliably and \
-                         ADBKeyboard is not the active input method. Install/enable ADBKeyboard \
-                         (com.android.adbkeyboard) and select it as the input method, or keep the \
-                         text ASCII.",
-                    ));
-                }
+                InputOp::Text(text.to_string())
             }
             "sequence" => match parse_tap_steps(args.get("steps")) {
-                Ok(steps) => encode_tap_sequence(&steps),
+                Ok(steps) => InputOp::Taps(
+                    steps
+                        .into_iter()
+                        .map(|(x, y)| {
+                            (i32::try_from(x).unwrap_or(0), i32::try_from(y).unwrap_or(0))
+                        })
+                        .collect(),
+                ),
                 Err(msg) => return Ok(ToolExecutionResult::error(msg)),
             },
-            "key" => {
-                let keycode = args
-                    .get("keycode")
+            "key" => InputOp::Key(
+                args.get("keycode")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("HOME");
-                format!("input keyevent {}", keycode)
-            }
+                    .unwrap_or("HOME")
+                    .to_string(),
+            ),
             _ => return Ok(ToolExecutionResult::error(format!("Unknown action: {}", action))),
         };
 
-        let argv = adb_args(&device, &["shell", &shell_cmd]);
-        let (status, _stdout, stderr) =
-            run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                .await
-                .map_err(|e| crate::error::SyscityError::ExternalService {
-                    source: "adb input failed".to_string(),
-                    cause: Some(Box::new(e)),
-                })?;
-
-        if !status.success() {
-            return Ok(ToolExecutionResult::error(format!("adb input failed: {}", stderr)));
+        match target {
+            Target::Screen => {
+                let shell_cmd = match &op {
+                    InputOp::Taps(steps) => encode_tap_sequence(steps),
+                    InputOp::Swipe { from, to } => {
+                        format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
+                    }
+                    InputOp::Key(keycode) => format!("input keyevent {keycode}"),
+                    InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
+                    InputOp::Text(text) => {
+                        if self.adbkeyboard_is_active(&device).await {
+                            // ADBKeyboard takes the text base64-encoded over a
+                            // broadcast, which carries any character the device
+                            // can render.
+                            let payload = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                text.as_bytes(),
+                            );
+                            format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
+                        } else {
+                            // `input text` types through the device's key
+                            // character map, so non-ASCII (CJK in particular)
+                            // comes out dropped or mangled. Fail loudly rather
+                            // than silently typing the wrong thing.
+                            return Ok(ToolExecutionResult::error(
+                                "Cannot type non-ASCII text: `input text` only types ASCII \
+                                 reliably and ADBKeyboard is not the active input method. \
+                                 Install/enable ADBKeyboard (com.android.adbkeyboard) and select \
+                                 it as the input method, or keep the text ASCII.",
+                            ));
+                        }
+                    }
+                };
+                let argv = adb_args(&device, &["shell", &shell_cmd]);
+                let (status, _stdout, stderr) =
+                    run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                        .await
+                        .map_err(|e| crate::error::SyscityError::ExternalService {
+                            source: "adb input failed".to_string(),
+                            cause: Some(Box::new(e)),
+                        })?;
+                if !status.success() {
+                    return Ok(ToolExecutionResult::error(format!("adb input failed: {stderr}")));
+                }
+            }
+            Target::Display(id) => {
+                if let InputOp::Text(text) = &op {
+                    if !text.is_ascii() {
+                        // The virtual display has no ADBKeyboard behind it: the
+                        // helper types with `input -d`, which has the same
+                        // ASCII-only limitation and no broadcast to fall back
+                        // on. Saying so beats typing half a message.
+                        return Ok(ToolExecutionResult::error(
+                            "Cannot type non-ASCII text on a second display: it is typed with \
+                             `input -d`, which only handles ASCII. Use android_display \
+                             action 'text' if the app accepts paste, or drive this task on the \
+                             main screen.",
+                        ));
+                    }
+                }
+                if let Err(message) = dispatch_display(id, &op).await {
+                    return Ok(ToolExecutionResult::error(message));
+                }
+            }
         }
 
         let serial = resolved_serial(&device).await;
@@ -759,7 +822,7 @@ impl Tool for AdbInputTool {
         // Judge the effect here rather than leaving it to the model: a dispatch
         // that was accepted says nothing about whether the tap landed.
         let before_fingerprint = before.as_ref().map(|elements| tree_fingerprint(elements));
-        let settle = settle_after_action(&device, before_fingerprint, settle_budget).await;
+        let settle = settle_after_action(&device, target, before_fingerprint, settle_budget).await;
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
         if !settle.elements.is_empty() {
@@ -1003,7 +1066,24 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
 /// Uses the byte-safe runner: the PNG has to reach the encoder exactly as the
 /// device produced it, and the `String` variant of `run_cmd` would replace every
 /// non-UTF-8 byte with U+FFFD and corrupt the image.
-async fn capture_png(device: &Option<String>) -> crate::Result<Vec<u8>> {
+async fn capture_png(device: &Option<String>, target: Target) -> crate::Result<Vec<u8>> {
+    if let Target::Display(id) = target {
+        // The helper owns the display's surface, so the frame comes from it
+        // rather than from `screencap` (which would photograph the user's
+        // screen). It is a PNG either way.
+        let bridge = display_bridge().map_err(|message| {
+            crate::error::SyscityError::ExternalService { source: message, cause: None }
+        })?;
+        let display = super::display::VirtualDisplay::attach(bridge, id);
+        return display
+            .screenshot()
+            .await
+            .map(|frame| frame.png)
+            .map_err(|e| crate::error::SyscityError::ExternalService {
+                source: e.to_string(),
+                cause: None,
+            });
+    }
     let args = adb_args(device, &["exec-out", "screencap", "-p"]);
 
     let (status, stdout, stderr) =
@@ -1089,6 +1169,8 @@ pub const SECURE_WINDOW: &str = "SECURE_WINDOW";
 pub const ACCESSIBILITY_DISABLED: &str = "ACCESSIBILITY_DISABLED";
 /// The dump failed for a reason this code does not name.
 pub const DUMP_FAILED: &str = "DUMP_FAILED";
+/// A virtual display's tree could not be read (no service, or API < 30).
+pub const DISPLAY_TREE_UNAVAILABLE: &str = "DISPLAY_TREE_UNAVAILABLE";
 
 impl DumpFailure {
     fn new(code: &'static str, message: String) -> Self {
@@ -1186,6 +1268,80 @@ pub(super) fn format_ui_summary(elements: &[UiElement]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+// ── Targets ────────────────────────────────────────────────────────────────
+
+/// Where a read or an action goes.
+///
+/// Most calls mean "the phone's own screen". The other case is a virtual
+/// display the agent created for itself so the user keeps using the phone —
+/// there, the tree comes from the accessibility service scoped to that display,
+/// the picture from the helper's frame, and the input from the helper too
+/// (`input -d`), because ADB's own `input` only reaches the default display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The device's own screen.
+    Screen,
+    /// A virtual display, by the id `android_display start` returned.
+    Display(i32),
+}
+
+impl Target {
+    /// Read the optional `display` argument. Absent means the user's screen.
+    pub(super) fn from_args(args: &Value) -> Result<Self, String> {
+        match args.get("display") {
+            None | Some(Value::Null) => Ok(Self::Screen),
+            Some(value) => {
+                let id = value
+                    .as_i64()
+                    .ok_or_else(|| "`display` must be an integer id".to_string())?;
+                i32::try_from(id)
+                    .map(Self::Display)
+                    .map_err(|_| format!("display id {id} is out of range"))
+            }
+        }
+    }
+}
+
+/// One input already resolved into device-independent coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputOp {
+    /// One or more taps, dispatched back to back.
+    Taps(Vec<(i32, i32)>),
+    Swipe {
+        from: (i32, i32),
+        to: (i32, i32),
+    },
+    Text(String),
+    Key(String),
+}
+
+/// The bridge, or the reason a display operation cannot happen here.
+pub(super) fn display_bridge() -> Result<crate::device::DeviceBridgeRef, String> {
+    crate::device::bridge().cloned().ok_or_else(|| {
+        "A virtual display only exists inside the Syscity app on the phone itself; this host has \
+         no display helper. Use the display-less actions instead."
+            .to_string()
+    })
+}
+
+/// Send a resolved input to the agent's own display.
+async fn dispatch_display(id: i32, op: &InputOp) -> Result<(), String> {
+    let bridge = display_bridge()?;
+    let display = super::display::VirtualDisplay::attach(bridge, id);
+    let failed = |e: super::display::DisplayError| e.to_string();
+    match op {
+        InputOp::Taps(points) => {
+            for (x, y) in points {
+                display.tap(*x, *y).await.map_err(failed)?;
+            }
+            Ok(())
+        }
+        InputOp::Swipe { from, to } => display.swipe(*from, *to, 300).await.map_err(failed),
+        InputOp::Text(text) => display.text(text).await.map_err(failed),
+        InputOp::Key(keycode) => display.key(keycode).await.map_err(failed),
+    }
 }
 
 // ── Tree quality ───────────────────────────────────────────────────────────
@@ -1357,6 +1513,7 @@ impl Settle {
 /// accepted. Two consecutive equal readings mean the screen has settled.
 pub async fn settle_after_action(
     device: &Option<String>,
+    target: Target,
     before: Option<u64>,
     budget_ms: u64,
 ) -> Settle {
@@ -1368,7 +1525,7 @@ pub async fn settle_after_action(
     let mut failure: Option<String> = None;
 
     loop {
-        match dump_ui_elements(device).await {
+        match dump_ui_elements(device, target).await {
             Ok(elements) => {
                 let fingerprint = tree_fingerprint(&elements);
                 if before.is_some_and(|before| before != fingerprint) {
@@ -1506,9 +1663,11 @@ pub async fn ocr_png(_png: &[u8]) -> Result<Vec<OcrLine>, String> {
     Err("this build has no OCR engine (compiled without the `vision` feature)".to_string())
 }
 
-/// Read text out of the device's current screen.
-pub async fn ocr_screen(device: &Option<String>) -> Result<Vec<OcrLine>, String> {
-    let png = capture_png(device).await.map_err(|e| e.to_string())?;
+/// Read text out of whatever `target` points at.
+pub async fn ocr_screen(device: &Option<String>, target: Target) -> Result<Vec<OcrLine>, String> {
+    let png = capture_png(device, target)
+        .await
+        .map_err(|e| e.to_string())?;
     ocr_png(&png).await
 }
 
@@ -1608,8 +1767,9 @@ pub struct UiDump {
 
 pub(super) async fn dump_ui_elements(
     device: &Option<String>,
+    target: Target,
 ) -> Result<Vec<UiElement>, DumpFailure> {
-    Ok(dump_ui(device).await?.elements)
+    Ok(dump_ui(device, target).await?.elements)
 }
 
 /// Dump, pull and parse the tree in one go.
@@ -1620,10 +1780,36 @@ pub(super) async fn dump_ui_elements(
 /// only on the phone itself and only while Syscity's accessibility service is
 /// on, so a desktop driving a remote device — and any phone with the service
 /// off — falls through to ADB exactly as before.
-pub(super) async fn dump_ui(device: &Option<String>) -> Result<UiDump, DumpFailure> {
+pub(super) async fn dump_ui(
+    device: &Option<String>,
+    target: Target,
+) -> Result<UiDump, DumpFailure> {
+    if let Target::Display(id) = target {
+        // A virtual display is reachable only through the accessibility
+        // service, which is the only reader that can be pointed at it. There is
+        // no `uiautomator` fallback: that dumps the default display, which
+        // would silently describe the wrong screen.
+        let bridge = display_bridge()
+            .map_err(|message| DumpFailure::new(DISPLAY_TREE_UNAVAILABLE, message))?;
+        return match super::a11y::fetch(&bridge, Some(id)).await {
+            Ok(snapshot) => Ok(UiDump {
+                elements: snapshot.elements,
+                screen: snapshot.display,
+                source: "accessibility",
+            }),
+            Err(unavailable) => Err(DumpFailure::new(
+                DISPLAY_TREE_UNAVAILABLE,
+                format!(
+                    "Could not read display {id}: {}. Work from the frame instead —                      android_display action 'frame' returns one.",
+                    unavailable.message
+                ),
+            )),
+        };
+    }
+
     if device.is_none() {
         if let Some(bridge) = crate::device::bridge() {
-            match super::a11y::fetch(bridge).await {
+            match super::a11y::fetch(bridge, None).await {
                 Ok(snapshot) if snapshot.is_addressable() => {
                     return Ok(UiDump {
                         elements: snapshot.elements,
@@ -1721,6 +1907,7 @@ impl Tool for AdbUiTreeTool {
         create_schema(
             "Get Android UI tree",
             serde_json::json!({
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -1739,7 +1926,11 @@ impl Tool for AdbUiTreeTool {
         // The raw dump is an order of magnitude larger than what the model can
         // use, and the model would have to parse `bounds` itself to act on it.
         // Hand back an indexed list instead; the XML stays out of the context.
-        let dump = match dump_ui(&device).await {
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let dump = match dump_ui(&device, target).await {
             Ok(dump) => dump,
             Err(failure) => {
                 return Ok(ToolExecutionResult::error(failure.message)
@@ -1754,7 +1945,7 @@ impl Tool for AdbUiTreeTool {
         // the only way to say what is actually on the screen — and saying it
         // here is what stops the model from re-reading the tree forever.
         if quality != TreeQuality::Usable {
-            match ocr_screen(&device).await {
+            match ocr_screen(&device, target).await {
                 Ok(lines) => {
                     summary.push_str("\n\n");
                     summary.push_str(&format_ocr_lines(&lines));
@@ -1930,6 +2121,7 @@ impl Tool for AdbVerifyTool {
                 "text": { "type": "string", "description": "The screen should show this text, in some element's text or content description" },
                 "target": { "type": "integer", "description": "An element index from android_ui_tree that should still be there" },
                 "target_description": { "type": "string", "description": "Optional label you expect at `target`" },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -1951,7 +2143,11 @@ impl Tool for AdbVerifyTool {
         };
         let checked = expectation.describe();
 
-        match dump_ui_elements(&device).await {
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        match dump_ui_elements(&device, target).await {
             Ok(elements) => {
                 let verdict = evaluate(&expectation, &elements);
                 Ok(ToolExecutionResult::success(format!(
@@ -2618,6 +2814,29 @@ mod tests {
     fn blank_labels_do_not_count() {
         let blank = node("android.widget.TextView", Some("   "), (0, 0, 10, 10));
         assert_eq!(element_label(&blank), None);
+    }
+
+    // ── Targets ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_display_argument_means_the_users_screen() {
+        let args = serde_json::json!({ "action": "tap", "x": 1, "y": 2 });
+        assert_eq!(Target::from_args(&args), Ok(Target::Screen));
+        let explicit_null = serde_json::json!({ "display": null });
+        assert_eq!(Target::from_args(&explicit_null), Ok(Target::Screen));
+    }
+
+    #[test]
+    fn a_display_id_targets_that_display() {
+        let args = serde_json::json!({ "display": 3 });
+        assert_eq!(Target::from_args(&args), Ok(Target::Display(3)));
+    }
+
+    #[test]
+    fn a_non_integer_display_is_refused_with_a_reason() {
+        let args = serde_json::json!({ "display": "three" });
+        let message = Target::from_args(&args).expect_err("refused");
+        assert!(message.contains("integer"), "{message}");
     }
 
     // ── Action effect ───────────────────────────────────────────────────

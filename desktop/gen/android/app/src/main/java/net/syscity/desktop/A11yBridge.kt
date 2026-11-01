@@ -2,6 +2,7 @@ package net.syscity.desktop
 
 import android.content.Context
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityNodeInfo
 import app.tauri.plugin.JSObject
@@ -69,12 +70,16 @@ object A11yBridge {
    * running service with no root (lock screen, a mid-transition frame) answers
    * with an empty node list instead, which the Rust side treats the same way.
    */
-  fun snapshot(): JSObject? {
+  fun snapshot(displayId: Int? = null): JSObject? {
     val service = this.service ?: return null
     val out = JSObject()
     out.put("enabled", true)
 
-    val root = service.rootOrNull()
+    val root = if (displayId == null || displayId == 0) {
+      service.rootOrNull()
+    } else {
+      service.rootForDisplay(displayId)
+    }
     if (root == null) {
       out.put("nodes", JSONArray())
       out.put("truncated", false)
@@ -82,7 +87,18 @@ object A11yBridge {
     }
 
     root.packageName?.toString()?.let { out.put("package", it) }
-    val metrics = service.resources.displayMetrics
+    val metrics = if (displayId == null || displayId == 0) {
+      service.resources.displayMetrics
+    } else {
+      // The agent's display has its own size; borrowing the main screen's would
+      // put every reported coordinate in the wrong space.
+      val display = service.getSystemService(DisplayManager::class.java)?.getDisplay(displayId)
+      val mode = display?.mode
+      android.util.DisplayMetrics().apply {
+        widthPixels = mode?.physicalWidth ?: 0
+        heightPixels = mode?.physicalHeight ?: 0
+      }
+    }
     out.put(
       "display",
       JSONObject().put("width", metrics.widthPixels).put("height", metrics.heightPixels),

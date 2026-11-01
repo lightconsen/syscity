@@ -193,17 +193,25 @@ pub fn parse(value: &Value) -> Result<A11ySnapshot, A11yUnavailable> {
     })
 }
 
-/// Ask the running accessibility service for the current screen.
-pub async fn fetch(bridge: &DeviceBridgeRef) -> Result<A11ySnapshot, A11yUnavailable> {
-    let answer = bridge
-        .call(CMD_A11Y_TREE, serde_json::json!({}))
-        .await
-        .map_err(|e| {
-            A11yUnavailable::new(
-                A11Y_BRIDGE_ERROR,
-                format!("the accessibility service could not be reached ({e})"),
-            )
-        })?;
+/// Ask the running accessibility service for a screen.
+///
+/// `display` selects a virtual display — the agent's own screen, which the
+/// service finds through the live window list rather than as the "active
+/// window". `None` is the user's screen.
+pub async fn fetch(
+    bridge: &DeviceBridgeRef,
+    display: Option<i32>,
+) -> Result<A11ySnapshot, A11yUnavailable> {
+    let payload = match display {
+        Some(id) => serde_json::json!({ "display": id }),
+        None => serde_json::json!({}),
+    };
+    let answer = bridge.call(CMD_A11Y_TREE, payload).await.map_err(|e| {
+        A11yUnavailable::new(
+            A11Y_BRIDGE_ERROR,
+            format!("the accessibility service could not be reached ({e})"),
+        )
+    })?;
     parse(&answer)
 }
 
@@ -316,7 +324,7 @@ mod tests {
             "nodes": [node("android.widget.Button", "Go", [0, 0, 50, 50], true)],
         }));
         let reference: DeviceBridgeRef = std::sync::Arc::new(bridge);
-        let snapshot = fetch(&reference).await.expect("snapshot");
+        let snapshot = fetch(&reference, None).await.expect("snapshot");
         assert_eq!(snapshot.elements.len(), 1);
         assert!(snapshot.is_addressable());
     }
@@ -335,7 +343,7 @@ mod tests {
             }
         }
         let reference: DeviceBridgeRef = std::sync::Arc::new(Broken);
-        let failed = fetch(&reference).await.expect_err("unreachable");
+        let failed = fetch(&reference, None).await.expect_err("unreachable");
         assert_eq!(failed.code, A11Y_BRIDGE_ERROR);
     }
 }

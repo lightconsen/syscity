@@ -457,7 +457,13 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
    */
   @Command
   fun accessibilityTree(invoke: Invoke) {
-    val snapshot = A11yBridge.snapshot()
+    // `display` selects a virtual display; absent means the user's screen.
+    val displayId = if (invoke.getArgs().has("display")) {
+      invoke.getArgs().optInt("display", 0)
+    } else {
+      null
+    }
+    val snapshot = A11yBridge.snapshot(displayId)
     if (snapshot == null) {
       invoke.resolve(JSObject().put("enabled", false))
       return

@@ -189,9 +189,9 @@ identically whichever one answered:
 | **`uiautomator dump`** (ADB) | every other case: a desktop driving a remote phone, or the phone with the service off | a subprocess plus an `/sdcard` round trip |
 
 The result says which one it used (`source`), because a read that disagrees with
-what you expected should be traceable to where it came from. The in-process path
-is also the prerequisite for reading a display other than the default one, which
-is what a virtual display needs.
+what you expected should be traceable to where it came from. The same
+in-process path reads a virtual display: pass `display: <id>` to any of the
+screen tools and the service selects that display's windows instead.
 
 ### A second screen (`android_display`)
 
@@ -220,8 +220,13 @@ Known limits, in the order they will bite:
   briefly while the agent types; 14+ gets `FLAG_OWN_FOCUS`.
 - **Frames cost a PNG each.** Right for one observation per turn, wrong for
   video.
-- **The accessibility tree still reads the default display.** Reading the
-  virtual one is the next step; until then `frame` + OCR is what sees it.
+- **Reading the second display needs API 30+.** `android_ui_tree`,
+  `android_observe`, `android_input` and the rest take a `display` argument;
+  on that display the tree comes from the accessibility service scoped to it
+  (windows are selected by display id, which arrived in API 30) and the
+  picture from the helper's frame. Below API 30, or with the service off, the
+  read fails with `DISPLAY_TREE_UNAVAILABLE` and `frame` + OCR is what is
+  left.
 
 ## Capability Registry
 

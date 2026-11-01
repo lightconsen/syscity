@@ -14,10 +14,11 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use super::android::display_bridge;
 use super::android::{
     adb_args, assess_tree, dump_ui, element_label, format_ocr_lines, format_ui_summary, ocr_screen,
-    resolve_device, resolved_serial, settle_after_action, sh_quote, tree_fingerprint, TreeQuality,
-    UiElement, DEVICE_PARAM, EFFECT_UNCHANGED,
+    resolve_device, resolved_serial, settle_after_action, sh_quote, tree_fingerprint, Target,
+    TreeQuality, UiElement, DEVICE_PARAM, DISPLAY_PARAM, EFFECT_UNCHANGED,
 };
 use super::run_cmd;
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
@@ -70,6 +71,7 @@ async fn scroll_once(
     device: &Option<String>,
     size: (i32, i32),
     direction: Direction,
+    target: Target,
 ) -> Result<(), String> {
     let (width, height) = size;
     let x = width / 2;
@@ -77,6 +79,16 @@ async fn scroll_once(
         Direction::Down => (height * 3 / 4, height / 4),
         Direction::Up => (height / 4, height * 3 / 4),
     };
+    if let Target::Display(id) = target {
+        // A swipe aimed at the agent's display goes through the helper: ADB's
+        // own `input` only reaches the default display.
+        let bridge = display_bridge()?;
+        let display = super::display::VirtualDisplay::attach(bridge, id);
+        return display
+            .swipe((x, from_y), (x, to_y), 300)
+            .await
+            .map_err(|e| e.to_string());
+    }
     let command = format!("input swipe {x} {from_y} {x} {to_y} 300");
     let args = adb_args(device, &["shell", &command]);
     let (status, _, stderr) = run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
@@ -147,6 +159,7 @@ impl Tool for AdbCollectTool {
                     "description": "down (default) reads towards older/newer content; up reverses.",
                     "enum": ["down", "up"]
                 },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -164,6 +177,10 @@ impl Tool for AdbCollectTool {
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
         let max_screens = args
             .get("max_screens")
@@ -184,7 +201,7 @@ impl Tool for AdbCollectTool {
         let mut stop = "reached max_screens";
 
         for index in 0..max_screens {
-            let dump = match dump_ui(&device).await {
+            let dump = match dump_ui(&device, target).await {
                 Ok(dump) => dump,
                 Err(failure) => {
                     if screens.is_empty() {
@@ -223,7 +240,7 @@ impl Tool for AdbCollectTool {
                 stop = "the screen size is unknown, so it cannot be scrolled";
                 break;
             };
-            if let Err(message) = scroll_once(&device, size, direction).await {
+            if let Err(message) = scroll_once(&device, size, direction, target).await {
                 stop = "scrolling failed";
                 if screens.len() == 1 {
                     return Ok(ToolExecutionResult::error(message));
@@ -231,7 +248,7 @@ impl Tool for AdbCollectTool {
                 break;
             }
             let before = tree_fingerprint(&dump.elements);
-            let settle = settle_after_action(&device, Some(before), 900).await;
+            let settle = settle_after_action(&device, target, Some(before), 900).await;
             if settle.effect == EFFECT_UNCHANGED {
                 stop = "the screen stopped moving";
                 break;
@@ -317,6 +334,7 @@ impl Tool for AdbFindTool {
                     "description": "down (default) or up.",
                     "enum": ["down", "up"]
                 },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             vec!["text"],
@@ -334,6 +352,10 @@ impl Tool for AdbFindTool {
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
         let needle = args
             .get("text")
@@ -359,7 +381,7 @@ impl Tool for AdbFindTool {
 
         let mut size: Option<(i32, i32)> = None;
         for step in 0..=max_scrolls {
-            let dump = match dump_ui(&device).await {
+            let dump = match dump_ui(&device, target).await {
                 Ok(dump) => dump,
                 Err(failure) => {
                     return Ok(ToolExecutionResult::error(failure.message)
@@ -398,11 +420,11 @@ impl Tool for AdbFindTool {
                      android_input action 'swipe' and read again",
                 ));
             };
-            if let Err(message) = scroll_once(&device, size, direction).await {
+            if let Err(message) = scroll_once(&device, size, direction, target).await {
                 return Ok(ToolExecutionResult::error(message));
             }
             let before = tree_fingerprint(&dump.elements);
-            let settle = settle_after_action(&device, Some(before), 900).await;
+            let settle = settle_after_action(&device, target, Some(before), 900).await;
             if settle.effect == EFFECT_UNCHANGED {
                 return Ok(ToolExecutionResult::success(format!(
                     "Not found: the screen stopped moving after {step} scroll(s), so there is \
@@ -481,6 +503,7 @@ impl Tool for AdbDialogTool {
                     "type": "string",
                     "description": "Button text to press. Refused unless exactly one button on the dialog matches."
                 },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -499,7 +522,11 @@ impl Tool for AdbDialogTool {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        let dump = match dump_ui(&device).await {
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let dump = match dump_ui(&device, target).await {
             Ok(dump) => dump,
             Err(failure) => {
                 return Ok(ToolExecutionResult::error(failure.message)
@@ -592,7 +619,7 @@ impl Tool for AdbDialogTool {
                 element_label(element).is_some_and(|label| label.to_lowercase().contains(&needle))
             })
             .collect();
-        let target = match matching.as_slice() {
+        let chosen = match matching.as_slice() {
             [only] => *only,
             [] => {
                 return Ok(ToolExecutionResult::success(format!(
@@ -625,22 +652,40 @@ impl Tool for AdbDialogTool {
         };
 
         let before = tree_fingerprint(&dump.elements);
-        let command = format!("input tap {} {}", target.center.0, target.center.1);
-        let argv = adb_args(&device, &["shell", &command]);
-        let (status, _, stderr) =
-            run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                .await
-                .map_err(|e| crate::error::SyscityError::ExternalService {
-                    source: "adb tap failed".to_string(),
-                    cause: Some(Box::new(e)),
-                })?;
-        if !status.success() {
-            return Ok(ToolExecutionResult::error(format!(
-                "pressing {wanted:?} failed: {}",
-                stderr.trim()
-            )));
+        let at = chosen.center;
+        let pressed = match target {
+            Target::Screen => {
+                let command = format!("input tap {} {}", at.0, at.1);
+                let argv = adb_args(&device, &["shell", &command]);
+                run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                    .await
+                    .map(|(status, _, stderr)| (status.success(), stderr))
+                    .map_err(|e| e.to_string())
+            }
+            Target::Display(id) => match display_bridge() {
+                Ok(bridge) => super::display::VirtualDisplay::attach(bridge, id)
+                    .tap(at.0, at.1)
+                    .await
+                    .map(|()| (true, String::new()))
+                    .map_err(|e| e.to_string()),
+                Err(message) => Err(message),
+            },
+        };
+        match pressed {
+            Ok((true, _)) => {}
+            Ok((false, stderr)) => {
+                return Ok(ToolExecutionResult::error(format!(
+                    "pressing {wanted:?} failed: {}",
+                    stderr.trim()
+                )))
+            }
+            Err(message) => {
+                return Ok(ToolExecutionResult::error(format!(
+                    "pressing {wanted:?} failed: {message}"
+                )))
+            }
         }
-        let settle = settle_after_action(&device, Some(before), 1200).await;
+        let settle = settle_after_action(&device, target, Some(before), 1200).await;
 
         Ok(
             ToolExecutionResult::success(format!("Pressed {wanted:?}. {}", settle.verdict()))
@@ -1054,6 +1099,7 @@ impl Tool for AdbOcrTool {
         create_schema(
             "Read text from the screen with OCR",
             serde_json::json!({
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             Vec::<String>::new(),
@@ -1069,7 +1115,11 @@ impl Tool for AdbOcrTool {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        match ocr_screen(&device).await {
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        match ocr_screen(&device, target).await {
             Ok(lines) => Ok(ToolExecutionResult::success(format_ocr_lines(&lines)).with_data(
                 serde_json::json!({
                     "lines": lines,
@@ -1107,21 +1157,6 @@ impl AdbDisplayTool {
         self.device = Some(device);
         self
     }
-}
-
-/// The bridge, or the reason a display cannot be created here.
-///
-/// A virtual display needs a helper running as shell on the device, and the
-/// only thing that can start it is this app. A desktop driving a remote phone
-/// over ADB has no bridge, so the honest answer there is "not available from
-/// this host" rather than a connection error.
-fn display_bridge() -> Result<crate::device::DeviceBridgeRef, String> {
-    crate::device::bridge().cloned().ok_or_else(|| {
-        "A virtual display needs the Syscity app running on the phone itself (it starts the \
-         helper as the shell user). From a desktop driving a remote device, use the ordinary \
-         android_* tools — they act on that phone's own screen."
-            .to_string()
-    })
 }
 
 #[async_trait]
