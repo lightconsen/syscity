@@ -1153,9 +1153,14 @@ impl AdbDisplayTool {
         Self { device: None }
     }
 
-    pub fn with_device(mut self, device: String) -> Self {
-        self.device = Some(device);
-        self
+    /// Kill whatever helper is running on the device.
+    ///
+    /// Best effort: a device without `pkill` is not a reason to refuse.
+    async fn kill_helper(&self, device: &Option<String>, class: &str) -> bool {
+        let args = adb_args(device, &["shell", "pkill", "-f", class]);
+        super::run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .await
+            .is_ok_and(|(status, _, _)| status.success())
     }
 }
 
@@ -1181,10 +1186,10 @@ impl Tool for AdbDisplayTool {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "start", "stop", "status", "frame", "launch",
+                        "start", "restart", "stop", "status", "frame", "launch",
                         "tap", "swipe", "text", "key"
                     ],
-                    "description": "start creates the display; the rest act on it."
+                    "description": "start creates the display; restart replaces a stale helper; the rest act on it."
                 },
                 "display": {
                     "type": "integer",
@@ -1235,6 +1240,38 @@ impl Tool for AdbDisplayTool {
                 }
                 Err(failed) => ToolExecutionResult::error(failed.to_string()),
             });
+        }
+
+        if action == "restart" {
+            // Kill whatever helper is running before starting a fresh one.
+            //
+            // A helper can outlive the app that started it (`app_process` is
+            // detached on purpose) and then hold the socket name with a
+            // process from an older build — reachable only if its identity
+            // still matches. This clears that without needing shell on the
+            // host.
+            let killed = self
+                .kill_helper(&device, super::display::HELPER_CLASS)
+                .await;
+            return Ok(
+                match super::display::ensure_helper(
+                    &device,
+                    super::display::ANDROID_PACKAGE,
+                    &bridge,
+                )
+                .await
+                {
+                    Ok(()) => ToolExecutionResult::success(format!(
+                        "Display helper restarted{} and is answering.",
+                        if killed {
+                            ""
+                        } else {
+                            " (nothing was running to kill)"
+                        }
+                    )),
+                    Err(failed) => ToolExecutionResult::error(failed.to_string()),
+                },
+            );
         }
 
         if action == "start" {

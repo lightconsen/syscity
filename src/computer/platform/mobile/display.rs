@@ -276,6 +276,11 @@ async fn call(bridge: &DeviceBridgeRef, request: Value) -> Result<Value, Display
 /// inherits the identity of whatever started it, so starting it from `adb
 /// shell` gives the display the `CAPTURE_VIDEO_OUTPUT` it needs. The classpath
 /// is the installed APK — `pm path` reports it, and the shell can read it.
+///
+/// The helper runs in the `shell` SELinux domain. An untagged app cannot open a
+/// unix socket there (`avc: denied { connectto } … untrusted_app → shell`), so
+/// what the app can reach of it is decided by the transport, not by this
+/// command line — see the module note.
 pub fn launch_command(apk_path: &str) -> String {
     format!("CLASSPATH={} app_process /system/bin {}", apk_path, HELPER_CLASS)
 }
@@ -306,9 +311,30 @@ pub async fn ensure_helper(
     if available(bridge).await {
         return Ok(());
     }
-    let apk = apk_path(device, package).await?;
+    // Before anything else, is there a device to talk to at all? Without this
+    // the first adb command fails with its own words (`libadb.so: device
+    // offline` — the prefix is adb's log tag, taken from the binary's name,
+    // not a serial), which reads like a bug in the display code.
+    let devices = super::adb_devices().await.map_err(|e| {
+        DisplayError::new(
+            DISPLAY_UNAVAILABLE,
+            format!("the app's bundled adb could not be queried ({e})"),
+        )
+    })?;
+    connected_device_note(&devices).map_err(|note| DisplayError::new(DISPLAY_UNAVAILABLE, note))?;
+
+    // Which device to aim at. On the phone this is the loopback connection it
+    // paired with; but an emulator also exposes a transport, and adb refuses a
+    // command that does not say which of the two it means ("more than one
+    // device/emulator"). Prefer the loopback one — that is the one the app owns.
+    let device = match device {
+        Some(explicit) => Some(explicit.clone()),
+        None => preferred_serial(&devices),
+    };
+
+    let apk = apk_path(&device, package).await?;
     let command = format!("{} >/dev/null 2>&1 &", launch_command(&apk));
-    let args = super::android::adb_args(device, &["shell", &command]);
+    let args = super::android::adb_args(&device, &["shell", &command]);
     let (status, _, stderr) =
         super::run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
             .await
@@ -339,6 +365,70 @@ pub async fn ensure_helper(
         "the display helper was started but never answered on its socket — check `adb shell \
          logcat -s syscity` on the device",
     ))
+}
+
+/// Whether adb has a device it can actually talk to, and what to do when it
+/// does not.
+///
+/// `has_adb()` only answers "is the binary there". Between that and a usable
+/// device are two states a person can fix in seconds but a stack trace cannot
+/// explain: not paired at all, and paired but not authorised.
+fn connected_device_note(devices: &[Value]) -> Result<(), String> {
+    let state_of = |device: &Value| {
+        device
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    if devices.iter().any(|device| state_of(device) == "device") {
+        return Ok(());
+    }
+    let states: Vec<String> = devices.iter().map(state_of).collect();
+    Err(match states.first().map(String::as_str) {
+        None => "the app's bundled adb has no device connected, so nothing can be run on the \
+                phone. Pair it once in Syscity's pairing screen (Settings › System › Developer \
+                options › Wireless debugging), or `adb connect` to it; the display helper is \
+                started through that connection."
+            .to_string(),
+        Some("unauthorized") => "adb sees the phone but this computer is not authorised: accept \
+                                 the “Allow USB debugging?” prompt on the phone, then try again."
+            .to_string(),
+        Some("offline") => "adb reports the phone as offline — usually a stale connection. Turn \
+                            wireless debugging off and on (or pair again), then try again."
+            .to_string(),
+        Some(other) => format!(
+            "adb cannot use the phone (state {other}); pair it again in Syscity's pairing screen."
+        ),
+    })
+}
+
+/// Which connected device to address when the caller did not name one.
+///
+/// The loopback serial (`localhost:…` / `127.0.0.1:…`) is the connection the
+/// app paired with — its own phone. A single device is unambiguous however it
+/// is named; several with no loopback among them is left to adb to complain
+/// about, because guessing there would mean running a command on someone
+/// else's device.
+fn preferred_serial(devices: &[Value]) -> Option<String> {
+    let usable = devices
+        .iter()
+        .filter(|device| device.get("state").and_then(Value::as_str) == Some("device"));
+    let serials: Vec<String> = usable
+        .filter_map(|device| device.get("serial").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    serials
+        .iter()
+        .find(|serial| serial.starts_with("localhost:") || serial.starts_with("127.0.0.1:"))
+        .cloned()
+        .or_else(|| {
+            if serials.len() == 1 {
+                serials.first().cloned()
+            } else {
+                None
+            }
+        })
 }
 
 /// The installed APK path for `package`, from `pm path`.
@@ -453,6 +543,59 @@ mod tests {
         let frame = display.screenshot().await.expect("frame");
         assert_eq!(frame.png, b"\x89PNG\r\n");
         assert_eq!((frame.width, frame.height), (10, 20));
+    }
+
+    #[test]
+    fn the_loopback_serial_wins_when_several_are_connected() {
+        let devices = vec![
+            json!({ "serial": "emulator-5554", "state": "device" }),
+            json!({ "serial": "localhost:5555", "state": "device" }),
+        ];
+        assert_eq!(preferred_serial(&devices).as_deref(), Some("localhost:5555"));
+    }
+
+    #[test]
+    fn a_single_device_is_taken_however_it_is_named() {
+        let devices = vec![json!({ "serial": "ABC123", "state": "device" })];
+        assert_eq!(preferred_serial(&devices).as_deref(), Some("ABC123"));
+        let offline = vec![json!({ "serial": "ABC123", "state": "offline" })];
+        assert_eq!(preferred_serial(&offline), None);
+    }
+
+    #[test]
+    fn several_devices_without_a_loopback_are_left_to_adb() {
+        let devices = vec![
+            json!({ "serial": "emulator-5554", "state": "device" }),
+            json!({ "serial": "ABC123", "state": "device" }),
+        ];
+        assert_eq!(preferred_serial(&devices), None);
+    }
+
+    #[test]
+    fn a_connected_device_passes_quietly() {
+        let devices = vec![json!({ "serial": "127.0.0.1:5555", "state": "device" })];
+        assert!(connected_device_note(&devices).is_ok());
+    }
+
+    #[test]
+    fn no_device_says_how_to_pair() {
+        let note = connected_device_note(&[]).expect_err("no device");
+        assert!(note.contains("pair"), "{note}");
+        assert!(note.contains("Wireless debugging"), "{note}");
+    }
+
+    #[test]
+    fn unauthorized_says_to_accept_the_prompt() {
+        let devices = vec![json!({ "serial": "127.0.0.1:5555", "state": "unauthorized" })];
+        let note = connected_device_note(&devices).expect_err("unauthorised");
+        assert!(note.contains("Allow USB debugging"), "{note}");
+    }
+
+    #[test]
+    fn offline_says_it_is_a_stale_connection() {
+        let devices = vec![json!({ "serial": "127.0.0.1:5555", "state": "offline" })];
+        let note = connected_device_note(&devices).expect_err("offline");
+        assert!(note.contains("offline"), "{note}");
     }
 
     #[tokio::test]
