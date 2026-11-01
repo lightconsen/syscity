@@ -1000,6 +1000,10 @@ async fn dispatch_method(
             device_ws::handle_device_permission_request(req, state).await
         }
         "device.adb.status" => device_ws::handle_device_adb_status(req, state).await,
+        // Debug-only (off unless SYSCITY_DEBUG_TOOL_INVOKE=1): run one
+        // platform tool without an agent turn, so on-device behaviour can be
+        // checked without spending a model call.
+        "debug.tool.invoke" => admin_ws::handle_debug_tool_invoke(req, state).await,
         "device.adb.pair" => device_ws::handle_device_adb_pair(req, state).await,
         "device.shortcut.run" => device_ws::handle_device_shortcut_run(req, state).await,
         "device.shortcut.results" => device_ws::handle_device_shortcut_results(req, state).await,

@@ -330,6 +330,11 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("device.capabilities", Some(SCOPE_READ)),
     ("device.permission.status", Some(SCOPE_READ)),
     ("device.adb.status", Some(SCOPE_READ)),
+    // Runs a platform tool outside an agent turn. `write` rather than `admin`
+    // because that is what the tools it reaches need — screen control is the
+    // same power the computer tools have, and the local client holds `write`
+    // but not `admin`. The real gate is the handler's opt-in, not the scope.
+    ("debug.tool.invoke", Some(SCOPE_WRITE)),
     ("device.shortcut.results", Some(SCOPE_READ)),
     ("device.shortcut.inbox", Some(SCOPE_READ)),
     ("eval.trace.list", Some(SCOPE_READ)),
@@ -1302,6 +1307,7 @@ mod tests {
         assert_eq!(method_scope("device.capabilities"), Some(SCOPE_READ));
         assert_eq!(method_scope("device.permission.status"), Some(SCOPE_READ));
         assert_eq!(method_scope("device.adb.status"), Some(SCOPE_READ));
+        assert_eq!(method_scope("debug.tool.invoke"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("device.shortcut.results"), Some(SCOPE_READ));
         assert_eq!(method_scope("device.shortcut.inbox"), Some(SCOPE_READ));
         assert_eq!(method_scope("eval.trace.list"), Some(SCOPE_READ));

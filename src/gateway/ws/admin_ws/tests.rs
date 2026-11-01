@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::super::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 
+use super::debug::{debug_enabled, invoke_platform_tool};
 use super::*;
 use crate::gateway::state_tests::make_test_state;
 use crate::gateway::GatewayConfig;
@@ -1401,4 +1402,56 @@ async fn skills_archive_and_restore_round_trip_over_ws() {
     assert!(!missing.ok);
 
     std::fs::remove_dir_all(crate::dirs::skills_dir().join(&name)).unwrap();
+}
+
+// ── debug.tool.invoke ──────────────────────────────────────────────────────
+//
+// The method runs a platform tool outside an agent turn, and therefore outside
+// the approval flow. These tests are the guard rail: off by default, and
+// unable to reach anything that is not a platform tool.
+
+#[test]
+fn the_debug_gate_is_on_only_for_an_explicit_one() {
+    assert!(debug_enabled(Some("1")));
+    assert!(!debug_enabled(Some("0")));
+    assert!(!debug_enabled(Some("true")));
+    assert!(!debug_enabled(None));
+}
+
+#[tokio::test]
+async fn debug_tool_invoke_is_off_by_default() {
+    let resp = invoke_platform_tool(
+        &req(
+            "d1",
+            "debug.tool.invoke",
+            Some(serde_json::json!({ "tool": "android_ui_tree" })),
+        ),
+        false,
+    )
+    .await;
+    assert!(!resp.ok);
+    assert_eq!(resp.error.as_ref().map(|e| e.code.as_str()), Some("DISABLED"));
+}
+
+#[tokio::test]
+async fn debug_tool_invoke_refuses_a_tool_it_does_not_have() {
+    let resp = invoke_platform_tool(
+        &req(
+            "d2",
+            "debug.tool.invoke",
+            // Deliberately outside the platform sets: this method must never
+            // become a way to run the shell.
+            Some(serde_json::json!({ "tool": "shell", "arguments": {} })),
+        ),
+        true,
+    )
+    .await;
+    assert!(!resp.ok);
+    assert_eq!(resp.error.as_ref().map(|e| e.code.as_str()), Some("TOOL_NOT_FOUND"));
+    let message = resp
+        .error
+        .as_ref()
+        .map(|e| e.message.clone())
+        .unwrap_or_default();
+    assert!(message.contains("available:"), "{message}");
 }

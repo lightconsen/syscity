@@ -18,6 +18,14 @@ class MainActivity : TauriActivity() {
     // Point the AndroidShellRunner at the APK's extracted native libraries
     // (`jniLibs`) so bundled binaries (sh/toybox) can be exec'd from there.
     Os.setenv("SYSCITY_NATIVE_LIB_DIR", applicationInfo.nativeLibraryDir, true)
+    // Debug builds only: let `debug.tool.invoke` run a platform tool without an
+    // agent turn, so on-device behaviour (the virtual display, the accessibility
+    // tree) can be checked without spending a model call. Release builds never
+    // set this, and the method refuses while it is absent — it runs tools
+    // outside the approval flow.
+    if (BuildConfig.DEBUG) {
+      Os.setenv("SYSCITY_DEBUG_TOOL_INVOKE", "1", true)
+    }
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     // Keep the process alive for long agent turns when backgrounded (§4.7).
