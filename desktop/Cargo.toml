@@ -11,7 +11,16 @@ rust-version = "1.75"
 tauri = { version = "2", features = ["tray-icon", "process-relaunch-dangerous-allow-symlink-macos"] }
 tauri-plugin-shell = "2"
 # Desktop self-update via the Tauri updater (minisign-signed bundles).
-tauri-plugin-updater = "2"
+#
+# `zip` is off on purpose. The plugin's default features pull it in for one
+# thing: extracting a *zip-shaped* Windows updater bundle (`extract_zip`, in
+# `updater.rs`). Our updater payloads are the NSIS `.exe` on Windows, a raw
+# `.AppImage` on Linux and the `.app.tar.gz` on macOS (see the manifest built
+# in `.github/workflows/release.yml`), so that path is never taken — and the
+# zip version it pins (4.x) carries RUSTSEC-2026-0429, where
+# `ZipArchive::extract` aborts the process on a symlink entry with a huge
+# declared size. Nothing else in the plugin is behind the feature.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 async-trait = "0.1"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"

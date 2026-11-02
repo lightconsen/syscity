@@ -43,28 +43,17 @@ ignore = [
     # jsonwebtoken (or if anything here ever signs with a private key).
     "RUSTSEC-2026-0387",
 
-    # RUSTSEC-2026-0367 / -0368 / -0369: three `zip` advisories (2026-10-09/10)
-    # about **extraction** — SUID/SGID bits preserved when extracting, symlink
-    # targets outside the destination directory, and Unix permissions applied
-    # through symlinks. Fixed in zip >= 9.0.0, which four dependents pin below
-    # (0.6.6 via ppt-rs, 4.6.1 via tauri-plugin-updater, 8.6.0 via calamine /
-    # docx-rs / rust_xlsxwriter, 2.4.2 direct), so there is no single version to
-    # move to. Reachability was checked rather than assumed:
-    #   - Syscity itself never calls `extract()` anywhere (grepped): the plugin
-    #     installer reads entries by index and refuses them with
-    #     `enclosed_name()` (zip-slip), the RAG loader reads named entries, and
-    #     the catalog tests write archives (`ZipWriter`). The office converters
-    #     that used three more zip copies are gone, so the graph now holds two.
-    #   - The office crates that carried zip 8.6.0 (calamine, docx-rs,
-    #     rust_xlsxwriter) and zip 0.6.6 (ppt-rs) are no longer dependencies.
-    #   - tauri-plugin-updater 2.10.1 does — `updater.rs:904`, from
-    #     `extract_zip` — but that path is Windows-only and runs only after
-    #     `verify_signature()` at `:712`, so reaching it needs a validly signed
-    #     update bundle, i.e. the release private key.
-    # Re-read this if anything ever extracts an archive that did not come from
-    # our own signed release, or if a dependency starts using `extract()` on
-    # untrusted input. See the matching entry in deny.toml.
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
+    # RUSTSEC-2026-0367 / -0368 / -0369 / -0429: four `zip` advisories about
+    # **extraction** — SUID/SGID bits preserved, symlink targets outside the
+    # destination, permissions applied through symlinks, and an abort on a
+    # symlink entry with a huge declared size (all fixed in zip >= 9.0.0).
+    #
+    # No waiver is needed: the graph now holds exactly one zip, the direct
+    # `zip 9` dependency, which is past all four. The 4.6.1 copy that forced
+    # the earlier waivers came from `tauri-plugin-updater`'s default `zip`
+    # feature, and `desktop/Cargo.toml` now disables default features — that
+    # feature only exists for *zip-shaped* Windows updater bundles, which we
+    # never publish (ours is the NSIS `.exe`). If an ignore ever reappears
+    # here for these IDs, the reason is a second zip copy back in the graph.
 ]
+
