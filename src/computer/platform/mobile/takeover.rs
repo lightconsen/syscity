@@ -234,7 +234,10 @@ pub async fn check_spill(
     let (task_id, package) = display.main_screen_top().await.ok()??;
     // The user's launcher is not a spill: it is what a phone sits on.
     let package_name = package?;
-    if package_name.contains("launcher") || package_name == "com.android.systemui" {
+    // The app's own task is the UI, not a spill: moving it onto the agent's
+    // display would take the screen away from under the user, and the launcher
+    // is what a phone sits on rather than something an action started.
+    if is_not_a_spill(&package_name) {
         return None;
     }
     if user_was_using == Some(package_name.as_str()) {
@@ -262,6 +265,15 @@ pub async fn check_spill(
             "left where it is (recovery was not requested)"
         },
     })
+}
+
+/// This app's own package — its task is the UI, never a spill.
+const SELF_PACKAGE: &str = "net.syscity.desktop";
+
+/// Packages that are never a spill: the launcher and the system UI sit on the
+/// user's screen by design.
+fn is_not_a_spill(package: &str) -> bool {
+    package.contains("launcher") || package == "com.android.systemui" || package == SELF_PACKAGE
 }
 
 /// An app that ended up on the user's screen.
@@ -320,6 +332,26 @@ mod tests {
         // as long as it contains the word.
         let lowered = "Skip this step".to_ascii_lowercase();
         assert!(lowered.contains("skip"));
+    }
+
+    #[test]
+    fn the_apps_own_task_is_never_a_spill() {
+        // It is the UI. Relocating it would take the screen from the user, and
+        // the "recovery" would be the agent moving its own window around.
+        assert!(is_not_a_spill("net.syscity.desktop"));
+    }
+
+    #[test]
+    fn the_launcher_and_system_ui_are_not_spills() {
+        assert!(is_not_a_spill("com.google.android.apps.nexuslauncher"));
+        assert!(is_not_a_spill("com.android.launcher3"));
+        assert!(is_not_a_spill("com.android.systemui"));
+    }
+
+    #[test]
+    fn an_app_that_was_opened_is_a_spill() {
+        assert!(!is_not_a_spill("com.android.intentresolver"));
+        assert!(!is_not_a_spill("com.google.android.documentsui"));
     }
 
     #[test]

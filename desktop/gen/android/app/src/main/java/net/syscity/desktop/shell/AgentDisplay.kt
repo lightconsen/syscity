@@ -114,33 +114,6 @@ class AgentDisplay private constructor(
         return !output.contains("Error") && !output.contains("Exception")
     }
 
-    /**
-     * The package and task now on the user's own screen (display 0).
-     *
-     * An action can start an app that lands on the user's screen rather than
-     * this one — a share sheet, a chooser, an app that ignores `--display` —
-     * and from here that is invisible: the agent's display simply stops
-     * changing. Asking what the user's screen has now is how the spill is seen.
-     */
-    fun topTaskOnMainScreen(): Pair<Int, String? > {
-        val output = exec(arrayOf("dumpsys", "activity", "activities"))
-        var inDisplay = false
-        for (line in output.lineSequence()) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith("Display #0 (")) {
-                inDisplay = true
-                continue
-            }
-            if (inDisplay && trimmed.startsWith("Display #")) return -1 to null
-            if (inDisplay && trimmed.startsWith("* Task{")) {
-                val taskId = trimmed.substringAfter('#', "").takeWhile { it.isDigit() }
-                val packageName = Regex("A=\\d+:([^\\s]+)").find(trimmed)?.groupValues?.get(1)
-                return (taskId.toIntOrNull() ?: -1) to packageName
-            }
-        }
-        return -1 to null
-    }
-
     /** Move `taskId` onto this display. */
     fun moveTaskTo(taskId: Int): Boolean {
         val output = exec(arrayOf("am", "display", "move-stack", taskId.toString(), id.toString()))
@@ -323,6 +296,68 @@ class AgentDisplay private constructor(
 
     companion object {
         private const val FRAME_TAG = "SyscityFrame"
+
+        /**
+         * The task on top of the user's own display (display 0).
+         *
+         * A static query, not a method on one display: the answer has nothing
+         * to do with which agent display is asking, and an instance method
+         * invited a caller to read it off whichever display came first.
+         */
+        @JvmStatic
+        fun mainScreenTop(): Pair<Int, String?> {
+            val output = try {
+                val process = ProcessBuilder("dumpsys", "activity", "activities")
+                    .redirectErrorStream(true)
+                    .start()
+                process.inputStream.bufferedReader().use { it.readText() }
+            } catch (e: Exception) {
+                Log.w(FRAME_TAG, "dumpsys activity failed: ${e.message}")
+                return -1 to null
+            }
+            var inDisplay = false
+            var taskId = -1
+            val lines = output.lineSequence().iterator()
+            while (lines.hasNext()) {
+                val trimmed = lines.next().trim()
+                if (trimmed.startsWith("Display #0 (")) {
+                    inDisplay = true
+                    continue
+                }
+                if (inDisplay && trimmed.startsWith("Display #")) return -1 to null
+                if (inDisplay && trimmed.startsWith("* Task{")) {
+                    taskId = trimmed.substringAfter('#', "").takeWhile { it.isDigit() }
+                        .toIntOrNull() ?: -1
+                    // The package, best source first: `topResumedActivity` names
+                    // the activity record directly; the task line itself names a
+                    // component only in some builds (`A=uid:pkg`) or an intent
+                    // (`I=pkg/class` — the share sheet's resolver is this shape,
+                    // and missing it means a real spill reads as "no spill").
+                    var packageName: String? = null
+                    while (lines.hasNext()) {
+                        val inner = lines.next()
+                        val t = inner.trim()
+                        if (t.startsWith("* Task{") || t.startsWith("Display #")) {
+                            packageName = packageName ?: packageFromTaskLine(trimmed)
+                            break
+                        }
+                        if (packageName == null) {
+                            packageName =
+                                Regex("topResumedActivity=ActivityRecord\\{[^}]*?\\s(\\S+?)/")
+                                    .find(t)?.groupValues?.get(1)
+                                    ?: packageFromTaskLine(t)
+                        }
+                    }
+                    return taskId to packageName
+                }
+            }
+            return -1 to null
+        }
+
+        /** The package a task/intent line names, if it names one. */
+        private fun packageFromTaskLine(line: String): String? =
+            Regex("A=\\d+:([^\\s/]+)").find(line)?.groupValues?.get(1)
+                ?: Regex("I=([^\\s/]+)/").find(line)?.groupValues?.get(1)
 
         /**
          * Create a display sized like the user's, or at the caller's size.

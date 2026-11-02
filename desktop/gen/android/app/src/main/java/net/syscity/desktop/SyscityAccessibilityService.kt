@@ -97,15 +97,28 @@ class SyscityAccessibilityService : AccessibilityService() {
         .getMethod("getWindowsOnAllDisplays")
         .invoke(this) as? android.util.SparseArray<*>
     } catch (e: Exception) {
-      Log.w(TAG, "getWindowsOnAllDisplays unavailable (${e.javaClass.simpleName}); using getWindows()")
+      Log.w(TAG, "getWindowsOnAllDisplays unavailable (${e.javaClass.simpleName})")
       null
     }
     if (all == null) return windows.filter { it.displayId == displayId }
-    val onDisplay = mutableListOf<AccessibilityWindowInfo>()
-    for (index in 0 until all.size()) {
-      (all.valueAt(index) as? AccessibilityWindowInfo)?.let { onDisplay.add(it) }
+
+    // The key of this SparseArray **is** the display id, and the value is a
+    // `List<AccessibilityWindowInfo>` — not a window. Casting the value to a
+    // window yields null for every entry, which reads as "this display has no
+    // windows" and was the wrong conclusion for two rounds of debugging.
+    val entry = all.get(displayId)
+    val list = entry as? List<*>
+    if (list == null) {
+      Log.d(TAG, "display $displayId: entry is ${entry?.javaClass?.name}, keys=${all.size()}")
+      return emptyList()
     }
-    return onDisplay.filter { it.displayId == displayId }
+    val onDisplay = list.filterIsInstance<AccessibilityWindowInfo>()
+    Log.d(
+      TAG,
+      "display $displayId: ${onDisplay.size} window(s) of ${list.size} " +
+        onDisplay.map { "${it.type} focused=${it.isFocused}" },
+    )
+    return onDisplay
   }
 
 }

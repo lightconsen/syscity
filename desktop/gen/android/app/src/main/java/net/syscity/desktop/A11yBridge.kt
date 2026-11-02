@@ -71,6 +71,7 @@ object A11yBridge {
    * with an empty node list instead, which the Rust side treats the same way.
    */
   fun snapshot(displayId: Int? = null): JSObject? {
+    val t0 = android.os.SystemClock.elapsedRealtime()
     val service = this.service ?: return null
     val out = JSObject()
     out.put("enabled", true)
@@ -150,6 +151,10 @@ object A11yBridge {
 
     out.put("nodes", nodes)
     out.put("truncated", truncated)
+    android.util.Log.d(
+      "SyscityBridge",
+      "display=$displayId nodes=${nodes.length()} walk=${android.os.SystemClock.elapsedRealtime() - t0}ms",
+    )
     return out
   }
 }

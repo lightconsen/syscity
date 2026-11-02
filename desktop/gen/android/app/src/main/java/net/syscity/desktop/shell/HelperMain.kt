@@ -306,11 +306,10 @@ object HelperMain {
             runCatching { display(displayId)?.moveTopTaskTo(displayId) == true }.getOrDefault(false)
 
         override fun mainScreenTop(): String {
-            // Any display knows how to ask; none attached yet means nobody is
-            // looking, which is "nothing to report" rather than an error.
-            val any = synchronized(lock) { displays.values.firstOrNull() }
-                ?: return ""
-            val (taskId, packageName) = any.topTaskOnMainScreen()
+            // Not tied to a display: the user's screen is the user's screen
+            // whoever asks, and asking the first-created display picked the
+            // wrong one as soon as two were open.
+            val (taskId, packageName) = AgentDisplay.mainScreenTop()
             return if (taskId < 0) "" else "$taskId|${packageName ?: ""}"
         }
 
