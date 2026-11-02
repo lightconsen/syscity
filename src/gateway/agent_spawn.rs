@@ -97,16 +97,22 @@ pub(crate) async fn spawn_agent_inner(
     mut config: AgentConfig,
 ) -> crate::Result<()> {
     config.agent_id = Some(id.clone());
+    let gateway = state.config.read().await;
+    let security = &gateway.security;
     // The fence postures are deployment-level security settings; every spawn
     // path funnels through here, so applying them here is what keeps a named
     // agent (whose config comes from its own file) from missing them.
-    let security = &state.config.read().await.security;
     config.fence_network = security.fence_network;
     config.fence_namespaces = security.fence_namespaces;
     // The named backends travel the same way the fence posture does: they are a
     // per-call fact, so they have to live on the tool context rather than in a
     // process-global.
     config.execution_backends = security.execution_backends.clone();
+    // And so does what an unattended agent may do to a phone: the toolset is
+    // registered before any agent exists, so `[computer.mobile]` has to ride on
+    // the agent config to reach the tool context.
+    config.mobile = gateway.computer.mobile.clone();
+    drop(gateway);
     info!("Spawning agent: {}", id);
 
     // Capture the base config before merging per-agent overrides so a later

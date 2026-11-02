@@ -513,7 +513,7 @@ impl Tool for AdbDialogTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let _target = crate::tools::target_lock::TargetLocks::global()
             .lock(crate::tools::target_lock::ANDROID)
@@ -651,6 +651,19 @@ impl Tool for AdbDialogTool {
             }
         };
 
+        // The dialog's own button is a fresh decision point: a confirmation
+        // prompt reading "Send 3 photos?" ends in a send whatever opened it.
+        let offer = chosen
+            .text
+            .as_deref()
+            .or(chosen.content_desc.as_deref())
+            .and_then(super::risk::classify_named);
+        let subject = format!("press \"{wanted}\" on a dialog");
+        let clearance = match super::gate::check(offer, context, &subject).await {
+            Ok(clearance) => clearance,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
+        };
+
         let before = tree_fingerprint(&dump.elements);
         let at = chosen.center;
         let pressed = match target {
@@ -687,15 +700,29 @@ impl Tool for AdbDialogTool {
         }
         let settle = settle_after_action(&device, target, Some(before), 1200).await;
 
-        Ok(
-            ToolExecutionResult::success(format!("Pressed {wanted:?}. {}", settle.verdict()))
-                .with_data(serde_json::json!({
-                    "pressed": true,
-                    "effect": settle.effect,
-                    "elements": settle.elements,
-                    "device": resolved_serial(&device).await,
-                })),
-        )
+        // A dialog button that reaches outward counts toward the pace exactly
+        // as an `android_input` tap would — otherwise the two paths would be
+        // two different speeds through the same app.
+        let pace_note = if clearance.reaches_outward() && context.mobile_control().pace_outward {
+            let package = dump.package.as_deref();
+            Some(super::android::note_outward(package).await)
+        } else {
+            None
+        };
+        let mut text = format!("Pressed {wanted:?}. {}", settle.verdict());
+        if let Some(note) = &pace_note {
+            text.push_str(&format!(" {note}"));
+        }
+
+        Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+            "pressed": true,
+            "effect": settle.effect,
+            "elements": settle.elements,
+            "device": resolved_serial(&device).await,
+            "risk": clearance.note(),
+            "risk_approved": clearance.asked,
+            "paced": pace_note,
+        })))
     }
 }
 
@@ -1386,7 +1413,7 @@ impl Tool for AdbDisplayTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let _target = crate::tools::target_lock::TargetLocks::global()
             .lock(crate::tools::target_lock::ANDROID)
@@ -1514,6 +1541,45 @@ impl Tool for AdbDisplayTool {
         // owns the record, and reconstructing a handle here would need its size.
         let display = super::display::VirtualDisplay::attach(bridge, id);
 
+        // A tap on this display can still end somewhere irreversible: the
+        // display runs a copy of the app, and the app's send button is the
+        // app's send button. The tree for the display is read here because
+        // the coordinates alone say nothing.
+        let mut before_package: Option<String> = None;
+        let clearance = match action {
+            "tap" => {
+                let x =
+                    i32::try_from(args.get("x").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0);
+                let y =
+                    i32::try_from(args.get("y").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0);
+                let offer = match super::android::dump_ui(&device, Target::Display(id)).await {
+                    Ok(dump) => {
+                        before_package = dump.package;
+                        super::risk::classify_point(&dump.elements, x, y)
+                    }
+                    // A read that failed is not a reason to refuse a tap the
+                    // agent has already located. It does mean the judgement
+                    // could not be made, which the reply carries no `risk` for.
+                    Err(_) => None,
+                };
+                let subject = match &offer {
+                    Some(offer) => format!(
+                        "tap \"{}\" on display {id}",
+                        offer.element.as_deref().unwrap_or("that")
+                    ),
+                    None => format!("tap on display {id}"),
+                };
+                super::gate::check(offer, context, &subject).await
+            }
+            // Nothing a paste types is what commits it; the button afterwards
+            // is the tap, and that tap is classified on its own.
+            _ => Ok(super::gate::Clearance { offer: None, asked: false }),
+        };
+        let clearance = match clearance {
+            Ok(clearance) => clearance,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
+        };
+
         let result = match action {
             "stop" => display.close().await.map(|_| "Display closed.".to_string()),
             "launch" => {
@@ -1604,9 +1670,23 @@ impl Tool for AdbDisplayTool {
             }
         };
 
+        // Same pace as `android_input`, and likewise after the action: the
+        // display is another screen running the same app, so a second send
+        // there is a second send.
+        let pace_note = if clearance.reaches_outward() && context.mobile_control().pace_outward {
+            Some(super::android::note_outward(before_package.as_deref()).await)
+        } else {
+            None
+        };
+
         Ok(match result {
-            Ok(message) => ToolExecutionResult::success(message)
-                .with_data(serde_json::json!({ "display": id, "action": action })),
+            Ok(message) => ToolExecutionResult::success(message).with_data(serde_json::json!({
+                "display": id,
+                "action": action,
+                "risk": clearance.note(),
+                "risk_approved": clearance.asked,
+                "paced": pace_note,
+            })),
             Err(failed) => ToolExecutionResult::error(failed.to_string()),
         })
     }

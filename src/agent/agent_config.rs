@@ -84,6 +84,14 @@ pub struct AgentConfig {
     /// by an LLM critic before being returned to the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection_config: Option<reflection::ReflectionConfig>,
+    /// How this agent treats the mobile (Android) control tools.
+    ///
+    /// Stamped from `[computer.mobile]` at spawn, like `fence_network`. It has
+    /// to travel on the config because tool registration cannot see config:
+    /// the toolset is built once per process, while this is a per-agent
+    /// decision about what an irreversible tap may do unattended.
+    #[serde(default)]
+    pub mobile: crate::config::MobileControlConfig,
 }
 
 /// Serde default: `true`.
@@ -153,6 +161,7 @@ Use rich formatting for lists, structured data, and technical content:
             tool_environment: std::collections::HashMap::new(),
             heartbeat: None,
             agent_id: None,
+            mobile: crate::config::MobileControlConfig::default(),
             reflection_config: None,
         }
     }

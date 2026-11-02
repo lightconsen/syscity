@@ -49,6 +49,7 @@ fn tool_context(conversation: &str) -> ToolContext {
         ask_queue: None,
         approval_queue: None,
         skill_trust_ceiling: None,
+        mobile: None,
     }
 }
 

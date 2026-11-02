@@ -11,7 +11,10 @@ pub mod a11y;
 pub mod android;
 pub mod android_tools;
 pub mod display;
+pub mod gate;
 pub mod ios;
+pub mod pacing;
+pub mod risk;
 pub mod takeover;
 
 pub use android::AndroidToolset;

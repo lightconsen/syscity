@@ -178,6 +178,74 @@ every tree read is graded `usable / partial / unusable`; below usable the tool
 falls back to OCR and returns the text as tappable lines rather than an empty
 list.
 
+### What a tap is about to do
+
+A wrong screen is recoverable. The right screen with the wrong button under the
+finger is not: a message reaches someone it cannot be unsent to, money leaves an
+account, a delete is gone. Before `android_input` dispatches a tap, and before
+`android_dialog` presses a button, the label of the element receiving it is
+classified (`computer::platform::mobile::risk`) into `send`, `submit`, `pay`,
+`delete` or `order`. It is a word list, and it is tuned to be wrong toward asking:
+a hit reports the word that caused it, so a refusal can be argued with.
+
+Two shapes of label are deliberately not classified, because they are far more
+common on a screen than the button itself:
+
+- **a status** — "待付款", "已付款", "付款成功", "订单明细", "付款方式". Asking on
+  those would mean asking permission to read an order page.
+- **a place** — "评论列表", "设置". `评论` and `评论(23)` are the reply button and
+  are classified; the count is decoration and does not change what a press does.
+
+The one thing the word list must get right in the other direction is the
+compound: "提交订单" is an *order*, not a submit — a submit is the one kind a
+deployment may choose to wave through (`[computer.mobile] ask_kinds`), and a
+"提交订单" button classified as a submit would be waved through with it.
+
+Then the gate (`mobile::gate`) decides whether the tap may run:
+
+| Situation | What happens |
+|---|---|
+| a human is reachable, and `ask_kinds` lists this kind | the question is put to them; only an explicit yes proceeds, and a question that times out is a refusal |
+| nobody is reachable (cron, goals, a delegated child) | it runs, and the result carries what it was judged to be |
+| `ask_before_irreversible = false` | it runs, with the same `risk` on the result |
+
+The unattended case is deliberate. Refusing would strand every scheduled job —
+the message due at 9am does not go out because nobody was at the desk. What
+bounds an agent with nobody watching is pacing, not refusal.
+
+```toml
+[computer.mobile]
+# Ask when someone can answer. Off: the taps run, still reporting `risk`.
+ask_before_irreversible = true
+# Only these kinds are asked about. `submit` is intentionally absent.
+ask_kinds = ["send", "pay", "delete", "order"]
+# Space out repeated outward actions like a person would. See below.
+pace_outward = true
+```
+
+Every `android_input`/`android_dialog` result carries `risk` (a sentence naming
+what the tap looked like) and `risk_approved` (`true` when a human said yes, and
+therefore also absent when there was nobody to ask).
+
+### The pace of actions that reach outward
+
+A send is one tap; a loop of sends is what gets an account flagged. After an
+action judged `send`, `submit`, `pay`, `delete` or `order`, the next outward
+action in the same app waits (`mobile::pacing`), the way someone working
+through a list would:
+
+- the first in an app does not wait;
+- the next comes 8–20 s after the previous one, the range growing 0.5/1 s per
+  action done in the last 30 minutes, capped at 30 s;
+- the gap is measured from the previous action *finishing*, so twenty seconds
+  spent reading the screen owes nothing — only the shortfall is waited out;
+- each app has its own history; a task that resumes after lunch starts fresh.
+
+The numbers and the shape are Mika's `OutwardPacing`, adopted rather than
+invented, so the two products behave the same when a model is moved between
+them. The process-wide history is shared by all agents on a host: one phone is
+one place, and two slow agents would otherwise be one fast one.
+
 ### Where the tree comes from
 
 Two sources produce the same `UiElement` list, so everything above works

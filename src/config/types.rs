@@ -513,6 +513,9 @@ pub struct ComputerConfig {
     /// Headless display configuration for CI/CD environments
     #[serde(default)]
     pub headless: HeadlessConfig,
+    /// How the mobile control tools treat actions that cannot be taken back.
+    #[serde(default)]
+    pub mobile: MobileControlConfig,
     /// Enable computer use loop in agent responses
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -522,6 +525,67 @@ pub struct ComputerConfig {
     /// Settle delay after actions (milliseconds)
     #[serde(default = "default_settle_delay_ms")]
     pub settle_delay_ms: u64,
+}
+
+/// What an Android tap may do without a human saying yes.
+///
+/// The rule the phone follows is: a tap that sends something to another
+/// person, moves money, places an order or deletes data is classified by its
+/// label (see `computer::platform::mobile::risk`). When a human is reachable
+/// it is asked about; when nobody is there it runs and says in its result what
+/// it judged the tap to be, so the transcript carries the risk even though no
+/// one approved it.
+///
+/// This is the per-agent knob because it is a judgement about *this* agent's
+/// duties — a shopping assistant and a support bot do not need the same
+/// answer about a send button.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileControlConfig {
+    /// Ask a human before an irreversible tap. Default on.
+    ///
+    /// Turn it off and the taps simply run, with `risk` still reported. It
+    /// does not change what happens when no human is reachable: nobody is
+    /// asked either way.
+    #[serde(default = "default_true")]
+    pub ask_before_irreversible: bool,
+    /// Which kinds of tap are irreversible enough to ask about when the
+    /// switch above is on: `send`, `submit`, `pay`, `delete`, `order`.
+    ///
+    /// Defaults to all of them except `submit` — a submitted form is undone on
+    /// the phone itself, where the others reach another person or an account.
+    /// An unknown name is kept in the list and simply never matches.
+    #[serde(default = "default_mobile_ask_kinds")]
+    pub ask_kinds: Vec<String>,
+    /// Pace repeated actions that reach outward, at the speed a person would
+    /// make them. Default on; off makes them as fast as the device allows.
+    #[serde(default = "default_true")]
+    pub pace_outward: bool,
+}
+
+fn default_mobile_ask_kinds() -> Vec<String> {
+    vec![
+        "send".to_string(),
+        "pay".to_string(),
+        "delete".to_string(),
+        "order".to_string(),
+    ]
+}
+
+impl Default for MobileControlConfig {
+    fn default() -> Self {
+        Self {
+            ask_before_irreversible: true,
+            ask_kinds: default_mobile_ask_kinds(),
+            pace_outward: true,
+        }
+    }
+}
+
+impl MobileControlConfig {
+    /// Whether a tap of this kind should be put to a human.
+    pub fn asks(&self, kind: &str) -> bool {
+        self.ask_before_irreversible && self.ask_kinds.iter().any(|k| k == kind)
+    }
 }
 
 /// Remote control configuration
@@ -614,6 +678,7 @@ impl Default for ComputerConfig {
         Self {
             remote_control: RemoteControlConfig::default(),
             headless: HeadlessConfig::default(),
+            mobile: MobileControlConfig::default(),
             enabled: true,
             max_steps: default_max_computer_steps(),
             settle_delay_ms: default_settle_delay_ms(),
@@ -759,6 +824,79 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// The gate's defaults are the product decision, so they are pinned: ask
+    /// by default, never silently let a submit through the same switch, and
+    /// pace outward actions. A change to any of these is a behaviour change
+    /// for every existing install.
+    #[test]
+    fn the_mobile_gate_defaults_ask_and_pace() {
+        let mobile = MobileControlConfig::default();
+        assert!(mobile.ask_before_irreversible);
+        assert!(mobile.pace_outward);
+        for kind in ["send", "pay", "delete", "order"] {
+            assert!(mobile.asks(kind), "{kind} must be asked about by default");
+        }
+        assert!(
+            !mobile.asks("submit"),
+            "a submitted form is undoable on the phone; it is the one kind not asked by default"
+        );
+        assert!(!mobile.asks("read"), "an unknown kind is never asked");
+    }
+
+    #[test]
+    fn the_mobile_switch_turns_every_kind_off_at_once() {
+        let mobile = MobileControlConfig {
+            ask_before_irreversible: false,
+            ..Default::default()
+        };
+        assert!(!mobile.asks("send"));
+        assert!(!mobile.asks("pay"));
+    }
+
+    #[test]
+    fn the_mobile_gate_is_configurable_from_toml() {
+        let toml_str = r#"
+[computer.mobile]
+ask_before_irreversible = false
+ask_kinds = ["pay", "send"]
+pace_outward = false
+"#;
+        let config: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!config.computer.mobile.ask_before_irreversible);
+        assert!(!config.computer.mobile.pace_outward);
+        assert_eq!(config.computer.mobile.ask_kinds, vec!["pay", "send"]);
+        // The switch is off, so nothing is asked however the list reads.
+        assert!(!config.computer.mobile.asks("pay"));
+    }
+
+    /// The list and the switch are independent: narrowing the list is how a
+    /// deployment says "only money matters to me".
+    #[test]
+    fn the_kind_list_narrows_what_is_asked() {
+        let toml_str = r#"
+[computer.mobile]
+ask_kinds = ["pay"]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("parse");
+        assert!(config.computer.mobile.asks("pay"));
+        assert!(!config.computer.mobile.asks("send"));
+    }
+
+    /// An install that has never heard of `[computer.mobile]` keeps the
+    /// configured behaviour: the section is optional and every field has a
+    /// default, so an old config file parses unchanged.
+    #[test]
+    fn an_old_config_without_the_mobile_section_still_parses() {
+        let toml_str = r#"
+[computer]
+enabled = true
+max_steps = 10
+"#;
+        let config: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(config.computer.mobile.ask_before_irreversible, true);
+        assert_eq!(config.computer.mobile.pace_outward, true);
     }
 
     #[test]

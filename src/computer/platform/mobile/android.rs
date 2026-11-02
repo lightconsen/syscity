@@ -659,7 +659,7 @@ impl Tool for AdbInputTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         // One device: two conversations must not type into it at once. See
         // `tools::target_lock`.
@@ -688,8 +688,15 @@ impl Tool for AdbInputTool {
         // failed read only refuses when the caller pointed at an element —
         // every other action still dispatches, and reports its effect as
         // unknown rather than pretending it worked.
-        let before = match dump_ui_elements(&device, target).await {
-            Ok(elements) => Some(elements),
+        // The dump's package is only used by the outward pacing, but it has to
+        // be read before the action: afterwards the screen belongs to whatever
+        // the action opened.
+        let mut before_package: Option<String> = None;
+        let before = match dump_ui(&device, target).await {
+            Ok(dump) => {
+                before_package = dump.package;
+                Some(dump.elements)
+            }
             Err(failed) => {
                 if action == "tap" && args.get("target").is_some() {
                     return Ok(ToolExecutionResult::error(failed.message));
@@ -772,6 +779,44 @@ impl Tool for AdbInputTool {
                 Err(message) => return Ok(ToolExecutionResult::error(message)),
             },
             _ => return Ok(ToolExecutionResult::error(format!("Unknown action: {}", action))),
+        };
+
+        // What is about to be pressed, before it is pressed.
+        //
+        // Only a tap can reach past the phone, and only a tap has a label to
+        // judge: a swipe and a key event do not. The classification happens
+        // here, after the tree read, because the tree is what names the
+        // element — and it happens before the dispatch, because a send that is
+        // refused must not leave the app.
+        let clearance = match &op {
+            InputOp::Taps(points) if points.len() == 1 => {
+                let offer = match args.get("target").and_then(|v| v.as_u64()) {
+                    Some(index) => super::risk::classify_tap(
+                        before.as_deref().unwrap_or(&[]),
+                        usize::try_from(index).ok(),
+                    ),
+                    None => super::risk::classify_point(
+                        before.as_deref().unwrap_or(&[]),
+                        points[0].0,
+                        points[0].1,
+                    ),
+                };
+                let subject = offer
+                    .as_ref()
+                    .and_then(|o| o.element.clone())
+                    .map(|label| format!("tap \"{label}\""))
+                    .unwrap_or_else(|| format!("tap ({}, {})", points[0].0, points[0].1));
+                match super::gate::check(offer, context, &subject).await {
+                    Ok(clearance) => clearance,
+                    Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
+                }
+            }
+            _ => {
+                // A multi-point `sequence` is a series of taps at raw
+                // coordinates with no element to name them by; the other ops
+                // (swipe, text, key, gesture) are not taps at all.
+                super::gate::Clearance { offer: None, asked: false }
+            }
         };
 
         // Two things have to be read *before* the action, not after: the
@@ -900,14 +945,28 @@ impl Tool for AdbInputTool {
             }
         }
 
+        // The action is now out. Record how far it reached, so the next one in
+        // the same app is spaced like a person's would be. The package is the
+        // one read *before* the action: after it, the screen may belong to
+        // whatever the action opened.
+        let pace_note = if clearance.reaches_outward() && context.mobile_control().pace_outward {
+            Some(note_outward(before_package.as_deref()).await)
+        } else {
+            None
+        };
+
         let serial = resolved_serial(&device).await;
         if !verify {
-            return Ok(ToolExecutionResult::success(format!(
-                "Input '{action}' sent (effect not checked)."
-            ))
-            .with_data(serde_json::json!({
+            let mut text = format!("Input '{action}' sent (effect not checked).");
+            if let Some(note) = clearance.note() {
+                text.push_str(&format!(" Judged {note}."));
+            }
+            return Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
                 "device": serial,
                 "effect": "unverified",
+                "risk": clearance.note(),
+                "risk_approved": clearance.asked,
+                "paced": pace_note,
             })));
         }
 
@@ -925,6 +984,12 @@ impl Tool for AdbInputTool {
         .await;
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+        if let Some(note) = clearance.note() {
+            text.push_str(&format!(" Judged {note}."));
+        }
+        if let Some(note) = &pace_note {
+            text.push_str(&format!(" {note}"));
+        }
         if settle.pixel_changed == Some(true) && settle.elements.is_empty() {
             text.push_str(
                 " The picture changed even though the tree names nothing here — this screen draws \
@@ -986,6 +1051,9 @@ impl Tool for AdbInputTool {
             })).collect::<Vec<_>>(),
             "settled_ms": settle.elapsed_ms,
             "elements": settle.elements,
+            "risk": clearance.note(),
+            "risk_approved": clearance.asked,
+            "paced": pace_note,
         })))
     }
 }
@@ -996,6 +1064,26 @@ impl Tool for AdbInputTool {
 /// enough that a task the user starts themselves a minute later is not blamed
 /// on the agent.
 const SPILL_WINDOW_MS: u64 = 3000;
+
+/// Record an outward action for the pace and describe the pause it took.
+///
+/// `package` is where the action happened. When the read that preceded it named
+/// no app (an empty tree, a failed accessibility fetch), the history is keyed
+/// on `"?"` rather than skipped: a pace that does not apply to the app the tree
+/// failed on would be no pace at all for the very screens that are hardest to
+/// read.
+pub(super) async fn note_outward(package: Option<&str>) -> String {
+    let package = package.unwrap_or("?");
+    let waited = super::pacing::Pacing::global().pace(package).await;
+    if waited.is_zero() {
+        "Next outward action here can go straight away.".to_string()
+    } else {
+        format!(
+            "Waited {} ms so the next outward action in this app is not back-to-back.",
+            waited.as_millis()
+        )
+    }
+}
 
 // ── ADB App Manager Tool ───────────────────────────────────────────────────
 
@@ -1271,6 +1359,19 @@ pub fn parse_screen_bounds(xml: &str) -> Option<(i32, i32)> {
         n.has_tag_name("node") && n.parent().is_some_and(|p| p.has_tag_name("hierarchy"))
     })?;
     parse_bounds(root.attribute("bounds")?).map(|(_, _, x2, y2)| (x2, y2))
+}
+
+/// The package the root node belongs to, from a `uiautomator` dump.
+///
+/// Read from the first node that names one: the hierarchy element sometimes
+/// carries the package itself, and the root node always does.
+fn parse_package(xml: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    doc.descendants()
+        .filter(|n| n.has_tag_name("node"))
+        .find_map(|n| n.attribute("package"))
+        .map(str::to_string)
+        .filter(|p| !p.is_empty())
 }
 
 /// Width and height from a PNG's IHDR chunk.
@@ -2066,6 +2167,11 @@ pub struct UiDump {
     /// Where the tree came from: `accessibility` (in-process) or `uiautomator`
     /// (ADB). Reported so a surprising read can be traced to its source.
     pub source: &'static str,
+    /// The app that owns the focused window, when the platform said.
+    ///
+    /// It is what the outward pacing is bucketed by: two sends to the same app
+    /// belong to the same history whether or not the screen changed.
+    pub package: Option<String>,
 }
 
 pub(super) async fn dump_ui_elements(
@@ -2099,6 +2205,7 @@ pub(super) async fn dump_ui(
                 elements: snapshot.elements,
                 screen: snapshot.display,
                 source: "accessibility",
+                package: snapshot.package,
             }),
             Err(unavailable) => Err(DumpFailure::new(
                 DISPLAY_TREE_UNAVAILABLE,
@@ -2118,6 +2225,7 @@ pub(super) async fn dump_ui(
                         elements: snapshot.elements,
                         screen: snapshot.display,
                         source: "accessibility",
+                        package: snapshot.package,
                     });
                 }
                 Ok(_) => {
@@ -2147,6 +2255,7 @@ pub(super) async fn dump_ui(
         elements,
         screen: parse_screen_bounds(&xml),
         source: "uiautomator",
+        package: parse_package(&xml),
     })
 }
 

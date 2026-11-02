@@ -14,8 +14,8 @@ pub use types::BrowserConfig;
 pub use types::{
     AppConfig, CapabilitiesConfig, ComputerConfig, Config, HeadlessConfig, LogFormat,
     LogRotationConfig, LoggingConfig, MemoryConfig, MemoryDreamingConfig,
-    MemoryEffectivenessConfig, MemoryMultimodalConfig, MemoryTierConfig, RemoteControlConfig,
-    RetryConfig, ServerConfig, ServiceConfig, StorageConfig, StorageType, CURRENT_SCHEMA_VERSION,
-    DEFAULT_CONFIG_FILE, ENV_PREFIX,
+    MemoryEffectivenessConfig, MemoryMultimodalConfig, MemoryTierConfig, MobileControlConfig,
+    RemoteControlConfig, RetryConfig, ServerConfig, ServiceConfig, StorageConfig, StorageType,
+    CURRENT_SCHEMA_VERSION, DEFAULT_CONFIG_FILE, ENV_PREFIX,
 };
 pub use watch::{ConfigChangeCallback, ConfigWatcher, ReloadableConfig};

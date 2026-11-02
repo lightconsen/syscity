@@ -377,6 +377,7 @@ impl AgentPersonality {
             tool_environment: std::collections::HashMap::new(),
             heartbeat: None,
             agent_id: None,
+            mobile: crate::config::MobileControlConfig::default(),
             reflection_config: None,
         }
     }

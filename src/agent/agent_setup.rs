@@ -228,6 +228,10 @@ impl Agent {
             // The media tools talk to the vendor through this, so they use the
             // configured credential rather than an environment variable.
             .with_media_provider(self.provider.clone())
+            // What this agent may do to a phone without asking. Stamped from
+            // `[computer.mobile]` at spawn; the default posture applies when
+            // the config leaves it unset.
+            .with_mobile_control(cfg.mobile.clone())
             .with_model_name(self.model.clone().unwrap_or_default())
             .with_provider_name(self.provider.name().to_string())
             .with_sender_id(user_id);

@@ -474,6 +474,7 @@ mod tests {
                 provider: Some("anthropic".to_string()),
             }),
             agent_id: None,
+            mobile: crate::config::MobileControlConfig::default(),
             reflection_config: None,
         };
         let json = serde_json::to_string(&config).unwrap();

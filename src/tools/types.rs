@@ -270,6 +270,11 @@ pub struct ToolContext {
     /// router — and those tools then say so rather than reaching for an
     /// environment variable, which is what they used to do.
     pub media_provider: Option<MediaProvider>,
+    /// What this turn's agent allows the mobile control tools to do without
+    /// asking. `None` outside an agent turn, where the default posture
+    /// applies: ask when a human is reachable, and run without asking when
+    /// one is not.
+    pub mobile: Option<crate::config::MobileControlConfig>,
 }
 
 /// Allowed environment variables that are safe to forward to child processes.
@@ -507,6 +512,18 @@ impl ToolContext {
     pub fn with_ask_queue(mut self, queue: Arc<AskQueue>) -> Self {
         self.ask_queue = Some(queue);
         self
+    }
+
+    /// Attach the agent's mobile-control posture, so an irreversible tap can
+    /// be decided from configuration rather than from a process global.
+    pub fn with_mobile_control(mut self, mobile: crate::config::MobileControlConfig) -> Self {
+        self.mobile = Some(mobile);
+        self
+    }
+
+    /// This turn's mobile-control posture, or the default one.
+    pub fn mobile_control(&self) -> crate::config::MobileControlConfig {
+        self.mobile.clone().unwrap_or_default()
     }
 
     /// Attach the approval queue so a command the fence refused can ask
