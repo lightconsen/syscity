@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::time::Duration;
 
 use super::android::display_bridge;
 use super::android::{
@@ -1692,6 +1693,375 @@ impl Tool for AdbDisplayTool {
     }
 }
 
+// ── Query ──────────────────────────────────────────────────────────────────
+
+/// Find controls on the current screen without reading the whole tree.
+#[derive(Debug)]
+pub struct AdbQueryTool {
+    device: Option<String>,
+}
+
+impl Default for AdbQueryTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbQueryTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+/// How many matches a query returns by default.
+const QUERY_DEFAULT_LIMIT: usize = 30;
+/// The most a query will return.
+const QUERY_MAX_LIMIT: usize = 100;
+
+/// Longest label quoted back in a query's text answer.
+const QUERY_LABEL_CHARS: usize = 80;
+
+#[async_trait]
+impl Tool for AdbQueryTool {
+    fn name(&self) -> &str {
+        "android_query"
+    }
+
+    fn description(&self) -> &str {
+        "Find elements on the current screen by text, resource id or class, without reading the \
+         whole UI tree into the conversation. Every criterion is a case-insensitive substring and \
+         they are combined, so `text: \"alice\"` and `class: \"TextView\"` narrows a name to the \
+         row that draws it. Returns each match with its index, label, class and centre, plus how \
+         many matched in total. Use it to check whether something is on screen, to count the rows \
+         of a list, or to get the coordinates of one control — it is much cheaper than \
+         android_ui_tree when you know what you are looking for."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Find elements on the current screen",
+            serde_json::json!({
+                "text": {
+                    "type": "string",
+                    "description": "Substring of the element's text or content description (case-insensitive)."
+                },
+                "resource_id": {
+                    "type": "string",
+                    "description": "Substring of the element's Android resource id, e.g. 'id/send'."
+                },
+                "class": {
+                    "type": "string",
+                    "description": "Substring of the element's class, e.g. 'Button' or 'TextView'."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many matches to return (default 30, max 100). The total is reported either way."
+                },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
+                "device": { "type": "string", "description": DEVICE_PARAM }
+            }),
+            Vec::<String>::new(),
+        )
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let text = args.get("text").and_then(|v| v.as_str());
+        let resource_id = args.get("resource_id").and_then(|v| v.as_str());
+        let class = args.get("class").and_then(|v| v.as_str());
+        let Some(query) = super::query::Query::new(text, resource_id, class) else {
+            return Ok(ToolExecutionResult::error(
+                "give at least one of `text`, `resource_id` or `class` — with none of them every \
+                 element matches and the answer would be the whole screen",
+            ));
+        };
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, QUERY_MAX_LIMIT as u64) as usize)
+            .unwrap_or(QUERY_DEFAULT_LIMIT);
+
+        let dump = match dump_ui(&device, target).await {
+            Ok(dump) => dump,
+            Err(failure) => {
+                return Ok(ToolExecutionResult::error(failure.message)
+                    .with_data(serde_json::json!({ "code": failure.code })))
+            }
+        };
+        let total = query.count(&dump.elements);
+        let found = query.find(&dump.elements, limit);
+
+        let text_out = if total == 0 {
+            format!(
+                "No element on this screen matches. The screen has {} element(s); read it with \
+                 android_ui_tree if the label may be worded differently.",
+                dump.elements.len()
+            )
+        } else {
+            let mut lines = vec![format!(
+                "{total} match(es){}:",
+                if total > found.len() {
+                    format!(", the first {}", found.len())
+                } else {
+                    String::new()
+                }
+            )];
+            for element in &found {
+                let label = element_label(element).unwrap_or("-");
+                let label: String = label.chars().take(QUERY_LABEL_CHARS).collect();
+                lines.push(format!(
+                    "[{}] {} {:?} center=({},{}){}",
+                    element.index,
+                    element.class,
+                    label,
+                    element.center.0,
+                    element.center.1,
+                    if element.clickable { " clickable" } else { "" }
+                ));
+            }
+            lines.join("\n")
+        };
+
+        Ok(ToolExecutionResult::success(text_out).with_data(serde_json::json!({
+            "total": total,
+            "returned": found.len(),
+            "matches": found,
+            "device": resolved_serial(&device).await,
+        })))
+    }
+}
+
+// ── Wait ───────────────────────────────────────────────────────────────────
+
+/// Wait for a control to appear or go, or for the screen to settle.
+#[derive(Debug)]
+pub struct AdbWaitTool {
+    device: Option<String>,
+}
+
+impl Default for AdbWaitTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbWaitTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+/// How often the screen is re-read while waiting.
+///
+/// The tree is the only signal: polling faster than a person could see a change
+/// just spends reads, and the whole point of the tool is to replace the model's
+/// own "observe, then observe again" loop.
+const WAIT_POLL_MS: u64 = 250;
+/// Default budget for a wait.
+const WAIT_DEFAULT_MS: u64 = 10_000;
+/// Upper bound on a wait.
+///
+/// Deliberately under the 120 s tool budget an agent's context carries, so a
+/// wait that runs out still returns an answer the model can act on.
+const WAIT_MAX_MS: u64 = 30_000;
+
+#[async_trait]
+impl Tool for AdbWaitTool {
+    fn name(&self) -> &str {
+        "android_wait"
+    }
+
+    fn description(&self) -> &str {
+        "Wait for the screen to reach a state, instead of reading it again a second later and \
+         hoping. `condition: appear` waits for an element matching `text`/`resource_id`/`class` to \
+         show up (a result, a button, a loaded list); `disappear` waits for it to go (a spinner, a \
+         dialog); `stable` waits for the screen to stop changing. Returns whether it got there, \
+         how long it waited, and the screen as it was at that moment. When it times out it says \
+         so and shows what is actually on screen, so a failure is information rather than another \
+         blind retry."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Wait for a screen condition",
+            serde_json::json!({
+                "condition": {
+                    "type": "string",
+                    "description": "appear (default), disappear, or stable.",
+                    "enum": ["appear", "disappear", "stable"]
+                },
+                "text": {
+                    "type": "string",
+                    "description": "For appear/disappear: substring of the element's text or content description."
+                },
+                "resource_id": {
+                    "type": "string",
+                    "description": "For appear/disappear: substring of the element's resource id."
+                },
+                "class": {
+                    "type": "string",
+                    "description": "For appear/disappear: substring of the element's class."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "How long to wait (default 10000, max 30000)."
+                },
+                "display": { "type": "integer", "description": DISPLAY_PARAM },
+                "device": { "type": "string", "description": DEVICE_PARAM }
+            }),
+            Vec::<String>::new(),
+        )
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        let device = match resolve_device(&args, self.device.as_deref()) {
+            Ok(device) => device,
+            Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+        };
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let condition = match super::query::Condition::parse(
+            args.get("condition")
+                .and_then(|v| v.as_str())
+                .unwrap_or("appear"),
+        ) {
+            Ok(condition) => condition,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let query = super::query::Query::new(
+            args.get("text").and_then(|v| v.as_str()),
+            args.get("resource_id").and_then(|v| v.as_str()),
+            args.get("class").and_then(|v| v.as_str()),
+        );
+        if condition.needs_query() && query.is_none() {
+            return Ok(ToolExecutionResult::error(format!(
+                "condition {:?} needs something to look for: set `text`, `resource_id` or \
+                 `class`. Use condition 'stable' to wait for the screen to stop changing.",
+                condition.label()
+            )));
+        }
+        let budget = Duration::from_millis(
+            args.get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(WAIT_DEFAULT_MS)
+                .clamp(WAIT_POLL_MS, WAIT_MAX_MS),
+        );
+        let poll = Duration::from_millis(WAIT_POLL_MS);
+        let started = std::time::Instant::now();
+        let mut previous: Option<u64> = None;
+        let mut reads = 0_u32;
+
+        loop {
+            let dump = match dump_ui(&device, target).await {
+                Ok(dump) => dump,
+                Err(failure) => {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "could not read the screen while waiting: {}",
+                        failure.message
+                    ))
+                    .with_data(serde_json::json!({ "code": failure.code })))
+                }
+            };
+            reads += 1;
+            let matches = query.as_ref().map_or(0, |q| q.count(&dump.elements));
+            let fingerprint = tree_fingerprint(&dump.elements);
+            let seen_twice = previous == Some(fingerprint);
+            previous = Some(fingerprint);
+
+            if condition.met(matches, seen_twice) {
+                let waited = started.elapsed().as_millis() as u64;
+                let mut text = match condition {
+                    super::query::Condition::Appear => {
+                        format!("It appeared after {waited} ms: {matches} element(s) match.")
+                    }
+                    super::query::Condition::Disappear => {
+                        format!("It is gone (after {waited} ms): nothing matches now.")
+                    }
+                    super::query::Condition::Stable => format!(
+                        "The screen settled after {waited} ms ({} element(s)).",
+                        dump.elements.len()
+                    ),
+                };
+                if let Some(found) = query.as_ref().and_then(|q| q.find(&dump.elements, 1).pop()) {
+                    text.push_str(&format!(
+                        "\n[{}] {} {:?} center=({},{})",
+                        found.index,
+                        found.class,
+                        element_label(found).unwrap_or("-"),
+                        found.center.0,
+                        found.center.1
+                    ));
+                }
+                return Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+                    "met": true,
+                    "condition": condition.label(),
+                    "matches": matches,
+                    "waited_ms": waited,
+                    "reads": reads,
+                    "elements": dump.elements,
+                    "device": resolved_serial(&device).await,
+                })));
+            }
+
+            if started.elapsed() >= budget {
+                let waited = started.elapsed().as_millis() as u64;
+                let text = match condition {
+                    super::query::Condition::Appear => format!(
+                        "It did not appear within {waited} ms. The screen shows {} element(s); \
+                         read it with android_ui_tree to see what is there.",
+                        dump.elements.len()
+                    ),
+                    super::query::Condition::Disappear => format!(
+                        "It is still there after {waited} ms ({matches} match(es)). The screen may \
+                         be waiting on something else; read it with android_ui_tree."
+                    ),
+                    super::query::Condition::Stable => format!(
+                        "The screen was still changing after {waited} ms; it may be animating or \
+                         loading. Read it with android_ui_tree to see where it got to."
+                    ),
+                };
+                return Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+                    "met": false,
+                    "condition": condition.label(),
+                    "matches": matches,
+                    "waited_ms": waited,
+                    "reads": reads,
+                    "elements": dump.elements,
+                    "device": resolved_serial(&device).await,
+                })));
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1777,5 +2147,17 @@ mod tests {
         assert_eq!(AdbSystemActionTool::new().name(), "android_system_action");
         assert_eq!(AdbOcrTool::new().name(), "android_ocr");
         assert_eq!(AdbDisplayTool::new().name(), "android_display");
+        assert_eq!(AdbQueryTool::new().name(), "android_query");
+        assert_eq!(AdbWaitTool::new().name(), "android_wait");
+    }
+
+    #[test]
+    fn a_wait_without_a_condition_does_not_wait_forever_open() {
+        // The poll budget clamps to what the tool budget can afford: a caller
+        // asking for an hour gets 30 s, and one asking for 0 ms still gets one
+        // poll rather than a busy loop.
+        assert_eq!(WAIT_MAX_MS, 30_000);
+        assert!(WAIT_DEFAULT_MS <= WAIT_MAX_MS);
+        assert!(WAIT_POLL_MS <= WAIT_DEFAULT_MS);
     }
 }

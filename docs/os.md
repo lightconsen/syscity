@@ -167,6 +167,8 @@ which replaces a turn the model would otherwise spend driving them by hand:
 |---|---|
 | `android_collect` | read-scroll-read over a long list or chat: one call returns the text in screen order, and says why it stopped |
 | `android_find` | scrolling until something appears: returns the coordinates once it does, or says how far it looked |
+| `android_query` | reading the whole tree to answer "is there a 发送 button" or "how many rows": matches by text / resource id / class and returns one line per hit, with the total |
+| `android_wait` | "observe, then observe again a second later": waits for an element to appear or go, or for the screen to settle, and on timeout says what is actually there |
 | `android_dialog` | describing a dialog: reads its text and buttons, and presses one only if exactly one button matches |
 | `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
 | `android_ocr` | the screenshot reader, for screens whose accessibility tree describes nothing |

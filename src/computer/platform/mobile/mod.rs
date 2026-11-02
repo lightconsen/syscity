@@ -14,13 +14,14 @@ pub mod display;
 pub mod gate;
 pub mod ios;
 pub mod pacing;
+pub mod query;
 pub mod risk;
 pub mod takeover;
 
 pub use android::AndroidToolset;
 pub use android_tools::{
     AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbFindTool, AdbHandToUserTool, AdbOcrTool,
-    AdbSystemActionTool,
+    AdbQueryTool, AdbSystemActionTool, AdbWaitTool,
 };
 pub use ios::IosToolset;
 

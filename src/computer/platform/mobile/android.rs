@@ -81,6 +81,10 @@ impl PlatformToolSet for AndroidToolset {
             // spend several turns reading, scrolling and tapping.
             Box::new(super::android_tools::AdbCollectTool::new()),
             Box::new(super::android_tools::AdbFindTool::new()),
+            // The two cheap reads: find one control without reading the whole
+            // tree, and wait for the screen instead of observing it again.
+            Box::new(super::android_tools::AdbQueryTool::new()),
+            Box::new(super::android_tools::AdbWaitTool::new()),
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
