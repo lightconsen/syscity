@@ -292,17 +292,16 @@ mod tests {
     use super::*;
 
     fn element(text: &str, bounds: (i32, i32, i32, i32)) -> UiElement {
-        UiElement {
-            index: 1,
-            text: Some(text.to_string()),
-            content_desc: None,
-            resource_id: None,
-            class: "Button".to_string(),
-            clickable: true,
-            enabled: true,
+        UiElement::new(
+            1,
+            Some(text.to_string()),
+            None,
+            None,
+            "Button".to_string(),
+            true,
+            true,
             bounds,
-            center: ((bounds.0 + bounds.2) / 2, (bounds.1 + bounds.3) / 2),
-        }
+        )
     }
 
     fn kind(label: &str) -> Option<Risk> {

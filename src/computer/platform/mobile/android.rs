@@ -420,6 +420,7 @@ impl Tool for AdbObserveTool {
                 &png,
             ),
             "source": dump.source,
+            "snapshot": dump.snapshot,
             "screenshot": as_size(shot),
             "screen": dump.screen.map(|(w, h)| serde_json::json!({ "width": w, "height": h })),
             "coordinates_consistent": consistent,
@@ -639,6 +640,14 @@ impl Tool for AdbInputTool {
                     "type": "string",
                     "description": "Optional label you expect at `target`. A mismatch refuses the tap and reports what is actually there."
                 },
+                "key": {
+                    "type": "string",
+                    "description": "Element key from the `key` field of an earlier android_ui_tree/android_observe. Preferred over `target`: the key is what the element *is*, so it is looked up again in the live screen even after the list scrolled or a row appeared. Refused with STALE_REF if it is gone, or if several elements are now indistinguishable — the refusal lists them."
+                },
+                "snapshot": {
+                    "type": "string",
+                    "description": "The `snapshot` of the read the reference came from. Optional; when the live read has a different snapshot the reference is still resolved by key, and the result says the screen had changed."
+                },
                 "x": { "type": "integer", "description": "X coordinate (tap/swipe). No safety net — prefer `target`." },
                 "y": { "type": "integer", "description": "Y coordinate (tap/swipe). No safety net — prefer `target`." },
                 "x2": { "type": "integer", "description": "End X (swipe)" },
@@ -696,44 +705,94 @@ impl Tool for AdbInputTool {
         // be read before the action: afterwards the screen belongs to whatever
         // the action opened.
         let mut before_package: Option<String> = None;
+        let mut before_snapshot: Option<String> = None;
+        let pointed_at_an_element = args.get("target").is_some() || args.get("key").is_some();
         let before = match dump_ui(&device, target).await {
             Ok(dump) => {
                 before_package = dump.package;
+                before_snapshot = Some(dump.snapshot);
                 Some(dump.elements)
             }
             Err(failed) => {
-                if action == "tap" && args.get("target").is_some() {
+                if action == "tap" && pointed_at_an_element {
                     return Ok(ToolExecutionResult::error(failed.message));
                 }
                 None
             }
         };
 
+        // A reference from an earlier read is resolved against this one before
+        // anything is dispatched, and the two ways of naming an element are the
+        // same question asked with different information: an index is a
+        // position in *that* read, a key is the element itself.
+        let snapshot_note = match args
+            .get("snapshot")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(was) if before_snapshot.as_deref() != Some(was) => Some(
+                "The screen had changed since that read; the element was found again by its key, \
+                 not by where it used to be.",
+            ),
+            _ => None,
+        };
+
         // The action is resolved once, into something that both dispatchers
         // understand. Where it goes — the device's screen or the agent's — is
         // the only thing that differs afterwards.
         let op = match action {
-            "tap" => match args.get("target").and_then(|v| v.as_u64()) {
-                // Preferred: an element index, checked against the read taken
-                // immediately before dispatch.
-                Some(index) => {
-                    let description = args.get("target_description").and_then(|v| v.as_str());
+            "tap" => {
+                if let Some(key) = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .filter(|k| !k.trim().is_empty())
+                {
                     let elements = before.as_deref().unwrap_or(&[]);
-                    match Self::tap_point_from(elements, index as usize, description) {
-                        Ok(point) => InputOp::Taps(vec![point]),
+                    match relocate(elements, key.trim()) {
+                        Ok(element) => {
+                            if let Some(description) =
+                                args.get("target_description").and_then(|v| v.as_str())
+                            {
+                                let label = element_label(element).unwrap_or("");
+                                if !label_matches(label, description) {
+                                    return Ok(ToolExecutionResult::error(format!(
+                                        "Refused: that key is now {label:?}, not {description:?} — \
+                                         the screen changed. Re-read it with android_ui_tree."
+                                    )));
+                                }
+                            }
+                            match check_tappable(element, element.index) {
+                                Ok(element) => InputOp::Taps(vec![element.center]),
+                                Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+                            }
+                        }
                         Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
                     }
+                } else {
+                    match args.get("target").and_then(|v| v.as_u64()) {
+                        // An element index, checked against the read taken
+                        // immediately before dispatch.
+                        Some(index) => {
+                            let description =
+                                args.get("target_description").and_then(|v| v.as_str());
+                            let elements = before.as_deref().unwrap_or(&[]);
+                            match Self::tap_point_from(elements, index as usize, description) {
+                                Ok(point) => InputOp::Taps(vec![point]),
+                                Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
+                            }
+                        }
+                        // Raw coordinates: no safety net, the caller is on its own.
+                        None => {
+                            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                            InputOp::Taps(vec![(
+                                i32::try_from(x).unwrap_or(0),
+                                i32::try_from(y).unwrap_or(0),
+                            )])
+                        }
+                    }
                 }
-                // Raw coordinates: no safety net, the caller is on its own.
-                None => {
-                    let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-                    InputOp::Taps(vec![(
-                        i32::try_from(x).unwrap_or(0),
-                        i32::try_from(y).unwrap_or(0),
-                    )])
-                }
-            },
+            }
             "swipe" => {
                 let value = |key: &str| {
                     i32::try_from(args.get(key).and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0)
@@ -962,6 +1021,9 @@ impl Tool for AdbInputTool {
         let serial = resolved_serial(&device).await;
         if !verify {
             let mut text = format!("Input '{action}' sent (effect not checked).");
+            if let Some(note) = snapshot_note {
+                text.push_str(&format!(" {note}"));
+            }
             if let Some(note) = clearance.note() {
                 text.push_str(&format!(" Judged {note}."));
             }
@@ -971,6 +1033,7 @@ impl Tool for AdbInputTool {
                 "risk": clearance.note(),
                 "risk_approved": clearance.asked,
                 "paced": pace_note,
+                "reference_moved": snapshot_note.is_some(),
             })));
         }
 
@@ -988,6 +1051,9 @@ impl Tool for AdbInputTool {
         .await;
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+        if let Some(note) = snapshot_note {
+            text.push_str(&format!(" {note}"));
+        }
         if let Some(note) = clearance.note() {
             text.push_str(&format!(" Judged {note}."));
         }
@@ -1058,6 +1124,7 @@ impl Tool for AdbInputTool {
             "risk": clearance.note(),
             "risk_approved": clearance.asked,
             "paced": pace_note,
+            "reference_moved": snapshot_note.is_some(),
         })))
     }
 }
@@ -1230,6 +1297,16 @@ impl AdbUiTreeTool {
 pub struct UiElement {
     /// 1-based index the model refers to this element by.
     pub index: usize,
+    /// What this element *is*, independent of where it sits.
+    ///
+    /// An index is only meaningful against the read it came from: the screen
+    /// scrolls, a row appears, and "element 7" is now something else. The key
+    /// is built from what identifies the element (its resource id, label and
+    /// class) and not from its position, so a later call can find the same
+    /// element again in a tree it has never seen. Duplicates are possible and
+    /// are reported rather than guessed at — see [`relocate`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1244,6 +1321,101 @@ pub struct UiElement {
     pub bounds: (i32, i32, i32, i32),
     /// Centre of `bounds` — what a tap should target.
     pub center: (i32, i32),
+}
+
+impl UiElement {
+    /// An element with its key computed from the fields that identify it.
+    ///
+    /// Construction goes through here so a key can never be a stale copy of
+    /// fields that were changed after it was computed.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        index: usize,
+        text: Option<String>,
+        content_desc: Option<String>,
+        resource_id: Option<String>,
+        class: String,
+        clickable: bool,
+        enabled: bool,
+        bounds: (i32, i32, i32, i32),
+    ) -> Self {
+        let (x1, y1, x2, y2) = bounds;
+        let mut element = Self {
+            index,
+            key: String::new(),
+            text,
+            content_desc,
+            resource_id,
+            class,
+            clickable,
+            enabled,
+            bounds,
+            center: ((x1 + x2) / 2, (y1 + y2) / 2),
+        };
+        element.key = element_key(&element);
+        element
+    }
+}
+
+/// The identity of an element, for finding it again on a later read.
+///
+/// Deliberately not a hash of the whole element: bounds and index are position,
+/// and an element that scrolled is the same element. Two elements that agree on
+/// everything here are interchangeable to a tap, which is why [`relocate`]
+/// refuses to choose between them.
+pub fn element_key(element: &UiElement) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    element.resource_id.hash(&mut hasher);
+    element.text.hash(&mut hasher);
+    element.content_desc.hash(&mut hasher);
+    element.class.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+/// Find the element a key names in the tree as it is now.
+///
+/// Exactly one match relocates. None, or several identical ones, does not: the
+/// alternative is tapping the first of two rows that look the same, which is
+/// precisely the silent wrong-target failure the key exists to prevent. The
+/// refusal names the candidates so the caller can pick by index from a fresh
+/// read instead of guessing.
+pub fn relocate<'a>(elements: &'a [UiElement], key: &str) -> Result<&'a UiElement, String> {
+    let matches: Vec<&UiElement> = elements
+        .iter()
+        .filter(|element| !element.key.is_empty() && element.key == key)
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(
+            "STALE_REF: nothing with that key is on the screen now. The element was replaced, \
+             scrolled away, or the screen changed — re-read it with android_ui_tree and use the \
+             new index or key."
+                .to_string(),
+        ),
+        many => {
+            let choices: Vec<String> = many
+                .iter()
+                .map(|element| {
+                    format!(
+                        "[{}] {} {:?} center=({},{})",
+                        element.index,
+                        element.class,
+                        element_label(element).unwrap_or("-"),
+                        element.center.0,
+                        element.center.1
+                    )
+                })
+                .collect();
+            Err(format!(
+                "STALE_REF: {} elements match that key and none of them is distinguishably the \
+                 one you meant:\n{}\nUse the index of the right one from android_ui_tree.",
+                many.len(),
+                choices.join("\n")
+            ))
+        }
+    }
 }
 
 /// Parse a `bounds="[x1,y1][x2,y2]"` attribute.
@@ -1296,17 +1468,16 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
             .map(|c| c.rsplit('.').next().unwrap_or(&c).to_string())
             .unwrap_or_default();
 
-        out.push(UiElement {
-            index: out.len() + 1,
+        out.push(UiElement::new(
+            out.len() + 1,
             text,
             content_desc,
             resource_id,
             class,
             clickable,
-            enabled: attr("enabled").as_deref() != Some("false"),
-            center: ((bounds.0 + bounds.2) / 2, (bounds.1 + bounds.3) / 2),
+            attr("enabled").as_deref() != Some("false"),
             bounds,
-        });
+        ));
     }
     Ok(out)
 }
@@ -2149,6 +2320,11 @@ fn validate_target<'a>(
             ));
         }
     }
+    check_tappable(element, index)
+}
+
+/// The part of a target check that does not depend on how it was named.
+fn check_tappable(element: &UiElement, index: usize) -> Result<&UiElement, String> {
     if !element.clickable {
         return Err(format!("Refused: element {index} ({}) is not clickable.", element.class));
     }
@@ -2176,6 +2352,26 @@ pub struct UiDump {
     /// It is what the outward pacing is bucketed by: two sends to the same app
     /// belong to the same history whether or not the screen changed.
     pub package: Option<String>,
+    /// A name for *this reading*, quoted back by a later call.
+    ///
+    /// Not a change detector and not a version of the app: it identifies the
+    /// enumeration the indices in this dump belong to, so a call can say which
+    /// read it was working from. Re-reading an unchanged screen yields the same
+    /// name; an element key is what survives the screen changing.
+    pub snapshot: String,
+}
+
+/// Name a reading of the tree.
+///
+/// The fingerprint alone would collide between two screens with the same
+/// elements, and a plain hash would make two identical reads look like
+/// different snapshots, which is the case a caller most often has right after
+/// an action that changed nothing. Numbering them monotonically makes "the
+/// snapshot I was told about" a fact rather than a guess.
+fn snapshot_name(fingerprint: u64) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("s{}-{fingerprint:x}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 pub(super) async fn dump_ui_elements(
@@ -2205,12 +2401,16 @@ pub(super) async fn dump_ui(
         let bridge = display_bridge()
             .map_err(|message| DumpFailure::new(DISPLAY_TREE_UNAVAILABLE, message))?;
         return match super::a11y::fetch(&bridge, Some(id)).await {
-            Ok(snapshot) => Ok(UiDump {
-                elements: snapshot.elements,
-                screen: snapshot.display,
-                source: "accessibility",
-                package: snapshot.package,
-            }),
+            Ok(snapshot) => {
+                let snapshot_id = snapshot_name(tree_fingerprint(&snapshot.elements));
+                Ok(UiDump {
+                    elements: snapshot.elements,
+                    screen: snapshot.display,
+                    source: "accessibility",
+                    package: snapshot.package,
+                    snapshot: snapshot_id,
+                })
+            }
             Err(unavailable) => Err(DumpFailure::new(
                 DISPLAY_TREE_UNAVAILABLE,
                 format!(
@@ -2225,11 +2425,13 @@ pub(super) async fn dump_ui(
         if let Some(bridge) = crate::device::bridge() {
             match super::a11y::fetch(bridge, None).await {
                 Ok(snapshot) if snapshot.is_addressable() => {
+                    let snapshot_id = snapshot_name(tree_fingerprint(&snapshot.elements));
                     return Ok(UiDump {
                         elements: snapshot.elements,
                         screen: snapshot.display,
                         source: "accessibility",
                         package: snapshot.package,
+                        snapshot: snapshot_id,
                     });
                 }
                 Ok(_) => {
@@ -2255,11 +2457,13 @@ pub(super) async fn dump_ui(
             format!("Could not read the UI tree: the dump did not parse ({source})"),
         )
     })?;
+    let snapshot_id = snapshot_name(tree_fingerprint(&elements));
     Ok(UiDump {
         elements,
         screen: parse_screen_bounds(&xml),
         source: "uiautomator",
         package: parse_package(&xml),
+        snapshot: snapshot_id,
     })
 }
 
@@ -2380,6 +2584,7 @@ impl Tool for AdbUiTreeTool {
             "advice": quality.advice(),
             "ocr": ocr_text,
             "source": dump.source,
+            "snapshot": dump.snapshot,
             "elements": elements,
             "device": resolved_serial(&device).await,
         })))
@@ -2733,6 +2938,90 @@ impl Tool for AdbStatusTool {
 mod tests {
     use super::*;
 
+    // ── Stable references ───────────────────────────────────────────────
+    //
+    // An index is a position in one reading of the screen; a key is the
+    // element itself. The tests below are about the property that matters: the
+    // same element found again after the list moved, and a refusal rather than
+    // a guess when it cannot be.
+
+    /// A labelled button at `bounds`, numbered as the parser would number it.
+    fn labelled_at(index: usize, text: &str, bounds: (i32, i32, i32, i32)) -> UiElement {
+        UiElement::new(
+            index,
+            Some(text.to_string()),
+            None,
+            Some(format!("com.x:id/{}", text.replace(' ', "_"))),
+            "Button".to_string(),
+            true,
+            true,
+            bounds,
+        )
+    }
+
+    #[test]
+    fn a_key_does_not_depend_on_where_the_element_is() {
+        let top = labelled_at(1, "Alice", (0, 0, 100, 100));
+        let scrolled = labelled_at(1, "Alice", (0, 400, 100, 500));
+        assert_eq!(top.key, scrolled.key);
+        assert_ne!(top.center, scrolled.center, "the test needs them to have moved");
+    }
+
+    #[test]
+    fn different_elements_have_different_keys() {
+        assert_ne!(
+            labelled_at(1, "Alice", (0, 0, 100, 100)).key,
+            labelled_at(1, "Bob", (0, 0, 100, 100)).key
+        );
+    }
+
+    #[test]
+    fn a_key_is_found_again_after_the_list_scrolled() {
+        let read_before = vec![
+            labelled_at(1, "Alice", (0, 0, 100, 100)),
+            labelled_at(2, "Bob", (0, 100, 100, 200)),
+        ];
+        let key = read_before[1].key.clone();
+        // A new row arrived above, so Bob is element 3 now and is elsewhere.
+        let read_after = vec![
+            labelled_at(1, "Zed", (0, 0, 100, 100)),
+            labelled_at(2, "Alice", (0, 100, 100, 200)),
+            labelled_at(3, "Bob", (0, 200, 100, 300)),
+        ];
+        let found = relocate(&read_after, &key).expect("relocated");
+        assert_eq!(element_label(found), Some("Bob"));
+        assert_eq!(found.index, 3);
+    }
+
+    #[test]
+    fn a_key_that_is_gone_is_a_refusal_not_a_guess() {
+        let elements = vec![labelled_at(1, "Alice", (0, 0, 100, 100))];
+        let err = relocate(&elements, "deadbeef").expect_err("refused");
+        assert!(err.starts_with("STALE_REF"), "{err}");
+        assert!(err.contains("re-read"), "{err}");
+    }
+
+    #[test]
+    fn two_indistinguishable_elements_are_refused_and_listed() {
+        // Two rows with the same label, class and resource id: picking the
+        // first would be the silent wrong-target failure the key exists for.
+        let elements = vec![
+            labelled_at(1, "Row", (0, 0, 100, 100)),
+            labelled_at(2, "Row", (0, 200, 100, 300)),
+        ];
+        let err = relocate(&elements, &elements[0].key).expect_err("refused");
+        assert!(err.contains("2 elements match"), "{err}");
+        assert!(err.contains("[1]"), "{err}");
+        assert!(err.contains("[2]"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_key_never_matches_anything() {
+        let mut element = labelled_at(1, "Alice", (0, 0, 100, 100));
+        element.key.clear();
+        assert!(relocate(&[element], "").is_err());
+    }
+
     // ── Text input encoding ─────────────────────────────────────────────
     //
     // `adb shell <cmd>` hands the string to the *device* shell, so the text has
@@ -2924,17 +3213,17 @@ mod tests {
     // that decision-making is `validate_target`, which needs no device.
 
     fn element(index: usize, text: Option<&str>, class: &str) -> UiElement {
-        UiElement {
+        let mut element = UiElement::new(
             index,
-            text: text.map(str::to_string),
-            content_desc: None,
-            resource_id: None,
-            class: class.to_string(),
-            clickable: true,
-            enabled: true,
-            bounds: (0, 0, 10, 10),
-            center: (5, 5),
-        }
+            text.map(str::to_string),
+            None,
+            None,
+            class.to_string(),
+            true,
+            true,
+            (0, 0, 10, 10),
+        );
+        element
     }
 
     #[test]
@@ -3170,17 +3459,16 @@ mod tests {
     // alike; what differs is whether the tree describes any of it.
 
     fn node(class: &str, text: Option<&str>, bounds: (i32, i32, i32, i32)) -> UiElement {
-        UiElement {
-            index: 1,
-            text: text.map(str::to_string),
-            content_desc: None,
-            resource_id: None,
-            class: class.to_string(),
-            clickable: true,
-            enabled: true,
+        UiElement::new(
+            1,
+            text.map(str::to_string),
+            None,
+            None,
+            class.to_string(),
+            true,
+            true,
             bounds,
-            center: ((bounds.0 + bounds.2) / 2, (bounds.1 + bounds.3) / 2),
-        }
+        )
     }
 
     #[test]

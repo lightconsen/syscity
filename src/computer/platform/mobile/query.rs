@@ -142,17 +142,16 @@ mod tests {
     use super::*;
 
     fn element(text: Option<&str>, id: Option<&str>, class: &str) -> UiElement {
-        UiElement {
-            index: 1,
-            text: text.map(str::to_string),
-            content_desc: None,
-            resource_id: id.map(str::to_string),
-            class: class.to_string(),
-            clickable: true,
-            enabled: true,
-            bounds: (0, 0, 10, 10),
-            center: (5, 5),
-        }
+        UiElement::new(
+            1,
+            text.map(str::to_string),
+            None,
+            id.map(str::to_string),
+            class.to_string(),
+            true,
+            true,
+            (0, 0, 10, 10),
+        )
     }
 
     fn query(text: Option<&str>, id: Option<&str>, class: Option<&str>) -> Query {

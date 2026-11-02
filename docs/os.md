@@ -248,6 +248,28 @@ invented, so the two products behave the same when a model is moved between
 them. The process-wide history is shared by all agents on a host: one phone is
 one place, and two slow agents would otherwise be one fast one.
 
+### Naming an element that will still be there
+
+An index is a position in one *reading* of the screen. A row arrives, the list
+scrolls, and "element 7" is something else by the time the tap is dispatched —
+the tap then lands on the wrong control and reports success. Every element
+therefore carries a `key` built from what identifies it (resource id, text,
+content description, class) and not from where it sits, and every read carries
+a `snapshot` naming that enumeration.
+
+`android_input` accepts either:
+
+| Reference | What it survives |
+|---|---|
+| `target` (an index) | nothing — it is checked against the live read and refused if the element is gone, changed or not clickable (`target_description` makes the check exact) |
+| `key` + optional `snapshot` | the list moving: the element is looked up again in the live tree. `reference_moved: true` in the result says the screen had changed since the read |
+
+A key that finds nothing, or finds several elements that are indistinguishable
+from each other, is refused as `STALE_REF` with the candidates listed. The
+alternative — tapping the first of two identical rows — is exactly the silent
+wrong-target failure the key exists to prevent. `android_ui_tree` and
+`android_observe` return both fields.
+
 ### Where the tree comes from
 
 Two sources produce the same `UiElement` list, so everything above works

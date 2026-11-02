@@ -19,6 +19,9 @@
 #   6. android_wait sees the screen settle, sees a label that is there, and
 #      says plainly that one which is not there did not appear
 #   7. a second send in the same app is paced — the tool waits
+#   8. after the page scrolls, the same button is tapped by its `key`: the
+#      element is found again where it is now, not where it was, and the
+#      result says the screen had changed
 #
 # The answers go out on a second WebSocket connection: the gateway services
 # each connection's frames in order, so a connection blocked inside a tool call
@@ -114,8 +117,13 @@ cat > "$PAGE_DIR/index.html" <<'HTML'
 <title>risk-check</title>
 <body style="font:24px sans-serif;margin:2rem">
 <p id=done>nothing happened</p>
+<!-- Filler above the button, so the page is taller than the screen: the
+     stable-reference step scrolls it and the button moves while staying
+     visible, which is the case an index cannot survive. -->
+<div style="height:60vh"></div>
 <button id=send style="font-size:28px;padding:1.5rem 3rem"
         onclick="document.getElementById('done').textContent='it happened'">发送</button>
+<div style="height:80vh"></div>
 </body>
 HTML
 
@@ -224,6 +232,8 @@ if (!button) {
        `texts: ${elements.map((e) => e.text).filter(Boolean).slice(0, 12).join(" | ")}`);
 }
 say("button", `"${button.text}" at (${button.center[0]}, ${button.center[1]})`);
+if (!button.key) stop("the tree read carried no element key, so a reference cannot be stable");
+const snapshot = tree.data.snapshot;
 
 const done = async () => {
   const read = await tool(`read-${Date.now()}`, "android_ui_tree", {});
@@ -343,6 +353,40 @@ if (!String(paced.data?.paced ?? "").includes("Waited")) {
   stop(`the second send was not paced: ${JSON.stringify(paced.data)}`);
 }
 say("paced", paced.data.paced);
+
+// 5. The screen moves between the read and the tap: one scroll, then the tapped
+// element is found again by its key rather than by where it used to be. This
+// is the whole point of the key — an index from the earlier read would name a
+// different button now.
+// Scroll down by about a third of the screen: the button stays in view but
+// is drawn somewhere else, which is the failure mode of an index.
+const beforeMove = (await tool("tree-before-move", "android_ui_tree", {})).data?.elements ?? [];
+const scrolled = await tool("scroll", "android_input", {
+  action: "swipe", x: 540, y: 1400, x2: 540, y2: 1000, verify: false,
+});
+if (scrolled.error) stop(`the scroll failed: ${scrolled.error}`);
+await sleep(500);
+const moved = beforeMove.find((e) => e.key === button.key);
+const stillThere = (await tool("tree-after-scroll", "android_ui_tree", {})).data?.elements
+  ?.find((e) => e.key === button.key);
+if (moved && stillThere && stillThere.index === moved.index
+    && stillThere.center[0] === moved.center[0] && stillThere.center[1] === moved.center[1]) {
+  stop("the scroll did not move anything, so this run proves nothing about a stale index");
+}
+say("moved", stillThere
+  ? `the button is [${moved.index}] -> [${stillThere.index}] at (${stillThere.center[0]}, ${stillThere.center[1]})`
+  : "the button left the screen (still a valid STALE_REF case)");
+
+const keyAnswer = answerWith("Allow");
+const byKey = await tool("tap-by-key", "android_input", {
+  action: "tap", key: button.key, snapshot, verify: true,
+});
+if (!(await keyAnswer)) stop("the tap by key was not put to a human");
+if (byKey.error) stop(`tapping by key failed: ${byKey.error}`);
+if (byKey.data?.reference_moved !== true) {
+  stop(`the tap by key did not notice the screen had changed: ${JSON.stringify(byKey.data)}`);
+}
+say("key", "tapped by key after the screen moved, and the result said so");
 
 console.log("CHECK OK");
 driver.ws.close();

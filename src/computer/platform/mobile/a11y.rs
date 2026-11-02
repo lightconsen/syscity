@@ -166,20 +166,18 @@ pub fn parse(value: &Value) -> Result<A11ySnapshot, A11yUnavailable> {
             // A zero-area node cannot be tapped and says nothing about layout.
             continue;
         }
-        elements.push(UiElement {
-            index: elements.len() + 1,
-            text: string_of(node, "text"),
-            content_desc: string_of(node, "desc"),
-            resource_id: string_of(node, "rid"),
-            class: short_class(node),
-            clickable: node
-                .get("clickable")
+        elements.push(UiElement::new(
+            elements.len() + 1,
+            string_of(node, "text"),
+            string_of(node, "desc"),
+            string_of(node, "rid"),
+            short_class(node),
+            node.get("clickable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            enabled: node.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            node.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             bounds,
-            center: ((x1 + x2) / 2, (y1 + y2) / 2),
-        });
+        ));
     }
 
     Ok(A11ySnapshot {
