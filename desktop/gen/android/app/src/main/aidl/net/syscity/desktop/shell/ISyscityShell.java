@@ -62,12 +62,12 @@ public interface ISyscityShell extends android.os.IInterface
       return false;
     }
     /**
-     * The display's current frame as a PNG in a file.
+     * The display's current frame, written to a PNG file.
      * 
-     * Returns a read-only fd the caller must close, or null when the display
-     * produced nothing.
+     * Returns the file's path — the reader is the app's own process and opens it
+     * directly — or null when the display produced nothing.
      */
-    @Override public android.os.ParcelFileDescriptor frame(int displayId) throws android.os.RemoteException
+    @Override public java.lang.String frame(int displayId) throws android.os.RemoteException
     {
       return null;
     }
@@ -75,6 +75,132 @@ public interface ISyscityShell extends android.os.IInterface
     @Override public java.lang.String describe(int displayId) throws android.os.RemoteException
     {
       return null;
+    }
+    /**
+     * Move the display's top task onto the user's own screen (display 0), so
+     * they can act on it directly when the agent cannot.
+     */
+    @Override public boolean moveToUser(int displayId) throws android.os.RemoteException
+    {
+      return false;
+    }
+    /** Move it back to this display after the user is done. */
+    @Override public boolean moveToAgent(int displayId) throws android.os.RemoteException
+    {
+      return false;
+    }
+    /**
+     * What is on the user's own screen now: `"<taskId>|<package>"`, or `""`.
+     * 
+     * An action that starts an app from a background service lands it on the
+     * user's display, not this one, and nothing on this display changes. This
+     * is how that becomes visible.
+     */
+    @Override public java.lang.String mainScreenTop() throws android.os.RemoteException
+    {
+      return null;
+    }
+    /** Move an arbitrary task here (used to pull a spilled app back). */
+    @Override public boolean moveTaskToMe(int displayId, int taskId) throws android.os.RemoteException
+    {
+      return false;
+    }
+    /**
+     * One gesture of one or two fingers, as flat parallel arrays.
+     * 
+     * `x`/`y`/`path` describe every point of every finger: `path[i]` is the
+     * finger a point belongs to, and the points of one finger are in time
+     * order. The fingers start together and run for `durationMs`. Coordinates
+     * are the display's own pixels.
+     * 
+     * `injectTap`/`injectSwipe` go through `input -d`, which only ever sends a
+     * single straight stroke. A pinch is two fingers moving apart at the same
+     * time, and that has no shell equivalent at all.
+     */
+    @Override public boolean injectGesture(int displayId, int[] x, int[] y, int[] path, int durationMs) throws android.os.RemoteException
+    {
+      return false;
+    }
+    /**
+     * Put `text` on the device clipboard and paste it with Ctrl+V on the
+     * display, then put the user's own clipboard back.
+     * 
+     * `input -d text` types through the key character map and mangles anything
+     * outside ASCII; a clipboard paste carries any character the app can
+     * render. Returns 0 when it pasted, 1 when the user's clipboard could not
+     * be read (nothing was changed), 2 on failure.
+     */
+    @Override public int pasteText(int displayId, java.lang.String text) throws android.os.RemoteException
+    {
+      return 0;
+    }
+    /**
+     * Start watching the user's screen for `windowMs`, and return the task on
+     * top of it right now (or -1).
+     * 
+     * An action can start an app that lands on the user's screen; a single
+     * look afterwards cannot tell that apart from an app the user opened
+     * themselves. Watching records what actually rose to the top, and when.
+     */
+    @Override public int watchMainScreen(int windowMs) throws android.os.RemoteException
+    {
+      return 0;
+    }
+    /**
+     * What rose to the top of the user's screen since `sinceUptimeMs`
+     * (`SystemClock.uptimeMillis`), as JSON: an array of
+     * `{task, package, at, from, sameTask, standard, now}`, oldest first.
+     * 
+     * `from` is the display the task was last seen on (-1 when new), `now` is
+     * where it is now (-1 when it is gone), `sameTask` marks the same task
+     * showing a different page.
+     */
+    @Override public java.lang.String mainArrivals(long sinceUptimeMs) throws android.os.RemoteException
+    {
+      return null;
+    }
+    /**
+     * The display's latest frame as a coarse brightness grid: `columns`,
+     * `rows`, then one byte per cell, row-major.
+     * 
+     * A cheap "did the picture change" that works on screens the accessibility
+     * tree describes nothing on — a game, a map, a camera preview.
+     */
+    @Override public byte[] frameSignature(int displayId) throws android.os.RemoteException
+    {
+      return null;
+    }
+    /**
+     * The most displays this device will run at once, and why not more.
+     * 
+     * Parallel tasks need per-display focus (API 34+); a low-memory phone gets
+     * one either way, and once a second display has failed to appear in this
+     * session nothing retries it.
+     */
+    @Override public java.lang.String parallelLimit() throws android.os.RemoteException
+    {
+      return null;
+    }
+    /** How many displays this helper currently owns. */
+    @Override public int displayCount() throws android.os.RemoteException
+    {
+      return 0;
+    }
+    /**
+     * Silence, or un-silence, what `displayId` shows.
+     * 
+     * The app-op is `PLAY_AUDIO`, per package: an app running on the agent's
+     * display is one the user cannot see, so a chime or a video from it is
+     * sound with no visible source. The helper remembers the mode each package
+     * was in before silencing it and writes that back — never an assumed
+     * default — and only ever touches packages it recorded itself.
+     * 
+     * Returns whether the request took effect. False is not fatal to the
+     * display: the app is already running, it is merely audible.
+     */
+    @Override public boolean setAudioMuted(int displayId, java.lang.String packageName, boolean muted) throws android.os.RemoteException
+    {
+      return false;
     }
     @Override
     public android.os.IBinder asBinder() {
@@ -218,9 +344,9 @@ public interface ISyscityShell extends android.os.IInterface
         {
           int _arg0;
           _arg0 = data.readInt();
-          android.os.ParcelFileDescriptor _result = this.frame(_arg0);
+          java.lang.String _result = this.frame(_arg0);
           reply.writeNoException();
-          _Parcel.writeTypedObject(reply, _result, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
+          reply.writeString(_result);
           break;
         }
         case TRANSACTION_describe:
@@ -230,6 +356,124 @@ public interface ISyscityShell extends android.os.IInterface
           java.lang.String _result = this.describe(_arg0);
           reply.writeNoException();
           reply.writeString(_result);
+          break;
+        }
+        case TRANSACTION_moveToUser:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          boolean _result = this.moveToUser(_arg0);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_moveToAgent:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          boolean _result = this.moveToAgent(_arg0);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_mainScreenTop:
+        {
+          java.lang.String _result = this.mainScreenTop();
+          reply.writeNoException();
+          reply.writeString(_result);
+          break;
+        }
+        case TRANSACTION_moveTaskToMe:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          int _arg1;
+          _arg1 = data.readInt();
+          boolean _result = this.moveTaskToMe(_arg0, _arg1);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_injectGesture:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          int[] _arg1;
+          _arg1 = data.createIntArray();
+          int[] _arg2;
+          _arg2 = data.createIntArray();
+          int[] _arg3;
+          _arg3 = data.createIntArray();
+          int _arg4;
+          _arg4 = data.readInt();
+          boolean _result = this.injectGesture(_arg0, _arg1, _arg2, _arg3, _arg4);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_pasteText:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          java.lang.String _arg1;
+          _arg1 = data.readString();
+          int _result = this.pasteText(_arg0, _arg1);
+          reply.writeNoException();
+          reply.writeInt(_result);
+          break;
+        }
+        case TRANSACTION_watchMainScreen:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          int _result = this.watchMainScreen(_arg0);
+          reply.writeNoException();
+          reply.writeInt(_result);
+          break;
+        }
+        case TRANSACTION_mainArrivals:
+        {
+          long _arg0;
+          _arg0 = data.readLong();
+          java.lang.String _result = this.mainArrivals(_arg0);
+          reply.writeNoException();
+          reply.writeString(_result);
+          break;
+        }
+        case TRANSACTION_frameSignature:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          byte[] _result = this.frameSignature(_arg0);
+          reply.writeNoException();
+          reply.writeByteArray(_result);
+          break;
+        }
+        case TRANSACTION_parallelLimit:
+        {
+          java.lang.String _result = this.parallelLimit();
+          reply.writeNoException();
+          reply.writeString(_result);
+          break;
+        }
+        case TRANSACTION_displayCount:
+        {
+          int _result = this.displayCount();
+          reply.writeNoException();
+          reply.writeInt(_result);
+          break;
+        }
+        case TRANSACTION_setAudioMuted:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          java.lang.String _arg1;
+          _arg1 = data.readString();
+          boolean _arg2;
+          _arg2 = (0!=data.readInt());
+          boolean _result = this.setAudioMuted(_arg0, _arg1, _arg2);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
           break;
         }
         default:
@@ -415,22 +659,22 @@ public interface ISyscityShell extends android.os.IInterface
         return _result;
       }
       /**
-       * The display's current frame as a PNG in a file.
+       * The display's current frame, written to a PNG file.
        * 
-       * Returns a read-only fd the caller must close, or null when the display
-       * produced nothing.
+       * Returns the file's path — the reader is the app's own process and opens it
+       * directly — or null when the display produced nothing.
        */
-      @Override public android.os.ParcelFileDescriptor frame(int displayId) throws android.os.RemoteException
+      @Override public java.lang.String frame(int displayId) throws android.os.RemoteException
       {
         android.os.Parcel _data = android.os.Parcel.obtain();
         android.os.Parcel _reply = android.os.Parcel.obtain();
-        android.os.ParcelFileDescriptor _result;
+        java.lang.String _result;
         try {
           _data.writeInterfaceToken(DESCRIPTOR);
           _data.writeInt(displayId);
           boolean _status = mRemote.transact(Stub.TRANSACTION_frame, _data, _reply, 0);
           _reply.readException();
-          _result = _Parcel.readTypedObject(_reply, android.os.ParcelFileDescriptor.CREATOR);
+          _result = _reply.readString();
         }
         finally {
           _reply.recycle();
@@ -457,6 +701,305 @@ public interface ISyscityShell extends android.os.IInterface
         }
         return _result;
       }
+      /**
+       * Move the display's top task onto the user's own screen (display 0), so
+       * they can act on it directly when the agent cannot.
+       */
+      @Override public boolean moveToUser(int displayId) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_moveToUser, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /** Move it back to this display after the user is done. */
+      @Override public boolean moveToAgent(int displayId) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_moveToAgent, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * What is on the user's own screen now: `"<taskId>|<package>"`, or `""`.
+       * 
+       * An action that starts an app from a background service lands it on the
+       * user's display, not this one, and nothing on this display changes. This
+       * is how that becomes visible.
+       */
+      @Override public java.lang.String mainScreenTop() throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        java.lang.String _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_mainScreenTop, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readString();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /** Move an arbitrary task here (used to pull a spilled app back). */
+      @Override public boolean moveTaskToMe(int displayId, int taskId) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          _data.writeInt(taskId);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_moveTaskToMe, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * One gesture of one or two fingers, as flat parallel arrays.
+       * 
+       * `x`/`y`/`path` describe every point of every finger: `path[i]` is the
+       * finger a point belongs to, and the points of one finger are in time
+       * order. The fingers start together and run for `durationMs`. Coordinates
+       * are the display's own pixels.
+       * 
+       * `injectTap`/`injectSwipe` go through `input -d`, which only ever sends a
+       * single straight stroke. A pinch is two fingers moving apart at the same
+       * time, and that has no shell equivalent at all.
+       */
+      @Override public boolean injectGesture(int displayId, int[] x, int[] y, int[] path, int durationMs) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          _data.writeIntArray(x);
+          _data.writeIntArray(y);
+          _data.writeIntArray(path);
+          _data.writeInt(durationMs);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_injectGesture, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * Put `text` on the device clipboard and paste it with Ctrl+V on the
+       * display, then put the user's own clipboard back.
+       * 
+       * `input -d text` types through the key character map and mangles anything
+       * outside ASCII; a clipboard paste carries any character the app can
+       * render. Returns 0 when it pasted, 1 when the user's clipboard could not
+       * be read (nothing was changed), 2 on failure.
+       */
+      @Override public int pasteText(int displayId, java.lang.String text) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        int _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          _data.writeString(text);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_pasteText, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readInt();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * Start watching the user's screen for `windowMs`, and return the task on
+       * top of it right now (or -1).
+       * 
+       * An action can start an app that lands on the user's screen; a single
+       * look afterwards cannot tell that apart from an app the user opened
+       * themselves. Watching records what actually rose to the top, and when.
+       */
+      @Override public int watchMainScreen(int windowMs) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        int _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(windowMs);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_watchMainScreen, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readInt();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * What rose to the top of the user's screen since `sinceUptimeMs`
+       * (`SystemClock.uptimeMillis`), as JSON: an array of
+       * `{task, package, at, from, sameTask, standard, now}`, oldest first.
+       * 
+       * `from` is the display the task was last seen on (-1 when new), `now` is
+       * where it is now (-1 when it is gone), `sameTask` marks the same task
+       * showing a different page.
+       */
+      @Override public java.lang.String mainArrivals(long sinceUptimeMs) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        java.lang.String _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeLong(sinceUptimeMs);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_mainArrivals, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readString();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * The display's latest frame as a coarse brightness grid: `columns`,
+       * `rows`, then one byte per cell, row-major.
+       * 
+       * A cheap "did the picture change" that works on screens the accessibility
+       * tree describes nothing on — a game, a map, a camera preview.
+       */
+      @Override public byte[] frameSignature(int displayId) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        byte[] _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_frameSignature, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.createByteArray();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * The most displays this device will run at once, and why not more.
+       * 
+       * Parallel tasks need per-display focus (API 34+); a low-memory phone gets
+       * one either way, and once a second display has failed to appear in this
+       * session nothing retries it.
+       */
+      @Override public java.lang.String parallelLimit() throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        java.lang.String _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_parallelLimit, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readString();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /** How many displays this helper currently owns. */
+      @Override public int displayCount() throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        int _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_displayCount, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readInt();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /**
+       * Silence, or un-silence, what `displayId` shows.
+       * 
+       * The app-op is `PLAY_AUDIO`, per package: an app running on the agent's
+       * display is one the user cannot see, so a chime or a video from it is
+       * sound with no visible source. The helper remembers the mode each package
+       * was in before silencing it and writes that back — never an assumed
+       * default — and only ever touches packages it recorded itself.
+       * 
+       * Returns whether the request took effect. False is not fatal to the
+       * display: the app is already running, it is merely audible.
+       */
+      @Override public boolean setAudioMuted(int displayId, java.lang.String packageName, boolean muted) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          _data.writeString(packageName);
+          _data.writeInt(((muted)?(1):(0)));
+          boolean _status = mRemote.transact(Stub.TRANSACTION_setAudioMuted, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
     }
     static final int TRANSACTION_identity = (android.os.IBinder.FIRST_CALL_TRANSACTION + 1);
     static final int TRANSACTION_createDisplay = (android.os.IBinder.FIRST_CALL_TRANSACTION + 2);
@@ -468,6 +1011,18 @@ public interface ISyscityShell extends android.os.IInterface
     static final int TRANSACTION_injectText = (android.os.IBinder.FIRST_CALL_TRANSACTION + 8);
     static final int TRANSACTION_frame = (android.os.IBinder.FIRST_CALL_TRANSACTION + 9);
     static final int TRANSACTION_describe = (android.os.IBinder.FIRST_CALL_TRANSACTION + 10);
+    static final int TRANSACTION_moveToUser = (android.os.IBinder.FIRST_CALL_TRANSACTION + 11);
+    static final int TRANSACTION_moveToAgent = (android.os.IBinder.FIRST_CALL_TRANSACTION + 12);
+    static final int TRANSACTION_mainScreenTop = (android.os.IBinder.FIRST_CALL_TRANSACTION + 13);
+    static final int TRANSACTION_moveTaskToMe = (android.os.IBinder.FIRST_CALL_TRANSACTION + 14);
+    static final int TRANSACTION_injectGesture = (android.os.IBinder.FIRST_CALL_TRANSACTION + 15);
+    static final int TRANSACTION_pasteText = (android.os.IBinder.FIRST_CALL_TRANSACTION + 16);
+    static final int TRANSACTION_watchMainScreen = (android.os.IBinder.FIRST_CALL_TRANSACTION + 17);
+    static final int TRANSACTION_mainArrivals = (android.os.IBinder.FIRST_CALL_TRANSACTION + 18);
+    static final int TRANSACTION_frameSignature = (android.os.IBinder.FIRST_CALL_TRANSACTION + 19);
+    static final int TRANSACTION_parallelLimit = (android.os.IBinder.FIRST_CALL_TRANSACTION + 20);
+    static final int TRANSACTION_displayCount = (android.os.IBinder.FIRST_CALL_TRANSACTION + 21);
+    static final int TRANSACTION_setAudioMuted = (android.os.IBinder.FIRST_CALL_TRANSACTION + 22);
   }
   /** @hide */
   public static final java.lang.String DESCRIPTOR = "net.syscity.desktop.shell.ISyscityShell";
@@ -488,33 +1043,102 @@ public interface ISyscityShell extends android.os.IInterface
   /** Type text into whatever has focus on the display. */
   public boolean injectText(int displayId, java.lang.String text) throws android.os.RemoteException;
   /**
-   * The display's current frame as a PNG in a file.
+   * The display's current frame, written to a PNG file.
    * 
-   * Returns a read-only fd the caller must close, or null when the display
-   * produced nothing.
+   * Returns the file's path — the reader is the app's own process and opens it
+   * directly — or null when the display produced nothing.
    */
-  public android.os.ParcelFileDescriptor frame(int displayId) throws android.os.RemoteException;
+  public java.lang.String frame(int displayId) throws android.os.RemoteException;
   /** The app's own debug surface: which overload created this display, for logs. */
   public java.lang.String describe(int displayId) throws android.os.RemoteException;
-  /** @hide */
-  static class _Parcel {
-    static private <T> T readTypedObject(
-        android.os.Parcel parcel,
-        android.os.Parcelable.Creator<T> c) {
-      if (parcel.readInt() != 0) {
-          return c.createFromParcel(parcel);
-      } else {
-          return null;
-      }
-    }
-    static private <T extends android.os.Parcelable> void writeTypedObject(
-        android.os.Parcel parcel, T value, int parcelableFlags) {
-      if (value != null) {
-        parcel.writeInt(1);
-        value.writeToParcel(parcel, parcelableFlags);
-      } else {
-        parcel.writeInt(0);
-      }
-    }
-  }
+  /**
+   * Move the display's top task onto the user's own screen (display 0), so
+   * they can act on it directly when the agent cannot.
+   */
+  public boolean moveToUser(int displayId) throws android.os.RemoteException;
+  /** Move it back to this display after the user is done. */
+  public boolean moveToAgent(int displayId) throws android.os.RemoteException;
+  /**
+   * What is on the user's own screen now: `"<taskId>|<package>"`, or `""`.
+   * 
+   * An action that starts an app from a background service lands it on the
+   * user's display, not this one, and nothing on this display changes. This
+   * is how that becomes visible.
+   */
+  public java.lang.String mainScreenTop() throws android.os.RemoteException;
+  /** Move an arbitrary task here (used to pull a spilled app back). */
+  public boolean moveTaskToMe(int displayId, int taskId) throws android.os.RemoteException;
+  /**
+   * One gesture of one or two fingers, as flat parallel arrays.
+   * 
+   * `x`/`y`/`path` describe every point of every finger: `path[i]` is the
+   * finger a point belongs to, and the points of one finger are in time
+   * order. The fingers start together and run for `durationMs`. Coordinates
+   * are the display's own pixels.
+   * 
+   * `injectTap`/`injectSwipe` go through `input -d`, which only ever sends a
+   * single straight stroke. A pinch is two fingers moving apart at the same
+   * time, and that has no shell equivalent at all.
+   */
+  public boolean injectGesture(int displayId, int[] x, int[] y, int[] path, int durationMs) throws android.os.RemoteException;
+  /**
+   * Put `text` on the device clipboard and paste it with Ctrl+V on the
+   * display, then put the user's own clipboard back.
+   * 
+   * `input -d text` types through the key character map and mangles anything
+   * outside ASCII; a clipboard paste carries any character the app can
+   * render. Returns 0 when it pasted, 1 when the user's clipboard could not
+   * be read (nothing was changed), 2 on failure.
+   */
+  public int pasteText(int displayId, java.lang.String text) throws android.os.RemoteException;
+  /**
+   * Start watching the user's screen for `windowMs`, and return the task on
+   * top of it right now (or -1).
+   * 
+   * An action can start an app that lands on the user's screen; a single
+   * look afterwards cannot tell that apart from an app the user opened
+   * themselves. Watching records what actually rose to the top, and when.
+   */
+  public int watchMainScreen(int windowMs) throws android.os.RemoteException;
+  /**
+   * What rose to the top of the user's screen since `sinceUptimeMs`
+   * (`SystemClock.uptimeMillis`), as JSON: an array of
+   * `{task, package, at, from, sameTask, standard, now}`, oldest first.
+   * 
+   * `from` is the display the task was last seen on (-1 when new), `now` is
+   * where it is now (-1 when it is gone), `sameTask` marks the same task
+   * showing a different page.
+   */
+  public java.lang.String mainArrivals(long sinceUptimeMs) throws android.os.RemoteException;
+  /**
+   * The display's latest frame as a coarse brightness grid: `columns`,
+   * `rows`, then one byte per cell, row-major.
+   * 
+   * A cheap "did the picture change" that works on screens the accessibility
+   * tree describes nothing on — a game, a map, a camera preview.
+   */
+  public byte[] frameSignature(int displayId) throws android.os.RemoteException;
+  /**
+   * The most displays this device will run at once, and why not more.
+   * 
+   * Parallel tasks need per-display focus (API 34+); a low-memory phone gets
+   * one either way, and once a second display has failed to appear in this
+   * session nothing retries it.
+   */
+  public java.lang.String parallelLimit() throws android.os.RemoteException;
+  /** How many displays this helper currently owns. */
+  public int displayCount() throws android.os.RemoteException;
+  /**
+   * Silence, or un-silence, what `displayId` shows.
+   * 
+   * The app-op is `PLAY_AUDIO`, per package: an app running on the agent's
+   * display is one the user cannot see, so a chime or a video from it is
+   * sound with no visible source. The helper remembers the mode each package
+   * was in before silencing it and writes that back — never an assumed
+   * default — and only ever touches packages it recorded itself.
+   * 
+   * Returns whether the request took effect. False is not fatal to the
+   * display: the app is already running, it is merely audible.
+   */
+  public boolean setAudioMuted(int displayId, java.lang.String packageName, boolean muted) throws android.os.RemoteException;
 }

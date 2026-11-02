@@ -290,8 +290,8 @@ screen tools and the service selects that display's windows instead.
 A task can run on its own display, so the user keeps the phone. The agent drives
 it with `android_display`: `start` creates it and returns an id, `launch` opens
 an app on it, `frame` returns a PNG, `tap`/`swipe`/`text`/`key` act on it, `stop`
-tears it down. Three more answer questions the model would otherwise have to
-guess at:
+tears it down. `mute`/`sound` silence an app and give it its voice back. Three
+more answer questions the model would otherwise have to guess at:
 
 - **`limits`** — how many displays may be open at once and why not more (API 34
   for per-display focus, a low-memory phone, a display that already failed to
@@ -408,6 +408,41 @@ the output into a verdict:
 ./scripts/android-display-check.sh --device emulator-5554
 ```
 
+`scripts/android-audio-check.sh` does the same for the sound: it opens a display,
+checks the app is silent and recorded, closes it and checks the mode is back,
+checks that a `sound` with nothing recorded writes nothing, hands the app to the
+user and back, and finally kills the helper with an app silenced to prove the
+record outlives the process and the next helper restores it.
+
+An app the agent opened on its second screen is an app the user cannot see.
+Whatever it plays — a notification chime, a video started by a stray tap, a voice
+note — comes out of a phone showing something else, with nothing on the screen to
+connect it to. So `launch` silences the app it starts, and `mute`/`sound` do the
+same for an app that arrived some other way. The switch is the per-package
+`PLAY_AUDIO` app-op, which only the shell-identity helper can set, and the rules
+that make it safe to do to somebody's phone are in `AudioMute.kt`:
+
+- **the prior mode is read before the write, and written back on the way out** —
+  `sound` means "what it was", not "audio on". `appops get` prints a package line
+  (only when set) above a uid line (always); reading the first line would call a
+  silenced package untouched, so the package line wins.
+- **only recorded packages are ever written.** A refused read is a refused mute:
+  an app whose mode cannot be established is left alone, and `mute` says so
+  rather than guessing.
+- **the record survives a kill.** It lives in `/data/local/tmp`, owned by the
+  shell uid — not in `java.io.tmpdir`, which under `app_process` is a tmpfs and
+  a reboot would take the record with it. A new helper restores whatever the last
+  one left silent at start-up, and `releaseAll` does it at teardown. The same app
+  on two displays is counted, not re-recorded.
+- **a record names the helper that wrote it** (`owner <pid> <starttime>`) and a
+  newcomer leaves a live helper's record alone. Two helpers can run at once — the
+  app decides one is missing and starts another — and restoring the first one's
+  record would make an app the user cannot see audible again while its display is
+  still up. The start time pins the process, because a pid alone is reused.
+- **a mute that does not take is not fatal.** The app is already running and
+  merely audible; `mute` reports `muted: false` with `AUDIO_UNCHANGED` instead of
+  failing the launch.
+
 Known limits, in the order they will bite:
 
 - **Android 13** has no per-display focus, so the user's screen can lose focus
@@ -421,6 +456,9 @@ Known limits, in the order they will bite:
   picture from the helper's frame. Below API 30, or with the service off, the
   read fails with `DISPLAY_TREE_UNAVAILABLE` and `frame` + OCR is what is
   left.
+- **`PLAY_AUDIO` is per package, not per display.** An app the agent opened is
+  silent everywhere, including a second copy the user has open themselves —
+  which is why it is only ever muted while it sits on the agent's display.
 
 ## Capability Registry
 

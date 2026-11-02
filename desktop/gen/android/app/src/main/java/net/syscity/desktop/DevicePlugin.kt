@@ -583,6 +583,20 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
             else out.put("ok", false).put("code", "LAUNCH_FAILED")
               .put("error", "the app would not start on display $displayId")
           }
+          // Audio is muted by the helper as part of `startApp`; this exists for
+          // the caller to mute an app it did not launch, and to give the sound
+          // back without tearing the display down.
+          "set_audio" -> {
+            val muted = args.optBoolean("muted", true)
+            val packageName = args.optString("package")
+            val changed = shell?.setAudioMuted(displayId, packageName, muted) ?: false
+            // A refused mute is an answer, not a failed display operation: the
+            // app is already running and merely audible. `ok` stays true so the
+            // caller can tell the two apart.
+            out.put("ok", true)
+            out.put("muted", changed)
+            if (!changed) out.put("code", "AUDIO_UNCHANGED")
+          }
           "tap" -> {
             val ok = shell?.injectTap(displayId, args.optInt("x"), args.optInt("y")) ?: false
             out.put("ok", ok)

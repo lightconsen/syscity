@@ -44,7 +44,7 @@ pub struct DisplayError {
 }
 
 impl DisplayError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
     }
 }
@@ -292,6 +292,33 @@ impl VirtualDisplay {
         call(&self.bridge, json!({ "op": "paste", "display": self.id, "text": text }))
             .await
             .map(|_| ())
+    }
+
+    /// Silence (or un-silence) an app shown on this display.
+    ///
+    /// The helper sets the app's `PLAY_AUDIO` app-op and remembers the mode it
+    /// was in, so the sound comes back as it was and not as we assume it was.
+    /// Launching an app here mutes it already; this exists for an app that
+    /// arrived some other way.
+    ///
+    /// `false` means the sound is unchanged (the helper could not read the mode
+    /// first, or the write did not take). That is not an error: the app is up,
+    /// it is merely audible, and the caller is told which of the two it got.
+    pub async fn set_audio_muted(&self, package: &str, muted: bool) -> Result<bool, DisplayError> {
+        let answer = call(
+            &self.bridge,
+            json!({
+                "op": "set_audio",
+                "display": self.id,
+                "package": package,
+                "muted": muted,
+            }),
+        )
+        .await?;
+        Ok(answer
+            .get("muted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     /// A coarse brightness grid of the current frame: `(columns, rows, cells)`.
@@ -975,6 +1002,52 @@ mod tests {
         let failed = display.screenshot().await.expect_err("missing file");
         assert_eq!(failed.code, DISPLAY_BAD_RESPONSE);
         assert!(failed.message.contains("could not be read"), "{}", failed.message);
+    }
+
+    #[tokio::test]
+    async fn muting_names_the_display_and_the_app() {
+        let mock = Arc::new(MockDeviceBridge::new(json!({ "ok": true, "muted": true })));
+        let bridge: DeviceBridgeRef = mock.clone();
+        let display = VirtualDisplay::attach(bridge, 4);
+        assert!(display.set_audio_muted("com.x", true).await.expect("muted"));
+        assert!(display
+            .set_audio_muted("com.x", false)
+            .await
+            .expect("unmuted"));
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, CMD_VIRTUAL_DISPLAY);
+        assert_eq!(
+            calls[0].1,
+            json!({ "op": "set_audio", "display": 4, "package": "com.x", "muted": true })
+        );
+        assert_eq!(calls[1].1["muted"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn a_refused_mute_is_reported_and_not_an_error() {
+        // The app is already running; a refused mute is a fact about the sound
+        // and not a failed display operation. The helper says so with
+        // `ok: true, muted: false` — the request was answered and nothing
+        // changed.
+        let bridge = bridge(json!({ "ok": true, "muted": false, "code": "AUDIO_UNCHANGED" }));
+        let display = VirtualDisplay::attach(bridge, 1);
+        assert!(!display
+            .set_audio_muted("com.x", true)
+            .await
+            .expect("answer"));
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_never_says_muted_did_not_mute() {
+        // An older helper answers `{ "ok": true }` to everything it does not
+        // refuse. Silence must not be read into that.
+        let bridge = bridge(json!({ "ok": true }));
+        let display = VirtualDisplay::attach(bridge, 1);
+        assert!(!display
+            .set_audio_muted("com.x", true)
+            .await
+            .expect("answer"));
     }
 
     #[test]

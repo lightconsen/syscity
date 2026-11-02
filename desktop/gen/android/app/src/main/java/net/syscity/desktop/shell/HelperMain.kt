@@ -40,6 +40,14 @@ object HelperMain {
     private const val PER_USER_RANGE = 100000
 
     /**
+     * Where the helper keeps state that must survive a reboot.
+     *
+     * `/data`, shell-owned, and not wiped: neither `java.io.tmpdir` nor the
+     * app's own `cacheDir` is (see `stateDir`).
+     */
+    private const val STATE_DIR = "/data/local/tmp"
+
+    /**
      * The shell Context this process built, kept for services that want one
      * (`isLowRamDevice` is a call on a Context, not a global).
      */
@@ -94,7 +102,7 @@ object HelperMain {
         }
         shellContext = context
 
-        val stub = Stub()
+        val stub = Stub(userId = appUid / PER_USER_RANGE)
         val token = handoff(context, packageName, appUid, nonce, stub)
         if (token == null) {
             Log.e(TAG, "handoff refused")
@@ -244,18 +252,67 @@ object HelperMain {
     }.getOrNull()
 
     /**
+     * Where this process may keep small pieces of state across restarts.
+     *
+     * Not `java.io.tmpdir`: under `app_process` that is `/tmp`, a tmpfs that a
+     * reboot wipes — and the audio-mute record has to survive exactly that. It
+     * is where the *frames* live, and that is right for them: a frame that
+     * outlived a reboot would be a picture of a phone that no longer exists.
+     *
+     * `/data/local/tmp` is on `/data`, is owned by the shell uid this process
+     * runs as, and is where adb keeps things meant to last. The platform's temp
+     * directory is the fallback: a record that does not survive a reboot still
+     * beats no record at all.
+     */
+    private fun stateDir(): File {
+        val preferred = File(STATE_DIR)
+        if (preferred.isDirectory && preferred.canWrite()) return preferred
+        val fallback = File(System.getProperty("java.io.tmpdir") ?: STATE_DIR)
+        return fallback.also { it.mkdirs() }
+    }
+
+    /**
      * The Binder the app talks to.
      *
      * Everything here touches the display or the shell, so it is real Binder
      * work on pool threads. Frames go to a file and come back as an fd: a
      * Binder transaction is capped at 1 MB and a full-screen PNG is not.
      */
-    private class Stub : ISyscityShell.Stub() {
+    private class Stub(private val userId: Int) : ISyscityShell.Stub() {
 
         private val lock = Any()
         private val displays = HashMap<Int, AgentDisplay>()
         private val clipboard = ShellClipboard()
         private val mainWatch = MainScreenWatch { TaskQuery.current().orEmpty() }
+
+        /**
+         * What each display has open, and which package it silenced for it.
+         *
+         * Keyed by display: two displays may show the same app, and the sound
+         * may only come back when the last of them closes.
+         */
+        private val audio = AudioControl(
+            ledger = AudioMuteLedger(File(stateDir(), "audio_mute_$userId")),
+            userId = userId,
+        )
+        private val muted = HashMap<Int, String>()
+
+        init {
+            // An earlier helper may have been killed with apps still silenced.
+            // The file is the only record of them, and nothing else will ever
+            // restore those apps: the display that muted them is gone. But a
+            // helper that is still alive owns its record — restoring it would
+            // undo a mute whose display is still up, and the app would be
+            // audible to a user who cannot see it.
+            if (audio.ownedByAnother()) {
+                Log.w(TAG, "another live helper owns the audio-mute record; leaving it alone")
+            } else {
+                runCatching { audio.restoreAll() }
+                    .onFailure {
+                        Log.w(TAG, "could not restore apps muted by an earlier session: ${it.message}")
+                    }
+            }
+        }
 
         /** Set once a second display has failed to appear — it is not retried. */
         @Volatile
@@ -281,7 +338,12 @@ object HelperMain {
 
         override fun startApp(displayId: Int, packageName: String): Int =
             runCatching {
-                display(displayId)?.launch(packageName)
+                val target = display(displayId) ?: return 1
+                target.launch(packageName)
+                // Only after the launch took: an app that never started is not
+                // an app the user would hear, and silencing it would outlive
+                // the failed call.
+                muteFor(displayId, packageName)
                 0
             }.getOrElse {
                 Log.e(TAG, "startApp $packageName on $displayId: ${it.message}")
@@ -290,6 +352,35 @@ object HelperMain {
 
         override fun releaseDisplay(displayId: Int) {
             synchronized(lock) { displays.remove(displayId)?.release() }
+            restoreFor(displayId)
+        }
+
+        /**
+         * Silence what this display shows, and say whether it worked.
+         *
+         * A display keeps only one package muted: whatever was open before is
+         * replaced, so an app the agent navigated away from gets its sound back
+         * rather than staying silent for the rest of the session.
+         *
+         * A mute for a display that does not exist is refused rather than
+         * applied: the record would outlive the display that justified it and
+         * the app would be silent for the rest of the session, with nothing on
+         * screen to explain why.
+         *
+         * The answer is advisory. The display is already running; a refusal to
+         * mute is worth reporting and not worth failing the launch over.
+         */
+        override fun setAudioMuted(displayId: Int, packageName: String, muted: Boolean): Boolean {
+            if (muted) {
+                display(displayId) ?: return false
+                return muteFor(displayId, packageName)
+            }
+            // Un-muting names a package, so an app this display never silenced
+            // is left alone — even when the display is holding something else
+            // down, which is not what the caller asked to release.
+            val held = synchronized(this.muted) { this.muted[displayId] }
+            if (held != packageName) return true
+            return restoreFor(displayId)
         }
 
         override fun injectTap(displayId: Int, x: Int, y: Int): Boolean =
@@ -318,11 +409,28 @@ object HelperMain {
         override fun describe(displayId: Int): String =
             display(displayId)?.describe() ?: "no display $displayId"
 
-        override fun moveToUser(displayId: Int): Boolean =
-            runCatching { display(displayId)?.moveTopTaskTo(0) == true }.getOrDefault(false)
+        override fun moveToUser(displayId: Int): Boolean {
+            val moved =
+                runCatching { display(displayId)?.moveTopTaskTo(0) == true }.getOrDefault(false)
+            // The app is on the user's screen now: they can see it, so they
+            // should hear it. The mute exists to keep sound attached to
+            // something visible, and the user is looking at it.
+            if (moved) restoreFor(displayId)
+            return moved
+        }
 
-        override fun moveToAgent(displayId: Int): Boolean =
-            runCatching { display(displayId)?.moveTopTaskTo(displayId) == true }.getOrDefault(false)
+        override fun moveToAgent(displayId: Int): Boolean {
+            val returned =
+                runCatching { display(displayId)?.moveTopTaskTo(displayId) == true }
+                    .getOrDefault(false)
+            // Back where the user cannot see it, so back to silent. The app is
+            // re-muted from the mode it was just restored to, which is the mode
+            // it had before the agent silenced it in the first place.
+            if (returned) {
+                shownPackage(displayId)?.let { packageName -> muteFor(displayId, packageName) }
+            }
+            return returned
+        }
 
         override fun mainScreenTop(): String {
             // Not tied to a display: the user's screen is the user's screen
@@ -408,12 +516,59 @@ object HelperMain {
 
         override fun displayCount(): Int = synchronized(lock) { displays.size }
 
+        /**
+         * Record that `displayId` now shows `packageName`, muting it.
+         *
+         * Returning the display to its previous package restores that one
+         * first: the map holds one package per display, so replacing it is also
+         * the release of the old one.
+         */
+        private fun muteFor(displayId: Int, packageName: String): Boolean {
+            val previous = synchronized(muted) { muted.put(displayId, packageName) }
+            if (previous == packageName) {
+                // Launched again, still the same app on this display. Asking the
+                // ledger to mute it a second time would count this display
+                // twice, and closing the display once would then leave two
+                // releases owed — an app silent for the rest of the session.
+                return true
+            }
+            if (previous != null) {
+                runCatching { audio.restore(previous) }
+                    .onFailure { Log.w(TAG, "could not restore $previous: ${it.message}") }
+            }
+            return runCatching { audio.mute(packageName) }.getOrElse {
+                Log.w(TAG, "could not silence $packageName: ${it.message}")
+                false
+            }
+        }
+
+        /** What is on top of `displayId`, as the task list names it. */
+        private fun shownPackage(displayId: Int): String? =
+            TaskQuery.current()
+                ?.firstOrNull { it.displayId == displayId }
+                ?.packageName
+
+        /** The display is going away or changed app: give the sound back. */
+        private fun restoreFor(displayId: Int): Boolean {
+            val previous = synchronized(muted) { muted.remove(displayId) } ?: return true
+            return runCatching { audio.restore(previous) }.getOrElse {
+                Log.w(TAG, "could not restore $previous: ${it.message}")
+                false
+            }
+        }
+
         /** Tear everything down; called when the app's token dies. */
         fun releaseAll() {
             synchronized(lock) {
                 displays.values.forEach { runCatching { it.release() } }
                 displays.clear()
             }
+            synchronized(muted) { muted.clear() }
+            // The ledger is the list of apps still silent, whoever muted them;
+            // restoring it here is what keeps a killed session from leaving the
+            // user with an app that has no sound.
+            runCatching { audio.restoreAll() }
+                .onFailure { Log.w(TAG, "could not restore every muted app: ${it.message}") }
             runCatching { mainWatch.close() }
             runCatching { clipboard.restore() }
         }

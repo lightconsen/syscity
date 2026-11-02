@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 /**
  * The parts of the phone control that are pure logic.
@@ -388,5 +389,258 @@ class PhoneLogicTest {
         assertEquals(2, GesturePlan.ACTION_MOVE)
         assertEquals(5, GesturePlan.ACTION_POINTER_DOWN)
         assertEquals(6, GesturePlan.ACTION_POINTER_UP)
+    }
+
+    // ── Silencing an app on the agent's display ─────────────────────────
+
+    @Test
+    fun aPackageLineBeatsTheUidLine() {
+        // A silenced package prints both; the uid line says `default` and would
+        // make a muted app look untouched if it were read first.
+        assertEquals(
+            PlayAudio.IGNORE,
+            PlayAudio.parse("Uid mode: PLAY_AUDIO: default\nPLAY_AUDIO: ignore"),
+        )
+    }
+
+    @Test
+    fun aUidOnlyAnswerStillSaysSomething() {
+        assertEquals(PlayAudio.IGNORE, PlayAudio.parse("Uid mode: PLAY_AUDIO: ignore"))
+    }
+
+    @Test
+    fun aPackageWithNothingSetReadsAsNull() {
+        // "No operations." is the answer for an app nobody has set: the mode is
+        // the system default, and there is nothing to write back.
+        assertNull(PlayAudio.parse("No operations."))
+        assertNull(PlayAudio.parse(""))
+    }
+
+    @Test
+    fun restoringAnAppWithNothingSetWritesDefaultNotAllow() {
+        // `allow` would be a mode the user did not choose; `default` is what
+        // "nothing was set" means and is what the package line came from.
+        assertEquals(PlayAudio.DEFAULT, PlayAudio.restoreMode(null))
+        assertEquals(PlayAudio.IGNORE, PlayAudio.restoreMode(PlayAudio.IGNORE))
+    }
+
+    @Test
+    fun aLedgerLineRoundTrips() {
+        val text = AudioMuteLedger.format(
+            linkedMapOf("com.a" to (PlayAudio.DEFAULT to 2), "com.b.c" to (PlayAudio.IGNORE to 1)),
+        )
+        val parsed = AudioMuteLedger.parse(text)
+        assertEquals("default", parsed["com.a"]?.prior)
+        assertEquals(2, parsed["com.a"]?.count)
+        assertEquals("ignore", parsed["com.b.c"]?.prior)
+    }
+
+    @Test
+    fun aHalfWrittenLineIsIgnoredRatherThanMisread() {
+        // A record that cannot be read is a package that is never restored, so
+        // an unknown line is dropped and the rest of the file still counts.
+        val parsed = AudioMuteLedger.parse("com.a default 1\ncom.b\n\n  noise  \n")
+        assertEquals(setOf("com.a"), parsed.keys)
+    }
+
+    @Test
+    fun theOwnerLineNamesTheProcessThatWroteTheRecord() {
+        val text = "owner 4242 99123\ncom.a default 1\n"
+        assertEquals("4242 99123", AudioMuteLedger.parseOwner(text))
+        assertNull(AudioMuteLedger.parseOwner("com.a default 1\n"))
+    }
+
+    @Test
+    fun aRecordLeftByADeadHelperIsInherited() {
+        // The pid is gone, so nothing is holding those mutes: restoring them at
+        // start-up is the only thing that will ever give the sound back.
+        val file = tempFile("owner 999999 1\ncom.a default 1\n")
+        val ledger = AudioMuteLedger(file = file, warn = {}, owner = "1 1", alive = { false })
+        assertFalse(ledger.ownedByAnother())
+        assertTrue(ledger.contains("com.a"))
+        assertEquals("default", ledger["com.a"])
+    }
+
+    @Test
+    fun aRecordOwnedByALiveHelperIsLeftAlone() {
+        // Two helpers can be alive at once. The newcomer did not open these
+        // displays and must not write to or outlive their record: restoring it
+        // would make an app the user cannot see audible again.
+        val text = "owner 4242 99123\ncom.a default 1\n"
+        val file = tempFile(text)
+        val ours = AudioMuteLedger(
+            file = file,
+            warn = {},
+            owner = "1 1",
+            alive = { it == "4242 99123" },
+        )
+        assertTrue(ours.ownedByAnother())
+        assertFalse(ours.contains("com.a"))
+        ours.acquire("com.b", PlayAudio.DEFAULT)
+        assertTrue(ours.contains("com.b"))
+        // Our record stays in memory; the other helper's file is untouched.
+        assertEquals(text, file.readText())
+    }
+
+    @Test
+    fun aRecordWithoutAnOwnerLineIsTakenRatherThanAbandoned() {
+        // Written by a version before the owner line existed: no process can be
+        // asked, and taking it is the only reading that restores the apps.
+        val file = tempFile("com.a default 1\n")
+        val ledger = AudioMuteLedger(file = file, warn = {}, owner = "1 1", alive = { false })
+        assertFalse(ledger.ownedByAnother())
+        assertTrue(ledger.contains("com.a"))
+    }
+
+    @Test
+    fun aRecordThisProcessWroteIsInherited() {
+        // Restarting inside the same pid is not possible, but the comparison is
+        // what protects a live helper: an equal owner is this process's own file.
+        val file = tempFile("owner 1 1\ncom.a default 1\n")
+        val ledger = AudioMuteLedger(file = file, warn = {}, owner = "1 1", alive = { true })
+        assertFalse(ledger.ownedByAnother())
+        assertTrue(ledger.contains("com.a"))
+    }
+
+    private fun tempFile(text: String): File {
+        val file = File.createTempFile("audio_mute_test", ".txt")
+        file.deleteOnExit()
+        file.writeText(text)
+        return file
+    }
+
+    @Test
+    fun twoDisplaysShowingTheSameAppReleaseItOnce() {
+        val ledger = AudioMuteLedger(file = null, warn = {})
+        assertTrue(ledger.acquire("com.x", PlayAudio.DEFAULT))
+        assertFalse(ledger.acquire("com.x", PlayAudio.DEFAULT))
+        assertFalse(ledger.release("com.x"))
+        assertTrue(ledger.release("com.x"))
+        assertFalse(ledger.contains("com.x"))
+    }
+
+    @Test
+    fun mutingRemembersWhatTheSoundWasBefore() {
+        val commands = mutableListOf<String>()
+        val control = AudioControl(
+            ledger = AudioMuteLedger(file = null, warn = {}),
+            userId = 0,
+            exec = { command ->
+                commands.add(command.joinToString(" "))
+                when {
+                    command[1] == "get" -> 0 to "Uid mode: PLAY_AUDIO: default"
+                    else -> 0 to ""
+                }
+            },
+            warn = {},
+        )
+        assertTrue(control.mute("com.x"))
+        // Read first, then write: a mute whose prior mode is unknown must not
+        // happen at all.
+        assertEquals(
+            listOf(
+                "appops get --user 0 com.x PLAY_AUDIO",
+                "appops set --user 0 com.x PLAY_AUDIO ignore",
+            ),
+            commands,
+        )
+        assertEquals(PlayAudio.DEFAULT, control.mode("com.x"))
+    }
+
+    @Test
+    fun aMuteItCannotReadFirstIsNotWritten() {
+        val commands = mutableListOf<String>()
+        val control = AudioControl(
+            ledger = AudioMuteLedger(file = null, warn = {}),
+            userId = 0,
+            exec = { command ->
+                commands.add(command.joinToString(" "))
+                255 to "Error: No UID for com.x in user 0"
+            },
+            warn = {},
+        )
+        assertFalse(control.mute("com.x"))
+        assertEquals(1, commands.size)
+        assertTrue(commands.single().startsWith("appops get"))
+    }
+
+    @Test
+    fun anAppThatRefusesToBeSilencedIsNotRecorded() {
+        val control = AudioControl(
+            ledger = AudioMuteLedger(file = null, warn = {}),
+            userId = 0,
+            exec = { command ->
+                if (command[1] == "get") 0 to "PLAY_AUDIO: default" else 1 to "denied"
+            },
+            warn = {},
+        )
+        assertFalse(control.mute("com.x"))
+        // Nothing was recorded, so `restore` finds nothing to write — which is
+        // true, and is the whole point: a later `sound` cannot write over a
+        // mode the user set themselves.
+        assertTrue(control.restore("com.x"))
+    }
+
+    @Test
+    fun restoringWritesTheModeThatWasThereAndChecksItTook() {
+        val commands = mutableListOf<String>()
+        val control = AudioControl(
+            ledger = AudioMuteLedger(file = null, warn = {}),
+            userId = 10,
+            exec = { command ->
+                commands.add(command.joinToString(" "))
+                when {
+                    command[1] == "get" && commands.size == 1 -> 0 to "PLAY_AUDIO: allow"
+                    command[1] == "get" -> 0 to "PLAY_AUDIO: allow"
+                    else -> 0 to ""
+                }
+            },
+            warn = {},
+        )
+        assertTrue(control.mute("com.x"))
+        commands.clear()
+        assertTrue(control.restore("com.x"))
+        assertEquals(
+            listOf(
+                "appops set --user 10 com.x PLAY_AUDIO allow",
+                "appops get --user 10 com.x PLAY_AUDIO",
+            ),
+            commands,
+        )
+    }
+
+    @Test
+    fun aRestoreThatLeavesTheAppSilentIsReplacedWithAllow() {
+        // On builds that store this op per-uid, writing `default` back over a
+        // package that had nothing set leaves it reading `ignore`. `allow` is
+        // the same thing said explicitly, and is what actually restores sound.
+        val commands = mutableListOf<String>()
+        var reads = 0
+        val control = AudioControl(
+            ledger = AudioMuteLedger(file = null, warn = {}),
+            userId = 0,
+            exec = { command ->
+                commands.add(command.joinToString(" "))
+                when {
+                    command[1] == "get" -> {
+                        reads += 1
+                        if (reads == 1) 0 to "No operations." else 0 to "PLAY_AUDIO: ignore"
+                    }
+                    else -> 0 to ""
+                }
+            },
+            warn = {},
+        )
+        assertTrue(control.mute("com.x"))
+        commands.clear()
+        assertTrue(control.restore("com.x"))
+        assertEquals(
+            listOf(
+                "appops set --user 0 com.x PLAY_AUDIO default",
+                "appops get --user 0 com.x PLAY_AUDIO",
+                "appops set --user 0 com.x PLAY_AUDIO allow",
+            ),
+            commands,
+        )
     }
 }

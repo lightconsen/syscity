@@ -1384,9 +1384,9 @@ impl Tool for AdbDisplayTool {
                     "type": "string",
                     "enum": [
                         "start", "restart", "stop", "status", "limits", "frame", "launch",
-                        "tap", "swipe", "text", "paste", "key"
+                        "tap", "swipe", "text", "paste", "key", "mute", "sound"
                     ],
-                    "description": "start creates the display; limits says how many may be open; restart replaces a stale helper; the rest act on it. 'paste' carries non-ASCII text, which `text` cannot."
+                    "description": "start creates the display; limits says how many may be open; restart replaces a stale helper; the rest act on it. 'paste' carries non-ASCII text, which `text` cannot. 'mute' silences the app on this display and 'sound' gives it back; launching an app mutes it already."
                 },
                 "display": {
                     "type": "integer",
@@ -1394,7 +1394,7 @@ impl Tool for AdbDisplayTool {
                 },
                 "package": {
                     "type": "string",
-                    "description": "start / launch: the app to open on the display."
+                    "description": "start / launch: the app to open on the display; mute / sound: the app whose sound to change."
                 },
                 "width": { "type": "integer", "description": "start: display width (default 1080)." },
                 "height": { "type": "integer", "description": "start: display height (default 2400)." },
@@ -1588,7 +1588,7 @@ impl Tool for AdbDisplayTool {
                 display
                     .launch(package)
                     .await
-                    .map(|_| format!("Opened {package} on display {id}."))
+                    .map(|_| format!("Opened {package} on display {id} (muted)."))
             }
             "frame" => match display.screenshot().await {
                 Ok(frame) => {
@@ -1663,10 +1663,40 @@ impl Tool for AdbDisplayTool {
                     .await
                     .map(|_| format!("Pressed {keycode} on display {id}."))
             }
+            "mute" | "sound" => {
+                let package = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
+                if package.is_empty() {
+                    return Ok(ToolExecutionResult::error(
+                        "`package` is required: say which app's sound to change",
+                    ));
+                }
+                let muted = action == "mute";
+                match display.set_audio_muted(package, muted).await {
+                    Ok(true) => Ok(if muted {
+                        format!(
+                            "{package} is silent on display {id}; its sound returns when it leaves."
+                        )
+                    } else {
+                        // True also for an app the agent never muted: nothing is
+                        // being held down, and saying what it was set back to
+                        // would imply it had been changed.
+                        format!("{package}'s sound is no longer held down by the agent.")
+                    }),
+                    Ok(false) => Err(super::display::DisplayError::new(
+                        super::display::DISPLAY_HELPER_ERROR,
+                        format!(
+                            "the sound of {package} was not changed: the helper records what \
+                             the mode was before silencing an app, and will not touch one it \
+                             cannot read first. The app is running; it is merely audible."
+                        ),
+                    )),
+                    Err(failed) => Err(failed),
+                }
+            }
             other => {
                 return Ok(ToolExecutionResult::error(format!(
                     "unknown action {other:?}; use start, stop, status, limits, frame, launch, \
-                     tap, swipe, text, paste or key"
+                     tap, swipe, text, paste, key, mute or sound"
                 )))
             }
         };

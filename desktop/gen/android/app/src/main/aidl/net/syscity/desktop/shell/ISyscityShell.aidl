@@ -137,4 +137,18 @@ interface ISyscityShell {
 
     /** How many displays this helper currently owns. */
     int displayCount() = 21;
+
+    /**
+     * Silence, or un-silence, what `displayId` shows.
+     *
+     * The app-op is `PLAY_AUDIO`, per package: an app running on the agent's
+     * display is one the user cannot see, so a chime or a video from it is
+     * sound with no visible source. The helper remembers the mode each package
+     * was in before silencing it and writes that back — never an assumed
+     * default — and only ever touches packages it recorded itself.
+     *
+     * Returns whether the request took effect. False is not fatal to the
+     * display: the app is already running, it is merely audible.
+     */
+    boolean setAudioMuted(int displayId, String packageName, boolean muted) = 22;
 }
