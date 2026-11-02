@@ -151,4 +151,37 @@ interface ISyscityShell {
      * display: the app is already running, it is merely audible.
      */
     boolean setAudioMuted(int displayId, String packageName, boolean muted) = 22;
+
+    /**
+     * Mark `displayId` as the person's, or take it back.
+     *
+     * While it is theirs, every write to it — tap, swipe, key, text, paste,
+     * gesture, launch, task moves — is refused by the helper. Reads keep
+     * working: the session that handed it over has to be able to look at what
+     * they did. This is the on-device half of the takeover guarantee; the
+     * process-wide lock in Rust is the host-side half, and it cannot cover a
+     * session that connected while a handoff was already in flight.
+     *
+     * `holdMs` bounds the takeover: after that long the helper releases it on
+     * its own. The caller is expected to take it back first — this is the
+     * backstop for a caller that died or was cancelled mid-handoff, which
+     * would otherwise leave the display unwritable for the rest of the session.
+     *
+     * Returns false from `giveToUser` when there is no such display, and true
+     * when it is theirs (including when it already was).
+     */
+    boolean giveToUser(int displayId, long holdMs) = 23;
+
+    /** The person is done; the agent may write to the display again. */
+    void takeBack(int displayId) = 24;
+
+    /**
+     * Whether a person holds `displayId` right now.
+     *
+     * A refused write answers `false` either way — that is what every write
+     * already returns for a display it cannot reach. This is what lets the
+     * caller say *why*: "somebody is using it" is a wait, and "it did not work"
+     * is a retry, and they are different instructions to give a model.
+     */
+    boolean isHeldByUser(int displayId) = 25;
 }

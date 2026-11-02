@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.Process
 import android.os.RemoteException
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 
@@ -283,6 +284,7 @@ object HelperMain {
         private val lock = Any()
         private val displays = HashMap<Int, AgentDisplay>()
         private val clipboard = ShellClipboard()
+        private val pasteLock = Any()
         private val mainWatch = MainScreenWatch { TaskQuery.current().orEmpty() }
 
         /**
@@ -296,6 +298,23 @@ object HelperMain {
             userId = userId,
         )
         private val muted = HashMap<Int, String>()
+
+        /**
+         * Displays a person is touching right now.
+         *
+         * The agent's display is handed over with `moveToUser`, and the person
+         * then acts on their own screen. While that is happening nothing may
+         * write to the display they are looking at — another session tapping
+         * under their finger is the worst possible moment for it. Reads still
+         * work: the waiting session has to be able to judge what they did.
+         *
+         * The flag is the guarantee, because it is checked on the device and
+         * so covers every caller: the process-wide lock in Rust serializes
+         * sessions on one host, and this covers the case where that lock was
+         * never taken — a second session that arrived while the handoff was in
+         * flight.
+         */
+        private val heldByUser = HashMap<Int, Long>()
 
         init {
             // An earlier helper may have been killed with apps still silenced.
@@ -338,7 +357,7 @@ object HelperMain {
 
         override fun startApp(displayId: Int, packageName: String): Int =
             runCatching {
-                val target = display(displayId) ?: return 1
+                val target = writable(displayId) ?: return 1
                 target.launch(packageName)
                 // Only after the launch took: an app that never started is not
                 // an app the user would hear, and silencing it would outlive
@@ -353,6 +372,9 @@ object HelperMain {
         override fun releaseDisplay(displayId: Int) {
             synchronized(lock) { displays.remove(displayId)?.release() }
             restoreFor(displayId)
+            // A display that no longer exists cannot be held: leaving the flag
+            // would make a new display that reuses the id unreachable.
+            takeBack(displayId)
         }
 
         /**
@@ -372,7 +394,8 @@ object HelperMain {
          */
         override fun setAudioMuted(displayId: Int, packageName: String, muted: Boolean): Boolean {
             if (muted) {
-                display(displayId) ?: return false
+                // A person holding the display decides what it sounds like.
+                writable(displayId) ?: return false
                 return muteFor(displayId, packageName)
             }
             // Un-muting names a package, so an app this display never silenced
@@ -383,8 +406,37 @@ object HelperMain {
             return restoreFor(displayId)
         }
 
+        /**
+         * Drop a takeover whose deadline has passed.
+         *
+         * The interval is the backstop, not the mechanism: the caller takes the
+         * display back when it is done. What this prevents is a caller that
+         * died, was cancelled, or never came back leaving the display
+         * unwritable for the rest of the session.
+         */
+        private fun expireHold(displayId: Int) {
+            val deadline = synchronized(heldByUser) { heldByUser[displayId] } ?: return
+            if (SystemClock.elapsedRealtime() < deadline) return
+            synchronized(heldByUser) { heldByUser.remove(displayId) }
+            Log.w(TAG, "the takeover of display $displayId timed out; the agent may write again")
+        }
+
+        /**
+         * The display, unless a person is holding it.
+         *
+         * Every write goes through here; reads do not. Null means either no
+         * such display or one the user has taken over, and both are answered
+         * with false by the callers that write — which is the same answer they
+         * already give for a display that is not there, so no caller needs a
+         * new branch.
+         */
+        private fun writable(id: Int): AgentDisplay? {
+            expireHold(id)
+            return synchronized(heldByUser) { if (id in heldByUser) null else display(id) }
+        }
+
         override fun injectTap(displayId: Int, x: Int, y: Int): Boolean =
-            runCatching { display(displayId)?.tap(x, y) != null }.getOrDefault(false)
+            runCatching { writable(displayId)?.tap(x, y) != null }.getOrDefault(false)
 
         override fun injectSwipe(
             displayId: Int,
@@ -394,14 +446,14 @@ object HelperMain {
             y2: Int,
             durationMs: Int,
         ): Boolean = runCatching {
-            display(displayId)?.swipe(x1, y1, x2, y2, durationMs) != null
+            writable(displayId)?.swipe(x1, y1, x2, y2, durationMs) != null
         }.getOrDefault(false)
 
         override fun injectKey(displayId: Int, keyCode: Int): Boolean =
-            runCatching { display(displayId)?.key(keyCode) != null }.getOrDefault(false)
+            runCatching { writable(displayId)?.key(keyCode) != null }.getOrDefault(false)
 
         override fun injectText(displayId: Int, text: String): Boolean =
-            runCatching { display(displayId)?.type(text) != null }.getOrDefault(false)
+            runCatching { writable(displayId)?.type(text) != null }.getOrDefault(false)
 
         override fun frame(displayId: Int): String? =
             runCatching { display(displayId)?.frameFile()?.absolutePath }.getOrNull()
@@ -409,6 +461,13 @@ object HelperMain {
         override fun describe(displayId: Int): String =
             display(displayId)?.describe() ?: "no display $displayId"
 
+        /**
+         * Put the display's app on the user's screen.
+         *
+         * This one is allowed on a held display, because it is what the hold is
+         * for: `giveToUser` marks it, and then this is the move the person is
+         * about to act on. Every other write is refused until they hand it back.
+         */
         override fun moveToUser(displayId: Int): Boolean {
             val moved =
                 runCatching { display(displayId)?.moveTopTaskTo(0) == true }.getOrDefault(false)
@@ -419,6 +478,26 @@ object HelperMain {
             return moved
         }
 
+        override fun giveToUser(displayId: Int, holdMs: Long): Boolean {
+            expireHold(displayId)
+            if (display(displayId) == null) return false
+            // The display is marked before the app moves: a session that got
+            // in between the move and the flag would be writing to a screen the
+            // user had just picked up.
+            val deadline = SystemClock.elapsedRealtime() + holdMs.coerceAtLeast(0)
+            return synchronized(heldByUser) { heldByUser.put(displayId, deadline) == null }
+        }
+
+        override fun isHeldByUser(displayId: Int): Boolean {
+            expireHold(displayId)
+            return synchronized(heldByUser) { displayId in heldByUser }
+        }
+
+        override fun takeBack(displayId: Int) {
+            synchronized(heldByUser) { heldByUser.remove(displayId) }
+        }
+
+        /** Take the app back. Allowed on a held display: the hold is over. */
         override fun moveToAgent(displayId: Int): Boolean {
             val returned =
                 runCatching { display(displayId)?.moveTopTaskTo(displayId) == true }
@@ -441,7 +520,7 @@ object HelperMain {
         }
 
         override fun moveTaskToMe(displayId: Int, taskId: Int): Boolean =
-            runCatching { display(displayId)?.moveTaskTo(taskId) == true }.getOrDefault(false)
+            runCatching { writable(displayId)?.moveTaskTo(taskId) == true }.getOrDefault(false)
 
         override fun injectGesture(
             displayId: Int,
@@ -452,11 +531,25 @@ object HelperMain {
         ): Boolean = runCatching {
             if (x.size != y.size || x.size != path.size || x.size < 2) return@runCatching false
             val points = x.indices.map { AgentDisplay.GesturePoint(path[it], x[it], y[it]) }
-            display(displayId)?.gesture(points, durationMs) == true
+            writable(displayId)?.gesture(points, durationMs) == true
         }.getOrDefault(false)
 
+        /**
+         * The paste, whole: put, press, wait, restore.
+         *
+         * `ShellClipboard` holds one saved clipboard at a time, so two pastes
+         * overlapping would have the first restore the second's text and hand
+         * the user back something neither of them typed. The Rust tools take a
+         * lock per phone, which serializes them today — but that lock is about
+         * input and lives on the other side of the bridge. The atomicity belongs
+         * where the state is.
+         */
         override fun pasteText(displayId: Int, text: String): Int {
-            val target = display(displayId) ?: return PASTE_FAILED
+            synchronized(pasteLock) { return paste(displayId, text) }
+        }
+
+        private fun paste(displayId: Int, text: String): Int {
+            val target = writable(displayId) ?: return PASTE_FAILED
             if (!clipboard.put(text)) return PASTE_NO_CLIPBOARD
             return try {
                 // Ctrl+A then Ctrl+V: select whatever is in the field first, so
@@ -564,6 +657,7 @@ object HelperMain {
                 displays.clear()
             }
             synchronized(muted) { muted.clear() }
+            synchronized(heldByUser) { heldByUser.clear() }
             // The ledger is the list of apps still silent, whoever muted them;
             // restoring it here is what keeps a killed session from leaving the
             // user with an app that has no sound.

@@ -202,6 +202,44 @@ public interface ISyscityShell extends android.os.IInterface
     {
       return false;
     }
+    /**
+     * Mark `displayId` as the person's, or take it back.
+     * 
+     * While it is theirs, every write to it — tap, swipe, key, text, paste,
+     * gesture, launch, task moves — is refused by the helper. Reads keep
+     * working: the session that handed it over has to be able to look at what
+     * they did. This is the on-device half of the takeover guarantee; the
+     * process-wide lock in Rust is the host-side half, and it cannot cover a
+     * session that connected while a handoff was already in flight.
+     * 
+     * `holdMs` bounds the takeover: after that long the helper releases it on
+     * its own. The caller is expected to take it back first — this is the
+     * backstop for a caller that died or was cancelled mid-handoff, which
+     * would otherwise leave the display unwritable for the rest of the session.
+     * 
+     * Returns false from `giveToUser` when there is no such display, and true
+     * when it is theirs (including when it already was).
+     */
+    @Override public boolean giveToUser(int displayId, long holdMs) throws android.os.RemoteException
+    {
+      return false;
+    }
+    /** The person is done; the agent may write to the display again. */
+    @Override public void takeBack(int displayId) throws android.os.RemoteException
+    {
+    }
+    /**
+     * Whether a person holds `displayId` right now.
+     * 
+     * A refused write answers `false` either way — that is what every write
+     * already returns for a display it cannot reach. This is what lets the
+     * caller say *why*: "somebody is using it" is a wait, and "it did not work"
+     * is a retry, and they are different instructions to give a model.
+     */
+    @Override public boolean isHeldByUser(int displayId) throws android.os.RemoteException
+    {
+      return false;
+    }
     @Override
     public android.os.IBinder asBinder() {
       return null;
@@ -472,6 +510,34 @@ public interface ISyscityShell extends android.os.IInterface
           boolean _arg2;
           _arg2 = (0!=data.readInt());
           boolean _result = this.setAudioMuted(_arg0, _arg1, _arg2);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_giveToUser:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          long _arg1;
+          _arg1 = data.readLong();
+          boolean _result = this.giveToUser(_arg0, _arg1);
+          reply.writeNoException();
+          reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_takeBack:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          this.takeBack(_arg0);
+          reply.writeNoException();
+          break;
+        }
+        case TRANSACTION_isHeldByUser:
+        {
+          int _arg0;
+          _arg0 = data.readInt();
+          boolean _result = this.isHeldByUser(_arg0);
           reply.writeNoException();
           reply.writeInt(((_result)?(1):(0)));
           break;
@@ -1000,6 +1066,85 @@ public interface ISyscityShell extends android.os.IInterface
         }
         return _result;
       }
+      /**
+       * Mark `displayId` as the person's, or take it back.
+       * 
+       * While it is theirs, every write to it — tap, swipe, key, text, paste,
+       * gesture, launch, task moves — is refused by the helper. Reads keep
+       * working: the session that handed it over has to be able to look at what
+       * they did. This is the on-device half of the takeover guarantee; the
+       * process-wide lock in Rust is the host-side half, and it cannot cover a
+       * session that connected while a handoff was already in flight.
+       * 
+       * `holdMs` bounds the takeover: after that long the helper releases it on
+       * its own. The caller is expected to take it back first — this is the
+       * backstop for a caller that died or was cancelled mid-handoff, which
+       * would otherwise leave the display unwritable for the rest of the session.
+       * 
+       * Returns false from `giveToUser` when there is no such display, and true
+       * when it is theirs (including when it already was).
+       */
+      @Override public boolean giveToUser(int displayId, long holdMs) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          _data.writeLong(holdMs);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_giveToUser, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
+      /** The person is done; the agent may write to the display again. */
+      @Override public void takeBack(int displayId) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_takeBack, _data, _reply, 0);
+          _reply.readException();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+      }
+      /**
+       * Whether a person holds `displayId` right now.
+       * 
+       * A refused write answers `false` either way — that is what every write
+       * already returns for a display it cannot reach. This is what lets the
+       * caller say *why*: "somebody is using it" is a wait, and "it did not work"
+       * is a retry, and they are different instructions to give a model.
+       */
+      @Override public boolean isHeldByUser(int displayId) throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        boolean _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          _data.writeInt(displayId);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_isHeldByUser, _data, _reply, 0);
+          _reply.readException();
+          _result = (0!=_reply.readInt());
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
     }
     static final int TRANSACTION_identity = (android.os.IBinder.FIRST_CALL_TRANSACTION + 1);
     static final int TRANSACTION_createDisplay = (android.os.IBinder.FIRST_CALL_TRANSACTION + 2);
@@ -1023,6 +1168,9 @@ public interface ISyscityShell extends android.os.IInterface
     static final int TRANSACTION_parallelLimit = (android.os.IBinder.FIRST_CALL_TRANSACTION + 20);
     static final int TRANSACTION_displayCount = (android.os.IBinder.FIRST_CALL_TRANSACTION + 21);
     static final int TRANSACTION_setAudioMuted = (android.os.IBinder.FIRST_CALL_TRANSACTION + 22);
+    static final int TRANSACTION_giveToUser = (android.os.IBinder.FIRST_CALL_TRANSACTION + 23);
+    static final int TRANSACTION_takeBack = (android.os.IBinder.FIRST_CALL_TRANSACTION + 24);
+    static final int TRANSACTION_isHeldByUser = (android.os.IBinder.FIRST_CALL_TRANSACTION + 25);
   }
   /** @hide */
   public static final java.lang.String DESCRIPTOR = "net.syscity.desktop.shell.ISyscityShell";
@@ -1141,4 +1289,34 @@ public interface ISyscityShell extends android.os.IInterface
    * display: the app is already running, it is merely audible.
    */
   public boolean setAudioMuted(int displayId, java.lang.String packageName, boolean muted) throws android.os.RemoteException;
+  /**
+   * Mark `displayId` as the person's, or take it back.
+   * 
+   * While it is theirs, every write to it — tap, swipe, key, text, paste,
+   * gesture, launch, task moves — is refused by the helper. Reads keep
+   * working: the session that handed it over has to be able to look at what
+   * they did. This is the on-device half of the takeover guarantee; the
+   * process-wide lock in Rust is the host-side half, and it cannot cover a
+   * session that connected while a handoff was already in flight.
+   * 
+   * `holdMs` bounds the takeover: after that long the helper releases it on
+   * its own. The caller is expected to take it back first — this is the
+   * backstop for a caller that died or was cancelled mid-handoff, which
+   * would otherwise leave the display unwritable for the rest of the session.
+   * 
+   * Returns false from `giveToUser` when there is no such display, and true
+   * when it is theirs (including when it already was).
+   */
+  public boolean giveToUser(int displayId, long holdMs) throws android.os.RemoteException;
+  /** The person is done; the agent may write to the display again. */
+  public void takeBack(int displayId) throws android.os.RemoteException;
+  /**
+   * Whether a person holds `displayId` right now.
+   * 
+   * A refused write answers `false` either way — that is what every write
+   * already returns for a display it cannot reach. This is what lets the
+   * caller say *why*: "somebody is using it" is a wait, and "it did not work"
+   * is a retry, and they are different instructions to give a model.
+   */
+  public boolean isHeldByUser(int displayId) throws android.os.RemoteException;
 }

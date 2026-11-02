@@ -23,7 +23,8 @@
 #   7. `sound` for a package with no record writes nothing
 #   8. a handoff makes the app audible while the user has it on their own
 #      screen, and silent again once it is back
-#   9. a helper killed with an app silenced leaves it in the file, and the next
+#   9. while they have it, a tap from a second session is refused
+#  10. a helper killed with an app silenced leaves it in the file, and the next
 #      helper restores it at start-up without being asked
 #
 # Prerequisites: adb, node, a device or emulator, and a built APK.
@@ -244,7 +245,16 @@ if (command === "open") {
   });
   if (launched.error) stop(`launch: ${launched.error}`);
   await sleep(1500);
+  // Emitted so the shell can address the same display while the question is
+  // open, which is the only moment the refusal can be observed.
+  say("display", `id=${display}`);
   console.log("LAUNCHED");
+  // The shell reads `appops` while the app is still on the agent's display.
+  // That window closes the instant the handoff moves it to the user's screen
+  // and gives the sound back, so the launch is not raced against it: without
+  // this pause the reading lands after the unmute and the check fails on a
+  // handoff that did exactly the right thing.
+  await sleep(4000);
 
   let answered = false;
   const waiting = (async () => {
@@ -307,6 +317,22 @@ if (command === "open") {
   const closed = await tool("close", "android_display", { action: "stop", display });
   if (closed.error) stop(`stop: ${closed.error}`);
   console.log("CLOSED");
+} else if (command === "poke") {
+  // A second connection taps the display another session has handed to the
+  // user. It must be refused by the helper — the lock on this host does not
+  // cover a connection that arrived later, and on the device the takeover flag
+  // is what stops the tap landing under the person's finger.
+  const display = Number(first);
+  const answer = await tool("poke", "android_display", {
+    action: "tap", display, x: 10, y: 10,
+  });
+  // A refused tap comes back as `ok: false` from the helper, which the Rust
+  // client turns into an error — so the error is the success case here. The
+  // message has to name the takeover, though: a display that was never there
+  // is refused too, and that would make this pass without proving anything.
+  const refusal = String(answer.error ?? "");
+  say("poke", answer.error ? `refused: ${refusal}` : `TAPPED: ${answer.output}`);
+  console.log(answer.error && refusal.includes("DISPLAY_HELD_BY_USER") ? "REFUSED" : "TAPPED");
 } else if (command === "mute") {
   // A display is addressed by id even when it is gone: this call's real purpose
   // in the last step is to bring a new helper up, and its own answer is not the
@@ -445,7 +471,10 @@ for _ in $(seq 1 90); do
 done
 grep -q '^LAUNCHED$' "$HAND_LOG" || { cat "$HAND_LOG"; die "the handoff never got its app on a display"; }
 HAND_MUTED=$(mode_now)
-[ "$HAND_MUTED" = "ignore" ] || die "before the handoff the app reads '$HAND_MUTED', not 'ignore'"
+[ "$HAND_MUTED" = "ignore" ] || {
+    cat "$HAND_LOG"
+    die "before the handoff the app reads '$HAND_MUTED', not 'ignore'"
+}
 ok "silent before the handoff"
 
 for _ in $(seq 1 90); do
@@ -458,6 +487,19 @@ HANDED=$(mode_now)
 [ "$HANDED" != "ignore" ] || die "the app is on the user's screen but is still silenced \
 — they can see it and cannot hear it"
 ok "audible while the user has it ('$HANDED')"
+
+# The display is the person's right now: a second session must not be able to
+# tap it. The Rust lock serialises sessions on this host and says nothing about
+# one that connected later, or about another host — the helper's takeover flag
+# is the guarantee, so this checks the device's answer rather than the host's.
+HAND_DISPLAY=$(sed -n 's/^display: id=\([0-9][0-9]*\)$/\1/p' "$HAND_LOG" | tail -1)
+[ -n "$HAND_DISPLAY" ] || { cat "$HAND_LOG"; die "the handoff never said which display it used"; }
+POKE=$(client poke "$HAND_DISPLAY" 2>&1)
+printf '%s\n' "$POKE"
+printf '%s\n' "$POKE" | grep -qx "REFUSED" ||
+    die "a second connection tapped the display a person was using — the takeover is \
+not holding"
+ok "a tap from another session is refused while the user has the display"
 
 for _ in $(seq 1 120); do
     grep -q '^HAND-RETURNED$' "$HAND_LOG" && break

@@ -21,6 +21,8 @@
 //! something starts it, and a phone without the pairing has no way to start it.
 //! Callers fall back to driving the default display over ADB.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::device::{DeviceBridgeRef, CMD_VIRTUAL_DISPLAY};
@@ -34,6 +36,14 @@ pub const DISPLAY_HELPER_ERROR: &str = "DISPLAY_HELPER_ERROR";
 
 /// The helper's main class, as launched by `app_process`.
 pub const HELPER_CLASS: &str = "net.syscity.desktop.shell.HelperMain";
+
+/// The helper refused because a person is using the display.
+///
+/// Distinct from every other refusal because the answer to it is different: a
+/// failed tap is worth retrying, and a tap on a screen somebody is holding is
+/// not — the caller should wait for the handoff to finish, or hand the step to
+/// that person.
+pub const DISPLAY_HELD_BY_USER: &str = "DISPLAY_HELD_BY_USER";
 
 /// Why a display operation did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +261,45 @@ impl VirtualDisplay {
     /// Pull a task from the user's screen back onto this display.
     pub async fn move_task_here(&self, task_id: i32) -> Result<(), DisplayError> {
         call(&self.bridge, json!({ "op": "move_task", "display": self.id, "task": task_id }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Hand this display to a person for at most `hold`, and say whether it is
+    /// theirs now.
+    ///
+    /// The helper stops answering for it — taps, swipes, keys, text, paste,
+    /// gestures, launches and task moves are refused until
+    /// [`take_back`](Self::take_back) — so a session that is waiting for a
+    /// human cannot be driven out from under them by another session on the
+    /// same phone. Reads keep working: the caller has to be able to see what
+    /// they did. The display itself is untouched; the refusal is the whole
+    /// mechanism.
+    ///
+    /// `hold` is a backstop, not the plan: the caller takes it back when it is
+    /// done, and the deadline covers a caller that died mid-handoff. Pass the
+    /// same budget as the question, plus the time the answer takes to come
+    /// back.
+    ///
+    /// Idempotent. False means a person already has it, which for the caller
+    /// is a refusal and not a failure: somebody else's takeover is exactly the
+    /// thing this stops.
+    pub async fn give_to_user(&self, hold: Duration) -> Result<bool, DisplayError> {
+        let answer = call(
+            &self.bridge,
+            json!({
+                "op": "give_to_user",
+                "display": self.id,
+                "hold_ms": u64::try_from(hold.as_millis()).unwrap_or(u64::MAX),
+            }),
+        )
+        .await?;
+        Ok(answer.get("held").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    /// Take it back after the person is done. Idempotent.
+    pub async fn take_back(&self) -> Result<(), DisplayError> {
+        call(&self.bridge, json!({ "op": "take_back", "display": self.id }))
             .await
             .map(|_| ())
     }
@@ -561,8 +610,15 @@ async fn call(bridge: &DeviceBridgeRef, request: Value) -> Result<Value, Display
                 .and_then(Value::as_str)
                 .unwrap_or("the display helper refused the request");
             // A helper that starts up and then reports a failure is not
-            // "unavailable" — it ran, and what it said matters.
-            Err(DisplayError::new(DISPLAY_HELPER_ERROR, format!("{message} ({code})")))
+            // "unavailable" — it ran, and what it said matters. A takeover
+            // refusal keeps its own code: the caller's next move is to wait,
+            // not to retry the same call. Its raw code stays in the message
+            // either way, because that is what names the refusal precisely.
+            let error = match code {
+                "DISPLAY_HELD_BY_USER" => DISPLAY_HELD_BY_USER,
+                _ => DISPLAY_HELPER_ERROR,
+            };
+            Err(DisplayError::new(error, format!("{message} ({code})")))
         }
         None => Err(DisplayError::new(
             DISPLAY_BAD_RESPONSE,
@@ -873,6 +929,64 @@ mod tests {
 
     fn bridge(answer: Value) -> DeviceBridgeRef {
         Arc::new(MockDeviceBridge::new(answer))
+    }
+
+    #[tokio::test]
+    async fn the_handoff_names_the_display_and_its_deadline() {
+        let mock = Arc::new(MockDeviceBridge::new(json!({ "ok": true, "held": true })));
+        let display = VirtualDisplay::attach(mock.clone(), 7);
+        assert!(display
+            .give_to_user(Duration::from_secs(90))
+            .await
+            .expect("held"));
+        display.take_back().await.expect("returned");
+        let calls = mock.calls();
+        assert_eq!(
+            calls[0].1,
+            json!({ "op": "give_to_user", "display": 7, "hold_ms": 90_000_u64 })
+        );
+        assert_eq!(calls[1].1, json!({ "op": "take_back", "display": 7 }));
+    }
+
+    #[tokio::test]
+    async fn a_held_displays_tap_says_who_is_holding_it() {
+        // "The tap did not happen" and "somebody is using the screen" are
+        // different instructions: one is a retry, the other is a wait. The
+        // helper marks the second so the model cannot mistake it for the first.
+        let display = VirtualDisplay::attach(
+            bridge(json!({
+                "ok": false,
+                "code": "DISPLAY_HELD_BY_USER",
+                "error": "a person is using display 7 right now",
+            })),
+            7,
+        );
+        let failed = display.tap(1, 2).await.expect_err("refused");
+        assert_eq!(failed.code, DISPLAY_HELD_BY_USER);
+        assert!(failed.message.contains("a person is using"), "{}", failed.message);
+    }
+
+    #[tokio::test]
+    async fn a_display_somebody_else_holds_is_refused_rather_than_stolen() {
+        // `held: false` is the helper saying a person already has this display.
+        // Reading it as a failure would be wrong — nothing failed, and the
+        // caller needs to know the handoff did not start.
+        let display = VirtualDisplay::attach(bridge(json!({ "ok": true, "held": false })), 7);
+        assert!(!display
+            .give_to_user(Duration::from_secs(90))
+            .await
+            .expect("answer"));
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_says_nothing_held_nothing() {
+        // An older helper answers `ok: true` to the ops it knows and
+        // `UNKNOWN_OP` to the ones it does not; neither may be read as a hold.
+        let display = VirtualDisplay::attach(bridge(json!({ "ok": true })), 7);
+        assert!(!display
+            .give_to_user(Duration::from_secs(90))
+            .await
+            .expect("answer"));
     }
 
     #[test]

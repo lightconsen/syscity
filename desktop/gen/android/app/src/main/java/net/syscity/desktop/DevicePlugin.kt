@@ -521,6 +521,23 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   // ─────────────────────────────────────────────
 
   /**
+   * Say that a write was refused because a person is using the display.
+   *
+   * `ok: false` on its own reads as "the tap did not happen" — which a model
+   * retries. This is not that: the screen is somebody's, and the honest answer
+   * is to wait or to hand the step to them, so the reason travels with the
+   * refusal.
+   */
+  private fun heldByUser(out: JSObject, displayId: Int) {
+    out.put("code", "DISPLAY_HELD_BY_USER")
+    out.put(
+      "error",
+      "a person is using display $displayId right now; nothing may act on it " +
+        "until they hand it back",
+    )
+  }
+
+  /**
    * `virtualDisplay` — forward one op to the shell-side display helper.
    *
    * The helper is reached over Binder, not a socket: SELinux forbids an
@@ -579,9 +596,15 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
           }
           "launch" -> {
             val status = shell?.startApp(displayId, args.optString("package")) ?: -1
-            if (status == 0) out.put("ok", true)
-            else out.put("ok", false).put("code", "LAUNCH_FAILED")
-              .put("error", "the app would not start on display $displayId")
+            if (status == 0) {
+              out.put("ok", true)
+            } else if (shell?.isHeldByUser(displayId) == true) {
+              out.put("ok", false)
+              heldByUser(out, displayId)
+            } else {
+              out.put("ok", false).put("code", "LAUNCH_FAILED")
+                .put("error", "the app would not start on display $displayId")
+            }
           }
           // Audio is muted by the helper as part of `startApp`; this exists for
           // the caller to mute an app it did not launch, and to give the sound
@@ -597,9 +620,23 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
             out.put("muted", changed)
             if (!changed) out.put("code", "AUDIO_UNCHANGED")
           }
+          "give_to_user" -> {
+            // False is a refusal and not a failure: the display is already
+            // somebody's, and a second takeover on top of the first is exactly
+            // what this op exists to prevent.
+            out.put("ok", true)
+            out.put("held", shell?.giveToUser(displayId, args.optLong("hold_ms", 0L)) ?: false)
+          }
+          "take_back" -> {
+            // A helper that is gone has nothing marked, which is the same end
+            // state as taking it back.
+            shell?.takeBack(displayId)
+            out.put("ok", true)
+          }
           "tap" -> {
             val ok = shell?.injectTap(displayId, args.optInt("x"), args.optInt("y")) ?: false
             out.put("ok", ok)
+            if (!ok && shell?.isHeldByUser(displayId) == true) heldByUser(out, displayId)
           }
           "swipe" -> {
             val ok = shell?.injectSwipe(
@@ -608,10 +645,12 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
               args.optInt("duration", 300),
             ) ?: false
             out.put("ok", ok)
+            if (!ok && shell?.isHeldByUser(displayId) == true) heldByUser(out, displayId)
           }
           "text" -> {
             val ok = shell?.injectText(displayId, args.optString("text")) ?: false
             out.put("ok", ok)
+            if (!ok && shell?.isHeldByUser(displayId) == true) heldByUser(out, displayId)
           }
           "key" -> {
             val keycode = args.optString("keycode")
@@ -619,6 +658,7 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
               .getField(keycode).getInt(null)
             val ok = shell?.injectKey(displayId, code) ?: false
             out.put("ok", ok)
+            if (!ok && shell?.isHeldByUser(displayId) == true) heldByUser(out, displayId)
           }
           "main_screen_top" -> {
             out.put("ok", true).put("top", shell?.mainScreenTop() ?: "")
@@ -641,6 +681,9 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
               out.put("ok", true).put("path", path)
             }
           }
+          "is_held" -> {
+            out.put("ok", true).put("held", shell?.isHeldByUser(displayId) ?: false)
+          }
           "gesture" -> {
             val xs = args.intArray("x")
             val ys = args.intArray("y")
@@ -649,9 +692,11 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
               out.put("ok", false).put("code", "BAD_GESTURE")
               out.put("error", "a gesture needs matching x/y/path arrays")
             } else {
-              out.put("ok", shell?.injectGesture(
+              val ok = shell?.injectGesture(
                 displayId, xs, ys, paths, args.optInt("duration", 500),
-              ) ?: false)
+              ) ?: false
+              out.put("ok", ok)
+              if (!ok && shell?.isHeldByUser(displayId) == true) heldByUser(out, displayId)
             }
           }
           "paste" -> {
@@ -661,8 +706,11 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
               0 -> out.put("ok", true)
               1 -> out.put("ok", false).put("code", "CLIPBOARD_UNREADABLE")
                 .put("error", "the user's clipboard could not be read, so nothing was replaced")
-              else -> out.put("ok", false).put("code", "PASTE_FAILED")
-                .put("error", "the text could not be pasted on display $displayId")
+              else -> {
+                out.put("ok", false).put("code", "PASTE_FAILED")
+                out.put("error", "the text could not be pasted on display $displayId")
+                if (shell?.isHeldByUser(displayId) == true) heldByUser(out, displayId)
+              }
             }
           }
           "watch_main" -> {

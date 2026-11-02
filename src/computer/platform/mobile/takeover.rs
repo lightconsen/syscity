@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 
 use super::android::{format_ui_summary, tree_fingerprint, UiElement};
-use super::display::{DisplayError, DISPLAY_UNAVAILABLE};
+use super::display::{DisplayError, VirtualDisplay, DISPLAY_UNAVAILABLE};
 use crate::device::CMD_VIRTUAL_DISPLAY;
 
 /// The user took over and handed back.
@@ -69,12 +69,32 @@ impl TakeoverOutcome {
 }
 
 /// Step aside: bring the display's app to the user, wait, and take it back.
+///
+/// `budget` is how long the display may stay the user's. It is a backstop for
+/// a caller that dies while waiting — the caller takes the display back when it
+/// is done — and it should be at least the question's own timeout plus a little
+/// room for the move.
 pub async fn hand_to_user(
     bridge: &crate::device::DeviceBridgeRef,
     display_id: i32,
     before: Option<u64>,
+    budget: std::time::Duration,
     ask: AskFn<'_>,
 ) -> Result<TakeoverOutcome, DisplayError> {
+    // 0. Mark the display as the user's, so nothing writes to it while they
+    //    are using it. A display already held is refused here: two takeovers
+    //    at once is two people on one screen.
+    let display = VirtualDisplay::attach(bridge.clone(), display_id);
+    let held = display.give_to_user(budget).await?;
+    if !held {
+        return Err(DisplayError {
+            code: super::display::DISPLAY_UNAVAILABLE,
+            message: "this display is already someone's to use right now; wait for that handoff \
+                      to finish"
+                .to_string(),
+        });
+    }
+
     // 1. Move the app to the user's screen.
     //
     // The helper does the move; from the app's side this is one op. A display
@@ -85,7 +105,9 @@ pub async fn hand_to_user(
     // 2. Ask, and wait.
     let answer = ask().await;
 
-    // 3. Take it back, whether or not they answered.
+    // 3. Take it back, whether or not they answered — including when the
+    //    question timed out and nobody is coming.
+    display.take_back().await.ok();
     let returned = move_to_agent(bridge, display_id).await;
 
     // 4. Read it. The fingerprint comparison is what turns "I'm done" into
@@ -446,6 +468,32 @@ mod tests {
             screen_changed: changed,
             elements: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_display_another_takeover_holds_stops_the_second_one() {
+        // The helper answers `held: false`: somebody is using that screen. The
+        // answer is a refusal, and it arrives before the question is even
+        // asked — asking the model's user to take over a screen already held
+        // would put two people on one phone.
+        let bridge: crate::device::DeviceBridgeRef =
+            std::sync::Arc::new(crate::device::tests::MockDeviceBridge::new(
+                serde_json::json!({ "ok": true, "held": false }),
+            ));
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asked_here = asked.clone();
+        let ask: AskFn<'_> = Box::new(move || {
+            asked_here.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Some("done".to_string()) })
+        });
+        let failed = hand_to_user(&bridge, 3, None, std::time::Duration::from_secs(60), ask)
+            .await
+            .expect_err("a held display must be refused");
+        assert!(failed.message.contains("already someone's"), "{}", failed.message);
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "the question was asked for a display the handoff never got"
+        );
     }
 
     #[test]

@@ -172,13 +172,11 @@ impl Tool for AdbCollectTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = super::android::lock_device(&device).await;
         let target = match Target::from_args(&args) {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
@@ -347,13 +345,11 @@ impl Tool for AdbFindTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = super::android::lock_device(&device).await;
         let target = match Target::from_args(&args) {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
@@ -516,13 +512,11 @@ impl Tool for AdbDialogTool {
         args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = super::android::lock_device(&device).await;
         let target = match Target::from_args(&args) {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
@@ -1027,13 +1021,11 @@ impl Tool for AdbSystemActionTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = super::android::lock_device(&device).await;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let intent = match system_action_args(action, &args) {
             Ok(intent) => intent,
@@ -1314,10 +1306,22 @@ impl Tool for AdbHandToUserTool {
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
         });
 
-        let outcome = match super::takeover::hand_to_user(&bridge, display_id, before, ask).await {
-            Ok(outcome) => outcome,
-            Err(failed) => return Ok(ToolExecutionResult::error(failed.to_string())),
-        };
+        // The hold outlives the question by a minute: the question's own
+        // timeout ends it for the caller, and this covers the gap between that
+        // and taking the display back. Without it a cancelled turn would leave
+        // the display unwritable until the helper died.
+        //
+        // No `TargetLocks` guard is taken here, deliberately: it would block
+        // this phone for as long as the person takes. What holds the display
+        // instead is the helper's own takeover flag (`giveToUser`), which every
+        // write checks on the device — so it covers a session on another host,
+        // or one that connected while this handoff was already in flight.
+        let hold = std::time::Duration::from_secs(timeout_secs + 60);
+        let outcome =
+            match super::takeover::hand_to_user(&bridge, display_id, before, hold, ask).await {
+                Ok(outcome) => outcome,
+                Err(failed) => return Ok(ToolExecutionResult::error(failed.to_string())),
+            };
 
         Ok(ToolExecutionResult::success(super::takeover::describe(&outcome)).with_data(
             serde_json::json!({
@@ -1416,13 +1420,11 @@ impl Tool for AdbDisplayTool {
         args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = super::android::lock_device(&device).await;
         let bridge = match display_bridge() {
             Ok(bridge) => bridge,
             Err(message) => return Ok(ToolExecutionResult::error(message)),

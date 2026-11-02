@@ -443,6 +443,34 @@ that make it safe to do to somebody's phone are in `AudioMute.kt`:
   merely audible; `mute` reports `muted: false` with `AUDIO_UNCHANGED` instead of
   failing the launch.
 
+### One display, one writer
+
+Two conversations can be told to drive the same phone at the same time, and a
+tap lands under whatever the other one is doing. Two mechanisms keep them apart,
+and neither is sufficient alone:
+
+- **`TargetLocks` on the host**, keyed by serial (`android-device:<serial>`), so
+  a call waits only for another call on *that* phone. A call with no pinned serial
+  takes the kind-wide lock, because it cannot name the device adb will pick.
+- **A hold on the device**, set by `giveToUser` when `android_hand_to_user` hands
+  the display to a person and cleared by `takeBack` when the tool takes it back.
+  Every write on the helper checks it; reads do not, so the waiting session can
+  still judge what the person did. The hold carries a deadline as a backstop: a
+  caller that died mid-handoff would otherwise leave the display unwritable for
+  the rest of the session.
+
+The device-side hold is what makes a handoff *exclusive* rather than merely
+serialized. The host lock only covers sessions on this machine; a second session
+that connected while a handoff was in flight, or one on another host, takes a
+different lock or no lock at all. A refused write comes back as
+`DISPLAY_HELD_BY_USER` — a different code from `DISPLAY_HELPER_ERROR` — because
+"somebody is using it" is an instruction to wait, and "it did not work" is an
+instruction to retry.
+
+`android_hand_to_user` deliberately holds no `TargetLocks` guard while waiting
+for the person: doing so would block the phone for as long as they take, which is
+the opposite of what the handoff is for.
+
 Known limits, in the order they will bite:
 
 - **Android 13** has no per-display focus, so the user's screen can lose focus

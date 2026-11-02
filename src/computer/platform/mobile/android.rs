@@ -176,6 +176,31 @@ pub(super) async fn resolved_serial(device: &Option<String>) -> Option<String> {
     }
 }
 
+/// The key to hold while acting on `serial`.
+///
+/// A pinned serial is a phone of its own, and two phones on one host are not
+/// each other's problem. Without a serial the call addresses whatever adb has
+/// attached, which is not a device this process can name — so it takes the
+/// kind-wide lock, which is exactly what the old coarse key was, and for the
+/// right reason.
+pub(crate) fn device_lock_key(device: &Option<String>) -> String {
+    match device {
+        Some(serial) => crate::tools::target_lock::android_device(serial),
+        None => crate::tools::target_lock::ANDROID.to_string(),
+    }
+}
+
+/// Wait for exclusive use of the device this call is about to address.
+///
+/// `&str` rather than the key itself: the guard does not borrow it, so the key
+/// may be built in the match arm that resolves the device.
+pub(super) async fn lock_device(device: &Option<String>) -> tokio::sync::OwnedMutexGuard<()> {
+    let key = device_lock_key(device);
+    crate::tools::target_lock::TargetLocks::global()
+        .lock_named(&key)
+        .await
+}
+
 // ── ADB Screenshot Tool ────────────────────────────────────────────────────
 
 /// Capture device screen via `adb exec-out screencap -p`.
@@ -227,10 +252,13 @@ impl Tool for AdbScreenshotTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // Resolved before the lock, because the lock is the device: a call that
+        // names a serial does not wait for one that names another.
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = lock_device(&device).await;
         let target = match Target::from_args(&args) {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
@@ -316,10 +344,13 @@ impl Tool for AdbObserveTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // Resolved before the lock, because the lock is the device: a call that
+        // names a serial does not wait for one that names another.
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = lock_device(&device).await;
         let target = match Target::from_args(&args) {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
@@ -674,16 +705,15 @@ impl Tool for AdbInputTool {
         args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        // One device: two conversations must not type into it at once. See
-        // `tools::target_lock`.
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("tap");
+        // One device: two conversations must not type into it at once. The
+        // lock is per serial, so this waits only for another call on the same
+        // phone. See `tools::target_lock`.
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = lock_device(&device).await;
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("tap");
 
         let verify = args.get("verify").and_then(|v| v.as_bool()).unwrap_or(true);
         let settle_budget = args
@@ -1215,16 +1245,14 @@ impl Tool for AdbAppManagerTool {
         args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        // One device: two conversations must not type into it at once. See
-        // `tools::target_lock`.
-        let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::ANDROID)
-            .await;
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        // One device: two conversations must not type into it at once. The
+        // lock is per serial. See `tools::target_lock`.
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
+        let _target = lock_device(&device).await;
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         let argv = match action {
             "install" => {
