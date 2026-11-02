@@ -70,4 +70,71 @@ interface ISyscityShell {
 
     /** Move an arbitrary task here (used to pull a spilled app back). */
     boolean moveTaskToMe(int displayId, int taskId) = 14;
+
+    /**
+     * One gesture of one or two fingers, as flat parallel arrays.
+     *
+     * `x`/`y`/`path` describe every point of every finger: `path[i]` is the
+     * finger a point belongs to, and the points of one finger are in time
+     * order. The fingers start together and run for `durationMs`. Coordinates
+     * are the display's own pixels.
+     *
+     * `injectTap`/`injectSwipe` go through `input -d`, which only ever sends a
+     * single straight stroke. A pinch is two fingers moving apart at the same
+     * time, and that has no shell equivalent at all.
+     */
+    boolean injectGesture(int displayId, in int[] x, in int[] y, in int[] path, int durationMs) = 15;
+
+    /**
+     * Put `text` on the device clipboard and paste it with Ctrl+V on the
+     * display, then put the user's own clipboard back.
+     *
+     * `input -d text` types through the key character map and mangles anything
+     * outside ASCII; a clipboard paste carries any character the app can
+     * render. Returns 0 when it pasted, 1 when the user's clipboard could not
+     * be read (nothing was changed), 2 on failure.
+     */
+    int pasteText(int displayId, String text) = 16;
+
+    /**
+     * Start watching the user's screen for `windowMs`, and return the task on
+     * top of it right now (or -1).
+     *
+     * An action can start an app that lands on the user's screen; a single
+     * look afterwards cannot tell that apart from an app the user opened
+     * themselves. Watching records what actually rose to the top, and when.
+     */
+    int watchMainScreen(int windowMs) = 17;
+
+    /**
+     * What rose to the top of the user's screen since `sinceUptimeMs`
+     * (`SystemClock.uptimeMillis`), as JSON: an array of
+     * `{task, package, at, from, sameTask, standard, now}`, oldest first.
+     *
+     * `from` is the display the task was last seen on (-1 when new), `now` is
+     * where it is now (-1 when it is gone), `sameTask` marks the same task
+     * showing a different page.
+     */
+    String mainArrivals(long sinceUptimeMs) = 18;
+
+    /**
+     * The display's latest frame as a coarse brightness grid: `columns`,
+     * `rows`, then one byte per cell, row-major.
+     *
+     * A cheap "did the picture change" that works on screens the accessibility
+     * tree describes nothing on — a game, a map, a camera preview.
+     */
+    byte[] frameSignature(int displayId) = 19;
+
+    /**
+     * The most displays this device will run at once, and why not more.
+     *
+     * Parallel tasks need per-display focus (API 34+); a low-memory phone gets
+     * one either way, and once a second display has failed to appear in this
+     * session nothing retries it.
+     */
+    String parallelLimit() = 20;
+
+    /** How many displays this helper currently owns. */
+    int displayCount() = 21;
 }

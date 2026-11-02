@@ -1355,10 +1355,10 @@ impl Tool for AdbDisplayTool {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "start", "restart", "stop", "status", "frame", "launch",
-                        "tap", "swipe", "text", "key"
+                        "start", "restart", "stop", "status", "limits", "frame", "launch",
+                        "tap", "swipe", "text", "paste", "key"
                     ],
-                    "description": "start creates the display; restart replaces a stale helper; the rest act on it."
+                    "description": "start creates the display; limits says how many may be open; restart replaces a stale helper; the rest act on it. 'paste' carries non-ASCII text, which `text` cannot."
                 },
                 "display": {
                     "type": "integer",
@@ -1406,6 +1406,31 @@ impl Tool for AdbDisplayTool {
                 Ok(answer) => {
                     ToolExecutionResult::success(format!("Display helper is running: {}", answer))
                         .with_data(answer)
+                }
+                Err(failed) => ToolExecutionResult::error(failed.to_string()),
+            });
+        }
+
+        if action == "limits" {
+            // Whether another display may be opened at all, and why not. A
+            // caller that starts three on a phone that allows one gets two
+            // failures and a half-driven screen; this answers first.
+            return Ok(match super::display::VirtualDisplay::parallel_limit(&bridge).await {
+                Ok(limits) => {
+                    let mut text = format!(
+                        "{} display(s) may be open at once; {} already are.",
+                        limits.limit, limits.open
+                    );
+                    if let Some(reason) = &limits.reason {
+                        text.push(' ');
+                        text.push_str(reason);
+                    }
+                    ToolExecutionResult::success(text).with_data(serde_json::json!({
+                        "limit": limits.limit,
+                        "open": limits.open,
+                        "remaining": limits.remaining(),
+                        "reason": limits.reason,
+                    }))
                 }
                 Err(failed) => ToolExecutionResult::error(failed.to_string()),
             });
@@ -1550,6 +1575,17 @@ impl Tool for AdbDisplayTool {
                     format!("Typed {} character(s) on display {id}.", text.chars().count())
                 })
             }
+            "paste" => {
+                // Bypasses the key character map, so CJK and emoji arrive as
+                // they are. `text` above remains the ASCII path.
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                display.paste_text(text).await.map(|_| {
+                    format!(
+                        "Pasted {} character(s) into the focused field on display {id}.",
+                        text.chars().count()
+                    )
+                })
+            }
             "key" => {
                 let keycode = args
                     .get("keycode")
@@ -1562,8 +1598,8 @@ impl Tool for AdbDisplayTool {
             }
             other => {
                 return Ok(ToolExecutionResult::error(format!(
-                    "unknown action {other:?}; use start, stop, status, frame, launch, tap, swipe, \
-                     text or key"
+                    "unknown action {other:?}; use start, stop, status, limits, frame, launch, \
+                     tap, swipe, text, paste or key"
                 )))
             }
         };

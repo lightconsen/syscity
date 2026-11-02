@@ -63,6 +63,10 @@ class AgentDisplay private constructor(
     @Volatile
     private var lastFrameAt: Long = 0
 
+    /** The last brightness grid, for a static screen that sends no new frame. */
+    @Volatile
+    private var lastSignature: ByteArray? = null
+
     fun release() {
         try {
             display.release()
@@ -163,6 +167,248 @@ class AgentDisplay private constructor(
     }
 
     /**
+     * Ctrl+<keyCode> on this display.
+     *
+     * Only select-all and paste: those are what a clipboard paste needs, and
+     * they are the two that `input -d keyevent` cannot express (it has no
+     * modifier state).
+     */
+    fun ctrlKey(keyCode: Int): Boolean {
+        if (keyCode != android.view.KeyEvent.KEYCODE_A &&
+            keyCode != android.view.KeyEvent.KEYCODE_V
+        ) {
+            return false
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        val meta = android.view.KeyEvent.META_CTRL_ON or android.view.KeyEvent.META_CTRL_LEFT_ON
+        val down = android.view.KeyEvent(
+            now,
+            now,
+            android.view.KeyEvent.ACTION_DOWN,
+            keyCode,
+            0,
+            meta,
+            0,
+            0,
+            0,
+            android.view.InputDevice.SOURCE_KEYBOARD,
+        )
+        val up = android.view.KeyEvent.changeAction(down, android.view.KeyEvent.ACTION_UP)
+        // KeyEvent has no recycle(); both are collectable once injected.
+        return inject(down) && inject(up)
+    }
+
+    /**
+     * One gesture of one or two fingers.
+     *
+     * `injectTap`/`injectSwipe` go through `input -d`, which only ever sends a
+     * single straight stroke. A pinch is two fingers moving apart at the same
+     * time, and a curved drag follows a path — neither has a shell equivalent,
+     * so this builds `MotionEvent`s and hands them to the input service with
+     * the display id set on each one.
+     *
+     * The events are timed, not spammed: every point is injected when its own
+     * timestamp arrives, so the app sees the gesture at the pace it was asked
+     * for. A finger that goes down is always lifted again, even if a later
+     * point fails, so nothing is left held on the screen.
+     */
+    fun gesture(points: List<GesturePoint>, durationMs: Int): Boolean {
+        if (points.size < 2) return false
+        val fingers = points.maxOf { it.path } + 1
+        if (fingers > 2) return false
+
+        // Each finger's points, in the order they were given.
+        val byFinger = (0 until fingers).map { finger -> points.filter { it.path == finger } }
+        if (byFinger.any { it.isEmpty() }) return false
+
+        // One step per point of the longest path; a shorter path holds its last
+        // point until the gesture ends.
+        val steps = byFinger.maxOf { it.size }
+        val stepMs = (durationMs.coerceAtLeast(1) / steps).coerceAtLeast(1)
+        val down = android.os.SystemClock.uptimeMillis()
+
+        /**
+         * One event with exactly the [count] pointers that are down for it.
+         * The pointer count is what the input dispatcher validates: a
+         * two-pointer `ACTION_DOWN` is rejected outright as
+         * `invalid event: invalid pointer count 2`. Fingers therefore enter
+         * with `ACTION_POINTER_DOWN` and leave with `ACTION_POINTER_UP`, each
+         * carrying the pointers that exist at that moment.
+         */
+        fun event(
+            step: Int,
+            eventTime: Long,
+            action: Int,
+            count: Int,
+            actionIndex: Int,
+        ): android.view.MotionEvent {
+            val props = Array(count) { pointer ->
+                android.view.MotionEvent.PointerProperties().apply {
+                    id = pointer
+                    toolType = android.view.MotionEvent.TOOL_TYPE_FINGER
+                }
+            }
+            val coords = Array(count) { pointer ->
+                val path = byFinger[pointer]
+                val point = path[step.coerceIn(0, path.lastIndex)]
+                android.view.MotionEvent.PointerCoords().apply {
+                    x = point.x.toFloat()
+                    y = point.y.toFloat()
+                    pressure = 1f
+                    size = 1f
+                }
+            }
+            val masked = if (actionIndex < 0) {
+                action
+            } else {
+                action or (actionIndex shl android.view.MotionEvent.ACTION_POINTER_INDEX_SHIFT)
+            }
+            return android.view.MotionEvent.obtain(
+                down,
+                eventTime,
+                masked,
+                count,
+                props,
+                coords,
+                0,
+                0,
+                1f,
+                1f,
+                0,
+                0,
+                android.view.InputDevice.SOURCE_TOUCHSCREEN,
+                0,
+            )
+        }
+
+        fun send(step: GesturePlan.Step): Boolean {
+            // Pace to the wall clock, not just to the timestamp: events that
+            // all arrive within a millisecond but claim to span 500 of them do
+            // not make a drag. The app's scroll detector needs the move events
+            // spread over real time, which is what a finger produces.
+            val at = down + step.position * stepMs
+            val wait = at - android.os.SystemClock.uptimeMillis()
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            val event = event(step.position, at, step.action, step.count, step.actionIndex)
+            return try {
+                inject(event)
+            } finally {
+                event.recycle()
+            }
+        }
+
+        return try {
+            // Fingers arrive one at a time (the dispatcher refuses a
+            // two-pointer ACTION_DOWN), which is the whole of GesturePlan.
+            val plan = GesturePlan.of(fingers, steps)
+            var held = 0
+            for (step in plan) {
+                if (send(step)) {
+                    when (step.action) {
+                        GesturePlan.ACTION_DOWN, GesturePlan.ACTION_POINTER_DOWN ->
+                            held = step.count
+                        GesturePlan.ACTION_UP -> held = 0
+                        GesturePlan.ACTION_POINTER_UP -> held = step.count - 1
+                    }
+                    continue
+                }
+                Log.w(
+                    FRAME_TAG,
+                    "gesture: action ${step.action} with ${step.count} pointer(s) " +
+                        "was not injected on display $id",
+                )
+                // Whatever is down has to come back up, or the screen is left
+                // with a finger held on it.
+                while (held > 0) {
+                    val lift = if (held == 1) {
+                        GesturePlan.Step(GesturePlan.ACTION_UP, 1, -1, steps - 1)
+                    } else {
+                        GesturePlan.Step(GesturePlan.ACTION_POINTER_UP, held, held - 1, steps - 1)
+                    }
+                    send(lift)
+                    held -= 1
+                }
+                return false
+            }
+            true
+        } catch (e: Exception) {
+            Log.w(FRAME_TAG, "gesture on display $id failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * A coarse brightness grid of the current frame.
+     *
+     * The tree says nothing on a canvas, a game, or a camera preview, so "did
+     * this change" has to come from pixels. Null when there is no frame yet.
+     */
+    fun frameSignature(): ByteArray? {
+        val image = acquire(deadlineMs = 60) ?: return lastSignature
+        return try {
+            val plane = image.planes[0]
+            val buffer = plane.buffer
+            val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride
+            val width = image.width
+            val height = image.height
+            // The grid samples a handful of points, so reading one pixel per
+            // sample beats materialising the whole bitmap.
+            val signature = FrameSignature.of(width, height) { x, y ->
+                val offset = y * rowStride + x * pixelStride
+                if (offset + 3 >= buffer.capacity()) {
+                    0
+                } else {
+                    val r = buffer.get(offset).toInt() and 0xff
+                    val g = buffer.get(offset + 1).toInt() and 0xff
+                    val b = buffer.get(offset + 2).toInt() and 0xff
+                    (0xff shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+            lastSignature = signature
+            signature
+        } finally {
+            image.close()
+        }
+    }
+
+    /** One point of one finger's path, in this display's pixels. */
+    data class GesturePoint(val path: Int, val x: Int, val y: Int)
+
+    /**
+     * Hand one event to the input service, addressed to this display.
+     *
+     * `setDisplayId` is what makes it land here rather than on the user's
+     * screen. The service entry point moved in API 34 (`InputManagerGlobal`),
+     * so both are tried.
+     */
+    private fun inject(event: android.view.InputEvent): Boolean = try {
+        event.javaClass.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+            .invoke(event, id)
+        val manager = runCatching {
+            Class.forName("android.hardware.input.InputManagerGlobal")
+                .getMethod("getInstance").invoke(null)
+        }.getOrNull() ?: Class.forName("android.hardware.input.InputManager")
+            .getMethod("getInstance").invoke(null)
+        manager.javaClass
+            .getMethod(
+                "injectInputEvent",
+                android.view.InputEvent::class.java,
+                Int::class.javaPrimitiveType,
+            )
+            .invoke(manager, event, INJECT_MODE_ASYNC) as Boolean
+    } catch (e: Exception) {
+        Log.w(FRAME_TAG, "injectInputEvent failed: ${e.message}")
+        false
+    }
+
+    /**
      * The latest frame, written to a file and returned by path.
      *
      * A file rather than bytes because Binder caps a transaction at 1 MB and a
@@ -190,6 +436,13 @@ class AgentDisplay private constructor(
                 try {
                     FileOutputStream(file).use { out ->
                         bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                    // One frame is one grid: computing it from the bitmap the
+                    // screenshot already needed costs 288 pixel reads, where
+                    // asking the reader again after it was consumed costs
+                    // nothing but never answers.
+                    lastSignature = FrameSignature.of(bitmap.width, bitmap.height) { x, y ->
+                        bitmap.getPixel(x, y)
                     }
                 } finally {
                     bitmap.recycle()
@@ -296,6 +549,9 @@ class AgentDisplay private constructor(
 
     companion object {
         private const val FRAME_TAG = "SyscityFrame"
+
+        /** `InputManager.injectInputEvent` mode: don't wait for the app to consume it. */
+        private const val INJECT_MODE_ASYNC = 0
 
         /**
          * The task on top of the user's own display (display 0).

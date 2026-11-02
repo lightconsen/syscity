@@ -198,7 +198,54 @@ screen tools and the service selects that display's windows instead.
 A task can run on its own display, so the user keeps the phone. The agent drives
 it with `android_display`: `start` creates it and returns an id, `launch` opens
 an app on it, `frame` returns a PNG, `tap`/`swipe`/`text`/`key` act on it, `stop`
-tears it down.
+tears it down. Three more answer questions the model would otherwise have to
+guess at:
+
+- **`limits`** — how many displays may be open at once and why not more (API 34
+  for per-display focus, a low-memory phone, a display that already failed to
+  create).
+- **`paste`** — the clipboard route for non-ASCII text. `text` goes through the
+  device's key character map and drops or mangles CJK; a paste carries whatever
+  the app can render, and the helper puts the user's own clipboard back
+  afterwards — but only if it could read it first. `CLIPBOARD_UNREADABLE` means
+  the user's clipboard was left alone because the platform would not hand it
+  over.
+- **`status`/`restart`** — whether the helper is answering, and replacing a
+  stale one that outlived the app that started it.
+
+Two fingers (`android_input action: "gesture"`) is only dispatched on a second
+display. A pinch has no `input` equivalent, so it is built as `MotionEvent`s and
+injected through `InputManagerGlobal` — and the dispatcher validates the pointer
+count against the action: `ACTION_DOWN` carries one pointer, each added finger
+arrives as `ACTION_POINTER_DOWN`, and they leave in reverse. A `MotionEvent` that
+names two pointers on `ACTION_DOWN` is refused with `invalid pointer count 2`,
+which is what the first attempt at a pinch hit. The events are also paced to the
+wall clock — injected instantly, they arrive with timestamps in the future and an
+app's scroll detector does not see a drag at all.
+
+A second display is meant to keep the user out of the way, but an action can
+still reach them — a mis-targeted tap, a link that opens the browser, an app
+that ignores the display argument and starts itself on the default one. Every
+input action therefore carries a **spill**: `android_input` opens a watch on
+display 0 before acting, and afterwards reports what rose to the top of the
+user's screen *during* that window. The window is the whole mechanism, and it
+is why the answer cannot be a single look before or after:
+
+- what was already on the user's screen when the action began is not blamed —
+  they were there first, and moving that app to the agent's display would take
+  the user's own work away;
+- an app that appears mid-action is a spill, named with the reason it was moved
+  back;
+- an in-app page change on the same task counts too, so a link that navigates
+  is caught even though no new task was created.
+
+The helper records arrivals as they happen (`MainScreenWatch`/`MainScreenLog`);
+the host only reads them at the end, because a polling loop on the host misses
+anything shorter than its own interval. The log is pruned to a fixed window, so
+a phone running for a long time does not accumulate task history. One thing the
+parse must get right: `dumpsys activity activities` repeats every task under
+`ActivityTaskSupervisor state:`, and reading that block put the user's task on
+the agent's display — a real spill then looked like nothing had happened.
 
 Creating a display needs `CAPTURE_VIDEO_OUTPUT`, which is `signature|privileged`
 — an app can never hold it. So the work happens in a helper that runs as
@@ -206,12 +253,15 @@ Creating a display needs `CAPTURE_VIDEO_OUTPUT`, which is `signature|privileged`
 
 ```bash
 adb shell CLASSPATH=<app.apk> app_process /system/bin \
-    net.syscity.desktop.helper.HelperMain
+    net.syscity.desktop.shell.HelperMain <package> <appUid>
 ```
 
 `android_display start` does that for you: it asks the helper, starts it if it is
-not there (`pm path` for the APK, then a detached `app_process`), and waits for
-its socket.
+not there (`pm path` for the APK, then a detached `app_process` with a nonce in
+its environment), and waits for the Binder it hands back through the app's
+exported provider. The helper has no socket: SELinux forbids an `untrusted_app`
+from opening a `shell` unix socket, and the Binder handoff runs in the direction
+the policy allows.
 
 Three things about that call are not obvious, and all three fail the same way —
 `SecurityException`, or a display that exists but has nothing on it:
@@ -231,41 +281,37 @@ Three things about that call are not obvious, and all three fail the same way �
   main Looper.
 
 The helper owns the `ImageReader` behind the display, which is why frames leave
-as PNG — a `Surface` cannot cross a `LocalSocket`.
+as PNG — a `Surface` cannot cross the Binder handoff.
 
-### Checking it on one device, without the app
+### Checking it on one device
 
-`--selftest` runs the whole thing once and prints each step, so the parts that
-only a device can answer — which hidden `createVirtualDisplay` overload this
-build accepts, whether an app starts on a non-default display, whether frames
-and input follow the display id — are one adb command away:
-
-```bash
-APK=$(adb shell pm path net.syscity.desktop | sed 's/package://' | tr -d '\r')
-adb shell "CLASSPATH=$APK app_process /system/bin \
-    net.syscity.desktop.helper.HelperMain --selftest"
-```
-
-```
-syscity: selftest — api=34 uid=2000
-syscity: display id=3 1080x2400 flags=0x… signature=9 args
-syscity: launched com.android.settings
-syscity: frame 1080x2400 png=… base64 chars
-syscity: tap (540, 1200)
-syscity: destroyed
-syscity: SELFTEST OK
-```
-
-It needs the APK installed but the app **not** running, which is what makes it a
-first checkpoint: if this fails, nothing above it can work.
-
-`scripts/android-display-check.sh` runs the whole sequence — build (which is
-also the first time the Kotlin is compiled), install, self-test — and turns the
-output into a verdict, including a warning if the user's focused window changed
-during the test, which is what a tap landing on the wrong display looks like:
+The parts that only a device can answer — which hidden `createVirtualDisplay`
+overload this build accepts, whether an app starts on a non-default display,
+whether input follows the display id — are the tool actions themselves:
 
 ```bash
-./scripts/android-display-check.sh                 # build, install, self-test
+# health of the helper, and what it says it can do
+android_display action=status
+# how many displays this phone will run, and why not more
+android_display action=limits
+# the whole sequence, by hand:
+android_display action=start  → id
+android_display action=launch display=<id> package=com.android.settings
+android_display action=frame  display=<id>
+android_input  action=tap    display=<id> x=540 y=1200 verify=true
+android_display action=stop   display=<id>
+```
+
+`start` failing names the reason: `NO_HELPER` (nothing is attached; `restart`
+replaces a stale one) or `CREATE_FAILED` (the helper refused to make the
+display; the message says what it returned, and it is version-specific).
+`launch` failing is `LAUNCH_FAILED`, and `frame` with no picture is `NO_FRAME`.
+
+`scripts/android-display-check.sh` drives the same sequence over adb and turns
+the output into a verdict:
+
+```bash
+./scripts/android-display-check.sh                 # build, install, check
 ./scripts/android-display-check.sh --skip-build    # reuse the last APK
 ./scripts/android-display-check.sh --device emulator-5554
 ```

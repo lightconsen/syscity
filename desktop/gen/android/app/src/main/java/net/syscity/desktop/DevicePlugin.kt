@@ -41,6 +41,17 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
+ * A JSON array argument as an `IntArray`, or empty when it is absent.
+ *
+ * The arrays are what the helper's AIDL takes for a gesture, so they are read
+ * once here rather than converted per call.
+ */
+private fun JSObject.intArray(key: String): IntArray {
+  val array = optJSONArray(key) ?: return IntArray(0)
+  return IntArray(array.length()) { index -> array.optInt(index, 0) }
+}
+
+/**
  * Native device capability bridge (mobile-migration §4.1/§4.2/§4.3).
  * Loopback-ADB pairing (§4.5) is intentionally NOT here: the bundled adb
  * client runs Rust-side via the platform process_runner, so the plugin never
@@ -614,6 +625,71 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
               out.put("error", "the display produced no frame")
             } else {
               out.put("ok", true).put("path", path)
+            }
+          }
+          "gesture" -> {
+            val xs = args.intArray("x")
+            val ys = args.intArray("y")
+            val paths = args.intArray("path")
+            if (xs.size != ys.size || xs.size != paths.size || xs.size < 2) {
+              out.put("ok", false).put("code", "BAD_GESTURE")
+              out.put("error", "a gesture needs matching x/y/path arrays")
+            } else {
+              out.put("ok", shell?.injectGesture(
+                displayId, xs, ys, paths, args.optInt("duration", 500),
+              ) ?: false)
+            }
+          }
+          "paste" -> {
+            // The clipboard route for non-ASCII text: `input -d text` goes
+            // through the key character map and mangles it.
+            when (shell?.pasteText(displayId, args.optString("text")) ?: 2) {
+              0 -> out.put("ok", true)
+              1 -> out.put("ok", false).put("code", "CLIPBOARD_UNREADABLE")
+                .put("error", "the user's clipboard could not be read, so nothing was replaced")
+              else -> out.put("ok", false).put("code", "PASTE_FAILED")
+                .put("error", "the text could not be pasted on display $displayId")
+            }
+          }
+          "watch_main" -> {
+            val since = android.os.SystemClock.uptimeMillis()
+            val top = shell?.watchMainScreen(args.optInt("window", 3000)) ?: -1
+            // `since` is taken on this side so the two calls share one clock:
+            // the helper's uptime is not this process's.
+            out.put("ok", top >= 0).put("top", top).put("since", since)
+            if (top < 0) out.put("code", "NO_MAIN_SCREEN")
+              .put("error", "the display helper is not attached")
+          }
+          "main_arrivals" -> {
+            val since = args.optLong("since", 0L)
+            val arrivals = shell?.mainArrivals(since) ?: ""
+            out.put("ok", true).put("arrivals", org.json.JSONArray(arrivals.ifEmpty { "[]" }))
+          }
+          "frame_signature" -> {
+            val bytes = shell?.frameSignature(displayId)
+            if (bytes == null) {
+              out.put("ok", true)
+            } else {
+              val hex = StringBuilder(bytes.size * 2)
+              for (b in bytes) hex.append(String.format("%02x", b.toInt() and 0xff))
+              out.put("ok", true).put("signature", hex.toString())
+            }
+          }
+          "parallel_limit" -> {
+            val json = shell?.parallelLimit()
+            if (json == null) {
+              out.put("ok", false).put("code", "NO_HELPER")
+              out.put("error", "the display helper is not attached")
+            } else {
+              val parsed = org.json.JSONObject(json)
+              out.put("ok", true)
+                .put("limit", parsed.optInt("limit", 1))
+                .put("open", parsed.optInt("open", 0))
+              if (parsed.isNull("reason")) {
+                out.put("reason", org.json.JSONObject.NULL)
+              } else {
+                out.put("reason", parsed.optString("reason"))
+              }
             }
           }
           else -> out.put("ok", false).put("code", "UNKNOWN_OP").put("error", "unknown op $op")

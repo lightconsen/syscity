@@ -586,7 +586,9 @@ impl Tool for AdbInputTool {
          whether the screen actually changed afterwards (effect: changed / unchanged / unknown) \
          and what is on it now, so a separate android_observe is usually unnecessary. Set \
          verify=false when the action is not meant to change the screen and you want to skip \
-         the extra reads."
+         the extra reads. On a second display, 'gesture' sends one or two fingers (a pinch, a \
+         curved drag), and non-ASCII text is typed by pasting it — both are things `input` \
+         cannot do."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -595,8 +597,23 @@ impl Tool for AdbInputTool {
             serde_json::json!({
                 "action": {
                     "type": "string",
-                    "description": "tap | sequence | swipe | text | key",
-                    "enum": ["tap", "sequence", "swipe", "text", "key"]
+                    "description": "tap | sequence | swipe | text | key | gesture",
+                    "enum": ["tap", "sequence", "swipe", "text", "key", "gesture"]
+                },
+                "paths": {
+                    "type": "array",
+                    "description": "For 'gesture': one or two fingers, each a list of 2–32 [x, y] points in the display's pixels. Two fingers moving apart is a pinch; one finger following several points is a curved drag. Only on a second display.",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        }
+                    }
+                },
+                "duration_ms": {
+                    "type": "integer",
+                    "description": "For 'gesture': how long the whole gesture takes (default 500, max 5000)."
                 },
                 "steps": {
                     "type": "array",
@@ -741,12 +758,76 @@ impl Tool for AdbInputTool {
                     .unwrap_or("HOME")
                     .to_string(),
             ),
+            "gesture" => match parse_gesture_paths(args.get("paths")) {
+                Ok(paths) => InputOp::Gesture {
+                    paths,
+                    duration_ms: u32::try_from(
+                        args.get("duration_ms")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(500),
+                    )
+                    .unwrap_or(500)
+                    .clamp(50, 5000),
+                },
+                Err(message) => return Ok(ToolExecutionResult::error(message)),
+            },
             _ => return Ok(ToolExecutionResult::error(format!("Unknown action: {}", action))),
+        };
+
+        // Two things have to be read *before* the action, not after: the
+        // picture (the tree cannot see a canvas change) and the user's screen
+        // (an app that lands there has to be told apart from one the user
+        // opened). Both are only worth taking on a display, where the action
+        // is not supposed to touch the user's screen at all.
+        let watched = match target {
+            Target::Display(id) if verify => {
+                let pixels = display_pixels(id).await;
+                let watch = match display_bridge() {
+                    Ok(bridge) => {
+                        let display = super::display::VirtualDisplay::attach(bridge, id);
+                        match display.watch_main_screen(SPILL_WINDOW_MS as u32).await {
+                            Ok(watch) => Some(watch),
+                            Err(failed) => {
+                                // Without the window there is no spill check at
+                                // all, so a failure here has to be visible.
+                                tracing::warn!(
+                                    display = id,
+                                    error = %failed,
+                                    "could not start watching the user's screen; \
+                                     a spill during this action will go unreported",
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                };
+                Some((pixels, watch))
+            }
+            _ => None,
         };
 
         match target {
             Target::Screen => {
+                if let InputOp::Gesture { .. } = &op {
+                    // `input` has no multi-finger form at all, and the
+                    // accessibility service is the only thing that could
+                    // dispatch one — but only to a display it owns. Saying so
+                    // beats sending one finger of a pinch.
+                    return Ok(ToolExecutionResult::error(
+                        "Multi-finger gestures are only dispatched on a second display \
+                         (android_display start). On the user's screen use 'swipe', or run the \
+                         task on a display where the gesture can be sent properly.",
+                    ));
+                }
                 let shell_cmd = match &op {
+                    // Rejected above: no shell form exists for two fingers.
+                    InputOp::Gesture { .. } => {
+                        return Ok(ToolExecutionResult::error(
+                            "Multi-finger gestures are only dispatched on a second display \
+                             (android_display start).",
+                        ))
+                    }
                     InputOp::Taps(steps) => encode_tap_sequence(steps),
                     InputOp::Swipe { from, to } => {
                         format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
@@ -792,16 +873,25 @@ impl Tool for AdbInputTool {
             Target::Display(id) => {
                 if let InputOp::Text(text) = &op {
                     if !text.is_ascii() {
-                        // The virtual display has no ADBKeyboard behind it: the
-                        // helper types with `input -d`, which has the same
-                        // ASCII-only limitation and no broadcast to fall back
-                        // on. Saying so beats typing half a message.
-                        return Ok(ToolExecutionResult::error(
-                            "Cannot type non-ASCII text on a second display: it is typed with \
-                             `input -d`, which only handles ASCII. Use android_display \
-                             action 'text' if the app accepts paste, or drive this task on the \
-                             main screen.",
-                        ));
+                        // `input -d text` goes through the key character map and
+                        // mangles anything outside ASCII. The helper's clipboard
+                        // paste carries whatever the app can render, and puts
+                        // the user's own clipboard back afterwards.
+                        if let Err(message) = paste_on_display(id, text).await {
+                            return Ok(ToolExecutionResult::error(message));
+                        }
+                        let serial = resolved_serial(&device).await;
+                        return Ok(ToolExecutionResult::success(format!(
+                            "Typed {} character(s) on display {id} by pasting them — `input -d \
+                             text` cannot carry non-ASCII text.",
+                            text.chars().count()
+                        ))
+                        .with_data(serde_json::json!({
+                            "device": serial,
+                            "display": id,
+                            "effect": "unverified",
+                            "input": "clipboard",
+                        })));
                     }
                 }
                 if let Err(message) = dispatch_display(id, &op).await {
@@ -824,27 +914,54 @@ impl Tool for AdbInputTool {
         // Judge the effect here rather than leaving it to the model: a dispatch
         // that was accepted says nothing about whether the tap landed.
         let before_fingerprint = before.as_ref().map(|elements| tree_fingerprint(elements));
-        let settle = settle_after_action(&device, target, before_fingerprint, settle_budget).await;
+        let before_pixels = watched.as_ref().and_then(|(pixels, _)| pixels.as_ref());
+        let settle = settle_after_action_with_pixels(
+            &device,
+            target,
+            before_fingerprint,
+            before_pixels,
+            settle_budget,
+        )
+        .await;
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+        if settle.pixel_changed == Some(true) && settle.elements.is_empty() {
+            text.push_str(
+                " The picture changed even though the tree names nothing here — this screen draws \
+                 itself.",
+            );
+        }
 
         // An action can start something that lands on the user's screen — a
         // share sheet, a chooser, an app that ignores `--display`. The agent's
         // display then just stops changing, which reads as "nothing happened".
-        // Checking is only possible on a display, and only worth doing when
-        // the action was meant to take effect.
-        let mut spill = None;
+        //
+        // The window taken before the action is what tells a spill apart from
+        // an app the user opened themselves. Without it there is only "what is
+        // on top now", which cannot know who put it there.
+        let mut spills = Vec::new();
         if let Target::Display(id) = target {
-            if let (true, Ok(bridge)) = (verify, display_bridge()) {
-                spill = super::takeover::check_spill(&bridge, id, None, true).await;
-                if let Some(spill) = &spill {
-                    text.push_str(&format!(
-                        "\n\nWarning: {} ended up on the user's screen ({}) rather than this \
-                         display — {}. The screen above is this display; the app above is not.",
-                        spill.package, spill.task_id, spill.reason
-                    ));
+            if let Some((_, Some((top, since)))) = watched.as_ref() {
+                if let Ok(bridge) = display_bridge() {
+                    spills = super::takeover::watch_and_check_spill(
+                        &bridge,
+                        id,
+                        *top,
+                        *since,
+                        SPILL_WINDOW_MS,
+                        &[],
+                        true,
+                    )
+                    .await;
                 }
             }
+        }
+        for spill in &spills {
+            text.push_str(&format!(
+                "\n\nWarning: {} ended up on the user's screen ({}) rather than this display — \
+                 {}. The screen above is this display; the app above is not.",
+                spill.package, spill.task_id, spill.reason
+            ));
         }
         if !settle.elements.is_empty() {
             text.push_str("\n\n");
@@ -854,17 +971,31 @@ impl Tool for AdbInputTool {
         Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
             "device": serial,
             "effect": settle.effect,
-            "spill": spill.map(|s| serde_json::json!({
+            "pixels_changed": settle.pixel_changed,
+            "spill": spills.first().map(|s| serde_json::json!({
                 "task": s.task_id,
                 "package": s.package,
                 "recovered": s.recovered,
                 "reason": s.reason,
             })),
+            "spills": spills.iter().map(|s| serde_json::json!({
+                "task": s.task_id,
+                "package": s.package,
+                "recovered": s.recovered,
+                "reason": s.reason,
+            })).collect::<Vec<_>>(),
             "settled_ms": settle.elapsed_ms,
             "elements": settle.elements,
         })))
     }
 }
+
+/// How long an action's spill window stays open.
+///
+/// Long enough for a chooser to appear after the tap that opened it, short
+/// enough that a task the user starts themselves a minute later is not blamed
+/// on the agent.
+const SPILL_WINDOW_MS: u64 = 3000;
 
 // ── ADB App Manager Tool ───────────────────────────────────────────────────
 
@@ -1315,6 +1446,17 @@ pub enum Target {
 }
 
 impl Target {
+    /// This target's display id, for calls that are addressed by number.
+    ///
+    /// The main screen is 0 to the platform, so the conversion is not a
+    /// judgement about which screen a caller meant.
+    pub fn display_id(self) -> i32 {
+        match self {
+            Self::Screen => super::takeover::MAIN_DISPLAY,
+            Self::Display(id) => id,
+        }
+    }
+
     /// Read the optional `display` argument. Absent means the user's screen.
     pub(super) fn from_args(args: &Value) -> Result<Self, String> {
         match args.get("display") {
@@ -1339,6 +1481,11 @@ enum InputOp {
     Swipe {
         from: (i32, i32),
         to: (i32, i32),
+    },
+    /// One or two fingers, each a path of points.
+    Gesture {
+        paths: Vec<Vec<(i32, i32)>>,
+        duration_ms: u32,
     },
     Text(String),
     Key(String),
@@ -1366,9 +1513,83 @@ async fn dispatch_display(id: i32, op: &InputOp) -> Result<(), String> {
             Ok(())
         }
         InputOp::Swipe { from, to } => display.swipe(*from, *to, 300).await.map_err(failed),
+        InputOp::Gesture { paths, duration_ms } => {
+            // Interleave the fingers point by point: the helper builds one
+            // `MotionEvent` per step with every finger's position, so the two
+            // have to arrive together rather than one path after the other.
+            let steps = paths.iter().map(Vec::len).max().unwrap_or(0);
+            let mut points = Vec::with_capacity(steps * paths.len());
+            for step in 0..steps {
+                for (finger, path) in paths.iter().enumerate() {
+                    let (x, y) = path[step.min(path.len().saturating_sub(1))];
+                    points.push((finger as i32, x, y));
+                }
+            }
+            display.gesture(&points, *duration_ms).await.map_err(failed)
+        }
         InputOp::Text(text) => display.text(text).await.map_err(failed),
         InputOp::Key(keycode) => display.key(keycode).await.map_err(failed),
     }
+}
+
+/// Paste `text` into whatever has focus on the display.
+async fn paste_on_display(display_id: i32, text: &str) -> Result<(), String> {
+    let bridge = display_bridge()?;
+    super::display::VirtualDisplay::attach(bridge, display_id)
+        .paste_text(text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The brightness grid of a display, or `None` when it has drawn nothing.
+async fn display_pixels(display_id: i32) -> Option<super::display::FrameSignature> {
+    let bridge = display_bridge().ok()?;
+    super::display::VirtualDisplay::attach(bridge, display_id)
+        .frame_signature()
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Parse the `paths` argument of a `gesture` action.
+///
+/// Accepted: one or two paths, each 2–32 `[x, y]` points. Two points is the
+/// shortest thing that is a gesture; more than two fingers has no use on a
+/// phone and would only make the injection wrong in a way that is hard to see.
+fn parse_gesture_paths(value: Option<&Value>) -> Result<Vec<Vec<(i32, i32)>>, String> {
+    let raw = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| "'gesture' needs 'paths': an array of one or two point lists".to_string())?;
+    if raw.is_empty() || raw.len() > 2 {
+        return Err(format!("'paths' must contain one or two fingers, not {}", raw.len()));
+    }
+    let mut paths = Vec::with_capacity(raw.len());
+    for (index, path) in raw.iter().enumerate() {
+        let points = path
+            .as_array()
+            .ok_or_else(|| format!("paths[{index}] must be an array of [x, y] points"))?;
+        if !(2..=32).contains(&points.len()) {
+            return Err(format!("paths[{index}] must have 2–32 points, not {}", points.len()));
+        }
+        let mut parsed = Vec::with_capacity(points.len());
+        for (position, point) in points.iter().enumerate() {
+            let pair = point
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| format!("paths[{index}][{position}] must be [x, y]"))?;
+            let x = pair[0]
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| format!("paths[{index}][{position}][0] must be an integer"))?;
+            let y = pair[1]
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| format!("paths[{index}][{position}][1] must be an integer"))?;
+            parsed.push((x, y));
+        }
+        paths.push(parsed);
+    }
+    Ok(paths)
 }
 
 // ── Tree quality ───────────────────────────────────────────────────────────
@@ -1504,6 +1725,9 @@ pub struct Settle {
     pub elements: Vec<UiElement>,
     /// Why the effect is unknown, when it is.
     pub note: Option<String>,
+    /// Whether the picture changed, when it was compared. `None` when the
+    /// caller did not supply a before-picture or the display produced none.
+    pub pixel_changed: Option<bool>,
 }
 
 impl Settle {
@@ -1587,14 +1811,66 @@ pub async fn settle_after_action(
             elapsed_ms,
             elements,
             note: None,
+            pixel_changed: None,
         },
         None => Settle {
             effect: EFFECT_UNKNOWN,
             elapsed_ms,
             elements: Vec::new(),
             note: failure,
+            pixel_changed: None,
         },
     }
+}
+
+/// The same wait, with the picture as a second signal.
+///
+/// A tree fingerprint says nothing about a game, a map, a camera preview, or a
+/// canvas: those screens change without changing what the tree exposes, and
+/// every action on them reads as "unchanged". The brightness grid is what sees
+/// it.
+///
+/// `before_pixels` is the grid taken before the action. When either side is
+/// missing the tree decides alone, exactly as [`settle_after_action`] does.
+pub async fn settle_after_action_with_pixels(
+    device: &Option<String>,
+    target: Target,
+    before: Option<u64>,
+    before_pixels: Option<&super::display::FrameSignature>,
+    budget_ms: u64,
+) -> Settle {
+    let mut settled = settle_after_action(device, target, before, budget_ms).await;
+
+    let Some(before_pixels) = before_pixels else {
+        return settled;
+    };
+    if settled.effect == EFFECT_CHANGED {
+        return settled;
+    }
+
+    // One read of the picture, after the tree has settled. Polling it would
+    // cost a frame per poll, and the frame is only consulted to overturn an
+    // "unchanged" the tree could not have seen.
+    let Some(bridge) = display_bridge().ok() else {
+        return settled;
+    };
+    let display = super::display::VirtualDisplay::attach(bridge, target.display_id());
+    let after = match display.frame_signature().await {
+        Ok(Some(signature)) => signature,
+        // No frame: the display has not drawn since it was created, which is
+        // its own answer and not something to guess about.
+        Ok(None) => return settled,
+        Err(failed) => {
+            settled.note = Some(format!("the picture could not be read ({failed})"));
+            return settled;
+        }
+    };
+    let pixels_changed = before_pixels.differs(&after);
+    settled.pixel_changed = Some(pixels_changed);
+    if pixels_changed && settled.effect == EFFECT_UNCHANGED {
+        settled.effect = EFFECT_CHANGED;
+    }
+    settled
 }
 
 /// [`format_ui_summary`] with a ceiling, for results that are a side effect of
@@ -2887,6 +3163,7 @@ mod tests {
             elapsed_ms: 300,
             elements: Vec::new(),
             note: Some("SCREEN_NEVER_IDLE".to_string()),
+            pixel_changed: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.starts_with("Effect unknown"), "{verdict}");
@@ -2900,6 +3177,7 @@ mod tests {
             elapsed_ms: 1200,
             elements: Vec::new(),
             note: None,
+            pixel_changed: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.contains("unchanged"), "{verdict}");
@@ -2913,11 +3191,98 @@ mod tests {
             elapsed_ms: 420,
             elements: vec![node("android.widget.TextView", Some("a"), (0, 0, 10, 10))],
             note: None,
+            pixel_changed: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.contains("changed"), "{verdict}");
         assert!(verdict.contains("420 ms"), "{verdict}");
         assert!(verdict.contains("1 elements"), "{verdict}");
+    }
+
+    // ── Gesture paths ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_two_finger_pinch_parses_into_two_paths() {
+        let args = serde_json::json!({
+            "paths": [
+                [[540, 1200], [540, 900]],
+                [[540, 1200], [540, 1500]],
+            ]
+        });
+        let paths = parse_gesture_paths(args.get("paths")).expect("paths");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], vec![(540, 1200), (540, 900)]);
+        assert_eq!(paths[1], vec![(540, 1200), (540, 1500)]);
+    }
+
+    #[test]
+    fn a_gesture_without_paths_is_refused() {
+        let args = serde_json::json!({});
+        let message = parse_gesture_paths(args.get("paths")).expect_err("refused");
+        assert!(message.contains("paths"), "{message}");
+    }
+
+    #[test]
+    fn a_third_finger_is_refused() {
+        let args = serde_json::json!({
+            "paths": [
+                [[0, 0], [1, 1]],
+                [[0, 0], [1, 1]],
+                [[0, 0], [1, 1]],
+            ]
+        });
+        let message = parse_gesture_paths(args.get("paths")).expect_err("refused");
+        assert!(message.contains("one or two"), "{message}");
+    }
+
+    #[test]
+    fn a_single_point_is_not_a_gesture() {
+        let args = serde_json::json!({ "paths": [[[10, 10]]] });
+        let message = parse_gesture_paths(args.get("paths")).expect_err("refused");
+        assert!(message.contains("2"), "{message}");
+    }
+
+    #[test]
+    fn a_point_that_is_not_a_pair_is_named() {
+        let args = serde_json::json!({ "paths": [[[10, 10], [20]]] });
+        let message = parse_gesture_paths(args.get("paths")).expect_err("refused");
+        assert!(message.contains("paths[0][1]"), "{message}");
+    }
+
+    #[test]
+    fn a_second_display_is_display_zero_only_when_it_is_the_screen() {
+        assert_eq!(Target::Screen.display_id(), 0);
+        assert_eq!(Target::Display(7).display_id(), 7);
+    }
+
+    #[test]
+    fn a_pixel_change_overturns_an_unchanged_tree() {
+        // The tree said nothing changed; the picture says otherwise. A canvas
+        // draws without touching the tree, and that is the case this exists for.
+        let before = super::super::display::FrameSignature {
+            columns: 2,
+            rows: 2,
+            cells: vec![0, 0, 0, 0],
+        };
+        let after = super::super::display::FrameSignature {
+            columns: 2,
+            rows: 2,
+            cells: vec![255, 255, 255, 255],
+        };
+        assert!(before.differs(&after));
+    }
+
+    #[test]
+    fn a_settle_without_a_pixel_signal_leaves_it_unknown() {
+        let settle = Settle {
+            effect: EFFECT_UNCHANGED,
+            elapsed_ms: 1200,
+            elements: Vec::new(),
+            note: None,
+            pixel_changed: None,
+        };
+        assert_eq!(settle.pixel_changed, None);
+        assert_eq!(settle.effect, EFFECT_UNCHANGED);
     }
 
     #[test]

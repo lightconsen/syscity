@@ -220,10 +220,9 @@ pub fn describe(outcome: &TakeoverOutcome) -> String {
 /// agent's side that is invisible: its own display simply stops changing, and
 /// the next read says "unchanged".
 ///
-/// Returns `Some((task_id, package))` when something is on the user's screen
-/// that should not be, and pulls it back when `recover` is set. An app the user
-/// was already using is left alone — moving it would yank the screen out from
-/// under them, which is the thing the second display exists to prevent.
+/// This is the **single look** version: whatever is on top of the user's screen
+/// right now. It is what a caller without a watch gets, and it cannot tell an
+/// app the agent started from an app the user opened themselves.
 pub async fn check_spill(
     bridge: &crate::device::DeviceBridgeRef,
     display_id: i32,
@@ -234,9 +233,6 @@ pub async fn check_spill(
     let (task_id, package) = display.main_screen_top().await.ok()??;
     // The user's launcher is not a spill: it is what a phone sits on.
     let package_name = package?;
-    // The app's own task is the UI, not a spill: moving it onto the agent's
-    // display would take the screen away from under the user, and the launcher
-    // is what a phone sits on rather than something an action started.
     if is_not_a_spill(&package_name) {
         return None;
     }
@@ -265,6 +261,159 @@ pub async fn check_spill(
             "left where it is (recovery was not requested)"
         },
     })
+}
+
+/// Which arrivals belong to an action.
+///
+/// The single look answers "is something on the user's screen now", which
+/// conflates three different things: the agent spilled an app, the user opened
+/// one themselves, or the user was already in one and it changed page. The
+/// window separates them, because it knows *when* each task rose.
+///
+/// Facts come from the helper ([`super::display::Arrival`]); the judgement is
+/// here so it can be tested without a phone.
+///
+/// What is not a spill, and why:
+///
+/// * **Outside the window.** A task that rose before the action is not it.
+/// * **Already gone.** A task that has since left the user's screen is not
+///   there to recover, and moving it would be acting on a stale fact.
+/// * **Never on the user's screen.** `now != 0` means it is somewhere else —
+///   very often the agent's own display, which is where it should be.
+/// * **Came from another display.** A task moved here deliberately (a handoff)
+///   is not something the action started.
+/// * **The user touched the screen during the window.** Then who opened it is
+///   unknowable, and the safe answer is "not the agent's fault".
+/// * **The launcher, the system UI, or this app.**
+pub fn spilled_by_action(
+    arrivals: &[super::display::Arrival],
+    since: u64,
+    window_ms: u64,
+    top_before: i32,
+    user_touched: &[u64],
+    self_package: &str,
+) -> Vec<SpillCandidate> {
+    let mut out: Vec<SpillCandidate> = Vec::new();
+    for arrival in arrivals {
+        if arrival.at < since || arrival.at > since + window_ms {
+            continue;
+        }
+        let Some(package) = arrival.package.as_deref() else {
+            continue;
+        };
+        if !arrival.standard || is_not_a_spill(package) || package == self_package {
+            continue;
+        }
+        // `from` is the display it was last seen on: -1 never seen, 0 already
+        // here. Anything else means somebody put it here on purpose.
+        if arrival.from != -1 && arrival.from != MAIN_DISPLAY {
+            continue;
+        }
+        if arrival.now != MAIN_DISPLAY {
+            continue;
+        }
+        if user_touched
+            .iter()
+            .any(|at| *at >= since && *at <= arrival.at)
+        {
+            continue;
+        }
+        let candidate = SpillCandidate {
+            task_id: arrival.task,
+            package: package.to_string(),
+            verdict: if arrival.task == top_before && arrival.same_task {
+                // The app the user was already in changed page: they are
+                // looking at it, so moving it would take the screen away.
+                SpillVerdict::InUse
+            } else if arrival.task == top_before {
+                continue;
+            } else {
+                SpillVerdict::PullBack
+            },
+        };
+        // One entry per task, the latest: the facts supersede.
+        out.retain(|existing| existing.task_id != candidate.task_id);
+        out.push(candidate);
+    }
+    out
+}
+
+/// The user's own screen.
+pub const MAIN_DISPLAY: i32 = 0;
+
+/// What the window says about one arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillVerdict {
+    /// Move it back to the agent's display.
+    PullBack,
+    /// The user is already in this app; leave it and say so.
+    InUse,
+}
+
+/// One task the window attributes to an action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpillCandidate {
+    pub task_id: i32,
+    pub package: String,
+    pub verdict: SpillVerdict,
+}
+
+/// Watch the user's screen around one action, and judge what arrived.
+///
+/// `since` and `window` come from the helper's clock, which is not this
+/// process's: the caller keeps the value [`super::display::VirtualDisplay::watch_main_screen`]
+/// returned.
+pub async fn watch_and_check_spill(
+    bridge: &crate::device::DeviceBridgeRef,
+    display_id: i32,
+    top_before: i32,
+    since: u64,
+    window_ms: u64,
+    user_touched: &[u64],
+    recover: bool,
+) -> Vec<Spill> {
+    let display = super::display::VirtualDisplay::attach(bridge.clone(), display_id);
+    let arrivals = match display.main_arrivals(since).await {
+        Ok(arrivals) => arrivals,
+        Err(failed) => {
+            tracing::warn!(
+                display = display_id,
+                error = %failed,
+                "could not read what rose to the top of the user's screen",
+            );
+            return Vec::new();
+        }
+    };
+    let candidates =
+        spilled_by_action(&arrivals, since, window_ms, top_before, user_touched, SELF_PACKAGE);
+
+    let mut spills = Vec::new();
+    for candidate in candidates {
+        match candidate.verdict {
+            SpillVerdict::InUse => spills.push(Spill {
+                task_id: candidate.task_id,
+                package: candidate.package,
+                recovered: false,
+                reason: "the user was already using this app, so it was left alone",
+            }),
+            SpillVerdict::PullBack => {
+                let moved = recover && display.move_task_here(candidate.task_id).await.is_ok();
+                spills.push(Spill {
+                    task_id: candidate.task_id,
+                    package: candidate.package,
+                    recovered: moved,
+                    reason: if moved {
+                        "moved back to the agent's display"
+                    } else if recover {
+                        "it could not be moved back — it is still on the user's screen"
+                    } else {
+                        "left where it is (recovery was not requested)"
+                    },
+                });
+            }
+        }
+    }
+    spills
 }
 
 /// This app's own package — its task is the UI, never a spill.
@@ -379,6 +528,135 @@ mod tests {
         };
         assert!(!spilled.recovered);
         assert!(spilled.reason.contains("still on the user's screen"));
+    }
+
+    // ── The spill window ────────────────────────────────────────────────
+
+    use super::super::display::Arrival;
+
+    fn arrival(task: i32, package: &str, at: u64, from: i32, now: i32) -> Arrival {
+        Arrival {
+            task,
+            package: Some(package.to_string()),
+            at,
+            from,
+            same_task: false,
+            standard: true,
+            now,
+        }
+    }
+
+    #[test]
+    fn an_app_that_rose_during_the_window_is_a_spill() {
+        let arrivals = vec![arrival(42, "com.android.intentresolver", 1_050, -1, 0)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert_eq!(spills.len(), 1);
+        assert_eq!(spills[0].task_id, 42);
+        assert_eq!(spills[0].verdict, SpillVerdict::PullBack);
+    }
+
+    #[test]
+    fn a_task_that_rose_before_the_action_is_not_blamed_on_it() {
+        let arrivals = vec![arrival(42, "com.example.chat", 900, -1, 0)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn a_task_that_rose_after_the_window_closed_is_not_blamed_on_it() {
+        let arrivals = vec![arrival(42, "com.example.chat", 4_500, -1, 0)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn a_task_the_user_opened_is_not_a_spill() {
+        // The user touched the screen at 1_500, the app rose at 1_600: the
+        // agent cannot be credited with it, so the safe answer is "not ours".
+        let arrivals = vec![arrival(42, "com.example.chat", 1_600, -1, 0)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[1_500], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn a_touch_before_the_action_does_not_excuse_a_spill() {
+        // The user had the screen at 800, before the window; what rose at 1_600
+        // is still the agent's doing.
+        let arrivals = vec![arrival(42, "com.example.chat", 1_600, -1, 0)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[800], SELF_PACKAGE);
+        assert_eq!(spills.len(), 1, "{spills:?}");
+    }
+
+    #[test]
+    fn a_task_that_has_already_left_the_users_screen_is_not_moved() {
+        let arrivals = vec![arrival(42, "com.example.chat", 1_100, -1, 3)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn a_task_moved_here_on_purpose_is_not_a_spill() {
+        // `from = 3` means it was on the agent's own display and moved;
+        // that is a handoff, not something an action started.
+        let arrivals = vec![arrival(42, "com.example.chat", 1_100, 3, 0)];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn the_launcher_and_this_app_are_never_spills() {
+        let arrivals = vec![
+            arrival(1, "com.google.android.apps.nexuslauncher", 1_100, -1, 0),
+            arrival(2, "net.syscity.desktop", 1_200, -1, 0),
+            arrival(3, "com.android.systemui", 1_300, -1, 0),
+        ];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn the_app_the_user_was_already_in_is_left_alone() {
+        // Same task as before the action, showing a different page: they are
+        // looking at it, so moving it would take the screen away.
+        let arrivals = vec![Arrival {
+            task: 7,
+            package: Some("com.example.mail".to_string()),
+            at: 1_200,
+            from: MAIN_DISPLAY,
+            same_task: true,
+            standard: true,
+            now: MAIN_DISPLAY,
+        }];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert_eq!(spills.len(), 1);
+        assert_eq!(spills[0].verdict, SpillVerdict::InUse);
+    }
+
+    #[test]
+    fn one_entry_per_task_the_latest_word_wins() {
+        // A task that bounced (rose, left, came back) is one spill, not three.
+        let arrivals = vec![
+            arrival(42, "com.example.chat", 1_100, -1, 0),
+            arrival(42, "com.example.chat", 1_500, -1, 0),
+        ];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert_eq!(spills.len(), 1);
+        assert_eq!(spills[0].task_id, 42);
+    }
+
+    #[test]
+    fn an_unnamed_task_is_skipped_rather_than_guessed() {
+        let arrivals = vec![Arrival {
+            task: 42,
+            package: None,
+            at: 1_100,
+            from: -1,
+            same_task: false,
+            standard: true,
+            now: 0,
+        }];
+        let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
+        assert!(spills.is_empty(), "{spills:?}");
     }
 
     #[test]

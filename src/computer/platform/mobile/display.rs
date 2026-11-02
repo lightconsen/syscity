@@ -255,10 +255,255 @@ impl VirtualDisplay {
             .map(|_| ())
     }
 
+    /// One gesture of one or two fingers, in this display's pixels.
+    ///
+    /// The flat arrays are the AIDL shape: `path[i]` is the finger a point
+    /// belongs to, and one finger's points are in time order. The helper builds
+    /// `MotionEvent`s, because a pinch has no `input -d` equivalent.
+    pub async fn gesture(
+        &self,
+        points: &[(i32, i32, i32)],
+        duration_ms: u32,
+    ) -> Result<(), DisplayError> {
+        let xs: Vec<i32> = points.iter().map(|(_, x, _)| *x).collect();
+        let ys: Vec<i32> = points.iter().map(|(_, _, y)| *y).collect();
+        let paths: Vec<i32> = points.iter().map(|(path, _, _)| *path).collect();
+        call(
+            &self.bridge,
+            json!({
+                "op": "gesture",
+                "display": self.id,
+                "x": xs,
+                "y": ys,
+                "path": paths,
+                "duration": duration_ms,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Type `text` by putting it on the clipboard and pasting it.
+    ///
+    /// `input -d text` types through the key character map and mangles anything
+    /// outside ASCII; the clipboard carries whatever the app can render. The
+    /// helper puts the user's own clipboard back afterwards.
+    pub async fn paste_text(&self, text: &str) -> Result<(), DisplayError> {
+        call(&self.bridge, json!({ "op": "paste", "display": self.id, "text": text }))
+            .await
+            .map(|_| ())
+    }
+
+    /// A coarse brightness grid of the current frame: `(columns, rows, cells)`.
+    ///
+    /// `None` when the display has produced no frame yet. Pixels are the only
+    /// signal on a screen the accessibility tree describes nothing on.
+    pub async fn frame_signature(&self) -> Result<Option<FrameSignature>, DisplayError> {
+        let answer =
+            call(&self.bridge, json!({ "op": "frame_signature", "display": self.id })).await?;
+        let encoded = answer.get("signature").and_then(Value::as_str);
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        FrameSignature::decode(encoded).map(Some).ok_or_else(|| {
+            DisplayError::new(
+                DISPLAY_BAD_RESPONSE,
+                "the helper's frame signature was not a brightness grid",
+            )
+        })
+    }
+
+    /// The user's screen top task, and the moment to pass to [`main_arrivals`].
+    ///
+    /// Watching starts now and lasts `window_ms`; the returned task is what was
+    /// on top when watching began. An action can put an app on the user's
+    /// screen, and a single look afterwards cannot tell that apart from an app
+    /// they opened themselves — the window is what makes the two different.
+    pub async fn watch_main_screen(&self, window_ms: u32) -> Result<(i32, u64), DisplayError> {
+        let started = uptime_ms();
+        let answer = call(&self.bridge, json!({ "op": "watch_main", "window": window_ms })).await?;
+        let top = answer
+            .get("top")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(-1);
+        let since = answer
+            .get("since")
+            .and_then(Value::as_u64)
+            .unwrap_or(started);
+        Ok((top, since))
+    }
+
+    /// What rose to the top of the user's screen since `since`.
+    pub async fn main_arrivals(&self, since: u64) -> Result<Vec<Arrival>, DisplayError> {
+        let answer = call(&self.bridge, json!({ "op": "main_arrivals", "since": since })).await?;
+        let arrivals = answer
+            .get("arrivals")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                DisplayError::new(DISPLAY_BAD_RESPONSE, "the helper listed no arrivals")
+            })?;
+        Ok(arrivals.iter().filter_map(Arrival::from_json).collect())
+    }
+
+    /// How many displays this device will run at once, and why not more.
+    pub async fn parallel_limit(bridge: &DeviceBridgeRef) -> Result<ParallelLimit, DisplayError> {
+        let answer = call(bridge, json!({ "op": "parallel_limit" })).await?;
+        Ok(ParallelLimit {
+            limit: answer
+                .get("limit")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(1),
+            open: answer
+                .get("open")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0),
+            reason: answer
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
     /// What the helper says it can do, and on which API level.
     pub async fn status(bridge: &DeviceBridgeRef) -> Result<Value, DisplayError> {
         call(bridge, json!({ "op": "ping" })).await
     }
+}
+
+/// A brightness grid: how many columns and rows, and one value per cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameSignature {
+    pub columns: u32,
+    pub rows: u32,
+    pub cells: Vec<u8>,
+}
+
+impl FrameSignature {
+    /// Decode the helper's hex form: `columns`, `rows`, then the cells.
+    ///
+    /// Hex rather than base64 because this crosses two transports (Binder and
+    /// then the Tauri bridge) and both are happier with text that has no `+`
+    /// or `/` in it.
+    fn decode(encoded: &str) -> Option<Self> {
+        if encoded.len() < 4 || !encoded.len().is_multiple_of(2) {
+            return None;
+        }
+        let columns = u32::from_str_radix(&encoded[0..2], 16).ok()?;
+        let rows = u32::from_str_radix(&encoded[2..4], 16).ok()?;
+        let mut cells = Vec::with_capacity((encoded.len() - 4) / 2);
+        let bytes = encoded.as_bytes();
+        for chunk in bytes[4..].chunks_exact(2) {
+            let text = std::str::from_utf8(chunk).ok()?;
+            cells.push(u8::from_str_radix(text, 16).ok()?);
+        }
+        if cells.len() != (columns * rows) as usize {
+            return None;
+        }
+        Some(Self { columns, rows, cells })
+    }
+
+    /// Whether this differs from `other` by enough to be a real change.
+    ///
+    /// A blinking cursor moves a cell or two; a page transition moves many.
+    /// Below [`SIGNATURE_MIN_CELLS`] cells of difference this is not a change.
+    pub fn differs(&self, other: &FrameSignature) -> bool {
+        if self.columns != other.columns
+            || self.rows != other.rows
+            || self.cells.len() != other.cells.len()
+        {
+            return false;
+        }
+        let changed = self
+            .cells
+            .iter()
+            .zip(&other.cells)
+            .filter(|(a, b)| a.abs_diff(**b) > SIGNATURE_CELL_DELTA)
+            .count();
+        changed >= SIGNATURE_MIN_CELLS
+    }
+}
+
+/// How far one cell must move to count as changed.
+pub const SIGNATURE_CELL_DELTA: u8 = 16;
+/// How many cells must change to call it a change at all.
+pub const SIGNATURE_MIN_CELLS: usize = 3;
+
+/// How many displays may exist at once, and why not more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelLimit {
+    pub limit: u32,
+    pub open: u32,
+    /// Why the limit is lower than the maximum, when it is.
+    pub reason: Option<String>,
+}
+
+impl ParallelLimit {
+    /// How many more may be opened.
+    pub fn remaining(&self) -> u32 {
+        self.limit.saturating_sub(self.open)
+    }
+}
+
+/// One task rising to the top of the user's screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arrival {
+    pub task: i32,
+    pub package: Option<String>,
+    /// Helper uptime (ms) at which it rose.
+    pub at: u64,
+    /// The display it was last seen on; -1 when it was never seen before.
+    pub from: i32,
+    /// The same task, showing a different page.
+    pub same_task: bool,
+    /// A normal app page, not the launcher.
+    pub standard: bool,
+    /// Where the task is now; -1 when it is gone.
+    pub now: i32,
+}
+
+impl Arrival {
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            task: i32::try_from(value.get("task")?.as_i64()?).ok()?,
+            package: value
+                .get("package")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            at: value.get("at")?.as_u64()?,
+            from: value
+                .get("from")
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+                .unwrap_or(-1),
+            same_task: value
+                .get("sameTask")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            standard: value
+                .get("standard")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            now: value
+                .get("now")
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+                .unwrap_or(-1),
+        })
+    }
+}
+
+/// The device's `SystemClock.uptimeMillis`, approximated locally.
+///
+/// Only ever compared against values the same helper produced, so the epoch
+/// does not matter — what matters is that two calls in one session share one.
+fn uptime_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Send one op to the helper and validate the envelope.
@@ -792,6 +1037,146 @@ mod tests {
         assert_eq!(display.id, 9);
         // Size is unknown until a frame reports it — the id is the address.
         assert_eq!((display.width, display.height), (0, 0));
+    }
+
+    #[test]
+    fn a_frame_signature_decodes_its_grid() {
+        // 2 columns, 3 rows, six cells: 00 40 80 c0 ff 20.
+        let decoded = FrameSignature::decode("0203004080c0ff20").expect("grid");
+        assert_eq!(decoded.columns, 2);
+        assert_eq!(decoded.rows, 3);
+        assert_eq!(decoded.cells, vec![0x00, 0x40, 0x80, 0xc0, 0xff, 0x20]);
+    }
+
+    #[test]
+    fn a_signature_whose_cell_count_does_not_match_is_rejected() {
+        // Says 2x3 but carries five cells.
+        assert!(FrameSignature::decode("0203004080c0ff").is_none());
+        assert!(FrameSignature::decode("zz03004080c0ff20").is_none());
+        // Odd length is not hex pairs.
+        assert!(FrameSignature::decode("0203004").is_none());
+    }
+
+    #[test]
+    fn a_cursor_blink_is_not_a_change() {
+        let before = FrameSignature {
+            columns: 2,
+            rows: 3,
+            cells: vec![100, 100, 100, 100, 100, 100],
+        };
+        let mut after = before.clone();
+        after.cells[0] = 200;
+        // One cell moved; below the threshold that is a cursor, not a screen.
+        assert!(!before.differs(&after));
+    }
+
+    #[test]
+    fn a_page_transition_is_a_change() {
+        let before = FrameSignature {
+            columns: 2,
+            rows: 3,
+            cells: vec![10, 10, 10, 10, 10, 10],
+        };
+        let after = FrameSignature {
+            columns: 2,
+            rows: 3,
+            cells: vec![200, 200, 200, 200, 200, 200],
+        };
+        assert!(before.differs(&after));
+    }
+
+    #[test]
+    fn grids_of_different_sizes_are_not_compared() {
+        let a = FrameSignature {
+            columns: 2,
+            rows: 2,
+            cells: vec![0, 0, 0, 0],
+        };
+        let b = FrameSignature {
+            columns: 3,
+            rows: 2,
+            cells: vec![255, 255, 255, 255, 255, 255],
+        };
+        assert!(!a.differs(&b));
+    }
+
+    #[test]
+    fn the_parallel_limit_says_how_many_more_fit() {
+        let limit = ParallelLimit {
+            limit: 2,
+            open: 1,
+            reason: None,
+        };
+        assert_eq!(limit.remaining(), 1);
+        let full = ParallelLimit {
+            limit: 2,
+            open: 2,
+            reason: None,
+        };
+        assert_eq!(full.remaining(), 0);
+        // Never negative, however the two came back.
+        let over = ParallelLimit {
+            limit: 1,
+            open: 3,
+            reason: None,
+        };
+        assert_eq!(over.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_gesture_is_sent_as_flat_finger_arrays() {
+        let bridge = bridge(json!({ "ok": true }));
+        let display = VirtualDisplay::attach(bridge, 4);
+        let points = vec![(0, 100, 100), (1, 200, 100), (0, 100, 300), (1, 200, 300)];
+        display.gesture(&points, 400).await.expect("gesture");
+    }
+
+    #[tokio::test]
+    async fn a_watch_reports_the_top_and_the_moment_to_ask_from() {
+        let bridge = bridge(json!({ "ok": true, "top": 12, "since": 5_000 }));
+        let display = VirtualDisplay::attach(bridge, 4);
+        let (top, since) = display.watch_main_screen(3_000).await.expect("watch");
+        assert_eq!(top, 12);
+        assert_eq!(since, 5_000);
+    }
+
+    #[tokio::test]
+    async fn an_arrival_is_parsed_with_where_it_came_from_and_where_it_is() {
+        let bridge = bridge(json!({
+            "ok": true,
+            "arrivals": [{
+                "task": 42,
+                "package": "com.android.intentresolver",
+                "at": 1_050,
+                "from": -1,
+                "sameTask": false,
+                "standard": true,
+                "now": 0,
+            }],
+        }));
+        let display = VirtualDisplay::attach(bridge, 4);
+        let arrivals = display.main_arrivals(1_000).await.expect("arrivals");
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].task, 42);
+        assert_eq!(arrivals[0].package.as_deref(), Some("com.android.intentresolver"));
+        assert_eq!(arrivals[0].from, -1);
+        assert_eq!(arrivals[0].now, 0);
+        assert!(arrivals[0].standard);
+    }
+
+    #[tokio::test]
+    async fn a_display_that_has_drawn_nothing_has_no_signature() {
+        let bridge = bridge(json!({ "ok": true }));
+        let display = VirtualDisplay::attach(bridge, 4);
+        assert_eq!(display.frame_signature().await.expect("none"), None);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_signature_is_rejected() {
+        let bridge = bridge(json!({ "ok": true, "signature": "not-hex" }));
+        let display = VirtualDisplay::attach(bridge, 4);
+        let failed = display.frame_signature().await.expect_err("bad");
+        assert_eq!(failed.code, DISPLAY_BAD_RESPONSE);
     }
 
     #[tokio::test]

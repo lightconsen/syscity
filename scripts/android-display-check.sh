@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 #
-# Build the Android app, install it, and run the display helper's self-test on
-# a device or emulator.
+# Build the Android app, install it, and check that the second display really
+# works on this device: the helper starts, a display is created, an app is
+# launched onto it, a frame comes back, a tap lands, and the display tears down.
 #
-# This is the first checkpoint for the second-screen work: the helper runs as
-# the shell user (uid 2000), creates a virtual display through a hidden API by
-# reflection, launches an app onto it, reads a frame and taps it. Every one of
-# those is a claim about the platform that only a device can settle, and none of
-# them needs the app to be running — only installed, because the helper's class
-# lives in the APK.
+# This is the first checkpoint for the second-screen work. The helper runs as
+# the shell user (uid 2000) and creates a virtual display through a hidden API
+# by reflection; launching an app onto a non-default display and reading a frame
+# from it are claims about the platform that only a device can settle.
+#
+# The check drives the same tool actions an agent would (`android_display`
+# over the gateway's WebSocket), which is the only path that works: the helper
+# refuses to start without the handoff nonce the app issues, so it cannot be
+# launched by hand with a `CLASSPATH` and a class name.
 #
 # Usage:
-#   ./scripts/android-display-check.sh              # build (debug), install, self-test
+#   ./scripts/android-display-check.sh              # build (debug), install, check
 #   ./scripts/android-display-check.sh --skip-build # use the last APK built
 #   ./scripts/android-display-check.sh --release    # release APK instead
 #   ./scripts/android-display-check.sh --device emulator-5554
+#   ./scripts/android-display-check.sh --port 18080 # gateway port to drive
 #
 # Exit code:
-#   0 — the self-test printed SELFTEST OK
+#   0 — every step answered
 #   1 — a step failed; the message names it
 
 set -euo pipefail
@@ -35,6 +40,7 @@ APK_DIR="$REPO_ROOT/desktop/gen/android/app/build/outputs/apk"
 BUILD_PROFILE="debug"
 SKIP_BUILD=false
 DEVICE="${ANDROID_SERIAL:-}"
+PORT="${SYSCITY_PORT:-18080}"
 
 log() { printf '%s==>%s %s\n' "$BLUE" "$RESET" "$*"; }
 ok() { printf '%s ok %s %s\n' "$GREEN" "$RESET" "$*"; }
@@ -54,6 +60,11 @@ while [ $# -gt 0 ]; do
             DEVICE="$2"
             shift 2
             ;;
+        --port)
+            [ $# -ge 2 ] || die "--port needs a number"
+            PORT="$2"
+            shift 2
+            ;;
         -h | --help)
             awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
             exit 0
@@ -62,10 +73,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# ── 0. adb and a device ────────────────────────────────────────────────────
+# ── 0. adb, a device, and a way to drive the gateway ───────────────────────
 command -v adb >/dev/null 2>&1 ||
     die "adb is not on PATH — install the Android platform tools (sdkmanager \
 \"platform-tools\") and put them on PATH"
+command -v node >/dev/null 2>&1 ||
+    die "node is not on PATH — the check drives the gateway's WebSocket, and \
+the client is a small node script"
 
 if [ -z "$DEVICE" ]; then
     # One device, so nothing is ambiguous. Two is a choice this script has no
@@ -85,9 +99,9 @@ adb_cmd get-state >/dev/null 2>&1 || die "device $DEVICE is not reachable"
 ok "device $DEVICE ($(adb_cmd shell getprop ro.build.version.sdk | tr -d '\r') API)"
 
 API=$(adb_cmd shell getprop ro.build.version.sdk | tr -d '\r')
-if [ "${API:-0}" -lt 30 ]; then
-    warn "API $API: a second display's accessibility tree needs API 30; the"
-    warn "      frame-based path still works, but half of what this checks will not"
+if [ "${API:-0}" -lt 34 ]; then
+    warn "API $API: the display works, but without per-display focus (API 34)"
+    warn "      typing on it can take the user's keyboard"
 fi
 
 # ── 1. build ───────────────────────────────────────────────────────────────
@@ -107,70 +121,202 @@ APK=$(find "$APK_DIR" -name '*.apk' -type f -print0 2>/dev/null |
 [ -n "$APK" ] || die "no APK under $APK_DIR — run without --skip-build"
 ok "apk $(basename "$APK") ($(du -h "$APK" | cut -f1))"
 
-# ── 2. install ─────────────────────────────────────────────────────────────
+# ── 2. install and start ───────────────────────────────────────────────────
 log "installing"
 adb_cmd install -r -t "$APK" >/dev/null || die "adb install failed (a signature \
 mismatch with an existing install needs 'adb uninstall $PACKAGE' first)"
 ok "installed $PACKAGE"
 
-ON_DEVICE=$(adb_cmd shell pm path "$PACKAGE" | head -1 | sed 's/^package://' | tr -d '\r')
-[ -n "$ON_DEVICE" ] || die "$PACKAGE is installed but pm gave no APK path"
-ok "device APK $ON_DEVICE"
+# A reinstall clears the accessibility service, and without it the display's
+# tree cannot be read at all — `DISPLAY_TREE_UNAVAILABLE`, which reads like a
+# broken display. Setting it back is part of what installing costs.
+log "starting the app and re-enabling the accessibility service"
+adb_cmd shell am start -n "$PACKAGE/.MainActivity" >/dev/null 2>&1 || true
+sleep 5
+adb_cmd shell settings put secure enabled_accessibility_services \
+    "$PACKAGE/.SyscityAccessibilityService" >/dev/null 2>&1 || true
+adb_cmd shell settings put secure accessibility_enabled 1 >/dev/null 2>&1 || true
 
-# ── 3. self-test ───────────────────────────────────────────────────────────
-# The app must NOT be running for a clean test: a running instance holds its own
-# views and its log noise buries the helper's. Force-stop is harmless (the app
-# keeps no important state across a restart).
-adb_cmd shell am force-stop "$PACKAGE" || true
-
-# Where the user's screen is focused, before and after. The self-test taps on a
-# display of its own, so a change here means the tap landed on the wrong one —
-# the failure this whole exercise exists to catch.
-focus() { adb_cmd shell dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus' || true; }
-FOCUS_BEFORE=$(focus)
-
-log "running the helper self-test"
-set +e
-OUTPUT=$(adb_cmd shell "CLASSPATH=$ON_DEVICE app_process /system/bin \
-net.syscity.desktop.helper.HelperMain --selftest" 2>&1)
-RC=$?
-set -e
-
-printf '%s\n' "$OUTPUT"
-
-FOCUS_AFTER=$(focus)
-if [ -n "$FOCUS_BEFORE" ] && [ "$FOCUS_BEFORE" != "$FOCUS_AFTER" ]; then
-    warn "the user's focused window changed during the test:"
-    warn "  before: $FOCUS_BEFORE"
-    warn "  after:  $FOCUS_AFTER"
-    warn "  on API 34+ this should not happen (FLAG_OWN_FOCUS); if it did, input"
-    warn "  is reaching the wrong display — check the 'tap' step below"
+FORWARDED=$(adb_cmd forward --list 2>/dev/null | grep -c "tcp:$PORT" || true)
+if [ "${FORWARDED:-0}" -eq 0 ]; then
+    log "forwarding tcp:$PORT to the app's gateway"
+    adb_cmd forward "tcp:$PORT" "tcp:$PORT" >/dev/null
 fi
 
+# The per-install token, not the host config's `shared_token`: the gateway runs
+# inside the app and enforces its own.
+TOKEN=$(adb_cmd shell run-as "$PACKAGE" cat "files/syscity/data/gateway_token" 2>/dev/null |
+    tr -d '\r')
+[ -n "$TOKEN" ] || die "no gateway token on the device — is the app installed \
+and has it started once?"
+ok "gateway token read from the app"
+
+# ── 3. the sequence, through the gateway ───────────────────────────────────
+log "driving android_display / android_input over the gateway's WebSocket"
+set +e
+RESULT=$(SYSCITY_TOKEN="$TOKEN" SYSCITY_PORT="$PORT" node --input-type=module -e '
+const port = process.env.SYSCITY_PORT;
+const token = process.env.SYSCITY_TOKEN;
+const base = `http://127.0.0.1:${port}`;
+
+const ticketAnswer = await fetch(`${base}/api/v1/ws-ticket`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${token}` },
+});
+const { ticket } = await ticketAnswer.json();
+
+const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?ticket=${ticket}`);
+await new Promise((done, failed) => {
+  ws.addEventListener("open", done, { once: true });
+  ws.addEventListener("error", failed, { once: true });
+});
+
+const waiting = new Map();
+ws.addEventListener("message", (event) => {
+  const message = JSON.parse(event.data);
+  const finish = waiting.get(message.id);
+  if (finish) { waiting.delete(message.id); finish(message); }
+});
+// Everything is bounded: a tool that never answers must fail the check with a
+// message, not leave it hanging with no output at all.
+const request = (id, method, params, timeoutMs = 90000) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => {
+    waiting.delete(id);
+    reject(new Error(`\`${method}\` (${id}) did not answer within ${timeoutMs} ms`));
+  }, timeoutMs);
+  waiting.set(id, (answer) => { clearTimeout(timer); resolve(answer); });
+  ws.send(JSON.stringify({ type: "req", id, method, params }));
+});
+
+await request("connect", "connect", {
+  protocol_version: 1, client: { id: "android-display-check" },
+});
+const tool = async (id, name, args) => {
+  const answer = await request(id, "debug.tool.invoke", { tool: name, arguments: args });
+  return answer.payload ?? {};
+};
+const say = (step, text) => console.log(`${step}: ${text}`);
+const stop = (reason) => { console.log(`FAIL ${reason}`); ws.close(); process.exit(1); };
+
+const status = await tool("status", "android_display", { action: "status" });
+if (status.error || status.success === false) {
+  say("helper", "not attached yet — `start` brings it up");
+} else {
+  say("helper", "answering");
+}
+
+const limits = await tool("limits", "android_display", { action: "limits" });
+const data = limits.data ?? {};
+if (limits.error || limits.success === false) {
+  // `limits` reads from the helper and does not start one, so right after a
+  // reinstall it cannot answer yet. That is not a failure: `start` is about to
+  // bring the helper up, and it is the call that would be refused if no slot
+  // were free.
+  say("limits", `not answerable until the helper starts (${limits.error})`);
+} else {
+  say("limits", `${data.limit} display(s) may be open, ${data.open} are` +
+    (data.reason ? ` — ${data.reason}` : ""));
+  if (typeof data.remaining === "number" && data.remaining < 1) {
+    // Every slot is taken — by a display this run did not open, so closing it
+    // would be closing work this run did not open. Say so instead of failing at
+    // `start`.
+    stop("limits: all " + data.limit + " display(s) are in use; close one first " +
+      "(android_display action: stop display: <id>)");
+  }
+}
+
+// The first helper call also starts the helper, through the loopback-ADB
+// pairing the app owns — which is not ready the instant the app is launched. A
+// refused call created nothing, so retrying is safe; it is the wait that is
+// missing, not a fix.
+let started = await tool("start", "android_display", { action: "start" });
+for (let attempt = 1; started.data?.display === undefined && attempt <= 10; attempt += 1) {
+  say("start", `attempt ${attempt} failed: ${started.error ?? "no display id"}`);
+  await new Promise((r) => setTimeout(r, 4000));
+  started = await tool(`start-${attempt}`, "android_display", { action: "start" });
+}
+const display = started.data?.display;
+if (display === undefined) {
+  stop(`create: ${started.error ?? started.output ?? JSON.stringify(started)}`);
+}
+say("display", `id=${display} ${started.data?.width}x${started.data?.height}`);
+
+const launched = await tool("launch", "android_display", {
+  action: "launch", display, package: "com.android.settings",
+});
+if (launched.error) stop(`launch: ${launched.output}`);
+say("launched", "com.android.settings");
+await new Promise((r) => setTimeout(r, 2500));
+
+const frame = await tool("frame", "android_display", { action: "frame", display });
+if (!frame.data?.base64) stop(`frame: ${frame.output ?? "no picture"}`);
+say("frame", `${frame.data.width}x${frame.data.height} png=` +
+  `${frame.data.base64.length} base64 chars`);
+
+const tapped = await tool("tap", "android_input", {
+  action: "tap", display, x: 540, y: 1200, verify: true,
+});
+if (tapped.error) stop(`tap: ${tapped.output}`);
+say("tap", `(540, 1200) — effect ${tapped.data?.effect ?? "unknown"}`);
+
+const stopped = await tool("stop", "android_display", { action: "stop", display });
+if (stopped.error) stop(`stop: ${stopped.output}`);
+say("stopped", `display ${display}`);
+console.log("CHECK OK");
+// `ws.close()` alone is not enough to end the process: the ticket fetch leaves
+// a keep-alive socket open, so the script would print its verdict and then
+// hang, holding the caller for as long as that socket lives. Exiting is what
+// makes the verdict reach the shell.
+ws.close();
+process.exit(0);
+' 2>&1)
+CLIENT_RC=$?
+set -e
+printf '%s\n' "$RESULT"
+
 # ── 4. verdict ─────────────────────────────────────────────────────────────
-if printf '%s' "$OUTPUT" | grep -q 'SELFTEST OK'; then
+# The client prints its verdict last and exits. Believing the last line is what
+# keeps a killed run from being read as a pass: it can still have printed
+# `CHECK OK` before it was interrupted, but only a run that reached the end
+# prints it last.
+if [ "$(printf '%s' "$RESULT" | tail -1)" = "CHECK OK" ]; then
     echo ""
     ok "second display works on this device"
     exit 0
 fi
-
-echo ""
-case "$OUTPUT" in
-    *"FAIL create"*)
-        die "creating the display failed. The message lists every \
-createVirtualDisplay signature it tried and what each returned — that list is the \
-finding, and it is version-specific. Check that the helper ran as uid 2000 above." ;;
-    *"FAIL launch"*)
+# A `FAIL <step>` line is the client naming what broke; fall through to the
+# case below so the message stays specific. Anything else means it died without
+# saying why, or was killed, and that is not a diagnosis.
+if ! printf '%s' "$RESULT" | grep -q '^FAIL '; then
+    printf '%s\n' "$RESULT" >&2
+    die "the gateway client stopped early (exit $CLIENT_RC) without naming a \
+step; output above"
+fi
+case "$RESULT" in
+    *"CREATE_FAILED"* | *"create:"*)
+        die "creating the display failed. The helper reports what the hidden \
+createVirtualDisplay calls returned; that message is version-specific."
+        ;;
+    *"LAUNCH_FAILED"* | *"launch:"*)
         die "the display exists but nothing would start on it. Check \
 'adb shell am start --display <id> -n <component>' by hand, and that the target \
-package is installed." ;;
-    *"FAIL frame"*)
+package is installed."
+        ;;
+    *"NO_FRAME"* | *"frame:"*)
         die "the display rendered nothing. 'adb shell dumpsys display' should list \
 a DisplayDevice named syscity-agent; if it is there but blank, the app never \
-reached the display." ;;
-    *"must run as shell"*)
-        die "the helper did not get shell identity — it was not started through \
-'adb shell', or adbd is not reachable for this user." ;;
+reached the display."
+        ;;
+    *"NO_HELPER"* | *"helper:"*)
+        die "the display helper is not running. Start it with \
+'android_display action: restart', or check that the app is running and the \
+loopback-ADB pairing is up."
+        ;;
+    *"DISPLAY_TREE_UNAVAILABLE"*)
+        die "the accessibility service is off, so the display cannot be read. \
+Re-enable $PACKAGE in Settings › Accessibility and run again."
+        ;;
     *)
-        die "the self-test did not report success (exit $RC); output above" ;;
+        die "the check did not finish; output above"
+        ;;
 esac

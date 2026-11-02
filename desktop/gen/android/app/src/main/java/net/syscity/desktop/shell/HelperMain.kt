@@ -39,8 +39,11 @@ object HelperMain {
     /** uid per Android user; a package's uid encodes its user in the high bits. */
     private const val PER_USER_RANGE = 100000
 
-    /** Set once a frame has been written here; a display id maps to a slot. */
-    private val displays = HashMap<Int, AgentDisplay>()
+    /**
+     * The shell Context this process built, kept for services that want one
+     * (`isLowRamDevice` is a call on a Context, not a global).
+     */
+    private var shellContext: android.content.Context? = null
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -89,6 +92,7 @@ object HelperMain {
             System.exit(5)
             return
         }
+        shellContext = context
 
         val stub = Stub()
         val token = handoff(context, packageName, appUid, nonce, stub)
@@ -250,14 +254,29 @@ object HelperMain {
 
         private val lock = Any()
         private val displays = HashMap<Int, AgentDisplay>()
+        private val clipboard = ShellClipboard()
+        private val mainWatch = MainScreenWatch { TaskQuery.current().orEmpty() }
+
+        /** Set once a second display has failed to appear — it is not retried. */
+        @Volatile
+        private var secondDisplayFailed = false
 
         override fun identity(): IntArray = intArrayOf(Process.myUid(), Process.myPid())
 
         override fun createDisplay(width: Int, height: Int, dpi: Int): Int =
             synchronized(lock) {
-                val display = AgentDisplay.create(width, height, dpi)
-                displays[display.id] = display
-                display.id
+                runCatching {
+                    val display = AgentDisplay.create(width, height, dpi)
+                    displays[display.id] = display
+                    display.id
+                }.getOrElse {
+                    // A second display that will not start is not retried for the
+                    // rest of the session: on a phone that refuses it, every
+                    // retry costs a second and fails the same way.
+                    if (displays.isNotEmpty()) secondDisplayFailed = true
+                    Log.e(TAG, "createDisplay failed: ${it.message}")
+                    -1
+                }
             }
 
         override fun startApp(displayId: Int, packageName: String): Int =
@@ -316,14 +335,96 @@ object HelperMain {
         override fun moveTaskToMe(displayId: Int, taskId: Int): Boolean =
             runCatching { display(displayId)?.moveTaskTo(taskId) == true }.getOrDefault(false)
 
+        override fun injectGesture(
+            displayId: Int,
+            x: IntArray,
+            y: IntArray,
+            path: IntArray,
+            durationMs: Int,
+        ): Boolean = runCatching {
+            if (x.size != y.size || x.size != path.size || x.size < 2) return@runCatching false
+            val points = x.indices.map { AgentDisplay.GesturePoint(path[it], x[it], y[it]) }
+            display(displayId)?.gesture(points, durationMs) == true
+        }.getOrDefault(false)
+
+        override fun pasteText(displayId: Int, text: String): Int {
+            val target = display(displayId) ?: return PASTE_FAILED
+            if (!clipboard.put(text)) return PASTE_NO_CLIPBOARD
+            return try {
+                // Ctrl+A then Ctrl+V: select whatever is in the field first, so
+                // the paste replaces it rather than appending to it.
+                if (!target.ctrlKey(KEYCODE_A) || !target.ctrlKey(KEYCODE_V)) {
+                    PASTE_FAILED
+                } else {
+                    // The app reads the clipboard when it handles the paste key.
+                    // Give it a moment before taking the clipboard back.
+                    Thread.sleep(PASTE_SETTLE_MS)
+                    PASTE_OK
+                }
+            } finally {
+                clipboard.restore()
+            }
+        }
+
+        override fun watchMainScreen(windowMs: Int): Int =
+            runCatching { mainWatch.watch(windowMs) }.getOrDefault(-1)
+
+        override fun mainArrivals(sinceUptimeMs: Long): String = runCatching {
+            val arrivals = mainWatch.arrivals(sinceUptimeMs)
+            val out = org.json.JSONArray()
+            for (arrival in arrivals) {
+                out.put(
+                    org.json.JSONObject()
+                        .put("task", arrival.taskId)
+                        .put("package", arrival.packageName ?: org.json.JSONObject.NULL)
+                        .put("at", arrival.at)
+                        .put("from", arrival.from)
+                        .put("sameTask", arrival.sameTask)
+                        .put("standard", arrival.standard)
+                        .put("now", mainWatch.displayOf(arrival.taskId)),
+                )
+            }
+            out.toString()
+        }.getOrElse {
+            Log.w(TAG, "mainArrivals failed: ${it.message}")
+            null
+        } ?: ""
+
+        override fun frameSignature(displayId: Int): ByteArray? =
+            runCatching { display(displayId)?.frameSignature() }.getOrNull()
+
+        override fun parallelLimit(): String {
+            val (limit, reason) = ParallelLimit.of(
+                sdk = TaskQuery.sdk(),
+                lowRam = TaskQuery.isLowRam(shellContext!!),
+                secondDisplayFailed = secondDisplayFailed,
+            )
+            return org.json.JSONObject()
+                .put("limit", limit)
+                .put("open", synchronized(lock) { displays.size })
+                .put("reason", reason ?: org.json.JSONObject.NULL)
+                .toString()
+        }
+
+        override fun displayCount(): Int = synchronized(lock) { displays.size }
+
         /** Tear everything down; called when the app's token dies. */
         fun releaseAll() {
             synchronized(lock) {
                 displays.values.forEach { runCatching { it.release() } }
                 displays.clear()
             }
+            runCatching { mainWatch.close() }
+            runCatching { clipboard.restore() }
         }
 
         private fun display(id: Int): AgentDisplay? = synchronized(lock) { displays[id] }
     }
+
+    private const val PASTE_OK = 0
+    private const val PASTE_NO_CLIPBOARD = 1
+    private const val PASTE_FAILED = 2
+    private const val PASTE_SETTLE_MS = 250L
+    private const val KEYCODE_A = android.view.KeyEvent.KEYCODE_A
+    private const val KEYCODE_V = android.view.KeyEvent.KEYCODE_V
 }
