@@ -151,7 +151,7 @@ regex = "1.10"
 ipnet = "2.9"
 
 # System monitoring (CPU, memory, disk, network, processes)
-sysinfo = "0.30"
+sysinfo = "0.40"
 
 # Browser automation (optional)
 chromiumoxide = { version = "0.9", optional = true }
