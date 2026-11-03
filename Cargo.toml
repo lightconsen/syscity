@@ -151,7 +151,14 @@ regex = "1.10"
 ipnet = "2.9"
 
 # System monitoring (CPU, memory, disk, network, processes)
-sysinfo = "0.30"
+#
+# 0.40 is the first release that compiles for iOS: every 0.39.x and earlier
+# pulls `libc::RTM_IFINFO2` in `src/unix/apple/network.rs` unconditionally,
+# but `libc` only defines that constant for `target_os = "macos"`, so the
+# `mobile` profile died with `error[E0432]: unresolved import RTM_IFINFO2`.
+# 0.40 gates the network backend on a `network` feature and returns
+# `Error::Unsupported` on iOS instead.
+sysinfo = "0.40"
 
 # Browser automation (optional)
 chromiumoxide = { version = "0.9", optional = true }
@@ -280,9 +287,16 @@ teloxide = { version = "0.17", features = ["macros"], optional = true }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model"], optional = true }
 
 # System resource limits and signals (Unix only)
+#
+# No `socket` feature: nothing here calls `nix::sys::socket`, and that module
+# is what breaks the iOS build. Its `SockProtocol::KextControl` is gated on
+# `cfg(apple_targets)` but reads `libc::SYSPROTO_CONTROL`, which `libc` only
+# defines for `target_os = "macos"` — so enabling it turns every iOS compile
+# into `error[E0425]: cannot find value SYSPROTO_CONTROL in crate libc`
+# (nix 0.31.3; same bug as rustix 1.1.4, fixed there in 1.1.6).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["signal", "process", "socket", "poll"] }
+nix = { version = "0.31", features = ["signal", "process", "poll"] }
 
 # Landlock kernel write fence (Linux filesystem MAC; pre_exec `restrict_self`)
 # Landlock crate is Linux-only and never built on other platforms.

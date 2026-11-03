@@ -30,10 +30,14 @@ pub(super) fn estimate_tokens(text: &str) -> u32 {
 }
 
 /// Capture current system memory usage in megabytes.
+///
+/// `None` on a platform `sysinfo` cannot read (notably iOS), where the dream
+/// engine simply runs without the memory trace.
 fn current_memory_mb() -> Option<f64> {
     let mut sys = System::new_with_specifics(
-        RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::new()),
-    );
+        RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing()),
+    )
+    .ok()?;
     sys.refresh_memory();
     Some(sys.used_memory() as f64 / 1024.0 / 1024.0)
 }

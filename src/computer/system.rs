@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-use sysinfo::{Disks, Networks, ProcessRefreshKind, RefreshKind, Signal, System};
+use sysinfo::{
+    Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, Signal, System,
+};
 
 use crate::computer::types::{DiskStatus, NetworkStatus, ProcessEntry, SystemStatus};
 use crate::computer::{ComputerError, Result};
@@ -15,79 +17,136 @@ use crate::computer::{ComputerError, Result};
 ///
 /// Create a new instance for each query (or keep one around and call
 /// `refresh_all()` before reading).
+///
+/// `sysinfo` returns `Result` from its constructors since 0.40 (it gained an
+/// iOS/App Store backend that can legitimately be unsupported), so the
+/// monitors are built once here and rebuilt on the first call that finds them
+/// missing rather than making every caller handle construction failure.
 pub struct SystemMonitor {
-    system: System,
-    networks: Networks,
-    disks: Disks,
+    system: Option<System>,
+    networks: Option<Networks>,
+    disks: Option<Disks>,
 }
 
 impl SystemMonitor {
     /// Create a monitor with all information freshly loaded.
     pub fn new() -> Self {
-        let system = System::new_with_specifics(RefreshKind::everything());
-        let networks = Networks::new_with_refreshed_list();
-        let disks = Disks::new_with_refreshed_list();
-        Self { system, networks, disks }
+        Self {
+            system: System::new_with_specifics(RefreshKind::everything()).ok(),
+            networks: Networks::new_with_refreshed_list().ok(),
+            disks: Disks::new_with_refreshed_list().ok(),
+        }
     }
 
     /// Refresh and return a full system status snapshot.
+    ///
+    /// On a platform where `sysinfo` reports no supported backend (iOS), this
+    /// returns whatever the static accessors can supply and empty collections
+    /// for the rest, rather than failing: `GetSystemStatus` is a read-only
+    /// convenience, and a phone has no `ps`/`df` to shell out to instead.
     pub fn get_status(&mut self) -> SystemStatus {
-        self.system.refresh_all();
-        self.networks.refresh();
-        self.disks.refresh();
+        if self.system.is_none() {
+            self.system = System::new_with_specifics(RefreshKind::everything()).ok();
+        }
+        if self.networks.is_none() {
+            self.networks = Networks::new_with_refreshed_list().ok();
+        }
+        if self.disks.is_none() {
+            self.disks = Disks::new_with_refreshed_list().ok();
+        }
 
-        let cpu_usage = if self.system.cpus().is_empty() {
-            0.0
-        } else {
-            self.system
-                .cpus()
-                .iter()
-                .map(|c| c.cpu_usage())
-                .sum::<f32>()
-                / self.system.cpus().len() as f32
+        if let Some(system) = self.system.as_mut() {
+            system.refresh_specifics(RefreshKind::everything());
+        }
+        if let Some(networks) = self.networks.as_mut() {
+            networks.refresh(false);
+        }
+        if let Some(disks) = self.disks.as_mut() {
+            disks.refresh(false);
+        }
+
+        let (cpu_usage, cpu_count) = match self.system.as_ref() {
+            Some(s) if !s.cpus().is_empty() => {
+                let cpus = s.cpus();
+                let total: f32 = cpus.iter().map(|c| c.usage()).sum();
+                (total / cpus.len() as f32, cpus.len())
+            }
+            _ => (0.0, 0),
         };
 
         let disks: Vec<DiskStatus> = self
             .disks
-            .list()
-            .iter()
+            .as_ref()
             .map(|d| {
-                let total = d.total_space();
-                let available = d.available_space();
-                let used = total.saturating_sub(available);
-                DiskStatus {
-                    name: d.name().to_string_lossy().to_string(),
-                    mount_point: d.mount_point().to_string_lossy().to_string(),
-                    total_gb: bytes_to_gb(total),
-                    used_gb: bytes_to_gb(used),
-                    available_gb: bytes_to_gb(available),
-                }
+                d.iter()
+                    .map(|d| {
+                        let total = d.total_space();
+                        let available = d.available_space();
+                        let used = total.saturating_sub(available);
+                        DiskStatus {
+                            name: d.name().to_string_lossy().to_string(),
+                            mount_point: d.mount_point().to_string_lossy().to_string(),
+                            total_gb: bytes_to_gb(total),
+                            used_gb: bytes_to_gb(used),
+                            available_gb: bytes_to_gb(available),
+                        }
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         let networks: Vec<NetworkStatus> = self
             .networks
-            .iter()
-            .map(|(name, data)| NetworkStatus {
-                name: name.clone(),
-                rx_bytes: data.total_received(),
-                tx_bytes: data.total_transmitted(),
+            .as_ref()
+            .map(|n| {
+                n.iter()
+                    .map(|(name, data)| NetworkStatus {
+                        name: name.to_string_lossy().to_string(),
+                        rx_bytes: data.total_received(),
+                        tx_bytes: data.total_transmitted(),
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         SystemStatus {
             hostname: System::host_name().unwrap_or_default(),
             os_name: System::name().unwrap_or_default(),
             os_version: System::os_version().unwrap_or_default(),
             kernel_version: System::kernel_version().unwrap_or_default(),
-            uptime_seconds: System::uptime(),
+            uptime_seconds: System::uptime().unwrap_or_default(),
             cpu_usage_percent: cpu_usage,
-            cpu_count: self.system.cpus().len(),
-            memory_total_mb: bytes_to_mb(self.system.total_memory()),
-            memory_used_mb: bytes_to_mb(self.system.used_memory()),
-            memory_available_mb: bytes_to_mb(self.system.available_memory()),
-            swap_total_mb: bytes_to_mb(self.system.total_swap()),
-            swap_used_mb: bytes_to_mb(self.system.used_swap()),
+            cpu_count,
+            memory_total_mb: bytes_to_mb(
+                self.system
+                    .as_ref()
+                    .map(|s| s.total_memory())
+                    .unwrap_or_default(),
+            ),
+            memory_used_mb: bytes_to_mb(
+                self.system
+                    .as_ref()
+                    .map(|s| s.used_memory())
+                    .unwrap_or_default(),
+            ),
+            memory_available_mb: bytes_to_mb(
+                self.system
+                    .as_ref()
+                    .map(|s| s.available_memory())
+                    .unwrap_or_default(),
+            ),
+            swap_total_mb: bytes_to_mb(
+                self.system
+                    .as_ref()
+                    .map(|s| s.total_swap())
+                    .unwrap_or_default(),
+            ),
+            swap_used_mb: bytes_to_mb(
+                self.system
+                    .as_ref()
+                    .map(|s| s.used_swap())
+                    .unwrap_or_default(),
+            ),
             disks,
             networks,
             timestamp: std::time::Instant::now(),
@@ -100,15 +159,21 @@ impl SystemMonitor {
         filter: Option<&str>,
         limit: Option<usize>,
     ) -> Vec<ProcessEntry> {
-        self.system
-            .refresh_processes_specifics(ProcessRefreshKind::everything());
+        let Some(system) = self.system.as_mut() else {
+            return Vec::new();
+        };
 
-        let mut entries: Vec<ProcessEntry> = self
-            .system
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything(),
+        );
+
+        let mut entries: Vec<ProcessEntry> = system
             .processes()
             .values()
             .filter_map(|p| {
-                let name = p.name().to_string();
+                let name = p.name().to_string_lossy().to_string();
                 if let Some(f) = filter {
                     if !name.to_lowercase().contains(&f.to_lowercase()) {
                         return None;
@@ -171,11 +236,12 @@ impl SystemMonitor {
         let target_pid = self.resolve_pid(pid, name)?;
 
         // Try to capture the original command line before killing.
-        let sys_pid = sysinfo::Pid::from(target_pid as usize);
-        let original_cmd = self
-            .system
-            .process(sys_pid)
-            .and_then(|p| p.cmd().first().map(|s| s.to_string()));
+        let sys_pid = sysinfo::Pid::from_u32(target_pid);
+        let original_cmd = self.system.as_ref().and_then(|system| {
+            system
+                .process(sys_pid)
+                .and_then(|p| p.cmd().first().map(|s| s.to_string_lossy().to_string()))
+        });
 
         // Kill the process.
         self.kill_process(Some(target_pid), None, force)?;
@@ -262,19 +328,32 @@ impl SystemMonitor {
 
     /// Resolve a PID from either an explicit PID or a process name.
     fn resolve_pid(&mut self, pid: Option<u32>, name: Option<&str>) -> Result<u32> {
-        self.system
-            .refresh_processes_specifics(ProcessRefreshKind::new().with_cpu());
-
         if let Some(p) = pid {
             return Ok(p);
         }
 
+        let Some(system) = self.system.as_mut() else {
+            return Err(ComputerError::ProcessNotFound(
+                "Process inspection is not available on this platform".to_string(),
+            ));
+        };
+
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu(),
+        );
+
         if let Some(n) = name {
-            return self
-                .system
+            return system
                 .processes()
                 .values()
-                .find(|p| p.name().to_lowercase().contains(&n.to_lowercase()))
+                .find(|p| {
+                    p.name()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&n.to_lowercase())
+                })
                 .map(|p| p.pid().as_u32())
                 .ok_or_else(|| {
                     ComputerError::ProcessNotFound(format!("No process matching '{}' found", n))
@@ -301,10 +380,14 @@ impl SystemMonitor {
     ) -> Result<u32> {
         let target_pid = self.resolve_pid(pid, name)?;
 
-        let sys_pid = sysinfo::Pid::from(target_pid as usize);
-        let process = self.system.process(sys_pid).ok_or_else(|| {
-            ComputerError::ProcessNotFound(format!("Process {} not found", target_pid))
-        })?;
+        let sys_pid = sysinfo::Pid::from_u32(target_pid);
+        let process = self
+            .system
+            .as_ref()
+            .and_then(|system| system.process(sys_pid))
+            .ok_or_else(|| {
+                ComputerError::ProcessNotFound(format!("Process {} not found", target_pid))
+            })?;
 
         let signal = if force { Signal::Kill } else { Signal::Term };
 
