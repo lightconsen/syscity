@@ -439,12 +439,26 @@ pub async fn watch_and_check_spill(
 }
 
 /// This app's own package — its task is the UI, never a spill.
-const SELF_PACKAGE: &str = "net.syscity.desktop";
+pub const SELF_PACKAGE: &str = "net.syscity.desktop";
 
 /// Packages that are never a spill: the launcher and the system UI sit on the
 /// user's screen by design.
 fn is_not_a_spill(package: &str) -> bool {
     package.contains("launcher") || package == "com.android.systemui" || package == SELF_PACKAGE
+}
+
+/// Whether `package` is Syscity's own UI.
+///
+/// The app's own screens — settings, pairing, the display list — are the
+/// controls that govern the agent. Tapping them is the agent reaching for its
+/// own levers: the setting it flips is the setting that is supposed to bound
+/// it, and the pairing screen it drives is where a new credential is handed
+/// out. A person can use those screens; an agent must not, and no approval
+/// makes it a good idea.
+pub fn is_own_app(package: &str) -> bool {
+    // Debug builds and forks carry a suffix; anything under this prefix is the
+    // same program.
+    package == SELF_PACKAGE || package.starts_with(&format!("{SELF_PACKAGE}."))
 }
 
 /// An app that ended up on the user's screen.
