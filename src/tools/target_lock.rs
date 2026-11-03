@@ -26,6 +26,7 @@
 //! adb resolves it to whatever is attached.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -43,6 +44,119 @@ pub const ANDROID: &str = "android-input";
 /// taking the lock at all, which is what the lock exists to prevent.
 pub fn android_device(serial: &str) -> String {
     format!("android-device:{serial}")
+}
+
+/// One virtual display of one phone.
+///
+/// A display has its own focus, so two displays on one phone are two places to
+/// type — the per-device lock made them wait for each other for no reason. The
+/// user's own screen (display 0) is *not* keyed this way: it has one focus and
+/// one visible owner, and [`android_device`] is what protects it.
+pub fn android_display(serial: &str, display: i32) -> String {
+    format!("android-display:{serial}:{display}")
+}
+
+/// One app on one phone, whatever display it is on.
+///
+/// Taking this *as well as* a display lock is what stops two tasks driving the
+/// same app on two different displays: the displays do not conflict, but the
+/// app does — one process, one account, one set of unsaved edits. It is always
+/// taken after the display lock and never on its own, so the two can never
+/// deadlock.
+pub fn android_app(serial: &str, package: &str) -> String {
+    format!("android-app:{serial}:{package}")
+}
+
+/// One app's lock, and how many writes have finished on it.
+#[derive(Default)]
+struct AppGate {
+    /// Held as an `Arc` so a caller's owned guard can be taken from a clone of
+    /// it, without borrowing the gate the map owns.
+    lock: Arc<AsyncMutex<()>>,
+    completed: Arc<AtomicU64>,
+}
+
+/// Exclusive use of one app, plus whether it arrived too late to be useful.
+///
+/// A caller finds out which app it is about to write to by reading the screen,
+/// and only then takes that app's lock — so the read is necessarily older than
+/// the lock. When another write to the same app finished in between, possibly
+/// on another display, [`stale`](Self::stale) says so and the caller re-reads
+/// rather than acting on a screen that has moved.
+pub struct AppLease {
+    guard: Option<OwnedMutexGuard<()>>,
+    completed: Option<Arc<AtomicU64>>,
+    pub stale: bool,
+}
+
+impl AppLease {
+    /// A lease nobody needed: no app was named.
+    pub fn none() -> Self {
+        Self {
+            guard: None,
+            completed: None,
+            stale: false,
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.guard.is_some()
+    }
+}
+
+impl Drop for AppLease {
+    fn drop(&mut self) {
+        // Counted here, on release, not on acquisition: a caller that acquired,
+        // wrote and released once must not read its own write as somebody
+        // else's and consider its own read stale.
+        if let Some(completed) = &self.completed {
+            completed.fetch_add(1, Ordering::SeqCst);
+        }
+        // Then the guard falls, releasing the app for the next writer.
+    }
+}
+
+/// The app leases and their completion counts.
+#[derive(Default)]
+pub struct AppGates {
+    gates: Mutex<HashMap<String, Arc<AppGate>>>,
+}
+
+impl AppGates {
+    pub fn global() -> &'static AppGates {
+        static GATES: OnceLock<AppGates> = OnceLock::new();
+        GATES.get_or_init(AppGates::default)
+    }
+
+    fn gate(&self, key: &str) -> Arc<AppGate> {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(gates.entry(key.to_string()).or_default())
+    }
+
+    /// How many writes to this app have finished so far.
+    ///
+    /// Take this *before* reading the screen, and hand it to
+    /// [`lease`](Self::lease) afterwards.
+    pub fn completed(&self, key: &str) -> u64 {
+        self.gate(key).completed.load(Ordering::SeqCst)
+    }
+
+    /// Wait for exclusive use of one app.
+    ///
+    /// `seen_completed` is what [`completed`](Self::completed) said before the
+    /// screen was read; the lease reports whether that read is still current.
+    pub async fn lease(&self, key: &str, seen_completed: u64) -> AppLease {
+        let gate = self.gate(key);
+        let guard = gate.lock.clone().lock_owned().await;
+        AppLease {
+            stale: gate.completed.load(Ordering::SeqCst) != seen_completed,
+            completed: Some(Arc::clone(&gate.completed)),
+            guard: Some(guard),
+        }
+    }
 }
 
 /// Process-wide locks, one per target.
@@ -179,5 +293,89 @@ mod tests {
         }
         let again = tokio::time::timeout(Duration::from_millis(200), locks.lock(DESKTOP)).await;
         assert!(again.is_ok(), "the target stayed locked after its guard dropped");
+    }
+
+    /// Two displays of one phone are two focuses; the same app on both is still
+    /// one app.
+    #[tokio::test]
+    async fn one_app_on_two_displays_is_one_app() {
+        let gates = AppGates::default();
+        let key = android_app("emulator-5554", "com.example.chat");
+        let _held = gates.lease(&key, 0).await;
+        let second = tokio::time::timeout(Duration::from_millis(200), gates.lease(&key, 0)).await;
+        assert!(second.is_err(), "two writers got into the same app at once");
+    }
+
+    /// And two different apps on those displays do not wait for each other.
+    #[tokio::test]
+    async fn different_apps_on_one_phone_do_not_block_each_other() {
+        let gates = AppGates::default();
+        let _one = gates
+            .lease(&android_app("emulator-5554", "com.example.chat"), 0)
+            .await;
+        let other = tokio::time::timeout(
+            Duration::from_millis(200),
+            gates.lease(&android_app("emulator-5554", "com.example.mail"), 0),
+        )
+        .await;
+        assert!(other.is_ok(), "a second app waited on the first");
+    }
+
+    /// The same app on two phones is two apps.
+    #[tokio::test]
+    async fn the_same_app_on_two_phones_is_two_leases() {
+        let gates = AppGates::default();
+        let _one = gates
+            .lease(&android_app("emulator-5554", "com.example.chat"), 0)
+            .await;
+        let other = tokio::time::timeout(
+            Duration::from_millis(200),
+            gates.lease(&android_app("emulator-5556", "com.example.chat"), 0),
+        )
+        .await;
+        assert!(other.is_ok(), "a second phone waited on the first");
+    }
+
+    /// A lease taken after somebody else wrote to the app says the read that
+    /// preceded it is out of date.
+    ///
+    /// This is the whole reason the completion count exists: the package name
+    /// that keys the lease comes from a read taken *before* the lock, so the
+    /// read can describe a screen somebody else has already changed.
+    #[tokio::test]
+    async fn a_lease_after_another_write_reports_a_stale_read() {
+        let gates = Arc::new(AppGates::default());
+        let key = android_app("emulator-5554", "com.example.chat");
+
+        // Read the count, as a caller does before its screen read.
+        let seen = gates.completed(&key);
+
+        // Somebody else writes and finishes first.
+        drop(gates.lease(&key, 0).await);
+
+        let late = gates.lease(&key, seen).await;
+        assert!(late.stale, "the read was older than a completed write but was not reported");
+    }
+
+    /// The writer that got in first has nothing to complain about.
+    #[tokio::test]
+    async fn an_uncontended_lease_is_not_stale() {
+        let gates = AppGates::default();
+        let key = android_app("emulator-5554", "com.example.chat");
+        let seen = gates.completed(&key);
+        assert!(!gates.lease(&key, seen).await.stale);
+    }
+
+    /// A lease counting its own release as a foreign write would mark every
+    /// second call stale, and the caller would re-read after nothing happened.
+    #[tokio::test]
+    async fn a_caller_does_not_make_its_own_read_stale() {
+        let gates = AppGates::default();
+        let key = android_app("emulator-5554", "com.example.chat");
+        let seen = gates.completed(&key);
+        drop(gates.lease(&key, seen).await);
+        let next_seen = gates.completed(&key);
+        assert_eq!(next_seen, seen + 1, "the release was not counted");
+        assert!(!gates.lease(&key, next_seen).await.stale);
     }
 }
