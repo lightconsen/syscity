@@ -548,6 +548,185 @@ jobs:
       - name: Check
         run: cargo check
 
+  android:
+    name: Android APK
+    # Nothing in CI compiled the phone build until now. `mobile` is a
+    # different feature set (`Cargo.toml`: no vision, no channels, bundled
+    # SQLite, embedded SPA assets), the Kotlin under `desktop/gen/android`
+    # only exists on this target, and `scripts/android-build.sh` had no
+    # caller — which is how `android_ocr` stayed registered on a build that
+    # has no `vision` to answer it with.
+    #
+    # Debug, not release: `app/build.gradle.kts` binds the `release` build
+    # type to a `keystore.properties` the runner does not have, and the
+    # release build then dies in `packageUniversalRelease` with
+    # `SigningConfig "release" is missing required property "storeFile"` —
+    # verified locally by moving that file aside. Debug still compiles all of
+    # the Rust `mobile` profile and all of the Kotlin, which is what this job
+    # is here to prove. R8 shrinking is therefore **not** covered: that only
+    # happens in a signed release build.
+    #
+    # The runner image already carries the SDK (`ANDROID_HOME`), three NDKs
+    # and a JDK 17; tauri-cli picks the newest NDK it finds, so no SDK
+    # install step is needed. `desktop/gen/android` is committed, so
+    # `tauri android init` must not run.
+    runs-on: ubuntu-latest
+    needs: check
+    # Drafts skip the expensive half; the cheap jobs below still run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # Only the dependencies: `beforeBuildCommand` ("cd web && npm run
+      # build") builds the SPA as part of `cargo tauri android build`, and
+      # `mobile` embeds `dist/` at compile time, so it has to exist by then.
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97"
+          targets: aarch64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0"
+
+      - name: Build the APK
+        working-directory: desktop
+        run: cargo tauri android build --apk --debug --ci --target aarch64
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: syscity-android-debug
+          path: desktop/gen/android/app/build/outputs/apk/universal/debug/*.apk
+          if-no-files-found: error
+
+  ios-unsigned:
+    name: iOS Unsigned Build
+    # The other half of the mobile profile, on the host Xcode needs. Unsigned
+    # (`--no-sign`) because the signing identity and provisioning profile live
+    # in secrets this job deliberately does not read: the point is that the
+    # Swift plugin (`desktop/mobile-ios`), the static library Xcode links from
+    # `Externals/`, and the `Gen/apple` project all still agree.
+    #
+    # Push-only, like `test-macos` and for the same reason: a cold macOS run
+    # is the most expensive job in this file, and iOS-only breakage is not a
+    # thing pull requests are gated on here.
+    #
+    # The deployment target is 15.0 (`project.yml`, the two configurations in
+    # the committed pbxproj, and the Podfile — changed together from 14.0).
+    # It has to be: Xcode 26, which `macos-latest` runs, supports no
+    # deployment target below 15.0 —
+    #   error: The iOS deployment target 'IPHONEOS_DEPLOYMENT_TARGET' is set
+    #   to 14.0, but the range of supported deployment target versions is
+    #   15.0 to 27.2.x
+    # So the app's floor follows the toolchain's floor instead of pinning the
+    # job to an older Xcode.
+    #
+    # Do not pin Xcode here. The alternative — `macos-15` with an explicit
+    # `xcode-select` to Xcode 16.4 — bought a toolchain two generations
+    # behind the one developers run, in exchange for keeping the floor at
+    # 14.0. Whatever `macos-latest` ships is the toolchain the app has to
+    # build with.
+    #
+    # `desktop/gen/apple` is committed, so `tauri ios init` must not run, and
+    # the build phase in `project.yml` shells out to
+    # `cargo tauri ios xcode-script`, which inherits this job's PATH (and so
+    # `~/.cargo/bin`). The Podfile declares no pods, so CocoaPods is never
+    # invoked either — xcodegen would rewrite the committed pbxproj anyway.
+    if: github.event_name == 'push'
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97"
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0"
+
+      # Only the dependencies, as in the `android` job: `beforeBuildCommand`
+      # ("cd web && npm run build") runs the SPA build as part of the Tauri
+      # build, and `mobile` embeds `dist/` at compile time. That command is
+      # resolved from the Tauri project directory (`desktop/`), so `web/` is
+      # two levels up and inside tauri-cli's three-level walk — the same
+      # arrangement the android job exercises.
+      - name: Build the unsigned IPA
+        working-directory: desktop
+        run: cargo tauri ios build --no-sign --ci --target aarch64
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: syscity-ios-unsigned
+          path: desktop/gen/apple/build/arm64/*.ipa
+          if-no-files-found: error
+
   frontend:
     name: Frontend Build
     runs-on: ubuntu-latest
