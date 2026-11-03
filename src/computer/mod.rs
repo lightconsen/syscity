@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::tools::ToolRegistry;
 
 pub mod audio;
+pub mod budget;
 pub mod display;
 pub mod element_index;
 pub mod fs_watch;
@@ -59,6 +60,7 @@ pub mod platform_windows;
 pub mod platform;
 
 pub use audio::{AudioCapture, AudioSegment, AudioSource, DetectedAudioEvent};
+pub use budget::StepBudget;
 pub use display::{CoordinateSpace, DisplayGeometry, DisplayInfo};
 pub use element_index::{ActionTarget, ResolveError, ResolvedElement, SnapshotCache, UiSnapshot};
 pub use fs_watch::{FileChangeEvent, FileChangeKind, FileWatchResult, FileWatcher};
@@ -92,6 +94,25 @@ pub enum ComputerError {
     ToolFailed(String),
     #[error("Element not found: {0}")]
     ElementNotFound(String),
+    /// More than one element matched, and picking one would be a guess.
+    #[error("Ambiguous target: {0}")]
+    AmbiguousTarget(String),
+    /// The step ran out of its time budget.
+    ///
+    /// Distinct from [`ComputerError::Timeout`], which is a wait that ended
+    /// the way waits do: this is the *caller's* ceiling being reached in the
+    /// middle of a step, so the answer is a larger budget rather than a
+    /// longer wait.
+    #[error("Step budget exhausted: {0}")]
+    BudgetExhausted(String),
+    /// Nothing matched, and the tree was not read in full.
+    ///
+    /// Separate from [`ComputerError::ElementNotFound`] on purpose: one says
+    /// the element is not there, the other says this read did not see all of
+    /// it. Only the second is worth a deeper retry, and telling a caller
+    /// "re-aim" when it should "re-read" wastes the turn.
+    #[error("{0}")]
+    TreeIncomplete(String),
     #[error("{0}")]
     StaleElement(String),
     #[error("Timeout waiting for condition")]
@@ -104,6 +125,18 @@ pub enum ComputerError {
     ProcessNotFound(String),
     #[error("Failed to kill process: {0}")]
     KillFailed(String),
+    /// No rung could run, and the rungs that tried left evidence behind.
+    ///
+    /// The ladder's failure is not one error, it is "these rungs could not do
+    /// this, and here is what each of them learned". Flattening it to a string
+    /// loses the very facts a caller would retry or re-aim on.
+    #[error("{error}")]
+    NoRung {
+        /// The last error, or a generic explanation when a rung reported none.
+        error: String,
+        /// What the rungs established before giving up.
+        evidence: Box<crate::computer::ActionEvidence>,
+    },
     #[error("Other: {0}")]
     Other(String),
 }
@@ -158,6 +191,22 @@ pub trait ComputerAdapter: Send + Sync {
         Err(ComputerError::UnsupportedPlatform(
             "accessibility actions are not supported by this adapter".to_string(),
         ))
+    }
+
+    /// Which element would receive an event at a screen point.
+    ///
+    /// The pixel rung aims at a point, and a point is not an element: a
+    /// dialog, a notification, or another window can be drawn over it. The
+    /// platform's own hit test answers "what is at this point", so a click
+    /// that would land somewhere else can be refused with the occluder named
+    /// instead of dispatched and reported as a success the wrong window got.
+    ///
+    /// `target` is what the caller meant to click, when it knows; a platform
+    /// that can only report the element under the point uses it to decide
+    /// whether the two are the same. The default reports `Unknown`: an
+    /// adapter that has no hit test must not pretend the point is clear.
+    async fn hit_test(&self, _point: Point, _target: Option<&ActionTarget>) -> HitTestResult {
+        HitTestResult::Unknown
     }
 
     /// Whether this adapter can deliver input without taking the foreground.
@@ -356,19 +405,25 @@ mod tests {
             role: "window".to_string(),
             label: Some("Main".to_string()),
             value: None,
-            bounds: Rect::new(0, 0, 100, 100),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(0, 0, 100, 100)),
+            enabled: crate::computer::Tri::Known(true),
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
             children: vec![UiElement {
                 id: "btn".to_string(),
                 role: "button".to_string(),
                 label: Some("OK".to_string()),
                 value: None,
-                bounds: Rect::new(10, 10, 50, 20),
-                enabled: true,
-                focused: false,
+                bounds: Some(Rect::new(10, 10, 50, 20)),
+                enabled: crate::computer::Tri::Known(true),
+                focused: crate::computer::Tri::Unknown,
+                actions: None,
                 children: vec![],
+                children_count: None,
+                truncated: false,
             }],
+            children_count: None,
+            truncated: false,
         };
 
         let btn = tree.find_by_role("button");
@@ -383,12 +438,68 @@ mod tests {
             role: "button".to_string(),
             label: None,
             value: None,
-            bounds: Rect::new(10, 20, 100, 50),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(10, 20, 100, 50)),
+            enabled: crate::computer::Tri::Known(true),
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
             children: vec![],
+            children_count: None,
+            truncated: false,
         };
-        assert_eq!(el.center(), Point::new(60, 45));
+        assert_eq!(el.center(), Some(Point::new(60, 45)));
+    }
+
+    fn node(children: Vec<UiElement>, children_count: Option<u32>, truncated: bool) -> UiElement {
+        UiElement {
+            id: String::new(),
+            role: "window".to_string(),
+            label: None,
+            value: None,
+            bounds: None,
+            enabled: crate::computer::Tri::Unknown,
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
+            children,
+            children_count,
+            truncated,
+        }
+    }
+
+    /// A node that reports more children than it carries was cut. The count
+    /// is the evidence; without a count there is nothing to contradict.
+    #[test]
+    fn a_short_child_list_against_a_larger_count_is_incomplete() {
+        let cut = node(vec![node(vec![], None, false)], Some(3), false);
+        assert!(cut.children_incomplete());
+        assert!(!cut.subtree_is_complete());
+
+        let whole = node(vec![node(vec![], None, false)], Some(1), false);
+        assert!(!whole.children_incomplete());
+        assert!(whole.subtree_is_complete());
+
+        // A platform that does not report counts says nothing about
+        // completeness, and nothing is all we can honestly claim.
+        let unknown = node(vec![], None, false);
+        assert!(unknown.subtree_is_complete());
+    }
+
+    /// A cut below the root makes the whole tree incomplete, even though the
+    /// root's own child list is exactly what the platform said it would be.
+    #[test]
+    fn incompleteness_propagates_from_a_deep_node() {
+        let root = node(vec![node(vec![node(vec![], None, true)], Some(1), false)], Some(1), false);
+        assert!(!root.children_incomplete());
+        assert!(!root.subtree_is_complete());
+        assert!(!UiElement::tree_is_complete(&[root]));
+    }
+
+    /// The flag and the count are independent answers, and either one is
+    /// enough to say the read stopped short.
+    #[test]
+    fn a_truncation_flag_alone_is_incomplete() {
+        let flagged = node(vec![], None, true);
+        assert!(flagged.children_incomplete());
+        assert!(!UiElement::tree_is_complete(&[flagged]));
     }
 
     #[test]

@@ -123,6 +123,95 @@ pub enum FullTraceEvent {
         success: bool,
         duration_ms: u64,
     },
+    /// One step of the computer-use ladder.
+    ///
+    /// A tool call says "the `computer` tool ran and took 800 ms"; this says
+    /// which rung it used, what the screen did, whether a second rung was
+    /// tried, how long it settled for, and — when the pixel rung refused —
+    /// what was in the way. Without it, "the click did nothing" is a symptom
+    /// with no record of the decision behind it.
+    ///
+    /// The payload is masked before it is written (see [`ActionTraceEvent::from_evidence`]):
+    /// an action's recovery text can quote a label from a password field, and
+    /// the trace is a file that outlives the turn.
+    Action {
+        round: u32,
+        /// The tool action, e.g. `click`, `type`, `screenshot`.
+        action: String,
+        /// Everything the evidence carries: rung, effect, delivery, retry,
+        /// tried rungs, escalation, recovery hint, occluder, settle time.
+        detail: serde_json::Value,
+    },
+}
+
+/// The action-level trace of one computer-use step.
+///
+/// Serialized into the turn's `full.json` as a `FullTraceEvent::Action` line.
+/// Everything here comes from [`crate::computer::ActionEvidence`] or the
+/// session's settle timing — nothing is invented for the record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionTraceEvent {
+    /// The tool action that produced it.
+    pub action: String,
+    /// Rung the evidence names.
+    pub rung: String,
+    /// `confirmed` / `unverifiable` / `suspected_noop` / `partial` / `refused`.
+    pub effect: String,
+    /// Whether the input reached the target, as the driver reported it.
+    pub delivery: String,
+    /// Whether repeating the step is safe.
+    pub retry: String,
+    /// Rungs tried and rejected before this one, lowest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tried: Vec<String>,
+    /// The next rung this evidence escalates to, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate: Option<String>,
+    /// What the caller must change for the action to succeed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
+    /// Time spent waiting for the screen to stop changing, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_ms: Option<u64>,
+    /// The element the hit test found in the way, when one was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_test: Option<crate::computer::Occluder>,
+}
+
+impl ActionTraceEvent {
+    /// Build the trace line for one step.
+    ///
+    /// `detail` is the same evidence object the model was shown, already
+    /// masked by the caller: one representation, so the file cannot disagree
+    /// with what the model acted on.
+    pub fn from_detail(action: &str, detail: &serde_json::Value) -> Self {
+        let text = |key: &str| detail.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        let tried = detail
+            .get("tried")
+            .and_then(|v| v.as_array())
+            .map(|rs| {
+                rs.iter()
+                    .filter_map(|r| r.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let hit_test = detail
+            .get("occluder")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        Self {
+            action: action.to_string(),
+            rung: text("rung").unwrap_or_else(|| "unknown".to_string()),
+            effect: text("effect").unwrap_or_else(|| "unknown".to_string()),
+            delivery: text("delivery").unwrap_or_else(|| "unknown".to_string()),
+            retry: text("retry").unwrap_or_else(|| "unknown".to_string()),
+            tried,
+            escalate: text("escalate").or_else(|| text("escalation")),
+            recovery: text("recovery"),
+            settle_ms: detail.get("settle_ms").and_then(|v| v.as_u64()),
+            hit_test,
+        }
+    }
 }
 
 /// Parse `raw` into a JSON value, falling back to a plain string value when it

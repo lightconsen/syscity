@@ -27,6 +27,43 @@ impl DesktopControlTool {
         Self
     }
 
+    /// PowerShell for a mouse drag, with a Release Guard.
+    ///
+    /// The button goes down at the start and only comes up at the end. A
+    /// failure in between — the move raising, the process dying — leaves the
+    /// system with the left button held, and every later click in every app
+    /// arrives as part of the drag. The `catch` posts the release whatever
+    /// happened, and the output says which path ran so a caller is never told
+    /// a clean "dragged" for a drag that stranded the button.
+    fn build_drag_script(from_x: i64, from_y: i64, to_x: i64, to_y: i64) -> String {
+        format!(
+            r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class Click {{ [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo); }}
+"@
+$ErrorActionPreference = 'Stop'
+try {{
+    [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({from_x}, {from_y})
+    Start-Sleep -Milliseconds 100
+    [Click]::mouse_event(0x02, 0, 0, 0, 0)
+    Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({to_x}, {to_y})
+    [Click]::mouse_event(0x04, 0, 0, 0, 0)
+    Write-Output "dragged"
+}} catch {{
+    try {{
+        [Click]::mouse_event(0x04, 0, 0, 0, 0)
+        Write-Output ("emergency-release: " + $_)
+    }} catch {{
+        Write-Output ("release-failed: " + $_)
+    }}
+}}
+"#
+        )
+    }
+
     async fn run_ps(script: &str) -> crate::Result<(bool, String, String)> {
         let output = timeout(
             Duration::from_secs(15),
@@ -143,7 +180,7 @@ impl Tool for DesktopControlTool {
         // One pointer and one focus: two conversations must not drive this
         // display at once. See `tools::target_lock`.
         let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::DESKTOP)
+            .lock_across_processes(crate::tools::target_lock::DESKTOP)
             .await;
         let action = args
             .get("action")
@@ -275,22 +312,21 @@ public class Click {{ [DllImport("user32.dll")] public static extern void mouse_
                 let from_y = args.get("from_y").and_then(|v| v.as_i64()).unwrap_or(0);
                 let to_x = args.get("to_x").and_then(|v| v.as_i64()).unwrap_or(0);
                 let to_y = args.get("to_y").and_then(|v| v.as_i64()).unwrap_or(0);
-                let script = format!(
-                    r#"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})
-Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class Click {{ [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo); }}
-"@
-[Click]::mouse_event(0x02, 0, 0, 0, 0)
-Start-Sleep -Milliseconds 100
-[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})
-[Click]::mouse_event(0x04, 0, 0, 0, 0)
-"#,
-                    from_x, from_y, to_x, to_y
-                );
-                let (ok, _, err) = Self::run_ps(&script).await?;
+                let script = Self::build_drag_script(from_x, from_y, to_x, to_y);
+                let (ok, stdout, err) = Self::run_ps(&script).await?;
+                let output = stdout.trim().to_string();
+                if output.starts_with("release-failed:") {
+                    // The button may still be held: a failure the caller
+                    // must see, not a drag that "mostly worked".
+                    return Ok(ToolExecutionResult::error(output));
+                }
+                if output.starts_with("emergency-release:") {
+                    let mut result = ToolExecutionResult::error(format!("Drag failed: {}", output));
+                    result.data = Some(serde_json::json!({
+                        "emergency_release_posted": true,
+                    }));
+                    return Ok(result);
+                }
                 if ok {
                     Ok(ToolExecutionResult::success(format!(
                         "Dragged from ({}, {}) to ({}, {})",
@@ -657,5 +693,20 @@ mod tests {
     fn test_desktop_control_tool_creation() {
         let tool = DesktopControlTool::new();
         assert_eq!(tool.name(), "windows_desktop_control");
+    }
+
+    /// The drag holds the left button across a move; if anything raises in
+    /// between, the catch branch must post the release and say so.
+    #[test]
+    fn a_drag_script_releases_the_button_on_error() {
+        let script = DesktopControlTool::build_drag_script(10, 20, 100, 120);
+        assert!(script.contains("mouse_event(0x02"), "{script}");
+        let error_branch = &script[script.find("catch {").expect("catch branch")..];
+        assert!(
+            error_branch.contains("mouse_event(0x04"),
+            "the catch branch must release the button: {script}"
+        );
+        assert!(script.contains("emergency-release"), "{script}");
+        assert!(script.contains("release-failed"), "{script}");
     }
 }

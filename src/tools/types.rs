@@ -282,6 +282,23 @@ pub struct ToolContext {
     /// wait, and a steer left in the controller would arrive only after the
     /// tool returned. `None` outside an agent turn, where nothing can steer.
     pub steers: Option<Arc<crate::acp::ExecutionController>>,
+    /// The turn whose trace this tool call belongs to.
+    ///
+    /// A tool that makes a decision worth replaying — the computer ladder's
+    /// rung, effect and occluder — files it here instead of only in its
+    /// result text, so the decision survives into `full.json`. `None` outside
+    /// an agent turn (tests, one-off tool use), where there is no turn to
+    /// trace.
+    pub trace: Option<Arc<dyn TurnTrace>>,
+}
+
+/// The part of a turn an independently-invoked tool may write to.
+///
+/// Kept as a trait because the collector lives behind `&mut` in the agent
+/// loop: a tool runs inside it and cannot borrow it, so it holds this instead.
+pub trait TurnTrace: Send + Sync + std::fmt::Debug {
+    /// File one computer-use step against the current round.
+    fn record_action(&self, rec: &crate::observe::ActionTraceEvent);
 }
 
 /// Allowed environment variables that are safe to forward to child processes.
@@ -556,6 +573,13 @@ impl ToolContext {
     /// can also notice them typing.
     pub fn with_steers(mut self, controller: Option<Arc<crate::acp::ExecutionController>>) -> Self {
         self.steers = controller;
+        self
+    }
+
+    /// Attach the running turn's trace, so a tool that makes a replayable
+    /// decision can file it.
+    pub fn with_trace(mut self, trace: Option<Arc<dyn TurnTrace>>) -> Self {
+        self.trace = trace;
         self
     }
 
@@ -976,12 +1000,24 @@ impl ToolExecutionResult {
     }
 
     /// Convert to a ToolResult for LLM response
+    ///
+    /// The structured `data` a tool produced is folded into `content`: every
+    /// provider's tool message is a string, so a `data` object that stays in
+    /// this struct never reaches the model. Dropping it is how a refusal's
+    /// recovery hint, or the evidence saying which rung ran, became invisible
+    /// to the very caller that had to decide what to do next.
     pub fn to_tool_result(self, tool_call_id: impl Into<String>) -> ToolResult {
-        let content = if self.success {
+        let mut content = if self.success {
             self.output
         } else {
             format!("Error: {}", self.error.unwrap_or_else(|| "Unknown error".to_string()))
         };
+        if let Some(data) = self.data.as_ref() {
+            if let Some(folded) = fold_tool_data(data) {
+                content.push_str("\n[data] ");
+                content.push_str(&folded);
+            }
+        }
 
         ToolResult {
             tool_call_id: tool_call_id.into(),
@@ -990,6 +1026,67 @@ impl ToolExecutionResult {
             is_error: Some(!self.success),
         }
     }
+}
+
+/// Byte budget for the `data` folded into a tool message.
+///
+/// The evidence that matters (`rung`, `effect`, `delivery`, `retry`,
+/// `recovery`, `tried`) is tens of bytes; the budget exists so that a bulky
+/// payload — a UI tree, an OCR dump — cannot crowd the model's context.
+const TOOL_DATA_FOLD_LIMIT: usize = 4_000;
+
+/// Keys whose values are too large, or too structured, to inline in a tool
+/// message. They stay in `data` for the UI and the traces; the model is told
+/// the payload exists rather than handed a base64 screenshot.
+const TOOL_DATA_ELIDED_KEYS: &[&str] = &[
+    "screenshot_base64",
+    "screenshot",
+    "base64",
+    "image_base64",
+    "elements",
+    "tree",
+];
+
+/// Render structured tool data as text for the model.
+///
+/// Returns `None` when there is nothing worth saying — an empty object would
+/// add noise to every tool message that carries one.
+fn fold_tool_data(data: &Value) -> Option<String> {
+    let elided: Vec<&str> = TOOL_DATA_ELIDED_KEYS
+        .iter()
+        .copied()
+        .filter(|key| data.get(*key).is_some_and(|v| !v.is_null()))
+        .collect();
+    let rendered = if elided.is_empty() {
+        let masked = crate::secrets::mask_json_value(data);
+        serde_json::to_string(&masked).ok()?
+    } else {
+        let mut trimmed = data.clone();
+        let mut placeholders = Vec::new();
+        if let Some(obj) = trimmed.as_object_mut() {
+            for key in &elided {
+                if let Some(value) = obj.remove(*key) {
+                    let size = match &value {
+                        Value::Array(arr) => format!("{} items", arr.len()),
+                        Value::String(s) => format!("{} chars", s.chars().count()),
+                        _ => "payload".to_string(),
+                    };
+                    placeholders.push(format!("{key}: {size} omitted"));
+                }
+            }
+        }
+        let masked = crate::secrets::mask_json_value(&trimmed);
+        let mut out = serde_json::to_string(&masked).ok()?;
+        if !placeholders.is_empty() {
+            out.push_str(&format!(" ({})", placeholders.join(", ")));
+        }
+        out
+    };
+    let rendered = crate::tools::head_tail_truncate(&rendered, TOOL_DATA_FOLD_LIMIT);
+    if rendered.trim().is_empty() || rendered == "{}" {
+        return None;
+    }
+    Some(rendered)
 }
 
 /// Trait for tools that can be executed by the agent
@@ -1117,6 +1214,108 @@ mod path_permission_tests {
         let ctx = ToolContext::new("user", "conv").with_workspace_root("/tmp");
         assert!(ctx.is_path_allowed(std::path::Path::new("/tmp/notes.md")));
         assert!(!ctx.is_path_allowed(std::path::Path::new("/etc/passwd")));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_fold_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The evidence a computer action computes only ever lived in `data`, and
+    /// `to_tool_result` dropped it. The model now sees it.
+    #[test]
+    fn data_reaches_the_model_on_success() {
+        let result = ToolExecutionResult::success("clicked").with_data(json!({
+            "rung": "ax_action",
+            "effect": "confirmed",
+            "retry": "unsafe",
+        }));
+        let tool_result = result.to_tool_result("call-1");
+        assert_eq!(tool_result.is_error, Some(false));
+        assert!(tool_result.content.starts_with("clicked\n[data] "));
+        assert!(
+            tool_result.content.contains("\"rung\":\"ax_action\""),
+            "{}",
+            tool_result.content
+        );
+        assert!(tool_result.content.contains("\"retry\":\"unsafe\""));
+    }
+
+    /// A failure used to reach the model as `error` text only, losing the
+    /// same evidence the success branch lost.
+    #[test]
+    fn data_reaches_the_model_on_failure_too() {
+        let mut result = ToolExecutionResult::error("refused");
+        result.data = Some(json!({ "recovery": "read the tree again" }));
+        let tool_result = result.to_tool_result("call-2");
+        assert_eq!(tool_result.is_error, Some(true));
+        assert!(tool_result.content.starts_with("Error: refused\n[data] "));
+        assert!(tool_result.content.contains("read the tree again"));
+    }
+
+    /// An empty payload is noise on every tool message that carries one.
+    #[test]
+    fn an_empty_data_object_adds_nothing() {
+        let result = ToolExecutionResult::success("ok").with_data(json!({}));
+        assert_eq!(result.to_tool_result("c").content, "ok");
+    }
+
+    /// A base64 screenshot is hundreds of kilobytes and is already rendered
+    /// as an attachment line in the output. The model is told it exists.
+    #[test]
+    fn an_inline_screenshot_is_elided_not_inlined() {
+        let big = "A".repeat(200_000);
+        let result = ToolExecutionResult::success("clicked").with_data(json!({
+            "rung": "pixel",
+            "screenshot_base64": big,
+            "screenshot_width": 800,
+        }));
+        let content = result.to_tool_result("c").content;
+        assert!(!content.contains("AAAA"), "base64 leaked into the tool message");
+        assert!(content.contains("screenshot_base64: 200000 chars omitted"), "{content}");
+        assert!(content.contains("\"rung\":\"pixel\""));
+        assert!(content.contains("\"screenshot_width\":800"));
+    }
+
+    /// A UI tree can be the largest thing a tool returns; it is summarised.
+    #[test]
+    fn a_bulky_element_tree_is_elided() {
+        let elements: Vec<Value> = (0..500)
+            .map(|i| json!({ "role": "button", "i": i }))
+            .collect();
+        let result = ToolExecutionResult::success("read")
+            .with_data(json!({ "app": "Finder", "elements": elements }));
+        let content = result.to_tool_result("c").content;
+        assert!(content.contains("elements: 500 items omitted"), "{content}");
+        assert!(content.contains("\"app\":\"Finder\""));
+    }
+
+    /// Secret-shaped keys are masked before the text reaches the model, the
+    /// same way config-shaped JSON is masked elsewhere.
+    #[test]
+    fn secret_shaped_values_are_masked() {
+        let result = ToolExecutionResult::success("done").with_data(json!({
+            "api_key": "sk-1234567890abcdef",
+        }));
+        let content = result.to_tool_result("c").content;
+        assert!(!content.contains("1234567890abcdef"), "{content}");
+        assert!(content.contains('•'), "{content}");
+    }
+
+    /// The fold has a byte budget: a small payload rides along in full, a
+    /// huge one is truncated rather than swallowing the context window.
+    #[test]
+    fn the_fold_is_bounded() {
+        let wide = (0..200)
+            .map(|i| format!("\"key_{i}\": \"{}\"", "x".repeat(100)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let data: Value = serde_json::from_str(&format!("{{{wide}}}")).unwrap();
+        let result = ToolExecutionResult::success("ok").with_data(data);
+        let content = result.to_tool_result("c").content;
+        assert!(content.len() < TOOL_DATA_FOLD_LIMIT + 200, "{} bytes", content.len());
+        assert!(content.contains("bytes omitted"), "the truncation says so");
     }
 }
 

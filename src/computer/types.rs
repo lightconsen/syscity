@@ -245,6 +245,73 @@ impl Rect {
     }
 }
 
+/// A three-state answer about one element property.
+///
+/// Two states cannot hold the truth about an accessibility attribute: a read
+/// that failed is not the same answer as a read that said "no", and folding
+/// them together invents a fact. `Unknown` is the property this type exists
+/// for — the platform did not tell us, and the caller must decide what that
+/// means for *its* question (skip a rung, refuse, or proceed and say so).
+///
+/// `Absent` is an answer, not a gap: the element does not publish this
+/// property (a static label has no `enabled`), so a gate that asks "is it
+/// disabled?" is satisfied — nothing says it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tri {
+    /// The property was read, and has this value.
+    Known(bool),
+    /// The element does not publish this property.
+    Absent,
+    /// The read failed, or the platform does not expose the property at all.
+    Unknown,
+}
+
+impl std::fmt::Display for Tri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(value) => write!(f, "{value}"),
+            Self::Absent => write!(f, "absent"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl Tri {
+    /// The value when the read succeeded.
+    pub fn known(self) -> Option<bool> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+
+    /// Whether this answer positively says the gate would fail.
+    ///
+    /// Only `Known(false)` blocks: `Absent` means the question does not apply
+    /// to this element, and `Unknown` means it was never asked.
+    pub fn is_false(self) -> bool {
+        matches!(self, Self::Known(false))
+    }
+
+    /// Whether anything at all is known.
+    pub fn is_known(self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+}
+
+impl From<Option<bool>> for Tri {
+    /// `None` is "the platform did not answer" — `Unknown`, never `Absent`:
+    /// a parser that returns `None` has not established that the element
+    /// declines to publish the property.
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            Some(value) => Self::Known(value),
+            None => Self::Unknown,
+        }
+    }
+}
+
 /// A UI element as seen by the accessibility / UI automation layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiElement {
@@ -256,29 +323,86 @@ pub struct UiElement {
     pub label: Option<String>,
     /// Current value (for inputs, checkboxes, sliders).
     pub value: Option<String>,
-    /// Bounding box in logical coordinates.
-    pub bounds: Rect,
+    /// Bounding box in logical coordinates, when the platform published one.
+    ///
+    /// `None` is a read failure, and is deliberately not (0,0,0,0): an element
+    /// with no geometry cannot be clicked, and pretending it sits at the
+    /// origin makes it look like an invisible-but-valid target.
+    pub bounds: Option<Rect>,
     /// Whether the element is enabled for interaction.
-    pub enabled: bool,
+    pub enabled: Tri,
     /// Whether the element currently has keyboard focus.
-    pub focused: bool,
+    pub focused: Tri,
+    /// The actions the element itself says it supports (`AXActions` on macOS,
+    /// `GetSupportedPatterns()` on Windows, the AT-SPI action names).
+    ///
+    /// `None` means the platform did not report them; `Some(vec![])` means it
+    /// answered "none", which is a different and more useful fact. This is
+    /// what the accessibility rung gates on — see
+    /// [`UiElement::supports_ax_action`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<String>>,
     /// Child elements (tree structure).
     pub children: Vec<UiElement>,
+    /// How many children the platform said this element has, when it said.
+    ///
+    /// This is what makes "the tree is complete" a decidable proposition
+    /// rather than a hope: a node whose `children_count` is larger than
+    /// `children.len()` was cut by the walker's depth or line budget, and a
+    /// caller looking for an element under it is not looking at everything.
+    /// `None` means the platform did not report a count — which is not the
+    /// same as "no children".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_count: Option<u32>,
+    /// Whether this node's children were cut short by the read.
+    ///
+    /// Distinct from a short `children` list: an element can have no children
+    /// *and* be complete. Only a platform that knows it stopped early sets
+    /// this; for trees read through a budget the walker stamps it itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Parse a UI element from accessibility tool JSON output.
 /// Handles the format produced by platform accessibility tools:
-/// `{ role, name, value, enabled, x, y, width, height, children }`.
+/// `{ role, name, value, enabled, x, y, width, height, actions, children }`.
+///
+/// A missing coordinate or an unreadable `enabled` no longer drops the element
+/// or invents a value: the geometry becomes `None` and the flag `Unknown`, so
+/// the element still exists and still says what the platform did not answer.
+/// Only `role` is required — an element with no role cannot be described at
+/// all.
 pub fn ui_element_from_accessibility_json(value: &serde_json::Value) -> Option<UiElement> {
     let obj = value.as_object()?;
     let role = obj.get("role")?.as_str()?.to_string();
-    let name = obj.get("name")?.as_str().unwrap_or("").to_string();
-    let x = obj.get("x")?.as_i64()? as i32;
-    let y = obj.get("y")?.as_i64()? as i32;
-    let width = obj.get("width")?.as_i64()? as u32;
-    let height = obj.get("height")?.as_i64()? as u32;
-    let enabled = obj.get("enabled")?.as_bool().unwrap_or(true);
+    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let x = obj.get("x").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let y = obj.get("y").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let width = obj
+        .get("width")
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as u32);
+    let height = obj
+        .get("height")
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as u32);
+    let bounds = match (x, y, width, height) {
+        (Some(x), Some(y), Some(width), Some(height)) => Some(Rect::new(x, y, width, height)),
+        _ => None,
+    };
+    let enabled = match obj.get("enabled") {
+        // A key that is present but not a boolean is a read failure, not a
+        // silent `true`: the caller decides, and `Unknown` says so.
+        Some(value) => Tri::from(value.as_bool()),
+        None => Tri::Unknown,
+    };
+    let focused = Tri::from(obj.get("focused").and_then(|v| v.as_bool()));
     let value = obj.get("value").and_then(|v| v.as_str()).map(String::from);
+    let actions = obj.get("actions").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
 
     let children = obj
         .get("children")
@@ -290,6 +414,18 @@ pub fn ui_element_from_accessibility_json(value: &serde_json::Value) -> Option<U
         })
         .unwrap_or_default();
 
+    // A platform that reports how many children it has, and reports a
+    // `truncated` flag, is the only one that can make "the tree is complete"
+    // decidable. Both are optional, and neither is invented.
+    let children_count = obj
+        .get("children_count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(u32::MAX as u64) as u32);
+    let truncated = obj
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Some(UiElement {
         // `AutomationId` when the application publishes one; snapshot-path
         // ids are filled in by `element_index::assign_ids` for the rest.
@@ -299,12 +435,19 @@ pub fn ui_element_from_accessibility_json(value: &serde_json::Value) -> Option<U
             .unwrap_or("")
             .to_string(),
         role,
-        label: if name.is_empty() { None } else { Some(name) },
+        label: if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        },
         value,
-        bounds: Rect::new(x, y, width, height),
+        bounds,
         enabled,
-        focused: false,
+        focused,
+        actions,
         children,
+        children_count,
+        truncated,
     })
 }
 
@@ -318,6 +461,36 @@ pub fn parse_accessibility_elements(data: Option<&serde_json::Value>) -> Vec<UiE
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The error a failed accessibility read should surface as.
+///
+/// A read can fail three ways, and they are not interchangeable:
+///
+/// - the OS refused it (Accessibility permission missing) — retrying is
+///   pointless until a human grants it;
+/// - it ran out of time — the tree was too deep or the platform too slow,
+///   and a shallower read or a retry may work;
+/// - it said something else — a spawn error, malformed output.
+///
+/// Reporting all three as "no permission" sent callers to the permission pane
+/// for a tree that was merely too deep, which is the macOS bug this replaces.
+pub fn accessibility_read_error(
+    data: Option<&serde_json::Value>,
+    message: &str,
+    timed_out: bool,
+) -> crate::computer::ComputerError {
+    let needs_permission = data
+        .and_then(|d| d.get("needs_permission"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if needs_permission {
+        crate::computer::ComputerError::AccessibilityDenied
+    } else if timed_out || message.to_ascii_lowercase().contains("timed out") {
+        crate::computer::ComputerError::Timeout
+    } else {
+        crate::computer::ComputerError::ToolFailed(message.to_string())
+    }
 }
 
 impl UiElement {
@@ -352,12 +525,61 @@ impl UiElement {
         None
     }
 
-    /// Compute the center point of this element's bounds.
-    pub fn center(&self) -> Point {
-        Point::new(
-            self.bounds.x + self.bounds.width as i32 / 2,
-            self.bounds.y + self.bounds.height as i32 / 2,
-        )
+    /// Compute the center point of this element's bounds, when it has any.
+    ///
+    /// `None` for an element whose geometry could not be read: aiming a click
+    /// at a made-up point is worse than saying the element cannot be clicked.
+    pub fn center(&self) -> Option<Point> {
+        let bounds = self.bounds?;
+        Some(Point::new(
+            bounds.x + bounds.width as i32 / 2,
+            bounds.y + bounds.height as i32 / 2,
+        ))
+    }
+
+    /// Whether this node's children are known to be cut short.
+    ///
+    /// True when the read said so, or when the platform reported more children
+    /// than it handed over. Both mean the same thing to a caller: an element
+    /// that cannot be found here may still exist below.
+    pub fn children_incomplete(&self) -> bool {
+        self.truncated
+            || self
+                .children_count
+                .is_some_and(|count| (count as usize) > self.children.len())
+    }
+
+    /// Whether this subtree and all of its descendants are complete.
+    pub fn subtree_is_complete(&self) -> bool {
+        !self.children_incomplete() && self.children.iter().all(UiElement::subtree_is_complete)
+    }
+
+    /// Whether every element in `roots` was read in full.
+    ///
+    /// This is the proposition a resolution result needs: "not found" is only
+    /// conclusive when the tree that was searched was whole.
+    pub fn tree_is_complete(roots: &[UiElement]) -> bool {
+        roots.iter().all(UiElement::subtree_is_complete)
+    }
+
+    /// Whether the element says it supports this accessibility action.
+    ///
+    /// The answer is three-state because the platform's answer is: an element
+    /// that does not publish its action list is not an element that supports
+    /// nothing. `Absent` is the only answer that closes the rung; `Unknown`
+    /// leaves the decision to the caller, which today means "try it anyway" —
+    /// the same behaviour as before this gate existed.
+    pub fn supports_ax_action(&self, action: &AxAction) -> Tri {
+        let Some(actions) = self.actions.as_ref() else {
+            return Tri::Unknown;
+        };
+        let wanted = action.declared_names();
+        let supported = actions.iter().any(|declared| {
+            wanted
+                .iter()
+                .any(|name| declared.eq_ignore_ascii_case(name))
+        });
+        Tri::Known(supported)
     }
 }
 
@@ -607,6 +829,139 @@ impl AxAction {
             Self::Focus => "focus",
         }
     }
+
+    /// The names a platform may publish for "this element supports me".
+    ///
+    /// Three vocabularies answer the same question: macOS `AXActions`
+    /// (`AXPress`, `AXValueChanged`), UIA patterns (`Invoke`, `Value`,
+    /// `SelectionItem`), and AT-SPI action names (`click`, `set-value`,
+    /// `grab-focus`). Matching is case-insensitive and ignores punctuation,
+    /// because each platform spells its own list differently.
+    pub fn declared_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::Press => &[
+                // macOS
+                "AXPress",
+                // UIA patterns
+                "Invoke",
+                "Toggle",
+                "ExpandCollapse",
+                "SelectionItem",
+                // AT-SPI
+                "click",
+                "press",
+                "activate",
+                "toggle",
+            ],
+            Self::SetValue { .. } => &[
+                // macOS
+                "AXValueChanged",
+                "AXConfirm",
+                // UIA patterns
+                "Value",
+                "ExpandCollapse",
+                "Text",
+                // AT-SPI
+                "set-value",
+                "set_text",
+                "set_text_contents",
+            ],
+            Self::Focus => &[
+                // macOS
+                "AXFocused",
+                // UIA patterns
+                "SelectionItem",
+                "Value",
+                // AT-SPI
+                "grab-focus",
+                "grab_focus",
+            ],
+        }
+    }
+}
+
+/// What is known about whether an action reached the element at all.
+///
+/// Separate from [`ActionEffect`], which answers a different question. A
+/// platform can deliver an action reliably and still tell you nothing about
+/// what happened there — that is `DeliveredUnverified`, and it is the honest
+/// answer for an accessibility action that returned no error but was never
+/// observed. Collapsing it into `Confirmed` is how "sent" quietly becomes
+/// "done".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryDisposition {
+    /// Nothing was established: the rung could not run, or did not report.
+    #[default]
+    Unknown,
+    /// The action never reached the element.
+    NotDelivered,
+    /// The request was sent and the platform's answer cannot be trusted.
+    DeliveryUncertain,
+    /// The action reached the element but its effect was not observed.
+    DeliveredUnverified,
+    /// The action reached the element and its effect was observed.
+    DeliveredVerified,
+}
+
+impl DeliveryDisposition {
+    /// Machine-readable name, for the tool result payload.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::NotDelivered => "not_delivered",
+            Self::DeliveryUncertain => "delivery_uncertain",
+            Self::DeliveredUnverified => "delivered_unverified",
+            Self::DeliveredVerified => "delivered_verified",
+        }
+    }
+
+    /// Whether repeating the action is safe.
+    ///
+    /// Only a delivery that never happened is safe to repeat. Anything that
+    /// reached the element may or may not have taken, so a retry either
+    /// doubles the effect or is pointless.
+    pub fn retry(self) -> RetryDisposition {
+        match self {
+            Self::NotDelivered => RetryDisposition::Safe,
+            Self::Unknown => RetryDisposition::Unknown,
+            Self::DeliveryUncertain | Self::DeliveredUnverified | Self::DeliveredVerified => {
+                RetryDisposition::Unsafe
+            }
+        }
+    }
+
+    /// Whether the effect was observed.
+    pub fn verified(self) -> bool {
+        matches!(self, Self::DeliveredVerified)
+    }
+}
+
+/// Whether the caller may repeat an action that did not visibly succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryDisposition {
+    /// Nothing is known about delivery, so a retry is a guess.
+    #[default]
+    Unknown,
+    /// The action never reached anything; repeating it is safe.
+    Safe,
+    /// The action may have taken; repeating it compounds the effect.
+    Unsafe,
+}
+
+impl RetryDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Safe => "safe",
+            Self::Unsafe => "unsafe",
+        }
+    }
+
+    pub fn is_safe(self) -> bool {
+        matches!(self, Self::Safe)
+    }
 }
 
 /// What is known about whether an action took effect.
@@ -712,6 +1067,17 @@ pub enum DeliveryMode {
 pub struct ActionEvidence {
     pub rung: Rung,
     pub effect: ActionEffect,
+    /// Whether the action reached the element, as the driver reported it.
+    ///
+    /// Kept apart from `effect` because the platform usually knows this and
+    /// rarely knows the effect: "delivered, unverified" must not be told as
+    /// "confirmed", and must not be told as "failed" either.
+    #[serde(default)]
+    pub delivery: DeliveryDisposition,
+    /// Whether repeating the action is safe — derived from `delivery`, unless
+    /// the adapter explicitly overrides it.
+    #[serde(default)]
+    pub retry: RetryDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation: Option<Escalation>,
     /// Rungs that were tried and rejected, lowest first.
@@ -721,6 +1087,84 @@ pub struct ActionEvidence {
     /// succeed — e.g. "re-read the UI tree and use a fresh element id".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<String>,
+    /// The element that was in the way, when the platform could name it.
+    ///
+    /// Present when a hit test found something other than the target at the
+    /// point the action would land on. This is the difference between "the
+    /// click did nothing" and "the click went to the dialog on top".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occluder: Option<Occluder>,
+}
+
+/// Something other than the target that receives events at the action point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Occluder {
+    /// Role of the element that would receive the click / key event.
+    pub role: String,
+    /// Its accessibility label, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<Rect>,
+}
+
+/// What the platform's hit test says about a point.
+///
+/// This is the answer to "what would receive a click here", which is a
+/// different question from "where is the element I named". An action aimed at
+/// a point is only the action the caller intended when the two are the same
+/// element, and only the platform can say whether they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitTestResult {
+    /// The target itself receives the event.
+    ReachesTarget,
+    /// Something else does; it is named so the refusal can say what.
+    InterceptedBy(Occluder),
+    /// The platform could not answer — no hit test, no permission, or the
+    /// point is outside every window. Never treated as "clear": an answer
+    /// nobody got is not a yes.
+    Unknown,
+}
+
+impl HitTestResult {
+    /// The occluder, when the point was intercepted.
+    pub fn occluder(&self) -> Option<&Occluder> {
+        match self {
+            Self::InterceptedBy(occluder) => Some(occluder),
+            _ => None,
+        }
+    }
+
+    /// Whether this result positively says the point is clear.
+    ///
+    /// Only `ReachesTarget` does. `Unknown` is not clearance.
+    pub fn is_clear(&self) -> bool {
+        matches!(self, Self::ReachesTarget)
+    }
+}
+
+impl Occluder {
+    pub fn new(role: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            role: role.into(),
+            label,
+            bounds: None,
+        }
+    }
+
+    pub fn with_bounds(mut self, bounds: Rect) -> Self {
+        self.bounds = Some(bounds);
+        self
+    }
+
+    /// One-line rendering, for evidence summaries.
+    pub fn summary(&self) -> String {
+        match self.label.as_deref().filter(|l| !l.is_empty()) {
+            Some(label) => format!("{} {:?}", self.role, label),
+            None => self.role.clone(),
+        }
+    }
 }
 
 impl ActionEvidence {
@@ -728,10 +1172,31 @@ impl ActionEvidence {
         Self {
             rung,
             effect,
+            delivery: DeliveryDisposition::Unknown,
+            retry: RetryDisposition::Unknown,
             escalation: None,
             tried: Vec::new(),
             recovery: None,
+            occluder: None,
         }
+    }
+
+    /// Record how far the action got, and derive retry safety from it.
+    pub fn with_delivery(mut self, delivery: DeliveryDisposition) -> Self {
+        self.delivery = delivery;
+        self.retry = delivery.retry();
+        self
+    }
+
+    /// An adapter that knows better than the delivery table may say so.
+    pub fn with_retry(mut self, retry: RetryDisposition) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    pub fn with_occluder(mut self, occluder: Occluder) -> Self {
+        self.occluder = Some(occluder);
+        self
     }
 
     pub fn with_recovery(mut self, recovery: impl Into<String>) -> Self {
@@ -752,6 +1217,10 @@ impl ActionEvidence {
     /// One-line rendering for the tool output the model reads.
     pub fn summary(&self) -> String {
         let mut line = format!("rung={} effect={}", rung_name(self.rung), self.effect.as_str());
+        if self.delivery != DeliveryDisposition::Unknown {
+            line.push_str(&format!(" delivered={}", self.delivery.as_str()));
+            line.push_str(&format!(" retry={}", self.retry.as_str()));
+        }
         if !self.tried.is_empty() {
             let previous: Vec<&str> = self.tried.iter().map(|r| rung_name(*r)).collect();
             line.push_str(&format!(" tried={}", previous.join(",")));
@@ -764,10 +1233,23 @@ impl ActionEvidence {
             };
             line.push_str(&format!(" escalate={next}"));
         }
+        if let Some(occluder) = &self.occluder {
+            line.push_str(&format!(" occluded_by={}", occluder.summary()));
+        }
         if let Some(recovery) = &self.recovery {
             line.push_str(&format!(" recovery={recovery}"));
         }
         line
+    }
+
+    /// The rung's stable name.
+    pub fn rung_name(&self) -> &'static str {
+        rung_name(self.rung)
+    }
+
+    /// The stable name of any rung.
+    pub fn rung_of(rung: Rung) -> &'static str {
+        rung_name(rung)
     }
 }
 
@@ -777,6 +1259,14 @@ fn rung_name(rung: Rung) -> &'static str {
         Rung::Pixel => "pixel",
         Rung::Keyboard => "keyboard",
         Rung::Page => "page",
+    }
+}
+
+fn escalation_name(escalation: Escalation) -> &'static str {
+    match escalation {
+        Escalation::Px => "px",
+        Escalation::Foreground => "foreground",
+        Escalation::Page => "page",
     }
 }
 
@@ -815,6 +1305,46 @@ impl ActionResult {
         }
     }
 
+    /// This result, with everything it established in `data`.
+    ///
+    /// The model does not read the typed fields — it reads the tool result's
+    /// text and, when the harness lets it through, the `data` object. The
+    /// structured evidence is written here so `ActionEvidence`'s machine
+    /// vocabulary survives the trip to the caller.
+    pub fn with_evidence(mut self, evidence: ActionEvidence) -> Self {
+        let data = self.data.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("rung".to_string(), serde_json::json!(rung_name(evidence.rung)));
+            obj.insert("effect".to_string(), serde_json::json!(evidence.effect.as_str()));
+            obj.insert("delivered".to_string(), serde_json::json!(evidence.delivery.as_str()));
+            obj.insert("retry".to_string(), serde_json::json!(evidence.retry.as_str()));
+            if let Some(next) = evidence.escalation {
+                obj.insert("escalation".to_string(), serde_json::json!(escalation_name(next)));
+            }
+            if !evidence.tried.is_empty() {
+                obj.insert(
+                    "tried".to_string(),
+                    serde_json::json!(evidence
+                        .tried
+                        .iter()
+                        .map(|r| rung_name(*r))
+                        .collect::<Vec<_>>()),
+                );
+            }
+            if let Some(recovery) = &evidence.recovery {
+                obj.insert("recovery".to_string(), serde_json::json!(recovery));
+            }
+            if let Some(occluder) = &evidence.occluder {
+                obj.insert(
+                    "occluder".to_string(),
+                    serde_json::to_value(occluder).unwrap_or_default(),
+                );
+            }
+        }
+        self.evidence = Some(evidence);
+        self
+    }
+
     pub fn with_screenshot(mut self, screenshot: Screenshot) -> Self {
         self.screenshot_after = Some(screenshot);
         self
@@ -822,11 +1352,6 @@ impl ActionResult {
 
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
-        self
-    }
-
-    pub fn with_evidence(mut self, evidence: ActionEvidence) -> Self {
-        self.evidence = Some(evidence);
         self
     }
 }
@@ -924,4 +1449,36 @@ pub struct WindowInfo {
     pub maximized: bool,
     /// Whether this window is the currently focused window.
     pub focused: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_permission_is_not_a_timeout() {
+        let data = serde_json::json!({ "needs_permission": true });
+        let err = accessibility_read_error(Some(&data), "timed out", true);
+        assert!(matches!(err, crate::computer::ComputerError::AccessibilityDenied), "{err:?}");
+    }
+
+    #[test]
+    fn a_read_that_ran_out_of_time_is_a_timeout() {
+        let err = accessibility_read_error(None, "osascript timed out after 15 seconds", false);
+        assert!(matches!(err, crate::computer::ComputerError::Timeout), "{err:?}");
+        // Many producers only put the fact in the flag.
+        let err = accessibility_read_error(None, "", true);
+        assert!(matches!(err, crate::computer::ComputerError::Timeout), "{err:?}");
+    }
+
+    #[test]
+    fn any_other_read_failure_keeps_its_message() {
+        let err = accessibility_read_error(None, "PowerShell spawn error: not found", false);
+        match err {
+            crate::computer::ComputerError::ToolFailed(message) => {
+                assert!(message.contains("PowerShell spawn error"), "{message}");
+            }
+            other => panic!("expected ToolFailed, got {other:?}"),
+        }
+    }
 }

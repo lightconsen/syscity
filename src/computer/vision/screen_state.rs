@@ -433,9 +433,17 @@ fn diff_elements(before: &[UiElement], after: &[UiElement], path: &str, out: &mu
                         .push(format!("{} value: {:?} → {:?}", child_path, b.value, a.value));
                 }
                 if b.bounds != a.bounds {
+                    // Geometry the read did not publish is not "moved to";
+                    // say which side went missing instead of inventing 0×0.
+                    let describe_bounds = |r: Option<Rect>| match r {
+                        Some(r) => format!("({},{}) {}x{}", r.x, r.y, r.width, r.height),
+                        None => "unknown".to_string(),
+                    };
                     out.changed.push(format!(
-                        "{} moved to ({},{}) {}x{}",
-                        child_path, a.bounds.x, a.bounds.y, a.bounds.width, a.bounds.height
+                        "{} moved: {} → {}",
+                        child_path,
+                        describe_bounds(a.bounds),
+                        describe_bounds(b.bounds)
                     ));
                 }
                 diff_elements(&b.children, &a.children, &child_path, out);
@@ -474,10 +482,13 @@ mod tests {
             role: role.to_string(),
             label: label.map(String::from),
             value: None,
-            bounds: Rect::new(0, 0, 100, 30),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(0, 0, 100, 30)),
+            enabled: crate::computer::Tri::Known(true),
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
             children,
+            children_count: None,
+            truncated: false,
         }
     }
 
@@ -522,7 +533,7 @@ mod tests {
     #[test]
     fn tree_diff_detects_enabled_change() {
         let mut before_btn = el("button", Some("OK"), vec![]);
-        before_btn.enabled = false;
+        before_btn.enabled = crate::computer::Tri::Known(false);
         let before = vec![el("window", Some("App"), vec![before_btn])];
         let after = vec![el(
             "window",

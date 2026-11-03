@@ -12,6 +12,7 @@ use crate::error::{Result, SyscityError};
 
 use super::record::{FullTraceEvent, TurnRecord};
 
+#[derive(Debug)]
 pub struct TurnMetricsWriter {
     base: PathBuf,
 }

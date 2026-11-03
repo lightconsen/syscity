@@ -43,7 +43,7 @@ use tracing::{info, warn};
 use crate::computer::screenshot_encoder::maybe_encode_screenshot;
 use crate::computer::{
     ActionResult, ClickTarget, ComputerAdapter, ComputerError, DesktopAction, MouseButton, Point,
-    Rect, Result, Screenshot, UiElement, WaitCondition,
+    Rect, Result, Screenshot, Tri, UiElement, WaitCondition,
 };
 // ── Configuration ──────────────────────────────────────────────────────────
 
@@ -712,15 +712,18 @@ except Exception as e:
                                     }
                                 },
                                 value: None,
-                                bounds: Rect::new(
+                                bounds: Some(Rect::new(
                                     coords[0],
                                     coords[1],
                                     coords[2] as u32,
                                     coords[3] as u32,
-                                ),
-                                enabled: meta[2].trim() == "1",
-                                focused: false,
+                                )),
+                                enabled: Tri::Known(meta[2].trim() == "1"),
+                                focused: Tri::Unknown,
+                                actions: None,
                                 children: vec![],
+                                children_count: None,
+                                truncated: false,
                             });
                         }
                     }
@@ -751,10 +754,13 @@ except Exception as e:
                             Some(title.to_string())
                         },
                         value: None,
-                        bounds: Rect::new(0, 0, 0, 0),
-                        enabled: true,
-                        focused: false,
+                        bounds: None,
+                        enabled: Tri::Unknown,
+                        focused: Tri::Unknown,
+                        actions: None,
                         children: vec![],
+                        children_count: None,
+                        truncated: false,
                     });
                 }
             }
@@ -826,15 +832,18 @@ Dump-Tree $desktop 0
                                     }
                                 },
                                 value: None,
-                                bounds: Rect::new(
+                                bounds: Some(Rect::new(
                                     coords[0],
                                     coords[1],
                                     coords[2] as u32,
                                     coords[3] as u32,
-                                ),
-                                enabled: meta[2].trim() == "True",
-                                focused: false,
+                                )),
+                                enabled: Tri::Known(meta[2].trim() == "True"),
+                                focused: Tri::Unknown,
+                                actions: None,
                                 children: vec![],
+                                children_count: None,
+                                truncated: false,
                             });
                         }
                     }

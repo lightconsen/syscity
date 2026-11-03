@@ -57,6 +57,13 @@ pub struct DesktopControlResult {
     pub accessibility: Option<serde_json::Value>,
     pub screenshot: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// Set when a failed chord had to release its modifier keys itself.
+    ///
+    /// The action did not happen, but the key presses that did happen were
+    /// undone; a caller that sees this knows the system is not left with a
+    /// modifier held down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emergency_release_posted: Option<bool>,
 }
 
 /// High-level desktop control tool for macOS.
@@ -185,14 +192,47 @@ set the clipboard to _clipboard"#,
             })
             .collect();
 
-        format!(
-            r#"{}tell application "System Events"
-    {}
+        // Release Guard: a chord presses modifiers first and releases them
+        // last. If a press in between raises, the releases are never reached
+        // and the system keeps the modifier down — every later keystroke in
+        // every app arrives modified. The `on error` branch releases them and
+        // returns a marker, so the tool can report that rather than a clean
+        // "done".
+        if key_up_lines.is_empty() {
+            return format!(
+                r#"{}tell application "System Events"
     {}
 end tell"#,
+                app_block,
+                key_lines.join("\n    ")
+            );
+        }
+
+        let releases = key_up_lines
+            .iter()
+            .map(|line| format!("        {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The happy path releases inside the `try`, so a release that raises
+        // is caught too; the `on error` branch is what runs when a press
+        // failed and the release was never reached.
+        format!(
+            r#"{}tell application "System Events"
+    try
+        {}
+{}
+    on error _err
+        try
+{releases}
+            return "emergency-release: " & _err
+        on error
+            return "release-failed: " & _err
+        end try
+    end try
+end tell"#,
             app_block,
-            key_lines.join("\n    "),
-            key_up_lines.join("\n    ")
+            key_lines.join("\n        "),
+            releases
         )
     }
 }
@@ -264,7 +304,7 @@ impl Tool for DesktopControlTool {
         // One pointer and one focus: two conversations must not drive this
         // display at once. See `tools::target_lock`.
         let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::DESKTOP)
+            .lock_across_processes(crate::tools::target_lock::DESKTOP)
             .await;
         let action_str = args["action"].as_str().ok_or_else(|| {
             crate::error::SyscityError::Validation("Missing 'action' argument".to_string())
@@ -285,6 +325,7 @@ impl Tool for DesktopControlTool {
             accessibility: None,
             screenshot: None,
             error: None,
+            emergency_release_posted: None,
         };
 
         // ── Perception step ────────────────────────────────────────────────
@@ -409,7 +450,25 @@ impl Tool for DesktopControlTool {
                 let script = Self::build_keystroke_script(app, &keys);
                 let as_result =
                     super::applescript::AppleScriptTool::execute_script(&script, 15).await;
-                if as_result.success {
+                let output = as_result.output.trim();
+                // The Release Guard reports through its return value: a chord
+                // that raised after pressing its modifiers is a failure, and
+                // the modifiers were released by the script rather than left
+                // held.
+                if output.starts_with("release-failed:") {
+                    return Ok(ToolExecutionResult::error(output.to_string()).with_data(
+                        serde_json::json!({
+                            "success": false,
+                            "action": "key_shortcut",
+                            "error": output,
+                            "modifiers_may_be_held": true,
+                        }),
+                    ));
+                }
+                if output.starts_with("emergency-release:") {
+                    result.emergency_release_posted = Some(true);
+                    Err(crate::error::SyscityError::Validation(output.to_string()))
+                } else if as_result.success {
                     Ok(())
                 } else {
                     Err(crate::error::SyscityError::Validation(
@@ -489,6 +548,27 @@ mod tests {
         assert!(script.contains("key down command"));
         assert!(script.contains("keystroke \"t\""));
         assert!(script.contains("key up command"));
+    }
+
+    /// A chord presses its modifiers first; if the key press in between
+    /// raises, the releases must still run.
+    #[test]
+    fn a_chord_releases_its_modifiers_when_the_press_fails() {
+        let script =
+            DesktopControlTool::build_keystroke_script(None, &["cmd".to_string(), "t".to_string()]);
+        let error_branch = &script[script.find("on error _err").expect("error branch")..];
+        assert!(
+            error_branch.contains("key up command"),
+            "the error branch must release the modifier: {script}"
+        );
+        assert!(script.contains("emergency-release"), "{script}");
+        assert!(script.contains("release-failed"), "{script}");
+
+        // A plain key with no modifier has nothing to release, so no
+        // try/error scaffolding is generated around it.
+        let script = DesktopControlTool::build_keystroke_script(None, &["Return".to_string()]);
+        assert!(!script.contains("on error"), "{script}");
+        assert!(script.contains("key code 36"), "{script}");
     }
 
     #[test]

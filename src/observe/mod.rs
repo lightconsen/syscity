@@ -13,11 +13,11 @@ pub mod writer;
 
 use std::sync::atomic::AtomicU64;
 
-pub use collector::{TurnContext, TurnMetricsCollector};
+pub use collector::{ActionTraceSink, TurnContext, TurnMetricsCollector};
 pub use record::{
-    ChannelObservation, CompressionObservation, ErrorSource, LlmRoundRecord, ObservedError,
-    ObservedToolCall, ObservedUsage, PlanSnapshot, PlanStepSnapshot, RouteRecord, TurnEndState,
-    TurnRecord,
+    ActionTraceEvent, ChannelObservation, CompressionObservation, ErrorSource, LlmRoundRecord,
+    ObservedError, ObservedToolCall, ObservedUsage, PlanSnapshot, PlanStepSnapshot, RouteRecord,
+    TurnEndState, TurnRecord,
 };
 pub use writer::TurnMetricsWriter;
 

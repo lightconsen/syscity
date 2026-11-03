@@ -50,6 +50,55 @@ impl DesktopControlTool {
         Self
     }
 
+    /// Move, press, move, release — with a Release Guard.
+    ///
+    /// The button goes down before the second move. If that move fails (or
+    /// xdotool cannot be run at all) the obvious `?` would skip `mouseup` and
+    /// leave the left button held: every later click in every app then arrives
+    /// as part of the drag. The release is attempted unconditionally, and the
+    /// result says which path ran.
+    async fn drag(
+        from_x: i64,
+        from_y: i64,
+        to_x: i64,
+        to_y: i64,
+    ) -> crate::Result<ToolExecutionResult> {
+        let moved_to_start =
+            Self::run_xdotool(&["mousemove", &format!("{}", from_x), &format!("{}", from_y)]).await;
+        if !matches!(moved_to_start, Ok((true, _, _))) {
+            // Nothing is held yet, so there is nothing to release.
+            let err = match moved_to_start {
+                Ok((_, _, err)) => err,
+                Err(e) => e.to_string(),
+            };
+            return Ok(ToolExecutionResult::error(format!("Drag failed: {}", err)));
+        }
+
+        let pressed = Self::run_xdotool(&["mousedown", "1"]).await;
+        if !matches!(pressed, Ok((true, _, _))) {
+            let err = match pressed {
+                Ok((_, _, err)) => err,
+                Err(e) => e.to_string(),
+            };
+            return Ok(ToolExecutionResult::error(format!("Drag failed: {}", err)));
+        }
+
+        let moved =
+            match Self::run_xdotool(&["mousemove", &format!("{}", to_x), &format!("{}", to_y)])
+                .await
+            {
+                Ok((true, _, _)) => Ok(()),
+                Ok((_, _, err)) => Err(err),
+                Err(e) => Err(e.to_string()),
+            };
+        // Whatever the move did, the button is down; it must come up.
+        let (released, _, release_err) = Self::run_xdotool(&["mouseup", "1"])
+            .await
+            .unwrap_or_else(|e| (false, String::new(), e.to_string()));
+
+        Ok(drag_outcome(moved, released, &release_err, from_x, from_y, to_x, to_y))
+    }
+
     async fn run_xdotool(args: &[&str]) -> crate::Result<(bool, String, String)> {
         let output =
             timeout(Duration::from_secs(10), Command::new("xdotool").args(args).output()).await;
@@ -178,7 +227,7 @@ impl Tool for DesktopControlTool {
         // One pointer and one focus: two conversations must not drive this
         // display at once. See `tools::target_lock`.
         let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::DESKTOP)
+            .lock_across_processes(crate::tools::target_lock::DESKTOP)
             .await;
         let action = args
             .get("action")
@@ -328,27 +377,7 @@ impl Tool for DesktopControlTool {
                 let from_y = args.get("from_y").and_then(|v| v.as_i64()).unwrap_or(0);
                 let to_x = args.get("to_x").and_then(|v| v.as_i64()).unwrap_or(0);
                 let to_y = args.get("to_y").and_then(|v| v.as_i64()).unwrap_or(0);
-
-                let _ = Self::run_xdotool(&[
-                    "mousemove",
-                    &format!("{}", from_x),
-                    &format!("{}", from_y),
-                ])
-                .await?;
-                let _ = Self::run_xdotool(&["mousedown", "1"]).await?;
-                let _ =
-                    Self::run_xdotool(&["mousemove", &format!("{}", to_x), &format!("{}", to_y)])
-                        .await?;
-                let (ok, _, err) = Self::run_xdotool(&["mouseup", "1"]).await?;
-
-                if ok {
-                    Ok(ToolExecutionResult::success(format!(
-                        "Dragged from ({}, {}) to ({}, {})",
-                        from_x, from_y, to_x, to_y
-                    )))
-                } else {
-                    Ok(ToolExecutionResult::error(format!("Drag failed: {}", err)))
-                }
+                Self::drag(from_x, from_y, to_x, to_y).await
             }
             "activate_window" => {
                 let name = args.get("name").and_then(|v| v.as_str());
@@ -612,6 +641,44 @@ impl Tool for DesktopControlTool {
     }
 }
 
+/// Decide what a finished drag reports.
+///
+/// Split out from [`DesktopControlTool::drag`] so the Release Guard's three
+/// outcomes can be exercised without xdotool: a clean drag, a drag whose move
+/// failed but whose button was released, and a drag that may have left the
+/// button held.
+fn drag_outcome(
+    moved: Result<(), String>,
+    released: bool,
+    release_err: &str,
+    from_x: i64,
+    from_y: i64,
+    to_x: i64,
+    to_y: i64,
+) -> ToolExecutionResult {
+    match (moved, released) {
+        (Ok(()), true) => ToolExecutionResult::success(format!(
+            "Dragged from ({}, {}) to ({}, {})",
+            from_x, from_y, to_x, to_y
+        )),
+        (Err(err), true) => {
+            let mut result = ToolExecutionResult::error(format!(
+                "Drag failed after the button went down: {err} (released at the end point)"
+            ));
+            result.data = Some(serde_json::json!({ "emergency_release_posted": true }));
+            result
+        }
+        (Ok(()), false) => ToolExecutionResult::error(format!(
+            "Dragged from ({}, {}) to ({}, {}), but the button release failed: {}",
+            from_x, from_y, to_x, to_y, release_err
+        )),
+        (Err(err), false) => ToolExecutionResult::error(format!(
+            "Drag failed: {err}; the button release also failed ({release_err}) — the pointer \
+             may still be held"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +687,48 @@ mod tests {
     fn test_desktop_control_tool_creation() {
         let tool = DesktopControlTool::new();
         assert_eq!(tool.name(), "linux_x11_desktop_control");
+    }
+
+    /// What a caller actually reads: a failure keeps its text in `error`,
+    /// whether it came from the drag or from a release attempt.
+    fn text(result: &ToolExecutionResult) -> String {
+        format!("{}{}", result.output, result.error.clone().unwrap_or_default())
+    }
+
+    #[test]
+    fn a_clean_drag_reports_success() {
+        let result = drag_outcome(Ok(()), true, "", 1, 2, 3, 4);
+        assert!(result.success);
+        assert!(result.output.contains("Dragged from (1, 2) to (3, 4)"));
+    }
+
+    #[test]
+    fn a_failed_move_still_releases_and_says_so() {
+        let result = drag_outcome(Err("xdotool timed out".into()), true, "", 1, 2, 3, 4);
+        assert!(!result.success);
+        assert!(text(&result).contains("xdotool timed out"), "{}", text(&result));
+        assert_eq!(
+            result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("emergency_release_posted"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_failed_release_is_not_reported_as_a_clean_drag() {
+        let result = drag_outcome(Ok(()), false, "mouseup timed out", 1, 2, 3, 4);
+        assert!(!result.success);
+        assert!(text(&result).contains("mouseup timed out"), "{}", text(&result));
+        assert!(text(&result).contains("release failed"), "{}", text(&result));
+    }
+
+    #[test]
+    fn a_failed_move_and_release_warns_the_button_may_be_held() {
+        let result = drag_outcome(Err("move died".into()), false, "mouseup died", 0, 0, 0, 0);
+        assert!(!result.success);
+        assert!(text(&result).contains("may still be held"), "{}", text(&result));
     }
 }

@@ -24,6 +24,7 @@ use serde_json::Value;
 
 use super::{has_adb, run_cmd, run_cmd_bytes};
 use crate::computer::platform::{OsControlScope, PlatformConstraints, PlatformToolSet};
+use crate::tools::target_lock::TargetLease;
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
 
 // ── Android Capability Set ─────────────────────────────────────────────────
@@ -195,10 +196,13 @@ pub(crate) fn device_lock_key(device: &Option<String>) -> String {
 ///
 /// `&str` rather than the key itself: the guard does not borrow it, so the key
 /// may be built in the match arm that resolves the device.
-pub(super) async fn lock_device(device: &Option<String>) -> tokio::sync::OwnedMutexGuard<()> {
+///
+/// Taken across processes: two `adb` drivers on one host — the gateway and the
+/// CLI — are two writers to one phone. See [`TargetLease`].
+pub(super) async fn lock_device(device: &Option<String>) -> TargetLease {
     let key = device_lock_key(device);
     crate::tools::target_lock::TargetLocks::global()
-        .lock_named(&key)
+        .lock_across_processes(&key)
         .await
 }
 
@@ -209,10 +213,7 @@ pub(super) async fn lock_device(device: &Option<String>) -> tokio::sync::OwnedMu
 /// places, and making them wait for each other would be cost with no
 /// correctness behind it. The app they share is guarded separately, by
 /// [`lease_app`].
-pub(super) async fn lock_target(
-    device: &Option<String>,
-    target: Target,
-) -> tokio::sync::OwnedMutexGuard<()> {
+pub(super) async fn lock_target(device: &Option<String>, target: Target) -> TargetLease {
     match target {
         Target::Screen => lock_device(device).await,
         Target::Display(id) => {
@@ -221,7 +222,7 @@ pub(super) async fn lock_target(
                 None => format!("android-display:any:{id}"),
             };
             crate::tools::target_lock::TargetLocks::global()
-                .lock_named(&key)
+                .lock_across_processes(&key)
                 .await
         }
     }

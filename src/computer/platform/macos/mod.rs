@@ -3,6 +3,7 @@
 pub mod accessibility;
 pub mod applescript;
 pub mod desktop_control;
+pub mod hit_test;
 pub mod notification;
 pub mod permissions;
 pub mod screenshot;

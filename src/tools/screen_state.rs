@@ -172,7 +172,32 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        // A capture is bounded by the call's own ceiling, less a margin, so a
+        // tree walk that will not finish says so in the terms of this call
+        // instead of being killed from above as "tool timed out".
+        let budget = crate::computer::StepBudget::new(screen_state_budget_for(context.timeout()));
+        self.screen_state(args, &budget).await
+    }
+}
+
+/// How much of the tool call's timeout a capture may spend.
+///
+/// Same rule as the computer tool's step: the timeout minus a tenth, capped
+/// at five seconds, so the result lands before the registry kills the call.
+fn screen_state_budget_for(timeout: std::time::Duration) -> std::time::Duration {
+    let margin = (timeout / 10).min(std::time::Duration::from_secs(5));
+    timeout.saturating_sub(margin)
+}
+
+impl ScreenStateTool {
+    /// Assemble the screen-state answer. Separated from `execute` so the
+    /// completeness rule can be exercised without a live adapter.
+    async fn screen_state(
+        &self,
+        args: Value,
+        budget: &crate::computer::StepBudget,
     ) -> crate::Result<ToolExecutionResult> {
         let adapter = self.adapter.as_ref().ok_or_else(|| {
             crate::error::SyscityError::Unsupported(
@@ -184,9 +209,14 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
         let want_ocr = args["include_ocr"].as_bool().unwrap_or(false);
 
         #[allow(unused_mut)]
-        let mut state = ScreenState::capture_light(adapter.as_ref())
-            .await
-            .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?;
+        let mut state = crate::computer::budget::within(
+            budget,
+            "the screen capture",
+            ScreenState::capture_light(adapter.as_ref()),
+        )
+        .await
+        .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?
+        .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?;
 
         #[cfg(feature = "vision")]
         if want_ocr {
@@ -267,41 +297,20 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
             }
         }
 
-        // Format: indented UI-tree outline + OCR text + screenshot in data.
-        let mut output = String::from("UI tree:\n");
-        let mut lines = 0usize;
-        for root in &state.ui_tree {
-            format_element(root, 0, &mut output, &mut lines, max_lines, &sensitive);
+        let mut outline = TreeOutline::default();
+        outline.push_tree(
+            &state.ui_tree,
+            ui_source,
+            max_lines,
+            want_fallback,
+            fallback_count,
+            &sensitive,
+        );
+        if let Some(note) = outline.incomplete_note() {
+            outline.text.push_str(note);
         }
-        if state.ui_tree.is_empty() {
-            output.push_str("(empty — no accessibility tree available)\n");
-            #[cfg(not(feature = "vision"))]
-            if want_fallback {
-                output.push_str("(UI detection unavailable: built without 'vision' feature)\n");
-            }
-        } else {
-            if ui_source == "omniparser" {
-                output.push_str(&format!(
-                    "(accessibility tree empty — {fallback_count} UI elements detected via OmniParser)\n"
-                ));
-            }
-            if lines >= max_lines {
-                output.push_str("… (tree truncated)\n");
-            }
-            // Trust labeling: the model must know how far it can rely on this
-            // tree before it acts on it. Accessibility comes from the OS's own
-            // semantic tree; OmniParser infers boxes from pixels, with no
-            // roles, names or ids — a click there is a guess at coordinates.
-            output.push_str(&format!(
-                "(tree source: {}; {})\n",
-                ui_source,
-                match ui_source {
-                    "omniparser" =>
-                        "inferred from pixels — treat roles/names as guesses, verify visually",
-                    _ => "authoritative — element ids address real accessibility elements",
-                }
-            ));
-        }
+        let mut output = outline.text;
+        output.push_str(&trust_line(ui_source));
         if !findings.is_empty() {
             output.push_str(&format!(
                 "(⚠ sensitive UI detected: {}) — pause and confirm before typing or clicking here\n",
@@ -334,9 +343,6 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
             output.push_str(&state.ocr_text);
         }
 
-        // CAS-first: store the screenshot bytes once and return a compact
-        // reference; fall back to inline base64 when the store is
-        // unavailable (fail-open — see crate::attachments docs).
         let mut data = json!({
             "screenshot_width": state.screenshot.width,
             "screenshot_height": state.screenshot.height,
@@ -352,6 +358,10 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
                 "authoritative"
             },
             "sensitive_ui": serde_json::to_value(&findings).unwrap_or_default(),
+            // Machine-readable, so a caller does not have to parse the prose.
+            // `not_found` from a complete tree means the element is not there;
+            // from an incomplete one it means "not where this read looked".
+            "ui_tree_complete": !outline.incomplete,
             "ocr_text": state.ocr_text,
             "ocr_regions": serde_json::to_value(&state.ocr_regions).unwrap_or_default(),
         });
@@ -389,6 +399,82 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
     }
 }
 
+/// The rendered tree section of a `screen_state` result.
+///
+/// Kept apart from the adapter so the two ways a tree can be short — this
+/// renderer's line cap and a read that stopped early — can be tested without
+/// a live desktop. They mean different things to the model: the first is
+/// fixed by asking for fewer elements, the second only by re-reading deeper.
+#[derive(Debug, Default)]
+struct TreeOutline {
+    /// The rendered outline, header included.
+    text: String,
+    /// The line cap stopped the render.
+    cut_by_cap: bool,
+    /// The accessibility read itself stopped early.
+    incomplete: bool,
+}
+
+impl TreeOutline {
+    fn push_tree(
+        &mut self,
+        roots: &[UiElement],
+        ui_source: &str,
+        max_lines: usize,
+        want_fallback: bool,
+        fallback_count: usize,
+        sensitive: &HashMap<String, &'static str>,
+    ) {
+        self.text.push_str("UI tree:\n");
+        let mut lines = 0usize;
+        for root in roots {
+            format_element(root, 0, &mut self.text, &mut lines, max_lines, sensitive);
+        }
+        if roots.is_empty() {
+            self.text
+                .push_str("(empty — no accessibility tree available)\n");
+            if cfg!(not(feature = "vision")) && want_fallback {
+                self.text
+                    .push_str("(UI detection unavailable: built without 'vision' feature)\n");
+            }
+            return;
+        }
+        if ui_source == "omniparser" {
+            self.text.push_str(&format!(
+                "(accessibility tree empty — {fallback_count} UI elements detected via OmniParser)\n"
+            ));
+        }
+        // The renderer's own cap. Saying so is what lets the model reason
+        // about a list it asked to be short.
+        self.cut_by_cap = lines >= max_lines;
+        if self.cut_by_cap {
+            self.text.push_str("… (tree truncated)\n");
+        }
+        self.incomplete = !UiElement::tree_is_complete(roots);
+    }
+
+    /// The sentence to append when the read — not the renderer — stopped
+    /// short, and `None` when the tree is whole.
+    fn incomplete_note(&self) -> Option<&'static str> {
+        self.incomplete.then_some(
+            "(⚠ tree incomplete — the accessibility read stopped at its depth or element \
+             limit; an element you cannot see may still exist)\n",
+        )
+    }
+}
+
+/// How far the model can trust the tree it was shown.
+fn trust_line(ui_source: &str) -> String {
+    format!(
+        "(tree source: {}; {})\n",
+        ui_source,
+        match ui_source {
+            "omniparser" => "inferred from pixels — treat roles/names as guesses, verify visually",
+            _ => "authoritative — element ids address real accessibility elements",
+        }
+    )
+}
+
 /// Render a UI element and its children as an indented outline.
 /// Returns `false` when the line cap was hit (tree truncated).
 fn format_element(
@@ -408,7 +494,22 @@ fn format_element(
     // elements carry no accessibility label), instead of rendering `""`.
     let label = el.label.as_deref().filter(|l| !l.is_empty());
     let label_part = label.map(|l| format!(" {:?}", l)).unwrap_or_default();
-    let state = if el.enabled { "" } else { " [disabled]" };
+    // Only a positive "disabled" is worth a mark. An unread state stays
+    // silent rather than being drawn as enabled — the model should not build
+    // confidence on an answer nobody gave.
+    let state = if el.enabled.is_false() {
+        " [disabled]"
+    } else {
+        ""
+    };
+    // Focus is the same three-state fact as `enabled`, and it is the one that
+    // decides where a bare `type` or `key_press` lands. An unread focus stays
+    // unmarked, like an unread enabled state.
+    let focus_part = if el.focused.known() == Some(true) {
+        " [focused]"
+    } else {
+        ""
+    };
     // The id is what lets the model act on this exact element later: it is
     // snapshot-bound, and `computer` resolves it or reports it as stale.
     let id_part = if el.id.is_empty() {
@@ -422,18 +523,16 @@ fn format_element(
         .get(&el.id)
         .map(|kind| format!(" [sensitive: {kind}]"))
         .unwrap_or_default();
+    // An element whose geometry the read did not publish has no point to
+    // click. Saying nothing is honest; printing `(0,0)` would invite a click
+    // at the top-left corner of the screen.
+    let geometry_part = el
+        .bounds
+        .map(|b| format!(" at ({},{}) {}x{}", b.x, b.y, b.width, b.height))
+        .unwrap_or_default();
     out.push_str(&format!(
-        "{}{}{}{} at ({},{}) {}x{}{}{}\n",
-        indent,
-        el.role,
-        label_part,
-        state,
-        el.bounds.x,
-        el.bounds.y,
-        el.bounds.width,
-        el.bounds.height,
-        id_part,
-        sensitive_part
+        "{}{}{}{}{}{}{}{}\n",
+        indent, el.role, label_part, state, focus_part, geometry_part, id_part, sensitive_part
     ));
     for child in &el.children {
         format_element(child, depth + 1, out, lines, max_lines, sensitive);
@@ -719,6 +818,7 @@ fn parse_region(args: &Value) -> Option<Rect> {
 mod tests {
     use super::*;
     use crate::computer::types::Rect;
+    use crate::computer::Tri;
 
     fn no_sensitive() -> HashMap<String, &'static str> {
         HashMap::new()
@@ -730,10 +830,13 @@ mod tests {
             role: role.to_string(),
             label: label.map(String::from),
             value: None,
-            bounds: Rect::new(10, 20, 100, 30),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(10, 20, 100, 30)),
+            enabled: Tri::Known(true),
+            focused: Tri::Unknown,
+            actions: None,
             children,
+            children_count: None,
+            truncated: false,
         }
     }
 
@@ -746,6 +849,30 @@ mod tests {
         assert!(out.contains("window \"App\" at (10,20) 100x30"));
         assert!(out.contains("  button \"OK\""));
         assert_eq!(lines, 2);
+    }
+
+    /// Focus is drawn only when the read established it; an unread focus is
+    /// not the same answer as "not focused".
+    #[test]
+    fn format_element_marks_the_focused_field() {
+        let mut tree = el("text field", Some("Search"), vec![]);
+        tree.focused = Tri::Known(true);
+        let mut out = String::new();
+        let mut lines = 0;
+        format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
+        assert!(out.contains("[focused]"), "{out}");
+
+        let mut unknown = el("text field", Some("Search"), vec![]);
+        unknown.focused = Tri::Unknown;
+        let mut out = String::new();
+        format_element(&unknown, 0, &mut out, &mut lines, 100, &no_sensitive());
+        assert!(!out.contains("[focused]"), "{out}");
+
+        let mut unfocused = el("text field", Some("Search"), vec![]);
+        unfocused.focused = Tri::Known(false);
+        let mut out = String::new();
+        format_element(&unfocused, 0, &mut out, &mut lines, 100, &no_sensitive());
+        assert!(!out.contains("[focused]"), "{out}");
     }
 
     #[test]
@@ -808,5 +935,120 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (10, 20, 300, 200));
+    }
+
+    /// The renderer's line cap and a partial read are different facts, and
+    /// the model is told which one it is looking at.
+    #[test]
+    fn a_cap_truncation_and_a_partial_read_are_distinguished() {
+        let whole = el("window", Some("App"), vec![el("button", Some("OK"), vec![])]);
+        let mut outline = TreeOutline::default();
+        outline.push_tree(&[whole], "accessibility", 100, true, 0, &no_sensitive());
+        assert!(!outline.cut_by_cap);
+        assert!(outline.incomplete_note().is_none());
+        assert!(!outline.text.contains("truncated"));
+
+        // Same tree, rendered with a one-line cap: the renderer is short, the
+        // read is not.
+        let whole = el("window", Some("App"), vec![el("button", Some("OK"), vec![])]);
+        let mut capped = TreeOutline::default();
+        capped.push_tree(&[whole], "accessibility", 1, true, 0, &no_sensitive());
+        assert!(capped.cut_by_cap);
+        assert!(capped.incomplete_note().is_none());
+        assert!(capped.text.contains("(tree truncated)"));
+
+        // A read that stopped early: the tree is short whatever the cap.
+        let mut cut = el("window", Some("App"), vec![]);
+        cut.children_count = Some(4);
+        let mut partial = TreeOutline::default();
+        partial.push_tree(&[cut], "accessibility", 100, true, 0, &no_sensitive());
+        assert!(!partial.cut_by_cap);
+        let note = partial.incomplete_note().expect("a partial read says so");
+        assert!(note.contains("incomplete"), "{note}");
+        assert!(note.contains("max_depth") || note.contains("depth"), "{note}");
+    }
+
+    /// An empty tree is not evidence that the screen is empty — it must not
+    /// be reported as a complete one.
+    #[test]
+    fn an_empty_tree_is_not_a_truncation() {
+        let mut outline = TreeOutline::default();
+        outline.push_tree(&[], "accessibility", 100, false, 0, &no_sensitive());
+        assert!(outline
+            .text
+            .contains("(empty — no accessibility tree available)"));
+        assert!(!outline.cut_by_cap);
+        assert!(outline.incomplete_note().is_none());
+    }
+
+    /// The trust line rides with the tree, because a click on a guessed box
+    /// and a click on a real element are different promises.
+    #[test]
+    fn the_trust_line_names_the_source() {
+        assert!(trust_line("accessibility").contains("authoritative"));
+        assert!(trust_line("omniparser").contains("inferred from pixels"));
+    }
+
+    /// A mock adapter that takes its time, for the capture budget.
+    struct SlowAdapter(std::time::Duration);
+
+    #[async_trait::async_trait]
+    impl ComputerAdapter for SlowAdapter {
+        async fn screenshot(
+            &self,
+            _region: Option<crate::computer::Rect>,
+        ) -> crate::computer::Result<crate::computer::Screenshot> {
+            tokio::time::sleep(self.0).await;
+            Ok(crate::computer::Screenshot::new(String::new(), 100, 100))
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(
+            &self,
+            _action: crate::computer::DesktopAction,
+        ) -> crate::computer::Result<crate::computer::ActionResult> {
+            Ok(crate::computer::ActionResult::success("ok"))
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: crate::computer::WaitCondition,
+            _timeout: std::time::Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// The capture ceiling follows the same rule as the computer tool's step.
+    #[test]
+    fn the_capture_budget_is_the_call_timeout_less_a_margin() {
+        use std::time::Duration;
+        assert_eq!(screen_state_budget_for(Duration::from_secs(30)), Duration::from_secs(27));
+        assert_eq!(screen_state_budget_for(Duration::from_secs(120)), Duration::from_secs(115));
+    }
+
+    /// A capture slower than the call's budget fails with a message that
+    /// names the budget, instead of the registry's opaque "tool timed out".
+    #[tokio::test]
+    async fn a_capture_past_the_budget_says_so() {
+        let tool = ScreenStateTool::new(
+            Some(Arc::new(SlowAdapter(std::time::Duration::from_millis(50)))),
+            #[cfg(feature = "vision")]
+            crate::tools::screen_state::new_shared_ocr(),
+            #[cfg(feature = "vision")]
+            crate::tools::screen_state::new_shared_ui_detector(),
+        );
+        let context = ToolContext::default().with_timeout(std::time::Duration::from_millis(20));
+        let error = tool
+            .execute(json!({}), &context)
+            .await
+            .expect_err("past the budget");
+        assert!(error.to_string().contains("ms"), "{error}");
     }
 }

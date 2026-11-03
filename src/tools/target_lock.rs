@@ -67,6 +67,42 @@ pub fn android_app(serial: &str, package: &str) -> String {
     format!("android-app:{serial}:{package}")
 }
 
+/// One target's lock, held until dropped.
+///
+/// Two layers, because they answer two different questions. The
+/// [in-process](Self::lock) handle serialises the tasks of *this* process; the
+/// [process lock](Self::lock_across_processes) is a file lock that serialises
+/// this process against the gateway, the CLI, and any delegated child driving
+/// the same display. The cross-process layer is the one that is real outside a
+/// single binary, and it is what every caller should take.
+pub struct TargetLease {
+    /// The in-process half. Dropped first on release — the outer lock is the
+    /// file lock, so its `Drop` runs before this field's and the file stays
+    /// held while the local queue drains.
+    _local: Option<OwnedMutexGuard<()>>,
+    /// The cross-process half, when the platform could provide one.
+    _file: Option<crate::tools::file_lock::FileLock>,
+    /// The key, for diagnostics.
+    key: String,
+}
+
+impl TargetLease {
+    /// The target this lease is on.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Whether the cross-process half was taken.
+    ///
+    /// False means the file lock could not be created — a read-only data
+    /// directory, a filesystem without advisory locks. The caller still holds
+    /// the in-process lock; it is the *other* processes that are unprotected,
+    /// which is why the caller is told rather than left to assume.
+    pub fn is_process_wide(&self) -> bool {
+        self._file.is_some()
+    }
+}
+
 /// One app's lock, and how many writes have finished on it.
 #[derive(Default)]
 struct AppGate {
@@ -200,6 +236,44 @@ impl TargetLocks {
         // The map's guard is gone by here: only the target's own lock is held
         // across the await, and only by the caller that asked for it.
         self.lock_named(key).await
+    }
+
+    /// Wait for exclusive use of a named target, across processes.
+    ///
+    /// This is the lock a caller that drives a display should take: the
+    /// in-process handle, then the file lock that the other processes on this
+    /// host contend for too. The two layers are always acquired in the same
+    /// order — local first, file second — so two waiters cannot deadlock by
+    /// taking them in opposite orders.
+    ///
+    /// A file lock that cannot be created is **not** fatal: the in-process
+    /// lock still holds, and the failure is reported through
+    /// [`TargetLease::is_process_wide`] rather than silently swallowed. What
+    /// must not happen is proceeding as if the file lock were held.
+    pub async fn lock_across_processes(&self, key: &str) -> TargetLease {
+        let local = self.lock_named(key).await;
+        let file = match crate::tools::file_lock::FileLock::acquire(
+            crate::tools::file_lock::lock_path(key),
+            crate::tools::file_lock::DEFAULT_TIMEOUT,
+        ) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                // The action still runs serialised against this process; that
+                // is strictly better than refusing, and the caller can say so.
+                tracing::warn!(
+                    "cross-process lock for '{}' unavailable, serialising within this process \
+                     only: {}",
+                    key,
+                    e
+                );
+                None
+            }
+        };
+        TargetLease {
+            _local: Some(local),
+            _file: file,
+            key: key.to_string(),
+        }
     }
 }
 
@@ -377,5 +451,46 @@ mod tests {
         let next_seen = gates.completed(&key);
         assert_eq!(next_seen, seen + 1, "the release was not counted");
         assert!(!gates.lease(&key, next_seen).await.stale);
+    }
+
+    /// The cross-process lock is taken as part of the same call, so a caller
+    /// that takes a target gets both halves without having to know there are
+    /// two.
+    #[tokio::test]
+    async fn a_cross_process_lease_holds_both_layers() {
+        let locks = TargetLocks::default();
+        let key = "test-cross-process-desktop";
+        let lease = locks.lock_across_processes(key).await;
+        assert_eq!(lease.key(), key);
+        assert!(lease.is_process_wide(), "the file half was not taken");
+
+        // The in-process half is held: a second local waiter must block even
+        // though the file half would also refuse it.
+        let second = tokio::time::timeout(Duration::from_millis(100), locks.lock_named(key)).await;
+        assert!(second.is_err(), "the local lock was not held by the lease");
+    }
+
+    /// The file half is a *kernel* lock, not a process-local one: a second
+    /// `FileLock` on the same path is refused while the lease is alive,
+    /// whether it comes from this process or another. `FileLock`'s own tests
+    /// prove the between-opens behaviour; this proves the lease actually
+    /// holds it.
+    #[tokio::test]
+    async fn a_cross_process_lease_contends_with_another_file_holder() {
+        let locks = TargetLocks::default();
+        let key = "test-cross-process-contention";
+        let lease = locks.lock_across_processes(key).await;
+        assert!(lease.is_process_wide());
+
+        let path = crate::tools::file_lock::lock_path(key);
+        let contended = crate::tools::file_lock::FileLock::try_acquire(&path);
+        assert!(
+            matches!(contended, Err(crate::tools::file_lock::LockError::TimedOut { .. })),
+            "a second file holder got in while the lease was alive"
+        );
+
+        drop(lease);
+        let after = crate::tools::file_lock::FileLock::try_acquire(&path);
+        assert!(after.is_ok(), "the file lock outlived the lease: {after:?}");
     }
 }

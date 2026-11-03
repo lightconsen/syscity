@@ -350,7 +350,7 @@ impl Agent {
                 if !tool_calls.is_empty() {
                     debug!("Processing {} tool calls", tool_calls.len());
                     return self
-                        .handle_tool_calls(context, &response, tool_calls, user_id)
+                        .handle_tool_calls(context, None, &response, tool_calls, user_id)
                         .await;
                 }
             }

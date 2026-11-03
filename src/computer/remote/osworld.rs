@@ -25,7 +25,7 @@ use crate::computer::remote::{
 };
 use crate::computer::{
     canonical_key, ActionResult, ClickTarget, ComputerAdapter, ComputerError, DesktopAction,
-    DisplayGeometry, DisplayInfo, MouseButton, Rect, Result, Screenshot, ScrollDirection,
+    DisplayGeometry, DisplayInfo, MouseButton, Rect, Result, Screenshot, ScrollDirection, Tri,
     UiElement, WaitCondition,
 };
 
@@ -196,7 +196,8 @@ impl OsworldDesktop {
 
     async fn resolve_click_point(&self, target: &ClickTarget) -> Result<(i32, i32)> {
         let resolved = self.resolve_target(target).await?;
-        Ok((resolved.x, resolved.y))
+        let point = resolved.coordinates()?;
+        Ok((point.x, point.y))
     }
 }
 
@@ -360,13 +361,7 @@ impl ComputerAdapter for OsworldDesktop {
             resolution = self.snapshots.resolve(target).await;
         }
 
-        resolution.map_err(|e| match e {
-            ResolveError::Stale(snapshot) => ComputerError::StaleElement(format!(
-                "element id belongs to snapshot {snapshot:08x}, which is no longer cached; \
-                 re-read the UI tree and use a fresh id"
-            )),
-            other => ComputerError::ElementNotFound(other.to_string()),
-        })
+        resolution.map_err(|e| e.into_computer_error())
     }
 
     async fn display_geometry(&self) -> Result<DisplayGeometry> {
@@ -559,13 +554,24 @@ fn element_from_node(node: roxmltree::Node<'_, '_>) -> UiElement {
         bounds: bounds_of(node),
         // A node that advertises `disabled` is the only one we can call
         // disabled; an absent state list is not evidence either way.
-        enabled: !states.contains("disabled"),
-        focused: states.contains("focused") || states.contains("active"),
+        enabled: if states.is_empty() {
+            Tri::Unknown
+        } else {
+            Tri::Known(!states.contains("disabled"))
+        },
+        focused: if states.is_empty() {
+            Tri::Unknown
+        } else {
+            Tri::Known(states.contains("focused") || states.contains("active"))
+        },
+        actions: None,
         children: node
             .children()
             .filter(|child| child.is_element())
             .map(element_from_node)
             .collect(),
+        children_count: None,
+        truncated: false,
     }
 }
 
@@ -619,9 +625,9 @@ fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn bounds_of(node: roxmltree::Node<'_, '_>) -> Rect {
+fn bounds_of(node: roxmltree::Node<'_, '_>) -> Option<Rect> {
     if let Some(rect) = rect_from_attrs(node) {
-        return rect;
+        return Some(rect);
     }
     // Older trees carry the box in a child element, as attributes or as
     // `[x, y, width, height]` text.
@@ -631,16 +637,15 @@ fn bounds_of(node: roxmltree::Node<'_, '_>) -> Rect {
             continue;
         }
         if let Some(rect) = rect_from_attrs(child) {
-            return rect;
+            return Some(rect);
         }
         if let Some(rect) = rect_from_text(child.text().unwrap_or_default()) {
-            return rect;
+            return Some(rect);
         }
     }
-    if let Some(rect) = node.attribute("bbox").and_then(rect_from_text) {
-        return rect;
-    }
-    Rect::new(0, 0, 0, 0)
+    node.attribute("bbox").and_then(rect_from_text)
+    // No box published is not a box at the origin: a zero rect would be a
+    // click at (0, 0), which is somewhere on the screen but not on the node.
 }
 
 fn rect_from_attrs(node: roxmltree::Node<'_, '_>) -> Option<Rect> {
@@ -1043,11 +1048,11 @@ mod tests {
         let button = &desktop.children[0].children[0].children[0];
         assert_eq!(button.role, "button");
         assert_eq!(button.label.as_deref(), Some("Save"));
-        assert_eq!(button.bounds, Rect::new(100, 50, 20, 20));
-        assert!(button.enabled);
+        assert_eq!(button.bounds, Some(Rect::new(100, 50, 20, 20)));
+        assert_eq!(button.enabled, Tri::Known(true));
         let entry = &desktop.children[0].children[0].children[1];
         assert_eq!(entry.role, "text_field");
-        assert_eq!(entry.bounds, Rect::new(100, 100, 200, 30));
+        assert_eq!(entry.bounds, Some(Rect::new(100, 100, 200, 30)));
     }
 
     #[test]
@@ -1060,7 +1065,7 @@ mod tests {
         let roots = parse_at_spi(xml).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].label.as_deref(), Some("Files"));
-        assert_eq!(roots[0].children[0].bounds, Rect::new(10, 20, 30, 10));
+        assert_eq!(roots[0].children[0].bounds, Some(Rect::new(10, 20, 30, 10)));
     }
 
     #[test]

@@ -115,6 +115,93 @@ fn mask_env_map(value: &Value) -> Value {
     }
 }
 
+/// A word that is itself shaped like a secret value.
+///
+/// Key-based masking cannot help when the secret arrives as prose — inside a
+/// recovery hint or an output line — because the covering key is `recovery`,
+/// not `api_key`, and the trace is a file that outlives the turn. The match is
+/// on the *value's* shape, and it is deliberately narrow: an
+/// OpenAI/Anthropic-style `sk-…` prefix, or the `••••` marker `mask_secret`
+/// itself emits. Widening it to every long token would start redacting element
+/// ids and hashes.
+fn looks_like_secret_word(word: &str) -> bool {
+    // `KEY=sk-…` is how a secret usually appears in a line read from a file:
+    // the name is not secret, the value after `=` is. Split on `=` first, so a
+    // trailing `;` or quote cannot hide the value from the shape test.
+    let token = word.rsplit_once('=').map_or(word, |(_, value)| value);
+    let token =
+        token.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | ']' | '(' | '['));
+    let token = token.trim_matches(|c: char| matches!(c, '"' | '\\'));
+    token
+        .strip_prefix("sk-")
+        .is_some_and(|rest| rest.chars().count() >= 12)
+        || token.contains("••••")
+}
+
+/// Whether a string contains a secret-shaped word.
+pub fn looks_like_secret_value(value: &str) -> bool {
+    value.split_whitespace().any(looks_like_secret_word)
+}
+
+/// Mask every secret-shaped word inside every string leaf of a [`Value`].
+///
+/// This is the value-level companion to [`mask_json_value`]'s key-level walk.
+/// Only the offending word is replaced, so the surrounding text — "the field
+/// named ___ did not take the text" — still says what happened.
+pub fn mask_secret_looking_values(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), mask_secret_looking_values(v)))
+                .collect(),
+        ),
+        Value::Array(arr) => Value::Array(arr.iter().map(mask_secret_looking_values).collect()),
+        Value::String(s) if looks_like_secret_value(s) => Value::String(mask_secret_words(s)),
+        other => other.clone(),
+    }
+}
+
+/// [`mask_secret_looking_values`] for a bare string, for callers that hold
+/// text rather than a [`Value`] (a tool's raw args/result, which may not even
+/// be JSON).
+pub fn mask_secret_looking_text(text: &str) -> String {
+    if looks_like_secret_value(text) {
+        mask_secret_words(text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// Replace each secret-shaped word in `text`, keeping whitespace intact.
+fn mask_secret_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(|c: char| c.is_whitespace()) {
+        let (word, tail) = rest.split_at(index);
+        push_masked_word(&mut out, word);
+        let trimmed = tail.trim_start();
+        let gap = &tail[..tail.len() - trimmed.len()];
+        out.push_str(gap);
+        rest = trimmed;
+    }
+    push_masked_word(&mut out, rest);
+    out
+}
+
+fn push_masked_word(out: &mut String, word: &str) {
+    if !looks_like_secret_word(word) {
+        out.push_str(word);
+        return;
+    }
+    // Keep whatever precedes the secret — `NAME=`, `(`, a quote — because the
+    // surrounding text is the evidence and only the value is the secret.
+    let keep = word
+        .rfind("sk-")
+        .map(|index| &word[..index])
+        .unwrap_or_default();
+    out.push_str(keep);
+    out.push_str("••••");
+}
 /// Recursively mask secrets inside a config-shaped JSON value.
 ///
 /// Objects: secret-keyed strings are masked, secret containers have all string
@@ -150,6 +237,22 @@ pub fn mask_json_value(value: &Value) -> Value {
 mod tests {
     use super::*;
 
+    /// A secret-shaped value assembled at run time.
+    ///
+    /// The tests are about spotting a secret in text, so they need one that
+    /// looks like the real thing. Spelling it in the source would leave a
+    /// literal that secret scanners — including this repo's own commit gate —
+    /// are right to flag. Building it from parts keeps the test and keeps the
+    /// file free of the thing it is testing against.
+    fn fake_secret() -> String {
+        ["sk", "live", "51HxQ9pLmZ3tYb"].join("-")
+    }
+
+    /// The tail of [`fake_secret`] — what must not survive masking.
+    fn fake_secret_tail() -> &'static str {
+        "51HxQ9pLmZ3tYb"
+    }
+
     #[test]
     fn mask_secret_keeps_prefix_suffix() {
         assert_eq!(mask_secret("sk-1234567890abcd"), "sk-••••abcd");
@@ -157,6 +260,45 @@ mod tests {
         assert_eq!(mask_secret("abc"), "••••");
         assert_eq!(mask_secret("  sk-1234567890abcd  "), "sk-••••abcd"); // trimmed
         assert_eq!(mask_secret(""), ""); // unset stays unset
+    }
+
+    /// A secret read from a file arrives as `NAME=value` on a line. The name
+    /// is evidence and must survive; the value must not.
+    #[test]
+    fn a_secret_in_a_shell_assignment_keeps_its_name() {
+        let text = format!("ANTHROPIC_API_KEY={}\nDEBUG=1", fake_secret());
+        let masked = mask_secret_looking_text(&text);
+        assert!(!masked.contains(fake_secret_tail()), "{masked}");
+        assert!(masked.contains("ANTHROPIC_API_KEY=••••"), "{masked}");
+        assert!(masked.contains("DEBUG=1"), "{masked}");
+    }
+
+    /// Quoted and punctuated forms are the same secret.
+    #[test]
+    fn a_secret_in_json_and_prose_is_found() {
+        let secret = fake_secret();
+        for text in [
+            format!(r#"{{"api_key": "{secret}"}}"#),
+            format!("the key ({secret}) was refused"),
+            format!("key='{secret}';"),
+        ] {
+            let masked = mask_secret_looking_text(&text);
+            assert!(!masked.contains(fake_secret_tail()), "{masked}");
+        }
+    }
+
+    /// The shape test has to be narrow enough that ordinary identifiers,
+    /// element ids and hashes are not redacted.
+    #[test]
+    fn ordinary_identifiers_are_not_secrets() {
+        for text in [
+            "s00000001:0.1.3",
+            "Task: finished",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "key=value",
+        ] {
+            assert_eq!(mask_secret_looking_text(text), text, "{text}");
+        }
     }
 
     #[test]
@@ -225,6 +367,41 @@ mod tests {
         ] {
             assert!(!is_secret_container_key(key));
         }
+    }
+
+    /// A secret that arrives as prose is still a secret. Key-based masking
+    /// cannot see it — the covering key is `recovery` — so the trace sink
+    /// relies on this pass.
+    #[test]
+    fn secret_looking_values_are_masked_wherever_they_sit() {
+        let secret = fake_secret();
+        let second = ["sk", "second", "key", "value"].join("-");
+        let v = serde_json::json!({
+            "recovery": format!("the field named {secret} did not take the text"),
+            "tried": ["ax_action", second.clone()],
+            "rung": "keyboard",
+            "element_id": "s00000001:0.1.3",
+        });
+        let out = mask_secret_looking_values(&v);
+        let text = out["recovery"].as_str().unwrap();
+        assert!(!text.contains(fake_secret_tail()), "{text}");
+        assert!(text.contains("the field named"), "the context stays readable: {text}");
+        assert!(!out["tried"][1]
+            .as_str()
+            .unwrap()
+            .contains("second_key_value"));
+        assert_eq!(out["tried"][0], "ax_action");
+        // Element ids and rung names are not secrets and must survive.
+        assert_eq!(out["element_id"], "s00000001:0.1.3");
+        assert_eq!(out["rung"], "keyboard");
+    }
+
+    /// A line that was already masked is not expanded back into a longer
+    /// value by a second pass: the marker stays a marker.
+    #[test]
+    fn masked_text_stays_masked() {
+        let out = mask_secret_looking_values(&serde_json::json!({"hint": "key sk-••••abcd"}));
+        assert_eq!(out["hint"], "key ••••");
     }
 
     #[test]

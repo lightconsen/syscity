@@ -41,8 +41,8 @@ pub use in_memory::MemoryStore;
 #[cfg(feature = "keyring")]
 pub use keyring_store::{keyring_disabled, probe_keyring, KeyringStore};
 pub use mask::{
-    is_secret_container_key, is_secret_key, mask_json_value, mask_secret,
-    mask_secret_container_payload,
+    is_secret_container_key, is_secret_key, looks_like_secret_value, mask_json_value, mask_secret,
+    mask_secret_container_payload, mask_secret_looking_text, mask_secret_looking_values,
 };
 pub use store::{
     SecretId, SecretStore, SecretStoreHandle, SecretStoreTier, SecretValue, StoreRef,

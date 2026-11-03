@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
+use crate::computer::budget::StepBudget;
 use crate::computer::display::CoordinateSpace;
 use crate::computer::element_index::SnapshotCache;
 use crate::computer::page::{PageAction, PageActor, PageTarget};
@@ -97,6 +98,23 @@ pub struct StepOutcome {
     pub snapshots_taken: usize,
     /// Whether the auto-rollback fired on this step.
     pub rolled_back: bool,
+    /// Time spent waiting for the screen to stop changing, when a screenshot
+    /// was compared. `None` for non-mutating actions and for steps that never
+    /// reached a settle.
+    pub settle_ms: Option<u64>,
+    /// The step's time budget on the way out: what it had, what it spent.
+    ///
+    /// `None` when the session has no budget. Present otherwise so a caller
+    /// can tell "the desktop was slow" from "the ceiling was tight" without
+    /// guessing from wall-clock.
+    pub budget: Option<serde_json::Value>,
+}
+
+/// A step refused because the platform's hit test found something else at
+/// the point the action would land on.
+struct OcclusionRefusal {
+    result: ActionResult,
+    evidence: crate::computer::ActionEvidence,
 }
 
 /// Mutable per-session state.
@@ -130,6 +148,13 @@ pub struct SessionConfig {
     /// cannot reach the app without taking the foreground, instead of
     /// delivering it anyway.
     pub delivery: DeliveryMode,
+    /// How long one step may take, from its first capture to its last.
+    ///
+    /// `None` keeps the historical behaviour — no ceiling beyond whatever the
+    /// caller wraps around the whole tool call. When set, every capture, read,
+    /// wait and settle inside the step is capped by what is left, so the step
+    /// ends with a budget refusal instead of being cut off from outside.
+    pub step_budget: Option<Duration>,
 }
 
 impl Default for SessionConfig {
@@ -141,6 +166,7 @@ impl Default for SessionConfig {
             snapshot_paths: Vec::new(),
             verify: true,
             delivery: DeliveryMode::Foreground,
+            step_budget: None,
         }
     }
 }
@@ -202,6 +228,17 @@ impl ComputerSession {
     pub fn with_rollback_manager(mut self, manager: Arc<Mutex<RollbackManager>>) -> Self {
         self.rollback_manager = Some(manager);
         self
+    }
+
+    /// The budget for one step, started now.
+    ///
+    /// Built per step rather than per session: "one minute" means one minute
+    /// of *this* action, not a clock that started when the conversation did.
+    fn step_budget(&self) -> StepBudget {
+        match self.config.step_budget {
+            Some(total) => StepBudget::new(total),
+            None => StepBudget::unlimited(),
+        }
     }
 
     pub fn config(&self) -> &SessionConfig {
@@ -418,6 +455,25 @@ impl ComputerSession {
     /// hand off to the next, because a blind second click is how a UI ends up
     /// in a state nobody intended.
     pub async fn execute(&self, action: DesktopAction) -> crate::computer::Result<StepOutcome> {
+        self.execute_with_budget(action, None).await
+    }
+
+    /// Execute one action under a budget the caller set for this call.
+    ///
+    /// The tool wraps a step in the same ceiling the tool registry applies to
+    /// the whole call, with a margin, so the step ends by saying it ran out of
+    /// time rather than by being killed mid-sentence from outside. A session
+    /// configured with a `step_budget` still has one; a budget passed here
+    /// overrides it, because it belongs to *this* call.
+    pub async fn execute_with_budget(
+        &self,
+        action: DesktopAction,
+        budget: Option<StepBudget>,
+    ) -> crate::computer::Result<StepOutcome> {
+        let budget = match budget {
+            Some(budget) => budget,
+            None => self.step_budget(),
+        };
         let mutating = is_screen_mutating_action(&action);
 
         // Filesystem snapshots, so a step that wrecks something can be undone.
@@ -432,18 +488,75 @@ impl ComputerSession {
         // The rung that was actually dispatched last, for refusal evidence.
         let mut attempted: Option<Rung> = None;
 
+        // A control that said it is disabled gets a refusal, not a click.
+        // Clicking it anyway means clicking whatever draws on top of it, and
+        // the pixel rung would report success for a press nothing received.
+        if let Some(reason) = self.disabled_target(&action).await {
+            let recovery = "wait for the control to become enabled, or ask the user how to \
+                            proceed";
+            let mut evidence =
+                crate::computer::ActionEvidence::new(Rung::AxAction, ActionEffect::Refused)
+                    .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
+                    .with_recovery(recovery.to_string());
+            evidence.escalation = None;
+            let result = ActionResult::error(format!("refused: {reason} — {recovery}"));
+            // Nothing was delivered, so nothing failed either; a refusal must
+            // not count toward the auto-rollback threshold.
+            let verification = StepVerification::Unverifiable;
+            let (rolled_back, reflection) = self
+                .account(&action, &result, verification, ActionEffect::Refused)
+                .await;
+            return Ok(StepOutcome {
+                action,
+                result,
+                verification,
+                evidence: Some(evidence),
+                state_after: None,
+                diff: None,
+                sensitive_before: Vec::new(),
+                sensitive_after: self.sensitive_findings().await,
+                sensitive_target: false,
+                reflection,
+                snapshots_taken,
+                rolled_back,
+                settle_ms: None,
+                budget: Some(budget.summary()),
+            });
+        }
+
         for (index, rung) in ladder.iter().copied().enumerate() {
             let last_rung = index + 1 == ladder.len();
+
+            // A rung started with the budget already spent has no time to
+            // dispatch or verify; starting it would be the schedule's
+            // problem, not the desktop's.
+            if budget.is_exhausted() {
+                last_error = Some(ComputerError::BudgetExhausted(format!(
+                    "the step spent its {} ms before rung {rung:?} could run",
+                    budget.total().map(|t| t.as_millis()).unwrap_or_default()
+                )));
+                break;
+            }
 
             // Baseline for this attempt: one screenshot, and the tree only
             // when a diff will need it.
             let screenshot_before = if mutating {
-                self.adapter.screenshot(None).await.ok()
+                crate::computer::budget::within(&budget, "the baseline screenshot", async {
+                    self.adapter.screenshot(None).await
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
             } else {
                 None
             };
             let tree_before = if mutating {
-                self.adapter.read_ui_tree(None).await.ok()
+                crate::computer::budget::within(&budget, "the baseline tree read", async {
+                    self.adapter.read_ui_tree(None).await
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
             } else {
                 None
             };
@@ -454,7 +567,47 @@ impl ComputerSession {
             }
 
             attempted = Some(rung);
-            let result = match self.dispatch(&action, rung).await {
+
+            // The pixel rung aims at a point, and a point is not an element:
+            // a dialog, a notification, or another window can be drawn over
+            // it. Ask the platform what would actually receive the event
+            // first. Only a positive "something else is there" refuses; an
+            // unanswered hit test is not clearance, but it is not a refusal
+            // either, and must not block an action nobody could check.
+            if rung == Rung::Pixel {
+                if let Some(refusal) = self.occluded_target(&action).await {
+                    let (rolled_back, reflection) = self
+                        .account(
+                            &action,
+                            &refusal.result,
+                            StepVerification::Unverifiable,
+                            ActionEffect::Refused,
+                        )
+                        .await;
+                    let mut outcome = StepOutcome {
+                        action,
+                        result: refusal.result,
+                        verification: StepVerification::Unverifiable,
+                        evidence: Some(refusal.evidence),
+                        state_after: None,
+                        diff: None,
+                        sensitive_before: Vec::new(),
+                        sensitive_after: self.sensitive_findings().await,
+                        sensitive_target: false,
+                        reflection,
+                        snapshots_taken,
+                        rolled_back,
+                        settle_ms: None,
+                        budget: Some(budget.summary()),
+                    };
+                    if let Some(evidence) = outcome.evidence.as_mut() {
+                        evidence.tried = tried;
+                    }
+                    return Ok(outcome);
+                }
+            }
+
+            let result = match self.dispatch(&action, rung, &budget).await {
                 Ok(result) => result,
                 Err(e) => {
                     // A rung that could not run is not a failed action: the
@@ -487,11 +640,18 @@ impl ComputerSession {
             result.evidence = Some(driver_evidence.clone());
 
             // Settle, then capture the state verification compares against.
+            let settle_start = std::time::Instant::now();
             let state_after = if mutating {
-                self.settle_and_capture(screenshot_before.as_ref()).await
+                self.settle_and_capture(screenshot_before.as_ref(), &budget)
+                    .await
             } else {
                 None
             };
+            // How long the screen took to stop changing is evidence about the
+            // action: a step that settled instantly did nothing observable.
+            let settle_ms = state_after
+                .is_some()
+                .then(|| settle_start.elapsed().as_millis() as u64);
 
             let (verification, diff, hint) = if self.config.verify {
                 self.verify_step(
@@ -562,6 +722,8 @@ impl ComputerSession {
                 reflection,
                 snapshots_taken,
                 rolled_back,
+                settle_ms,
+                budget: Some(budget.summary()),
             });
         }
 
@@ -578,12 +740,16 @@ impl ComputerSession {
                 attempted.unwrap_or(Rung::Pixel),
                 ActionEffect::Refused,
             )
+            .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
             .with_recovery(recovery.to_string())
             .with_tried(tried);
             evidence.escalation = None;
             let message = format!("refused: {error} — {recovery}");
             let result = ActionResult::error(message);
-            let verification = StepVerification::Failed;
+            // Nothing was delivered, so nothing was verified — but nothing
+            // failed either. Recording a refusal as a verification failure
+            // makes three refusals in a row roll back work that may be fine.
+            let verification = StepVerification::Unverifiable;
             let (rolled_back, reflection) = self
                 .account(&action, &result, verification, ActionEffect::Refused)
                 .await;
@@ -600,10 +766,27 @@ impl ComputerSession {
                 reflection,
                 snapshots_taken,
                 rolled_back,
+                settle_ms: None,
+                budget: Some(budget.summary()),
             });
         }
 
-        Err(error)
+        // No rung could run, and none of them was a refusal: the ladder
+        // failed for a reason retrying might fix (a timeout, a tool failure).
+        // The evidence still travels — which rungs were tried, which was
+        // last — because "nothing worked" without "what was tried" is what
+        // makes a failure unactionable.
+        let mut evidence = crate::computer::ActionEvidence::new(
+            attempted.unwrap_or(Rung::Pixel),
+            ActionEffect::Refused,
+        )
+        .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
+        .with_tried(tried);
+        evidence.escalation = None;
+        Err(ComputerError::NoRung {
+            error: error.to_string(),
+            evidence: Box::new(evidence),
+        })
     }
 
     /// Which rungs to try, in order, for this action.
@@ -629,11 +812,18 @@ impl ComputerSession {
 
         let resolved = self.adapter.resolve_target(target).await.ok();
         let mut ladder = Vec::new();
-        // The ax rung needs a resolved element with an addressable path.
+        // The accessibility rung is offered only when the element says it
+        // supports the action, or when the platform did not publish an action
+        // list (then the old behaviour stands: try it, and let the rung's own
+        // result decide). An element that declared its actions and did not
+        // include this one is not worth an external round trip.
         if resolved
             .as_ref()
             .and_then(|r| r.element.as_ref())
-            .map(|e| e.supports_ax_action())
+            .map(|e| {
+                !e.supports_ax_action(&ax_action_for(target, action))
+                    .is_false()
+            })
             .unwrap_or(false)
         {
             ladder.push(Rung::AxAction);
@@ -653,12 +843,101 @@ impl ComputerSession {
         ladder
     }
 
+    /// Why the pixel rung should not be dispatched, when the platform's own
+    /// hit test says something else is at the point.
+    ///
+    /// Only a named occluder refuses. Every other answer — the platform has
+    /// no hit test, the point is outside every window, the target itself
+    /// receives the event — lets the action through: "nobody could check" is
+    /// not evidence that the way is blocked.
+    async fn occluded_target(&self, action: &DesktopAction) -> Option<OcclusionRefusal> {
+        let target = match action {
+            DesktopAction::Click { target, .. } | DesktopAction::DoubleClick { target, .. } => {
+                target
+            }
+            DesktopAction::Type { target: Some(target), .. } => target,
+            _ => return None,
+        };
+        // A bare coordinate has no intended element to compare against: the
+        // caller named a point and meant that point, so there is nothing the
+        // hit test could contradict.
+        let resolved = match target {
+            ClickTarget::Coordinate(_) => return None,
+            other => self.adapter.resolve_target(other).await.ok(),
+        };
+        let resolved = resolved?;
+        let Ok(point) = resolved.coordinates() else {
+            return None;
+        };
+        let hit = self.adapter.hit_test(point, Some(&resolved)).await;
+        let occluder = hit.occluder()?.clone();
+        let recovery = format!(
+            "{} is in the way at ({}, {}); dismiss or move it, re-read the UI tree and target \
+             the element again — the click was not sent",
+            occluder.summary(),
+            point.x,
+            point.y
+        );
+        let mut evidence = crate::computer::ActionEvidence::new(Rung::Pixel, ActionEffect::Refused)
+            .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
+            .with_recovery(recovery.clone())
+            .with_occluder(occluder.clone());
+        evidence.escalation = None;
+        Some(OcclusionRefusal {
+            result: ActionResult::error(format!("refused: {recovery}")),
+            evidence,
+        })
+    }
+
+    /// Why this action should not be attempted, when the target said so.
+    ///
+    /// Only a positive "disabled" answer blocks the action. `Tri::Absent` and
+    /// `Tri::Unknown` both let it through: the first means the platform does
+    /// not publish the state, the second that the read failed, and neither is
+    /// evidence that the control is unusable.
+    async fn disabled_target(&self, action: &DesktopAction) -> Option<String> {
+        let target = match action {
+            DesktopAction::Click { target, .. }
+            | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Type { target: Some(target), .. } => target,
+            _ => return None,
+        };
+        if matches!(target, ClickTarget::Coordinate(_)) {
+            return None;
+        }
+        let resolved = self.adapter.resolve_target(target).await.ok()?;
+        let element = resolved.element.as_ref()?;
+        if !element.enabled.is_false() {
+            return None;
+        }
+        let what = match element.label.as_deref().filter(|l| !l.is_empty()) {
+            Some(label) => format!("{} {:?}", element.role, label),
+            None => element.role.clone(),
+        };
+        Some(format!("{what} is disabled"))
+    }
+
     /// Perform the action at one rung.
     async fn dispatch(
         &self,
         action: &DesktopAction,
         rung: Rung,
+        budget: &StepBudget,
     ) -> crate::computer::Result<ActionResult> {
+        // A `wait` is the one action whose whole content is time. Asking for
+        // more than the step has left would turn a requested wait into a
+        // timeout from above; sleeping what fits and saying so is the honest
+        // answer.
+        let action = match action {
+            DesktopAction::Wait { milliseconds } if budget.total().is_some() => {
+                let left = budget.remaining().unwrap_or_default().as_millis() as u64;
+                DesktopAction::Wait {
+                    milliseconds: (*milliseconds).min(left),
+                }
+            }
+            other => other.clone(),
+        };
+        let action = &action;
         // The pointer and keyboard rungs are the two that can take the screen
         // away from whoever is using it. In background mode they go through
         // the adapter's background path, which refuses when the platform has
@@ -667,12 +946,31 @@ impl ComputerSession {
             && matches!(rung, Rung::Pixel | Rung::Keyboard)
         {
             let target = self.resolved_target(action).await;
-            return self
-                .adapter
-                .perform_background(action, target.as_ref())
-                .await;
+            return crate::computer::budget::within(budget, "the background dispatch", async {
+                self.adapter
+                    .perform_background(action, target.as_ref())
+                    .await
+            })
+            .await?;
         }
 
+        // The dispatch itself is the part that can hang (an AppleScript
+        // telling System Events to do something that never answers). Give it
+        // the budget, not a magic number.
+        crate::computer::budget::within(
+            budget,
+            "the action dispatch",
+            self.dispatch_now(action, rung),
+        )
+        .await
+        .unwrap_or_else(|_| Err(ComputerError::BudgetExhausted("dispatch".to_string())))
+    }
+
+    async fn dispatch_now(
+        &self,
+        action: &DesktopAction,
+        rung: Rung,
+    ) -> crate::computer::Result<ActionResult> {
         match (rung, action) {
             (Rung::AxAction, DesktopAction::Click { target, .. })
             | (Rung::AxAction, DesktopAction::DoubleClick { target, .. }) => {
@@ -697,10 +995,11 @@ impl ComputerSession {
             // keyboard rung is not a safe answer, so stop the ladder here.
             (Rung::Pixel, DesktopAction::Type { text, target: Some(target) }) => {
                 let resolved = self.adapter.resolve_target(target).await?;
+                let point = resolved.coordinates()?;
                 let focus = self
                     .adapter
                     .click_at(
-                        crate::computer::Point::new(resolved.x, resolved.y),
+                        crate::computer::Point::new(point.x, point.y),
                         crate::computer::MouseButton::Left,
                     )
                     .await?;
@@ -860,7 +1159,11 @@ impl ComputerSession {
     ///
     /// The first capture is the one verification needs anyway, so a settled
     /// screen costs one screenshot instead of a fixed sleep plus one.
-    async fn settle_and_capture(&self, before: Option<&Screenshot>) -> Option<ScreenState> {
+    async fn settle_and_capture(
+        &self,
+        before: Option<&Screenshot>,
+        budget: &StepBudget,
+    ) -> Option<ScreenState> {
         let cfg = self.config.settle;
         let mut previous = before.cloned();
         let mut settled_shot = None;
@@ -871,13 +1174,39 @@ impl ComputerSession {
             } else {
                 cfg.poll_interval_ms
             };
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            // Settling is where a step spends most of its time, and it is
+            // also the most expandable part: stopping it at the deadline is
+            // honest (the last capture is still a capture) where a timeout
+            // cut from outside is not.
+            let delay = Duration::from_millis(delay);
+            if budget.is_exhausted() {
+                tracing::info!("settle stopped: the step budget is spent");
+                break;
+            }
+            tokio::time::sleep(budget.cap(delay)).await;
+            if budget.is_exhausted() {
+                tracing::info!("settle stopped after its wait: the step budget is spent");
+                break;
+            }
 
-            let shot = match self.adapter.screenshot(None).await {
-                Ok(shot) => shot,
-                Err(e) => {
+            // The capture is part of what the step pays for: a screenshot
+            // that outlasts the budget is a setTimeout from outside, which is
+            // exactly what the budget exists to avoid.
+            let shot = match crate::computer::budget::within(
+                budget,
+                "a settle screenshot",
+                self.adapter.screenshot(None),
+            )
+            .await
+            {
+                Ok(Ok(shot)) => shot,
+                Ok(Err(e)) => {
                     tracing::warn!("post-action screenshot failed: {}", e);
                     return None;
+                }
+                Err(e) => {
+                    tracing::info!("settle stopped: {}", e);
+                    break;
                 }
             };
 
@@ -897,7 +1226,22 @@ impl ComputerSession {
         }
 
         let shot = settled_shot?;
-        let tree = self.adapter.read_ui_tree(None).await.unwrap_or_default();
+        // The tree read is the other half of the post-action capture, and it
+        // is the half that walks a full accessibility tree. If it cannot
+        // finish in what is left, the screenshot alone still tells the
+        // verifier something; an empty tree tells it exactly as much as a
+        // timed-out one would.
+        let tree = crate::computer::budget::within(
+            budget,
+            "the post-action tree read",
+            self.adapter.read_ui_tree(None),
+        )
+        .await
+        .map(|result| result.unwrap_or_default())
+        .unwrap_or_else(|e| {
+            tracing::info!("post-action tree read skipped: {}", e);
+            Vec::new()
+        });
         Some(ScreenState::from_parts(tree, shot))
     }
 
@@ -1080,6 +1424,19 @@ impl ComputerSession {
     }
 }
 
+/// The accessibility action a rung would perform for this target.
+///
+/// The whole action is passed because `SetValue` carries text: the gate only
+/// asks *which* action a rung would send, never *what* it writes.
+fn ax_action_for(target: &ClickTarget, action: &DesktopAction) -> crate::computer::AxAction {
+    match (target, action) {
+        (_, DesktopAction::Type { target: Some(_), .. }) => {
+            crate::computer::AxAction::SetValue { value: String::new() }
+        }
+        _ => crate::computer::AxAction::Press,
+    }
+}
+
 /// A verdict derived from the UI tree rather than from pixels.
 ///
 /// The pixel diff can only answer "something changed". Some actions have an
@@ -1239,6 +1596,16 @@ fn refusal_recovery(error: &ComputerError) -> Option<&'static str> {
             "no element matched — re-read the UI tree and target a current element id, label, or \
              screen coordinates",
         ),
+        // Different advice from "not found": the element may exist, the read
+        // just did not reach it. Re-aiming would waste the turn.
+        ComputerError::TreeIncomplete(_) => Some(
+            "the element was not in the part of the tree that was read — re-read the UI tree with \
+             a larger max_depth, then target a fresh element id",
+        ),
+        ComputerError::AmbiguousTarget(_) => Some(
+            "more than one element matched — use the element id of the one you mean, or add its \
+             role to the target",
+        ),
         ComputerError::AccessibilityDenied => Some(
             "grant Accessibility permission to the gateway (System Settings → Privacy & Security \
              → Accessibility), then retry",
@@ -1257,6 +1624,14 @@ fn refusal_recovery(error: &ComputerError) -> Option<&'static str> {
         ComputerError::NotInitialized => {
             Some("the computer adapter is not initialized; configure desktop access first")
         }
+        // The step ran out of the time the caller gave it. Retrying the same
+        // step with the same ceiling will hit the same wall; the fix is either
+        // more budget or a smaller step (a narrower tree read, an element id
+        // instead of a screen-wide settle).
+        ComputerError::BudgetExhausted(_) => Some(
+            "the step spent its time budget before this action could be delivered — raise the \
+             step budget, or narrow the step (target an element id, read the tree shallower)",
+        ),
         _ => None,
     }
 }
@@ -1275,29 +1650,60 @@ fn scan_sensitive(tree: &[UiElement]) -> Vec<SensitiveUiFinding> {
 ///
 /// The driver's `Confirmed` survives only when nothing contradicted it — a
 /// failed diff means the action was delivered but had no visible effect, which
-/// is `SuspectedNoop`, not `Confirmed`.
+/// is `SuspectedNoop`, not `Confirmed`. And "the platform accepted the call"
+/// is not `Confirmed` at all: a driver that reached the element but could not
+/// observe what happened there says `DeliveredUnverified`, and the effect
+/// stays `Unverifiable`. Nothing in this function may promote an unobserved
+/// effect to a confirmed one.
 pub fn score_evidence(
     verification: StepVerification,
     driver: Option<&crate::computer::ActionEvidence>,
 ) -> crate::computer::ActionEvidence {
     let rung = driver.map(|d| d.rung).unwrap_or(Rung::Pixel);
     let tried = driver.map(|d| d.tried.clone()).unwrap_or_default();
+    let driver_effect = driver.map(|d| d.effect);
+    let driver_delivery = driver.map(|d| d.delivery).unwrap_or_default();
 
     let effect = match verification {
         StepVerification::Verified => ActionEffect::Confirmed,
-        StepVerification::Failed => match driver.map(|d| d.effect) {
+        StepVerification::Failed => match driver_effect {
             // The driver knows something the pixels do not: the action was
             // delivered and partly took, or never ran at all.
             Some(ActionEffect::Partial) => ActionEffect::Partial,
             Some(ActionEffect::Refused) => ActionEffect::Refused,
             _ => ActionEffect::SuspectedNoop,
         },
-        StepVerification::Unverifiable => match driver.map(|d| d.effect) {
+        StepVerification::Unverifiable => match driver_effect {
+            // A driver that claims `Confirmed` without having observed the
+            // effect is reporting a successful *call*, not a result. If it
+            // also admitted it could not verify (`DeliveredUnverified`), the
+            // honest effect is `Unverifiable`; keeping its `Confirmed` here is
+            // how an ax rung that silently did nothing reads as done.
+            Some(ActionEffect::Confirmed)
+                if driver_delivery == crate::computer::DeliveryDisposition::DeliveredUnverified =>
+            {
+                ActionEffect::Unverifiable
+            }
             Some(ActionEffect::Confirmed) => ActionEffect::Confirmed,
             Some(ActionEffect::Partial) => ActionEffect::Partial,
             Some(ActionEffect::Refused) => ActionEffect::Refused,
             _ => ActionEffect::Unverifiable,
         },
+    };
+
+    // The delivery disposition follows the final effect: an effect that was
+    // observed is a delivery that was verified, whatever the driver thought.
+    let delivery = match effect {
+        ActionEffect::Confirmed => crate::computer::DeliveryDisposition::DeliveredVerified,
+        ActionEffect::Refused => crate::computer::DeliveryDisposition::NotDelivered,
+        ActionEffect::SuspectedNoop | ActionEffect::Partial => {
+            if driver_delivery == crate::computer::DeliveryDisposition::NotDelivered {
+                crate::computer::DeliveryDisposition::NotDelivered
+            } else {
+                crate::computer::DeliveryDisposition::DeliveredUnverified
+            }
+        }
+        ActionEffect::Unverifiable => driver_delivery,
     };
 
     let escalation = match (effect, rung) {
@@ -1318,9 +1724,12 @@ pub fn score_evidence(
     crate::computer::ActionEvidence {
         rung,
         effect,
+        delivery,
+        retry: delivery.retry(),
         escalation,
         tried,
         recovery: driver.and_then(|d| d.recovery.clone()),
+        occluder: driver.and_then(|d| d.occluder.clone()),
     }
 }
 
@@ -1353,7 +1762,7 @@ pub fn render_notes(notes: &[PinnedNote]) -> String {
 mod tests {
     use super::*;
     use crate::computer::headless::HeadlessComputerAdapter;
-    use crate::computer::types::{MouseButton, Rect, WaitCondition};
+    use crate::computer::types::{MouseButton, Rect, Tri, WaitCondition};
     use crate::computer::ActionEvidence;
 
     fn headless_session() -> ComputerSession {
@@ -1410,6 +1819,13 @@ mod tests {
     struct LadderAdapter {
         role: String,
         set_value_works: bool,
+        /// What the element says about accepting input. `Known(true)` unless a
+        /// test is about the disabled pre-check.
+        enabled: Tri,
+        /// How long every call takes. Zero unless a test is about the budget:
+        /// a real desktop call is not instantaneous, and a budget test needs
+        /// calls that can outlast it.
+        delay: Duration,
         log: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -1418,8 +1834,33 @@ mod tests {
             Self {
                 role: role.to_string(),
                 set_value_works,
+                enabled: Tri::Known(true),
+                delay: Duration::ZERO,
                 log: tokio::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// Make every call take `ms` milliseconds, as a slow desktop would.
+        fn slow(mut self, ms: u64) -> Self {
+            self.delay = Duration::from_millis(ms);
+            self
+        }
+
+        async fn pause(&self) {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+        }
+
+        fn disabled(mut self) -> Self {
+            self.enabled = Tri::Known(false);
+            self
+        }
+
+        /// The element did not publish its state: not evidence of anything.
+        fn state_unknown(mut self) -> Self {
+            self.enabled = Tri::Unknown;
+            self
         }
 
         async fn recorded(&self) -> Vec<String> {
@@ -1434,6 +1875,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ComputerAdapter for LadderAdapter {
         async fn screenshot(&self, _region: Option<Rect>) -> crate::computer::Result<Screenshot> {
+            self.pause().await;
             Ok(Screenshot::new(String::new(), 100, 100))
         }
 
@@ -1441,6 +1883,7 @@ mod tests {
             &self,
             _app: Option<&str>,
         ) -> crate::computer::Result<Vec<UiElement>> {
+            self.pause().await;
             Ok(Vec::new())
         }
 
@@ -1448,26 +1891,25 @@ mod tests {
             &self,
             target: &ClickTarget,
         ) -> crate::computer::Result<ActionTarget> {
-            Ok(ActionTarget {
-                x: 10,
-                y: 20,
+            let mut resolved = ActionTarget {
+                point: Some(crate::computer::Point::new(10, 20)),
                 element: Some(crate::computer::element_index::ResolvedElement {
                     id: "e1".to_string(),
                     role: self.role.clone(),
                     label: Some("Field".to_string()),
-                    center: crate::computer::Point::new(10, 20),
+                    center: Some(crate::computer::Point::new(10, 20)),
+                    bounds: Some(crate::computer::Rect::new(10, 20, 20, 10)),
                     path: vec![0, 0],
+                    actions: None,
+                    enabled: self.enabled,
                 }),
                 app: Some("Test".to_string()),
                 snapshot: None,
-            })
-            .map(|mut resolved| {
-                if let ClickTarget::Coordinate(point) = target {
-                    resolved.x = point.x;
-                    resolved.y = point.y;
-                }
-                resolved
-            })
+            };
+            if let ClickTarget::Coordinate(point) = target {
+                resolved.point = Some(*point);
+            }
+            Ok(resolved)
         }
 
         async fn perform_ax_action(
@@ -1475,6 +1917,7 @@ mod tests {
             _target: &ActionTarget,
             action: crate::computer::AxAction,
         ) -> crate::computer::Result<ActionResult> {
+            self.pause().await;
             let confirmed =
                 || crate::computer::ActionEvidence::new(Rung::AxAction, ActionEffect::Confirmed);
             match action {
@@ -1500,6 +1943,7 @@ mod tests {
         }
 
         async fn execute(&self, action: DesktopAction) -> crate::computer::Result<ActionResult> {
+            self.pause().await;
             match action {
                 DesktopAction::Click { target, .. } => {
                     self.record(format!("click:{target:?}")).await;
@@ -1512,6 +1956,13 @@ mod tests {
                 DesktopAction::KeyPress { keys } => {
                     self.record(format!("key:{}", keys.join("+"))).await;
                     Ok(ActionResult::success("pressed"))
+                }
+                // A wait really spends its time, so a test can see that the
+                // step capped it.
+                DesktopAction::Wait { milliseconds } => {
+                    self.record(format!("wait:{milliseconds}")).await;
+                    tokio::time::sleep(Duration::from_millis(milliseconds)).await;
+                    Ok(ActionResult::success("waited"))
                 }
                 _ => Ok(ActionResult::success("ok")),
             }
@@ -1554,10 +2005,13 @@ mod tests {
             role: role.to_string(),
             label: None,
             value: Some(value.to_string()),
-            bounds: Rect::new(0, 0, 100, 20),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(0, 0, 100, 20)),
+            enabled: crate::computer::Tri::Known(true),
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
             children: Vec::new(),
+            children_count: None,
+            truncated: false,
         }
     }
 
@@ -1783,7 +2237,11 @@ mod tests {
         assert_eq!(evidence.effect, ActionEffect::Refused);
         let recovery = evidence.recovery.expect("refusals carry a recovery hint");
         assert!(recovery.contains("re-read the UI tree"), "{recovery}");
-        assert_eq!(outcome.verification, StepVerification::Failed);
+        // A refusal delivered nothing, so it is neither verified nor failed:
+        // counting it as a failure is how three refusals in a row rolled back
+        // work that was fine.
+        assert_eq!(outcome.verification, StepVerification::Unverifiable);
+        assert!(!outcome.rolled_back);
         assert!(!outcome.result.success);
         assert!(outcome.result.message.contains("refused"));
         assert!(outcome.result.message.contains(recovery.as_str()));
@@ -1837,6 +2295,7 @@ mod tests {
                         button: MouseButton::Left,
                     },
                     Rung::Keyboard,
+                    &StepBudget::unlimited(),
                 )
                 .await
                 .expect("keyboard rung");
@@ -1968,7 +2427,7 @@ mod tests {
         // Dispatching it anyway must refuse, not fall through to a blind
         // click: "no page" is not "the pixel rung again".
         let error = session
-            .dispatch(&click_element("e1"), Rung::Page)
+            .dispatch(&click_element("e1"), Rung::Page, &StepBudget::unlimited())
             .await
             .expect_err("no page is attached");
         assert!(matches!(error, ComputerError::UnsupportedPlatform(_)));
@@ -1994,7 +2453,7 @@ mod tests {
         let session = ladder_session(&adapter).with_page(page.clone(), "conv-1");
 
         session
-            .dispatch(&click_element("e1"), Rung::Page)
+            .dispatch(&click_element("e1"), Rung::Page, &StepBudget::unlimited())
             .await
             .expect("page click");
         session
@@ -2004,6 +2463,7 @@ mod tests {
                     target: Some(ClickTarget::ElementId("e1".to_string())),
                 },
                 Rung::Page,
+                &StepBudget::unlimited(),
             )
             .await
             .expect("page type");
@@ -2062,23 +2522,24 @@ mod tests {
             target: &ClickTarget,
         ) -> crate::computer::Result<ActionTarget> {
             let mut resolved = ActionTarget {
-                x: 10,
-                y: 20,
+                point: Some(crate::computer::Point::new(10, 20)),
                 element: Some(crate::computer::element_index::ResolvedElement {
                     id: "e1".to_string(),
                     role: "AXButton".to_string(),
                     label: Some("Save".to_string()),
-                    center: crate::computer::Point::new(10, 20),
+                    center: Some(crate::computer::Point::new(10, 20)),
+                    bounds: Some(crate::computer::Rect::new(10, 20, 20, 10)),
                     // No path: the accessibility rung cannot run, which is
                     // the case background delivery has to answer for.
                     path: Vec::new(),
+                    actions: None,
+                    enabled: crate::computer::Tri::Known(true),
                 }),
                 app: Some("Test".to_string()),
                 snapshot: None,
             };
             if let ClickTarget::Coordinate(point) = target {
-                resolved.x = point.x;
-                resolved.y = point.y;
+                resolved.point = Some(*point);
             }
             Ok(resolved)
         }
@@ -2186,5 +2647,183 @@ mod tests {
         let log = adapter.recorded().await;
         assert!(log.iter().any(|entry| entry.starts_with("foreground:")), "{log:?}");
         assert!(!log.iter().any(|entry| entry.starts_with("background:")), "{log:?}");
+    }
+
+    // ── The disabled pre-check (§2) ──────────────────────────────────────
+
+    /// A control that said it is disabled is refused before any rung runs.
+    #[tokio::test]
+    async fn a_disabled_control_is_refused_not_clicked() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true).disabled());
+        let session = ladder_session(&adapter);
+        let outcome = session
+            .execute(click_element("e1"))
+            .await
+            .expect("a refusal is an outcome");
+
+        assert!(adapter.recorded().await.is_empty(), "nothing was dispatched");
+        let evidence = outcome.evidence.expect("evidence");
+        assert_eq!(evidence.effect, ActionEffect::Refused);
+        assert_eq!(evidence.delivery, crate::computer::DeliveryDisposition::NotDelivered);
+        assert!(evidence.escalation.is_none());
+        let message = outcome.result.message;
+        assert!(message.contains("disabled"), "{message}");
+    }
+
+    /// A refusal is not a verification failure: three in a row must not
+    /// trigger the auto-rollback that counts failures.
+    #[tokio::test]
+    async fn repeated_refusals_do_not_count_as_failures() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true).disabled());
+        let session = ladder_session(&adapter);
+        for _ in 0..4 {
+            let outcome = session.execute(click_element("e1")).await.expect("refusal");
+            assert_eq!(outcome.verification, StepVerification::Unverifiable);
+            assert!(!outcome.rolled_back, "a refusal must not roll back work");
+        }
+    }
+
+    /// An unpublished state is not a reason to refuse: refusing would skip a
+    /// control that is perfectly clickable.
+    #[tokio::test]
+    async fn an_unpublished_state_does_not_block_the_action() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true).state_unknown());
+        let session = ladder_session(&adapter);
+        session
+            .execute(click_element("e1"))
+            .await
+            .expect("the action proceeds");
+        let log = adapter.recorded().await;
+        assert!(!log.is_empty(), "the ladder ran: {log:?}");
+    }
+
+    /// A coordinate target has no element state to consult.
+    #[tokio::test]
+    async fn a_coordinate_click_is_not_pre_checked() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true).disabled());
+        let session = ladder_session(&adapter);
+        session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(5, 5)),
+                button: crate::computer::MouseButton::Left,
+            })
+            .await
+            .expect("coordinates are delivered as given");
+        let log = adapter.recorded().await;
+        assert!(!log.is_empty(), "{log:?}");
+    }
+
+    // ── The step budget (§5.3) ───────────────────────────────────────────
+
+    /// A step that runs out of time stops itself and says so, with a recovery
+    /// hint, instead of being killed from above as "tool timed out".
+    #[tokio::test]
+    async fn a_spent_budget_is_a_refusal_with_the_budget_in_evidence() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true).slow(50));
+        let session = ladder_session(&adapter);
+        let outcome = session
+            .execute_with_budget(
+                click_element("e1"),
+                Some(StepBudget::new(Duration::from_millis(20))),
+            )
+            .await
+            .expect("a spent budget is an outcome, not a crash");
+
+        assert!(!outcome.result.success, "nothing was confirmed");
+        let evidence = outcome.evidence.expect("evidence travels with a refusal");
+        assert_eq!(evidence.effect, ActionEffect::Refused);
+        assert!(
+            evidence
+                .recovery
+                .as_deref()
+                .is_some_and(|r| r.contains("budget")),
+            "the refusal names the ceiling: {:?}",
+            evidence.recovery
+        );
+        assert!(
+            adapter.recorded().await.is_empty(),
+            "no rung was dispatched after the budget ran out"
+        );
+        let budget = outcome.budget.expect("the step reports its budget");
+        assert_eq!(budget["total_ms"], 20);
+        assert_eq!(budget["remaining_ms"], 0);
+    }
+
+    /// A budget generous enough for the work changes nothing: the action is
+    /// delivered and verified exactly as it is without one.
+    #[tokio::test]
+    async fn a_generous_budget_leaves_the_step_unchanged() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true));
+        let session = ladder_session(&adapter);
+        let outcome = session
+            .execute_with_budget(click_element("e1"), Some(StepBudget::new(Duration::from_secs(5))))
+            .await
+            .expect("delivered");
+
+        assert!(outcome.result.success, "{}", outcome.result.message);
+        assert!(!adapter.recorded().await.is_empty(), "the action ran");
+        let budget = outcome.budget.expect("budget reported");
+        assert_eq!(budget["total_ms"], 5000);
+        assert!(budget["elapsed_ms"].as_u64().expect("elapsed") < 5000, "{budget}");
+    }
+
+    /// The configured ceiling works the same way, so a caller that sets it
+    /// once on the session does not have to pass it per call.
+    #[tokio::test]
+    async fn a_session_configured_budget_applies_to_the_step() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true).slow(50));
+        let session = ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 0,
+                poll_interval_ms: 0,
+                max_rounds: 1,
+                stable_threshold: 0.5,
+            },
+            step_budget: Some(Duration::from_millis(20)),
+            ..SessionConfig::default()
+        });
+        let outcome = session
+            .execute(click_element("e1"))
+            .await
+            .expect("an outcome");
+        assert!(!outcome.result.success);
+        assert!(adapter.recorded().await.is_empty());
+        assert_eq!(
+            outcome.budget.expect("budget")["total_ms"],
+            20,
+            "the configured ceiling is the one reported"
+        );
+    }
+
+    /// `wait` is the one action whose content is time: asking for longer than
+    /// the step has left sleeps what fits instead of overrunning the caller.
+    #[tokio::test]
+    async fn a_wait_longer_than_the_budget_is_capped() {
+        let adapter = Arc::new(LadderAdapter::new("AXButton", true));
+        let session = ladder_session(&adapter);
+        let started = std::time::Instant::now();
+        let outcome = session
+            .execute_with_budget(
+                DesktopAction::Wait { milliseconds: 5_000 },
+                Some(StepBudget::new(Duration::from_millis(200))),
+            )
+            .await
+            .expect("a capped wait is still a wait");
+        assert!(outcome.result.success);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait was capped, not slept in full: {:?}",
+            started.elapsed()
+        );
+        // The adapter is told a number it can actually sleep, not 5 s.
+        let log = adapter.recorded().await;
+        let waited: u64 = log
+            .iter()
+            .find_map(|entry| entry.strip_prefix("wait:"))
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or_else(|| panic!("a capped wait reached the adapter: {log:?}"));
+        assert!(waited <= 200, "sleeps what fits: {waited}");
+        let budget = outcome.budget.expect("budget");
+        assert!(budget["remaining_ms"].as_u64().expect("remaining") <= 5, "{budget}");
     }
 }

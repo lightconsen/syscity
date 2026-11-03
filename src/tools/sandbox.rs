@@ -336,6 +336,7 @@ mod tests {
             skill_trust_ceiling: None,
             mobile: None,
             steers: None,
+            trace: None,
         }
     }
 

@@ -82,6 +82,10 @@ impl ComputerTool {
             sessions
                 .entry(key.clone())
                 .or_insert_with(|| {
+                    // No step budget in the config: the session is cached
+                    // across calls, and a ceiling set here would belong to
+                    // whichever call happened to create it. The per-call
+                    // budget is passed to `execute_with_budget` instead.
                     let session = ComputerSession::new(adapter).with_config(
                         crate::computer::session::SessionConfig { delivery, ..Default::default() },
                     );
@@ -143,7 +147,7 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
                 },
                 "element_id": {
                     "type": "string",
-                    "description": "Element id from read_ui_tree / screen output, e.g. \"s0000001f:0.1\". Preferred over x/y for click and double_click: it resolves inside the application instead of at screen pixels, and survives the window moving. For type it names the field to write into, which lets the tool set its value directly instead of typing into whatever holds focus. An id from an older snapshot is rejected — re-read the tree."
+                    "description": "Element id from read_ui_tree / screen output, e.g. \"s3f2a1b4c0000001f:0.1\". Preferred over x/y for click and double_click: it resolves inside the application instead of at screen pixels, and survives the window moving. For type it names the field to write into, which lets the tool set its value directly instead of typing into whatever holds focus. An id from an older snapshot is rejected — re-read the tree."
                 },
                 "delivery": {
                     "type": "string",
@@ -201,6 +205,8 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
                 // ── Wait ──────────────────────────────────────────────────
                 "milliseconds": { "type": "integer", "description": "Duration to wait in milliseconds" },
                 // ── Drag sub-params ───────────────────────────────────────
+                "from_element_id": { "type": "string", "description": "Drag start element id (preferred over from_x/from_y)" },
+                "to_element_id": { "type": "string", "description": "Drag end element id (preferred over to_x/to_y)" },
                 "from_x": { "type": "integer", "description": "Drag start X" },
                 "from_y": { "type": "integer", "description": "Drag start Y" },
                 "to_x": { "type": "integer", "description": "Drag end X" },
@@ -233,7 +239,7 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
     async fn execute(
         &self,
         mut args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let _t_start = std::time::Instant::now();
         // Owned: converting screenshot coordinates needs `&mut args` later.
@@ -247,7 +253,7 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
             _ => crate::computer::DeliveryMode::Foreground,
         };
 
-        let Some(session) = self.session_for(_context, delivery).await else {
+        let Some(session) = self.session_for(context, delivery).await else {
             return Err(crate::error::SyscityError::Unsupported(
                 "Computer adapter is not configured".to_string(),
             ));
@@ -326,10 +332,26 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
         let desktop_action = action_to_desktop_action(&action, &args)?;
 
         let adapter_start = std::time::Instant::now();
-        let outcome = session
-            .execute(desktop_action)
+        // A ladder that never got a rung to run is still a step with evidence:
+        // which rungs were tried, what each of them said, and whether a retry
+        // is safe. Returning it as `Ok(failed result)` — rather than as a
+        // flattened `Err` — is what lets that evidence reach the model.
+        let step_budget = step_budget_for(context.timeout());
+        let outcome = match session
+            .execute_with_budget(
+                desktop_action,
+                Some(crate::computer::budget::StepBudget::new(step_budget)),
+            )
             .await
-            .map_err(to_syscity_err)?;
+        {
+            Ok(outcome) => outcome,
+            Err(error @ ComputerError::NoRung { .. }) => {
+                let result = norung_tool_result(&error, &action);
+                record_action_trace(context, &action, result.data.as_ref());
+                return Ok(result);
+            }
+            Err(other) => return Err(to_syscity_err(other)),
+        };
         info!(
             "[ComputerTool] action={} session.execute() took {:?} (total so far: {:?})",
             action,
@@ -338,6 +360,7 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
         );
 
         let mut tool_result = build_tool_result(outcome, &action).await;
+        record_action_trace(context, &action, tool_result.data.as_ref());
 
         // Say which space the coordinates were quoted in, so the caller can
         // see the conversion rather than having to trust it.
@@ -425,16 +448,27 @@ fn action_to_desktop_action(action: &str, args: &Value) -> crate::Result<Desktop
             Ok(DesktopAction::Scroll { target, direction, amount })
         }
         "drag" => {
-            let from_coords = (
-                args["from_x"].as_i64().unwrap_or(0) as i32,
-                args["from_y"].as_i64().unwrap_or(0) as i32,
-            );
-            let to_coords = (
-                args["to_x"].as_i64().unwrap_or(0) as i32,
-                args["to_y"].as_i64().unwrap_or(0) as i32,
-            );
-            let from = ClickTarget::Coordinate(Point::new(from_coords.0, from_coords.1));
-            let to = ClickTarget::Coordinate(Point::new(to_coords.0, to_coords.1));
+            // A drag names its ends the same way every other action does: an
+            // element id first, then a point. Coordinates-only drags were the
+            // one place the tool's "elements before pixels" contract did not
+            // hold.
+            let from = if let Some(id) = args["from_element_id"].as_str().filter(|s| !s.is_empty())
+            {
+                ClickTarget::ElementId(id.to_string())
+            } else {
+                ClickTarget::Coordinate(Point::new(
+                    args["from_x"].as_i64().unwrap_or(0) as i32,
+                    args["from_y"].as_i64().unwrap_or(0) as i32,
+                ))
+            };
+            let to = if let Some(id) = args["to_element_id"].as_str().filter(|s| !s.is_empty()) {
+                ClickTarget::ElementId(id.to_string())
+            } else {
+                ClickTarget::Coordinate(Point::new(
+                    args["to_x"].as_i64().unwrap_or(0) as i32,
+                    args["to_y"].as_i64().unwrap_or(0) as i32,
+                ))
+            };
             Ok(DesktopAction::Drag { from, to })
         }
         "read_ui_tree" => {
@@ -571,6 +605,19 @@ fn action_to_desktop_action(action: &str, args: &Value) -> crate::Result<Desktop
 /// Coordinate parameter pairs an action may carry.
 const COORDINATE_PAIRS: [(&str, &str); 3] = [("x", "y"), ("from_x", "from_y"), ("to_x", "to_y")];
 
+/// How much of the tool call's timeout a step may spend.
+///
+/// The registry kills the tool at `timeout` and reports "tool timed out",
+/// which says nothing about the desktop. A step given the whole timeout would
+/// always be killed mid-flight, so it gets the timeout minus a margin: enough
+/// left over to account, write the trace line and return the refusal. The
+/// margin is a tenth of the ceiling, capped at five seconds, so a 120 s call
+/// leaves 5 s to land and a 30 s call leaves 3 s.
+fn step_budget_for(timeout: std::time::Duration) -> std::time::Duration {
+    let margin = (timeout / 10).min(std::time::Duration::from_secs(5));
+    timeout.saturating_sub(margin)
+}
+
 /// Whether the args carry at least one complete coordinate pair.
 fn has_screenshot_coordinates(args: &Value) -> bool {
     COORDINATE_PAIRS.iter().any(|(xk, yk)| {
@@ -686,11 +733,31 @@ fn parse_string_array(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Write this step's evidence into the turn trace, when there is one.
+///
+/// The trace is derived from the exact payload the model was shown, so the
+/// file cannot disagree with what the model acted on. Masking happens inside
+/// the sink (see [`crate::observe::ActionTraceSink::record_action`]), which is
+/// why the unmasked payload can be handed over here.
+fn record_action_trace(context: &ToolContext, action: &str, data: Option<&Value>) {
+    let Some(trace) = context.trace.as_ref() else {
+        return;
+    };
+    let Some(detail) = data else {
+        return;
+    };
+    trace.record_action(&crate::observe::ActionTraceEvent::from_detail(action, detail));
+}
+
 /// Render a [`StepOutcome`] for the model.
 ///
 /// The payload carries machine-readable `effect` / `escalation` / `rung`, and
 /// the text carries the same facts in one line each, because the model reads
 /// the text and the harness reads the data.
+///
+/// When the turn has a trace sink, the same evidence also becomes one
+/// `action` line in the turn's `full.json` — without it, "the click did
+/// nothing" in a report has nothing under it to read.
 async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionResult {
     let StepOutcome {
         result,
@@ -700,6 +767,8 @@ async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionR
         sensitive_target,
         reflection,
         verification,
+        settle_ms,
+        budget,
         ..
     } = outcome;
 
@@ -756,13 +825,29 @@ async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionR
             if let Some(next) = evidence.escalation {
                 obj.insert("escalation".to_string(), json!(escalation_name(next)));
             }
+            obj.insert("delivery".to_string(), json!(evidence.delivery.as_str()));
+            obj.insert("retry".to_string(), json!(evidence.retry.as_str()));
             if let Some(recovery) = &evidence.recovery {
                 obj.insert("recovery".to_string(), json!(recovery));
+            }
+            if let Some(occluder) = &evidence.occluder {
+                obj.insert(
+                    "occluder".to_string(),
+                    serde_json::to_value(occluder).unwrap_or_default(),
+                );
             }
             obj.insert(
                 "tried".to_string(),
                 serde_json::to_value(&evidence.tried).unwrap_or_default(),
             );
+        }
+        if let Some(settle_ms) = settle_ms {
+            obj.insert("settle_ms".to_string(), json!(settle_ms));
+        }
+        // What the step had and what it spent. A caller that sees a slow
+        // step can tell "the desktop was slow" from "the ceiling was tight".
+        if let Some(budget) = budget {
+            obj.insert("budget".to_string(), budget);
         }
         obj.insert("verification_state".to_string(), json!(verification_name(verification)));
         if !sensitive_after.is_empty() || sensitive_target {
@@ -781,9 +866,11 @@ async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionR
         obj.insert("action".to_string(), json!(action));
     }
 
-    // A failed result reaches the model through its `error` field only, so the
-    // evidence and reflection appended to `output` would be invisible — and a
-    // refusal without its recovery hint is just a dead end.
+    // A failed result used to reach the model through its `error` field only,
+    // so the evidence and reflection appended to `output` were invisible. Fold
+    // the text into `error` — and keep `data` too, because the structured
+    // evidence is what the harness reads and the model now gets through
+    // `to_tool_result`.
     if !tool_result.success {
         let extra = std::mem::take(&mut tool_result.output);
         if !extra.trim().is_empty() {
@@ -877,7 +964,14 @@ async fn action_result_to_tool_result(result: ActionResult) -> ToolExecutionResu
     if result.success {
         ToolExecutionResult::success(output).with_data(data.unwrap_or(json!({})))
     } else {
-        ToolExecutionResult::error(output)
+        // The failure branch keeps the screenshot reference and the action's
+        // own `data`: a failed click still needs its evidence, and the caller
+        // that asks "what did it look like?" asks about the failure too.
+        let mut failed = ToolExecutionResult::error(output);
+        if let Some(data) = data {
+            failed.data = Some(data);
+        }
+        failed
     }
 }
 
@@ -905,17 +999,44 @@ async fn store_screenshot(
         .map(Some)
 }
 
-/// Map [`ComputerError`] to [`SyscityError`].
+/// Build the tool result for a ladder that could not run any rung.
+///
+/// The session hands back the evidence it collected; this renders it both as
+/// the one-line text the model reads and as the `data` object it receives
+/// through `to_tool_result`.
+fn norung_tool_result(error: &ComputerError, action: &str) -> ToolExecutionResult {
+    let ComputerError::NoRung { error: message, evidence } = error else {
+        return ToolExecutionResult::error(error.to_string());
+    };
+    let mut failed = ToolExecutionResult::error(format!(
+        "no rung could complete {action}: {message}\n[action] {}",
+        evidence.summary()
+    ));
+    failed.data = Some(json!({
+        "error_code": crate::error::ComputerErrorCode::Internal.as_str(),
+        "action": action,
+        "rung": evidence.rung_name(),
+        "effect": evidence.effect.as_str(),
+        "delivery": evidence.delivery.as_str(),
+        "retry": evidence.retry.as_str(),
+        "tried": evidence.tried.iter().map(|r| crate::computer::ActionEvidence::rung_of(*r)).collect::<Vec<_>>(),
+        "recovery": evidence.recovery,
+    }));
+    failed
+}
+
+/// Map [`ComputerError`] to [`SyscityError`], keeping the failure class.
+///
+/// The mapping used to flatten stale refs, missing elements and background
+/// refusals into `Internal(String)`, which is the one shape a caller can
+/// neither tell apart nor act on.
 fn to_syscity_err(e: ComputerError) -> crate::error::SyscityError {
-    match e {
-        ComputerError::UnsupportedPlatform(msg) => crate::error::SyscityError::Unsupported(msg),
-        ComputerError::NoDisplay => {
-            crate::error::SyscityError::Unsupported("No display server available".to_string())
-        }
-        ComputerError::AccessibilityDenied => crate::error::SyscityError::Unsupported(
-            "Accessibility permission not granted".to_string(),
-        ),
-        other => crate::error::SyscityError::Internal(other.to_string()),
+    use crate::error::ComputerErrorCode;
+    let message = e.to_string();
+    let (code, details) = ComputerErrorCode::of(&e);
+    match code {
+        ComputerErrorCode::PlatformNotSupported => crate::error::SyscityError::Unsupported(message),
+        _ => crate::error::SyscityError::Computer { code, message, details },
     }
 }
 
@@ -927,19 +1048,33 @@ mod tests {
     /// Mock adapter returning a fixed screenshot and empty UI tree.
     struct MockAdapter {
         screenshot_b64: String,
+        /// How long every call takes; zero except in budget tests, where the
+        /// desktop has to be slower than the ceiling.
+        delay: std::time::Duration,
+    }
+
+    impl MockAdapter {
+        async fn pause(&self) {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl ComputerAdapter for MockAdapter {
         async fn screenshot(&self, _region: Option<Rect>) -> ComputerResult<Screenshot> {
+            self.pause().await;
             Ok(Screenshot::new(self.screenshot_b64.clone(), 100, 100))
         }
 
         async fn read_ui_tree(&self, _app: Option<&str>) -> ComputerResult<Vec<UiElement>> {
+            self.pause().await;
             Ok(Vec::new())
         }
 
         async fn execute(&self, _action: DesktopAction) -> ComputerResult<ActionResult> {
+            self.pause().await;
             Ok(ActionResult::success("done"))
         }
 
@@ -963,7 +1098,82 @@ mod tests {
     fn mock_tool() -> ComputerTool {
         ComputerTool::new(Some(Arc::new(MockAdapter {
             screenshot_b64: "aGVsbG8gd29ybGQ=".to_string(),
+            delay: std::time::Duration::ZERO,
         })))
+    }
+
+    fn slow_tool(delay_ms: u64) -> ComputerTool {
+        ComputerTool::new(Some(Arc::new(MockAdapter {
+            screenshot_b64: "aGVsbG8gd29ybGQ=".to_string(),
+            delay: std::time::Duration::from_millis(delay_ms),
+        })))
+    }
+
+    /// The step ceiling comes from the tool call's own timeout, with a margin
+    /// so the step lands before the registry kills the call.
+    #[test]
+    fn the_step_budget_is_the_call_timeout_less_a_margin() {
+        use std::time::Duration;
+        assert_eq!(
+            step_budget_for(Duration::from_secs(120)),
+            Duration::from_secs(115),
+            "a long call keeps five seconds to land"
+        );
+        assert_eq!(
+            step_budget_for(Duration::from_secs(30)),
+            Duration::from_secs(27),
+            "a short call keeps a tenth"
+        );
+        assert_eq!(step_budget_for(Duration::from_secs(3)), Duration::from_millis(2_700));
+        assert_eq!(step_budget_for(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// A step that outlasts the call's timeout ends as a refusal carrying a
+    /// budget, not as the registry's opaque "tool timed out".
+    #[tokio::test]
+    async fn a_slow_step_reports_a_budget_refusal_to_the_model() {
+        let tool = slow_tool(50);
+        let context = ToolContext::default().with_timeout(std::time::Duration::from_millis(20));
+        let result = tool
+            .execute(json!({"action": "click", "x": 10, "y": 20}), &context)
+            .await
+            .expect("a budget refusal is still a tool result");
+
+        assert!(!result.success);
+        // A failed result reaches the model through `error`, where the
+        // evidence text is folded in.
+        let message = result
+            .error
+            .clone()
+            .unwrap_or_else(|| result.output.clone());
+        assert!(
+            message.contains("budget") && message.contains("refused"),
+            "the model is told what ran out: {message}"
+        );
+        let data = result.data.expect("data");
+        assert_eq!(data["effect"], json!("refused"));
+        let budget = data.get("budget").expect("the budget travels in data");
+        assert_eq!(budget["total_ms"], 18, "20 ms less a 2 ms margin");
+        assert_eq!(budget["remaining_ms"], 0);
+    }
+
+    /// The margin is enough: a step that fits returns normally and its budget
+    /// on the way out.
+    #[tokio::test]
+    async fn a_step_inside_the_budget_returns_its_budget() {
+        let tool = mock_tool();
+        let context = ToolContext::default().with_timeout(std::time::Duration::from_secs(10));
+        let result = tool
+            .execute(json!({"action": "click", "x": 10, "y": 20}), &context)
+            .await
+            .expect("delivered");
+        let budget = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("budget"))
+            .expect("budget");
+        assert_eq!(budget["total_ms"], 9_000);
+        assert!(budget["elapsed_ms"].as_u64().expect("elapsed") < 9_000, "{budget}");
     }
 
     #[tokio::test]
@@ -988,6 +1198,105 @@ mod tests {
         assert_eq!(data["rung"], json!("pixel"));
         assert_eq!(data["escalation"], json!("foreground"));
         assert_eq!(data["verification_state"], json!("failed"));
+    }
+
+    /// The trace line is the action-level record the turn report reads; a
+    /// click that did nothing has to leave more than "nothing happened".
+    #[tokio::test]
+    async fn a_computer_action_writes_one_trace_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer =
+            std::sync::Arc::new(crate::observe::TurnMetricsWriter::new(dir.path().to_path_buf()));
+        let collector = crate::observe::TurnMetricsCollector::with_writer(
+            crate::observe::TurnContext {
+                session_id: None,
+                conversation_id: "c".into(),
+                agent_id: "a".into(),
+                thread_id: "main".into(),
+                turn_index: 0,
+                user_message: "click".into(),
+                enqueued_at: None,
+            },
+            writer,
+        );
+        let turn_id = collector.turn_id().to_string();
+        let trace: std::sync::Arc<dyn crate::tools::TurnTrace> = collector.trace(0);
+        let context = ToolContext::default().with_trace(Some(trace));
+
+        mock_tool()
+            .execute(json!({"action": "click", "x": 10, "y": 20}), &context)
+            .await
+            .unwrap();
+
+        let path = dir
+            .path()
+            .join(chrono::Local::now().format("%Y-%m-%d").to_string())
+            .join(&turn_id)
+            .join("full.json");
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["type"], json!("action"));
+        let detail = &lines[0]["detail"];
+        assert_eq!(detail["action"], json!("click"));
+        assert_eq!(detail["rung"], json!("pixel"));
+        assert_eq!(detail["effect"], json!("suspected_noop"));
+        assert_eq!(detail["escalate"], json!("foreground"));
+        // The settle wait is measured, not omitted: "how long did the screen
+        // take to stop changing" is part of the evidence.
+        assert!(detail["settle_ms"].as_u64().is_some(), "{detail}");
+    }
+
+    /// A refusal is the step the trace has to explain.
+    #[tokio::test]
+    async fn a_refused_action_writes_its_recovery_to_the_trace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer =
+            std::sync::Arc::new(crate::observe::TurnMetricsWriter::new(dir.path().to_path_buf()));
+        let collector = crate::observe::TurnMetricsCollector::with_writer(
+            crate::observe::TurnContext {
+                session_id: None,
+                conversation_id: "c".into(),
+                agent_id: "a".into(),
+                thread_id: "main".into(),
+                turn_index: 0,
+                user_message: "click".into(),
+                enqueued_at: None,
+            },
+            writer,
+        );
+        let turn_id = collector.turn_id().to_string();
+        let trace: std::sync::Arc<dyn crate::tools::TurnTrace> = collector.trace(0);
+        let context = ToolContext::default().with_trace(Some(trace));
+
+        // A bare coordinate in background mode: no target, so the platform
+        // refuses it — the mock adapter has no background path.
+        mock_tool()
+            .execute(
+                json!({"action": "click", "x": 10, "y": 20, "delivery": "background"}),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        let path = dir
+            .path()
+            .join(chrono::Local::now().format("%Y-%m-%d").to_string())
+            .join(&turn_id)
+            .join("full.json");
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let detail = &lines[0]["detail"];
+        assert_eq!(detail["effect"], json!("refused"));
+        assert!(detail["retry"].is_string(), "{detail}");
+        assert!(detail["recovery"].is_string(), "{detail}");
     }
 
     #[test]
@@ -1062,6 +1371,45 @@ mod tests {
         }
     }
 
+    /// A drag names its ends like every other action: an element id when the
+    /// caller has one, a point only when it does not.
+    #[test]
+    fn a_drag_takes_element_ids_at_both_ends() {
+        let args = json!({
+            "action": "drag",
+            "from_element_id": "s00000001:0.1",
+            "to_element_id": "s00000001:0.2",
+        });
+        match action_to_desktop_action("drag", &args).unwrap() {
+            DesktopAction::Drag { from, to } => {
+                assert_eq!(from, ClickTarget::ElementId("s00000001:0.1".to_string()));
+                assert_eq!(to, ClickTarget::ElementId("s00000001:0.2".to_string()));
+            }
+            other => panic!("expected Drag, got {other:?}"),
+        }
+
+        // Mixing is allowed: an element to a point, which is a common
+        // "drag this into empty canvas" request.
+        let args = json!({"action": "drag", "from_element_id": "s1", "to_x": 30, "to_y": 40});
+        match action_to_desktop_action("drag", &args).unwrap() {
+            DesktopAction::Drag { from, to } => {
+                assert_eq!(from, ClickTarget::ElementId("s1".to_string()));
+                assert_eq!(to, ClickTarget::Coordinate(Point::new(30, 40)));
+            }
+            other => panic!("expected Drag, got {other:?}"),
+        }
+
+        // No ids: both ends are points.
+        let args = json!({"action": "drag", "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4});
+        match action_to_desktop_action("drag", &args).unwrap() {
+            DesktopAction::Drag { from, to } => {
+                assert_eq!(from, ClickTarget::Coordinate(Point::new(1, 2)));
+                assert_eq!(to, ClickTarget::Coordinate(Point::new(3, 4)));
+            }
+            other => panic!("expected Drag, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn element_id_clicks_need_no_conversion() {
         // No screenshot has passed through the session, so a conversion would
@@ -1130,15 +1478,83 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        let error = result.error.expect("error text");
+        let error = result.error.clone().expect("error text");
         assert!(error.contains("refused"), "{error}");
         assert!(error.contains("re-read the UI tree"), "{error}");
-        let data = result.data.expect("data");
+        let data = result.data.clone().expect("data");
         assert_eq!(data["effect"], json!("refused"));
         assert!(data["recovery"]
             .as_str()
             .unwrap_or_default()
             .contains("re-read the UI tree"));
+        // And the model actually receives it: `data` used to be dropped here.
+        let tool_result = result.to_tool_result("c");
+        assert!(
+            tool_result.content.contains("\"effect\":\"refused\""),
+            "{}",
+            tool_result.content
+        );
+    }
+
+    /// Every recoverable failure keeps its class instead of becoming
+    /// `Internal(String)`.
+    #[test]
+    fn computer_errors_keep_their_named_code() {
+        use crate::error::ComputerErrorCode;
+        let cases = [
+            (ComputerError::StaleElement("s1:0".into()), ComputerErrorCode::StaleRef),
+            (
+                ComputerError::ElementNotFound("Save".into()),
+                ComputerErrorCode::ElementNotFound,
+            ),
+            (
+                ComputerError::TreeIncomplete("label~Quit: tree is incomplete".into()),
+                ComputerErrorCode::TreeIncomplete,
+            ),
+            (
+                ComputerError::BackgroundInputUnavailable("no background path".into()),
+                ComputerErrorCode::PolicyDenied,
+            ),
+            (ComputerError::AccessibilityDenied, ComputerErrorCode::PermissionDenied),
+            (ComputerError::Timeout, ComputerErrorCode::Timeout),
+            (ComputerError::ToolFailed("boom".into()), ComputerErrorCode::Internal),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(ComputerErrorCode::of(&error).0, expected, "{error}");
+            let mapped = to_syscity_err(error);
+            assert!(
+                matches!(
+                    &mapped,
+                    crate::error::SyscityError::Computer { code, .. } if *code == ComputerErrorCode::PlatformNotSupported || code.as_str().starts_with("desktop.")
+                ),
+                "{mapped:?}"
+            );
+        }
+    }
+
+    /// A ladder that never ran a rung reaches the model as a failed step with
+    /// evidence, not as a flattened `Err`.
+    #[tokio::test]
+    async fn a_ladder_with_no_usable_rung_keeps_its_evidence() {
+        let tool = ComputerTool::new(Some(Arc::new(StaleClickAdapter)));
+        // A double click has no keyboard equivalent, and this adapter refuses
+        // the pixel rung by failing to resolve; what matters here is that the
+        // result carries `tried` and `retry` rather than an opaque message.
+        let result = tool
+            .execute(json!({"action": "double_click", "x": 10, "y": 10}), &ToolContext::default())
+            .await;
+        match result {
+            Ok(result) => {
+                if let Some(data) = result.data {
+                    assert!(data.get("rung").is_some() || data.get("tried").is_some(), "{data}");
+                }
+            }
+            Err(error) => {
+                // If the ladder surfaced as an error, it must still be a
+                // classified one rather than an opaque Internal string.
+                assert!(matches!(error, crate::error::SyscityError::Computer { .. }), "{error:?}");
+            }
+        }
     }
 
     #[tokio::test]

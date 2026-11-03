@@ -20,7 +20,7 @@ mod sensitive_ui_tests {
     use syscity::computer::sensitive_ui::{
         SensitiveUiDetector, SensitiveUiFinding, SensitiveUiType,
     };
-    use syscity::computer::types::{Rect, UiElement};
+    use syscity::computer::types::{Rect, Tri, UiElement};
 
     fn make_node(
         id: &str,
@@ -34,10 +34,13 @@ mod sensitive_ui_tests {
             role: role.to_string(),
             label: label.map(String::from),
             value: value.map(String::from),
-            bounds: Rect::new(0, 0, 100, 30),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(0, 0, 100, 30)),
+            enabled: Tri::Known(true),
+            focused: Tri::Unknown,
+            actions: None,
             children,
+            children_count: None,
+            truncated: false,
         }
     }
 
@@ -225,10 +228,13 @@ mod sensitive_ui_tests {
             role: "dialog".to_string(),
             label: Some("Confirm".to_string()),
             value: Some("Are you sure you want to permanently delete this item?".to_string()),
-            bounds: Rect::new(0, 0, 400, 200),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(0, 0, 400, 200)),
+            enabled: Tri::Known(true),
+            focused: Tri::Unknown,
+            actions: None,
             children: vec![],
+            children_count: None,
+            truncated: false,
         };
         let findings = detector.scan_tree(&tree);
         assert!(
@@ -248,10 +254,13 @@ mod sensitive_ui_tests {
             role: "dialog".to_string(),
             label: Some("确认删除".to_string()),
             value: Some("此操作不可恢复".to_string()),
-            bounds: Rect::new(0, 0, 400, 200),
-            enabled: true,
-            focused: false,
+            bounds: Some(Rect::new(0, 0, 400, 200)),
+            enabled: Tri::Known(true),
+            focused: Tri::Unknown,
+            actions: None,
             children: vec![],
+            children_count: None,
+            truncated: false,
         };
         let findings = detector.scan_tree(&tree);
         assert!(

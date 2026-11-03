@@ -8,6 +8,7 @@ pub mod approval;
 pub mod ask_user;
 pub mod escalation;
 pub mod eval;
+pub mod file_lock;
 pub mod metadata;
 pub mod permissions;
 pub mod target_lock;
@@ -41,7 +42,7 @@ pub use registry::{ToolRegistry, WebSearchProviders};
 pub use types::{
     execution_backend_error, BoxedTool, SharedTool, SkillTrust, SkillTrustCeiling, Tool,
     ToolContext, ToolExecutionChunk, ToolExecutionResult, ToolId, ToolIdentity, ToolModel,
-    ToolSandbox,
+    ToolSandbox, TurnTrace,
 };
 pub use util::create_schema;
 pub use validators::{

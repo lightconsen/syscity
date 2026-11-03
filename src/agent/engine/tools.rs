@@ -57,6 +57,7 @@ impl Agent {
     pub(crate) async fn handle_tool_calls(
         &self,
         context: &mut Context,
+        collector: Option<&mut TurnMetricsCollector>,
         original_response: &crate::providers::CompletionResponse,
         tool_calls: &[ToolCall],
         user_id: &str,
@@ -173,7 +174,18 @@ impl Agent {
             // The running turn's controller, so a tool that waits on a person
             // can notice them typing instead of answering, and leave what they
             // said with the step it is about (see `attach_notices`).
-            .with_steers(self.execution_controller.read().await.clone());
+            .with_steers(self.execution_controller.read().await.clone())
+            // And its trace, so a step the computer ladder took is replayable
+            // from `full.json` rather than only readable as result text. The
+            // non-progress path has no collector, and then there is no turn
+            // file to write to.
+            .with_trace(
+                collector
+                    .as_ref()
+                    .map(|c| -> std::sync::Arc<dyn crate::tools::TurnTrace> {
+                        c.trace(c.round_count().saturating_sub(1))
+                    }),
+            );
 
         let mut results = Vec::new();
 
@@ -474,7 +486,10 @@ impl Agent {
             // The running turn's controller, so a tool that waits on a person
             // can notice them typing instead of answering, and leave what they
             // said with the step it is about (see `attach_notices`).
-            .with_steers(self.execution_controller.read().await.clone());
+            .with_steers(self.execution_controller.read().await.clone())
+            // And its trace, so a step the computer ladder took is replayable
+            // from `full.json` rather than only readable as result text.
+            .with_trace(Some(collector.trace(collector.round_count().saturating_sub(1))));
 
         let mut results = Vec::new();
 

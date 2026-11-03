@@ -99,9 +99,110 @@ pub enum SyscityError {
     #[error("Sandbox violation: {0}")]
     SandboxViolation(String),
 
+    /// A computer-use failure, kept structured on the way to the model.
+    ///
+    /// Flattening these into `Internal(String)` threw away the one thing the
+    /// caller needs to recover: whether the failure is retryable, which rung
+    /// was tried, and what to do instead. The `Display` form is the single
+    /// human line (`[desktop.rung_exhausted] ...`), and the JSON payload is
+    /// available to anything that wants the evidence.
+    #[error("[{}] {message}", .code.as_str())]
+    Computer {
+        /// Named failure class — see [`ComputerErrorCode`].
+        code: ComputerErrorCode,
+        /// The last error, unflattened.
+        message: String,
+        /// What the rungs established, as machine-readable evidence.
+        details: Option<serde_json::Value>,
+    },
+
     /// Operation not supported by this channel/provider
     #[error("Unsupported: {0}")]
     Unsupported(String),
+}
+
+/// Named computer-use failure classes.
+///
+/// These are the vocabulary a caller retries on, so they must survive the
+/// trip from the ladder to the model rather than collapsing into `Internal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputerErrorCode {
+    /// The element id belongs to a snapshot the adapter no longer holds.
+    StaleRef,
+    /// No element matched the target.
+    ElementNotFound,
+    /// The tree that was searched was not read in full.
+    TreeIncomplete,
+    /// More than one element matched; the caller must disambiguate.
+    AmbiguousTarget,
+    /// The action cannot be delivered without taking the foreground.
+    PolicyDenied,
+    /// A permission (Accessibility, screen recording) is missing.
+    PermissionDenied,
+    /// The platform or adapter cannot do this at all.
+    PlatformNotSupported,
+    /// The operation did not finish in time.
+    Timeout,
+    /// The whole step ran out of its caller-set time budget.
+    BudgetExhausted,
+    /// Everything else, including a rung-exhausted ladder.
+    Internal,
+}
+
+impl ComputerErrorCode {
+    /// The stable string form used in tool results and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleRef => "desktop.stale_ref",
+            Self::ElementNotFound => "desktop.element_not_found",
+            Self::TreeIncomplete => "desktop.tree_incomplete",
+            Self::AmbiguousTarget => "desktop.ambiguous_target",
+            Self::PolicyDenied => "desktop.policy_denied",
+            Self::PermissionDenied => "desktop.permission_denied",
+            Self::PlatformNotSupported => "desktop.platform_not_supported",
+            Self::Timeout => "desktop.timeout",
+            Self::BudgetExhausted => "desktop.budget_exhausted",
+            Self::Internal => "desktop.internal",
+        }
+    }
+
+    /// Classify a computer error.
+    ///
+    /// The three failures that used to collapse into `Internal` are the ones
+    /// a caller can actually act on: a stale id means "re-read the tree", a
+    /// missing element means "re-aim", and a background refusal means "ask
+    /// the user, or take the foreground deliberately".
+    pub fn of(error: &crate::computer::ComputerError) -> (Self, Option<serde_json::Value>) {
+        use crate::computer::ComputerError as E;
+        let evidence = |e: &crate::computer::ActionEvidence| {
+            Some(serde_json::json!({
+                "rung": e.rung_name(),
+                "effect": e.effect.as_str(),
+                "delivery": e.delivery.as_str(),
+                "retry": e.retry.as_str(),
+                "tried": e.tried.iter().map(|r| crate::computer::ActionEvidence::rung_of(*r)).collect::<Vec<_>>(),
+                "recovery": e.recovery,
+                "occluder": e.occluder,
+            }))
+        };
+        match error {
+            E::StaleElement(_) => (Self::StaleRef, None),
+            E::ElementNotFound(_) => (Self::ElementNotFound, None),
+            // A partial tree is its own class: the element may exist in the
+            // part nobody read, and the fix is a deeper read, not a new aim.
+            E::TreeIncomplete { .. } => (Self::TreeIncomplete, None),
+            E::AmbiguousTarget(_) => (Self::AmbiguousTarget, None),
+            E::BackgroundInputUnavailable(_) => (Self::PolicyDenied, None),
+            E::AccessibilityDenied => (Self::PermissionDenied, None),
+            E::UnsupportedPlatform(_) | E::NoDisplay | E::NotInitialized => {
+                (Self::PlatformNotSupported, None)
+            }
+            E::Timeout => (Self::Timeout, None),
+            E::BudgetExhausted(_) => (Self::BudgetExhausted, None),
+            E::NoRung { evidence: ev, .. } => (Self::Internal, evidence(ev)),
+            _ => (Self::Internal, None),
+        }
+    }
 }
 
 /// Configuration-specific errors

@@ -252,9 +252,11 @@ fn test_to_ui_elements_conversion() {
     assert_eq!(elements.len(), 2);
     assert_eq!(elements[0].role, "button");
     assert_eq!(elements[0].label, Some("OK".to_string()));
-    assert_eq!(elements[0].bounds.x, 10);
-    assert_eq!(elements[0].bounds.y, 20);
-    assert!(elements[0].enabled);
+    // A detector reports a box, not the state of the control behind it.
+    let bounds = elements[0].bounds.expect("detector reports a box");
+    assert_eq!(bounds.x, 10);
+    assert_eq!(bounds.y, 20);
+    assert_eq!(elements[0].enabled, syscity::computer::Tri::Unknown);
     assert!(elements[0].children.is_empty());
 
     assert_eq!(elements[1].role, "text_field");

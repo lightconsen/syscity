@@ -24,6 +24,17 @@ pub struct UiElement {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Whether the element holds keyboard focus. `None` when the read did not
+    /// say; it decides where a bare `type` / `key_press` lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+    /// How many children the element has, when AT-SPI2 said. A count larger
+    /// than `children.len()` means the walk stopped before reading them all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children_count: Option<u32>,
+    /// Whether the depth limit stopped this node's walk with children unread.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     pub children: Vec<UiElement>,
 }
 
@@ -58,7 +69,14 @@ impl X11AccessibilityTool {
     }
 
     /// Python script that traverses the active AT-SPI2 application.
-    fn build_python_script() -> &'static str {
+    ///
+    /// `max_depth` is substituted into the script rather than frozen at 3: a
+    /// caller asking for a deeper tree used to be silently given a shallow
+    /// one, which reads as "the element is not there".
+    fn build_python_script(max_depth: u32) -> String {
+        // The script is a template rather than a `format!` string: its Python
+        // bodies are full of `{}` dict literals, which would have to be
+        // doubled to survive formatting.
         r#"
 import json, sys
 try:
@@ -73,18 +91,26 @@ def export_element(acc, depth=0):
         role = acc.getRoleName() or "unknown"
         state_set = acc.getState()
         enabled = state_set.contains(pyatspi.STATE_ENABLED)
+        focused = state_set.contains(pyatspi.STATE_FOCUSED)
         x, y, w, h = acc.extents
     except Exception:
         return None
+    try:
+        child_count = int(acc.childCount)
+    except Exception:
+        child_count = None
     obj = {
         "role": role,
         "name": name,
         "enabled": enabled,
+        "focused": focused,
         "x": x, "y": y,
         "width": w, "height": h,
+        "children_count": child_count,
+        "truncated": False,
         "children": []
     }
-    if depth < 3:
+    if depth < __MAX_DEPTH__:
         try:
             for i in range(acc.childCount):
                 child = acc.getChildAtIndex(i)
@@ -93,6 +119,11 @@ def export_element(acc, depth=0):
                     obj["children"].append(child_dict)
         except Exception:
             pass
+    else:
+        # Stopped at the depth limit with children still unread. The count is
+        # what makes that visible: the caller can tell "no children" from
+        # "children nobody looked at".
+        obj["truncated"] = bool(child_count)
     return obj
 
 desktop = pyatspi.Registry.getDesktop(0)
@@ -115,6 +146,7 @@ if active_app:
 else:
     print(json.dumps({"role": "desktop", "name": "", "children": []}))
 "#
+        .replace("__MAX_DEPTH__", &max_depth.to_string())
     }
 
     /// Fallback script using xdotool + xwininfo for minimal window data.
@@ -223,6 +255,15 @@ print(json.dumps({
             y: obj.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             width: obj.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             height: obj.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            focused: obj.get("focused").and_then(|v| v.as_bool()),
+            children_count: obj
+                .get("children_count")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(u32::MAX as u64) as u32),
+            truncated: obj
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             children,
         })
     }
@@ -261,7 +302,12 @@ impl Tool for X11AccessibilityTool {
         info!("Querying X11 accessibility tree via AT-SPI2");
 
         // Strategy 1: Python + pyatspi
-        let (success, stdout, stderr) = Self::run_python(Self::build_python_script()).await?;
+        let max_depth = _args["max_depth"]
+            .as_u64()
+            .map(|d| d.clamp(1, 16) as u32)
+            .unwrap_or(3);
+        let script = Self::build_python_script(max_depth);
+        let (success, stdout, stderr) = Self::run_python(&script).await?;
 
         if success {
             match serde_json::from_str::<Value>(&stdout) {
@@ -342,6 +388,20 @@ mod tests {
     fn test_x11_accessibility_tool_creation() {
         let tool = X11AccessibilityTool::new();
         assert_eq!(tool.name(), "linux_x11_accessibility");
+    }
+
+    /// The depth the caller asked for reaches the walker rather than being
+    /// frozen at 3.
+    #[test]
+    fn the_python_script_honours_the_requested_depth() {
+        let script = X11AccessibilityTool::build_python_script(7);
+        assert!(script.contains("if depth < 7:"), "{script}");
+        assert!(!script.contains("__MAX_DEPTH__"), "placeholder left in script");
+        // The dict literals survive templating untouched.
+        assert!(script.contains(r#"{"error": "pyatspi not installed"}"#));
+        // Focus decides where a bare `type` / `key_press` lands.
+        assert!(script.contains("STATE_FOCUSED"), "{script}");
+        assert!(script.contains(r#""focused": focused,"#), "{script}");
     }
 
     #[test]

@@ -368,10 +368,16 @@ impl OmniParserDetector {
                 role: d.role,
                 label: d.label,
                 value: None,
-                bounds: d.bounds,
-                enabled: true,
-                focused: false,
+                bounds: Some(d.bounds),
+                // A detector saw a box on screen; it cannot say whether the
+                // control accepts input. Claiming `enabled` would turn a
+                // guess into a pre-check that passes.
+                enabled: crate::computer::types::Tri::Unknown,
+                focused: crate::computer::types::Tri::Unknown,
+                actions: None,
                 children: vec![],
+                children_count: None,
+                truncated: false,
             })
             .collect()
     }

@@ -8,7 +8,8 @@ use tracing::info;
 use crate::computer::element_index::{parse_element_id, ActionTarget, ResolveError, SnapshotCache};
 use crate::computer::{
     ActionEffect, ActionEvidence, ActionResult, AxAction, ClickTarget, ComputerAdapter,
-    ComputerError, DesktopAction, Rect, Result, Rung, Screenshot, UiElement, WaitCondition,
+    ComputerError, DesktopAction, HitTestResult, Point, Rect, Result, Rung, Screenshot, Tri,
+    UiElement, WaitCondition,
 };
 use crate::tools::ToolRegistry;
 
@@ -109,7 +110,17 @@ impl ComputerAdapter for MacosComputerAdapter {
             .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
 
         if !result.success {
-            return Err(ComputerError::AccessibilityDenied);
+            // A read that timed out and a read the OS refused are different
+            // failures: one is retryable with more time, the other is not
+            // retryable at all until a human grants the permission. Reporting
+            // both as `AccessibilityDenied` sent callers to the permission
+            // pane for a tree that was merely too deep.
+            let message = result.error.clone().unwrap_or_default();
+            return Err(crate::computer::accessibility_read_error(
+                result.data.as_ref(),
+                &message,
+                false,
+            ));
         }
 
         let elements: Vec<UiElement> = result
@@ -226,16 +237,13 @@ end tell"#,
             DesktopAction::Drag { from, to } => {
                 let (from_x, from_y) = self.resolve_click_point(from).await?;
                 let (to_x, to_y) = self.resolve_click_point(to).await?;
-                let script = format!(
-                    r#"tell application "System Events"
-    click at {{ {}, {} }}
-    delay 0.1
-    key down option
-    click at {{ {}, {} }}
-    key up option
-end tell"#,
-                    from_x, from_y, to_x, to_y
-                );
+                // Release Guard: the modifier key is held across two separate
+                // clicks. If the second click raises, `key up option` is never
+                // reached and the system is left with a key held down — every
+                // later keystroke in every app arrives modified. The error
+                // branch releases it, and the result says whether the release
+                // itself had to run, so a caller is not told a clean "done".
+                let script = drag_script(from_x, from_y, to_x, to_y);
                 let apple_args = serde_json::json!({ "script": script });
                 let result = self
                     .registry
@@ -245,7 +253,20 @@ end tell"#,
                         ComputerError::ToolFailed("applescript tool not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(result.output))
+                let output = result.output.trim().to_string();
+                if output.starts_with("release-failed:") {
+                    // The key may still be held. That is a failure a caller
+                    // must see, not a drag that "mostly worked".
+                    return Err(ComputerError::ToolFailed(output));
+                }
+                let mut action_result = ActionResult::success(output.clone());
+                if output.starts_with("emergency-release:") {
+                    action_result = ActionResult::error(output);
+                    action_result.data = Some(serde_json::json!({
+                        "emergency_release_posted": true,
+                    }));
+                }
+                Ok(action_result)
             }
             DesktopAction::CloseWindow { title_pattern } => {
                 let args = serde_json::json!({ "action": "close_window", "app": title_pattern });
@@ -281,7 +302,26 @@ end tell"#,
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(result.output))
+                // A chord that failed may have pressed its modifiers before it
+                // raised. The tool's result says whether the Release Guard had
+                // to post the release, so the adapter does not report a clean
+                // key press for one that stranded a modifier.
+                let released = result
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("emergency_release_posted"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut action_result = ActionResult::success(result.output);
+                if released {
+                    action_result.success = false;
+                    action_result.message = "key press failed after pressing its modifiers;                                              they were released"
+                        .to_string();
+                    action_result.data = Some(serde_json::json!({
+                        "emergency_release_posted": true,
+                    }));
+                }
+                Ok(action_result)
             }
             DesktopAction::ClipboardGet => {
                 let args = serde_json::json!({ "script": "get the clipboard" });
@@ -663,13 +703,7 @@ end tell"#,
             resolution = self.snapshots.resolve(target).await;
         }
 
-        resolution.map_err(|e| match e {
-            ResolveError::Stale(snapshot) => ComputerError::StaleElement(format!(
-                "element id belongs to snapshot {snapshot:08x}, which is no longer cached; \
-                 re-read the UI tree and use a fresh id"
-            )),
-            other => ComputerError::ElementNotFound(other.to_string()),
-        })
+        resolution.map_err(|e| e.into_computer_error())
     }
 
     async fn perform_ax_action(
@@ -715,16 +749,22 @@ end tell"#,
             .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
 
         if result.success {
-            Ok(ActionResult::success(
-                result
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.get("result"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ok")
-                    .to_string(),
-            )
-            .with_evidence(ActionEvidence::new(Rung::AxAction, ActionEffect::Confirmed)))
+            // The script said the action was performed; it did not say the
+            // element changed. `AXPress` on a row that answers success and
+            // selects nothing is a real macOS behaviour, so the honest
+            // disposition is "delivered, effect not observed" — never
+            // `Confirmed`, which is what this used to claim.
+            let outcome = result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("result"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("ok")
+                .to_string();
+            Ok(ActionResult::success(outcome).with_evidence(
+                ActionEvidence::new(Rung::AxAction, ActionEffect::Unverifiable)
+                    .with_delivery(crate::computer::DeliveryDisposition::DeliveredUnverified),
+            ))
         } else {
             let message = result
                 .data
@@ -735,6 +775,19 @@ end tell"#,
                 .to_string();
             Err(ComputerError::ToolFailed(message))
         }
+    }
+
+    /// Ask the system what a click at `point` would land on.
+    ///
+    /// This is `AXUIElementCopyElementAtPosition`, the same query the window
+    /// server runs to route the event, so it answers for sheets, menus and
+    /// overlapping windows exactly as the click would. It is deliberately a
+    /// direct call rather than an AppleScript round-trip: it runs before every
+    /// pixel-rung click. Any failure — notably a missing Accessibility grant —
+    /// reports [`HitTestResult::Unknown`], which the session treats as "the
+    /// check did not happen" and lets the action proceed.
+    async fn hit_test(&self, point: Point, target: Option<&ActionTarget>) -> HitTestResult {
+        crate::computer::platform::macos::hit_test::check(point, target)
     }
 
     /// AppKit accessibility actions reach the app through System Events, which
@@ -876,7 +929,8 @@ impl MacosComputerAdapter {
     /// Resolve a target and return only its coordinates.
     async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
         let resolved = self.resolve_target(&target).await?;
-        Ok((resolved.x, resolved.y))
+        let point = resolved.coordinates()?;
+        Ok((point.x, point.y))
     }
 }
 
@@ -894,14 +948,32 @@ fn ui_element_from_macos_json(value: &serde_json::Value) -> Option<UiElement> {
     let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let position = obj.get("position").and_then(|v| v.as_str()).unwrap_or("");
     let size = obj.get("size").and_then(|v| v.as_str()).unwrap_or("");
-    let enabled = obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Three states, not two: "the script did not read this" is not "true",
+    // and it is not "false" either.
+    let enabled = Tri::from(obj.get("enabled").and_then(|v| v.as_bool()));
+    let focused = Tri::from(obj.get("focused").and_then(|v| v.as_bool()));
     let value = obj.get("value").and_then(|v| v.as_str()).map(String::from);
+    let actions = obj.get("actions").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
 
     let children = obj
         .get("children")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(ui_element_from_macos_json).collect())
         .unwrap_or_default();
+    // Carried, not inferred: a tree whose walk stopped early must say so all
+    // the way up to the caller, or "not found" becomes a false statement.
+    let children_count = obj
+        .get("children_count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(u32::MAX as u64) as u32);
+    let truncated = obj
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     Some(UiElement {
         // AXIdentifier, when the application publishes one; the snapshot
@@ -920,36 +992,45 @@ fn ui_element_from_macos_json(value: &serde_json::Value) -> Option<UiElement> {
         value,
         bounds: parse_position_size(position, size),
         enabled,
-        focused: false,
+        focused,
+        actions,
         children,
+        children_count,
+        truncated,
     })
 }
 
 /// Parse macOS `position` / `size` strings like `"{100, 200}"` / `"{80, 30}"`.
-fn parse_position_size(position: &str, size: &str) -> Rect {
-    let x = position
-        .trim_start_matches('{')
-        .split(',')
-        .next()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(0);
-    let y = position
-        .split(',')
-        .nth(1)
-        .and_then(|s| s.trim_end_matches('}').trim().parse::<i32>().ok())
-        .unwrap_or(0);
-    let width = size
-        .trim_start_matches('{')
-        .split(',')
-        .next()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    let height = size
-        .split(',')
-        .nth(1)
-        .and_then(|s| s.trim_end_matches('}').trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    Rect::new(x, y, width, height)
+///
+/// `None` when either string is missing or unparseable: (0,0,0,0) is a real
+/// place on screen, and reporting an unreadable element as sitting there makes
+/// it look like an invisible-but-clickable target.
+fn parse_position_size(position: &str, size: &str) -> Option<Rect> {
+    if position.is_empty() || size.is_empty() {
+        return None;
+    }
+    let coord = |text: &str, index: usize| -> Option<i32> {
+        let part = text
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+            .nth(index)?;
+        part.trim().parse::<i32>().ok()
+    };
+    let extent = |text: &str, index: usize| -> Option<u32> {
+        let part = text
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+            .nth(index)?;
+        part.trim().parse::<i64>().ok().map(|v| v.max(0) as u32)
+    };
+    let (Some(x), Some(y), Some(width), Some(height)) =
+        (coord(position, 0), coord(position, 1), extent(size, 0), extent(size, 1))
+    else {
+        return None;
+    };
+    Some(Rect::new(x, y, width, height))
 }
 
 /// Escape a string for an AppleScript double-quoted literal.
@@ -1012,6 +1093,36 @@ pub async fn create(registry: Arc<ToolRegistry>) -> Result<Box<dyn ComputerAdapt
     Ok(Box::new(MacosComputerAdapter::new(registry)))
 }
 
+/// AppleScript for a modifier-held drag, with a Release Guard.
+///
+/// The modifier is held across two separate clicks. If the second click
+/// raises, `key up option` is never reached and the system is left with a key
+/// held down — every later keystroke in every app arrives modified. The error
+/// branch releases it and reports which release path ran, so a caller is never
+/// told a clean "done" for a drag that stranded a modifier.
+fn drag_script(from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> String {
+    format!(
+        r#"tell application "System Events"
+    click at {{ {}, {} }}
+    delay 0.1
+    key down option
+    try
+        click at {{ {}, {} }}
+        key up option
+        return "dragged"
+    on error _err
+        try
+            key up option
+            return "emergency-release: " & _err
+        on error
+            return "release-failed: " & _err
+        end try
+    end try
+end tell"#,
+        from_x, from_y, to_x, to_y
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1145,21 @@ mod tests {
         assert!(!script.contains("activate"), "{script}");
         assert!(!script.contains("keystroke"), "{script}");
         assert!(script.contains(r#"set value of (first UI element whose role is "AXTextField" and name is "Title") to "Hello""#));
+    }
+
+    /// The drag script holds a modifier key across two clicks; if the second
+    /// raises, the key must be released and the caller told.
+    #[test]
+    fn a_drag_script_releases_the_modifier_on_error() {
+        let script = drag_script(10, 20, 100, 120);
+        assert!(script.contains("key down option"), "{script}");
+        assert!(script.contains("on error"), "{script}");
+        let error_branch = &script[script.find("on error").expect("error branch")..];
+        assert!(
+            error_branch.contains("key up option"),
+            "the error branch must release the key: {script}"
+        );
+        assert!(script.contains("emergency-release"), "{script}");
     }
 
     #[test]

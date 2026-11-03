@@ -21,6 +21,22 @@ pub struct UiElement {
     /// across snapshots, which makes it a better handle than a child path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+    /// The element's declared `AXActions`. `None` means the read did not say;
+    /// `Some([])` means it said "none".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<String>>,
+    /// How many children the element has in the application, as counted
+    /// before the depth cut. A count larger than `children.len()` is the
+    /// machine-readable form of "this subtree was cut".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children_count: Option<u32>,
+    /// Whether the element holds keyboard focus. `None` means the script
+    /// could not read it; the adapter turns that into `Tri::Unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+    /// Whether the walk stopped here instead of at the bottom of the tree.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     pub children: Vec<UiElement>,
 }
 
@@ -54,77 +70,49 @@ impl AccessibilityTool {
 
     /// Build an AppleScript that enumerates UI elements of a target
     /// application.
-    fn build_ui_tree_script(app_name: &str) -> String {
-        format!(
+    ///
+    /// Each line carries the element's own declared actions
+    /// (`name of every action`, i.e. `AXActions`) as the last column. The
+    /// action rung is gated on that list: an element that publishes its
+    /// actions and does not include the one about to be performed is skipped,
+    /// because a responder can answer `kAXErrorSuccess` to an action it never
+    /// published and never ran.
+    ///
+    /// `max_depth` is honoured here rather than ignored: a deep tree used to
+    /// recurse without bound, time out, and be reported as a missing
+    /// accessibility permission.
+    fn build_ui_tree_script(app_name: &str, max_depth: u32) -> String {
+        Self::tree_script(&format!(
             r#"tell application "System Events"
     tell application process "{}"
-        set frontmost to true
         set _output to "app|{}" & "\n"
         set _indent to "  "
 
         repeat with _win in (get every window)
-            set _output to _output & "window|" & (name of _win) & "|enabled|" & (enabled of _win) & "\n"
-            set _output to _output & my describe_elements(_win, _indent)
+            set _output to _output & "window|" & (name of _win) & "|enabled|" & (enabled of _win) & "|\n"
+            set _output to _output & my describe_elements(_win, _indent, 1, {max_depth})
         end repeat
 
         return _output
     end tell
-end tell
-
-on describe_elements(_container, _indent)
-    tell application "System Events"
-        set _result to ""
-        try
-            repeat with _elem in (get every UI element of _container)
-                try
-                    set _role to role of _elem as string
-                on error
-                    set _role to "unknown"
-                end try
-                try
-                    set _name to name of _elem as string
-                on error
-                    set _name to ""
-                end try
-                try
-                    set _value to value of _elem as string
-                on error
-                    set _value to ""
-                end try
-                try
-                    set _enabled to enabled of _elem as string
-                on error
-                    set _enabled to ""
-                end try
-                try
-                    set _pos to position of _elem as string
-                on error
-                    set _pos to ""
-                end try
-                try
-                    set _sz to size of _elem as string
-                on error
-                    set _sz to ""
-                end try
-                try
-                    set _idn to value of attribute "AXIdentifier" of _elem as string
-                on error
-                    set _idn to ""
-                end try
-
-                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "|" & _idn & "\n"
-                set _result to _result & my describe_elements(_elem, _indent & "  ")
-            end repeat
-        end try
-        return _result
-    end tell
-end describe_elements"#,
-            app_name, app_name
-        )
+end tell"#,
+            Self::escape(app_name),
+            app_name
+        ))
     }
 
-    fn build_frontmost_script() -> String {
-        r#"tell application "System Events"
+    /// Build the script for "whatever is frontmost".
+    ///
+    /// It produces exactly the same columns as [`Self::build_ui_tree_script`]
+    /// — including the declared actions — because one parser reads both, and
+    /// a column the script omits is a column the parser reports as unknown.
+    ///
+    /// `max_depth` is the caller's, not a constant: the schema declares the
+    /// parameter for both branches, so honouring it on only one of them would
+    /// be a lie the caller cannot see.
+    fn build_frontmost_script(max_depth: u32) -> String {
+        Self::tree_script(&format!(
+            r#"tell application "System Events"
     set _proc to first application process whose frontmost is true
     set _name to name of _proc
     set _output to "app|" & _name & "\n"
@@ -136,19 +124,89 @@ end describe_elements"#,
             on error
                 set _win_name to ""
             end try
-            set _output to _output & "window|" & _win_name & "|enabled|" & (enabled of _win) & "\n"
-            set _output to _output & my describe_elements(_win, "  ")
+            try
+                set _win_enabled to enabled of _win as string
+            on error
+                set _win_enabled to ""
+            end try
+            set _output to _output & "window|" & _win_name & "|enabled|" & _win_enabled & "|\n"
+            set _output to _output & my describe_elements(_win, "  ", 1, {max_depth})
         end repeat
     end tell
 
     return _output
-end tell
+end tell"#
+        ))
+    }
 
-on describe_elements(_container, _indent)
+    /// One tree walk, shared by both entry points.
+    ///
+    /// The two callers differ only in how they name the process; the columns
+    /// and the truncation rule must not drift apart, so the walk itself is
+    /// assembled once.
+    ///
+    /// Columns: `role|name|value|enabled|position|size|identifier|actions|
+    /// children_count|focused|state`.
+    /// Every column after `name` may be empty, which the parser reads as
+    /// "the script did not say" rather than as a default.
+    ///
+    /// A node past `max_depth` is still reported — with its role, name,
+    /// geometry and **child count** — and marked `cut` on a line of its own.
+    /// That is what makes "the tree is incomplete" a fact the caller can act
+    /// on, instead of a depth limit the model cannot see.
+    fn tree_script(header: &str) -> String {
+        format!(
+            r#"{header}
+
+on describe_elements(_container, _indent, _depth, _max_depth)
     tell application "System Events"
         set _result to ""
         try
-            repeat with _elem in (get every UI element of _container)
+            set _elems to (get every UI element of _container)
+        on error
+            set _elems to {{}}
+        end try
+
+        if _depth > _max_depth then
+            -- Below the cut: report the element, its geometry and how many
+            -- children remain unread, then stop. The count is the evidence
+            -- that something was left out.
+            repeat with _elem in _elems
+                try
+                    set _role to role of _elem as string
+                on error
+                    set _role to "unknown"
+                end try
+                try
+                    set _name to name of _elem as string
+                on error
+                    set _name to ""
+                end try
+                try
+                    set _pos to position of _elem as string
+                on error
+                    set _pos to ""
+                end try
+                try
+                    set _sz to size of _elem as string
+                on error
+                    set _sz to ""
+                end try
+                try
+                    set _kids to (count of (get every UI element of _elem)) as string
+                on error
+                    set _kids to ""
+                end try
+                -- Columns: role|name|value|enabled|position|size|identifier|
+                -- actions|children_count|focused|state. A cut node's value,
+                -- enabled, identifier, actions and focus were not read.
+                set _result to _result & _indent & _role & "|" & _name & "||||" & _pos & "|" & _sz & "||||" & _kids & "|cut" & "\n"
+            end repeat
+            return _result
+        end if
+
+        try
+            repeat with _elem in _elems
                 try
                     set _role to role of _elem as string
                 on error
@@ -184,15 +242,36 @@ on describe_elements(_container, _indent)
                 on error
                     set _idn to ""
                 end try
+                try
+                    set _acts to ""
+                    repeat with _act in (get name of every action of _elem)
+                        if _acts is not "" then set _acts to _acts & ","
+                        set _acts to _acts & (_act as string)
+                    end repeat
+                on error
+                    set _acts to ""
+                end try
+                try
+                    set _kids to (count of (get every UI element of _elem)) as string
+                on error
+                    set _kids to ""
+                end try
+                -- Focus is the one fact that decides where a bare `type` or
+                -- `key_press` lands, and it was never read.
+                try
+                    set _focused to (value of attribute "AXFocused" of _elem) as string
+                on error
+                    set _focused to ""
+                end try
 
-                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "|" & _idn & "\n"
-                set _result to _result & my describe_elements(_elem, _indent & "  ")
+                set _result to _result & _indent & _role & "|" & _name & "|" & _value & "|" & _enabled & "|" & _pos & "|" & _sz & "|" & _idn & "|" & _acts & "|" & _kids & "|" & _focused & "|ok" & "\n"
+                set _result to _result & my describe_elements(_elem, _indent & "  ", _depth + 1, _max_depth)
             end repeat
         end try
         return _result
     end tell
 end describe_elements"#
-        .to_string()
+        )
     }
 
     /// Escape a value for an AppleScript string literal.
@@ -293,6 +372,16 @@ end tell"#,
             position: Option<String>,
             size: Option<String>,
             identifier: Option<String>,
+            actions: Option<Vec<String>>,
+            /// The `children_count` column: the element says how many
+            /// children it has, before the walk decided how many to read.
+            children_count: Option<u32>,
+            /// The `focused` column: whether this element holds keyboard
+            /// focus. `None` where the script could not read it.
+            focused: Option<bool>,
+            /// The `ok` / `cut` column: this node's own children were or
+            /// were not fully read.
+            truncated: bool,
         }
 
         let entries: Vec<Entry> = output
@@ -308,6 +397,10 @@ end tell"#,
                 if content.starts_with("app|") {
                     return None;
                 }
+                // Split from both ends: the trailing columns are positional
+                // and known, while the name/value columns may themselves
+                // contain the separator. `role|name|value|enabled|position|
+                // size|identifier|actions|children_count|state`.
                 let parts: Vec<&str> = content.split('|').collect();
                 if parts.len() < 2 {
                     return None;
@@ -337,6 +430,27 @@ end tell"#,
                         .get(6)
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
+                    // An empty column means the script could not read the
+                    // action list; a non-empty one is the element's answer.
+                    actions: parts
+                        .get(7)
+                        .map(|s| {
+                            s.split(',')
+                                .map(str::trim)
+                                .filter(|a| !a.is_empty())
+                                .map(String::from)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|a: &Vec<String>| !a.is_empty()),
+                    // A column the script did not fill is "unknown", never
+                    // "zero children": only a number is a count.
+                    children_count: parts.get(8).and_then(|s| s.trim().parse::<u32>().ok()),
+                    focused: parts.get(9).and_then(|s| match s.trim() {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    }),
+                    truncated: parts.get(10).map(|s| s.trim() == "cut").unwrap_or(false),
                 })
             })
             .collect();
@@ -360,6 +474,13 @@ end tell"#,
                     position: entries[i].position.clone(),
                     size: entries[i].size.clone(),
                     identifier: entries[i].identifier.clone(),
+                    actions: entries[i].actions.clone(),
+                    focused: entries[i].focused,
+                    // A parent is incomplete when any child was cut, even if
+                    // the parent's own count is complete — the missing
+                    // evidence is somewhere below it.
+                    children_count: entries[i].children_count,
+                    truncated: entries[i].truncated || children.iter().any(|c| c.truncated),
                     children,
                 });
                 i = next;
@@ -495,12 +616,16 @@ impl Tool for AccessibilityTool {
             return Self::run_action(action, &args).await;
         }
 
+        let max_depth = args["max_depth"]
+            .as_u64()
+            .map(|d| d.clamp(1, 16) as u32)
+            .unwrap_or(3);
         let script = if let Some(app) = args["app"].as_str() {
             info!("Querying accessibility tree for app: {}", app);
-            Self::build_ui_tree_script(app)
+            Self::build_ui_tree_script(app, max_depth)
         } else {
             info!("Querying accessibility tree for frontmost app");
-            Self::build_frontmost_script()
+            Self::build_frontmost_script(max_depth)
         };
 
         let as_result =
@@ -573,5 +698,184 @@ mod tests {
         // Text field has 1 child: static text
         assert_eq!(elements[0].children[1].children.len(), 1);
         assert_eq!(elements[0].children[1].children[0].role, "static text");
+    }
+
+    /// The tree script's column order, for tests that write raw output.
+    fn line(indent: usize, fields: &[&str]) -> String {
+        let mut all = fields.to_vec();
+        // role|name|value|enabled|position|size|identifier|actions|count|focused|state
+        all.resize(11, "");
+        format!("{}{}", "  ".repeat(indent), all.join("|"))
+    }
+
+    /// A node below the depth limit is reported with its geometry and the
+    /// number of children nobody read, and is marked `cut`. Without that the
+    /// depth limit is invisible: the caller sees a leaf and believes it.
+    #[test]
+    fn a_cut_node_says_how_much_was_left_unread() {
+        let output = [
+            "app|Safari".to_string(),
+            line(
+                0,
+                &[
+                    "window", "GitHub", "", "true", "", "", "", "", "2", "", "ok",
+                ],
+            ),
+            line(
+                1,
+                &[
+                    "button", "Reload", "", "true", "{1, 2}", "{3, 4}", "", "", "1", "", "ok",
+                ],
+            ),
+            line(2, &["group", "Toolbar", "", "", "", "", "", "", "2", "", "cut"]),
+        ]
+        .join("\n");
+        let elements = AccessibilityTool::parse_tree_output(&output);
+        let window = &elements[0];
+        assert_eq!(window.children_count, Some(2));
+
+        let group = &window.children[0].children[0];
+        assert_eq!(group.role, "group");
+        assert_eq!(group.children_count, Some(2));
+        assert!(group.truncated);
+        assert!(group.children.is_empty(), "a cut node's children were not read");
+    }
+
+    /// The cut belongs to the node the walk stopped at, but it is the whole
+    /// tree that is incomplete — so every ancestor reports it.
+    #[test]
+    fn a_cut_deep_in_the_tree_makes_its_ancestors_incomplete() {
+        let output = [
+            "app|Safari".to_string(),
+            line(
+                0,
+                &[
+                    "window", "GitHub", "", "true", "", "", "", "", "1", "", "ok",
+                ],
+            ),
+            line(1, &["button", "Reload", "", "", "", "", "", "", "1", "", "ok"]),
+            line(2, &["group", "Toolbar", "", "", "", "", "", "", "4", "", "cut"]),
+        ]
+        .join("\n");
+        let elements = AccessibilityTool::parse_tree_output(&output);
+        assert!(elements[0].truncated, "the root inherits the cut below it");
+        assert!(elements[0].children[0].truncated);
+    }
+
+    /// A complete tree says so: the count matches what was read, and nothing
+    /// is flagged.
+    #[test]
+    fn a_fully_read_tree_carries_no_truncation() {
+        let output = [
+            "app|Safari".to_string(),
+            line(
+                0,
+                &[
+                    "window", "GitHub", "", "true", "", "", "", "", "1", "", "ok",
+                ],
+            ),
+            line(1, &["button", "Reload", "", "", "", "", "", "", "0", "", "ok"]),
+        ]
+        .join("\n");
+        let elements = AccessibilityTool::parse_tree_output(&output);
+        assert_eq!(elements[0].children_count, Some(1));
+        assert_eq!(elements[0].children.len(), 1);
+        assert!(!elements[0].truncated);
+        assert!(!elements[0].children[0].truncated);
+    }
+
+    /// Focus is read, and an empty column is "unknown" rather than "not
+    /// focused" — the same three-state rule as `enabled`.
+    #[test]
+    fn a_focused_field_is_reported_and_an_unread_one_is_unknown() {
+        let output = [
+            "app|Safari".to_string(),
+            line(
+                0,
+                &[
+                    "window", "GitHub", "", "true", "", "", "", "", "1", "", "ok",
+                ],
+            ),
+            line(
+                1,
+                &[
+                    "text field",
+                    "Search",
+                    "",
+                    "true",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "0",
+                    "true",
+                    "ok",
+                ],
+            ),
+        ]
+        .join(
+            "
+",
+        );
+        let elements = AccessibilityTool::parse_tree_output(&output);
+        assert_eq!(elements[0].children[0].focused, Some(true));
+
+        let unread = AccessibilityTool::parse_tree_output(&line(
+            0,
+            &[
+                "window", "GitHub", "", "true", "", "", "", "", "0", "", "ok",
+            ],
+        ));
+        assert_eq!(unread[0].focused, None, "an unread column is not 'not focused'");
+    }
+
+    /// The script must actually produce those two columns, and must not
+    /// recurse past the limit — the limit is what it reports, not what it
+    /// hides.
+    #[test]
+    fn the_script_counts_children_and_marks_the_cut() {
+        let script = AccessibilityTool::build_ui_tree_script("Safari", 3);
+        assert!(script.contains("count of (get every UI element of _elem)"), "{script}");
+        assert!(script.contains("AXFocused"), "focus is read: {script}");
+        assert!(script.contains("|cut"), "{script}");
+        assert!(script.contains("|ok"), "{script}");
+        assert!(script.contains("1, 3"), "the depth limit is substituted in: {script}");
+        // Below the cut the walk returns before recursing.
+        let cut = script
+            .find("if _depth > _max_depth then")
+            .expect("cut branch");
+        let recurse = script
+            .find("my describe_elements(_elem")
+            .expect("recursion");
+        assert!(cut < recurse);
+    }
+
+    /// The frontmost branch honours the caller's depth too. The schema offers
+    /// `max_depth` whether or not `app` is named, so a constant here would be
+    /// a parameter that only sometimes works.
+    #[test]
+    fn the_frontmost_script_honours_the_requested_depth() {
+        let script = AccessibilityTool::build_frontmost_script(6);
+        assert!(script.contains("my describe_elements(_win, \"  \", 1, 6)"), "{script}");
+        assert!(!script.contains("frontmost of"), "reading must not take the foreground");
+    }
+
+    /// Reading the tree addresses the process by name; it must never activate
+    /// it. `set frontmost to true` used to be in this script, and it stole the
+    /// screen from whoever was using it.
+    #[test]
+    fn reading_the_tree_does_not_activate_the_app() {
+        for script in [
+            AccessibilityTool::build_ui_tree_script("Safari", 3),
+            AccessibilityTool::build_frontmost_script(3),
+        ] {
+            assert!(
+                !script.contains("set frontmost to true") && !script.contains("\nactivate"),
+                "{script}"
+            );
+            // One addresses the process by name, the other through System
+            // Events' frontmost process; neither activates anything.
+            assert!(script.contains("tell application \"System Events\""), "{script}");
+        }
     }
 }

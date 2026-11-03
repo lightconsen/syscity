@@ -15,10 +15,10 @@ use crate::agent::turns::ToolCallRecord;
 use crate::providers::Usage;
 
 use super::record::{
-    json_value_or_string, BudgetDecisionRecord, ChannelObservation, CompressionObservation,
-    ErrorSource, FullTraceEvent, LlmRoundRecord, ObservedError, ObservedToolCall, ObservedUsage,
-    PlanSnapshot, RouteRecord, TurnEndState, TurnRecord, DEFAULT_MIN_RETENTION_RATIO,
-    SCHEMA_VERSION,
+    json_value_or_string, ActionTraceEvent, BudgetDecisionRecord, ChannelObservation,
+    CompressionObservation, ErrorSource, FullTraceEvent, LlmRoundRecord, ObservedError,
+    ObservedToolCall, ObservedUsage, PlanSnapshot, RouteRecord, TurnEndState, TurnRecord,
+    DEFAULT_MIN_RETENTION_RATIO, SCHEMA_VERSION,
 };
 use super::writer::TurnMetricsWriter;
 use super::TurnMetricsSink;
@@ -433,15 +433,32 @@ impl TurnMetricsCollector {
                 Some(rec.result.clone())
             },
         });
-        // Full trace keeps the complete args/result (never truncated here).
+        // Full trace keeps the complete args/result (never truncated here) —
+        // but "complete" is not "unmasked": a tool result routinely carries a
+        // key the model just read, and this file outlives the turn. Only
+        // secret-shaped words are replaced; the rest of the text is intact,
+        // so the line is still fully replayable.
         self.append_full_event(&FullTraceEvent::Tool {
             round,
             name: rec.name.clone(),
-            args: rec.args.clone(),
-            result: rec.result.clone(),
+            args: crate::secrets::mask_secret_looking_text(&rec.args),
+            result: crate::secrets::mask_secret_looking_text(&rec.result),
             success: rec.success,
             duration_ms: rec.duration_ms,
         });
+    }
+
+    /// The handle a tool files its decision trace through.
+    ///
+    /// The collector itself is `&mut` in the agent loop and cannot be shared
+    /// with a tool that runs inside it, so the writer and turn id — the only
+    /// things needed to append a line — are handed over instead.
+    pub fn trace(&self, round: u32) -> Arc<ActionTraceSink> {
+        Arc::new(ActionTraceSink {
+            writer: Arc::clone(&self.writer),
+            turn_id: self.turn_id.clone(),
+            round,
+        })
     }
 
     fn build_record(&self, state: TurnEndState, error: Option<ObservedError>) -> TurnRecord {
@@ -561,6 +578,48 @@ impl TurnMetricsCollector {
     }
 }
 
+/// What a tool needs to file action-level trace lines for one turn.
+///
+/// Implements [`crate::tools::TurnTrace`] so the `computer` tool can write into
+/// the turn it is running inside without holding the collector (which the
+/// agent loop owns mutably).
+#[derive(Debug)]
+pub struct ActionTraceSink {
+    writer: Arc<TurnMetricsWriter>,
+    turn_id: String,
+    round: u32,
+}
+
+impl ActionTraceSink {
+    /// Append one step to the turn's `full.json`.
+    ///
+    /// Two masking passes, because there are two ways a secret reaches this
+    /// line: under a secret-looking *key* (handled by `mask_json_value`) and
+    /// quoted inside ordinary text such as a recovery hint (handled by
+    /// `mask_secret_looking_values`). The second exists because a password
+    /// field's label arrives as prose, not as a field named `password`.
+    pub fn record_action(&self, rec: &ActionTraceEvent) {
+        let mut detail = serde_json::to_value(rec).unwrap_or_default();
+        detail = crate::secrets::mask_json_value(&detail);
+        detail = crate::secrets::mask_secret_looking_values(&detail);
+        let event = FullTraceEvent::Action {
+            round: self.round,
+            action: rec.action.clone(),
+            detail,
+        };
+        if let Err(e) = self.writer.append_event(&self.turn_id, &event) {
+            super::WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            warn!("Failed to append action trace for turn {}: {}", self.turn_id, e);
+        }
+    }
+}
+
+impl crate::tools::TurnTrace for ActionTraceSink {
+    fn record_action(&self, rec: &ActionTraceEvent) {
+        ActionTraceSink::record_action(self, rec);
+    }
+}
+
 impl Drop for TurnMetricsCollector {
     fn drop(&mut self) {
         if self.terminal {
@@ -638,6 +697,67 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
             .collect()
+    }
+
+    /// A tool's action reaches the turn file through the sink, not through
+    /// the collector: the collector is `&mut` inside the loop the tool runs
+    /// in, so the sink is the only handle a tool can hold.
+    #[tokio::test]
+    async fn a_tool_action_lands_in_the_turn_file() {
+        let dir = TempDir::new().unwrap();
+        let c = make_collector(&dir);
+        let id = c.turn_id().to_string();
+        let sink = c.trace(2);
+        sink.record_action(&ActionTraceEvent {
+            action: "click".into(),
+            rung: "pixel".into(),
+            effect: "suspected_noop".into(),
+            delivery: "delivered_unverified".into(),
+            retry: "unsafe".into(),
+            tried: vec!["ax_action".into()],
+            escalate: Some("foreground".into()),
+            recovery: None,
+            settle_ms: Some(140),
+            hit_test: None,
+        });
+
+        let lines = read_full_lines(&dir, &id);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["type"], "action");
+        assert_eq!(lines[0]["round"], 2);
+        assert_eq!(lines[0]["action"], "click");
+        assert_eq!(lines[0]["detail"]["rung"], "pixel");
+        assert_eq!(lines[0]["detail"]["settle_ms"], 140);
+        assert_eq!(lines[0]["detail"]["tried"][0], "ax_action");
+    }
+
+    /// An action's recovery text can quote a field label, and this file
+    /// outlives the turn: masking happens in the sink so no caller can skip
+    /// it.
+    #[tokio::test]
+    async fn an_action_that_quotes_a_secret_is_masked_in_the_turn_file() {
+        let dir = TempDir::new().unwrap();
+        let c = make_collector(&dir);
+        let id = c.turn_id().to_string();
+        // Built at runtime: the commit gate scans whole files for literal
+        // secret shapes, and a test fixture is still a file.
+        let secret = format!("sk-{}", "live_51HxQ9pLmZ3tYb");
+        c.trace(0).record_action(&ActionTraceEvent {
+            action: "type".into(),
+            rung: "keyboard".into(),
+            effect: "unverifiable".into(),
+            delivery: "delivered_unverified".into(),
+            retry: "unsafe".into(),
+            tried: Vec::new(),
+            escalate: None,
+            recovery: Some(format!("the field named {secret} did not take the text")),
+            settle_ms: None,
+            hit_test: None,
+        });
+
+        let raw = std::fs::read_to_string(turn_dir(&dir, &id).join("full.json")).unwrap();
+        assert!(!raw.contains(&secret), "the trace file carried the secret: {raw}");
+        assert!(raw.contains("••••"), "{raw}");
     }
 
     #[tokio::test]
@@ -807,6 +927,34 @@ mod tests {
         let mut c = make_collector(&tempfile::tempdir().unwrap()).with_min_retention_ratio(0.0);
         c.record_compression(1000, 200, "llm_summary");
         assert!(c.compression_risks().is_empty());
+    }
+
+    /// The tool line is untruncated but not unmasked: a result that quoted a
+    /// key the model just read must not persist it verbatim.
+    #[tokio::test]
+    async fn a_tool_result_that_quotes_a_key_is_masked_in_the_trace() {
+        let dir = TempDir::new().unwrap();
+        let mut c = make_collector(&dir);
+        c.begin_round("p", "m", None, None);
+        c.end_round(None, Some("stop".into()));
+        let secret = format!("sk-{}", "live_51HxQ9pLmZ3tYb");
+        c.record_tool(&ToolCallRecord {
+            name: "file_read".into(),
+            args: r#"{"path":"/tmp/.env"}"#.into(),
+            result: format!("ANTHROPIC_API_KEY={secret}\nDEBUG=1"),
+            success: true,
+            duration_ms: 3,
+        });
+        let id = c.turn_id().to_string();
+        c.finish("done").await;
+
+        let raw = std::fs::read_to_string(turn_dir(&dir, &id).join("full.json")).unwrap();
+        assert!(!raw.contains(&secret), "the tool trace carried the key: {raw}");
+        // The surrounding line — which is what makes the trace replayable —
+        // is still there.
+        assert!(raw.contains("ANTHROPIC_API_KEY="), "{raw}");
+        assert!(raw.contains("DEBUG=1"), "{raw}");
+        assert!(raw.contains("/tmp/.env"), "{raw}");
     }
 
     #[tokio::test]

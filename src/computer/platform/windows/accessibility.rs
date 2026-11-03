@@ -26,6 +26,21 @@ pub struct UiElement {
     /// UIA `AutomationId`, when the application publishes one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+    /// The control patterns the element supports (`Invoke`, `Value`, …).
+    /// `None` when the read did not say; `Some([])` when it said "none".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<String>>,
+    /// Whether the element holds keyboard focus. `None` when the read did not
+    /// say; it decides where a bare `type` / `key_press` lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+    /// How many children UIA reported. A count larger than `children.len()`
+    /// means the depth limit cut the walk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children_count: Option<u32>,
+    /// Whether the depth limit stopped this node's walk with children unread.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     pub children: Vec<UiElement>,
 }
 
@@ -60,9 +75,19 @@ impl WindowsAccessibilityTool {
     }
 
     /// Build a PowerShell script that traverses the foreground window.
-    fn build_ui_tree_script() -> String {
+    ///
+    /// `app` narrows the root to a named window; when it is absent the script
+    /// keeps today's rule (the first window with a native handle). `max_depth`
+    /// is threaded through instead of being frozen at 3, so a caller asking
+    /// for a deeper tree gets one rather than a silently shallow read.
+    fn build_ui_tree_script(app: Option<&str>, max_depth: u32) -> String {
+        // A template rather than a `format!` string: the PowerShell bodies are
+        // full of `{ ... }` script blocks that formatting would misread.
+        let app = app.unwrap_or("").replace('\'', "''");
         r#"
 Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+$MaxDepth = __MAX_DEPTH__
+$AppName = '__APP_NAME__'
 
 function Export-Element {
     param($elem, $depth = 0)
@@ -77,9 +102,11 @@ function Export-Element {
         width  = [int]$r.BoundingRectangle.Width
         height = [int]$r.BoundingRectangle.Height
         identifier = $r.AutomationId
+        focused = $r.HasKeyboardFocus
+        actions = @($elem.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace '^Pattern\.','' })
         children = @()
     }
-    if ($depth -lt 3) {
+    if ($depth -lt $MaxDepth) {
         $children = $elem.FindAll([System.Windows.Automation.TreeScope]::Children,
                                   [System.Windows.Automation.Condition]::TrueCondition)
         for ($i = 0; $i -lt $children.Count; $i++) {
@@ -90,14 +117,25 @@ function Export-Element {
 }
 
 $root = [System.Windows.Automation.AutomationElement]::RootElement
-# Try to find the foreground (active) window
+# Find the named window when the caller named one; otherwise take the first
+# window that owns a native handle (the old behaviour).
 $cond = [System.Windows.Automation.ControlTypeCondition]::Window
 $allWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
 $target = $null
-for ($i = 0; $i -lt $allWindows.Count; $i++) {
-    if ($allWindows[$i].Current.NativeWindowHandle -ne 0) {
-        $target = $allWindows[$i]
-        break
+if ($AppName -ne '') {
+    for ($i = 0; $i -lt $allWindows.Count; $i++) {
+        if ($allWindows[$i].Current.Name -eq $AppName) {
+            $target = $allWindows[$i]
+            break
+        }
+    }
+}
+if (-not $target) {
+    for ($i = 0; $i -lt $allWindows.Count; $i++) {
+        if ($allWindows[$i].Current.NativeWindowHandle -ne 0) {
+            $target = $allWindows[$i]
+            break
+        }
     }
 }
 if (-not $target -and $allWindows.Count -gt 0) {
@@ -111,7 +149,8 @@ if ($target) {
     '{"role":"desktop","name":"","children":[]}'
 }
 "#
-        .to_string()
+        .replace("__MAX_DEPTH__", &max_depth.to_string())
+        .replace("__APP_NAME__", &app)
     }
 
     /// Parse the JSON returned by PowerShell into a tree of elements.
@@ -152,6 +191,20 @@ if ($target) {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from),
+            actions: obj.get("actions").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
+            focused: obj.get("focused").and_then(|v| v.as_bool()),
+            children_count: obj
+                .get("children_count")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(u32::MAX as u64) as u32),
+            truncated: obj
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             children,
         })
     }
@@ -339,6 +392,10 @@ impl Tool for WindowsAccessibilityTool {
                 "value": {
                     "type": "string",
                     "description": "Value to set, for action=set_value."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "How deep to walk the tree (1–16, default 3)."
                 }
             }),
             Vec::<String>::new(),
@@ -356,7 +413,12 @@ impl Tool for WindowsAccessibilityTool {
 
         info!("Querying Windows accessibility tree");
 
-        let (success, stdout, stderr) = Self::run_ps(&Self::build_ui_tree_script()).await?;
+        let max_depth = args["max_depth"]
+            .as_u64()
+            .map(|d| d.clamp(1, 16) as u32)
+            .unwrap_or(3);
+        let script = Self::build_ui_tree_script(args["app"].as_str(), max_depth);
+        let (success, stdout, stderr) = Self::run_ps(&script).await?;
 
         let mut result = AccessibilityResult {
             success,
@@ -407,6 +469,38 @@ mod tests {
         let tool = WindowsAccessibilityTool::new();
         assert_eq!(tool.name(), "windows_accessibility");
         assert!(tool.description().contains("UIAutomation"));
+    }
+
+    /// The depth the caller asked for reaches the walker; it used to be
+    /// frozen at 3, so a deep tree came back shallow and looked empty.
+    #[test]
+    fn the_tree_script_honours_the_requested_depth() {
+        let shallow = WindowsAccessibilityTool::build_ui_tree_script(None, 2);
+        assert!(shallow.contains("$MaxDepth = 2"), "{shallow}");
+        assert!(shallow.contains("if ($depth -lt $MaxDepth)"));
+        let deep = WindowsAccessibilityTool::build_ui_tree_script(None, 12);
+        assert!(deep.contains("$MaxDepth = 12"));
+    }
+
+    /// Focus decides where a bare `type` / `key_press` lands, so the tree
+    /// reports it; it used to be the one fact the script never read.
+    #[test]
+    fn the_tree_script_reports_keyboard_focus() {
+        let script = WindowsAccessibilityTool::build_ui_tree_script(None, 3);
+        assert!(script.contains("HasKeyboardFocus"), "{script}");
+    }
+
+    /// The app argument used to be accepted by the schema and then ignored by
+    /// the tree branch.
+    #[test]
+    fn the_tree_script_targets_the_named_window() {
+        let script = WindowsAccessibilityTool::build_ui_tree_script(Some("Calculator"), 3);
+        assert!(script.contains("$AppName = 'Calculator'"), "{script}");
+        // An apostrophe in a window title must not end the PowerShell string.
+        let quoted = WindowsAccessibilityTool::build_ui_tree_script(Some("Bob's App"), 3);
+        assert!(quoted.contains("$AppName = 'Bob''s App'"), "{quoted}");
+        let foreground = WindowsAccessibilityTool::build_ui_tree_script(None, 3);
+        assert!(foreground.contains("$AppName = ''"));
     }
 
     #[test]

@@ -25,6 +25,9 @@
 //!     enabled: true,
 //!     focused: false,
 //!     children: vec![],
+//!
+//!     children_count: None,
+//!     truncated: false,
 //! };
 //! let findings = detector.scan_tree(&ui_tree);
 //! if !findings.is_empty() {
@@ -292,10 +295,13 @@ mod tests {
             role: role.to_string(),
             label: label.map(String::from),
             value: None,
-            bounds: crate::computer::types::Rect::new(0, 0, 100, 30),
-            enabled: true,
-            focused: false,
+            bounds: Some(crate::computer::types::Rect::new(0, 0, 100, 30)),
+            enabled: crate::computer::Tri::Known(true),
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
             children: vec![],
+            children_count: None,
+            truncated: false,
         }
     }
 
@@ -337,10 +343,13 @@ mod tests {
             role: "dialog".to_string(),
             label: Some("Are you sure you want to delete?".to_string()),
             value: None,
-            bounds: crate::computer::types::Rect::new(0, 0, 400, 200),
-            enabled: true,
-            focused: false,
+            bounds: Some(crate::computer::types::Rect::new(0, 0, 400, 200)),
+            enabled: crate::computer::Tri::Known(true),
+            focused: crate::computer::Tri::Unknown,
+            actions: None,
             children: vec![],
+            children_count: None,
+            truncated: false,
         };
         let findings = detector.scan_tree(&tree);
         assert!(findings

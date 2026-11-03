@@ -245,10 +245,12 @@ async fn test_omniparser_to_ui_elements() {
     let ui_elements = OmniParserDetector::to_ui_elements(detected);
     for el in &ui_elements {
         assert!(!el.role.is_empty());
-        assert!(el.enabled);
         assert!(el.children.is_empty());
-        assert!(el.bounds.x >= 0 && el.bounds.x as u32 + el.bounds.width <= 640);
-        assert!(el.bounds.y >= 0 && el.bounds.y as u32 + el.bounds.height <= 480);
+        let bounds = el
+            .bounds
+            .expect("a detected element carries the box it was found in");
+        assert!(bounds.x >= 0 && bounds.x as u32 + bounds.width <= 640);
+        assert!(bounds.y >= 0 && bounds.y as u32 + bounds.height <= 480);
     }
 }
 

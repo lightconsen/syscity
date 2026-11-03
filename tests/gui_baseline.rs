@@ -50,6 +50,8 @@ fn tool_context(conversation: &str) -> ToolContext {
         approval_queue: None,
         skill_trust_ceiling: None,
         mobile: None,
+        steers: None,
+        trace: None,
     }
 }
 

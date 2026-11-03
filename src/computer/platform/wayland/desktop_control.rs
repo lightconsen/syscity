@@ -145,7 +145,7 @@ impl Tool for DesktopControlTool {
         // One pointer and one focus: two conversations must not drive this
         // display at once. See `tools::target_lock`.
         let _target = crate::tools::target_lock::TargetLocks::global()
-            .lock(crate::tools::target_lock::DESKTOP)
+            .lock_across_processes(crate::tools::target_lock::DESKTOP)
             .await;
         let tool = match Self::find_input_tool().await {
             Some(t) => t,

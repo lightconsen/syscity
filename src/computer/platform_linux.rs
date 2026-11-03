@@ -30,7 +30,8 @@ impl X11ComputerAdapter {
     /// Resolve a target and return only its coordinates.
     async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
         let resolved = self.resolve_target(&target).await?;
-        Ok((resolved.x, resolved.y))
+        let point = resolved.coordinates()?;
+        Ok((point.x, point.y))
     }
 }
 
@@ -94,7 +95,16 @@ impl ComputerAdapter for X11ComputerAdapter {
             .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
 
         if !result.success {
-            return Err(ComputerError::AccessibilityDenied);
+            // A pyatspi run that timed out is not a missing AT-SPI bridge:
+            // the tree was too deep or the bus too slow, and a shallower read
+            // may work. Reporting both alike told callers to enable an
+            // accessibility bus that was already running.
+            let message = result.error.clone().unwrap_or_default();
+            return Err(crate::computer::accessibility_read_error(
+                result.data.as_ref(),
+                &message,
+                false,
+            ));
         }
 
         let elements = crate::computer::parse_accessibility_elements(result.data.as_ref());
@@ -557,13 +567,7 @@ impl X11ComputerAdapter {
             resolution = self.snapshots.resolve(target).await;
         }
 
-        resolution.map_err(|e| match e {
-            ResolveError::Stale(snapshot) => ComputerError::StaleElement(format!(
-                "element id belongs to snapshot {snapshot:08x}, which is no longer cached; \
-                 re-read the UI tree and use a fresh id"
-            )),
-            other => ComputerError::ElementNotFound(other.to_string()),
-        })
+        resolution.map_err(|e| e.into_computer_error())
     }
 }
 
@@ -587,7 +591,8 @@ impl WaylandComputerAdapter {
     /// Resolve a target and return only its coordinates.
     async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
         let resolved = self.resolve_target(&target).await?;
-        Ok((resolved.x, resolved.y))
+        let point = resolved.coordinates()?;
+        Ok((point.x, point.y))
     }
 }
 
@@ -1016,13 +1021,7 @@ impl WaylandComputerAdapter {
             resolution = self.snapshots.resolve(target).await;
         }
 
-        resolution.map_err(|e| match e {
-            ResolveError::Stale(snapshot) => ComputerError::StaleElement(format!(
-                "element id belongs to snapshot {snapshot:08x}, which is no longer cached; \
-                 re-read the UI tree and use a fresh id"
-            )),
-            other => ComputerError::ElementNotFound(other.to_string()),
-        })
+        resolution.map_err(|e| e.into_computer_error())
     }
 }
 
