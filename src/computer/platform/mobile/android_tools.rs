@@ -19,7 +19,7 @@ use super::android::display_bridge;
 use super::android::{
     adb_args, assess_tree, dump_ui, element_label, format_ocr_lines, format_ui_summary, ocr_screen,
     resolve_device, resolved_serial, settle_after_action, sh_quote, tree_fingerprint, Target,
-    TreeQuality, UiElement, DEVICE_PARAM, DISPLAY_PARAM, EFFECT_UNCHANGED,
+    TreeQuality, UiDump, UiElement, DEVICE_PARAM, DISPLAY_PARAM, EFFECT_UNCHANGED,
 };
 use super::run_cmd;
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
@@ -84,7 +84,7 @@ async fn scroll_once(
         // A swipe aimed at the agent's display goes through the helper: ADB's
         // own `input` only reaches the default display.
         let bridge = display_bridge()?;
-        let display = super::display::VirtualDisplay::attach(bridge, id);
+        let display = super::display::VirtualDisplay::attach(bridge.clone(), id);
         return display
             .swipe((x, from_y), (x, to_y), 300)
             .await
@@ -516,11 +516,13 @@ impl Tool for AdbDialogTool {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        let _target = super::android::lock_device(&device).await;
         let target = match Target::from_args(&args) {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
+        // A dialog on a display is a write to that display's own focus, not to
+        // the user's screen; the same split as `android_input` applies here.
+        let _target = super::android::lock_target(&device, target).await;
         let dump = match dump_ui(&device, target).await {
             Ok(dump) => dump,
             Err(failure) => {
@@ -646,6 +648,16 @@ impl Tool for AdbDialogTool {
             }
         };
 
+        // A person may have locked the phone, and the task may have left the
+        // display while the model was thinking. Either way the button being
+        // pressed is not the button that was read.
+        let readiness = super::ready::probe().await;
+        if let Err(blocked) =
+            super::ready::check(readiness.as_ref(), target, dump.package.as_deref())
+        {
+            return Ok(ToolExecutionResult::error(super::ready::describe(&blocked)));
+        }
+
         // The dialog's own button is a fresh decision point: a confirmation
         // prompt reading "Send 3 photos?" ends in a send whatever opened it.
         let offer = chosen
@@ -654,13 +666,83 @@ impl Tool for AdbDialogTool {
             .or(chosen.content_desc.as_deref())
             .and_then(super::risk::classify_named);
         let subject = format!("press \"{wanted}\" on a dialog");
-        let clearance = match super::gate::check(offer, context, &subject).await {
-            Ok(clearance) => clearance,
-            Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
-        };
+        let clearance =
+            match super::gate::check(offer, context, &subject, dump.package.as_deref()).await {
+                Ok(clearance) => clearance,
+                Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
+            };
 
-        let before = tree_fingerprint(&dump.elements);
-        let at = chosen.center;
+        // Pressing the same dialog button again and again is the loop the
+        // ladder exists for, and it runs after the gate so that "the person
+        // said yes" is not silently spent on a refusal.
+        let guard_key = super::guard::Guard::bucket_key(
+            &context.conversation_id,
+            &format!("{}:{}", device.as_deref().unwrap_or("-"), target.display_id()),
+        );
+        let signature = format!("dialog:{wanted}");
+        let ladder = super::guard::Guard::global().check(&guard_key, &signature);
+        if let super::guard::Verdict::Refuse(reason) = &ladder {
+            return Ok(ToolExecutionResult::error(if clearance.asked {
+                format!("{reason} (An approval was given but unused; nothing was pressed.)")
+            } else {
+                reason.clone()
+            }));
+        }
+
+        // The question was open for as long as the person took to read it, and
+        // a dialog is exactly the kind of screen that changes underneath one:
+        // a countdown closes it, a message arrives behind it. What was approved
+        // was the button that was described; before pressing, check that it is
+        // still that button in that app. The re-read only happens when somebody
+        // was actually asked — otherwise there is nothing to check.
+        let mut fresh_dump: Option<UiDump> = None;
+        if clearance.asked {
+            let fresh = match super::android::dump_ui(&device, target).await {
+                Ok(fresh) => fresh,
+                Err(failed) => {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "Refused: \"{subject}\" was approved, but the screen could not be read \
+                         again to confirm it is still there ({}). Nothing was pressed.",
+                        failed.message
+                    )))
+                }
+            };
+            let still_there = fresh.elements.iter().any(|element| {
+                element.clickable
+                    && super::android::element_label(element)
+                        .is_some_and(|label| label.trim() == wanted.trim())
+            });
+            if !still_there {
+                return Ok(ToolExecutionResult::error(format!(
+                    "Refused: \"{subject}\" was approved, and by then the dialog no longer had \
+                     that button. Nothing was pressed. Read the screen again."
+                )));
+            }
+            let now = super::risk::classify_named(wanted);
+            if let Err(withheld) =
+                super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
+            {
+                return Ok(ToolExecutionResult::error(withheld.reason));
+            }
+            fresh_dump = Some(fresh);
+        }
+        let before = tree_fingerprint(&fresh_dump.as_ref().unwrap_or(&dump).elements);
+        // The button's own position may have moved with its container; press
+        // where it is *now*, not where it was before the question.
+        let at = fresh_dump
+            .as_ref()
+            .and_then(|fresh| {
+                fresh
+                    .elements
+                    .iter()
+                    .find(|element| {
+                        element.clickable
+                            && super::android::element_label(element)
+                                .is_some_and(|label| label.trim() == wanted.trim())
+                    })
+                    .map(|element| element.center)
+            })
+            .unwrap_or(chosen.center);
         let pressed = match target {
             Target::Screen => {
                 let command = format!("input tap {} {}", at.0, at.1);
@@ -695,6 +777,15 @@ impl Tool for AdbDialogTool {
         }
         let settle = settle_after_action(&device, target, Some(before), 1200).await;
 
+        // The ladder learns what the press did, judged by the screen rather
+        // than the dispatch: a dialog that reappears is the same screen, and
+        // that is the stuck state this counts.
+        super::guard::Guard::global().record(
+            &guard_key,
+            &signature,
+            super::android::guard_outcome(settle.effect),
+        );
+
         // A dialog button that reaches outward counts toward the pace exactly
         // as an `android_input` tap would — otherwise the two paths would be
         // two different speeds through the same app.
@@ -708,6 +799,10 @@ impl Tool for AdbDialogTool {
         if let Some(note) = &pace_note {
             text.push_str(&format!(" {note}"));
         }
+        if let Some(note) = ladder.note() {
+            text.push(' ');
+            text.push_str(note);
+        }
 
         Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
             "pressed": true,
@@ -717,6 +812,7 @@ impl Tool for AdbDialogTool {
             "risk": clearance.note(),
             "risk_approved": clearance.asked,
             "paced": pace_note,
+            "guard": ladder.note(),
         })))
     }
 }
@@ -1460,18 +1556,41 @@ impl Tool for AdbDisplayTool {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        let _target = super::android::lock_device(&device).await;
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        // Not the device lock: a display is its own focus, so two displays on
+        // one phone are two places to write and do not need to wait for each
+        // other. Which display this call is about is often only known after
+        // the action is parsed (`start` names none, `stop` names one), so the
+        // lock for a named display is taken below, once the id is in hand.
+        // Actions that are about the phone as a whole (`start`, `restart`,
+        // `status`, `limits`) take the device.
+        let named_display = args
+            .get("display")
+            .and_then(|v| v.as_i64())
+            .and_then(|id| i32::try_from(id).ok())
+            .filter(|_| action != "start" && action != "restart");
+        let _target = match named_display {
+            Some(id) => super::android::lock_target(&device, Target::Display(id)).await,
+            None => super::android::lock_device(&device).await,
+        };
         let bridge = match display_bridge() {
             Ok(bridge) => bridge,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         if action == "status" {
+            // The helper's own description, and the state that decides whether
+            // a write still means anything: locked screen, which app each
+            // display holds. Reported together because "it is running" is not
+            // the same answer as "it is running somewhere useful".
             return Ok(match super::display::VirtualDisplay::status(&bridge).await {
                 Ok(answer) => {
-                    ToolExecutionResult::success(format!("Display helper is running: {}", answer))
-                        .with_data(answer)
+                    let mut text = format!("Display helper is running: {answer}");
+                    if let Ok(state) = super::display::VirtualDisplay::readiness(&bridge).await {
+                        text.push('\n');
+                        text.push_str(&describe_readiness(&state));
+                    }
+                    ToolExecutionResult::success(text).with_data(answer)
                 }
                 Err(failed) => ToolExecutionResult::error(failed.to_string()),
             });
@@ -1578,22 +1697,25 @@ impl Tool for AdbDisplayTool {
         let id = i32::try_from(id).unwrap_or(-1);
         // The display is addressed by id alone for every later call: the helper
         // owns the record, and reconstructing a handle here would need its size.
-        let display = super::display::VirtualDisplay::attach(bridge, id);
+        let display = super::display::VirtualDisplay::attach(bridge.clone(), id);
 
         // A tap on this display can still end somewhere irreversible: the
         // display runs a copy of the app, and the app's send button is the
         // app's send button. The tree for the display is read here because
         // the coordinates alone say nothing.
         let mut before_package: Option<String> = None;
+        let mut before_fingerprint: Option<u64> = None;
+        let tap_point = (
+            i32::try_from(args.get("x").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0),
+            i32::try_from(args.get("y").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0),
+        );
         let clearance = match action {
             "tap" => {
-                let x =
-                    i32::try_from(args.get("x").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0);
-                let y =
-                    i32::try_from(args.get("y").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0);
+                let (x, y) = tap_point;
                 let offer = match super::android::dump_ui(&device, Target::Display(id)).await {
                     Ok(dump) => {
                         before_package = dump.package;
+                        before_fingerprint = Some(super::android::tree_fingerprint(&dump.elements));
                         super::risk::classify_point(&dump.elements, x, y)
                     }
                     // A read that failed is not a reason to refuse a tap the
@@ -1608,16 +1730,154 @@ impl Tool for AdbDisplayTool {
                     ),
                     None => format!("tap on display {id}"),
                 };
-                super::gate::check(offer, context, &subject).await
+                super::gate::check(offer, context, &subject, before_package.as_deref()).await
+            }
+            // `launch` starts an app, so the app it is about to open is the app
+            // this write will be in — named by the argument, since there is no
+            // screen to read it from yet.
+            "launch" => {
+                before_package = args
+                    .get("package")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string);
+                Ok(super::gate::Clearance {
+                    offer: None,
+                    asked: false,
+                    granted: None,
+                })
             }
             // Nothing a paste types is what commits it; the button afterwards
             // is the tap, and that tap is classified on its own.
-            _ => Ok(super::gate::Clearance { offer: None, asked: false }),
+            _ => Ok(super::gate::Clearance {
+                offer: None,
+                asked: false,
+                granted: None,
+            }),
         };
         let clearance = match clearance {
             Ok(clearance) => clearance,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
         };
+
+        // What was approved was a description, and the screen has had the whole
+        // question's lifetime to move. One re-read, only when somebody was
+        // actually asked: a clock has closed and a message has arrived behind
+        // it, and "tap 发送" means nothing unless the 发送 that is there now is
+        // the one that was described.
+        if clearance.asked {
+            let fresh = match super::android::dump_ui(&device, Target::Display(id)).await {
+                Ok(fresh) => fresh,
+                Err(failed) => {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "Refused: the tap on display {id} was approved, but the display could \
+                         not be read again to confirm it is still there ({}). Nothing was done.",
+                        failed.message
+                    )))
+                }
+            };
+            let now = super::risk::classify_point(&fresh.elements, tap_point.0, tap_point.1);
+            if let Err(withheld) =
+                super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
+            {
+                return Ok(ToolExecutionResult::error(withheld.reason));
+            }
+            // The press is computed against the screen as it is now, not as it
+            // was when the question was asked.
+            before_package = fresh.package;
+            before_fingerprint = Some(super::android::tree_fingerprint(&fresh.elements));
+        }
+
+        // Two displays on one phone are two places to write, but the app on
+        // them is one app: one process, one account, one set of unsaved edits.
+        // `launch` names its app in the argument; every other action finds out
+        // from the screen it just read. `stop` touches no app at all.
+        let lease_package = if action == "stop" {
+            None
+        } else {
+            before_package.clone()
+        };
+        let seen = super::android::app_completed(&device, lease_package.as_deref());
+        let _lease = super::android::lease_app(&device, lease_package.as_deref(), seen).await;
+        if _lease.stale {
+            return Ok(ToolExecutionResult::error(format!(
+                "Refused: another writer changed {} while this call waited for it — the screen \
+                 read a moment ago no longer describes what is there. Nothing was done. Read the \
+                 display again and retry.",
+                lease_package.as_deref().unwrap_or("this app")
+            )));
+        }
+
+        // The app's own screens are the controls that govern the agent; no
+        // approval makes operating them right. Only `launch` names a package
+        // without reading one, and the guard covers it too.
+        if let Some(package) = before_package.as_deref() {
+            if super::takeover::is_own_app(package) {
+                return Ok(ToolExecutionResult::error(format!(
+                    "Refused: this would write to Syscity's own screen ({package}). The app's \
+                     settings, pairing and display pages are the controls that govern the \
+                     agent, so the agent does not operate them — a person does. Nothing was \
+                     done."
+                )));
+            }
+        }
+
+        // Whether the phone is still in the state this write was computed for:
+        // the helper still alive, the person's screen unlocked, this display
+        // still holding the app it held. `launch` is exempt — it is the
+        // ordinary way back into a display whose app has gone, so "this display
+        // no longer shows what it did" is the starting condition, not a fault.
+        if action != "launch" {
+            if let Ok(readiness) = super::display::VirtualDisplay::readiness(&bridge).await {
+                if let Err(blocked) =
+                    super::ready::check(Some(&readiness), Target::Display(id), None)
+                {
+                    return Ok(ToolExecutionResult::error(super::ready::describe(&blocked)));
+                }
+            }
+        }
+
+        // What the model is about to do, named so that "the same action again"
+        // is a question with an answer. A tap is worth more than its
+        // coordinates: the label of what is under it, from the read above.
+        let reads_only =
+            matches!(action, "frame" | "status" | "limits" | "stop" | "mute" | "sound");
+        let signature = match action {
+            "tap" => format!("tap@{}:{}", tap_point.0, tap_point.1),
+            "swipe" => {
+                let value = |key: &str| args.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+                format!("swipe@{}:{}>{}:{}", value("x"), value("y"), value("x2"), value("y2"))
+            }
+            "text" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                format!("text:{}", text.chars().take(40).collect::<String>())
+            }
+            "paste" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                format!("paste:{}", text.chars().take(40).collect::<String>())
+            }
+            "key" => format!("key:{}", args.get("keycode").and_then(|v| v.as_str()).unwrap_or("")),
+            _ => format!("{action}:{id}"),
+        };
+        let guard_key = super::guard::Guard::bucket_key(
+            &context.conversation_id,
+            &format!("{}:{}", device.as_deref().unwrap_or("-"), id),
+        );
+        let ladder = if reads_only {
+            super::guard::Verdict::Clear
+        } else {
+            super::guard::Guard::global().check(&guard_key, &signature)
+        };
+        if let super::guard::Verdict::Refuse(reason) = &ladder {
+            // A refusal to take an action that was already approved has to say
+            // so: the person is not being asked again, and nothing was done.
+            return Ok(ToolExecutionResult::error(if clearance.asked {
+                format!("{reason} (An approval was given but unused; nothing was sent.)")
+            } else {
+                reason.clone()
+            }));
+        }
 
         let result = match action {
             "stop" => display.close().await.map(|_| "Display closed.".to_string()),
@@ -1739,6 +1999,25 @@ impl Tool for AdbDisplayTool {
             }
         };
 
+        // The ladder learns what this did, from the screen's own answer rather
+        // than the action's: a tap the helper accepted is not a tap that
+        // landed. Only a tap took a read before it, so only a tap has a
+        // fingerprint to compare against; the rest are recorded as unseen,
+        // which the ladder does not count as "nothing happened".
+        if !reads_only {
+            let outcome = match before_fingerprint {
+                Some(was) => match super::android::dump_ui(&device, Target::Display(id)).await {
+                    Ok(now) if super::android::tree_fingerprint(&now.elements) == was => {
+                        super::guard::Outcome::Unchanged
+                    }
+                    Ok(_) => super::guard::Outcome::Changed,
+                    Err(_) => super::guard::Outcome::Unknown,
+                },
+                None => super::guard::Outcome::Unknown,
+            };
+            super::guard::Guard::global().record(&guard_key, &signature, outcome);
+        }
+
         // Same pace as `android_input`, and likewise after the action: the
         // display is another screen running the same app, so a second send
         // there is a second send.
@@ -1749,13 +2028,21 @@ impl Tool for AdbDisplayTool {
         };
 
         Ok(match result {
-            Ok(message) => ToolExecutionResult::success(message).with_data(serde_json::json!({
-                "display": id,
-                "action": action,
-                "risk": clearance.note(),
-                "risk_approved": clearance.asked,
-                "paced": pace_note,
-            })),
+            Ok(message) => {
+                let mut text = message;
+                if let Some(note) = ladder.note() {
+                    text.push(' ');
+                    text.push_str(note);
+                }
+                ToolExecutionResult::success(text).with_data(serde_json::json!({
+                    "display": id,
+                    "action": action,
+                    "risk": clearance.note(),
+                    "risk_approved": clearance.asked,
+                    "paced": pace_note,
+                    "guard": ladder.note(),
+                }))
+            }
             Err(failed) => ToolExecutionResult::error(failed.to_string()),
         })
     }
@@ -2227,5 +2514,95 @@ mod tests {
         assert_eq!(WAIT_MAX_MS, 30_000);
         assert!(WAIT_DEFAULT_MS <= WAIT_MAX_MS);
         assert!(WAIT_POLL_MS <= WAIT_DEFAULT_MS);
+    }
+}
+
+/// One line per fact the model needs before it writes to a display.
+///
+/// The three states are separate sentences because they call for three
+/// different moves: unlock the phone, start the helper, or re-read the screen.
+fn describe_readiness(state: &super::display::Readiness) -> String {
+    let mut lines = Vec::new();
+    lines.push(if state.locked {
+        "The phone is locked: a tap on the user's screen lands on the lock screen, and an app \
+         started behind it will not have changed."
+            .to_string()
+    } else {
+        "The phone is unlocked.".to_string()
+    });
+    if let Some(top) = &state.main {
+        lines.push(format!(
+            "User's screen: {} (task {}).",
+            top.package.as_deref().unwrap_or("an unnamed app"),
+            top.task
+        ));
+    }
+    if state.displays.is_empty() {
+        lines.push("No displays are open.".to_string());
+    } else {
+        let shown: Vec<String> = state
+            .displays
+            .iter()
+            .map(|top| match top.package.as_deref() {
+                Some(package) => format!("display {} holds {package}", top.display),
+                None => format!("display {} is empty", top.display),
+            })
+            .collect();
+        lines.push(format!("{}.", shown.join("; ")));
+    }
+    lines.join(" ")
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use crate::computer::platform::mobile::display::{Readiness, ScreenTop};
+
+    fn state(locked: bool, displays: Vec<ScreenTop>) -> Readiness {
+        Readiness {
+            helper: true,
+            locked,
+            main: Some(ScreenTop {
+                display: 0,
+                task: 4,
+                package: Some("com.example.chat".to_string()),
+            }),
+            displays,
+        }
+    }
+
+    #[test]
+    fn a_locked_phone_is_said_in_the_status_line() {
+        let text = describe_readiness(&state(true, Vec::new()));
+        assert!(text.contains("locked"), "{text}");
+        assert!(text.contains("lock screen"), "{text}");
+    }
+
+    #[test]
+    fn each_display_says_what_it_holds() {
+        let text = describe_readiness(&state(
+            false,
+            vec![
+                ScreenTop {
+                    display: 3,
+                    task: 9,
+                    package: Some("com.example.mail".to_string()),
+                },
+                ScreenTop {
+                    display: 4,
+                    task: -1,
+                    package: None,
+                },
+            ],
+        ));
+        assert!(text.contains("display 3 holds com.example.mail"), "{text}");
+        assert!(text.contains("display 4 is empty"), "{text}");
+        assert!(!text.contains("No displays"), "{text}");
+    }
+
+    #[test]
+    fn no_displays_says_so_rather_than_nothing() {
+        let text = describe_readiness(&state(false, Vec::new()));
+        assert!(text.contains("No displays are open"), "{text}");
     }
 }

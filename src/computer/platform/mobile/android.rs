@@ -7,8 +7,9 @@
 //! `uiautomator dump`, not the raw XML: the dump is an order of magnitude
 //! larger, and the model would otherwise have to parse `bounds` to act on it.
 //! Text input escapes for the *device* shell (a plain `input text '<text>'`
-//! breaks on an embedded quote) and routes non-ASCII through ADBKeyboard, which
-//! `input text` cannot type.
+//! breaks on an embedded quote) and routes non-ASCII through ADBKeyboard or,
+//! failing that, through a clipboard paste by the phone's own helper — `input
+//! text` types through the key character map and cannot carry it.
 //!
 //! Two things make the loop shorter rather than just correct. Every action is
 //! followed by a re-read that answers "did the screen change" ([`EFFECT_CHANGED`]
@@ -201,6 +202,83 @@ pub(super) async fn lock_device(device: &Option<String>) -> tokio::sync::OwnedMu
         .await
 }
 
+/// Wait for exclusive use of the thing this call is about to address.
+///
+/// The user's screen has one pointer and one focus, so a write to it takes the
+/// device. A virtual display has a focus of its own: two of them are two
+/// places, and making them wait for each other would be cost with no
+/// correctness behind it. The app they share is guarded separately, by
+/// [`lease_app`].
+pub(super) async fn lock_target(
+    device: &Option<String>,
+    target: Target,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    match target {
+        Target::Screen => lock_device(device).await,
+        Target::Display(id) => {
+            let key = match device {
+                Some(serial) => crate::tools::target_lock::android_display(serial, id),
+                None => format!("android-display:any:{id}"),
+            };
+            crate::tools::target_lock::TargetLocks::global()
+                .lock_named(&key)
+                .await
+        }
+    }
+}
+
+/// Wait for exclusive use of one app on one phone, for the length of a write.
+///
+/// The device lock serialises input on a phone, and on the user's screen that
+/// is all there is to it: one focus, one screen. A virtual display is not the
+/// user's screen though — it has its own focus — and the helper lets two of
+/// them run at once. Two tasks can then drive the *same app* on *two displays*
+/// of one phone, which the display-side checks cannot see: the app is one
+/// process, one account, one set of unsaved edits, and two writers interleaving
+/// in it produce a state neither of them would have reached alone.
+///
+/// So a write also takes this, keyed by `(serial, package)`. It is taken after
+/// the pre-action read (the package is what that read names) and released when
+/// the action finishes. Order is always the display-or-device lock first and
+/// this second, so the two cannot deadlock.
+///
+/// [`stale`](AppLease::stale) covers the gap the ordering leaves: the read that
+/// named the package happened *before* the lock, so another write to the same
+/// app may have landed in between. When it says so, the caller re-reads.
+pub(super) type AppLease = crate::tools::target_lock::AppLease;
+
+/// Take the app lease for the package the pre-action read named.
+///
+/// An unreadable tree names no package, and there is no key to take: the write
+/// proceeds under the display lock only, as it did before. That is a real gap
+/// — a blind action is exactly one you cannot serialise — but inventing a key
+/// would serialise every app on the phone against every other, which is the
+/// coarse lock this whole module is trying not to be.
+pub(super) async fn lease_app(
+    device: &Option<String>,
+    package: Option<&str>,
+    seen_completed: u64,
+) -> AppLease {
+    let Some(package) = package.map(str::trim).filter(|p| !p.is_empty()) else {
+        return AppLease::none();
+    };
+    let key = crate::tools::target_lock::android_app(device.as_deref().unwrap_or("-"), package);
+    crate::tools::target_lock::AppGates::global()
+        .lease(&key, seen_completed)
+        .await
+}
+
+/// How many writes to `package` have finished, for [`lease_app`]'s staleness
+/// check. Zero when no package is known, which never reports stale.
+pub(super) fn app_completed(device: &Option<String>, package: Option<&str>) -> u64 {
+    let Some(package) = package.map(str::trim).filter(|p| !p.is_empty()) else {
+        return 0;
+    };
+    crate::tools::target_lock::AppGates::global().completed(
+        &crate::tools::target_lock::android_app(device.as_deref().unwrap_or("-"), package),
+    )
+}
+
 // ── ADB Screenshot Tool ────────────────────────────────────────────────────
 
 /// Capture device screen via `adb exec-out screencap -p`.
@@ -277,6 +355,73 @@ impl Tool for AdbScreenshotTool {
             })),
         )
     }
+}
+
+/// What an action *is*, for the repetition guard.
+///
+/// Not the arguments: a tap by index and the same tap by key are the same
+/// action, and a model that alternates between the two would otherwise reset
+/// the count while doing exactly the same thing. The signature names the
+/// element where one is known, so scrolling the same list and tapping the same
+/// row is still "the same action", and separately names the operation where it
+/// is not.
+fn action_signature(op: &InputOp, before: Option<&[UiElement]>) -> String {
+    match op {
+        InputOp::Taps(points) if points.len() == 1 => {
+            let (x, y) = points[0];
+            let label = before
+                .and_then(|elements| {
+                    elements
+                        .iter()
+                        .filter(|element| {
+                            let (x1, y1, x2, y2) = element.bounds;
+                            x >= x1 && y >= y1 && x <= x2 && y <= y2
+                        })
+                        .min_by_key(|element| {
+                            let (x1, y1, x2, y2) = element.bounds;
+                            (x2 - x1) as i64 * (y2 - y1) as i64
+                        })
+                })
+                .and_then(element_label)
+                .unwrap_or("");
+            if label.is_empty() {
+                format!("tap@{x},{y}")
+            } else {
+                format!("tap:{label}")
+            }
+        }
+        // A sequence is several taps in one call; what it *is* is the gesture
+        // as a whole, so two identical sequences are the same repeat.
+        InputOp::Taps(points) => format!("sequence@{}", points.len()),
+        // Both ends: a short nudge and a long drag are different actions, and
+        // calling them the same repeat would refuse a gesture that had not yet
+        // been tried.
+        InputOp::Swipe { from, to } => {
+            format!("swipe@{}:{}>{}:{}", from.0, from.1, to.0, to.1)
+        }
+        InputOp::Text(text) => format!("text:{}", text.chars().take(40).collect::<String>()),
+        InputOp::Key(keycap) => format!("key:{keycap}"),
+        InputOp::Gesture { paths, .. } => format!("gesture@{}", paths.len()),
+    }
+}
+
+// ── Touch tracking ─────────────────────────────────────────────────────────
+
+/// One change to the screen, as the post-action check saw it.
+///
+/// `effect` is [`EFFECT_CHANGED`], [`EFFECT_UNCHANGED`] or [`EFFECT_UNKNOWN`],
+/// as the post-action check reported it.
+pub(super) fn guard_outcome(effect: &str) -> super::guard::Outcome {
+    match effect {
+        EFFECT_CHANGED => super::guard::Outcome::Changed,
+        EFFECT_UNCHANGED => super::guard::Outcome::Unchanged,
+        _ => super::guard::Outcome::Unknown,
+    }
+}
+
+/// What the model is told when it is on a lower rung of the ladder.
+fn ladder_note(verdict: &super::guard::Verdict) -> Option<String> {
+    verdict.note().map(str::to_string)
 }
 
 // ── ADB Observe Tool ───────────────────────────────────────────────────────
@@ -705,14 +850,24 @@ impl Tool for AdbInputTool {
         args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        // One device: two conversations must not type into it at once. The
-        // lock is per serial, so this waits only for another call on the same
-        // phone. See `tools::target_lock`.
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
-        let _target = lock_device(&device).await;
+        let target = match Target::from_args(&args) {
+            Ok(target) => target,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+
+        // Which lock is the right one depends on where the action lands.
+        //
+        // The user's own screen has one pointer and one focus, so everything
+        // addressed to it waits on the device. A virtual display has a focus of
+        // its own, so two of them are two places to type and do not need to
+        // wait for each other — but the *app* they are driving is shared, and
+        // that is what the lease below is for.
+        let _target = lock_target(&device, target).await;
+
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("tap");
 
         let verify = args.get("verify").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -720,11 +875,6 @@ impl Tool for AdbInputTool {
             .get("settle_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(SETTLE_DEFAULT_MS);
-
-        let target = match Target::from_args(&args) {
-            Ok(target) => target,
-            Err(message) => return Ok(ToolExecutionResult::error(message)),
-        };
 
         // One read serves both purposes: it validates an indexed tap (the
         // safety net) and it is the picture the effect is judged against. A
@@ -737,7 +887,7 @@ impl Tool for AdbInputTool {
         let mut before_package: Option<String> = None;
         let mut before_snapshot: Option<String> = None;
         let pointed_at_an_element = args.get("target").is_some() || args.get("key").is_some();
-        let before = match dump_ui(&device, target).await {
+        let mut before = match dump_ui(&device, target).await {
             Ok(dump) => {
                 before_package = dump.package;
                 before_snapshot = Some(dump.snapshot);
@@ -750,6 +900,74 @@ impl Tool for AdbInputTool {
                 None
             }
         };
+
+        // The read named the app; now take exclusive use of it. This is the
+        // half the display lock cannot give: two displays, one app. It is taken
+        // after the read because the read is what names the app, so the read
+        // itself may predate the lease — `stale` is that, and the answer is to
+        // read again rather than act on a screen that has moved.
+        let held = app_completed(&device, before_package.as_deref());
+        let lease = lease_app(&device, before_package.as_deref(), held).await;
+        if lease.stale {
+            match dump_ui(&device, target).await {
+                // Somebody wrote to this app while this call was waiting. The
+                // tree it read a moment ago is no longer the screen; use this
+                // one, and if the app itself changed, stop rather than take a
+                // second lease on a different app while holding this one.
+                Ok(dump) if dump.package == before_package => {
+                    before_package = dump.package;
+                    before_snapshot = Some(dump.snapshot);
+                    before = Some(dump.elements);
+                }
+                Ok(dump) => {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "Refused: the screen changed app while this call waited for another \
+                         writer — it was {:?}, it is now {:?}. Nothing was done. Read the screen \
+                         again and retry.",
+                        before_package.as_deref().unwrap_or("unknown"),
+                        dump.package.as_deref().unwrap_or("unknown"),
+                    )));
+                }
+                Err(_) => {
+                    // Nothing to act on: the screen cannot be read now, and the
+                    // read in hand describes a moment before somebody else's
+                    // write.
+                    return Ok(ToolExecutionResult::error(
+                        "Refused: another writer changed this app while this call was waiting, \
+                         and the screen could not be re-read afterwards. Nothing was done. Read \
+                         the screen again and retry.",
+                    ));
+                }
+            }
+        }
+
+        // The app's own screens are the controls that govern the agent:
+        // settings, pairing, the display list. Driving them is the agent
+        // reaching for its own levers, and it is never what the task meant.
+        // Refused here rather than in the gate because this is not a question
+        // of judgement — there is no answer a person could give that makes it
+        // right. Reads stay allowed: the agent may look at its own screen to
+        // report on it.
+        if let Some(package) = before_package.as_deref() {
+            if super::takeover::is_own_app(package) {
+                return Ok(ToolExecutionResult::error(format!(
+                    "Refused: this would write to Syscity's own screen ({package}). The app's \
+                     settings, pairing and display pages are the controls that govern the agent, \
+                     so the agent does not operate them — a person does. Nothing was done."
+                )));
+            }
+        }
+
+        // Whether the phone is still in the state this action was computed
+        // for. This runs before the ladder, because the ladder counts an action
+        // that did not work, and an action that was never taken is not evidence
+        // of anything — least of all that it should be tried again.
+        let readiness = super::ready::probe().await;
+        if let Err(blocked) =
+            super::ready::check(readiness.as_ref(), target, before_package.as_deref())
+        {
+            return Ok(ToolExecutionResult::error(super::ready::describe(&blocked)));
+        }
 
         // A reference from an earlier read is resolved against this one before
         // anything is dispatched, and the two ways of naming an element are the
@@ -881,6 +1099,21 @@ impl Tool for AdbInputTool {
         // here, after the tree read, because the tree is what names the
         // element — and it happens before the dispatch, because a send that is
         // refused must not leave the app.
+        //
+        // The repetition guard runs *before* the gate. Asking a person to
+        // approve the twelfth identical send would be asking them to endorse a
+        // loop the agent should have noticed itself; the ladder refuses that
+        // without troubling anyone.
+        let signature = action_signature(&op, before.as_deref());
+        let guard_key = super::guard::Guard::bucket_key(
+            &context.conversation_id,
+            &format!("{}:{}", device.as_deref().unwrap_or("-"), target.display_id()),
+        );
+        let ladder = super::guard::Guard::global().check(&guard_key, &signature);
+        if let super::guard::Verdict::Refuse(reason) = &ladder {
+            return Ok(ToolExecutionResult::error(reason.clone()));
+        }
+
         let clearance = match &op {
             InputOp::Taps(points) if points.len() == 1 => {
                 let offer = match args.get("target").and_then(|v| v.as_u64()) {
@@ -899,7 +1132,12 @@ impl Tool for AdbInputTool {
                     .and_then(|o| o.element.clone())
                     .map(|label| format!("tap \"{label}\""))
                     .unwrap_or_else(|| format!("tap ({}, {})", points[0].0, points[0].1));
-                match super::gate::check(offer, context, &subject).await {
+                let subject = match before_package.as_deref() {
+                    Some(package) => format!("{subject} in {package}"),
+                    None => subject,
+                };
+                match super::gate::check(offer, context, &subject, before_package.as_deref()).await
+                {
                     Ok(clearance) => clearance,
                     Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
                 }
@@ -908,9 +1146,57 @@ impl Tool for AdbInputTool {
                 // A multi-point `sequence` is a series of taps at raw
                 // coordinates with no element to name them by; the other ops
                 // (swipe, text, key, gesture) are not taps at all.
-                super::gate::Clearance { offer: None, asked: false }
+                super::gate::Clearance {
+                    offer: None,
+                    asked: false,
+                    granted: None,
+                }
             }
         };
+
+        // The question was open for as long as the person took to read it, and
+        // a phone screen moves under a question: a message arrives and the row
+        // under the finger becomes a different row. What they approved was the
+        // button described in the question. Before dispatching, check that the
+        // same thing is still under the finger — one re-read, and only when
+        // somebody actually said yes.
+        if clearance.granted.is_some() {
+            let fresh = match dump_ui(&device, target).await {
+                Ok(fresh) => fresh,
+                Err(failed) => {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "\"{}\" was approved, but the screen could not be read again to confirm \
+                         it is still there ({}). Nothing was done. Read the screen with \
+                         android_observe and retry if it is still wanted.",
+                        clearance
+                            .granted
+                            .as_ref()
+                            .map(|grant| grant.subject.clone())
+                            .unwrap_or_default(),
+                        failed.message
+                    )))
+                }
+            };
+            let now = match &op {
+                InputOp::Taps(points) if points.len() == 1 => {
+                    let recorded = points[0];
+                    match args.get("target").and_then(|v| v.as_u64()) {
+                        Some(index) => {
+                            super::risk::classify_tap(&fresh.elements, usize::try_from(index).ok())
+                        }
+                        None => {
+                            super::risk::classify_point(&fresh.elements, recorded.0, recorded.1)
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Err(withheld) =
+                super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
+            {
+                return Ok(ToolExecutionResult::error(withheld.reason));
+            }
+        }
 
         // Two things have to be read *before* the action, not after: the
         // picture (the tree cannot see a canvas change) and the user's screen
@@ -958,44 +1244,70 @@ impl Tool for AdbInputTool {
                          task on a display where the gesture can be sent properly.",
                     ));
                 }
-                let shell_cmd = match &op {
-                    // Rejected above: no shell form exists for two fingers.
-                    InputOp::Gesture { .. } => {
-                        return Ok(ToolExecutionResult::error(
-                            "Multi-finger gestures are only dispatched on a second display \
-                             (android_display start).",
-                        ))
-                    }
-                    InputOp::Taps(steps) => encode_tap_sequence(steps),
-                    InputOp::Swipe { from, to } => {
-                        format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
-                    }
-                    InputOp::Key(keycode) => format!("input keyevent {keycode}"),
-                    InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
-                    InputOp::Text(text) => {
-                        if self.adbkeyboard_is_active(&device).await {
-                            // ADBKeyboard takes the text base64-encoded over a
-                            // broadcast, which carries any character the device
-                            // can render.
-                            let payload = base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                text.as_bytes(),
-                            );
-                            format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
-                        } else {
-                            // `input text` types through the device's key
-                            // character map, so non-ASCII (CJK in particular)
-                            // comes out dropped or mangled. Fail loudly rather
-                            // than silently typing the wrong thing.
+                let shell_cmd =
+                    match &op {
+                        // Rejected above: no shell form exists for two fingers.
+                        InputOp::Gesture { .. } => {
                             return Ok(ToolExecutionResult::error(
-                                "Cannot type non-ASCII text: `input text` only types ASCII \
-                                 reliably and ADBKeyboard is not the active input method. \
-                                 Install/enable ADBKeyboard (com.android.adbkeyboard) and select \
-                                 it as the input method, or keep the text ASCII.",
-                            ));
+                                "Multi-finger gestures are only dispatched on a second display \
+                             (android_display start).",
+                            ))
                         }
-                    }
-                };
+                        InputOp::Taps(steps) => encode_tap_sequence(steps),
+                        InputOp::Swipe { from, to } => {
+                            format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
+                        }
+                        InputOp::Key(keycode) => format!("input keyevent {keycode}"),
+                        InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
+                        InputOp::Text(text) => {
+                            if self.adbkeyboard_is_active(&device).await {
+                                // ADBKeyboard takes the text base64-encoded over a
+                                // broadcast, which carries any character the device
+                                // can render.
+                                let payload = base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    text.as_bytes(),
+                                );
+                                format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
+                            } else {
+                                // Two ways without ADBKeyboard, tried in that order:
+                                // the app's own helper (uid 2000, which can inject
+                                // Ctrl+V on the user's screen and can put the
+                                // person's clipboard back afterwards), and nothing.
+                                //
+                                // `input text` types through the device's key
+                                // character map, so non-ASCII (CJK in particular)
+                                // comes out dropped or mangled. Failing loudly is
+                                // still better than silently typing the wrong thing
+                                // — but only once the paste has been ruled out.
+                                match paste_on_user_screen(text).await {
+                                    Ok(()) => {
+                                        return Ok(ToolExecutionResult::success(format!(
+                                            "Typed {} character(s) by pasting them — `input text` \
+                                         cannot carry non-ASCII text. The person's own clipboard \
+                                         was put back.",
+                                            text.chars().count()
+                                        ))
+                                        .with_data(serde_json::json!({
+                                            "device": resolved_serial(&device).await,
+                                            "effect": "unverified",
+                                            "input": "clipboard",
+                                        })))
+                                    }
+                                    Err(_) => {
+                                        return Ok(ToolExecutionResult::error(
+                                            "Cannot type non-ASCII text: `input text` only types \
+                                         ASCII reliably, ADBKeyboard is not the active input \
+                                         method, and the display helper is not available on this \
+                                         device to paste it. Install/enable ADBKeyboard \
+                                         (com.android.adbkeyboard) and select it as the input \
+                                         method, or keep the text ASCII.",
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                    };
                 let argv = adb_args(&device, &["shell", &shell_cmd]);
                 let (status, _stdout, stderr) =
                     run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
@@ -1050,8 +1362,19 @@ impl Tool for AdbInputTool {
 
         let serial = resolved_serial(&device).await;
         if !verify {
+            // No re-read was asked for, so the screen did not move as far as
+            // this call knows — recorded as unknown, which the ladder does not
+            // count as "no effect".
+            super::guard::Guard::global().record(
+                &guard_key,
+                &signature,
+                super::guard::Outcome::Unknown,
+            );
             let mut text = format!("Input '{action}' sent (effect not checked).");
             if let Some(note) = snapshot_note {
+                text.push_str(&format!(" {note}"));
+            }
+            if let Some(note) = ladder_note(&ladder) {
                 text.push_str(&format!(" {note}"));
             }
             if let Some(note) = clearance.note() {
@@ -1080,8 +1403,16 @@ impl Tool for AdbInputTool {
         )
         .await;
 
+        // The ladder learns what this did. It counts the screen's answer, not
+        // the action's: three different taps that all leave the same screen are
+        // one stuck screen, and the streak is what says so.
+        super::guard::Guard::global().record(&guard_key, &signature, guard_outcome(settle.effect));
+
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
         if let Some(note) = snapshot_note {
+            text.push_str(&format!(" {note}"));
+        }
+        if let Some(note) = ladder_note(&ladder) {
             text.push_str(&format!(" {note}"));
         }
         if let Some(note) = clearance.note() {
@@ -1155,6 +1486,7 @@ impl Tool for AdbInputTool {
             "risk_approved": clearance.asked,
             "paced": pace_note,
             "reference_moved": snapshot_note.is_some(),
+            "guard": ladder.note(),
         })))
     }
 }
@@ -1841,6 +2173,34 @@ async fn paste_on_display(display_id: i32, text: &str) -> Result<(), String> {
     let bridge = display_bridge()?;
     super::display::VirtualDisplay::attach(bridge, display_id)
         .paste_text(text)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Type `text` onto the user's own screen by pasting it through the helper.
+///
+/// This is the fallback for non-ASCII text when ADBKeyboard is not installed:
+/// `input text` types through the key character map and mangles everything
+/// outside ASCII, so a Chinese message would arrive as nothing. The helper runs
+/// as uid 2000, which can inject the Ctrl+V pair onto display 0 and can put the
+/// person's own clipboard back afterwards — neither of which a caller outside
+/// the phone can do.
+async fn paste_on_user_screen(text: &str) -> Result<(), String> {
+    let bridge = display_bridge()?;
+    // Asking only works when a helper is already there — `ensure_helper` needs
+    // the nonce the app's own hub mints, which is what makes it callable from
+    // the phone and nowhere else. Typing must not spawn a shell process on
+    // somebody's phone as a side effect anyway, so a helper that is not running
+    // is a "no", not a "start one".
+    if !super::display::available(&bridge).await {
+        return Err("the display helper is not running on this device".to_string());
+    }
+    // Display 0 is the user's own; the helper reaches it through injected keys
+    // rather than through a virtual display record. Appending, not replacing:
+    // a replace would wipe whatever they had already typed into the field.
+    super::display::VirtualDisplay::attach(bridge, 0)
+        .paste_text_after(text)
         .await
         .map_err(|e| e.to_string())
 }
