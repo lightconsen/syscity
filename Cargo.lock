@@ -56,6 +56,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -6755,9 +6756,12 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-rustls",
+ "hyper-tls",
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
+ "native-tls",
  "percent-encoding",
  "pin-project-lite",
  "rustls",
@@ -6767,6 +6771,7 @@ dependencies = [
  "serde_json",
  "sync_wrapper",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls",
  "tokio-util",
  "tower",
@@ -7453,7 +7458,7 @@ dependencies = [
  "futures",
  "mime_guess",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_cow",
@@ -11970,9 +11975,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.2"
+version = "9.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
+checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
 dependencies = [
  "aes 0.9.3",
  "bzip2",
