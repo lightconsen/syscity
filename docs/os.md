@@ -471,6 +471,28 @@ instruction to retry.
 for the person: doing so would block the phone for as long as they take, which is
 the opposite of what the handoff is for.
 
+A handoff is also a place where people type instead of pressing a button. The
+question is open for minutes; a message sent to the agent during that time would
+otherwise sit in the `ExecutionController`'s steer queue — which the tool loop
+drains only *between* iterations — and reach the model after the handoff's own
+result. It would read as a remark about the previous step rather than about the
+one the person was in the middle of. So the wait watches the controller's steer
+notify as well as the answer, drains what arrives, and leaves it on the tool
+context as a **note** (`ToolContext::note` / `ExecutionController::note`). The
+loop attaches notes to the result of the tool that waited, before the result goes
+into the transcript, so the reply reads in the right order:
+
+```
+User said "Done"; the screen changed while they had it.
+
+[Sent while this step was waiting on you; it came after the question was
+answered:]
+- actually, use my work account
+```
+
+A steer that arrives when *no* tool is waiting is untouched: it stays in the
+queue and is delivered the usual way, at the top of the next iteration.
+
 Known limits, in the order they will bite:
 
 - **Android 13** has no per-display focus, so the user's screen can lose focus

@@ -1156,6 +1156,17 @@ impl Tool for AdbOcrTool {
 
 // ── Takeover ───────────────────────────────────────────────────────────────
 
+/// Wait until a steer arrives, or forever when nothing can steer.
+///
+/// `select!` needs a future in every arm; outside an agent turn there is no
+/// controller, and "nothing will ever arrive" is the honest shape of that.
+async fn wait_for_steer(controller: Option<&crate::acp::ExecutionController>) {
+    match controller {
+        Some(controller) => controller.steer_notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Hand the agent's display to the person, wait, and take it back.
 #[derive(Debug)]
 pub struct AdbHandToUserTool {
@@ -1266,14 +1277,21 @@ impl Tool for AdbHandToUserTool {
         .map(|elements| super::android::tree_fingerprint(&elements));
 
         let conversation_id = context.conversation_id.clone();
+        // A steer that arrives while the question is open is the person still
+        // talking about the step they were handed — they typed at the agent
+        // rather than pressing a button. It belongs with the handoff's result,
+        // not after it, so the wait watches for it and leaves it as a note.
+        let notices_context = context.clone();
         let ask = Box::new(move || {
             Box::pin(async move {
-                use crate::tools::ask_user::{AskRequest, PendingQuestion};
+                use crate::tools::ask_user::AskRequest;
+                use crate::tools::ask_user::PendingQuestion;
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let id = queue
+                let id = format!("takeover-{}", uuid::Uuid::new_v4());
+                queue
                     .submit(PendingQuestion {
                         request: AskRequest {
-                            id: format!("takeover-{}", uuid::Uuid::new_v4()),
+                            id: id.clone(),
                             conversation_id,
                             question,
                             options: vec![
@@ -1287,19 +1305,37 @@ impl Tool for AdbHandToUserTool {
                         response_tx: Some(tx),
                     })
                     .await;
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    // The bound is the caller's; see `takeover::hand_to_user`.
-                    rx,
-                )
-                .await
-                {
-                    Ok(Ok(answer)) => Some(answer),
-                    // Timed out or the channel closed: either way nobody
-                    // answered. Cancel so the queue does not hold it.
-                    _ => {
-                        queue.cancel(&id).await;
-                        None
+                let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+                tokio::pin!(deadline);
+                let mut answer = rx;
+                let controller = notices_context.steers.clone();
+                // Waiting for the answer and for anything typed at the agent
+                // are the same wait: the person may answer with either. What
+                // they typed is moved out of the controller here rather than
+                // left for the next iteration, which would be too late — the
+                // loop only drains between tool calls.
+                //
+                // Drained both before sleeping and again after waking, so a
+                // message that arrived before this tool started is not left
+                // behind either. The remaining gap — a steer landing between
+                // the drain and the wait registering — is not a loss: it stays
+                // in the queue and reaches the model at the top of the next
+                // iteration, which is where it would have gone anyway.
+                loop {
+                    if let Some(controller) = controller.as_deref() {
+                        for steer in controller.drain_steers() {
+                            notices_context.note(steer);
+                        }
+                    }
+                    tokio::select! {
+                        answered = &mut answer => {
+                            return answered.ok();
+                        }
+                        _ = &mut deadline => {
+                            queue.cancel(&id).await;
+                            return None;
+                        }
+                        _ = wait_for_steer(controller.as_deref()) => {}
                     }
                 }
             })

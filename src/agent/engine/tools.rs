@@ -169,7 +169,11 @@ impl Agent {
         // its tool_call IDs don't yet have matching tool results.
         let tool_context = self
             .build_tool_context(user_id, context.id(), context.delegation().cloned())
-            .with_timeout(std::time::Duration::from_secs(120));
+            .with_timeout(std::time::Duration::from_secs(120))
+            // The running turn's controller, so a tool that waits on a person
+            // can notice them typing instead of answering, and leave what they
+            // said with the step it is about (see `attach_notices`).
+            .with_steers(self.execution_controller.read().await.clone());
 
         let mut results = Vec::new();
 
@@ -215,6 +219,8 @@ impl Agent {
 
             results.push(result);
         }
+
+        attach_notices(&tool_context, &mut results);
 
         // Soft budget reminder, carried on the last result of the batch.
         if let Some(note) = budget_reminder(context) {
@@ -464,7 +470,11 @@ impl Agent {
         // tool results, the tool_call/tool_result pairing is preserved.
         let tool_context = self
             .build_tool_context(user_id, context.id(), context.delegation().cloned())
-            .with_timeout(std::time::Duration::from_secs(120));
+            .with_timeout(std::time::Duration::from_secs(120))
+            // The running turn's controller, so a tool that waits on a person
+            // can notice them typing instead of answering, and leave what they
+            // said with the step it is about (see `attach_notices`).
+            .with_steers(self.execution_controller.read().await.clone());
 
         let mut results = Vec::new();
 
@@ -648,9 +658,41 @@ fn format_steers(steers: &[String]) -> Option<String> {
     }
 }
 
+/// Fold notes a tool left on its context into the tool results.
+///
+/// A tool that blocked on a person (`android_hand_to_user`) collected what
+/// they said while it waited, and there is nowhere else to put it: the
+/// controller's steer queue is drained only *between* iterations, so a steer
+/// that arrives mid-handoff would reach the model after the handoff's result.
+/// Attaching it to the handoff's own result puts it in the right order — the
+/// person's remark belongs with the step it happened during.
+///
+/// The note goes on the last result of the batch, which is where the handoff
+/// put it in every real call: a batch runs its tools in order, and a tool that
+/// waits on a human runs alone.
+fn attach_notices(tool_context: &crate::tools::ToolContext, results: &mut [ToolResult]) {
+    let notices = tool_context.drain_notices();
+    if notices.is_empty() {
+        return;
+    }
+    let Some(last) = results.last_mut() else {
+        return;
+    };
+    let mut text = String::from(
+        "\n\n[Sent while this step was waiting on you; it came after the question was \
+         answered:]",
+    );
+    for notice in &notices {
+        text.push_str("\n- ");
+        text.push_str(notice);
+    }
+    last.content.push_str(&text);
+}
+
 #[cfg(test)]
 mod steer_format_tests {
-    use super::format_steers;
+    use super::{attach_notices, format_steers};
+    use crate::providers::ToolResult;
 
     #[test]
     fn no_steers_means_no_message() {
@@ -680,5 +722,58 @@ mod steer_format_tests {
         let original = "别管那个了，先存草稿";
         let text = format_steers(&[original.to_string()]).expect("message");
         assert!(text.contains(original), "{text}");
+    }
+
+    // ── Notices: what a person said while a tool waited ────────────────
+
+    fn tool_result(id: &str, content: &str) -> ToolResult {
+        ToolResult {
+            tool_call_id: id.to_string(),
+            role: crate::providers::Role::Tool,
+            content: content.to_string(),
+            is_error: None,
+        }
+    }
+
+    #[test]
+    fn a_note_rides_with_the_result_of_the_tool_that_waited() {
+        let controller = crate::acp::ExecutionController::new();
+        controller.note("actually, log in with the other account");
+        let context = crate::tools::ToolContext::new("u", "conv").with_steers(Some(controller));
+        let mut results = vec![tool_result(
+            "call-1",
+            "User said \"Done\"; the screen changed.",
+        )];
+        attach_notices(&context, &mut results);
+        assert!(results[0].content.contains("the other account"), "{}", results[0].content);
+        // The remark has to read as *part of the handoff*, not as something
+        // that happened after it.
+        assert!(
+            results[0].content.contains("while this step was waiting"),
+            "{}",
+            results[0].content
+        );
+    }
+
+    #[test]
+    fn a_note_is_not_repeated_on_the_next_tool_result() {
+        let controller = crate::acp::ExecutionController::new();
+        controller.note("one remark");
+        let context = crate::tools::ToolContext::new("u", "conv").with_steers(Some(controller));
+        let mut first = vec![tool_result("call-1", "done")];
+        attach_notices(&context, &mut first);
+        let mut second = vec![tool_result("call-2", "done")];
+        attach_notices(&context, &mut second);
+        assert_eq!(second[0].content, "done");
+    }
+
+    #[test]
+    fn a_turn_with_no_controller_leaves_its_results_alone() {
+        // Outside an agent turn nothing can collect a note; the result must be
+        // byte-for-byte what the tool produced.
+        let context = crate::tools::ToolContext::new("u", "conv");
+        let mut results = vec![tool_result("call-1", "Tapped (1, 2).")];
+        attach_notices(&context, &mut results);
+        assert_eq!(results[0].content, "Tapped (1, 2).");
     }
 }

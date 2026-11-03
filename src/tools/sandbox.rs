@@ -335,6 +335,7 @@ mod tests {
             approval_queue: None,
             skill_trust_ceiling: None,
             mobile: None,
+            steers: None,
         }
     }
 

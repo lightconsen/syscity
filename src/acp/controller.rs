@@ -27,6 +27,11 @@ pub struct ExecutionController {
     /// awaited while it is held, so it cannot block a runtime thread across a
     /// yield point.
     steers: std::sync::Mutex<Vec<String>>,
+    /// Notes a tool collected while it was blocking, taken by the loop before
+    /// the tool's own result goes into the transcript.
+    notices: std::sync::Mutex<Vec<String>>,
+    /// Signalled whenever a steer is pushed, for a tool waiting on a person.
+    steer_arrived: tokio::sync::Notify,
 }
 
 impl ExecutionController {
@@ -37,6 +42,8 @@ impl ExecutionController {
             notify: tokio::sync::Notify::new(),
             iteration: std::sync::atomic::AtomicUsize::new(0),
             steers: std::sync::Mutex::new(Vec::new()),
+            notices: std::sync::Mutex::new(Vec::new()),
+            steer_arrived: tokio::sync::Notify::new(),
         })
     }
 
@@ -130,7 +137,9 @@ impl ExecutionController {
         let mut state = self.state.write().await;
         *state = RuntimeState::Idle;
         // A steer belongs to the turn that was running; a new one starts clean.
+        // So does a note: it was said about a step that turn has finished.
         let _ = self.drain_steers();
+        let _ = self.drain_notices();
         self.iteration
             .store(0, std::sync::atomic::Ordering::Relaxed);
         drop(state);
@@ -150,6 +159,7 @@ impl ExecutionController {
         // human saying something, and leaving it parked would drop the message
         // on the floor. (Only pause is lifted; a cancel stays cancelled.)
         drop(pending);
+        self.steer_arrived.notify_waiters();
         self.notify.notify_waiters();
         info!("Execution steered");
     }
@@ -158,6 +168,41 @@ impl ExecutionController {
     pub fn drain_steers(&self) -> Vec<String> {
         let mut pending = self.steers.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *pending)
+    }
+
+    /// Resolve the next time a steer arrives.
+    ///
+    /// The tool-call loop drains steers between iterations, which is the right
+    /// place for a message about what to do next. A tool that is itself
+    /// waiting on a person — a handoff asking them to take the screen — needs
+    /// the message *during* the wait, both to stop waiting on the wrong thing
+    /// and so it lands with the step it is about rather than after it. This is
+    /// that handle: `select!` it against whatever the tool is waiting for,
+    /// then drain.
+    ///
+    /// The notify is signalled on every steer, so a single wait may resolve
+    /// several times; a caller that drains on each is not losing any, because
+    /// they are only removed by [`drain_steers`](Self::drain_steers).
+    pub fn steer_notified(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.steer_arrived.notified()
+    }
+
+    /// Put a message aside for the loop, to be attached to this tool's result.
+    ///
+    /// Distinct from [`steer`](Self::steer): that one is for the *next*
+    /// iteration, which is the wrong place for something said while a tool was
+    /// blocking — by the time the loop drains it, the tool's result has
+    /// already gone in, and the model reads the remark as an afterthought
+    /// about the step it just finished rather than as part of it.
+    pub fn note(&self, message: impl Into<String>) {
+        let mut notes = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        notes.push(message.into());
+    }
+
+    /// Take the notes collected since the last call, oldest first.
+    pub fn drain_notices(&self) -> Vec<String> {
+        let mut notes = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *notes)
     }
 
     /// Current runtime state.
@@ -254,5 +299,42 @@ mod tests {
         // The point of steering is that the turn survives it.
         assert_eq!(ctrl.current_state().await, RuntimeState::Idle);
         assert!(ctrl.drain_steers().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_tool_is_woken_by_a_steer() {
+        // This is what lets a handoff notice the person typing instead of
+        // pressing a button: the wait for an answer selects on it.
+        let ctrl = ExecutionController::new();
+        let waiting = ctrl.clone();
+        let woke = tokio::spawn(async move { waiting.steer_notified().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ctrl.steer("no, the other account");
+        tokio::time::timeout(std::time::Duration::from_secs(1), woke)
+            .await
+            .expect("the wait resolved")
+            .expect("task finished");
+        // Still the controller's to drain — waking is not consuming.
+        assert_eq!(ctrl.drain_steers(), vec!["no, the other account"]);
+    }
+
+    #[tokio::test]
+    async fn a_note_is_kept_apart_from_the_next_iteration() {
+        // A note rides with the result of the tool that waited. If it went
+        // into the steer queue instead it would arrive a whole iteration
+        // later, after the model had already read that result.
+        let ctrl = ExecutionController::new();
+        ctrl.note("said while the question was open");
+        assert!(ctrl.drain_steers().is_empty());
+        assert_eq!(ctrl.drain_notices(), vec!["said while the question was open"]);
+        assert!(ctrl.drain_notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_drops_a_note_from_the_finished_turn() {
+        let ctrl = ExecutionController::new();
+        ctrl.note("about the step this turn finished");
+        ctrl.reset().await;
+        assert!(ctrl.drain_notices().is_empty());
     }
 }

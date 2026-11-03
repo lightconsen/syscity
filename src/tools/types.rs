@@ -275,6 +275,13 @@ pub struct ToolContext {
     /// applies: ask when a human is reachable, and run without asking when
     /// one is not.
     pub mobile: Option<crate::config::MobileControlConfig>,
+    /// The running turn's steering handle, when there is one.
+    ///
+    /// A tool that waits on a person has to notice them typing at the agent
+    /// rather than pressing a button: the answer and the steer are the same
+    /// wait, and a steer left in the controller would arrive only after the
+    /// tool returned. `None` outside an agent turn, where nothing can steer.
+    pub steers: Option<Arc<crate::acp::ExecutionController>>,
 }
 
 /// Allowed environment variables that are safe to forward to child processes.
@@ -518,6 +525,37 @@ impl ToolContext {
     /// be decided from configuration rather than from a process global.
     pub fn with_mobile_control(mut self, mobile: crate::config::MobileControlConfig) -> Self {
         self.mobile = Some(mobile);
+        self
+    }
+
+    /// Add a note the turn reads as soon as this tool returns.
+    ///
+    /// This is how a tool that blocked on a person reports what they said
+    /// while it waited: a steer sent during that wait would otherwise sit in
+    /// the controller's queue, which is drained only *between* tool calls, and
+    /// reach the model after the tool's own result. The loop drains these
+    /// before that result, so the remark reads as part of the wait.
+    pub fn note(&self, text: impl Into<String>) {
+        if let Some(controller) = self.steers.as_ref() {
+            // Not the controller's queue: that belongs to the next iteration.
+            // This rides on the controller only so the loop can find it, and
+            // is taken out before anything else looks.
+            controller.note(text);
+        }
+    }
+
+    /// Take every note added since the last call, oldest first.
+    pub fn drain_notices(&self) -> Vec<String> {
+        match self.steers.as_ref() {
+            Some(controller) => controller.drain_notices(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Attach the running turn's controller, so a tool that waits on a person
+    /// can also notice them typing.
+    pub fn with_steers(mut self, controller: Option<Arc<crate::acp::ExecutionController>>) -> Self {
+        self.steers = controller;
         self
     }
 
