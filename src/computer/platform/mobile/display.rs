@@ -337,10 +337,35 @@ impl VirtualDisplay {
     /// `input -d text` types through the key character map and mangles anything
     /// outside ASCII; the clipboard carries whatever the app can render. The
     /// helper puts the user's own clipboard back afterwards.
+    ///
+    /// `display` is `0` for the user's own screen: the helper can inject the
+    /// Ctrl+V pair there, which the app itself cannot, and only then does
+    /// non-ASCII text reach a screen that is not the agent's.
     pub async fn paste_text(&self, text: &str) -> Result<(), DisplayError> {
-        call(&self.bridge, json!({ "op": "paste", "display": self.id, "text": text }))
-            .await
-            .map(|_| ())
+        self.paste(text, true).await
+    }
+
+    /// Paste `text` **after** whatever the field already holds.
+    ///
+    /// The only form safe on a screen whose clipboard is the person's: a
+    /// replace opens with Ctrl+A, which also wipes text they had already typed
+    /// into the field.
+    ///
+    /// Nothing is pressed when the text could not be put on the clipboard at
+    /// all (the helper refuses rather than overwrite a clipboard it could not
+    /// read), because a paste would then insert whatever the person had copied
+    /// themselves. That comes back as an error, not a silent no-op.
+    pub async fn paste_text_after(&self, text: &str) -> Result<(), DisplayError> {
+        self.paste(text, false).await
+    }
+
+    async fn paste(&self, text: &str, replace: bool) -> Result<(), DisplayError> {
+        call(
+            &self.bridge,
+            json!({ "op": "paste", "display": self.id, "text": text, "replace": replace }),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Silence (or un-silence) an app shown on this display.
@@ -446,6 +471,105 @@ impl VirtualDisplay {
     /// What the helper says it can do, and on which API level.
     pub async fn status(bridge: &DeviceBridgeRef) -> Result<Value, DisplayError> {
         call(bridge, json!({ "op": "ping" })).await
+    }
+
+    /// The phone's state, as far as it changes what a write means.
+    ///
+    /// Answered by the helper, because the two facts that matter most are the
+    /// ones the host cannot see: whether the user's screen is locked, and which
+    /// app each display actually holds now. A display that no longer shows
+    /// what the caller left on it is a screen every coordinate was computed
+    /// against and is now wrong for.
+    ///
+    /// A helper that is not running answers with `helper: false` rather than
+    /// an error: "the phone is fine, the thing that drives its displays is
+    /// not" is a state the caller has to distinguish from "the phone is gone".
+    pub async fn readiness(bridge: &DeviceBridgeRef) -> Result<Readiness, DisplayError> {
+        let answer = call(bridge, json!({ "op": "readiness" })).await?;
+        Ok(Readiness::parse(&answer))
+    }
+}
+
+/// What the phone says about itself right now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Readiness {
+    /// A helper answered. False means the display side is down, which does not
+    /// stop the user's screen being writable over ADB.
+    pub helper: bool,
+    /// The user's own screen is locked or asleep.
+    pub locked: bool,
+    /// What is on the user's screen: `(task, package)`.
+    pub main: Option<ScreenTop>,
+    /// One entry per display the helper owns.
+    pub displays: Vec<ScreenTop>,
+}
+
+/// The task on top of one display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenTop {
+    /// The display id; `0` is the user's own.
+    pub display: i32,
+    /// The task, or `-1` when the display is empty.
+    pub task: i32,
+    /// The app that owns it, when the platform named one.
+    pub package: Option<String>,
+}
+
+impl Readiness {
+    fn parse(answer: &Value) -> Self {
+        let top = |value: Option<&Value>, fallback_display: i32| {
+            let value = value?;
+            let task = value
+                .get("task")
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+                .unwrap_or(-1);
+            if task < 0 {
+                return None;
+            }
+            Some(ScreenTop {
+                display: value
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .unwrap_or(fallback_display),
+                task,
+                package: value
+                    .get("package")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        };
+        Self {
+            helper: answer
+                .get("helper")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            locked: answer
+                .get("locked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            main: top(answer.get("main"), 0),
+            displays: answer
+                .get("displays")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| top(Some(item), -1))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The task a display holds now, or `None` when the display is empty or
+    /// unknown to the helper.
+    pub fn top_of(&self, display: i32) -> Option<&ScreenTop> {
+        if display == 0 {
+            return self.main.as_ref();
+        }
+        self.displays.iter().find(|top| top.display == display)
     }
 }
 
@@ -929,6 +1053,48 @@ mod tests {
 
     fn bridge(answer: Value) -> DeviceBridgeRef {
         Arc::new(MockDeviceBridge::new(answer))
+    }
+
+    #[tokio::test]
+    async fn readiness_is_one_call_and_reads_both_screens() {
+        let mock = Arc::new(MockDeviceBridge::new(json!({
+            "ok": true,
+            "helper": true,
+            "locked": true,
+            "main": { "task": 7, "package": "com.example.chat" },
+            "displays": [
+                { "id": 3, "task": 11, "package": "com.example.mail" },
+                { "id": 4, "task": -1, "package": null }
+            ]
+        })));
+        let reference: DeviceBridgeRef = mock.clone();
+        let state = VirtualDisplay::readiness(&reference)
+            .await
+            .expect("readiness");
+        assert_eq!(mock.calls()[0].1, json!({ "op": "readiness" }));
+        assert!(state.helper && state.locked);
+        assert_eq!(
+            state.main.as_ref().map(|top| top.package.as_deref()),
+            Some(Some("com.example.chat"))
+        );
+        // A display with no task is an empty display, not a display showing
+        // `null`: the distinction is what keeps "moved" from firing on it.
+        assert_eq!(state.displays.len(), 1);
+        assert_eq!(state.top_of(3).map(|top| top.task), Some(11));
+        assert!(state.top_of(4).is_none());
+        assert_eq!(state.top_of(0).map(|top| top.task), Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_phone_with_no_helper_still_answers() {
+        // "The phone is here and the display side is not" must not look like
+        // "the phone is gone": the first is a `start`, the second is a wait.
+        let state = VirtualDisplay::readiness(&bridge(json!({ "ok": true, "helper": false })))
+            .await
+            .expect("answered");
+        assert!(!state.helper);
+        assert!(state.displays.is_empty());
+        assert!(state.main.is_none());
     }
 
     #[tokio::test]
