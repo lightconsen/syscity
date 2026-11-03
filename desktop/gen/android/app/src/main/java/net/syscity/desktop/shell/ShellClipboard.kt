@@ -175,3 +175,21 @@ internal object ShellClipRestore {
         else -> Restore.CLEAR
     }
 }
+
+/** Whether the paste key may be pressed once the clipboard has been written. */
+internal enum class Paste { PROCEED, NO_CLIPBOARD }
+
+/** The rule about pressing Ctrl+V, split out because it decides what text lands. */
+internal object ShellPaste {
+    /**
+     * [putTook] is what `ShellClipboard.put` answered. False means the text is
+     * *not* on the clipboard: either the write failed, or the person's
+     * clipboard was unreadable and was deliberately left alone.
+     *
+     * In that case nothing is pressed at all. Appending instead of replacing
+     * protects the person's clipboard from being wiped, but it cannot paste
+     * text that never reached the clipboard — a Ctrl+V would insert whatever
+     * they had copied themselves into the field.
+     */
+    fun decide(putTook: Boolean): Paste = if (putTook) Paste.PROCEED else Paste.NO_CLIPBOARD
+}

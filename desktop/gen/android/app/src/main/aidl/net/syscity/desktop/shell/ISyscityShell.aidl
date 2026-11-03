@@ -91,10 +91,19 @@ interface ISyscityShell {
      *
      * `input -d text` types through the key character map and mangles anything
      * outside ASCII; a clipboard paste carries any character the app can
-     * render. Returns 0 when it pasted, 1 when the user's clipboard could not
-     * be read (nothing was changed), 2 on failure.
+     * render.
+     *
+     * `replace` false means append: the field's existing text is kept and the
+     * paste lands after it. This is the form a caller should use on the user's
+     * own screen, where the clipboard belongs to them — a replace opens with
+     * Ctrl+A, and would also wipe whatever they had already typed.
+     *
+     * Returns 0 when it pasted, 1 when the user's clipboard could not be read,
+     * 2 on failure. A 1 means nothing was pressed at all: the text never
+     * reached the clipboard, so a paste would have inserted the user's own
+     * content into the field.
      */
-    int pasteText(int displayId, String text) = 16;
+    int pasteText(int displayId, String text, boolean replace) = 16;
 
     /**
      * Start watching the user's screen for `windowMs`, and return the task on
@@ -184,4 +193,23 @@ interface ISyscityShell {
      * is a retry, and they are different instructions to give a model.
      */
     boolean isHeldByUser(int displayId) = 25;
+
+    /**
+     * Whether the phone is in a state where the agent's writes still mean what
+     * it thinks they mean.
+     *
+     * Three things stop that being true, and only the first is visible from
+     * the host: this helper being reachable at all (a call that answers proves
+     * it), the user's screen being locked (a tap on the user's screen lands on
+     * the lock screen, and an app the agent opened may be behind it), and a
+     * display no longer holding the app it was holding (the user pressed home
+     * on it, or the task moved elsewhere).
+     *
+     * JSON:
+     * `{locked, main:{task,package}, displays:[{id,task,package}]}`.
+     *
+     * Refusing to act is the caller's decision — this reports the state and
+     * nothing else, so the two halves can be tested apart.
+     */
+    String readiness() = 26;
 }

@@ -127,10 +127,19 @@ public interface ISyscityShell extends android.os.IInterface
      * 
      * `input -d text` types through the key character map and mangles anything
      * outside ASCII; a clipboard paste carries any character the app can
-     * render. Returns 0 when it pasted, 1 when the user's clipboard could not
-     * be read (nothing was changed), 2 on failure.
+     * render.
+     * 
+     * `replace` false means append: the field's existing text is kept and the
+     * paste lands after it. This is the form a caller should use on the user's
+     * own screen, where the clipboard belongs to them — a replace opens with
+     * Ctrl+A, and would also wipe whatever they had already typed.
+     * 
+     * Returns 0 when it pasted, 1 when the user's clipboard could not be read,
+     * 2 on failure. A 1 means nothing was pressed at all: the text never
+     * reached the clipboard, so a paste would have inserted the user's own
+     * content into the field.
      */
-    @Override public int pasteText(int displayId, java.lang.String text) throws android.os.RemoteException
+    @Override public int pasteText(int displayId, java.lang.String text, boolean replace) throws android.os.RemoteException
     {
       return 0;
     }
@@ -239,6 +248,27 @@ public interface ISyscityShell extends android.os.IInterface
     @Override public boolean isHeldByUser(int displayId) throws android.os.RemoteException
     {
       return false;
+    }
+    /**
+     * Whether the phone is in a state where the agent's writes still mean what
+     * it thinks they mean.
+     * 
+     * Three things stop that being true, and only the first is visible from
+     * the host: this helper being reachable at all (a call that answers proves
+     * it), the user's screen being locked (a tap on the user's screen lands on
+     * the lock screen, and an app the agent opened may be behind it), and a
+     * display no longer holding the app it was holding (the user pressed home
+     * on it, or the task moved elsewhere).
+     * 
+     * JSON:
+     * `{locked, main:{task,package}, displays:[{id,task,package}]}`.
+     * 
+     * Refusing to act is the caller's decision — this reports the state and
+     * nothing else, so the two halves can be tested apart.
+     */
+    @Override public java.lang.String readiness() throws android.os.RemoteException
+    {
+      return null;
     }
     @Override
     public android.os.IBinder asBinder() {
@@ -455,7 +485,9 @@ public interface ISyscityShell extends android.os.IInterface
           _arg0 = data.readInt();
           java.lang.String _arg1;
           _arg1 = data.readString();
-          int _result = this.pasteText(_arg0, _arg1);
+          boolean _arg2;
+          _arg2 = (0!=data.readInt());
+          int _result = this.pasteText(_arg0, _arg1, _arg2);
           reply.writeNoException();
           reply.writeInt(_result);
           break;
@@ -540,6 +572,13 @@ public interface ISyscityShell extends android.os.IInterface
           boolean _result = this.isHeldByUser(_arg0);
           reply.writeNoException();
           reply.writeInt(((_result)?(1):(0)));
+          break;
+        }
+        case TRANSACTION_readiness:
+        {
+          java.lang.String _result = this.readiness();
+          reply.writeNoException();
+          reply.writeString(_result);
           break;
         }
         default:
@@ -892,10 +931,19 @@ public interface ISyscityShell extends android.os.IInterface
        * 
        * `input -d text` types through the key character map and mangles anything
        * outside ASCII; a clipboard paste carries any character the app can
-       * render. Returns 0 when it pasted, 1 when the user's clipboard could not
-       * be read (nothing was changed), 2 on failure.
+       * render.
+       * 
+       * `replace` false means append: the field's existing text is kept and the
+       * paste lands after it. This is the form a caller should use on the user's
+       * own screen, where the clipboard belongs to them — a replace opens with
+       * Ctrl+A, and would also wipe whatever they had already typed.
+       * 
+       * Returns 0 when it pasted, 1 when the user's clipboard could not be read,
+       * 2 on failure. A 1 means nothing was pressed at all: the text never
+       * reached the clipboard, so a paste would have inserted the user's own
+       * content into the field.
        */
-      @Override public int pasteText(int displayId, java.lang.String text) throws android.os.RemoteException
+      @Override public int pasteText(int displayId, java.lang.String text, boolean replace) throws android.os.RemoteException
       {
         android.os.Parcel _data = android.os.Parcel.obtain();
         android.os.Parcel _reply = android.os.Parcel.obtain();
@@ -904,6 +952,7 @@ public interface ISyscityShell extends android.os.IInterface
           _data.writeInterfaceToken(DESCRIPTOR);
           _data.writeInt(displayId);
           _data.writeString(text);
+          _data.writeInt(((replace)?(1):(0)));
           boolean _status = mRemote.transact(Stub.TRANSACTION_pasteText, _data, _reply, 0);
           _reply.readException();
           _result = _reply.readInt();
@@ -1145,6 +1194,40 @@ public interface ISyscityShell extends android.os.IInterface
         }
         return _result;
       }
+      /**
+       * Whether the phone is in a state where the agent's writes still mean what
+       * it thinks they mean.
+       * 
+       * Three things stop that being true, and only the first is visible from
+       * the host: this helper being reachable at all (a call that answers proves
+       * it), the user's screen being locked (a tap on the user's screen lands on
+       * the lock screen, and an app the agent opened may be behind it), and a
+       * display no longer holding the app it was holding (the user pressed home
+       * on it, or the task moved elsewhere).
+       * 
+       * JSON:
+       * `{locked, main:{task,package}, displays:[{id,task,package}]}`.
+       * 
+       * Refusing to act is the caller's decision — this reports the state and
+       * nothing else, so the two halves can be tested apart.
+       */
+      @Override public java.lang.String readiness() throws android.os.RemoteException
+      {
+        android.os.Parcel _data = android.os.Parcel.obtain();
+        android.os.Parcel _reply = android.os.Parcel.obtain();
+        java.lang.String _result;
+        try {
+          _data.writeInterfaceToken(DESCRIPTOR);
+          boolean _status = mRemote.transact(Stub.TRANSACTION_readiness, _data, _reply, 0);
+          _reply.readException();
+          _result = _reply.readString();
+        }
+        finally {
+          _reply.recycle();
+          _data.recycle();
+        }
+        return _result;
+      }
     }
     static final int TRANSACTION_identity = (android.os.IBinder.FIRST_CALL_TRANSACTION + 1);
     static final int TRANSACTION_createDisplay = (android.os.IBinder.FIRST_CALL_TRANSACTION + 2);
@@ -1171,6 +1254,7 @@ public interface ISyscityShell extends android.os.IInterface
     static final int TRANSACTION_giveToUser = (android.os.IBinder.FIRST_CALL_TRANSACTION + 23);
     static final int TRANSACTION_takeBack = (android.os.IBinder.FIRST_CALL_TRANSACTION + 24);
     static final int TRANSACTION_isHeldByUser = (android.os.IBinder.FIRST_CALL_TRANSACTION + 25);
+    static final int TRANSACTION_readiness = (android.os.IBinder.FIRST_CALL_TRANSACTION + 26);
   }
   /** @hide */
   public static final java.lang.String DESCRIPTOR = "net.syscity.desktop.shell.ISyscityShell";
@@ -1235,10 +1319,19 @@ public interface ISyscityShell extends android.os.IInterface
    * 
    * `input -d text` types through the key character map and mangles anything
    * outside ASCII; a clipboard paste carries any character the app can
-   * render. Returns 0 when it pasted, 1 when the user's clipboard could not
-   * be read (nothing was changed), 2 on failure.
+   * render.
+   * 
+   * `replace` false means append: the field's existing text is kept and the
+   * paste lands after it. This is the form a caller should use on the user's
+   * own screen, where the clipboard belongs to them — a replace opens with
+   * Ctrl+A, and would also wipe whatever they had already typed.
+   * 
+   * Returns 0 when it pasted, 1 when the user's clipboard could not be read,
+   * 2 on failure. A 1 means nothing was pressed at all: the text never
+   * reached the clipboard, so a paste would have inserted the user's own
+   * content into the field.
    */
-  public int pasteText(int displayId, java.lang.String text) throws android.os.RemoteException;
+  public int pasteText(int displayId, java.lang.String text, boolean replace) throws android.os.RemoteException;
   /**
    * Start watching the user's screen for `windowMs`, and return the task on
    * top of it right now (or -1).
@@ -1319,4 +1412,22 @@ public interface ISyscityShell extends android.os.IInterface
    * is a retry, and they are different instructions to give a model.
    */
   public boolean isHeldByUser(int displayId) throws android.os.RemoteException;
+  /**
+   * Whether the phone is in a state where the agent's writes still mean what
+   * it thinks they mean.
+   * 
+   * Three things stop that being true, and only the first is visible from
+   * the host: this helper being reachable at all (a call that answers proves
+   * it), the user's screen being locked (a tap on the user's screen lands on
+   * the lock screen, and an app the agent opened may be behind it), and a
+   * display no longer holding the app it was holding (the user pressed home
+   * on it, or the task moved elsewhere).
+   * 
+   * JSON:
+   * `{locked, main:{task,package}, displays:[{id,task,package}]}`.
+   * 
+   * Refusing to act is the caller's decision — this reports the state and
+   * nothing else, so the two halves can be tested apart.
+   */
+  public java.lang.String readiness() throws android.os.RemoteException;
 }

@@ -544,27 +544,155 @@ object HelperMain {
          * input and lives on the other side of the bridge. The atomicity belongs
          * where the state is.
          */
-        override fun pasteText(displayId: Int, text: String): Int {
-            synchronized(pasteLock) { return paste(displayId, text) }
+        override fun pasteText(displayId: Int, text: String, replace: Boolean): Int {
+            synchronized(pasteLock) { return paste(displayId, text, replace) }
         }
 
-        private fun paste(displayId: Int, text: String): Int {
-            val target = writable(displayId) ?: return PASTE_FAILED
-            if (!clipboard.put(text)) return PASTE_NO_CLIPBOARD
-            return try {
-                // Ctrl+A then Ctrl+V: select whatever is in the field first, so
-                // the paste replaces it rather than appending to it.
-                if (!target.ctrlKey(KEYCODE_A) || !target.ctrlKey(KEYCODE_V)) {
-                    PASTE_FAILED
+        /**
+         * The phone's state, as far as it changes what a write means.
+         *
+         * A helper answering at all is the first fact, and the caller already
+         * has it by having got an answer. What it adds is the two that the
+         * host cannot see: whether the user's screen is locked (a tap on that
+         * screen lands on the lock screen, and the app behind it did not
+         * change), and which app each display actually holds now — a display
+         * that no longer shows what the caller left on it is a screen the
+         * caller's next coordinate was computed against and is wrong for.
+         *
+         * Reported, not judged: refusing to act is the caller's call, and
+         * keeping the judgement out of here is what lets both halves be tested
+         * without a phone.
+         */
+        override fun readiness(): String {
+            val locked = runCatching {
+                val context = ShellContext.create()
+                val power = context?.getSystemService(android.content.Context.POWER_SERVICE)
+                    as? android.os.PowerManager
+                // `KeyguardManager.isKeyguardLocked` rather than
+                // `PowerManager.isKeyguardLocked`: the latter is a hidden API,
+                // and a hidden-API call from uid 2000 is a link failure at the
+                // worst possible moment. Asleep counts as locked — the screen
+                // is not showing anything a tap could reach.
+                val keyguard = if (context == null) {
+                    null
                 } else {
-                    // The app reads the clipboard when it handles the paste key.
-                    // Give it a moment before taking the clipboard back.
-                    Thread.sleep(PASTE_SETTLE_MS)
-                    PASTE_OK
+                    context.getSystemService(android.content.Context.KEYGUARD_SERVICE)
+                        as? android.app.KeyguardManager
                 }
+                power?.isInteractive == false || keyguard?.isKeyguardLocked == true
+            }.getOrDefault(false)
+
+            // Assembled and serialised by the pure half, so the rules about
+            // "empty" and "unknown" are one implementation with tests rather
+            // than duplicated here against a live Binder.
+            val tasks = runCatching { TaskQuery.current() }.getOrNull().orEmpty()
+            val open = synchronized(lock) { this@Stub.displays.keys.toList() }
+            return ReadinessReport.toJson(ReadinessReport.of(tasks, open, locked))
+        }
+
+        private fun paste(displayId: Int, text: String, replace: Boolean): Int {
+            // Display 0 is the person's own screen. Writes there are allowed —
+            // that is what the display-less tools do all day — but the display
+            // record is keyed by the helper's own displays, so it has to be
+            // reached differently: through injected keys, the same way the
+            // helper reaches any display it does not own.
+            if (displayId == USER_DISPLAY) return pasteOnUserScreen(text, replace)
+            val target = writable(displayId) ?: return PASTE_FAILED
+
+            // The clipboard belongs to the person whichever screen the paste
+            // lands on, and the rule is one rule: a replace opens with Ctrl+A,
+            // and an unreadable clipboard cannot be put back afterwards. So a
+            // replace needs the read to have succeeded; an append does not,
+            // because it selects nothing.
+            //
+            // A false from `put` means the text is *not* on the clipboard —
+            // either it was unreadable and deliberately left alone, or the
+            // write failed. Either way a Ctrl+V would paste the person's own
+            // clipboard into the field, so nothing is pressed at all.
+            if (ShellPaste.decide(clipboard.put(text)) == Paste.NO_CLIPBOARD) {
+                return PASTE_NO_CLIPBOARD
+            }
+            return try {
+                if (replace && !target.ctrlKey(KEYCODE_A)) return PASTE_FAILED
+                if (!target.ctrlKey(KEYCODE_V)) return PASTE_FAILED
+                // The app reads the clipboard when it handles the paste key.
+                // Give it a moment before taking the clipboard back.
+                Thread.sleep(PASTE_SETTLE_MS)
+                PASTE_OK
             } finally {
                 clipboard.restore()
             }
+        }
+
+        /**
+         * Paste onto the user's own screen.
+         *
+         * The clipboard is the person's, so the rules are the strict ones:
+         * nothing is pressed unless their clipboard was readable and will be
+         * put back, and a replace is never asked for unless the caller asked —
+         * on this screen a replace would also wipe whatever they had already
+         * typed into the field.
+         */
+        private fun pasteOnUserScreen(text: String, replace: Boolean): Int {
+            if (ShellPaste.decide(clipboard.put(text)) == Paste.NO_CLIPBOARD) {
+                return PASTE_NO_CLIPBOARD
+            }
+            return try {
+                if (replace && !keyevent(KEYCODE_A, CTRL)) return PASTE_FAILED
+                if (!keyevent(KEYCODE_V, CTRL)) return PASTE_FAILED
+                Thread.sleep(PASTE_SETTLE_MS)
+                PASTE_OK
+            } finally {
+                clipboard.restore()
+            }
+        }
+
+        /**
+         * One key with modifier state, on the user's screen.
+         *
+         * `input keyevent` has no modifier form, so the event pair is built and
+         * injected with display 0. This is the helper (uid 2000) doing it,
+         * which is why it works at all: an ordinary app cannot reach the input
+         * dispatcher.
+         */
+        private fun keyevent(keyCode: Int, meta: Int): Boolean = try {
+            val now = SystemClock.uptimeMillis()
+            val down = android.view.KeyEvent(
+                now,
+                now,
+                android.view.KeyEvent.ACTION_DOWN,
+                keyCode,
+                0,
+                meta,
+                0,
+                0,
+                0,
+                android.view.InputDevice.SOURCE_KEYBOARD,
+            )
+            val up = android.view.KeyEvent.changeAction(down, android.view.KeyEvent.ACTION_UP)
+            injectOnDisplay(USER_DISPLAY, down) && injectOnDisplay(USER_DISPLAY, up)
+        } catch (e: Exception) {
+            Log.w(TAG, "key $keyCode on display $USER_DISPLAY failed: ${e.message}")
+            false
+        }
+
+        private fun injectOnDisplay(displayId: Int, event: android.view.InputEvent): Boolean = try {
+            @Suppress("PrivateApi", "DiscouragedPrivateApi")
+            val manager = runCatching {
+                Class.forName("android.hardware.input.InputManagerGlobal")
+                    .getMethod("getInstance").invoke(null)
+            }.getOrNull() ?: Class.forName("android.hardware.input.InputManager")
+                .getMethod("getInstance").invoke(null)
+            manager.javaClass
+                .getMethod(
+                    "injectInputEvent",
+                    android.view.InputEvent::class.java,
+                    Int::class.javaPrimitiveType,
+                )
+                .invoke(manager, event, INJECT_MODE_ASYNC) as Boolean
+        } catch (e: Exception) {
+            Log.w(TAG, "injectInputEvent on display $displayId failed: ${e.message}")
+            false
         }
 
         override fun watchMainScreen(windowMs: Int): Int =
@@ -674,6 +802,10 @@ object HelperMain {
     private const val PASTE_NO_CLIPBOARD = 1
     private const val PASTE_FAILED = 2
     private const val PASTE_SETTLE_MS = 250L
+    private const val USER_DISPLAY = 0
+    private const val INJECT_MODE_ASYNC = 0
+    private const val CTRL = android.view.KeyEvent.META_CTRL_ON or
+        android.view.KeyEvent.META_CTRL_LEFT_ON
     private const val KEYCODE_A = android.view.KeyEvent.KEYCODE_A
     private const val KEYCODE_V = android.view.KeyEvent.KEYCODE_V
 }

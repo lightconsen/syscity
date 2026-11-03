@@ -643,4 +643,103 @@ class PhoneLogicTest {
             commands,
         )
     }
+
+    // ── Paste modes ────────────────────────────────────────────────────
+
+    @Test
+    fun aReplaceIsRefusedWhenTheClipboardCannotBeSaved() {
+        // The rule that must never bend: Ctrl+A takes the person's text away,
+        // so a replace may only run when their clipboard was read and will be
+        // put back. This is the classification the helper branches on, and
+        // getting it backwards loses data.
+        val unreadable = ShellClipRead.classify(clipTextCameBack = false, present = true)
+        assertEquals(Read.UNREADABLE, unreadable)
+        assertEquals(Restore.LEAVE, ShellClipRestore.decide(
+            stillOurs = false,
+            savedPresent = true,
+            savedWasEmpty = false,
+        ))
+    }
+
+    @Test
+    fun anUnwrittenClipboardMeansNothingIsPressed() {
+        // Appending protects the person's clipboard from being selected away,
+        // but it cannot paste text that never got onto the clipboard: a
+        // Ctrl+V would insert whatever they had copied themselves. So a
+        // failed put means no keystroke at all, in either mode — the bug this
+        // rule exists to prevent is pasting the user's own content.
+        assertEquals(Paste.NO_CLIPBOARD, ShellPaste.decide(putTook = false))
+        assertEquals(Paste.PROCEED, ShellPaste.decide(putTook = true))
+        // And the reason a put fails on an unreadable clipboard: it never
+        // overwrites text it could not save first.
+        assertEquals(
+            Read.UNREADABLE,
+            ShellClipRead.classify(clipTextCameBack = false, present = true),
+        )
+    }
+
+    // ── Readiness ──────────────────────────────────────────────────────
+
+    private fun task(id: Int, display: Int, pkg: String?) = MainScreenLog.Task(
+        taskId = id,
+        displayId = display,
+        packageName = pkg,
+        topActivity = pkg?.let { "$it/.Main" },
+    )
+
+    @Test
+    fun everyOpenDisplayIsInTheReport() {
+        val state = ReadinessReport.of(
+            listOf(task(7, 0, "com.chat"), task(11, 3, "com.mail"), task(12, 4, "com.map")),
+            open = listOf(3, 4),
+            locked = false,
+        )
+        assertEquals("com.chat", state.topOf(0)?.packageName)
+        assertEquals(11, state.topOf(3)?.task)
+        assertEquals("com.map", state.topOf(4)?.packageName)
+        assertFalse(state.locked)
+    }
+
+    @Test
+    fun aDisplayThatIsNotOpenHasNoAnswerRatherThanAnEmptyOne() {
+        // The difference matters: `topOf(5)` returning a task of -1 would read
+        // as "the display is empty", and an empty display is not a display
+        // that moved.
+        val state = ReadinessReport.of(listOf(task(7, 0, "com.chat")), open = listOf(3), locked = false)
+        assertNull(state.topOf(5))
+        assertEquals(-1, state.topOf(3)?.task)
+    }
+
+    @Test
+    fun anEmptyUserScreenIsReportedAsEmptyNotEmptyAsAbsent() {
+        val state = ReadinessReport.of(emptyList(), open = emptyList(), locked = false)
+        assertEquals(-1, state.main.task)
+        assertNull(state.main.packageName)
+    }
+
+    @Test
+    fun theMostRecentlyUsedTaskIsTheOneShowing() {
+        // The system lists tasks most-recently-used first; the second task on
+        // the same display is behind the first, not on top of it.
+        val state = ReadinessReport.of(
+            listOf(task(20, 3, "com.b"), task(21, 3, "com.a")),
+            open = listOf(3),
+            locked = false,
+        )
+        assertEquals("com.b", state.topOf(3)?.packageName)
+    }
+
+    @Test
+    fun everyOpenDisplayIsListedOnce() {
+        // The wire form is a list rather than a map, and the host looks a
+        // display up by id: a display listed twice would be one id with two
+        // answers, and the last would silently win.
+        val state = ReadinessReport.of(
+            listOf(task(7, 0, "com.chat"), task(11, 3, "com.mail")),
+            open = listOf(3, 3),
+            locked = true,
+        )
+        assertEquals(1, state.displays.size)
+        assertTrue(state.locked)
+    }
 }

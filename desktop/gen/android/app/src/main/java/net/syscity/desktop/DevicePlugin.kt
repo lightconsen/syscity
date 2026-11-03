@@ -34,6 +34,8 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -701,11 +703,14 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
           }
           "paste" -> {
             // The clipboard route for non-ASCII text: `input -d text` goes
-            // through the key character map and mangles it.
-            when (shell?.pasteText(displayId, args.optString("text")) ?: 2) {
+            // through the key character map and mangles it. `replace` false
+            // appends instead, which is the only form usable on a screen whose
+            // clipboard belongs to the person.
+            val replace = args.optBoolean("replace", true)
+            when (shell?.pasteText(displayId, args.optString("text"), replace) ?: 2) {
               0 -> out.put("ok", true)
               1 -> out.put("ok", false).put("code", "CLIPBOARD_UNREADABLE")
-                .put("error", "the user's clipboard could not be read, so nothing was replaced")
+                .put("error", "the user's clipboard could not be read, so nothing was pasted")
               else -> {
                 out.put("ok", false).put("code", "PASTE_FAILED")
                 out.put("error", "the text could not be pasted on display $displayId")
@@ -726,6 +731,23 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
             val since = args.optLong("since", 0L)
             val arrivals = shell?.mainArrivals(since) ?: ""
             out.put("ok", true).put("arrivals", org.json.JSONArray(arrivals.ifEmpty { "[]" }))
+          }
+          "readiness" -> {
+            // Whether the phone is in a state where a write still means what
+            // the caller thinks. A missing helper is the third answer: the
+            // phone is fine, the thing that drives a display is not.
+            out.put("ok", true)
+            val state = shell?.readiness()
+            if (state == null) {
+              out.put("helper", false).put("locked", false)
+              out.put("main", JSObject()).put("displays", JSONArray())
+            } else {
+              val parsed = JSONObject(state)
+              out.put("helper", true)
+                .put("locked", parsed.optBoolean("locked", false))
+                .put("main", parsed.optJSONObject("main") ?: JSObject())
+                .put("displays", parsed.optJSONArray("displays") ?: JSONArray())
+            }
           }
           "frame_signature" -> {
             val bytes = shell?.frameSignature(displayId)
