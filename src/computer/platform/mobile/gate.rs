@@ -47,6 +47,114 @@ pub struct Clearance {
     pub offer: Option<Offer>,
     /// Whether the question was actually put to someone.
     pub asked: bool,
+    /// What a person actually approved, when they did.
+    ///
+    /// The answer "allow" is not permission to tap whatever is under the
+    /// finger when the call finally dispatches — it is permission for the
+    /// thing that was described in the question. [`verify`] checks that this
+    /// is still what is about to happen.
+    pub granted: Option<Grant>,
+}
+
+/// An approval, bound to the thing that was approved.
+///
+/// The question reads "the agent wants to tap "发送" in com.example.chat —
+/// send ...". All three parts of that are in here, because all three can
+/// change between the question and the dispatch, and a `bool` would carry
+/// none of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// The app the question named.
+    pub package: Option<String>,
+    /// The kind of action, as classified.
+    pub risk: Risk,
+    /// The element label, as it appeared on screen.
+    pub label: Option<String>,
+    /// What the person read, for the mismatch message.
+    pub subject: String,
+}
+
+impl Grant {
+    fn describes(&self, offer: &Offer, package: Option<&str>) -> bool {
+        // The kind must match: approving a send is not approving a payment
+        // because the screen changed under the same label.
+        self.risk == offer.risk
+            // The app must match when either side knows it. A missing package
+            // on one side means the tree could not name one, not that any app
+            // will do.
+            && match (self.package.as_deref(), package) {
+                (Some(approved), Some(now)) => approved == now,
+                _ => true,
+            }
+            // And the label, when there was one: the same app can hold the same
+            // risk on two different buttons, and the person approved one of
+            // them.
+            && match (self.label.as_deref(), offer.element.as_deref()) {
+                (Some(approved), Some(now)) => approved == now,
+                (Some(_), None) => false,
+                _ => true,
+            }
+    }
+}
+
+/// Why a granted action was not carried out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withheld {
+    pub reason: String,
+}
+
+/// Check that what is about to happen is what was approved.
+///
+/// Called immediately before dispatch, with the tree read for *this* attempt.
+/// The gap this closes: a question is put to a person, they take a few seconds
+/// to read it, and by the time they say yes the app has moved on — a message
+/// arrived and the list scrolled, the page redirected. The approval was for
+/// the thing described; this refuses to let it authorise anything else.
+///
+/// Nothing to check when no grant was made (nobody was asked, or nobody could
+/// be), which is the unattended case and keeps its own rules.
+pub fn verify(
+    clearance: &Clearance,
+    offer: Option<&Offer>,
+    package: Option<&str>,
+) -> Result<(), Withheld> {
+    let Some(grant) = &clearance.granted else {
+        return Ok(());
+    };
+    let Some(offer) = offer else {
+        return Err(Withheld {
+            reason: format!(
+                "Refused: \"{}\" was approved, and by the time it was, the screen no longer \
+                 shows a {} action there. Nothing was done. Read the screen and, if it is still \
+                 the right thing to do, try again.",
+                grant.subject,
+                grant.risk.label()
+            ),
+        });
+    };
+    if grant.describes(offer, package) {
+        return Ok(());
+    }
+    Err(Withheld {
+        reason: format!(
+            "Refused: \"{}\" was approved as a {}{}, and what is there now is a {} on {:?}{}. \
+             An approval covers the action that was described, not whatever took its place. \
+             Nothing was done — read the screen and ask again if it is still wanted.",
+            grant.subject,
+            grant.risk.label(),
+            grant
+                .package
+                .as_deref()
+                .map(|p| format!(" in {p}"))
+                .unwrap_or_default(),
+            offer.risk.label(),
+            offer.element.as_deref().unwrap_or("that"),
+            package
+                .filter(|now| Some(*now) != grant.package.as_deref())
+                .map(|now| format!(" in {now}"))
+                .unwrap_or_default(),
+        ),
+    })
 }
 
 impl Clearance {
@@ -88,10 +196,15 @@ pub async fn check(
     offer: Option<Offer>,
     ctx: &ToolContext,
     subject: &str,
+    package: Option<&str>,
 ) -> Result<Clearance, Refusal> {
     let Some(offer) = offer else {
         // Nothing to judge. This is the common case and must stay free.
-        return Ok(Clearance { offer: None, asked: false });
+        return Ok(Clearance {
+            offer: None,
+            asked: false,
+            granted: None,
+        });
     };
 
     let config = ctx.mobile_control();
@@ -99,6 +212,7 @@ pub async fn check(
         return Ok(Clearance {
             offer: Some(offer),
             asked: false,
+            granted: None,
         });
     }
 
@@ -109,12 +223,14 @@ pub async fn check(
         return Ok(Clearance {
             offer: Some(offer),
             asked: false,
+            granted: None,
         });
     }
     let Some(queue) = ctx.ask_queue.clone() else {
         return Ok(Clearance {
             offer: Some(offer),
             asked: false,
+            granted: None,
         });
     };
 
@@ -156,6 +272,12 @@ pub async fn check(
     // word we sent rather than guessing at free text.
     if answer.trim().eq_ignore_ascii_case("allow") {
         Ok(Clearance {
+            granted: Some(Grant {
+                package: package.map(str::to_string),
+                risk: offer.risk,
+                label: offer.element.clone(),
+                subject: subject.to_string(),
+            }),
             offer: Some(offer),
             asked: true,
         })
@@ -209,7 +331,7 @@ mod tests {
     async fn a_send_with_a_human_present_is_asked_about() {
         let queue = Arc::new(AskQueue::new());
         let responder = answer(Arc::clone(&queue), "Allow");
-        let clearance = check(Some(offer()), &context(queue), "tap 发送")
+        let clearance = check(Some(offer()), &context(queue), "tap 发送", Some("com.example.chat"))
             .await
             .expect("allowed");
         responder.await.unwrap();
@@ -221,7 +343,7 @@ mod tests {
     async fn a_refusal_stops_the_tap_and_says_why() {
         let queue = Arc::new(AskQueue::new());
         let responder = answer(Arc::clone(&queue), "Refuse");
-        let refused = check(Some(offer()), &context(queue), "tap 发送")
+        let refused = check(Some(offer()), &context(queue), "tap 发送", Some("com.example.chat"))
             .await
             .expect_err("refused");
         responder.await.unwrap();
@@ -233,7 +355,7 @@ mod tests {
     async fn nobody_to_ask_means_it_runs_and_reports_the_risk() {
         // A cron turn: user_id `system`, a `cron:` conversation, and no queue.
         let ctx = ToolContext::new("system", "cron:nightly");
-        let clearance = check(Some(offer()), &ctx, "tap 发送")
+        let clearance = check(Some(offer()), &ctx, "tap 发送", Some("com.example.chat"))
             .await
             .expect("unattended sends are paced, not refused");
         assert!(!clearance.asked);
@@ -248,7 +370,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = context(queue).with_mobile_control(config);
-        let clearance = check(Some(offer()), &ctx, "tap 发送")
+        let clearance = check(Some(offer()), &ctx, "tap 发送", Some("com.example.chat"))
             .await
             .expect("allowed");
         assert!(!clearance.asked);
@@ -264,7 +386,7 @@ mod tests {
             matched: "提交".to_string(),
             element: Some("提交".to_string()),
         };
-        let clearance = check(Some(submit), &context(queue), "tap 提交")
+        let clearance = check(Some(submit), &context(queue), "tap 提交", Some("com.example.chat"))
             .await
             .expect("allowed");
         assert!(!clearance.asked);
@@ -276,7 +398,7 @@ mod tests {
         let ctx = ToolContext::new("user-1", "conv-1")
             .with_ask_queue(queue)
             .with_delegation(Some(crate::delegation::DelegationScope::new("root", "task", 2, 3)));
-        let clearance = check(Some(offer()), &ctx, "tap 发送")
+        let clearance = check(Some(offer()), &ctx, "tap 发送", Some("com.example.chat"))
             .await
             .expect("allowed");
         assert!(!clearance.asked);
@@ -285,9 +407,91 @@ mod tests {
     #[tokio::test]
     async fn nothing_irreversible_costs_nothing() {
         let queue = Arc::new(AskQueue::new());
-        let clearance = check(None, &context(queue), "tap 首页")
+        let clearance = check(None, &context(queue), "tap 首页", Some("com.example.chat"))
             .await
             .expect("allowed");
         assert!(clearance.offer.is_none() && !clearance.asked);
+    }
+
+    // ── What the approval is bound to ──────────────────────────────────────
+
+    /// Approve a send, then check it against what is about to happen.
+    async fn approved() -> Clearance {
+        let queue = Arc::new(AskQueue::new());
+        let responder = answer(Arc::clone(&queue), "Allow");
+        let clearance = check(
+            Some(offer()),
+            &context(queue),
+            "tap \"发送\" in com.example.chat",
+            Some("com.example.chat"),
+        )
+        .await
+        .expect("allowed");
+        responder.await.unwrap();
+        clearance
+    }
+
+    #[tokio::test]
+    async fn an_approval_covers_the_thing_that_was_approved() {
+        let clearance = approved().await;
+        verify(&clearance, Some(&offer()), Some("com.example.chat"))
+            .expect("the same send is what was approved");
+    }
+
+    #[tokio::test]
+    async fn an_approval_does_not_cover_a_different_kind_of_action() {
+        // A message arrived, the list scrolled, and the button under the
+        // finger is now "pay". The person approved a send.
+        let clearance = approved().await;
+        let pay = Offer {
+            risk: Risk::Pay,
+            matched: "付款".to_string(),
+            element: Some("付款".to_string()),
+        };
+        let withheld = verify(&clearance, Some(&pay), Some("com.example.chat"))
+            .expect_err("a payment is not a send");
+        assert!(withheld.reason.contains("send"), "{}", withheld.reason);
+        assert!(withheld.reason.contains("pay"), "{}", withheld.reason);
+    }
+
+    #[tokio::test]
+    async fn an_approval_does_not_cover_the_same_button_in_another_app() {
+        let clearance = approved().await;
+        let withheld = verify(&clearance, Some(&offer()), Some("com.example.other"))
+            .expect_err("a different app is a different action");
+        assert!(withheld.reason.contains("com.example.other"), "{}", withheld.reason);
+    }
+
+    #[tokio::test]
+    async fn an_approval_does_not_cover_a_different_button() {
+        let clearance = approved().await;
+        let other = Offer {
+            risk: Risk::Send,
+            matched: "转发".to_string(),
+            element: Some("转发".to_string()),
+        };
+        verify(&clearance, Some(&other), Some("com.example.chat"))
+            .expect_err("a different label is a different action");
+    }
+
+    #[tokio::test]
+    async fn nothing_left_where_it_was_withholds_the_action() {
+        // The screen moved on entirely: there is no such button any more.
+        let clearance = approved().await;
+        let withheld = verify(&clearance, None, Some("com.example.chat"))
+            .expect_err("nothing there is not the approved thing");
+        assert!(withheld.reason.contains("no longer"), "{}", withheld.reason);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_verify_when_nobody_was_asked() {
+        // Unattended: no grant exists, so the binding check has nothing to
+        // say, and the pacing is what limits it.
+        let ctx = ToolContext::new("system", "cron:nightly");
+        let clearance = check(Some(offer()), &ctx, "tap 发送", Some("com.example.chat"))
+            .await
+            .expect("allowed");
+        verify(&clearance, None, Some("something.else"))
+            .expect("nothing was approved, so nothing binds");
     }
 }
