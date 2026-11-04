@@ -129,6 +129,12 @@ pub(super) const DEVICE_PARAM: &str =
     "Device serial to act on. Omit it and the call uses the only attached device — the result \
      reports which serial was actually used, since that is whatever is attached at the time.";
 
+pub(super) const SINCE_PARAM: &str =
+    "Optional: the `snapshot` of an earlier read, to get only what changed since then (what \
+     appeared, left, moved) instead of the whole screen. Falls back to the whole screen when the \
+     named read is not one of the last few, was of a different app, or when more than half the \
+     screen is different — the result says which.";
+
 /// `adb` argv prefix for the target device — no `-s` when none is pinned, in
 /// which case adb resolves the device itself.
 pub(super) fn adb_args(device: &Option<String>, base: &[&str]) -> Vec<String> {
@@ -483,13 +489,16 @@ impl Tool for AdbObserveTool {
          disagree about the screen size, which would make the element coordinates unusable. When \
          the UI tree cannot be read at all it still returns the screenshot and says why: in that \
          case the elements are absent from the result rather than empty, because an empty list \
-         means the tree was read and held nothing actionable."
+         means the tree was read and held nothing actionable. Pass `since` with the snapshot of \
+         an earlier read to get only what changed instead of the whole list; the screenshot is \
+         still returned, because a canvas can change while the tree stays silent."
     }
 
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Observe the Android device",
             serde_json::json!({
+                "since": { "type": "string", "description": SINCE_PARAM },
                 "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
@@ -513,6 +522,7 @@ impl Tool for AdbObserveTool {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
+        let since = super::diff::since_arg(&args).map(str::to_string);
         let png = match capture_png(&device, target).await {
             Ok(png) => png,
             Err(e) => return Ok(ToolExecutionResult::error(e.to_string())),
@@ -564,7 +574,38 @@ impl Tool for AdbObserveTool {
             }
         };
 
+        // A delta replaces the element list, not the screenshot: the picture is
+        // how a caller learns that a canvas changed while the tree stayed
+        // silent, so a delta answer carries the image too. A *fallback* is left
+        // to the normal path below, which runs the quality check and OCR — the
+        // stricter read, and the one that would otherwise be skipped.
+        let mut fallback = None;
+        let since_delta = match since_answer(device.as_deref(), target, since.as_deref(), &dump) {
+            Some(SinceAnswer::Delta { text, data }) => Some((text, data)),
+            Some(SinceAnswer::Full(reason)) => {
+                fallback = Some(reason);
+                None
+            }
+            None => None,
+        };
         let shot = png_dimensions(&png);
+        if let Some((text, mut data)) = since_delta {
+            let quality = assess_tree(&dump.elements);
+            data["quality"] = serde_json::json!(quality.as_str());
+            data["screenshot_base64"] = serde_json::json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &png,
+            ));
+            data["screenshot"] = as_size(shot).unwrap_or(serde_json::Value::Null);
+            data["screen"] = serde_json::json!(dump
+                .screen
+                .map(|(w, h)| serde_json::json!({ "width": w, "height": h })));
+            data["coordinates_consistent"] =
+                serde_json::json!(coordinate_space_consistent(dump.screen, shot));
+            data["source"] = serde_json::json!(dump.source);
+            data["device"] = serde_json::json!(resolved_serial(&device).await);
+            return Ok(ToolExecutionResult::success(text).with_data(data));
+        }
         let consistent = coordinate_space_consistent(dump.screen, shot);
 
         let quality = assess_tree(&dump.elements);
@@ -598,7 +639,7 @@ impl Tool for AdbObserveTool {
             ));
         }
 
-        Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
+        let mut data = serde_json::json!({
             "count": dump.elements.len(),
             "quality": quality.as_str(),
             "advice": quality.advice(),
@@ -614,8 +655,88 @@ impl Tool for AdbObserveTool {
             "screen": dump.screen.map(|(w, h)| serde_json::json!({ "width": w, "height": h })),
             "coordinates_consistent": consistent,
             "device": resolved_serial(&device).await,
-        })))
+        });
+        if let Some(reason) = fallback {
+            let note = since_fallback(reason);
+            data["baseline"] = note["baseline"].clone();
+            data["fallback"] = note["fallback"].clone();
+            summary.push_str(&format!("\n\n{}", reason.describe()));
+        }
+        Ok(ToolExecutionResult::success(summary).with_data(data))
     }
+}
+
+// ── Incremental reads ──────────────────────────────────────────────────────
+
+/// What a read asked to be compared with an earlier one found.
+enum SinceAnswer {
+    /// The comparison held: report the delta instead of the whole screen.
+    Delta {
+        text: String,
+        data: serde_json::Value,
+    },
+    /// It did not: report the whole screen, and say why it was not compared.
+    Full(super::diff::FullReason),
+}
+
+/// Answer a `since` argument against the read that has just been taken.
+///
+/// `None` means the caller did not ask for a delta at all. Otherwise this is
+/// either the delta — what appeared, what left, what moved — or the reason the
+/// whole list is the better answer ([`super::diff::FullReason`]).
+fn since_answer(
+    device: Option<&str>,
+    target: Target,
+    since: Option<&str>,
+    dump: &UiDump,
+) -> Option<SinceAnswer> {
+    let since = since?;
+    match super::diff::compare(
+        device,
+        target.display_id(),
+        since,
+        dump.package.as_deref(),
+        &dump.elements,
+    ) {
+        super::diff::ScreenDiff::Diff(delta) => {
+            // Only what is on the screen now is addressable: an added row's
+            // index works, and a removed row's does not.
+            let mut present: Vec<&UiElement> = delta.added.iter().collect();
+            present.extend(delta.moved.iter());
+            let data = serde_json::json!({
+                "since": since,
+                "baseline": true,
+                "diff": {
+                    "added": delta.added.len(),
+                    "removed": delta.removed.len(),
+                    "moved": delta.moved.len(),
+                    "unchanged": delta.unchanged,
+                    "before": delta.before_len,
+                    "after": delta.after_len,
+                },
+                "elements": present,
+                "count": present.len(),
+                "snapshot": dump.snapshot,
+            });
+            Some(SinceAnswer::Delta {
+                text: super::diff::describe(&delta),
+                data,
+            })
+        }
+        super::diff::ScreenDiff::Full(reason) => Some(SinceAnswer::Full(reason)),
+    }
+}
+
+/// The `data` field naming why a read was not compared.
+fn since_fallback(reason: super::diff::FullReason) -> serde_json::Value {
+    serde_json::json!({
+        "baseline": false,
+        "fallback": match reason {
+            crate::computer::platform::mobile::diff::FullReason::NoBaseline => "no_baseline",
+            crate::computer::platform::mobile::diff::FullReason::AppChanged => "app_changed",
+            crate::computer::platform::mobile::diff::FullReason::MostlyChanged => "mostly_changed",
+        },
+    })
 }
 
 // ── ADB Input Tool ─────────────────────────────────────────────────────────
@@ -2759,54 +2880,60 @@ pub(super) fn format_ui_summary(elements: &[UiElement]) -> String {
             .to_string();
     }
     let mut lines = vec![format!("{} actionable element(s):", elements.len())];
-    for e in elements {
-        // A password field's contents must not reach the model — not as a
-        // label, and not as a resource id it could be read back through.
-        let label = if e.state.password {
-            "[password]".to_string()
-        } else {
-            e.text
-                .as_deref()
-                .or(e.content_desc.as_deref())
-                .map(|s| format!("{s:?}"))
-                .or_else(|| e.resource_id.clone())
-                .unwrap_or_else(|| "-".to_string())
-        };
-        let mut flags = String::new();
-        if e.clickable {
-            flags.push_str(" clickable");
-        }
-        if !e.enabled {
-            flags.push_str(" disabled");
-        }
-        if e.state.scrollable {
-            flags.push_str(" scrollable");
-        }
-        if e.state.editable {
-            flags.push_str(" editable");
-        }
-        if e.state.checkable {
-            flags.push_str(if e.state.checked {
-                " checked"
-            } else {
-                " unchecked"
-            });
-        }
-        if e.state.wheel {
-            flags.push_str(" wheel");
-        }
-        if e.state.selected {
-            flags.push_str(" selected");
-        }
-        if e.state.focused {
-            flags.push_str(" focused");
-        }
-        lines.push(format!(
-            "[{}] {} {}{} center=({},{})",
-            e.index, e.class, label, flags, e.center.0, e.center.1
-        ));
-    }
+    lines.extend(elements.iter().map(format_ui_element));
     lines.join("\n")
+}
+
+/// One element as the model reads it: `[3] Button "Send" clickable center=(1,2)`.
+///
+/// The index is the element's own, so a line rendered on its own from a diff
+/// is still something a later call can point at.
+pub(super) fn format_ui_element(e: &UiElement) -> String {
+    // A password field's contents must not reach the model — not as a label,
+    // and not as a resource id it could be read back through.
+    let label = if e.state.password {
+        "[password]".to_string()
+    } else {
+        e.text
+            .as_deref()
+            .or(e.content_desc.as_deref())
+            .map(|s| format!("{s:?}"))
+            .or_else(|| e.resource_id.clone())
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let mut flags = String::new();
+    if e.clickable {
+        flags.push_str(" clickable");
+    }
+    if !e.enabled {
+        flags.push_str(" disabled");
+    }
+    if e.state.scrollable {
+        flags.push_str(" scrollable");
+    }
+    if e.state.editable {
+        flags.push_str(" editable");
+    }
+    if e.state.checkable {
+        flags.push_str(if e.state.checked {
+            " checked"
+        } else {
+            " unchecked"
+        });
+    }
+    if e.state.wheel {
+        flags.push_str(" wheel");
+    }
+    if e.state.selected {
+        flags.push_str(" selected");
+    }
+    if e.state.focused {
+        flags.push_str(" focused");
+    }
+    format!(
+        "[{}] {} {}{} center=({},{})",
+        e.index, e.class, label, flags, e.center.0, e.center.1
+    )
 }
 
 // ── Targets ────────────────────────────────────────────────────────────────
@@ -4276,13 +4403,14 @@ pub struct UiDump {
     /// It is what the outward pacing is bucketed by: two sends to the same app
     /// belong to the same history whether or not the screen changed.
     pub package: Option<String>,
-    /// A name for *this reading*, quoted back by a later call.
+    /// The name of *the screen this read saw*, quoted back by a later call.
     ///
-    /// Not a change detector and not a version of the app: it identifies the
-    /// enumeration the indices in this dump belong to, so a call can say which
-    /// read it was working from. Every read gets its own name, because two
-    /// reads of the same screen are still two different enumerations to a
-    /// caller holding indices from one of them. An element *key* is what
+    /// It is the tree's fingerprint in hex, so two reads of an unchanged screen
+    /// carry the same name — which is what makes it usable as the `since`
+    /// baseline of an incremental read ([`super::diff`]). It is not a version
+    /// of the app, and it is not what an *index* refers to: indices belong to
+    /// one enumeration, so a caller holding them is working from this read
+    /// whether or not the screen has changed since. An element *key* is what
     /// survives the screen changing.
     pub snapshot: String,
     /// The source capped the node list, so this tree is a prefix of the screen.
@@ -4296,15 +4424,17 @@ pub struct UiDump {
 
 /// Name a reading of the tree.
 ///
-/// The fingerprint alone would collide between two screens with the same
-/// elements, and a plain hash would make two identical reads look like
-/// different snapshots, which is the case a caller most often has right after
-/// an action that changed nothing. Numbering them monotonically makes "the
-/// snapshot I was told about" a fact rather than a guess.
+/// The name *is* the fingerprint, in hex: two reads with the same elements get
+/// the same name, which is what makes a name usable as the baseline for
+/// [`super::diff`] — a later read can ask "what changed since this screen".
+/// A read counter was the obvious alternative and is wrong: it would name the
+/// same screen differently every time, so a caller diffing against it would
+/// always be comparing with a baseline that cannot be found.
+///
+/// It is still not a version of the app, and still not what an *index* refers
+/// to: indices belong to one enumeration. `key` is what survives a change.
 fn snapshot_name(fingerprint: u64) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    format!("s{}-{fingerprint:x}", NEXT.fetch_add(1, Ordering::Relaxed))
+    format!("{fingerprint:x}")
 }
 
 pub(super) async fn dump_ui_elements(
@@ -4335,13 +4465,20 @@ pub(super) async fn dump_ui(
             .map_err(|message| DumpFailure::new(DISPLAY_TREE_UNAVAILABLE, message))?;
         return match super::a11y::fetch(&bridge, Some(id)).await {
             Ok(snapshot) => {
-                let snapshot_id = snapshot_name(tree_fingerprint(&snapshot.elements));
+                let fingerprint = tree_fingerprint(&snapshot.elements);
+                crate::computer::platform::mobile::diff::remember(
+                    device.as_deref(),
+                    target.display_id(),
+                    fingerprint,
+                    snapshot.package.as_deref(),
+                    &snapshot.elements,
+                );
                 Ok(UiDump {
                     elements: snapshot.elements,
                     screen: snapshot.display,
                     source: "accessibility",
                     package: snapshot.package,
-                    snapshot: snapshot_id,
+                    snapshot: snapshot_name(fingerprint),
                     truncated: snapshot.truncated,
                 })
             }
@@ -4359,13 +4496,20 @@ pub(super) async fn dump_ui(
         if let Some(bridge) = crate::device::bridge() {
             match super::a11y::fetch(bridge, None).await {
                 Ok(snapshot) if snapshot.is_addressable() => {
-                    let snapshot_id = snapshot_name(tree_fingerprint(&snapshot.elements));
+                    let fingerprint = tree_fingerprint(&snapshot.elements);
+                    crate::computer::platform::mobile::diff::remember(
+                        device.as_deref(),
+                        target.display_id(),
+                        fingerprint,
+                        snapshot.package.as_deref(),
+                        &snapshot.elements,
+                    );
                     return Ok(UiDump {
                         elements: snapshot.elements,
                         screen: snapshot.display,
                         source: "accessibility",
                         package: snapshot.package,
-                        snapshot: snapshot_id,
+                        snapshot: snapshot_name(fingerprint),
                         truncated: snapshot.truncated,
                     });
                 }
@@ -4392,13 +4536,21 @@ pub(super) async fn dump_ui(
             format!("Could not read the UI tree: the dump did not parse ({source})"),
         )
     })?;
-    let snapshot_id = snapshot_name(tree_fingerprint(&elements));
+    let fingerprint = tree_fingerprint(&elements);
+    let package = parse_package(&xml);
+    crate::computer::platform::mobile::diff::remember(
+        device.as_deref(),
+        target.display_id(),
+        fingerprint,
+        package.as_deref(),
+        &elements,
+    );
     Ok(UiDump {
         elements,
         screen: parse_screen_bounds(&xml),
         source: "uiautomator",
-        package: parse_package(&xml),
-        snapshot: snapshot_id,
+        package,
+        snapshot: snapshot_name(fingerprint),
         // The dump writes what the window held; it has no cap of its own.
         truncated: false,
     })
@@ -4457,13 +4609,16 @@ impl Tool for AdbUiTreeTool {
          containers are omitted. The result says how much of the screen the tree actually \
          describes (quality: usable / partial / unusable); when it is not usable this reads the \
          screenshot with OCR instead and returns those lines, so do not re-read hoping for more — \
-         act on the OCR text or the coordinates it gives."
+         act on the OCR text or the coordinates it gives. Pass `since` with the snapshot of an \
+         earlier read to get only what changed — the rows that appeared, left or moved — instead \
+         of the whole screen."
     }
 
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Get Android UI tree",
             serde_json::json!({
+                "since": { "type": "string", "description": SINCE_PARAM },
                 "display": { "type": "integer", "description": DISPLAY_PARAM },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
@@ -4487,6 +4642,7 @@ impl Tool for AdbUiTreeTool {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
+        let since = super::diff::since_arg(&args).map(str::to_string);
         let dump = match dump_ui(&device, target).await {
             Ok(dump) => dump,
             Err(failure) => {
@@ -4494,6 +4650,20 @@ impl Tool for AdbUiTreeTool {
                     .with_data(serde_json::json!({ "code": failure.code })))
             }
         };
+        if let Some(answer) = since_answer(device.as_deref(), target, since.as_deref(), &dump) {
+            let (text, data) = match answer {
+                SinceAnswer::Delta { text, data } => (text, data),
+                SinceAnswer::Full(reason) => {
+                    (format!("{} {}", reason.describe(), format_ui_summary(&dump.elements)), {
+                        let mut data = since_fallback(reason);
+                        data["elements"] = serde_json::json!(dump.elements);
+                        data["snapshot"] = serde_json::json!(dump.snapshot);
+                        data
+                    })
+                }
+            };
+            return Ok(ToolExecutionResult::success(text).with_data(data));
+        }
         let elements = dump.elements;
         let quality = assess_tree(&elements);
         let mut summary = format_ui_summary(&elements);
@@ -5540,6 +5710,124 @@ mod tests {
             true,
             bounds,
         )
+    }
+
+    // ── Incremental reads ──────────────────────────────────────────────
+
+    fn row(index: usize, key: &str, y: i32) -> UiElement {
+        let mut element = node("android.widget.TextView", Some(key), (0, y, 200, y + 80));
+        element.index = index;
+        element.key = key.to_string();
+        element
+    }
+
+    fn ui_dump(elements: Vec<UiElement>, package: &str) -> UiDump {
+        let fingerprint = tree_fingerprint(&elements);
+        UiDump {
+            elements,
+            screen: Some((1080, 2340)),
+            source: "accessibility",
+            package: Some(package.to_string()),
+            snapshot: snapshot_name(fingerprint),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_is_the_same_name_for_the_same_screen() {
+        // Diffing against a name only works if the name is the screen, not the
+        // enumeration: two identical reads must be the same baseline.
+        let first = ui_dump(
+            vec![node("android.widget.TextView", Some("a"), (0, 0, 100, 50))],
+            "com.example",
+        );
+        let second = ui_dump(
+            vec![node("android.widget.TextView", Some("a"), (0, 0, 100, 50))],
+            "com.example",
+        );
+        assert_eq!(first.snapshot, second.snapshot);
+        // And different screens must not share one.
+        let other = ui_dump(
+            vec![node("android.widget.TextView", Some("b"), (0, 0, 100, 50))],
+            "com.example",
+        );
+        assert_ne!(first.snapshot, other.snapshot);
+    }
+
+    #[test]
+    fn no_since_means_a_full_read() {
+        let dump = ui_dump(vec![node("android.widget.TextView", Some("a"), (0, 0, 100, 50))], "x");
+        assert!(since_answer(None, Target::Screen, None, &dump).is_none());
+    }
+
+    #[test]
+    fn a_named_previous_read_yields_only_what_changed() {
+        let before = vec![row(1, "a", 0), row(2, "b", 80)];
+        crate::computer::platform::mobile::diff::remember(
+            None,
+            0,
+            tree_fingerprint(&before),
+            Some("com.example"),
+            &before,
+        );
+        let after = vec![row(1, "a", 0), row(2, "b", 80), row(3, "c", 160)];
+        let dump = ui_dump(after, "com.example");
+        // The baseline name is the fingerprint of the *earlier* read.
+        let since = format!("{:x}", tree_fingerprint(&before));
+        let answer = since_answer(None, Target::Screen, Some(&since), &dump).expect("an answer");
+        match answer {
+            SinceAnswer::Delta { text, data } => {
+                assert!(text.contains("1 appeared"), "{text}");
+                let added = data["diff"]["added"].as_u64().expect("a count");
+                assert_eq!(added, 1);
+                // Only the new row is addressable now, so only it is listed.
+                let listed = data["elements"].as_array().expect("rows");
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0]["key"], "c");
+                assert_eq!(data["baseline"], true);
+            }
+            SinceAnswer::Full(reason) => panic!("expected a delta, got {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_baseline_falls_back_and_says_why() {
+        let dump = ui_dump(vec![node("android.widget.TextView", Some("a"), (0, 0, 100, 50))], "x");
+        let answer =
+            since_answer(None, Target::Screen, Some("deadbeef"), &dump).expect("an answer");
+        match answer {
+            SinceAnswer::Full(reason) => {
+                assert_eq!(reason, crate::computer::platform::mobile::diff::FullReason::NoBaseline);
+                assert!(reason.describe().contains("whole screen"));
+            }
+            SinceAnswer::Delta { .. } => panic!("expected a fallback"),
+        }
+    }
+
+    #[test]
+    fn a_different_app_is_not_compared() {
+        let before = vec![row(1, "a", 0)];
+        crate::computer::platform::mobile::diff::remember(
+            None,
+            0,
+            0x1234,
+            Some("com.one"),
+            &before,
+        );
+        let dump = ui_dump(vec![row(1, "a", 0)], "com.two");
+        let answer = since_answer(None, Target::Screen, Some("1234"), &dump).expect("an answer");
+        assert!(matches!(
+            answer,
+            SinceAnswer::Full(crate::computer::platform::mobile::diff::FullReason::AppChanged)
+        ));
+    }
+
+    #[test]
+    fn a_fallback_names_its_reason_in_the_data() {
+        let data =
+            since_fallback(crate::computer::platform::mobile::diff::FullReason::MostlyChanged);
+        assert_eq!(data["baseline"], false);
+        assert_eq!(data["fallback"], "mostly_changed");
     }
 
     #[test]
