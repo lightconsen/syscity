@@ -1204,6 +1204,14 @@ impl Tool for AdbInputTool {
         // (an app that lands there has to be told apart from one the user
         // opened). Both are only worth taking on a display, where the action
         // is not supposed to touch the user's screen at all.
+        //
+        // The user's own screen is different: the only way to see its pixels is
+        // a raw `screencap`, a second ADB round trip carrying ~10 MB, and an
+        // action on it has no spill to watch for. So its picture is taken only
+        // when the tree has already said "unchanged" — after the action, once
+        // — and the tree is read again from that same moment. The cost is one
+        // extra round trip and one extra read, and only on the path where
+        // without them the answer would have been a bare "unchanged".
         let watched = match target {
             Target::Display(id) if verify => {
                 let pixels = display_pixels(id).await;
@@ -1232,124 +1240,116 @@ impl Tool for AdbInputTool {
             _ => None,
         };
 
-        match target {
-            Target::Screen => {
-                if let InputOp::Gesture { .. } = &op {
-                    // `input` has no multi-finger form at all, and the
-                    // accessibility service is the only thing that could
-                    // dispatch one — but only to a display it owns. Saying so
-                    // beats sending one finger of a pinch.
-                    return Ok(ToolExecutionResult::error(
-                        "Multi-finger gestures are only dispatched on a second display \
+        // Whether the text went in by clipboard rather than by keystrokes —
+        // the result says which, because the two fail in different ways.
+        let pasted =
+            match target {
+                Target::Screen => {
+                    if let InputOp::Gesture { .. } = &op {
+                        // `input` has no multi-finger form at all, and the
+                        // accessibility service is the only thing that could
+                        // dispatch one — but only to a display it owns. Saying so
+                        // beats sending one finger of a pinch.
+                        return Ok(ToolExecutionResult::error(
+                            "Multi-finger gestures are only dispatched on a second display \
                          (android_display start). On the user's screen use 'swipe', or run the \
                          task on a display where the gesture can be sent properly.",
-                    ));
-                }
-                let shell_cmd =
-                    match &op {
-                        // Rejected above: no shell form exists for two fingers.
-                        InputOp::Gesture { .. } => {
-                            return Ok(ToolExecutionResult::error(
+                        ));
+                    }
+                    // Set when the text went in by clipboard paste rather than by
+                    // `input text`: the result line says so, and the readback below
+                    // is the only confirmation a paste gets.
+                    let mut pasted = false;
+                    let shell_cmd =
+                        match &op {
+                            // Rejected above: no shell form exists for two fingers.
+                            InputOp::Gesture { .. } => return Ok(ToolExecutionResult::error(
                                 "Multi-finger gestures are only dispatched on a second display \
                              (android_display start).",
-                            ))
-                        }
-                        InputOp::Taps(steps) => encode_tap_sequence(steps),
-                        InputOp::Swipe { from, to } => {
-                            format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
-                        }
-                        InputOp::Key(keycode) => format!("input keyevent {keycode}"),
-                        InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
-                        InputOp::Text(text) => {
-                            if self.adbkeyboard_is_active(&device).await {
-                                // ADBKeyboard takes the text base64-encoded over a
-                                // broadcast, which carries any character the device
-                                // can render.
-                                let payload = base64::Engine::encode(
-                                    &base64::engine::general_purpose::STANDARD,
-                                    text.as_bytes(),
-                                );
-                                format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
-                            } else {
-                                // Two ways without ADBKeyboard, tried in that order:
-                                // the app's own helper (uid 2000, which can inject
-                                // Ctrl+V on the user's screen and can put the
-                                // person's clipboard back afterwards), and nothing.
-                                //
-                                // `input text` types through the device's key
-                                // character map, so non-ASCII (CJK in particular)
-                                // comes out dropped or mangled. Failing loudly is
-                                // still better than silently typing the wrong thing
-                                // — but only once the paste has been ruled out.
-                                match paste_on_user_screen(text).await {
-                                    Ok(()) => {
-                                        return Ok(ToolExecutionResult::success(format!(
-                                            "Typed {} character(s) by pasting them — `input text` \
-                                         cannot carry non-ASCII text. The person's own clipboard \
-                                         was put back.",
-                                            text.chars().count()
-                                        ))
-                                        .with_data(serde_json::json!({
-                                            "device": resolved_serial(&device).await,
-                                            "effect": "unverified",
-                                            "input": "clipboard",
-                                        })))
-                                    }
-                                    Err(_) => {
-                                        return Ok(ToolExecutionResult::error(
+                            )),
+                            InputOp::Taps(steps) => encode_tap_sequence(steps),
+                            InputOp::Swipe { from, to } => {
+                                format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
+                            }
+                            InputOp::Key(keycode) => format!("input keyevent {keycode}"),
+                            InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
+                            InputOp::Text(text) => {
+                                if self.adbkeyboard_is_active(&device).await {
+                                    // ADBKeyboard takes the text base64-encoded over a
+                                    // broadcast, which carries any character the device
+                                    // can render.
+                                    let payload = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        text.as_bytes(),
+                                    );
+                                    format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
+                                } else {
+                                    // Two ways without ADBKeyboard, tried in that order:
+                                    // the app's own helper (uid 2000, which can inject
+                                    // Ctrl+V on the user's screen and can put the
+                                    // person's clipboard back afterwards), and nothing.
+                                    //
+                                    // `input text` types through the device's key
+                                    // character map, so non-ASCII (CJK in particular)
+                                    // comes out dropped or mangled. Failing loudly is
+                                    // still better than silently typing the wrong thing
+                                    // — but only once the paste has been ruled out.
+                                    match paste_on_user_screen(text).await {
+                                        Ok(()) => {
+                                            pasted = true;
+                                            String::new()
+                                        }
+                                        Err(_) => return Ok(ToolExecutionResult::error(
                                             "Cannot type non-ASCII text: `input text` only types \
                                          ASCII reliably, ADBKeyboard is not the active input \
                                          method, and the display helper is not available on this \
                                          device to paste it. Install/enable ADBKeyboard \
                                          (com.android.adbkeyboard) and select it as the input \
                                          method, or keep the text ASCII.",
-                                        ))
+                                        )),
                                     }
                                 }
                             }
+                        };
+                    if !pasted {
+                        let argv = adb_args(&device, &["shell", &shell_cmd]);
+                        let (status, _stdout, stderr) =
+                            run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                .await
+                                .map_err(|e| crate::error::SyscityError::ExternalService {
+                                    source: "adb input failed".to_string(),
+                                    cause: Some(Box::new(e)),
+                                })?;
+                        if !status.success() {
+                            return Ok(ToolExecutionResult::error(format!(
+                                "adb input failed: {stderr}"
+                            )));
                         }
-                    };
-                let argv = adb_args(&device, &["shell", &shell_cmd]);
-                let (status, _stdout, stderr) =
-                    run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                        .await
-                        .map_err(|e| crate::error::SyscityError::ExternalService {
-                            source: "adb input failed".to_string(),
-                            cause: Some(Box::new(e)),
-                        })?;
-                if !status.success() {
-                    return Ok(ToolExecutionResult::error(format!("adb input failed: {stderr}")));
+                    }
+                    pasted
                 }
-            }
-            Target::Display(id) => {
-                if let InputOp::Text(text) = &op {
-                    if !text.is_ascii() {
-                        // `input -d text` goes through the key character map and
-                        // mangles anything outside ASCII. The helper's clipboard
-                        // paste carries whatever the app can render, and puts
-                        // the user's own clipboard back afterwards.
-                        if let Err(message) = paste_on_display(id, text).await {
+                Target::Display(id) => {
+                    let mut pasted = false;
+                    if let InputOp::Text(text) = &op {
+                        if !text.is_ascii() {
+                            // `input -d text` goes through the key character map and
+                            // mangles anything outside ASCII. The helper's clipboard
+                            // paste carries whatever the app can render, and puts
+                            // the user's own clipboard back afterwards.
+                            if let Err(message) = paste_on_display(id, text).await {
+                                return Ok(ToolExecutionResult::error(message));
+                            }
+                            pasted = true;
+                        }
+                    }
+                    if !pasted {
+                        if let Err(message) = dispatch_display(id, &op).await {
                             return Ok(ToolExecutionResult::error(message));
                         }
-                        let serial = resolved_serial(&device).await;
-                        return Ok(ToolExecutionResult::success(format!(
-                            "Typed {} character(s) on display {id} by pasting them — `input -d \
-                             text` cannot carry non-ASCII text.",
-                            text.chars().count()
-                        ))
-                        .with_data(serde_json::json!({
-                            "device": serial,
-                            "display": id,
-                            "effect": "unverified",
-                            "input": "clipboard",
-                        })));
                     }
+                    pasted
                 }
-                if let Err(message) = dispatch_display(id, &op).await {
-                    return Ok(ToolExecutionResult::error(message));
-                }
-            }
-        }
+            };
 
         // The action is now out. Record how far it reached, so the next one in
         // the same app is spaced like a person's would be. The package is the
@@ -1359,6 +1359,22 @@ impl Tool for AdbInputTool {
             Some(note_outward(before_package.as_deref()).await)
         } else {
             None
+        };
+
+        // A write is the one action whose *content* can be checked, and "the
+        // shell accepted the keystrokes" is not "the field holds the text" — a
+        // message that never lands is the failure mode that matters. Read it
+        // back here, before the settle re-read: if the text opened a suggestion
+        // list, the field is still there now and may not be after settling.
+        let readback = match (&op, verify) {
+            (InputOp::Text(the_text), true) => {
+                Some(read_back_write(&device, target, the_text, before.as_deref()).await)
+            }
+            _ => None,
+        };
+        let text_len = match &op {
+            InputOp::Text(the_text) => the_text.chars().count(),
+            _ => 0,
         };
 
         let serial = resolved_serial(&device).await;
@@ -1372,6 +1388,13 @@ impl Tool for AdbInputTool {
                 super::guard::Outcome::Unknown,
             );
             let mut text = format!("Input '{action}' sent (effect not checked).");
+            if pasted {
+                text.push_str(&format!(
+                    " The text went in by clipboard paste ({} character(s)) — `input text` \
+                     cannot carry non-ASCII text. The person's own clipboard was put back.",
+                    text_len
+                ));
+            }
             if let Some(note) = snapshot_note {
                 text.push_str(&format!(" {note}"));
             }
@@ -1394,15 +1417,54 @@ impl Tool for AdbInputTool {
         // Judge the effect here rather than leaving it to the model: a dispatch
         // that was accepted says nothing about whether the tap landed.
         let before_fingerprint = before.as_ref().map(|elements| tree_fingerprint(elements));
+        let before_copy = before
+            .as_ref()
+            .map(|elements| (before_fingerprint.unwrap_or_default(), elements.clone()));
         let before_pixels = watched.as_ref().and_then(|(pixels, _)| pixels.as_ref());
-        let settle = settle_after_action_with_pixels(
+        let mut settle = settle_after_action_with_pixels_from(
             &device,
             target,
-            before_fingerprint,
+            before_copy,
             before_pixels,
             settle_budget,
         )
         .await;
+
+        // The tree said nothing changed, and on the user's own screen there was
+        // no before-frame to compare against. Some screens — a game, a map, a
+        // camera preview — change without changing what the tree exposes, so
+        // "unchanged" there is not yet an answer. Take the picture once, and
+        // only now: this is a raw `screencap`, a second ADB round trip of ~10 MB,
+        // and paying it for every tap would make every tap twice as slow for an
+        // answer only canvases need. Two reads a moment apart are enough to
+        // tell a picture that moved from one that blinked (a cursor, a clock).
+        if matches!(target, Target::Screen)
+            && settle.effect == EFFECT_UNCHANGED
+            && before_package.is_some()
+        {
+            if let Some(first) = user_screen_signature(&device).await {
+                tokio::time::sleep(std::time::Duration::from_millis(SETTLE_POLL_MS)).await;
+                if let Some(second) = user_screen_signature(&device).await {
+                    settle.pixel_changed = Some(first.differs(&second));
+                    if settle.pixel_changed == Some(true) {
+                        settle.effect = EFFECT_SMALL_CHANGE;
+                    }
+                }
+            }
+        }
+
+        // Now that both reads are in hand, the place-change question can be
+        // answered — it needs the package from *before* the action, which only
+        // this call has.
+        if settle.effect != EFFECT_UNKNOWN {
+            if let (Some(before), Some(after)) =
+                (before_package.as_deref(), settle.package.as_deref())
+            {
+                if before != after {
+                    settle.effect = EFFECT_PLACE_CHANGED;
+                }
+            }
+        }
 
         // The ladder learns what this did. It counts the screen's answer, not
         // the action's: three different taps that all leave the same screen are
@@ -1410,6 +1472,16 @@ impl Tool for AdbInputTool {
         super::guard::Guard::global().record(&guard_key, &signature, guard_outcome(settle.effect));
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+        if pasted {
+            text.push_str(&format!(
+                " The text went in by clipboard paste ({} character(s)) — `input text` cannot \
+                 carry non-ASCII text.",
+                text_len
+            ));
+        }
+        if let Some(note) = readback_note(readback.as_ref()) {
+            text.push_str(&format!(" {note}"));
+        }
         if let Some(note) = snapshot_note {
             text.push_str(&format!(" {note}"));
         }
@@ -1483,6 +1555,11 @@ impl Tool for AdbInputTool {
             })).collect::<Vec<_>>(),
             "settled_ms": settle.elapsed_ms,
             "elements": settle.elements,
+            "readback": readback.as_ref().map(|read| serde_json::json!({
+                "verdict": read.verdict,
+                "actual": read.actual,
+                "note": read.note,
+            })),
             "risk": clearance.note(),
             "risk_approved": clearance.asked,
             "paced": pace_note,
@@ -1521,6 +1598,103 @@ pub(super) async fn note_outward(package: Option<&str>) -> String {
 
 // ── ADB App Manager Tool ───────────────────────────────────────────────────
 
+/// How long `am start -W` may wait for the activity to report idle.
+///
+/// `-W` is what turns "the command was dispatched" into "the app is up", and
+/// the cost of that is paid by the device lock this call holds. An app that
+/// never reports idle would otherwise hold the lock forever: `ProcessRequest`
+/// defaults to `timeout: None`, which means exactly that, so the timeout is
+/// not optional here.
+const LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a `resolve-activity` / `monkey` probe may take.
+///
+/// Neither waits on an app, so a tight bound is right: this is a lookup, and a
+/// lookup that has not answered in ten seconds has failed.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Parse the `-brief` output of `cmd package resolve-activity`.
+///
+/// The command prints the component as the last non-empty line
+/// (`com.example/.MainActivity`) after a `priority=…` line and, on some
+/// releases, a `packageName=…` line. Returning the input verbatim when no
+/// component-shaped line is found is deliberate: the caller then falls back to
+/// `monkey` instead of launching whatever word happened to be first.
+pub(super) fn parse_resolve_activity(stdout: &str) -> Option<String> {
+    // `-brief` output is one line on API 26+, but older platform builds print
+    // `priority=N`/`packageName=…` preamble as well, so scan for the shape
+    // rather than trusting the last line.
+    for line in stdout.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("priority=") || line.starts_with("packageName=") {
+            continue;
+        }
+        // A component is `package/class` (or `package/package.class`).
+        let (pkg, class) = match line.split_once('/') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if pkg.is_empty() || class.is_empty() || pkg.contains(' ') {
+            continue;
+        }
+        return Some(line.to_string());
+    }
+    None
+}
+
+/// What `am start -W` said about the launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LaunchOutcome {
+    /// `Status: ok` — the activity is up.
+    Started,
+    /// The task was already in front; Android reports this on stderr and does
+    /// not start the activity again. The app *is* on screen, so this counts as
+    /// a success even though no `Status:` line appears.
+    AlreadyInFront,
+    /// `Error: …`, or `Status:` with something other than `ok`.
+    Failed,
+    /// No recognisable status: the command exited zero but said nothing about
+    /// the activity. Reported as unknown rather than assumed to be fine.
+    Unknown,
+}
+
+/// The phrase Android prints instead of `Status:` when the task is already top.
+const BROUGHT_TO_FRONT: &str =
+    "Warning: Activity not started, its current task has been brought to the front";
+
+/// Read the verdict out of `am start -W`'s combined output.
+///
+/// Both streams are passed in because the "already in front" warning goes to
+/// stderr on some releases and stdout on others, and an `Error:` line is what
+/// decides failure — a `Status: ok` that follows an `Error:` in the same run
+/// must not mask it.
+pub(super) fn parse_am_start_output(stdout: &str, stderr: &str) -> LaunchOutcome {
+    let combined = format!("{stdout}\n{stderr}");
+    for line in combined.lines() {
+        let line = line.trim();
+        if line.starts_with("Error:") || line.starts_with("Exception:") {
+            return LaunchOutcome::Failed;
+        }
+        if line.contains(BROUGHT_TO_FRONT) {
+            return LaunchOutcome::AlreadyInFront;
+        }
+        if let Some(rest) = line.strip_prefix("Status:") {
+            // `Status: ok` / `Status: timeout` / `Status: warning`
+            return if rest.trim().eq_ignore_ascii_case("ok") {
+                LaunchOutcome::Started
+            } else {
+                LaunchOutcome::Failed
+            };
+        }
+        if let Some(rest) = line.strip_prefix("Activity:") {
+            // `Activity: com.example/.Main` — the launch reached the activity
+            // manager, but this is not itself a verdict; keep scanning.
+            let _ = rest;
+        }
+    }
+    LaunchOutcome::Unknown
+}
+
 /// Install, launch, force-stop, and list Android apps.
 #[derive(Debug)]
 pub struct AdbAppManagerTool {
@@ -1541,6 +1715,201 @@ impl AdbAppManagerTool {
     pub fn with_device(mut self, device: String) -> Self {
         self.device = Some(device);
         self
+    }
+
+    /// Launch `package`, resolving its entry point instead of guessing.
+    ///
+    /// The old code sent `am start -n pkg/.MainActivity` whenever the caller did
+    /// not name an activity, which is true of almost no app: the launcher entry
+    /// is whatever the app declares, often `…ui.LauncherActivity` or a
+    /// Flutter/Compose shell that is not called `MainActivity` at all. So:
+    ///
+    /// 1. `cmd package resolve-activity --brief -c android.intent.category.LAUNCHER`
+    ///    — what the system itself would open. The `-c` is load-bearing: without
+    ///    the category this resolves the *default* activity, which may be an
+    ///    activity with no launcher entry at all.
+    /// 2. `monkey -p <pkg> 1`, which asks the launcher machinery to open the
+    ///    app's main entry. It exists precisely for the case where the package
+    ///    manager cannot name a component.
+    /// 3. Only then report `launch_no_entry`.
+    ///
+    /// The start itself uses `-W` and parses the verdict, because "the command
+    /// was dispatched" and "the app is on screen" are different facts and the
+    /// caller is about to act on the second one. `-W` waits for the activity to
+    /// report idle, which some apps take seconds to do — hence [`LAUNCH_TIMEOUT`]
+    /// rather than the default (unbounded) process timeout.
+    async fn launch(
+        &self,
+        device: &Option<String>,
+        args: &Value,
+    ) -> crate::Result<ToolExecutionResult> {
+        let pkg = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
+        if pkg.trim().is_empty() {
+            return Ok(ToolExecutionResult::error("launch needs `package` — the app to start"));
+        }
+
+        let component = match args.get("activity").and_then(|v| v.as_str()) {
+            Some(a) if !a.trim().is_empty() => Some(format!("{}/{}", pkg, a.trim())),
+            Some(_) => Some(format!("{}/{}", pkg, ".MainActivity")),
+            None => self.resolve_component(device, pkg).await,
+        };
+
+        let Some(component) = component else {
+            return Ok(ToolExecutionResult::error(format!(
+                "launch_no_entry: no launcher activity found for `{pkg}` — it may have none \
+                 (a service, a shortcut-only app), or it may not be installed. \
+                 `android_app_manager action=list_packages` shows what is."
+            ))
+            .with_data(serde_json::json!({
+                "device": resolved_serial(device).await,
+                "reason": "launch_no_entry",
+            })));
+        };
+
+        let argv = adb_args(device, &["shell", "am", "start", "-W", "-n", &component]);
+        let outcome = super::run_cmd_timeout(
+            "adb",
+            &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            LAUNCH_TIMEOUT,
+        )
+        .await;
+
+        let (verdict, detail, timed_out) = match outcome {
+            super::RunOutcome::Finished { status, stdout, stderr } => {
+                let _ = status;
+                let verdict = parse_am_start_output(&stdout, &stderr);
+                let detail = if stderr.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    format!("{}\n{}", stdout.trim(), stderr.trim())
+                };
+                (verdict, detail, false)
+            }
+            super::RunOutcome::TimedOut { stdout, stderr } => (
+                LaunchOutcome::Unknown,
+                format!(
+                    "no answer within {} ms (the launch may still complete)\n{}\n{}",
+                    LAUNCH_TIMEOUT.as_millis(),
+                    stdout.trim(),
+                    stderr.trim()
+                ),
+                true,
+            ),
+            super::RunOutcome::Failed(why) => {
+                return Ok(ToolExecutionResult::error(format!("could not run `adb`: {why}")))
+            }
+        };
+
+        // "Already in front" is Android declining to restart an app that is
+        // already open. The app is on screen, which is all the caller asked for.
+        let started = matches!(verdict, LaunchOutcome::Started | LaunchOutcome::AlreadyInFront);
+        let sentence = match verdict {
+            LaunchOutcome::Started => format!("`{pkg}` is up ({component})."),
+            LaunchOutcome::AlreadyInFront => {
+                format!("`{pkg}` was already in front; Android did not restart it ({component}).")
+            }
+            LaunchOutcome::Failed => format!("launch failed for `{pkg}` ({component})."),
+            LaunchOutcome::Unknown if timed_out => format!(
+                "`adb` did not confirm `{pkg}` within {} ms; it may still come up. Observe before acting.",
+                LAUNCH_TIMEOUT.as_millis()
+            ),
+            LaunchOutcome::Unknown => format!(
+                "`adb` exited without a status for `{pkg}`; observe before acting."
+            ),
+        };
+
+        let status_word = match verdict {
+            LaunchOutcome::Started => "ok",
+            LaunchOutcome::AlreadyInFront => "already_in_front",
+            LaunchOutcome::Failed => "error",
+            LaunchOutcome::Unknown => "unknown",
+        };
+        let data = serde_json::json!({
+            "device": resolved_serial(device).await,
+            "component": component,
+            "launched": started,
+            "timed_out": timed_out,
+            "status": status_word,
+        });
+
+        Ok(if started {
+            ToolExecutionResult::success(format!("{sentence}\n{detail}")).with_data(data)
+        } else {
+            ToolExecutionResult::error(format!("{sentence}\n{detail}")).with_data(data)
+        })
+    }
+
+    /// Ask the phone which activity `package` launches through.
+    ///
+    /// Tries the package manager first, then `monkey`, which is the launcher's
+    /// own entry path. Both are read-only probes on a bounded clock: a lookup
+    /// that has not answered in ten seconds has failed.
+    async fn resolve_component(&self, device: &Option<String>, pkg: &str) -> Option<String> {
+        let argv = adb_args(
+            device,
+            &[
+                "shell",
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-c",
+                "android.intent.category.LAUNCHER",
+                pkg,
+            ],
+        );
+        if let super::RunOutcome::Finished { status, stdout, .. } = super::run_cmd_timeout(
+            "adb",
+            &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            PROBE_TIMEOUT,
+        )
+        .await
+        {
+            if status.success() {
+                if let Some(component) = parse_resolve_activity(&stdout) {
+                    return Some(component);
+                }
+            }
+            // `Error: …` on stdout is how the package manager says it could not
+            // resolve; it is not worth logging, `monkey` is the next answer.
+        }
+
+        // `monkey -p pkg 1` prints the component it chose in its events dump.
+        let argv = adb_args(
+            device,
+            &[
+                "shell",
+                "monkey",
+                "-p",
+                pkg,
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1",
+            ],
+        );
+        if let super::RunOutcome::Finished { stdout, .. } = super::run_cmd_timeout(
+            "adb",
+            &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            PROBE_TIMEOUT,
+        )
+        .await
+        {
+            // `  // com.example/.MainActivity` — the chosen component, indented
+            // under `cmp=`. Older releases print it as `cmp=com.example/.MainActivity`.
+            for line in stdout.lines() {
+                let line = line.trim();
+                let candidate = line
+                    .strip_prefix("// ")
+                    .or_else(|| line.strip_prefix("cmp="))
+                    .unwrap_or(line);
+                if let Some((p, c)) = candidate.split_once('/') {
+                    if p == pkg && !c.is_empty() && !c.contains(' ') {
+                        return Some(candidate.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -1587,19 +1956,17 @@ impl Tool for AdbAppManagerTool {
         let _target = lock_device(&device).await;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
+        // `launch` is not a plain argv: it has to find the entry point, which is
+        // a query of its own, and then wait for the activity. It reports what it
+        // learned rather than a single line of stdout.
+        if action == "launch" {
+            return self.launch(&device, &args).await;
+        }
+
         let argv = match action {
             "install" => {
                 let path = args.get("apk_path").and_then(|v| v.as_str()).unwrap_or("");
                 adb_args(&device, &["install", "-r", path])
-            }
-            "launch" => {
-                let pkg = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
-                let activity = args.get("activity").and_then(|v| v.as_str());
-                let component = match activity {
-                    Some(a) => format!("{}/{}", pkg, a),
-                    None => format!("{}/.MainActivity", pkg),
-                };
-                adb_args(&device, &["shell", "am", "start", "-n", &component])
             }
             "force_stop" => {
                 let pkg = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
@@ -1653,6 +2020,68 @@ impl AdbUiTreeTool {
     }
 }
 
+/// What a node *is*, as opposed to what it says.
+///
+/// Separate from [`UiElement`] and deliberately outside [`element_key`]: these
+/// are states that change while the element stays the same element (a checkbox
+/// gets ticked, a field takes focus). Identity must not move when they do.
+///
+/// Two sources fill this in: the accessibility service hands most of it over
+/// directly (`A11yBridge.kt`), and `uiautomator dump` carries the same
+/// attributes for everything except `editable`, which is inferred from the
+/// class because the XML has no such attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct NodeState {
+    /// The node itself scrolls — a list, a pager, a wheel picker.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub scrollable: bool,
+    /// Text can be typed into it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub editable: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub checkable: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub selected: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub focused: bool,
+    /// A password field: its contents must never be summarised to the model.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub password: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub long_clickable: bool,
+    /// `ACTION_SCROLL_FORWARD` / `ACTION_SCROLL_BACKWARD` are available. A
+    /// scrollable node without them can only be moved by a gesture.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub scroll_forward: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub scroll_backward: bool,
+    /// Distance from the root of the read it came from.
+    ///
+    /// The element list is flat, so depth is the only surviving trace of the
+    /// hierarchy: it is what lets a scroll aim at the innermost list containing
+    /// the point rather than at any scrollable container on the screen.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub depth: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+impl NodeState {
+    /// The node is structurally meaningful without carrying a name.
+    ///
+    /// An unnamed clickable `View` is a tap target nobody described; an unnamed
+    /// list, field or toggle still tells the reader where it is and what can be
+    /// done there. [`assess_tree`] uses this so a blank-looking list screen is
+    /// not written off as undescribable.
+    pub fn is_structural(&self) -> bool {
+        self.scrollable || self.editable || self.checkable
+    }
+}
+
 /// One node of the Android accessibility tree, flattened for the model.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UiElement {
@@ -1678,6 +2107,9 @@ pub struct UiElement {
     pub class: String,
     pub clickable: bool,
     pub enabled: bool,
+    /// What the node is beyond its label — never part of its identity.
+    #[serde(flatten)]
+    pub state: NodeState,
     /// `(x1, y1, x2, y2)` in device pixels.
     pub bounds: (i32, i32, i32, i32),
     /// Centre of `bounds` — what a tap should target.
@@ -1689,6 +2121,10 @@ impl UiElement {
     ///
     /// Construction goes through here so a key can never be a stale copy of
     /// fields that were changed after it was computed.
+    ///
+    /// Test-only: both real sources know something about what the node is, so
+    /// they go through [`with_state`](Self::with_state).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         index: usize,
@@ -1698,6 +2134,32 @@ impl UiElement {
         class: String,
         clickable: bool,
         enabled: bool,
+        bounds: (i32, i32, i32, i32),
+    ) -> Self {
+        Self::with_state(
+            index,
+            text,
+            content_desc,
+            resource_id,
+            class,
+            clickable,
+            enabled,
+            NodeState::default(),
+            bounds,
+        )
+    }
+
+    /// [`new`](Self::new) for a source that also reports what the node is.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn with_state(
+        index: usize,
+        text: Option<String>,
+        content_desc: Option<String>,
+        resource_id: Option<String>,
+        class: String,
+        clickable: bool,
+        enabled: bool,
+        state: NodeState,
         bounds: (i32, i32, i32, i32),
     ) -> Self {
         let (x1, y1, x2, y2) = bounds;
@@ -1710,6 +2172,7 @@ impl UiElement {
             class,
             clickable,
             enabled,
+            state,
             bounds,
             center: ((x1 + x2) / 2, (y1 + y2) / 2),
         };
@@ -1794,7 +2257,8 @@ fn parse_bounds(raw: &str) -> Option<(i32, i32, i32, i32)> {
 /// Flatten a `uiautomator dump` document into an indexed element list.
 ///
 /// Only nodes the model can act on or read are kept — those with text, a
-/// content description or a resource id, plus clickable ones. Bare layout
+/// content description or a resource id, plus the ones that are actionable or
+/// structural (clickable, scrollable, editable, checkable). Bare layout
 /// containers carry nothing actionable and cost context, and the raw XML is
 /// ~10x the size of this list.
 ///
@@ -1811,13 +2275,27 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string)
         };
+        let flag = |key: &str| attr(key).as_deref() == Some("true");
         let text = attr("text");
         let content_desc = attr("content-desc");
         let resource_id = attr("resource-id");
-        let clickable = attr("clickable").as_deref() == Some("true");
-        let scrollable = attr("scrollable").as_deref() == Some("true");
+        let clickable = flag("clickable");
+        let long_clickable = flag("long-clickable");
+        let scrollable = flag("scrollable");
+        let checkable = flag("checkable");
+        let password = flag("password");
+        let class = attr("class")
+            .map(|c| c.rsplit('.').next().unwrap_or(&c).to_string())
+            .unwrap_or_default();
+        // The dump has no `editable` attribute; the class is the honest signal,
+        // and the same list `A11yBridge` reports through `isEditable` in
+        // practice. Text *content* is not evidence — a label is not a field.
+        let editable = matches!(
+            class.as_str(),
+            "EditText" | "AutoCompleteTextView" | "TextInputEditText" | "SearchView"
+        );
 
-        let actionable = clickable || scrollable;
+        let actionable = clickable || long_clickable || scrollable || checkable || editable;
         if text.is_none() && content_desc.is_none() && resource_id.is_none() && !actionable {
             continue;
         }
@@ -1825,11 +2303,23 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
             continue;
         };
 
-        let class = attr("class")
-            .map(|c| c.rsplit('.').next().unwrap_or(&c).to_string())
-            .unwrap_or_default();
+        let state = NodeState {
+            scrollable,
+            editable,
+            checkable,
+            checked: flag("checked"),
+            selected: flag("selected"),
+            focused: flag("focused"),
+            password,
+            long_clickable,
+            // uiautomator reports `scrollable` but not which directions, so a
+            // node it calls scrollable is assumed to accept both.
+            scroll_forward: scrollable,
+            scroll_backward: scrollable,
+            depth: node_depth(node),
+        };
 
-        out.push(UiElement::new(
+        out.push(UiElement::with_state(
             out.len() + 1,
             text,
             content_desc,
@@ -1837,10 +2327,27 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
             class,
             clickable,
             attr("enabled").as_deref() != Some("false"),
+            state,
             bounds,
         ));
     }
     Ok(out)
+}
+
+/// How many `node` ancestors a node has.
+///
+/// `uiautomator` nests every element in `<node>` elements all the way up, so
+/// counting ancestors is the depth. The bridge reports depth directly; both
+/// have to mean the same thing or a scroll would pick a different container
+/// depending on which source answered.
+fn node_depth(node: roxmltree::Node<'_, '_>) -> u32 {
+    node.ancestors()
+        // `ancestors()` starts at the node itself; the first real ancestor is
+        // its parent, and the root `node` element is depth 1 — the same as the
+        // bridge reports, where the root window is 0.
+        .skip(1)
+        .filter(|ancestor| ancestor.has_tag_name("node"))
+        .count() as u32
 }
 
 /// Capture the device screen as raw PNG bytes.
@@ -1884,8 +2391,127 @@ async fn capture_png(device: &Option<String>, target: Target) -> crate::Result<V
     Ok(stdout)
 }
 
-/// The screen rectangle a dump describes: the root `<node>`'s bounds.
+/// The user's screen as a brightness grid, for screens the tree cannot see.
 ///
+/// The helper's `frameSignature` only covers displays it created, so display 0
+/// has to come from `screencap` — and deliberately **without** `-p`. Without
+/// it `screencap` emits the raw framebuffer: some little-endian `u32` header
+/// fields (width, height, format, and from API 28 a colorspace) followed by
+/// `width * height * 4` bytes of RGBA. That is exactly what a 12×24 luma grid
+/// needs, and it costs no PNG decoder — which matters because the phone build
+/// has no `vision` feature and therefore no `image` crate.
+///
+/// The header length is derived rather than assumed (`12` on API 26/27, `16`
+/// on 28+), and the `format` field is checked: a non-RGBA_8888 frame would have
+/// the same length with a different byte layout, and reading it as RGBA would
+/// produce a grid of noise that "differs" every time.
+///
+/// This is a second ADB round trip, not free: 1080×2400 is ~10 MB uncompressed.
+/// Callers must treat it as the expensive path it is.
+async fn user_screen_signature(device: &Option<String>) -> Option<super::display::FrameSignature> {
+    let args = adb_args(device, &["exec-out", "screencap"]);
+    let (status, bytes, _stderr) =
+        run_cmd_bytes("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .await
+            .ok()?;
+    if !status.success() {
+        return None;
+    }
+    raw_screencap_signature(&bytes)
+}
+
+/// Turn a raw `screencap` frame into a brightness grid.
+///
+/// `None` when the frame is truncated, its format is not RGBA_8888, or its
+/// dimensions are too small to divide into a grid — every one of those is a
+/// reason not to guess about the picture rather than a reason to fail the
+/// action.
+fn raw_screencap_signature(frame: &[u8]) -> Option<super::display::FrameSignature> {
+    // API 26/27 write 12 bytes, API 28+ write 16. Both are ruled out by the
+    // pixel count, so the header length is whatever is left over. Sixteen is
+    // tried first: a 12-byte frame under a 16-byte reading is four bytes short
+    // and is rejected, while a 16-byte frame under a 12-byte reading is not —
+    // the leftover four bytes just shift the pixels, which is the one wrong
+    // answer this check exists to avoid.
+    const RGBA_8888: u32 = 1;
+    let read_u32 = |offset: usize| -> Option<u32> {
+        frame
+            .get(offset..offset + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    for header in [16usize, 12] {
+        if frame.len() < header {
+            continue;
+        }
+        let Some(width) = read_u32(0) else { continue };
+        let Some(height) = read_u32(4) else { continue };
+        let Some(format) = read_u32(8) else { continue };
+        if width == 0 || height == 0 || format != RGBA_8888 {
+            continue;
+        }
+        let pixels = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        if frame.len() != header + pixels {
+            continue;
+        }
+        return luma_grid_from_rgba(&frame[header..], width, height);
+    }
+    None
+}
+
+/// Average luminance per cell, sampled the way the helper samples it.
+///
+/// Same grid, same 4×4 sample points inside each cell, same `(3r + 6g + b) / 10`
+/// weights as `FrameSignature.lumaGrid` on the Kotlin side. The two producers
+/// have to agree: a grid from `screencap` is compared against one the helper
+/// produced for a virtual display whenever an action on a display is checked.
+pub fn luma_grid_from_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<super::display::FrameSignature> {
+    const GRID_W: u32 = 12;
+    const GRID_H: u32 = 24;
+    const SAMPLES: u32 = 4;
+    let cell_width = width / GRID_W;
+    let cell_height = height / GRID_H;
+    if cell_width == 0 || cell_height == 0 {
+        return None;
+    }
+    if rgba.len() < (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    let luma_at = |x: u32, y: u32| -> u32 {
+        let offset = ((y as usize) * (width as usize) + (x as usize)) * 4;
+        let red = u32::from(rgba[offset]);
+        let green = u32::from(rgba[offset + 1]);
+        let blue = u32::from(rgba[offset + 2]);
+        (red * 3 + green * 6 + blue) / 10
+    };
+    let mut cells = Vec::with_capacity((GRID_W * GRID_H) as usize);
+    for gy in 0..GRID_H {
+        for gx in 0..GRID_W {
+            let mut sum = 0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    sum += luma_at(
+                        gx * cell_width + sx * cell_width / SAMPLES,
+                        gy * cell_height + sy * cell_height / SAMPLES,
+                    );
+                }
+            }
+            cells.push((sum / (SAMPLES * SAMPLES)).min(255) as u8);
+        }
+    }
+    Some(super::display::FrameSignature {
+        columns: GRID_W,
+        rows: GRID_H,
+        cells,
+    })
+}
+
+/// The screen rectangle a dump describes: the root `<node>`'s bounds.///
 /// `uiautomator dump` wraps everything in `<hierarchy>` with a single root node
 /// whose bounds are the full display. Comparing that against the screenshot's
 /// pixel size is how a coordinate-space mismatch is caught.
@@ -2043,19 +2669,43 @@ pub(super) fn format_ui_summary(elements: &[UiElement]) -> String {
     }
     let mut lines = vec![format!("{} actionable element(s):", elements.len())];
     for e in elements {
-        let label = e
-            .text
-            .as_deref()
-            .or(e.content_desc.as_deref())
-            .map(|s| format!("{s:?}"))
-            .or_else(|| e.resource_id.clone())
-            .unwrap_or_else(|| "-".to_string());
+        // A password field's contents must not reach the model — not as a
+        // label, and not as a resource id it could be read back through.
+        let label = if e.state.password {
+            "[password]".to_string()
+        } else {
+            e.text
+                .as_deref()
+                .or(e.content_desc.as_deref())
+                .map(|s| format!("{s:?}"))
+                .or_else(|| e.resource_id.clone())
+                .unwrap_or_else(|| "-".to_string())
+        };
         let mut flags = String::new();
         if e.clickable {
             flags.push_str(" clickable");
         }
         if !e.enabled {
             flags.push_str(" disabled");
+        }
+        if e.state.scrollable {
+            flags.push_str(" scrollable");
+        }
+        if e.state.editable {
+            flags.push_str(" editable");
+        }
+        if e.state.checkable {
+            flags.push_str(if e.state.checked {
+                " checked"
+            } else {
+                " unchecked"
+            });
+        }
+        if e.state.selected {
+            flags.push_str(" selected");
+        }
+        if e.state.focused {
+            flags.push_str(" focused");
         }
         lines.push(format!(
             "[{}] {} {}{} center=({},{})",
@@ -2166,6 +2816,136 @@ async fn dispatch_display(id: i32, op: &InputOp) -> Result<(), String> {
         }
         InputOp::Text(text) => display.text(text).await.map_err(failed),
         InputOp::Key(keycode) => display.key(keycode).await.map_err(failed),
+    }
+}
+
+/// Read a written field back and judge whether the text arrived.
+///
+/// `before` is the tree from just before the write: it is what names the field
+/// (see [`locate_for_readback`]) and what says whether the field's answer has
+/// moved at all.
+///
+/// Returns `None` when there is nothing to check — no text, or the caller
+/// turned verification off. Every other outcome is a [`Readback`], including
+/// the ones that could not decide: silence with a reason is what lets the model
+/// tell "the field is a password box" from "the text did not go in".
+async fn read_back_write(
+    device: &Option<String>,
+    target: Target,
+    text: &str,
+    before: Option<&[UiElement]>,
+) -> Readback {
+    if text.trim().is_empty() {
+        return Readback::unknown("nothing was typed");
+    }
+    let Some(before) = before else {
+        return Readback::unknown(
+            "the screen could not be read before the write, so there is nothing to read back from",
+        );
+    };
+    // The write point is the focused/nearest field's centre; the element that
+    // was written into is the one a person would look at.
+    let Some(field) = locate_for_readback(before, write_point(before)) else {
+        return Readback::unknown(
+            "no text field was on the screen before the write, so the text went wherever focus \
+             happened to be and cannot be read back",
+        );
+    };
+    if field.state.password {
+        return Readback::unknown(
+            "that is a password field — Android does not expose its contents, so the write \
+             cannot be verified",
+        );
+    }
+    let baseline = field.text.clone();
+
+    // A beat, then one read. The delay is on the accessibility path too: the
+    // input has travelled through another process before the tree sees it.
+    tokio::time::sleep(std::time::Duration::from_millis(READBACK_DELAY_MS)).await;
+    let after = match dump_ui(device, target).await {
+        Ok(dump) => dump,
+        Err(failed) => {
+            return Readback::unknown(format!(
+                "the screen could not be read back after the write ({})",
+                failed.message
+            ))
+        }
+    };
+
+    // The same field, found again by what did not change: an editable node in
+    // the same place with the same resource id and class. The key cannot be
+    // used — it hashes the text, which is exactly what just changed.
+    let now = after
+        .elements
+        .iter()
+        .find(|element| {
+            (element.state.editable || element.state.password)
+                && element.resource_id == field.resource_id
+                && element.class == field.class
+                && intersects(element.bounds, field.bounds)
+        })
+        .or_else(|| locate_for_readback(&after.elements, field.center));
+    let Some(now) = now else {
+        return Readback::unknown(
+            "the field is no longer on the screen — the screen moved on after the write",
+        );
+    };
+    let actual = now.text.clone().unwrap_or_default();
+    let reacted = screen_echoed(before, &after.elements, text);
+    let verdict = readback_verdict(text, &actual, baseline.as_deref(), reacted);
+    Readback {
+        verdict,
+        actual: Some(actual),
+        note: (verdict == READBACK_UNKNOWN).then(|| {
+            "the field still reads what it did before the write, but the screen shows the typed \
+             text, so the app received it and this field cannot confirm where it landed"
+                .to_string()
+        }),
+    }
+}
+
+/// Where the write was aimed, for choosing the field to read back.
+///
+/// The focused field's centre when the tree names one — that is where the text
+/// went regardless of what else is on screen — and otherwise the centre of the
+/// tree, which is the point every one of these tools would have used.
+fn write_point(before: &[UiElement]) -> (i32, i32) {
+    before
+        .iter()
+        .find(|element| element.state.editable && element.state.focused)
+        .map(|element| element.center)
+        .unwrap_or_else(|| {
+            let (x1, y1) = before
+                .first()
+                .map(|e| (e.bounds.0, e.bounds.1))
+                .unwrap_or((0, 0));
+            let (x2, y2) = before
+                .last()
+                .map(|e| (e.bounds.2, e.bounds.3))
+                .unwrap_or((0, 0));
+            ((x1 + x2) / 2, (y1 + y2) / 2)
+        })
+}
+
+/// Whether two rectangles overlap at all.
+fn intersects(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+}
+
+/// The sentence a write's result ends with, when it has one.
+fn readback_note(readback: Option<&Readback>) -> Option<String> {
+    let read = readback?;
+    match read.verdict {
+        READBACK_MATCH => Some("Read back: the field holds the text.".to_string()),
+        READBACK_MISMATCH => Some(format!(
+            "Read back: the field reads {:?} instead — the text did not go in as typed. Do not \
+             press Enter; check the field and retry.",
+            read.actual.as_deref().unwrap_or("")
+        )),
+        _ => read
+            .note
+            .as_ref()
+            .map(|note| format!("Read back: not verified — {note}")),
     }
 }
 
@@ -2323,19 +3103,24 @@ pub fn element_label(element: &UiElement) -> Option<&str> {
 /// The bar is deliberately low: named nodes at all, and named nodes being a
 /// meaningful share of what was found. Thin trees are normal on Android; the
 /// case worth flagging is a tree that describes *none* of the screen.
+///
+/// A node with no name but real structure (a list, a field, a toggle) counts as
+/// describing something: a message list is often a scrollable container full of
+/// custom-drawn rows, and calling that screen undescribable sends the model to
+/// OCR when the one thing it needed — the list to scroll — was right there.
 pub fn assess_tree(elements: &[UiElement]) -> TreeQuality {
     if elements.is_empty() {
         return TreeQuality::Unusable;
     }
-    let named = elements
+    let described = elements
         .iter()
-        .filter(|e| element_label(e).is_some())
+        .filter(|e| element_label(e).is_some() || e.state.is_structural())
         .count();
-    if named == 0 {
+    if described == 0 {
         return TreeQuality::Unusable;
     }
-    let share = named as f32 / elements.len() as f32;
-    if named < 3 || share < 0.25 {
+    let share = described as f32 / elements.len() as f32;
+    if described < 3 || share < 0.25 {
         TreeQuality::Partial
     } else {
         TreeQuality::Usable
@@ -2361,6 +3146,136 @@ pub fn tree_fingerprint(elements: &[UiElement]) -> u64 {
     hasher.finish()
 }
 
+// ── Write readback ─────────────────────────────────────────────────────────
+
+/// The field read back after `this` much silence, or `None` to skip the check.
+///
+/// A short pause is enough on a local accessibility read and is a wasted second
+/// on the ADB path, so it is only spent when the caller asked for verification
+/// and expects to read back.
+const READBACK_DELAY_MS: u64 = 250;
+
+/// The text the screen actually holds matches what was typed.
+pub const READBACK_MATCH: &str = "match";
+/// It holds something else.
+pub const READBACK_MISMATCH: &str = "mismatch";
+/// The field could not be read back — no field was found, it is a password
+/// box, or the tree could not be read at all.
+pub const READBACK_UNKNOWN: &str = "unknown";
+
+/// One field's answer after a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Readback {
+    pub verdict: &'static str,
+    /// What the field holds now, when it could be read.
+    pub actual: Option<String>,
+    /// Why the verdict is unknown, when it is.
+    pub note: Option<String>,
+}
+
+impl Readback {
+    fn unknown(note: impl Into<String>) -> Self {
+        Self {
+            verdict: READBACK_UNKNOWN,
+            actual: None,
+            note: Some(note.into()),
+        }
+    }
+}
+
+/// Compare what was typed with what the field holds.
+///
+/// Whitespace is stripped on both sides: an auto-formatted phone number inserts
+/// spaces as it goes, and that is the field formatting, not the text being
+/// wrong. Case and punctuation are compared exactly — "Hello" and "hello" are
+/// two different messages, and the field is where the difference matters.
+pub fn readback_matches(written: &str, read: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    norm(written) == norm(read)
+}
+
+/// The field a write should be read back from, given the tree *before* the
+/// write and the point that was typed into.
+///
+/// The element key is the wrong tool here: it hashes the text, so a field that
+/// has just received text has a different key from the one that was typed
+/// into — `relocate` would report `STALE_REF` on the very field that worked.
+/// The stable handles are the resource id and the class, and position is used
+/// only to choose between fields that share them (a form with six identical
+/// inputs): the one whose bounds contain the write point, else the nearest.
+///
+/// A password field is returned too, so the caller can say *why* it is not
+/// being read rather than claiming no field was there.
+pub fn locate_for_readback(before: &[UiElement], point: (i32, i32)) -> Option<&UiElement> {
+    let is_field = |element: &&UiElement| element.state.editable || element.state.password;
+    let contains = |element: &&UiElement| {
+        let (x1, y1, x2, y2) = element.bounds;
+        point.0 >= x1 && point.0 <= x2 && point.1 >= y1 && point.1 <= y2
+    };
+    // Focus beats geometry: a field the platform says is focused is where the
+    // text went, whichever field the coordinates landed in (keyboard overlay,
+    // hint text, padding).
+    before
+        .iter()
+        .filter(is_field)
+        .find(|element| element.state.focused && contains(element))
+        .or_else(|| before.iter().filter(is_field).find(contains))
+        .or_else(|| {
+            before.iter().filter(is_field).min_by_key(|element| {
+                let (cx, cy) = element.center;
+                (i64::from(cx) - i64::from(point.0)).pow(2)
+                    + (i64::from(cy) - i64::from(point.1)).pow(2)
+            })
+        })
+}
+
+/// Decide the verdict from what was written, what the field reads now, and
+/// what it read before the write.
+///
+/// A field that answers the same thing it did before is normally a mismatch —
+/// the write did not take. It is `unknown` instead when the screen meanwhile
+/// showed text containing what was typed (an autocomplete suggestion, a
+/// counter, the text echoed in a preview): the app clearly received the input,
+/// and this field just cannot confirm the content. Claiming a mismatch there
+/// would send a caller round a loop of retries that write the text twice.
+pub fn readback_verdict(
+    written: &str,
+    actual: &str,
+    baseline: Option<&str>,
+    reacted: bool,
+) -> &'static str {
+    if readback_matches(written, actual) {
+        return READBACK_MATCH;
+    }
+    if baseline.is_some_and(|base| base == actual) && reacted {
+        return READBACK_UNKNOWN;
+    }
+    READBACK_MISMATCH
+}
+
+/// Whether the screen after the write shows text derived from what was typed.
+///
+/// The evidence that an unreadable field nevertheless received the input: the
+/// app echoed it somewhere — a suggestion strip, a preview, a character count.
+/// Only labels that *contain* the typed text count, and only ones that were not
+/// on the screen before, so a static label that happens to match is not
+/// mistaken for a response.
+fn screen_echoed(before: &[UiElement], after: &[UiElement], written: &str) -> bool {
+    let needle: String = written.chars().filter(|c| !c.is_whitespace()).collect();
+    if needle.is_empty() {
+        return false;
+    }
+    let seen: std::collections::HashSet<&str> = before
+        .iter()
+        .filter_map(element_label)
+        .map(str::trim)
+        .collect();
+    after.iter().filter_map(element_label).any(|label| {
+        let normalized: String = label.chars().filter(|c| !c.is_whitespace()).collect();
+        normalized.contains(&needle) && !seen.contains(label.trim())
+    })
+}
+
 // ── Action effect ──────────────────────────────────────────────────────────
 
 /// The screen was different after the action.
@@ -2369,6 +3284,167 @@ pub const EFFECT_CHANGED: &str = "changed";
 pub const EFFECT_UNCHANGED: &str = "unchanged";
 /// The effect could not be judged — the tree could not be read.
 pub const EFFECT_UNKNOWN: &str = "unknown";
+/// Something moved, but the app stayed and the screen's structure did not
+/// change — a tick, a highlight, a toast, a spinner.
+///
+/// Worth its own word: `unchanged` tells a caller the action missed, and
+/// `changed` tells it the screen went somewhere. A tap that ticked a checkbox
+/// is neither, and folding it into `changed` was hiding the degree.
+pub const EFFECT_SMALL_CHANGE: &str = "small_change";
+/// The action moved the task to a different app or a different place.
+///
+/// Only knowable when the foreground package was read before and after. A
+/// screen that changed without the package changing is [`EFFECT_CHANGED`].
+pub const EFFECT_PLACE_CHANGED: &str = "place_changed";
+
+/// How the element list changed between two reads.
+///
+/// Counts rather than a yes/no: "three rows appeared" and "the whole page was
+/// replaced" are different answers, and only the second means the action left
+/// this screen. Elements are identified by [`element_key`] — the part that
+/// survives the write that is being judged — and matched as a multiset, so two
+/// identical rows are two rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TreeDiff {
+    pub added: usize,
+    pub removed: usize,
+    /// Same key, different bounds.
+    pub moved: usize,
+    /// Same key, different label.
+    pub edited: usize,
+}
+
+impl TreeDiff {
+    /// Total number of elements that are not in the same place, or not the
+    /// same, as before.
+    pub fn changed(&self) -> usize {
+        self.added + self.removed + self.moved + self.edited
+    }
+
+    /// One line for the result text, or `None` when nothing changed.
+    pub fn describe(&self) -> Option<String> {
+        if self.changed() == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for (count, what) in [
+            (self.added, "appeared"),
+            (self.removed, "left"),
+            (self.moved, "moved"),
+            (self.edited, "changed text"),
+        ] {
+            if count > 0 {
+                parts.push(format!("{count} {what}"));
+            }
+        }
+        Some(format!("Compared with before: {}.", parts.join(", ")))
+    }
+}
+
+/// Compare two reads of the screen by element identity.
+///
+/// Two passes, because one is not enough when several rows share a key (a list
+/// of identical rows has one key, and that is the common case): first pair the
+/// rows that are in exactly the same place, then treat what is left as movement
+/// before calling it gone. Pairing straight by list order would report every
+/// row as moved the moment one row was inserted at the top, which is the
+/// difference between "a message arrived" and "the whole list is new".
+pub fn tree_diff(before: &[UiElement], after: &[UiElement]) -> TreeDiff {
+    use std::collections::HashMap;
+
+    let mut diff = TreeDiff::default();
+    let mut unclaimed: HashMap<&str, Vec<&UiElement>> = HashMap::new();
+    for element in before {
+        if !element.key.is_empty() {
+            unclaimed.entry(&element.key).or_default().push(element);
+        }
+    }
+
+    // Pass one: same key, same place.
+    let mut leftover_after: Vec<&UiElement> = Vec::new();
+    for element in after {
+        let previous = unclaimed.get_mut(element.key.as_str()).and_then(|list| {
+            let position = list
+                .iter()
+                .position(|other| other.bounds == element.bounds)?;
+            Some(list.swap_remove(position))
+        });
+        match previous {
+            Some(previous) => {
+                if previous.text != element.text || previous.content_desc != element.content_desc {
+                    diff.edited += 1;
+                }
+            }
+            None => leftover_after.push(element),
+        }
+    }
+
+    // Pass two: same key, somewhere else. Two rows with the same label but no
+    // shared place are the same row that moved.
+    for element in leftover_after {
+        let pool = unclaimed.get_mut(element.key.as_str());
+        match pool.and_then(|list| (!list.is_empty()).then(|| list.swap_remove(0))) {
+            Some(previous) => {
+                diff.moved += 1;
+                if previous.text != element.text || previous.content_desc != element.content_desc {
+                    diff.edited += 1;
+                }
+            }
+            None => diff.added += 1,
+        }
+    }
+
+    diff.removed = unclaimed.values().map(Vec::len).sum();
+    diff
+}
+
+/// How many changed elements make a screen "changed" rather than "small".
+///
+/// Proportional with a floor: three changed elements is a real change on a
+/// short screen, and ten percent of a long one. Below either, the screen moved
+/// but did not go anywhere.
+fn changed_threshold(total: usize) -> usize {
+    (total * 10).div_ceil(100).max(3)
+}
+
+/// The effect verdict, from what was observed after the action.
+///
+/// Ordered so the most specific answer wins: a new app is a place change even
+/// if the tree also changed; a canvas that moved under a motionless tree is a
+/// small change; and a tree that could not be read twice is unknown, not
+/// unchanged.
+pub fn classify_effect(
+    before_package: Option<&str>,
+    after_package: Option<&str>,
+    diff: Option<&TreeDiff>,
+    shown: usize,
+    pixels_changed: Option<bool>,
+    before_fingerprint: Option<u64>,
+    after_fingerprint: Option<u64>,
+) -> &'static str {
+    if matches!((before_package, after_package), (Some(before), Some(after)) if before != after) {
+        return EFFECT_PLACE_CHANGED;
+    }
+    let Some(diff) = diff else {
+        return EFFECT_UNKNOWN;
+    };
+    let same_tree = before_fingerprint.is_some() && before_fingerprint == after_fingerprint;
+    if same_tree {
+        return if pixels_changed == Some(true) {
+            EFFECT_SMALL_CHANGE
+        } else {
+            EFFECT_UNCHANGED
+        };
+    }
+    if before_fingerprint.is_none() {
+        return EFFECT_UNKNOWN;
+    }
+    if diff.changed() >= changed_threshold(shown) {
+        EFFECT_CHANGED
+    } else {
+        EFFECT_SMALL_CHANGE
+    }
+}
 
 /// How often the screen is polled while waiting for it to settle.
 const SETTLE_POLL_MS: u64 = 150;
@@ -2393,16 +3469,37 @@ pub struct Settle {
     /// Whether the picture changed, when it was compared. `None` when the
     /// caller did not supply a before-picture or the display produced none.
     pub pixel_changed: Option<bool>,
+    /// How the tree moved, when both reads could be compared.
+    pub diff: Option<TreeDiff>,
+    /// The app on screen when the screen settled.
+    pub package: Option<String>,
 }
 
 impl Settle {
     /// A one-line verdict for the tool result.
     pub fn verdict(&self) -> String {
+        let structure = self
+            .diff
+            .as_ref()
+            .and_then(TreeDiff::describe)
+            .map(|line| format!(" {line}"))
+            .unwrap_or_default();
         match self.effect {
             EFFECT_CHANGED => format!(
-                "The screen changed (settled in {} ms, {} elements now).",
+                "The screen changed (settled in {} ms, {} elements now).{structure}",
                 self.elapsed_ms,
                 self.elements.len()
+            ),
+            EFFECT_PLACE_CHANGED => format!(
+                "The action opened something else — the foreground app changed (settled in {} ms, \
+                 {} elements now).{structure}",
+                self.elapsed_ms,
+                self.elements.len()
+            ),
+            EFFECT_SMALL_CHANGE => format!(
+                "Something changed, but the screen is still the same page (settled in {} ms).\
+                 {structure} The action landed; the screen did not go anywhere.",
+                self.elapsed_ms
             ),
             EFFECT_UNCHANGED => format!(
                 "The screen looks unchanged after {} ms. The action may have missed, or this \
@@ -2433,23 +3530,45 @@ pub async fn settle_after_action(
     before: Option<u64>,
     budget_ms: u64,
 ) -> Settle {
+    settle_after_action_from(
+        device,
+        target,
+        before.map(|fingerprint| (fingerprint, Vec::new())),
+        budget_ms,
+    )
+    .await
+}
+
+/// The same wait, started from the element list rather than only its
+/// fingerprint.
+///
+/// The list is what makes a *degree* of change possible: a fingerprint says
+/// "different", the element diff says "two rows appeared". Callers that only
+/// have the fingerprint pass an empty list and get the old three-way answer
+/// with an empty diff.
+pub async fn settle_after_action_from(
+    device: &Option<String>,
+    target: Target,
+    before: Option<(u64, Vec<UiElement>)>,
+    budget_ms: u64,
+) -> Settle {
     let started = std::time::Instant::now();
     let budget = budget_ms.clamp(SETTLE_MIN_MS, SETTLE_MAX_MS);
+    let before_fingerprint = before.as_ref().map(|(fingerprint, _)| *fingerprint);
+    let before_elements = before.as_ref().map(|(_, elements)| elements.as_slice());
     let mut previous: Option<u64> = None;
-    let mut changed = false;
     let mut last: Option<Vec<UiElement>> = None;
+    let mut after_package: Option<String> = None;
     let mut failure: Option<String> = None;
 
     loop {
-        match dump_ui_elements(device, target).await {
-            Ok(elements) => {
-                let fingerprint = tree_fingerprint(&elements);
-                if before.is_some_and(|before| before != fingerprint) {
-                    changed = true;
-                }
+        match dump_ui(device, target).await {
+            Ok(dump) => {
+                let fingerprint = tree_fingerprint(&dump.elements);
                 let stable = previous == Some(fingerprint);
                 previous = Some(fingerprint);
-                last = Some(elements);
+                after_package = dump.package;
+                last = Some(dump.elements);
                 if stable && started.elapsed().as_millis() as u64 >= SETTLE_MIN_MS {
                     break;
                 }
@@ -2467,23 +3586,38 @@ pub async fn settle_after_action(
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match last {
-        Some(elements) => Settle {
-            effect: match (before, changed) {
-                (None, _) => EFFECT_UNKNOWN,
-                (Some(_), true) => EFFECT_CHANGED,
-                (Some(_), false) => EFFECT_UNCHANGED,
-            },
-            elapsed_ms,
-            elements,
-            note: None,
-            pixel_changed: None,
-        },
+        Some(elements) => {
+            let after_fingerprint = tree_fingerprint(&elements);
+            let diff = before_elements
+                .filter(|before| !before.is_empty())
+                .map(|before| tree_diff(before, &elements));
+            let effect = classify_effect(
+                None,
+                after_package.as_deref(),
+                diff.as_ref(),
+                elements.len(),
+                None,
+                before_fingerprint,
+                Some(after_fingerprint),
+            );
+            Settle {
+                effect,
+                elapsed_ms,
+                elements,
+                note: None,
+                pixel_changed: None,
+                diff: diff.filter(|diff| diff.changed() > 0),
+                package: after_package,
+            }
+        }
         None => Settle {
             effect: EFFECT_UNKNOWN,
             elapsed_ms,
             elements: Vec::new(),
             note: failure,
             pixel_changed: None,
+            diff: None,
+            package: None,
         },
     }
 }
@@ -2504,7 +3638,26 @@ pub async fn settle_after_action_with_pixels(
     before_pixels: Option<&super::display::FrameSignature>,
     budget_ms: u64,
 ) -> Settle {
-    let mut settled = settle_after_action(device, target, before, budget_ms).await;
+    settle_after_action_with_pixels_from(
+        device,
+        target,
+        before.map(|fingerprint| (fingerprint, Vec::new())),
+        before_pixels,
+        budget_ms,
+    )
+    .await
+}
+
+/// [`settle_after_action_with_pixels`] with the element list before the
+/// action, so the change can be measured as well as noted.
+pub async fn settle_after_action_with_pixels_from(
+    device: &Option<String>,
+    target: Target,
+    before: Option<(u64, Vec<UiElement>)>,
+    before_pixels: Option<&super::display::FrameSignature>,
+    budget_ms: u64,
+) -> Settle {
+    let mut settled = settle_after_action_from(device, target, before, budget_ms).await;
 
     let Some(before_pixels) = before_pixels else {
         return settled;
@@ -2516,26 +3669,33 @@ pub async fn settle_after_action_with_pixels(
     // One read of the picture, after the tree has settled. Polling it would
     // cost a frame per poll, and the frame is only consulted to overturn an
     // "unchanged" the tree could not have seen.
-    let Some(bridge) = display_bridge().ok() else {
+    let Some(after) = display_frame(target).await else {
         return settled;
-    };
-    let display = super::display::VirtualDisplay::attach(bridge, target.display_id());
-    let after = match display.frame_signature().await {
-        Ok(Some(signature)) => signature,
-        // No frame: the display has not drawn since it was created, which is
-        // its own answer and not something to guess about.
-        Ok(None) => return settled,
-        Err(failed) => {
-            settled.note = Some(format!("the picture could not be read ({failed})"));
-            return settled;
-        }
     };
     let pixels_changed = before_pixels.differs(&after);
     settled.pixel_changed = Some(pixels_changed);
     if pixels_changed && settled.effect == EFFECT_UNCHANGED {
-        settled.effect = EFFECT_CHANGED;
+        settled.effect = EFFECT_SMALL_CHANGE;
     }
     settled
+}
+
+/// The current picture of whatever screen the action targeted.
+///
+/// Two producers, because the two screens have different owners: a virtual
+/// display's frames come from the helper, and the user's own screen is the
+/// device's — the helper never mirrors display 0, so `screencap` is the only
+/// source there. Both produce the same grid, which is what makes the two
+/// comparable.
+async fn display_frame(target: Target) -> Option<super::display::FrameSignature> {
+    if let Target::Display(id) = target {
+        let bridge = display_bridge().ok()?;
+        let display = super::display::VirtualDisplay::attach(bridge, id);
+        // `Ok(None)` means the display has not drawn since it was created,
+        // which is its own answer and not something to guess about.
+        return display.frame_signature().await.ok().flatten();
+    }
+    user_screen_signature(&None).await
 }
 
 /// [`format_ui_summary`] with a ceiling, for results that are a side effect of
@@ -2622,13 +3782,132 @@ pub async fn ocr_png(png: &[u8]) -> Result<Vec<OcrLine>, String> {
     Ok(ocr_lines(blocks))
 }
 
-/// Read text out of a screenshot in a build without an OCR engine.
+/// Read text out of a screenshot in a build without an ONNX engine.
 ///
-/// Says so rather than returning an empty list, which would read like "the
-/// screen is blank" and send the model looking for a problem that is not there.
+/// On the phone itself there is a perfectly good recogniser in the platform,
+/// so this is only "no OCR" when *neither* path exists: the mobile feature
+/// profile drops `vision` (no ORT, no `image` crate), and the phone build
+/// answers through its own ML Kit bridge instead. A desktop build without
+/// `vision` installs no bridge, so it still fails here — explicitly, rather
+/// than returning an empty list, which would read like "the screen is blank"
+/// and send the model looking for a problem that is not there.
 #[cfg(not(feature = "vision"))]
-pub async fn ocr_png(_png: &[u8]) -> Result<Vec<OcrLine>, String> {
-    Err("this build has no OCR engine (compiled without the `vision` feature)".to_string())
+pub async fn ocr_png(png: &[u8]) -> Result<Vec<OcrLine>, String> {
+    let Some(bridge) = crate::device::bridge() else {
+        return Err("this build has no OCR engine (compiled without the `vision` feature, and no \
+             on-device bridge)"
+            .to_string());
+    };
+    use base64::Engine as _;
+    let payload = serde_json::json!({
+        "pngBase64": base64::engine::general_purpose::STANDARD.encode(png),
+    });
+    // The bridge round trip is a JNI hop into a blocking recogniser. It has no
+    // timeout of its own, and a stuck model would otherwise freeze the whole
+    // read for the rest of the turn.
+    let answer = match tokio::time::timeout(
+        OCR_BRIDGE_TIMEOUT,
+        bridge.call(crate::device::CMD_OCR, payload),
+    )
+    .await
+    {
+        Err(_) => {
+            return Err(format!(
+                "{}: the on-device OCR did not answer within {} s",
+                OCR_UNAVAILABLE,
+                OCR_BRIDGE_TIMEOUT.as_secs()
+            ))
+        }
+        Ok(Err(error)) => return Err(format!("{OCR_UNAVAILABLE}: {error}")),
+        Ok(Ok(answer)) => answer,
+    };
+    parse_ocr_answer(&answer)
+}
+
+/// How long the on-device OCR may take before the read is abandoned.
+///
+/// A full-screen recognition takes a few hundred milliseconds on a mid-range
+/// phone; anything near five seconds means the model is wedged, and waiting
+/// longer only makes the turn slower to fail.
+#[cfg_attr(feature = "vision", allow(dead_code))]
+const OCR_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The error code the bridge uses for "the engine could not run".
+#[cfg_attr(feature = "vision", allow(dead_code))]
+const OCR_UNAVAILABLE: &str = "ocr_unavailable";
+
+/// Parse the bridge's answer into lines, refusing the "no engine" sentinel.
+///
+/// `ok: false` carries `code: "ocr_unavailable"`; turning that into an empty
+/// list would tell the model the screen is blank, which is a different (and
+/// wrong) statement. A missing `lines` array is a malformed payload and fails
+/// the same way despite `ok: true`.
+///
+/// Lives outside the `not(vision)` gate so the default test run exercises it;
+/// the phone build is the one that calls it.
+#[cfg_attr(feature = "vision", allow(dead_code))]
+fn parse_ocr_answer(answer: &serde_json::Value) -> Result<Vec<OcrLine>, String> {
+    if !answer.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let code = answer
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or(OCR_UNAVAILABLE);
+        let detail = answer
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the on-device OCR engine could not run");
+        return Err(format!("{code}: {detail}"));
+    }
+    let lines = answer
+        .get("lines")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{OCR_UNAVAILABLE}: the OCR answer carried no line list"))?;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let Some(text) = line.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Some(bounds) = line.get("bounds").and_then(Value::as_array) else {
+            continue;
+        };
+        if bounds.len() != 4 {
+            continue;
+        }
+        let mut rect = [0i32; 4];
+        let mut readable = true;
+        for (slot, value) in rect.iter_mut().zip(bounds) {
+            match value.as_i64().and_then(|v| i32::try_from(v).ok()) {
+                Some(v) => *slot = v,
+                None => {
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        if !readable {
+            continue;
+        }
+        let (x1, y1, x2, y2) = (rect[0], rect[1], rect[2], rect[3]);
+        if x2 <= x1 || y2 <= y1 {
+            // A zero-area box cannot be tapped, so it is not a usable line.
+            continue;
+        }
+        out.push(OcrLine {
+            text: text.to_string(),
+            center: ((x1 + x2) / 2, (y1 + y2) / 2),
+            bounds: (x1, y1, x2, y2),
+            confidence: line
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .map(|c| c as f32)
+                .unwrap_or(0.0),
+        });
+    }
+    Ok(out)
 }
 
 /// Read text out of whatever `target` points at.
@@ -3327,6 +4606,79 @@ impl Tool for AdbStatusTool {
 mod tests {
     use super::*;
 
+    // ── Launch entry resolution ─────────────────────────────────────────
+    //
+    // `launch` used to guess `pkg/.MainActivity`. These cover the two parsers
+    // that replaced the guess: what the package manager answers, and what
+    // `am start -W` says about whether it worked. Both are pure so they run
+    // without a device — which is the only way they get run at all.
+
+    #[test]
+    fn resolve_activity_reads_the_brief_form() {
+        // API 26+ `--brief` output, verbatim.
+        assert_eq!(
+            parse_resolve_activity("com.tencent.mm/.ui.LauncherUI\n"),
+            Some("com.tencent.mm/.ui.LauncherUI".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_activity_skips_the_preamble() {
+        let out = "priority=0\npackageName=com.example\ncom.example/.MainActivity\n";
+        assert_eq!(parse_resolve_activity(out), Some("com.example/.MainActivity".to_string()));
+    }
+
+    #[test]
+    fn resolve_activity_returns_none_for_an_error() {
+        // What the package manager prints when nothing matches.
+        assert_eq!(parse_resolve_activity("Error: Activity not found\n"), None);
+        assert_eq!(parse_resolve_activity(""), None);
+    }
+
+    #[test]
+    fn resolve_activity_ignores_lines_that_are_not_components() {
+        let out = "priority=0\nsome warning\ncom.example/.Main\n";
+        assert_eq!(parse_resolve_activity(out), Some("com.example/.Main".to_string()));
+    }
+
+    #[test]
+    fn am_start_ok_is_started() {
+        let out = "Starting: Intent { cmp=com.example/.Main }\nStatus: ok\nActivity: com.example/.Main\nThisTime: 412\n";
+        assert_eq!(parse_am_start_output(out, ""), LaunchOutcome::Started);
+    }
+
+    #[test]
+    fn already_in_front_counts_as_started() {
+        // Android prints this instead of `Status:` when the task is already top.
+        // Treating it as failure would report every second launch of a warm app
+        // as broken.
+        let warning =
+            "Warning: Activity not started, its current task has been brought to the front";
+        assert_eq!(parse_am_start_output("", warning), LaunchOutcome::AlreadyInFront);
+    }
+
+    #[test]
+    fn error_wins_over_a_later_status() {
+        let out = "Error: Activity class {com.example/.Main} does not exist.\nStatus: ok\n";
+        assert_eq!(parse_am_start_output(out, ""), LaunchOutcome::Failed);
+    }
+
+    #[test]
+    fn status_other_than_ok_is_failed() {
+        assert_eq!(parse_am_start_output("Status: timeout\n", ""), LaunchOutcome::Failed);
+    }
+
+    #[test]
+    fn silent_success_is_unknown_not_ok() {
+        // Exit zero with no verdict means the command ran and told us nothing.
+        // Assuming success here is exactly the "dispatched, not started" bug.
+        assert_eq!(parse_am_start_output("", ""), LaunchOutcome::Unknown);
+        assert_eq!(
+            parse_am_start_output("Starting: Intent { cmp=a/b }\n", ""),
+            LaunchOutcome::Unknown
+        );
+    }
+
     // ── Stable references ───────────────────────────────────────────────
     //
     // An index is a position in one reading of the screen; a key is the
@@ -3501,6 +4853,10 @@ mod tests {
     <node index="3" class="android.widget.ImageButton" text="" content-desc="返回" resource-id="" bounds="[0,100][100,200]" enabled="true" clickable="true" />
     <node index="4" class="android.widget.EditText" text="" resource-id="com.app:id/phone" bounds="[120,500][960,580]" enabled="false" clickable="true" />
     <node index="5" class="android.view.View" text="" resource-id="" bounds="[0,300][1080,400]" enabled="true" clickable="false" scrollable="false" />
+    <node index="6" class="android.widget.EditText" text="" resource-id="com.app:id/code" bounds="[120,600][960,680]" enabled="true" clickable="false" password="true" focused="true" />
+    <node index="7" class="androidx.recyclerview.widget.RecyclerView" text="" resource-id="" bounds="[0,1000][1080,2000]" enabled="true" clickable="false" scrollable="true">
+      <node index="0" class="android.widget.CheckBox" text="记住我" resource-id="" bounds="[120,1020][400,1100]" enabled="true" clickable="true" checkable="true" checked="true" />
+    </node>
   </node>
 </hierarchy>"#;
 
@@ -3518,7 +4874,52 @@ mod tests {
         // The bare FrameLayout and the unlabelled non-clickable View are dropped.
         let classes: Vec<&str> = els.iter().map(|e| e.class.as_str()).collect();
         assert!(!classes.contains(&"FrameLayout"), "container kept: {classes:?}");
-        assert_eq!(els.len(), 4, "{classes:?}");
+        // The unnamed code field and the scroll list are kept despite having no
+        // name: one is where a write goes, the other is where a scroll goes.
+        assert!(classes.contains(&"EditText"), "{classes:?}");
+        assert!(classes.contains(&"RecyclerView"), "{classes:?}");
+        assert_eq!(els.len(), 7, "{classes:?}");
+    }
+
+    #[test]
+    fn xml_semantics_reach_the_element() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        let code = els
+            .iter()
+            .find(|e| e.resource_id.as_deref() == Some("com.app:id/code"))
+            .unwrap();
+        assert!(code.state.password);
+        assert!(code.state.focused);
+        assert!(code.state.editable);
+        let list = els.iter().find(|e| e.class == "RecyclerView").unwrap();
+        assert!(list.state.scrollable);
+        assert!(list.state.scroll_forward && list.state.scroll_backward);
+        let check = els.iter().find(|e| e.class == "CheckBox").unwrap();
+        assert!(check.state.checkable && check.state.checked);
+    }
+
+    #[test]
+    fn depth_is_counted_from_the_root_node() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        let title = els.iter().find(|e| e.class == "TextView").unwrap();
+        let list = els.iter().find(|e| e.class == "RecyclerView").unwrap();
+        let check = els.iter().find(|e| e.class == "CheckBox").unwrap();
+        assert_eq!(title.state.depth, 1);
+        assert_eq!(list.state.depth, 1);
+        // The checkbox sits under the list, so a scroll aimed at the midpoint
+        // would pick the list and not the row.
+        assert_eq!(check.state.depth, 2);
+    }
+
+    #[test]
+    fn a_password_field_is_not_read_out() {
+        let els = parse_uiautomator_xml(DUMP).unwrap();
+        let summary = format_ui_summary(&els);
+        assert!(summary.contains("[password]"), "{summary}");
+        assert!(!summary.contains("com.app:id/code"), "{summary}");
+        assert!(summary.contains("editable"), "{summary}");
+        assert!(summary.contains("checked"), "{summary}");
+        assert!(summary.contains("scrollable"), "{summary}");
     }
 
     #[test]
@@ -3574,7 +4975,7 @@ mod tests {
     fn summary_lists_elements_with_their_index_and_center() {
         let els = parse_uiautomator_xml(DUMP).unwrap();
         let summary = format_ui_summary(&els);
-        assert!(summary.starts_with("4 actionable element(s):"), "{summary}");
+        assert!(summary.starts_with("7 actionable element(s):"), "{summary}");
         assert!(summary.contains(r#"[2] Button "登录" clickable center=(240,880)"#), "{summary}");
         assert!(summary.contains("disabled"), "{summary}");
     }
@@ -3897,6 +5298,45 @@ mod tests {
     }
 
     #[test]
+    fn structural_nodes_keep_a_nameless_list_screen_usable() {
+        // A message list whose rows are custom-drawn: the only thing the tree
+        // says is "there is a list here", and that is exactly what a read needs.
+        let elements = (0..4)
+            .map(|i| {
+                let mut element = node("android.view.View", None, (0, i * 10, 100, i * 10 + 9));
+                element.state.scrollable = i == 0;
+                element
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assess_tree(&elements), TreeQuality::Partial);
+        let mut list_only = elements[..1].to_vec();
+        list_only[0].state.scrollable = true;
+        assert_eq!(assess_tree(&list_only), TreeQuality::Partial);
+        // Enough structure and the screen is judged readable even unnamed.
+        let structured = (0..3)
+            .map(|i| {
+                let mut element =
+                    node("android.widget.EditText", None, (0, i * 10, 100, i * 10 + 9));
+                element.state.editable = true;
+                element
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assess_tree(&structured), TreeQuality::Usable);
+    }
+
+    #[test]
+    fn a_tree_of_unstructured_unnamed_boxes_is_still_unusable() {
+        let mut clickable = node("android.view.View", None, (0, 0, 100, 100));
+        clickable.clickable = true;
+        let elements = vec![
+            clickable,
+            node("android.view.View", None, (0, 0, 100, 50)),
+            node("android.view.View", None, (0, 50, 100, 100)),
+        ];
+        assert_eq!(assess_tree(&elements), TreeQuality::Unusable);
+    }
+
+    #[test]
     fn content_description_counts_as_a_name() {
         let mut described = node("android.widget.ImageButton", None, (0, 0, 10, 10));
         described.content_desc = Some("Back".to_string());
@@ -3907,6 +5347,134 @@ mod tests {
     fn blank_labels_do_not_count() {
         let blank = node("android.widget.TextView", Some("   "), (0, 0, 10, 10));
         assert_eq!(element_label(&blank), None);
+    }
+
+    // ── Write readback ─────────────────────────────────────────────────────
+
+    fn field(text: Option<&str>, rid: Option<&str>, bounds: (i32, i32, i32, i32)) -> UiElement {
+        let mut element = UiElement::new(
+            1,
+            text.map(str::to_string),
+            None,
+            rid.map(str::to_string),
+            "EditText".to_string(),
+            true,
+            true,
+            bounds,
+        );
+        element.state.editable = true;
+        element
+    }
+
+    #[test]
+    fn readback_ignores_whitespace_the_field_inserted() {
+        assert!(readback_matches("13800138000", "138 0013 8000"));
+        assert!(readback_matches("hello world", "helloworld"));
+        // Case and punctuation are the message, not formatting.
+        assert!(!readback_matches("Hello", "hello"));
+        assert!(!readback_matches("done.", "done"));
+    }
+
+    #[test]
+    fn the_field_holding_the_text_is_a_match() {
+        assert_eq!(readback_verdict("hi", "hi", None, false), READBACK_MATCH);
+        assert_eq!(readback_verdict("hi", "hi", Some(""), false), READBACK_MATCH);
+    }
+
+    #[test]
+    fn different_text_is_a_mismatch() {
+        assert_eq!(readback_verdict("hi", "ho", None, false), READBACK_MISMATCH);
+    }
+
+    #[test]
+    fn a_field_that_did_not_move_but_saw_the_text_is_unknown_not_a_mismatch() {
+        // The field answers the same hint whatever is typed, while the screen
+        // echoed the text: the input arrived, this field cannot confirm it, and
+        // calling that a mismatch would loop the caller into typing twice.
+        assert_eq!(
+            readback_verdict("hi", "Type a message", Some("Type a message"), true),
+            READBACK_UNKNOWN
+        );
+        // Same stuck field without any echo: the write really did nothing.
+        assert_eq!(
+            readback_verdict("hi", "Type a message", Some("Type a message"), false),
+            READBACK_MISMATCH
+        );
+    }
+
+    #[test]
+    fn the_write_point_is_the_focused_field() {
+        let mut first = field(None, Some("id/a"), (0, 0, 400, 100));
+        let focused = field(None, Some("id/b"), (0, 200, 400, 300));
+        first.state.focused = false;
+        let mut focused = focused;
+        focused.state.focused = true;
+        let elements = vec![first, focused];
+        assert_eq!(write_point(&elements), (200, 250));
+    }
+
+    #[test]
+    fn the_field_is_located_by_place_not_by_key_which_the_write_changed() {
+        let before = vec![
+            field(Some("old"), Some("id/a"), (0, 0, 400, 100)),
+            field(None, Some("id/b"), (0, 200, 400, 300)),
+        ];
+        let found = locate_for_readback(&before, (200, 250)).expect("a field");
+        assert_eq!(found.resource_id.as_deref(), Some("id/b"));
+        // And after the write the same field has a different key — which is
+        // exactly why the key cannot be what finds it.
+        let mut after = field(Some("new"), Some("id/b"), (0, 200, 400, 300));
+        after.key = "different".to_string();
+        assert_ne!(found.key, after.key);
+    }
+
+    #[test]
+    fn a_focused_field_wins_over_one_the_point_merely_lands_in() {
+        let mut focused = field(None, Some("id/a"), (0, 0, 400, 100));
+        focused.state.focused = true;
+        let other = field(None, Some("id/b"), (0, 0, 400, 100));
+        let elements = vec![other, focused];
+        assert_eq!(
+            locate_for_readback(&elements, (200, 50))
+                .expect("a field")
+                .resource_id
+                .as_deref(),
+            Some("id/a")
+        );
+    }
+
+    #[test]
+    fn a_password_field_is_still_found_so_the_refusal_can_name_it() {
+        let mut secret = field(None, Some("id/pw"), (0, 0, 400, 100));
+        secret.state.password = true;
+        secret.state.editable = false;
+        let elements = vec![secret];
+        let found = locate_for_readback(&elements, (200, 50)).expect("a field");
+        assert!(found.state.password);
+    }
+
+    #[test]
+    fn a_screen_without_a_field_has_nothing_to_read_back() {
+        assert!(locate_for_readback(&[], (0, 0)).is_none());
+        let label = node("android.widget.TextView", Some("hi"), (0, 0, 100, 100));
+        assert!(locate_for_readback(&[label], (10, 10)).is_none());
+    }
+
+    #[test]
+    fn an_echo_is_a_label_the_screen_did_not_have_before() {
+        let before = vec![node(
+            "android.widget.TextView",
+            Some("Message"),
+            (0, 0, 100, 40),
+        )];
+        let after = vec![
+            node("android.widget.TextView", Some("Message"), (0, 0, 100, 40)),
+            node("android.widget.TextView", Some("say hello now"), (0, 40, 100, 80)),
+        ];
+        assert!(screen_echoed(&before, &after, "hello"));
+        // The same label was already there: not evidence of this write.
+        assert!(!screen_echoed(&before, &after, "Message"));
+        assert!(!screen_echoed(&before, &before, "hello"));
     }
 
     // ── Targets ─────────────────────────────────────────────────────────
@@ -3954,6 +5522,8 @@ mod tests {
             elements: Vec::new(),
             note: Some("SCREEN_NEVER_IDLE".to_string()),
             pixel_changed: None,
+            diff: None,
+            package: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.starts_with("Effect unknown"), "{verdict}");
@@ -3968,6 +5538,8 @@ mod tests {
             elements: Vec::new(),
             note: None,
             pixel_changed: None,
+            diff: None,
+            package: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.contains("unchanged"), "{verdict}");
@@ -3982,6 +5554,8 @@ mod tests {
             elements: vec![node("android.widget.TextView", Some("a"), (0, 0, 10, 10))],
             note: None,
             pixel_changed: None,
+            diff: None,
+            package: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.contains("changed"), "{verdict}");
@@ -4070,9 +5644,199 @@ mod tests {
             elements: Vec::new(),
             note: None,
             pixel_changed: None,
+            diff: None,
+            package: None,
         };
         assert_eq!(settle.pixel_changed, None);
         assert_eq!(settle.effect, EFFECT_UNCHANGED);
+    }
+
+    // ── Effect classification ──────────────────────────────────────────────
+
+    #[test]
+    fn a_row_appearing_is_a_small_change_not_the_screen_changing() {
+        let before: Vec<_> = (0..20)
+            .map(|i| node("android.widget.TextView", Some("row"), (0, i * 10, 100, i * 10 + 9)))
+            .collect();
+        let mut after = before.clone();
+        // One label changed: the key hashes the text, so it reads as one gone
+        // and one new — beneath max(3, 10% of 20) and therefore small.
+        after[0] = node("android.widget.TextView", Some("row2"), (0, 0, 100, 9));
+        let diff = tree_diff(&before, &after);
+        assert_eq!(diff.removed, 1);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.changed(), 2);
+        assert_eq!(
+            classify_effect(None, None, Some(&diff), after.len(), None, Some(1), Some(2)),
+            EFFECT_SMALL_CHANGE
+        );
+    }
+
+    #[test]
+    fn three_changed_elements_are_a_real_change_on_a_short_screen() {
+        let before = vec![
+            node("android.widget.Button", Some("a"), (0, 0, 100, 50)),
+            node("android.widget.Button", Some("b"), (0, 50, 100, 100)),
+            node("android.widget.Button", Some("c"), (0, 100, 100, 150)),
+        ];
+        let after = vec![
+            node("android.widget.Button", Some("x"), (0, 0, 100, 50)),
+            node("android.widget.Button", Some("y"), (0, 50, 100, 100)),
+            node("android.widget.Button", Some("z"), (0, 100, 100, 150)),
+        ];
+        let diff = tree_diff(&before, &after);
+        // Three labels replaced read as three gone and three new: six changed
+        // against a threshold of three.
+        assert_eq!(diff.changed(), 6);
+        assert_eq!(
+            classify_effect(None, None, Some(&diff), after.len(), None, Some(1), Some(2)),
+            EFFECT_CHANGED
+        );
+    }
+
+    #[test]
+    fn a_moved_element_is_counted_once() {
+        let before = vec![node("android.widget.TextView", Some("a"), (0, 0, 100, 50))];
+        let after = vec![node("android.widget.TextView", Some("a"), (0, 40, 100, 90))];
+        let diff = tree_diff(&before, &after);
+        assert_eq!(
+            diff,
+            TreeDiff {
+                added: 0,
+                removed: 0,
+                moved: 1,
+                edited: 0
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_rows_are_counted_as_a_multiset() {
+        // Two identical rows, one of them gone: "one left", not "nothing
+        // happened because the other one still matches".
+        let before = vec![
+            node("android.widget.TextView", Some("same"), (0, 0, 100, 50)),
+            node("android.widget.TextView", Some("same"), (0, 50, 100, 100)),
+        ];
+        let after = vec![node(
+            "android.widget.TextView",
+            Some("same"),
+            (0, 0, 100, 50),
+        )];
+        let diff = tree_diff(&before, &after);
+        assert_eq!(diff.removed, 1);
+        assert_eq!(diff.added, 0);
+    }
+
+    #[test]
+    fn text_that_changed_under_the_same_key_is_edited() {
+        // A counter going 3 → 4 keeps its resource id and class; only the text
+        // moved, and the key is built from it, so this shows up as a pair.
+        let before = vec![node("android.widget.TextView", Some("3"), (0, 0, 100, 50))];
+        let after = vec![node("android.widget.TextView", Some("4"), (0, 0, 100, 50))];
+        let diff = tree_diff(&before, &after);
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+    }
+
+    #[test]
+    fn a_canvas_that_moved_under_a_motionless_tree_is_a_small_change() {
+        assert_eq!(
+            classify_effect(
+                None,
+                None,
+                Some(&TreeDiff::default()),
+                0,
+                Some(true),
+                Some(7),
+                Some(7)
+            ),
+            EFFECT_SMALL_CHANGE
+        );
+        assert_eq!(
+            classify_effect(
+                None,
+                None,
+                Some(&TreeDiff::default()),
+                0,
+                Some(false),
+                Some(7),
+                Some(7)
+            ),
+            EFFECT_UNCHANGED
+        );
+    }
+
+    #[test]
+    fn a_new_app_is_a_place_change_even_when_the_tree_changed() {
+        assert_eq!(
+            classify_effect(
+                Some("com.a"),
+                Some("com.b"),
+                Some(&TreeDiff {
+                    added: 9,
+                    ..TreeDiff::default()
+                }),
+                9,
+                None,
+                Some(1),
+                Some(2)
+            ),
+            EFFECT_PLACE_CHANGED
+        );
+    }
+
+    #[test]
+    fn a_tree_that_was_never_read_before_is_unknown() {
+        assert_eq!(classify_effect(None, None, None, 0, None, None, Some(3)), EFFECT_UNKNOWN);
+    }
+
+    // ── Raw screencap ──────────────────────────────────────────────────────
+
+    fn raw_frame(width: u32, height: u32, rgba: [u8; 4], header: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // RGBA_8888
+        out.extend(std::iter::repeat_n(0u8, header - 12));
+        out.extend(std::iter::repeat_n(rgba, (width * height) as usize).flatten());
+        out
+    }
+
+    #[test]
+    fn a_raw_frame_becomes_a_grid() {
+        // 120×240 gives 10×10 pixel cells, so every cell is the same colour.
+        for header in [12, 16] {
+            let frame = raw_frame(120, 240, [255, 0, 0, 255], header);
+            let signature = raw_screencap_signature(&frame).expect("a grid");
+            assert_eq!((signature.columns, signature.rows), (12, 24));
+            assert_eq!(signature.cells.len(), 12 * 24);
+            // (3*255 + 0 + 0) / 10 = 76
+            assert!(signature.cells.iter().all(|&cell| cell == 76), "{header}");
+        }
+    }
+
+    #[test]
+    fn a_frame_in_another_format_is_refused_rather_than_misread() {
+        let mut frame = raw_frame(120, 240, [0, 255, 0, 255], 16);
+        // Not RGBA_8888: the byte count matches but the layout does not, which
+        // is exactly the case that would silently produce a grid of noise.
+        frame[8..12].copy_from_slice(&0x11u32.to_le_bytes());
+        assert!(raw_screencap_signature(&frame).is_none());
+    }
+
+    #[test]
+    fn a_truncated_frame_is_refused() {
+        let mut frame = raw_frame(120, 240, [0, 0, 0, 255], 16);
+        frame.truncate(frame.len() - 400);
+        assert!(raw_screencap_signature(&frame).is_none());
+    }
+
+    #[test]
+    fn a_frame_too_small_for_the_grid_is_refused() {
+        // Fewer columns than grid cells: there is no honest average to take.
+        let frame = raw_frame(8, 8, [0, 0, 0, 255], 16);
+        assert!(raw_screencap_signature(&frame).is_none());
     }
 
     #[test]
@@ -4097,6 +5861,71 @@ mod tests {
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("center=(50,25)"), "{text}");
         assert!(format_ocr_lines(&[]).contains("no text"));
+    }
+
+    #[test]
+    fn a_bridge_ocr_answer_becomes_tappable_lines() {
+        let answer = serde_json::json!({
+            "ok": true,
+            "width": 1080,
+            "height": 2400,
+            "lines": [
+                { "text": "设置", "bounds": [10, 20, 110, 60], "confidence": 0.93 },
+                { "text": "  确定  ", "bounds": [900, 2200, 1060, 2320], "confidence": 0.81 },
+            ],
+        });
+        let lines = parse_ocr_answer(&answer).expect("lines");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "设置");
+        assert_eq!(lines[0].center, (60, 40));
+        assert_eq!(lines[1].text, "确定");
+        // The tap target has to be inside the line's own box.
+        let (cx, cy) = lines[1].center;
+        assert!(cx > 900 && cx < 1060 && cy > 2200 && cy < 2320);
+        assert!((lines[0].confidence - 0.93).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_unloadable_engine_is_never_an_empty_screen() {
+        // The whole point of the sentinel: an empty list would tell the model
+        // the screen is blank, and it would stop looking.
+        let answer = serde_json::json!({
+            "ok": false,
+            "code": "ocr_unavailable",
+            "error": "the on-device OCR engine could not be loaded",
+        });
+        let refused = parse_ocr_answer(&answer).expect_err("no engine");
+        assert!(refused.starts_with("ocr_unavailable"), "{refused}");
+        assert!(refused.contains("could not be loaded"), "{refused}");
+    }
+
+    #[test]
+    fn a_success_answer_without_lines_is_malformed_not_blank() {
+        let refused =
+            parse_ocr_answer(&serde_json::json!({ "ok": true })).expect_err("no line list");
+        assert!(refused.starts_with("ocr_unavailable"), "{refused}");
+    }
+
+    #[test]
+    fn unusable_ocr_lines_are_skipped_but_the_rest_survive() {
+        let answer = serde_json::json!({
+            "ok": true,
+            "lines": [
+                { "text": "kept", "bounds": [0, 0, 100, 40] },
+                { "text": "   ", "bounds": [0, 0, 100, 40] },
+                { "text": "no bounds" },
+                { "text": "short bounds", "bounds": [0, 0, 100] },
+                { "text": "not numbers", "bounds": ["a", 0, 1, 1] },
+                { "text": "flat", "bounds": [10, 10, 10, 40] },
+                { "text": "no confidence", "bounds": [0, 50, 100, 90] },
+            ],
+        });
+        let lines = parse_ocr_answer(&answer).expect("lines");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0].text, "kept");
+        assert_eq!(lines[1].text, "no confidence");
+        // Absent confidence is reported as zero, not as a negative sentinel.
+        assert_eq!(lines[1].confidence, 0.0);
     }
 
     #[test]

@@ -133,6 +133,40 @@ object A11yBridge {
             .put("clickable", node.isClickable)
             .put("enabled", node.isEnabled)
             .put("depth", depth)
+            // What the node *is*, as opposed to what it says. Without these the
+            // reader cannot tell a scrollable list from a static wrapper (so a
+            // scroll has to be a guessed swipe down the middle of the screen),
+            // or an editable field from a label (so a write cannot be read
+            // back), or a password box from ordinary text (so its contents get
+            // summarised to the model). `isPassword` is API 18; minSdk is 26.
+            .put("scrollable", node.isScrollable)
+            .put("editable", node.isEditable)
+            .put("checkable", node.isCheckable)
+            // `getChecked()` (API 21) is the tri-state replacement for the
+            // deprecated `isChecked()`. "Partially checked" is a real state for
+            // a parent checkbox, but for the model it is still "on" — the point
+            // of the flag is whether ticking this node changed anything.
+            .put(
+              "checked",
+              node.checked != AccessibilityNodeInfo.CHECKED_STATE_FALSE,
+            )
+            .put("selected", node.isSelected)
+            .put("focused", node.isFocused)
+            .put("password", node.isPassword)
+            .put("longClickable", node.isLongClickable)
+            .put(
+              "scrollActions",
+              JSONArray(
+                listOf(
+                  node.actionList.any {
+                    it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                  },
+                  node.actionList.any {
+                    it.id == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                  },
+                ),
+              ),
+            )
             .put(
               "bounds",
               JSONArray(listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)),

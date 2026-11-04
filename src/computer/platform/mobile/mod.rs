@@ -85,6 +85,56 @@ pub async fn run_cmd(
     run_cmd_with(&req).await
 }
 
+/// [`run_cmd`] with a wall-clock bound.
+///
+/// `ProcessRequest::timeout` defaults to `None`, which waits forever; the
+/// device lock a caller holds is held for exactly as long as the process runs,
+/// so anything that can hang must state its bound here. On expiry the child is
+/// killed and this reports a timeout rather than an `io::Error`: "it did not
+/// answer in time" is a result the caller can explain, not a transport fault.
+pub async fn run_cmd_timeout(cmd: &str, args: &[&str], timeout: std::time::Duration) -> RunOutcome {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(cmd.to_string());
+    argv.extend(args.iter().map(|s| s.to_string()));
+    let mut req = crate::tools::process_runner::ProcessRequest::argv(
+        &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    req.timeout = Some(timeout);
+
+    match crate::tools::process_runner::run_collect(&req).await {
+        Ok(out) if out.timed_out => RunOutcome::TimedOut {
+            stdout: out.stdout_string(),
+            stderr: out.stderr_string(),
+        },
+        Ok(out) => match out.status {
+            Some(status) => RunOutcome::Finished {
+                status,
+                stdout: out.stdout_string(),
+                stderr: out.stderr_string(),
+            },
+            None => RunOutcome::TimedOut {
+                stdout: out.stdout_string(),
+                stderr: out.stderr_string(),
+            },
+        },
+        Err(e) => RunOutcome::Failed(e.to_string()),
+    }
+}
+
+/// What [`run_cmd_timeout`] observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    Finished {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    },
+    /// The child was killed at the deadline. Whatever it printed first is kept.
+    TimedOut { stdout: String, stderr: String },
+    /// It never ran (spawn failure, bad argv).
+    Failed(String),
+}
+
 /// [`run_cmd`] for a request that carries more than argv — stdin, notably.
 ///
 /// The display helper's launch sends a one-time nonce on stdin, and that is the

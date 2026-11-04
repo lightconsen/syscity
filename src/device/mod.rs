@@ -88,6 +88,13 @@ pub const CMD_OPEN_URL: &str = "openUrl";
 pub const CMD_A11Y_TREE: &str = "accessibilityTree";
 /// Whether the accessibility service is enabled and connected.
 pub const CMD_A11Y_STATUS: &str = "accessibilityStatus";
+/// Read text out of a base64 PNG with the on-device ML Kit model.
+///
+/// Only the mobile build has no `vision` feature, so this is how OCR works on
+/// the phone itself: the desktop agent's ONNX engine is not compiled in there.
+/// Answers `{"ok": false, "code": "ocr_unavailable"}` when the model cannot
+/// load — an explicit failure, never an empty line list.
+pub const CMD_OCR: &str = "ocr";
 /// Open the system accessibility settings, where the user enables the service.
 pub const CMD_A11Y_SETTINGS: &str = "openAccessibilitySettings";
 

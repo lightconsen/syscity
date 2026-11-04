@@ -497,6 +497,28 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   }
 
   /**
+   * `ocr` — read the text in a screenshot with the on-device ML Kit model.
+   *
+   * The screenshot arrives base64-encoded because the caller (`ocr_png` in
+   * `src/computer/platform/mobile/android.rs`) already has the PNG bytes in
+   * the Rust process and there is no cheaper way to hand them across the
+   * bridge. Decoding and recognition both block, so they run on the serial
+   * executor; the answer is resolved back on the main thread like every other
+   * command here.
+   */
+  @Command
+  fun ocr(invoke: Invoke) {
+    val png = invoke.getArgs().optString("pngBase64")
+    if (png.isBlank()) {
+      invoke.reject("ocr needs the screenshot as `pngBase64`", "NO_IMAGE")
+      return
+    }
+    executor.execute {
+      OcrBridge.recognize(png) { answer -> mainHandler.post { invoke.resolve(answer) } }
+    }
+  }
+
+  /**
    * `openAccessibilitySettings` — take the user where they can enable it.
    *
    * The grant itself is deliberately not automated: an app that can turn on its

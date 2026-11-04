@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 
-use super::android::UiElement;
+use super::android::{NodeState, UiElement};
 use crate::device::{DeviceBridgeRef, CMD_A11Y_TREE};
 
 /// The service is not enabled (or not connected yet).
@@ -83,7 +83,49 @@ fn keep(node: &Value) -> bool {
         .get("clickable")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    clickable || !text.is_empty() || !desc.is_empty() || !rid.is_empty()
+    // A structural node is worth keeping even when it says nothing: an unnamed
+    // list is where the scroll has to go, and an unnamed field is where a write
+    // goes. Dropping them here would throw away the only handle on either.
+    clickable
+        || !text.is_empty()
+        || !desc.is_empty()
+        || !rid.is_empty()
+        || state_of(node).is_structural()
+}
+
+/// Read the node's semantics, whichever fields the bridge sent.
+///
+/// Older bridge builds carry none of these, so every field defaults to `false`
+/// and the element behaves exactly as it did before.
+fn state_of(node: &Value) -> NodeState {
+    let flag = |key: &str| node.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let actions = node.get("scrollActions").and_then(Value::as_array);
+    NodeState {
+        scrollable: flag("scrollable"),
+        editable: flag("editable"),
+        checkable: flag("checkable"),
+        checked: flag("checked"),
+        selected: flag("selected"),
+        focused: flag("focused"),
+        password: flag("password"),
+        long_clickable: flag("longClickable"),
+        // `scrollActions` is `[forward, backward]`. Absent (an older bridge, or
+        // a source without action info) falls back to plain scrollability,
+        // which is the pre-existing behaviour: try, and let the result say.
+        scroll_forward: actions
+            .and_then(|a| a.first())
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| flag("scrollable")),
+        scroll_backward: actions
+            .and_then(|a| a.get(1))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| flag("scrollable")),
+        depth: node
+            .get("depth")
+            .and_then(Value::as_i64)
+            .and_then(|depth| u32::try_from(depth).ok())
+            .unwrap_or(0),
+    }
 }
 
 /// `[x1, y1, x2, y2]`, however the platform spelled it.
@@ -166,7 +208,7 @@ pub fn parse(value: &Value) -> Result<A11ySnapshot, A11yUnavailable> {
             // A zero-area node cannot be tapped and says nothing about layout.
             continue;
         }
-        elements.push(UiElement::new(
+        elements.push(UiElement::with_state(
             elements.len() + 1,
             string_of(node, "text"),
             string_of(node, "desc"),
@@ -176,6 +218,7 @@ pub fn parse(value: &Value) -> Result<A11ySnapshot, A11yUnavailable> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             node.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            state_of(node),
             bounds,
         ));
     }
@@ -312,6 +355,83 @@ mod tests {
     fn truncation_is_reported() {
         let payload = serde_json::json!({ "enabled": true, "truncated": true, "nodes": [] });
         assert!(parse(&payload).expect("tree").truncated);
+    }
+
+    #[test]
+    fn semantics_reach_the_element() {
+        let payload = serde_json::json!({
+            "enabled": true,
+            "nodes": [{
+                "cls": "android.widget.EditText", "text": "hunter2", "desc": "", "rid": "id/pw",
+                "clickable": true, "enabled": true, "depth": 4,
+                "scrollable": true, "editable": true, "checkable": true, "checked": true,
+                "selected": true, "focused": true, "password": true, "longClickable": true,
+                "scrollActions": [true, false],
+                "bounds": [0, 0, 100, 40],
+            }],
+        });
+        let element = &parse(&payload).expect("tree").elements[0];
+        assert!(element.state.scrollable);
+        assert!(element.state.editable);
+        assert!(element.state.checkable);
+        assert!(element.state.checked);
+        assert!(element.state.selected);
+        assert!(element.state.focused);
+        assert!(element.state.password);
+        assert!(element.state.long_clickable);
+        assert!(element.state.scroll_forward);
+        assert!(!element.state.scroll_backward);
+        assert_eq!(element.state.depth, 4);
+    }
+
+    #[test]
+    fn an_unnamed_scroll_list_survives_the_filter() {
+        // The list is where a scroll has to go; dropping it for having no text
+        // is what made every scroll a blind swipe down the middle.
+        let payload = serde_json::json!({
+            "enabled": true,
+            "nodes": [
+                { "cls": "androidx.recyclerview.widget.RecyclerView", "text": "", "desc": "",
+                  "rid": "", "clickable": false, "enabled": true, "scrollable": true,
+                  "bounds": [0, 200, 1080, 2000] },
+                node("android.widget.FrameLayout", "", [0, 0, 1080, 100], false),
+            ],
+        });
+        let elements = parse(&payload).expect("tree").elements;
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].class, "RecyclerView");
+        assert!(elements[0].state.scrollable);
+    }
+
+    #[test]
+    fn an_older_bridge_without_semantics_still_parses() {
+        let payload = serde_json::json!({
+            "enabled": true,
+            "nodes": [{
+                "cls": "android.widget.Button", "text": "OK", "desc": "", "rid": "",
+                "clickable": true, "enabled": true, "bounds": [0, 0, 100, 50],
+            }],
+        });
+        let element = &parse(&payload).expect("tree").elements[0];
+        assert_eq!(element.state, NodeState::default());
+    }
+
+    #[test]
+    fn semantics_do_not_change_identity() {
+        let base = serde_json::json!({
+            "enabled": true,
+            "nodes": [
+                { "cls": "android.widget.CheckBox", "text": "Remember me", "desc": "",
+                  "rid": "id/remember", "clickable": true, "enabled": true,
+                  "bounds": [0, 0, 100, 50] },
+                { "cls": "android.widget.CheckBox", "text": "Remember me", "desc": "",
+                  "rid": "id/remember", "clickable": true, "enabled": true,
+                  "bounds": [0, 0, 100, 50], "checkable": true, "checked": true },
+            ],
+        });
+        let elements = parse(&base).expect("tree").elements;
+        // Ticking the box is a state change, not a different element.
+        assert_eq!(elements[0].key, elements[1].key);
     }
 
     #[tokio::test]
