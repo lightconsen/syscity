@@ -2230,6 +2230,10 @@ impl Tool for AdbDisplayTool {
         // launch has one: every other action is judged by the screen it acted
         // on, and this is the screen a launch *moved to*.
         let mut opened: Option<super::coldstart::Opened> = None;
+        // Which copy the launch is asking about, when the system raised a
+        // chooser because the app is installed twice. `None` is "not a
+        // question", which is not the same as "could not tell".
+        let mut chooser: Option<Vec<super::profiles::Choice>> = None;
         let result = match action {
             "stop" => display.close().await.map(|_| "Display closed.".to_string()),
             "launch" => {
@@ -2244,6 +2248,26 @@ impl Tool for AdbDisplayTool {
                         opened =
                             super::coldstart::await_opened(&bridge, id, package, LAUNCH_SETTLE)
                                 .await;
+                        // A chooser is the system asking which copy of a
+                        // twice-installed app to open. The display cannot
+                        // answer it — a tap would be picking without knowing
+                        // which copy — so it is named, its options are read,
+                        // and the caller chooses.
+                        if matches!(opened, Some(super::coldstart::Opened::Chooser { .. })) {
+                            chooser = match (
+                                super::profiles::users(&device).await,
+                                super::android::dump_ui(&device, Target::Display(id)).await,
+                            ) {
+                                (Some(users), Ok(screen)) => {
+                                    super::profiles::chooser_options(&screen.elements, &users)
+                                }
+                                // Not being able to read who else is on the
+                                // phone, or the chooser itself, leaves the
+                                // question open rather than answered: the
+                                // caller is told it is a chooser either way.
+                                _ => None,
+                            };
+                        }
                         let mut text = format!("Opened {package} on display {id} (muted).");
                         if let Some(rest) = opened
                             .as_ref()
@@ -2251,6 +2275,10 @@ impl Tool for AdbDisplayTool {
                         {
                             text.push(' ');
                             text.push_str(&rest);
+                        }
+                        if let Some(choices) = &chooser {
+                            text.push(' ');
+                            text.push_str(&super::profiles::describe_choices(choices));
                         }
                         Ok(text)
                     }
@@ -2425,6 +2453,19 @@ impl Tool for AdbDisplayTool {
                             _ => None,
                         },
                     })),
+                    // The options the chooser is offering, when the launch
+                    // raised one and they could be read. Absent means "not a
+                    // chooser, or a question that could not be read" — the
+                    // `opened` state says which.
+                    "chooser": chooser.as_ref().map(|choices| {
+                        serde_json::json!({
+                            "options": choices.iter().map(|choice| serde_json::json!({
+                                "label": choice.label,
+                                "copy": choice.copy.as_str(),
+                                "note": choice.copy.note(),
+                            })).collect::<Vec<_>>(),
+                        })
+                    }),
                     "risk": clearance.note(),
                     "risk_approved": clearance.asked,
                     "paced": pace_note,

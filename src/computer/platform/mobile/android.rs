@@ -2040,33 +2040,64 @@ impl AdbAppManagerTool {
         // "Already in front" is Android declining to restart an app that is
         // already open. The app is on screen, which is all the caller asked for.
         let started = matches!(verdict, LaunchOutcome::Started | LaunchOutcome::AlreadyInFront);
-        let sentence = match verdict {
-            LaunchOutcome::Started => format!("`{pkg}` is up ({component})."),
-            LaunchOutcome::AlreadyInFront => {
+
+        // An install in two profiles is two copies of one package, and Android
+        // answers a launch of it by asking which copy to open instead of
+        // opening one. `am start` reports `Status: ok` for that question — the
+        // activity it started is the chooser — so the launch is not finished
+        // until the screen says what rose to the top. Read it here rather than
+        // reporting "started" and leaving the caller to discover the question
+        // on its next observation.
+        let chooser = if started {
+            self.launch_chooser(device).await
+        } else {
+            None
+        };
+
+        let sentence = match (&chooser, verdict) {
+            (Some(choices), _) => format!(
+                "`{pkg}` is up only as a question: {}. Pick one copy with \
+                 `android_dialog` before going on.",
+                super::profiles::describe_choices(choices)
+            ),
+            (None, LaunchOutcome::Started) => format!("`{pkg}` is up ({component})."),
+            (None, LaunchOutcome::AlreadyInFront) => {
                 format!("`{pkg}` was already in front; Android did not restart it ({component}).")
             }
-            LaunchOutcome::Failed => format!("launch failed for `{pkg}` ({component})."),
-            LaunchOutcome::Unknown if timed_out => format!(
+            (None, LaunchOutcome::Failed) => format!("launch failed for `{pkg}` ({component})."),
+            (None, LaunchOutcome::Unknown) if timed_out => format!(
                 "`adb` did not confirm `{pkg}` within {} ms; it may still come up. Observe before acting.",
                 LAUNCH_TIMEOUT.as_millis()
             ),
-            LaunchOutcome::Unknown => format!(
-                "`adb` exited without a status for `{pkg}`; observe before acting."
-            ),
+            (None, LaunchOutcome::Unknown) => {
+                format!("`adb` exited without a status for `{pkg}`; observe before acting.")
+            }
         };
 
-        let status_word = match verdict {
-            LaunchOutcome::Started => "ok",
-            LaunchOutcome::AlreadyInFront => "already_in_front",
-            LaunchOutcome::Failed => "error",
-            LaunchOutcome::Unknown => "unknown",
+        let status_word = match (&chooser, verdict) {
+            (Some(_), _) => "chooser",
+            (None, LaunchOutcome::Started) => "ok",
+            (None, LaunchOutcome::AlreadyInFront) => "already_in_front",
+            (None, LaunchOutcome::Failed) => "error",
+            (None, LaunchOutcome::Unknown) => "unknown",
         };
         let data = serde_json::json!({
             "device": resolved_serial(device).await,
             "component": component,
+            // A chooser is not the app: `launched` stays true because the
+            // start was accepted, and `chooser` is the fact the caller has to
+            // act on.
             "launched": started,
             "timed_out": timed_out,
             "status": status_word,
+            "chooser": chooser.map(|choices| serde_json::json!({
+                "package": pkg,
+                "options": choices.iter().map(|choice| serde_json::json!({
+                    "label": choice.label,
+                    "copy": choice.copy.as_str(),
+                    "note": choice.copy.note(),
+                })).collect::<Vec<_>>(),
+            })),
         });
 
         Ok(if started {
@@ -2074,6 +2105,112 @@ impl AdbAppManagerTool {
         } else {
             ToolExecutionResult::error(format!("{sentence}\n{detail}")).with_data(data)
         })
+    }
+
+    /// Whether what came to the front after a launch is the system asking
+    /// which copy of an app to open, and what the options are.
+    ///
+    /// Best-effort in both directions. The tree may be unreadable (a phone
+    /// whose accessibility service is off, a screen the platform hides); the
+    /// user list may be unreadable (no shell). Neither is a launch failure, and
+    /// neither is a reason to guess: the answer is `None` and the launch is
+    /// reported as the `am start` verdict said.
+    async fn launch_chooser(
+        &self,
+        device: &Option<String>,
+    ) -> Option<Vec<super::profiles::Choice>> {
+        let users = super::profiles::users(device).await?;
+        // `am start` without `--display` puts the launch on whichever screen
+        // the person is using, so that is the tree the question is in.
+        let dump = dump_ui(device, Target::Screen).await.ok()?;
+        let current = super::profiles::current_user(device)
+            .await
+            .unwrap_or(super::profiles::OWNER);
+        let others: Vec<super::profiles::UserProfile> = users
+            .into_iter()
+            .filter(|user| user.id != current)
+            .collect();
+        super::profiles::chooser_options(&dump.elements, &others)
+    }
+
+    /// List the apps installed here, and which of them are also installed in
+    /// another profile.
+    ///
+    /// The plain `pm list packages` answers for the user the shell is in, which
+    /// on a phone with a work profile or a clone is one of several package
+    /// lists. An app that is in two of them is *the same package name*, so a
+    /// caller reading only its own list cannot tell the two copies apart — and
+    /// a launch of it raises the system's "which one?" question instead of
+    /// opening the app. `alsoIn` is that second answer.
+    ///
+    /// The extra reads are best-effort: on a phone with one user there is
+    /// nothing to ask, and on a phone whose `pm` refuses `--user` the list is
+    /// still the right answer to "what is installed here". Neither is a reason
+    /// to fail the listing, so the result reports `profiles_known`.
+    async fn list_packages(&self, device: &Option<String>) -> crate::Result<ToolExecutionResult> {
+        let argv = adb_args(device, &["shell", "pm", "list", "packages"]);
+        let (status, stdout, stderr) =
+            run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                .await
+                .map_err(|e| crate::error::SyscityError::ExternalService {
+                    source: "adb app manager failed".to_string(),
+                    cause: Some(Box::new(e)),
+                })?;
+        if !status.success() {
+            return Ok(ToolExecutionResult::error(format!(
+                "listing the apps failed: {}",
+                stderr.trim()
+            )));
+        }
+        let own = super::profiles::parse_packages(&stdout);
+        let current = super::profiles::current_user(device)
+            .await
+            .unwrap_or(super::profiles::OWNER);
+        let shared = super::profiles::other_profiles(device, current)
+            .await
+            .map(|others| super::profiles::also_in(&others))
+            .unwrap_or_default();
+        let profiles_known = super::profiles::users(device).await.is_some();
+
+        let apps: Vec<Value> = own
+            .iter()
+            .map(|package| {
+                let mut entry = serde_json::json!({ "package": package });
+                if let Some(profiles) = shared.get(package) {
+                    entry["also_in"] = serde_json::json!(profiles);
+                }
+                entry
+            })
+            .collect();
+        let text = if shared.is_empty() {
+            format!(
+                "{} app(s) installed{}.\n{}",
+                own.len(),
+                if profiles_known {
+                    ""
+                } else {
+                    " (no other profile but the phone's own)"
+                },
+                stdout.trim()
+            )
+        } else {
+            let mut lines = vec![format!(
+                "{} app(s) installed; {} also have a copy in another profile:",
+                own.len(),
+                shared.len()
+            )];
+            for (package, profiles) in &shared {
+                lines.push(format!("  {package} — also in {}", profiles.join(", ")));
+            }
+            lines.join("\n")
+        };
+
+        Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+            "device": resolved_serial(device).await,
+            "apps": apps,
+            "also_in": shared,
+            "profiles_known": profiles_known,
+        })))
     }
 
     /// Ask the phone which activity `package` launches through.
@@ -2158,7 +2295,9 @@ impl Tool for AdbAppManagerTool {
 
     fn description(&self) -> &str {
         "Install, launch, force-stop, or list apps on an Android device. 'completed' means the \
-         adb command was dispatched, not that the app started — observe afterwards to see."
+         adb command was dispatched, not that the app started — observe afterwards to see. \
+         `list_packages` marks an app also installed in another profile (`also_in`); `launch` of \
+         such an app can raise the system's \"which copy?\" question, reported as `chooser`."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -2199,6 +2338,9 @@ impl Tool for AdbAppManagerTool {
         if action == "launch" {
             return self.launch(&device, &args).await;
         }
+        if action == "list_packages" {
+            return self.list_packages(&device).await;
+        }
 
         let argv = match action {
             "install" => {
@@ -2209,7 +2351,6 @@ impl Tool for AdbAppManagerTool {
                 let pkg = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
                 adb_args(&device, &["shell", "am", "force-stop", pkg])
             }
-            "list_packages" => adb_args(&device, &["shell", "pm", "list", "packages"]),
             _ => return Ok(ToolExecutionResult::error(format!("Unknown action: {}", action))),
         };
 
