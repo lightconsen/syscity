@@ -11,6 +11,7 @@ pub mod a11y;
 pub mod android;
 pub mod android_tools;
 pub mod coldstart;
+pub mod diagnose;
 pub mod diff;
 pub mod display;
 pub mod gate;
@@ -27,9 +28,9 @@ pub mod wheel_typing;
 
 pub use android::AndroidToolset;
 pub use android_tools::{
-    AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbEventTool, AdbExtractTool, AdbFindTool,
-    AdbHandToUserTool, AdbOcrTool, AdbQueryTool, AdbRunTool, AdbSetWheelTool, AdbSystemActionTool,
-    AdbWaitTool,
+    AdbCollectTool, AdbDiagnoseTool, AdbDialogTool, AdbDisplayTool, AdbEventTool, AdbExtractTool,
+    AdbFindTool, AdbHandToUserTool, AdbOcrTool, AdbQueryTool, AdbRunTool, AdbSetWheelTool,
+    AdbSystemActionTool, AdbWaitTool,
 };
 pub use ios::IosToolset;
 

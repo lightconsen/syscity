@@ -36,6 +36,11 @@ pub struct Blocked {
 
 /// A person holds the phone: locked, or asleep.
 pub const PHONE_LOCKED: &str = "PHONE_LOCKED";
+/// What [`PHONE_LOCKED`] means, said once so the diagnosis tool and the write
+/// guard cannot drift into two wordings of the same fact.
+pub const PHONE_LOCKED_HINT: &str = "the phone is locked (or asleep), so a tap on the user's \
+     screen lands on the lock screen rather than the app. Nothing was done. Wait for the person \
+     to unlock it, or use a second display, which the lock screen does not cover.";
 /// The display helper is not running.
 pub const HELPER_DOWN: &str = "HELPER_DOWN";
 /// The display no longer shows the app it was showing.
@@ -72,12 +77,7 @@ pub fn check(
         // the tap lands on the lock screen and the agent will be told the
         // screen changed when nothing it meant to touch did.
         return if readiness.locked {
-            Err(Blocked::new(
-                PHONE_LOCKED,
-                "the phone is locked (or asleep), so a tap on the user's screen lands on the lock \
-                 screen rather than the app. Nothing was done. Wait for the person to unlock it, \
-                 or use a second display, which the lock screen does not cover.",
-            ))
+            Err(Blocked::new(PHONE_LOCKED, PHONE_LOCKED_HINT))
         } else {
             Ok(())
         };

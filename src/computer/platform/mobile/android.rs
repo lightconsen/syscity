@@ -102,6 +102,9 @@ impl PlatformToolSet for AndroidToolset {
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
+            // Why this screen looks the way it does: a blank, a spinner, a
+            // protected window, or a person the agent must hand it to.
+            Box::new(super::android_tools::AdbDiagnoseTool::new()),
             // The second screen: the user keeps the phone while a task runs,
             // and a step they have to do themselves goes back to them.
             Box::new(super::android_tools::AdbDisplayTool::new()),
@@ -4397,7 +4400,7 @@ pub async fn settle_after_action_with_pixels_and_events_from(
 /// device's — the helper never mirrors display 0, so `screencap` is the only
 /// source there. Both produce the same grid, which is what makes the two
 /// comparable.
-async fn display_frame(target: Target) -> Option<super::display::FrameSignature> {
+pub(super) async fn display_frame(target: Target) -> Option<super::display::FrameSignature> {
     if let Target::Display(id) = target {
         let bridge = display_bridge().ok()?;
         let display = super::display::VirtualDisplay::attach(bridge, id);
