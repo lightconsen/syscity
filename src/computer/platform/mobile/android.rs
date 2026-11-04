@@ -91,6 +91,8 @@ impl PlatformToolSet for AndroidToolset {
             // `android_input`/`android_app_manager`, so nothing a single call
             // checks is skipped — what it saves is the model's turns.
             Box::new(super::android_tools::AdbRunTool::new()),
+            // The same screen, read as data rather than as tap targets.
+            Box::new(super::android_tools::AdbExtractTool::new()),
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),

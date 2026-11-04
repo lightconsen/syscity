@@ -170,6 +170,7 @@ hand:
 | `android_find` | scrolling until something appears: returns the coordinates once it does, or says how far it looked |
 | `android_query` | reading the whole tree to answer "is there a 发送 button" or "how many rows": matches by text / resource id / class and returns one line per hit, with the total |
 | `android_wait` | "observe, then observe again a second later": waits for an element to appear or go, or for the screen to settle, and on timeout says what is actually there |
+| `android_extract` | reading a screen as text: `text` returns readable lines in order, `list` one entry per row of a list, `form` one entry per input field with its label and inferred kind (a password's contents are never read) |
 | `android_run` | one turn per tap: runs up to 30 known steps in one call, finding each target again on the live screen before acting, and stops at the first step whose aftermath says the rest are unsafe — an app switch, an app landing on the user's screen, or a screen the tree cannot describe |
 | `android_dialog` | describing a dialog: reads its text and buttons, and presses one only if exactly one button matches |
 | `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
