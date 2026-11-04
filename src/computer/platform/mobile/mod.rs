@@ -19,11 +19,14 @@ pub mod query;
 pub mod ready;
 pub mod risk;
 pub mod takeover;
+pub mod wheel;
+pub mod wheel_typing;
 
 pub use android::AndroidToolset;
 pub use android_tools::{
     AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbEventTool, AdbExtractTool, AdbFindTool,
-    AdbHandToUserTool, AdbOcrTool, AdbQueryTool, AdbRunTool, AdbSystemActionTool, AdbWaitTool,
+    AdbHandToUserTool, AdbOcrTool, AdbQueryTool, AdbRunTool, AdbSetWheelTool, AdbSystemActionTool,
+    AdbWaitTool,
 };
 pub use ios::IosToolset;
 

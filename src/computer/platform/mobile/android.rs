@@ -96,6 +96,9 @@ impl PlatformToolSet for AndroidToolset {
             // What the phone says has happened, without reading the screen:
             // windows, content changes and notifications, as facts.
             Box::new(super::android_tools::AdbEventTool::new()),
+            // One call to turn a wheel (a time, a date, a region): the control
+            // a model otherwise drives one tap at a time.
+            Box::new(super::android_tools::AdbSetWheelTool::new()),
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
@@ -716,7 +719,7 @@ pub(super) fn sh_quote(s: &str) -> String {
 ///
 /// A literal `%` must be doubled *before* spaces become `%s`, otherwise the `%`
 /// introduced here would itself be doubled.
-fn input_encode(s: &str) -> String {
+pub(super) fn input_encode(s: &str) -> String {
     s.replace('%', "%%").replace(' ', "%s")
 }
 
@@ -2121,6 +2124,16 @@ pub struct NodeState {
     pub scroll_forward: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub scroll_backward: bool,
+    /// This node reads as a wheel picker: a short, centred, evenly spaced run
+    /// of values (a time, a date, a region) rather than a list.
+    ///
+    /// Decided by the source that has the children, not by this struct — see
+    /// `wheel::looks_like_wheel`. The flag is what lets
+    /// `android_set_wheel` find a picker without the model having to describe
+    /// its geometry, and its absence is why a wheel used to be driven by
+    /// guessing which way a swipe turns it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wheel: bool,
     /// Distance from the root of the read it came from.
     ///
     /// The element list is flat, so depth is the only surviving trace of the
@@ -2142,7 +2155,7 @@ impl NodeState {
     /// done there. [`assess_tree`] uses this so a blank-looking list screen is
     /// not written off as undescribable.
     pub fn is_structural(&self) -> bool {
-        self.scrollable || self.editable || self.checkable
+        self.scrollable || self.editable || self.checkable || self.wheel
     }
 }
 
@@ -2178,6 +2191,15 @@ pub struct UiElement {
     pub bounds: (i32, i32, i32, i32),
     /// Centre of `bounds` — what a tap should target.
     pub center: (i32, i32),
+    /// The accessibility node this element came from, when the source keeps
+    /// one (`a11y::NodeRef`).
+    ///
+    /// Not part of the element's identity and never sent to the model: it is a
+    /// handle into the phone's own process that expires with the node, whereas
+    /// `key` is what survives a read. It exists so an action can be addressed to
+    /// the control itself instead of to a point on the screen.
+    #[serde(skip)]
+    pub node_ref: Option<super::a11y::NodeRef>,
 }
 
 impl UiElement {
@@ -2239,6 +2261,7 @@ impl UiElement {
             state,
             bounds,
             center: ((x1 + x2) / 2, (y1 + y2) / 2),
+            node_ref: None,
         };
         element.key = element_key(&element);
         element
@@ -2380,6 +2403,10 @@ pub fn parse_uiautomator_xml(xml: &str) -> Result<Vec<UiElement>, String> {
             // node it calls scrollable is assumed to accept both.
             scroll_forward: scrollable,
             scroll_backward: scrollable,
+            // `uiautomator` says nothing about wheels, and the dump has no
+            // children to judge a run of values by; the class is the one
+            // honest signal, and it is the same one the bridge trusts first.
+            wheel: class.ends_with("NumberPicker"),
             depth: node_depth(node),
         };
 
@@ -2764,6 +2791,9 @@ pub(super) fn format_ui_summary(elements: &[UiElement]) -> String {
             } else {
                 " unchecked"
             });
+        }
+        if e.state.wheel {
+            flags.push_str(" wheel");
         }
         if e.state.selected {
             flags.push_str(" selected");
@@ -4165,7 +4195,7 @@ pub fn format_ocr_lines(lines: &[OcrLine]) -> String {
 /// match in either direction. An element with no label at all cannot be checked
 /// and passes — refusing there would block icon buttons the model identified
 /// from the screenshot.
-fn label_matches(label: &str, description: &str) -> bool {
+pub(super) fn label_matches(label: &str, description: &str) -> bool {
     let label = label.trim();
     if label.is_empty() {
         return true;
@@ -4185,7 +4215,7 @@ fn label_matches(label: &str, description: &str) -> bool {
 /// stale read silently hits whatever has since moved into place, so an indexed
 /// tap re-reads and validates first, and refuses with a reason the model can act
 /// on rather than clicking blind.
-fn validate_target<'a>(
+pub(super) fn validate_target<'a>(
     elements: &'a [UiElement],
     index: usize,
     description: Option<&str>,

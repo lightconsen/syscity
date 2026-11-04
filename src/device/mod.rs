@@ -101,6 +101,14 @@ pub const CMD_A11Y_STATUS: &str = "accessibilityStatus";
 /// is the buffer half — history from before a waiter started listening, and the
 /// only path when the callback is missing.
 pub const CMD_A11Y_EVENTS: &str = "accessibilityEvents";
+/// Run an accessibility action on a node named by the `ref` of a tree read.
+///
+/// This is how a control is pressed as a control rather than as a point: the
+/// node itself receives `ACTION_CLICK` / `ACTION_SCROLL_FORWARD` /
+/// `ACTION_SET_TEXT`, which reaches widgets that do not sit under their own
+/// coordinates and lists whose only honest scroll is the platform's. The
+/// answer is `{ok, accepted, reason}` — every caller has a next method to try.
+pub const CMD_A11Y_ACTION: &str = "accessibilityAction";
 /// Read text out of a base64 PNG with the on-device ML Kit model.
 ///
 /// Only the mobile build has no `vision` feature, so this is how OCR works on

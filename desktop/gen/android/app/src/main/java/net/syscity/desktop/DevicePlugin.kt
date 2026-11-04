@@ -488,6 +488,37 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   }
 
   /**
+   * `accessibilityAction` — run an accessibility action on a node of the last
+   * read.
+   *
+   * This is "tell the control it was pressed", where `input tap` is "press
+   * here". The difference matters for a control that does not sit under its
+   * own coordinates (a checkbox in a whole clickable row), for a list that
+   * only scrolls through `ACTION_SCROLL_FORWARD`, and for a picker whose row
+   * accepts `ACTION_SET_TEXT`. The node is named by the `ref` the tree read
+   * carried, not by a point, so it is still the same node after the screen
+   * scrolled under it.
+   *
+   * The answer is always an answer — `{ok, accepted, reason}` — because every
+   * caller has a next way to act and needs to know why this one did not work.
+   */
+  @Command
+  fun accessibilityAction(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val ref = args.optInt("ref", 0)
+    if (ref <= 0) {
+      invoke.resolve(
+        JSObject().put("ok", false).put("accepted", 0).put("reason", "no_ref"),
+      )
+      return
+    }
+    val action = args.optString("action", "")
+    val text = if (args.has("text") && !args.isNull("text")) args.optString("text", "") else null
+    val count = args.optInt("count", 1)
+    invoke.resolve(A11yBridge.action(ref, action, text, count))
+  }
+
+  /**
    * `accessibilityStatus` — is the service switched on, is it connected, and
    * which event types is the running binding subscribed to?
    *

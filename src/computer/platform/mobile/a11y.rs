@@ -42,6 +42,15 @@ impl A11yUnavailable {
     }
 }
 
+/// The handle for one node of a read.
+///
+/// `ref` names the node itself — the same integer the Kotlin side keeps in its
+/// table — which is what lets an action be addressed to a control rather than
+/// to a point. It is deliberately *not* part of [`UiElement`]: a ref lives in
+/// the phone's process and expires with the node, while the key is the
+/// element's identity and survives across reads.
+pub type NodeRef = u32;
+
 /// One read of the screen through the accessibility service.
 #[derive(Debug, Clone, PartialEq)]
 pub struct A11ySnapshot {
@@ -125,7 +134,22 @@ fn state_of(node: &Value) -> NodeState {
             .and_then(Value::as_i64)
             .and_then(|depth| u32::try_from(depth).ok())
             .unwrap_or(0),
+        // Only the bridge can decide this: the judgement is about the node's
+        // children, and `uiautomator` drops that hierarchy. A bridge that does
+        // not send the flag says nothing, which is the safe answer.
+        wheel: flag("wheel"),
     }
+}
+
+/// The node handle a bridge node carried, if it sent one.
+///
+/// `None` for a source that does not hand out refs (`uiautomator`), which is
+/// exactly the case where an action has to be a gesture instead.
+pub fn node_ref(node: &Value) -> Option<NodeRef> {
+    node.get("ref")
+        .and_then(Value::as_u64)
+        .and_then(|value| NodeRef::try_from(value).ok())
+        .filter(|value| *value > 0)
 }
 
 /// `[x1, y1, x2, y2]`, however the platform spelled it.
@@ -208,7 +232,7 @@ pub fn parse(value: &Value) -> Result<A11ySnapshot, A11yUnavailable> {
             // A zero-area node cannot be tapped and says nothing about layout.
             continue;
         }
-        elements.push(UiElement::with_state(
+        let mut element = UiElement::with_state(
             elements.len() + 1,
             string_of(node, "text"),
             string_of(node, "desc"),
@@ -220,7 +244,9 @@ pub fn parse(value: &Value) -> Result<A11ySnapshot, A11yUnavailable> {
             node.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             state_of(node),
             bounds,
-        ));
+        );
+        element.node_ref = node_ref(node);
+        elements.push(element);
     }
 
     Ok(A11ySnapshot {
