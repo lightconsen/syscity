@@ -109,6 +109,14 @@ pub const CMD_A11Y_EVENTS: &str = "accessibilityEvents";
 /// coordinates and lists whose only honest scroll is the platform's. The
 /// answer is `{ok, accepted, reason}` — every caller has a next method to try.
 pub const CMD_A11Y_ACTION: &str = "accessibilityAction";
+/// Dispatch a touch gesture through the accessibility service.
+///
+/// This is the middle rung between a node action and a shell injection: the
+/// platform sends a real touch stream, which reaches a view that ignores
+/// `input tap` (a canvas, a game surface, a slider that tracks the finger).
+/// It exists only while the service is running, so `{"ok": false, "reason":
+/// "no_service"}` is a normal answer, not an error.
+pub const CMD_A11Y_GESTURE: &str = "accessibilityGesture";
 /// Read text out of a base64 PNG with the on-device ML Kit model.
 ///
 /// Only the mobile build has no `vision` feature, so this is how OCR works on

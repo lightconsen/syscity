@@ -147,6 +147,83 @@ object A11yBridge {
   }
 
 
+  /**
+   * Send one or two fingers as a real touch stream.
+   *
+   * This is the middle rung between a node action and shell injection. A view
+   * that ignores injected `input tap` events — a canvas, a game surface, a
+   * slider that tracks the finger — still sees these, because the platform
+   * delivers them through the same pipeline as a person's finger. It needs
+   * `canPerformGestures`, which the service's XML config already asks for.
+   *
+   * `onDone` is called back on the main thread with `{ok, reason?}`:
+   * `no_service` (the rung does not exist here), `no_paths` (the caller sent
+   * nothing usable), `not_dispatched` (the platform refused to start it),
+   * `cancelled` (it started and something interrupted it).
+   */
+  fun gesture(paths: JSONArray?, durationMs: Int, onDone: (JSObject) -> Unit) {
+    val reply = { ok: Boolean, reason: String? ->
+      val out = JSObject().put("ok", ok)
+      if (reason != null) out.put("reason", reason)
+      mainHandler.post { onDone(out) }
+    }
+    val service = this.service
+    if (service == null) {
+      reply(false, "no_service")
+      return
+    }
+    val durations = durationMs.coerceIn(1, MAX_GESTURE_MS)
+    val strokes = ArrayList<android.accessibilityservice.GestureDescription.StrokeDescription>()
+    for (index in 0 until (paths?.length() ?: 0)) {
+      val points = paths?.optJSONArray(index) ?: continue
+      if (points.length() < 2) continue
+      val path = android.graphics.Path()
+      for (point in 0 until points.length()) {
+        val pair = points.optJSONArray(point) ?: continue
+        val x = pair.optInt(0, 0).toFloat()
+        val y = pair.optInt(1, 0).toFloat()
+        if (point == 0) path.moveTo(x, y) else path.lineTo(x, y)
+      }
+      strokes.add(
+        android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, durations.toLong()),
+      )
+      if (strokes.size == MAX_GESTURE_FINGERS) break
+    }
+    if (strokes.isEmpty()) {
+      reply(false, "no_paths")
+      return
+    }
+    val description = android.accessibilityservice.GestureDescription.Builder()
+      .apply { strokes.forEach { addStroke(it) } }
+      .build()
+    val callback = object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {
+      override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) {
+        reply(true, null)
+      }
+
+      override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) {
+        reply(false, "cancelled")
+      }
+    }
+    val started = try {
+      service.dispatchGesture(description, callback, null)
+    } catch (e: Exception) {
+      android.util.Log.w("SyscityA11y", "dispatchGesture failed", e)
+      false
+    }
+    if (!started) reply(false, "not_dispatched")
+  }
+
+  /** Longest a touched stroke may last (`StrokeDescription` caps at 60 s). */
+  private const val MAX_GESTURE_MS = 10_000
+
+  /** How many fingers one gesture may carry. */
+  private const val MAX_GESTURE_FINGERS = 2
+
+  /** Where callbacks come back, so a reply never lands on a Binder thread. */
+  private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+
   fun attach(service: SyscityAccessibilityService) {
     this.service = service
   }

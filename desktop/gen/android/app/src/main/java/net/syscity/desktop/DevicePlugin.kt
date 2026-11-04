@@ -519,6 +519,25 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   }
 
   /**
+   * `accessibilityGesture` — send a gesture as a real touch stream.
+   *
+   * The middle rung of the delivery ladder: after a node action (`input` to the
+   * control) and before shell injection (`input tap`). A view that ignores
+   * injected events still sees this, because the platform delivers it through
+   * the same pipeline as a finger. The answer is `{ok, reason?}` and is always
+   * answered, asynchronously — the platform reports completion, not dispatch.
+   */
+  @Command
+  fun accessibilityGesture(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val paths = if (args.has("paths") && !args.isNull("paths")) args.optJSONArray("paths") else null
+    val durationMs = args.optInt("duration_ms", 80)
+    // The completion callback arrives later, from the platform: resolve on the
+    // main thread, as every other command here does.
+    A11yBridge.gesture(paths, durationMs) { answer -> mainHandler.post { invoke.resolve(answer) } }
+  }
+
+  /**
    * `accessibilityStatus` — is the service switched on, is it connected, and
    * which event types is the running binding subscribed to?
    *

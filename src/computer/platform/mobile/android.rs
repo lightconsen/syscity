@@ -780,18 +780,6 @@ impl AdbInputTool {
             _ => false,
         }
     }
-
-    /// Resolve an index against a tree the caller already read.
-    ///
-    /// The before-action read serves two purposes — validating the target and
-    /// judging the effect — so it is done once, not twice.
-    fn tap_point_from(
-        elements: &[UiElement],
-        index: usize,
-        description: Option<&str>,
-    ) -> Result<(i32, i32), String> {
-        validate_target(elements, index, description).map(|e| e.center)
-    }
 }
 
 /// The one spelling of a keycode every dispatcher understands.
@@ -942,7 +930,9 @@ impl Tool for AdbInputTool {
          verify=false when the action is not meant to change the screen and you want to skip \
          the extra reads. On a second display, 'gesture' sends one or two fingers (a pinch, a \
          curved drag), and non-ASCII text is typed by pasting it — both are things `input` \
-         cannot do."
+         cannot do. A tap named by `target` or `key` is pressed as a control first (an \
+         accessibility action on the element itself), then as a service gesture, and only then \
+         by shell injection; the result's `via` says which was used."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1161,6 +1151,15 @@ impl Tool for AdbInputTool {
         // The action is resolved once, into something that both dispatchers
         // understand. Where it goes — the device's screen or the agent's — is
         // the only thing that differs afterwards.
+        //
+        // A tap named by element may already have been delivered by a rung
+        // above the shell (the control itself, or a service gesture), which is
+        // what `pressed` records: the resolved op is then only the fallback the
+        // safety checks below still reason about. `press_target` is the element
+        // it would be pressed on, remembered rather than pressed — the gate and
+        // the approval re-check run before anything leaves this process.
+        let mut pressed: Option<(Via, (i32, i32))> = None;
+        let mut press_target: Option<UiElement> = None;
         let op = match action {
             "tap" => {
                 if let Some(key) = args
@@ -1183,7 +1182,13 @@ impl Tool for AdbInputTool {
                                 }
                             }
                             match check_tappable(element, element.index) {
-                                Ok(element) => InputOp::Taps(vec![element.center]),
+                                Ok(element) => {
+                                    // Remembered, not pressed yet: the gate and
+                                    // the approval re-check below run before
+                                    // anything leaves this process.
+                                    press_target = Some(element.clone());
+                                    InputOp::Taps(vec![element.center])
+                                }
                                 Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
                             }
                         }
@@ -1197,8 +1202,15 @@ impl Tool for AdbInputTool {
                             let description =
                                 args.get("target_description").and_then(|v| v.as_str());
                             let elements = before.as_deref().unwrap_or(&[]);
-                            match Self::tap_point_from(elements, index as usize, description) {
-                                Ok(point) => InputOp::Taps(vec![point]),
+                            match validate_target(
+                                elements,
+                                usize::try_from(index).unwrap_or(0),
+                                description,
+                            ) {
+                                Ok(element) => {
+                                    press_target = Some(element.clone());
+                                    InputOp::Taps(vec![element.center])
+                                }
                                 Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
                             }
                         }
@@ -1423,79 +1435,105 @@ impl Tool for AdbInputTool {
             while receiver.try_recv().is_ok() {}
         }
 
+        // The press itself, now that it is allowed to happen and the picture
+        // the effect is judged against has been taken: the ladder is tried in
+        // order and `pressed` records the rung that delivered it. A shell rung
+        // sends nothing here — the dispatcher below is the only one that can
+        // reach a virtual display.
+        if let Some(element) = press_target.as_ref() {
+            let (via, refusal) =
+                press_element(element, false, matches!(target, Target::Screen)).await;
+            if let Some(refusal) = refusal {
+                return Ok(ToolExecutionResult::error(refusal));
+            }
+            pressed = Some((via, element.center));
+        }
+
+        // Which rung pressed it — only a press has an answer. A swipe or a
+        // typed line is a shell injection, and saying "shell" there would read
+        // as if the ladder had been tried and failed.
+        let via = (action == "tap" || pressed.is_some())
+            .then(|| pressed.as_ref().map(|(via, _)| *via).unwrap_or(Via::Shell));
+
         // Whether the text went in by clipboard rather than by keystrokes —
         // the result says which, because the two fail in different ways.
-        let pasted =
-            match target {
-                Target::Screen => {
-                    if let InputOp::Gesture { .. } = &op {
-                        // `input` has no multi-finger form at all, and the
-                        // accessibility service is the only thing that could
-                        // dispatch one — but only to a display it owns. Saying so
-                        // beats sending one finger of a pinch.
-                        return Ok(ToolExecutionResult::error(
-                            "Multi-finger gestures are only dispatched on a second display \
+        let pasted = match target {
+            Target::Screen => {
+                if let InputOp::Gesture { .. } = &op {
+                    // `input` has no multi-finger form at all, and the
+                    // accessibility service is the only thing that could
+                    // dispatch one — but only to a display it owns. Saying so
+                    // beats sending one finger of a pinch.
+                    return Ok(ToolExecutionResult::error(
+                        "Multi-finger gestures are only dispatched on a second display \
                          (android_display start). On the user's screen use 'swipe', or run the \
                          task on a display where the gesture can be sent properly.",
-                        ));
-                    }
-                    // Set when the text went in by clipboard paste rather than by
-                    // `input text`: the result line says so, and the readback below
-                    // is the only confirmation a paste gets.
-                    let mut pasted = false;
-                    let shell_cmd =
-                        match &op {
-                            // Rejected above: no shell form exists for two fingers.
-                            InputOp::Gesture { .. } => return Ok(ToolExecutionResult::error(
-                                "Multi-finger gestures are only dispatched on a second display \
+                    ));
+                }
+                // Set when the text went in by clipboard paste rather than by
+                // `input text`: the result line says so, and the readback below
+                // is the only confirmation a paste gets.
+                let mut pasted = false;
+                let shell_cmd = match &op {
+                    // Rejected above: no shell form exists for two fingers.
+                    InputOp::Gesture { .. } => {
+                        return Ok(ToolExecutionResult::error(
+                            "Multi-finger gestures are only dispatched on a second display \
                              (android_display start).",
-                            )),
-                            InputOp::Taps(steps) => encode_tap_sequence(steps),
-                            InputOp::Swipe { from, to } => {
-                                format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
-                            }
-                            InputOp::Key(keycode) => format!("input keyevent {keycode}"),
-                            InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
-                            InputOp::Text(text) => {
-                                if self.adbkeyboard_is_active(&device).await {
-                                    // ADBKeyboard takes the text base64-encoded over a
-                                    // broadcast, which carries any character the device
-                                    // can render.
-                                    let payload = base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        text.as_bytes(),
-                                    );
-                                    format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
-                                } else {
-                                    // Two ways without ADBKeyboard, tried in that order:
-                                    // the app's own helper (uid 2000, which can inject
-                                    // Ctrl+V on the user's screen and can put the
-                                    // person's clipboard back afterwards), and nothing.
-                                    //
-                                    // `input text` types through the device's key
-                                    // character map, so non-ASCII (CJK in particular)
-                                    // comes out dropped or mangled. Failing loudly is
-                                    // still better than silently typing the wrong thing
-                                    // — but only once the paste has been ruled out.
-                                    match paste_on_user_screen(text).await {
-                                        Ok(()) => {
-                                            pasted = true;
-                                            String::new()
-                                        }
-                                        Err(_) => return Ok(ToolExecutionResult::error(
-                                            "Cannot type non-ASCII text: `input text` only types \
+                        ))
+                    }
+                    InputOp::Taps(steps) => encode_tap_sequence(steps),
+                    InputOp::Swipe { from, to } => {
+                        format!("input swipe {} {} {} {}", from.0, from.1, to.0, to.1)
+                    }
+                    InputOp::Key(keycode) => format!("input keyevent {keycode}"),
+                    InputOp::Text(text) if text.is_ascii() => encode_input_text(text),
+                    InputOp::Text(text) => {
+                        if self.adbkeyboard_is_active(&device).await {
+                            // ADBKeyboard takes the text base64-encoded over a
+                            // broadcast, which carries any character the device
+                            // can render.
+                            let payload = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                text.as_bytes(),
+                            );
+                            format!("am broadcast -a ADB_INPUT_B64 --es msg '{}'", payload)
+                        } else {
+                            // Two ways without ADBKeyboard, tried in that order:
+                            // the app's own helper (uid 2000, which can inject
+                            // Ctrl+V on the user's screen and can put the
+                            // person's clipboard back afterwards), and nothing.
+                            //
+                            // `input text` types through the device's key
+                            // character map, so non-ASCII (CJK in particular)
+                            // comes out dropped or mangled. Failing loudly is
+                            // still better than silently typing the wrong thing
+                            // — but only once the paste has been ruled out.
+                            match paste_on_user_screen(text).await {
+                                Ok(()) => {
+                                    pasted = true;
+                                    String::new()
+                                }
+                                Err(_) => {
+                                    return Ok(ToolExecutionResult::error(
+                                        "Cannot type non-ASCII text: `input text` only types \
                                          ASCII reliably, ADBKeyboard is not the active input \
                                          method, and the display helper is not available on this \
                                          device to paste it. Install/enable ADBKeyboard \
                                          (com.android.adbkeyboard) and select it as the input \
                                          method, or keep the text ASCII.",
-                                        )),
-                                    }
+                                    ))
                                 }
                             }
-                        };
-                    if !pasted {
-                        let argv = adb_args(&device, &["shell", &shell_cmd]);
+                        }
+                    }
+                };
+                if !pasted {
+                    let argv = adb_args(&device, &["shell", &shell_cmd]);
+                    // A press already delivered by a rung above the shell is
+                    // not sent again: what the safety net still owes the
+                    // caller is the *effect*, not a second tap.
+                    if pressed.is_none() {
                         let (status, _stdout, stderr) =
                             run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>())
                                 .await
@@ -1509,30 +1547,33 @@ impl Tool for AdbInputTool {
                             )));
                         }
                     }
-                    pasted
                 }
-                Target::Display(id) => {
-                    let mut pasted = false;
-                    if let InputOp::Text(text) = &op {
-                        if !text.is_ascii() {
-                            // `input -d text` goes through the key character map and
-                            // mangles anything outside ASCII. The helper's clipboard
-                            // paste carries whatever the app can render, and puts
-                            // the user's own clipboard back afterwards.
-                            if let Err(message) = paste_on_display(id, text).await {
-                                return Ok(ToolExecutionResult::error(message));
-                            }
-                            pasted = true;
-                        }
-                    }
-                    if !pasted {
-                        if let Err(message) = dispatch_display(id, &op).await {
+                pasted
+            }
+            Target::Display(id) => {
+                let mut pasted = false;
+                if let InputOp::Text(text) = &op {
+                    if !text.is_ascii() {
+                        // `input -d text` goes through the key character map and
+                        // mangles anything outside ASCII. The helper's clipboard
+                        // paste carries whatever the app can render, and puts
+                        // the user's own clipboard back afterwards.
+                        if let Err(message) = paste_on_display(id, text).await {
                             return Ok(ToolExecutionResult::error(message));
                         }
+                        pasted = true;
                     }
-                    pasted
                 }
-            };
+                // A press already delivered by a rung above the shell is not
+                // sent again, and a pasted text is already in.
+                if !pasted && pressed.is_none() {
+                    if let Err(message) = dispatch_display(id, &op).await {
+                        return Ok(ToolExecutionResult::error(message));
+                    }
+                }
+                pasted
+            }
+        };
 
         // The action is now out. Record how far it reached, so the next one in
         // the same app is spaced like a person's would be. The package is the
@@ -1571,6 +1612,9 @@ impl Tool for AdbInputTool {
                 super::guard::Outcome::Unknown,
             );
             let mut text = format!("Input '{action}' sent (effect not checked).");
+            if let Some(note) = via.and_then(Via::note) {
+                text.push_str(&format!(" {note}"));
+            }
             if pasted {
                 text.push_str(&format!(
                     " The text went in by clipboard paste ({} character(s)) — `input text` \
@@ -1590,6 +1634,7 @@ impl Tool for AdbInputTool {
             return Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
                 "device": serial,
                 "effect": "unverified",
+                "via": via.map(Via::as_str),
                 "risk": clearance.note(),
                 "risk_approved": clearance.asked,
                 "paced": pace_note,
@@ -1656,6 +1701,9 @@ impl Tool for AdbInputTool {
         super::guard::Guard::global().record(&guard_key, &signature, guard_outcome(settle.effect));
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
+        if let Some(note) = via.and_then(Via::note) {
+            text.push_str(&format!(" {note}"));
+        }
         if pasted {
             text.push_str(&format!(
                 " The text went in by clipboard paste ({} character(s)) — `input text` cannot \
@@ -1724,6 +1772,7 @@ impl Tool for AdbInputTool {
         Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
             "device": serial,
             "effect": settle.effect,
+            "via": via.map(Via::as_str),
             "pixels_changed": settle.pixel_changed,
             // What answered first: `events` (a content event, then quiet) or
             // `tree` (the poll). The model does not need it to act, but it is
@@ -2387,6 +2436,143 @@ impl UiElement {
         element.key = element_key(&element);
         element
     }
+}
+
+/// Which rung of the delivery ladder pressed something.
+///
+/// The order is fixed and it matters: a node action tells the *control* it was
+/// pressed and reaches widgets that ignore injected events; a service gesture
+/// is a real touch stream and reaches canvases and sliders; a shell injection
+/// is the last resort and works everywhere `adb` does. The result reports
+/// which one was used, because the three fail in different ways and a caller
+/// reading "the screen did not change" needs to know what was tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Via {
+    /// `AccessibilityNodeInfo.performAction` on the node the read named.
+    Semantic,
+    /// `dispatchGesture` through the accessibility service.
+    Gesture,
+    /// `input tap` / the display helper's `MotionEvent`.
+    Shell,
+    /// Nothing was dispatched: the caller was refused.
+    None,
+}
+
+impl Via {
+    /// The word the result carries.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Gesture => "gesture",
+            Self::Shell => "shell",
+            Self::None => "none",
+        }
+    }
+
+    /// The clause the result sentence carries.
+    pub(super) fn explain(self) -> &'static str {
+        match self {
+            Self::Semantic => {
+                "It was pressed as a control (an accessibility action on the node), \
+                              not as a point on the screen."
+            }
+            Self::Gesture => {
+                "It was pressed with a touch gesture sent by the accessibility \
+                              service, not by shell injection."
+            }
+            Self::Shell => "It was pressed by shell injection at its coordinates.",
+            Self::None => "",
+        }
+    }
+    /// The clause the sentence carries, when the rung is news.
+    ///
+    /// A shell press is what every result was before this ladder existed and
+    /// says nothing new; a control action or a service gesture is the case a
+    /// caller reading "the screen did not change" needs to see.
+    pub(super) fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Semantic | Self::Gesture => Some(self.explain()),
+            Self::Shell | Self::None => None,
+        }
+    }
+}
+
+/// Press the element the read named, the best way this phone can.
+///
+/// The ladder is tried in order and each rung says whether the next one should
+/// be tried. A node that is *gone* ends the ladder: pressing its old
+/// coordinates would hit whatever has since moved into place, which is the
+/// mistake the reference exists to prevent — the caller re-reads instead.
+/// A node that merely refuses (no such action, the action did not take) falls
+/// through, because the control is still there and a gesture or a tap lands on
+/// the thing that was meant.
+pub(super) async fn press_element(
+    element: &UiElement,
+    long: bool,
+    allow_gesture: bool,
+) -> (Via, Option<String>) {
+    // Rung one: the control itself. Only possible when the read came from the
+    // accessibility service — `uiautomator` has no way to address a node.
+    if let Some(node) = element.node_ref {
+        if let Some(bridge) = crate::device::bridge() {
+            let action = super::a11y::NodeAction::press(long);
+            if let Some(answer) = super::a11y::act(bridge, node, action, None, 1).await {
+                if answer.ok {
+                    return (Via::Semantic, None);
+                }
+                if answer.node_is_gone() {
+                    return (
+                        Via::None,
+                        Some(format!(
+                            "Refused: {} was found in the live screen, but the control it named \
+                             is gone — the screen changed between the read and the press. Nothing \
+                             was pressed: a coordinate tap would have hit whatever took its \
+                             place. Re-read the screen with android_ui_tree and retry.",
+                            element_label(element).unwrap_or("that element")
+                        )),
+                    );
+                }
+                // Rung two: a real touch stream at the element, which reaches a
+                // view that ignores `input tap` (a canvas, a game surface).
+                // Only the *user's* screen: a virtual display's gestures are
+                // the display helper's job, and the service's gesture injection
+                // is not tied to a display.
+                if allow_gesture {
+                    if let Some(gesture) =
+                        super::a11y::gesture(bridge, &press_paths(element), PRESS_GESTURE_MS).await
+                    {
+                        if gesture.ok {
+                            return (Via::Gesture, None);
+                        }
+                        if gesture.no_service() {
+                            // The service stopped between the read and now; the
+                            // shell route below still works.
+                            tracing::debug!(
+                                "accessibility gesture unavailable: the service is not running"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (Via::Shell, None)
+}
+
+/// How long a press sent as a gesture takes.
+///
+/// Short enough to read as a tap rather than a hold (`ViewConfiguration`'s own
+/// long-press threshold is 500 ms), long enough that the platform sees more
+/// than one frame of contact.
+pub(super) const PRESS_GESTURE_MS: u32 = 80;
+
+/// The finger path for a press on `element`: down and up on the same point.
+///
+/// A gesture of one point would be a contact the platform sees once; three
+/// points over the same coordinate read as a press the way a finger does.
+pub(super) fn press_paths(element: &UiElement) -> Vec<Vec<(i32, i32)>> {
+    let point = element.center;
+    vec![vec![point, point, point]]
 }
 
 /// The identity of an element, for finding it again on a later read.
@@ -5526,6 +5712,33 @@ mod tests {
         disabled.enabled = false;
         let err = validate_target(&[disabled], 1, None).unwrap_err();
         assert!(err.contains("disabled"), "{err}");
+    }
+
+    // ── Delivery ladder ─────────────────────────────────────────────────
+    //
+    // The rungs themselves need a device; what decides between them is a pure
+    // function and is tested here.
+
+    #[test]
+    fn a_press_gesture_is_a_still_finger_on_the_element() {
+        let element = element(1, Some("Play"), "Button");
+        let paths = press_paths(&element);
+        assert_eq!(paths.len(), 1);
+        // Three points on the same coordinate: a contact the platform sees for
+        // more than one frame, which is what a tap is.
+        assert_eq!(paths[0], vec![(5, 5), (5, 5), (5, 5)]);
+    }
+
+    #[test]
+    fn only_a_control_press_is_news_in_the_result() {
+        // A shell press is what every result was before the ladder existed.
+        assert!(Via::Shell.note().is_none());
+        assert!(Via::None.note().is_none());
+        assert!(Via::Semantic.note().unwrap().contains("control"));
+        assert!(Via::Gesture.note().unwrap().contains("gesture"));
+        assert_eq!(Via::Semantic.as_str(), "semantic");
+        assert_eq!(Via::Gesture.as_str(), "gesture");
+        assert_eq!(Via::Shell.as_str(), "shell");
     }
 
     // ── Tap sequences ───────────────────────────────────────────────────

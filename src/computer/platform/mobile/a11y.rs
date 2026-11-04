@@ -282,6 +282,206 @@ pub async fn fetch(
     parse(&answer)
 }
 
+// ── Actions on a node ──────────────────────────────────────────────────────
+
+/// The node is gone: the reference names something that is no longer on screen.
+pub const ACTION_NODE_GONE: &str = "node_gone";
+/// The node is there but does not offer this action.
+pub const ACTION_UNKNOWN: &str = "unknown_action";
+/// The node offered the action and refused it.
+pub const ACTION_REFUSED: &str = "action_refused";
+/// The service stopped part-way through a repeated action.
+pub const ACTION_STOPPED_EARLY: &str = "stopped_early";
+/// The service is not running, so a gesture cannot be dispatched at all.
+pub const ACTION_NO_SERVICE: &str = "no_service";
+
+/// What to do to a node, in the bridge's vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAction {
+    Click,
+    LongClick,
+    Focus,
+    ScrollForward,
+    ScrollBackward,
+    SetText,
+}
+
+impl NodeAction {
+    /// The string the Kotlin side switches on.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::LongClick => "longClick",
+            Self::Focus => "focus",
+            Self::ScrollForward => "scrollForward",
+            Self::ScrollBackward => "scrollBackward",
+            Self::SetText => "setText",
+        }
+    }
+
+    /// The action a press on a control is, when the control offers one.
+    pub fn press(long: bool) -> Self {
+        if long {
+            Self::LongClick
+        } else {
+            Self::Click
+        }
+    }
+}
+
+/// What the bridge said about one action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionAnswer {
+    /// The node performed the action — all `accepted` times.
+    pub ok: bool,
+    /// How many times it was accepted (one for everything but a repeated scroll).
+    pub accepted: i64,
+    /// Why not, when it was not.
+    pub reason: Option<String>,
+}
+
+impl ActionAnswer {
+    /// Read the bridge's answer, tolerating an older build.
+    ///
+    /// A missing `ok` is "not done": the one thing this answer must never do is
+    /// claim an action happened when the answer did not say so.
+    pub fn parse(value: &Value) -> Self {
+        Self {
+            ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            accepted: value.get("accepted").and_then(Value::as_i64).unwrap_or(0),
+            reason: value
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    /// The node is gone — the screen moved under the reference.
+    ///
+    /// This is deliberately *not* a fall-through: pressing the same
+    /// coordinates would now hit whatever has taken the node's place, which is
+    /// exactly the mistake the reference existed to prevent. The caller
+    /// re-reads instead.
+    pub fn node_is_gone(&self) -> bool {
+        self.reason.as_deref() == Some(ACTION_NODE_GONE)
+    }
+
+    /// The node refused, so the next way of pressing can be tried.
+    ///
+    /// Unlike a gone node, the control is still where the read said it was, so
+    /// a gesture or a shell injection lands on the thing that was meant.
+    pub fn falls_through(&self) -> bool {
+        !self.ok && !self.node_is_gone()
+    }
+
+    /// The answer as the result line says it.
+    pub fn describe(&self) -> String {
+        match self.reason.as_deref() {
+            None if self.ok => "the control reported the press as done".to_string(),
+            None => "the bridge did not say what the press did".to_string(),
+            Some(ACTION_NODE_GONE) => {
+                "the control it named is gone — the screen changed under the reference, so it \
+                 was not pressed by coordinate instead"
+                    .to_string()
+            }
+            Some(ACTION_UNKNOWN) => {
+                "the control does not offer that action, so it was pressed as a point instead"
+                    .to_string()
+            }
+            Some(ACTION_REFUSED) => {
+                "the control has the action but did not take it, so it was pressed as a point \
+                 instead"
+                    .to_string()
+            }
+            Some(other) => format!("the control declined ({other})"),
+        }
+    }
+}
+
+/// Run one action on the node `node` names.
+///
+/// `text` is what `setText` writes; every other action ignores it. The answer
+/// is always an answer — see [`ActionAnswer`] — because the caller has a next
+/// way of pressing and needs to know why this one did not work.
+pub async fn act(
+    bridge: &DeviceBridgeRef,
+    node: NodeRef,
+    action: NodeAction,
+    text: Option<&str>,
+    count: i32,
+) -> Option<ActionAnswer> {
+    let bridge = bridge.clone();
+    let mut payload = serde_json::json!({
+        "ref": node,
+        "action": action.wire(),
+        "count": count.max(1),
+    });
+    if let Some(text) = text {
+        payload["text"] = Value::String(text.to_string());
+    }
+    bridge
+        .call(crate::device::CMD_A11Y_ACTION, payload)
+        .await
+        .ok()
+        .map(|answer| ActionAnswer::parse(&answer))
+}
+
+/// Whether the service took a gesture it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GestureAnswer {
+    /// The platform completed the gesture.
+    pub ok: bool,
+    /// Why not — `no_service`, `cancelled`, `timeout`, `not_dispatched`.
+    pub reason: Option<String>,
+}
+
+impl GestureAnswer {
+    pub fn parse(value: &Value) -> Self {
+        Self {
+            ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            reason: value
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    /// The service is not running, so this rung does not exist here.
+    pub fn no_service(&self) -> bool {
+        !self.ok && self.reason.as_deref() == Some(ACTION_NO_SERVICE)
+    }
+}
+
+/// Dispatch one or two fingers through the accessibility service.
+///
+/// This is the middle rung: a gesture the platform sends as a real touch
+/// stream, which reaches a view that ignores injected shell events. It only
+/// exists while the service is running, and only on the display the service
+/// sees — a virtual display's gestures go through the display helper instead.
+pub async fn gesture(
+    bridge: &DeviceBridgeRef,
+    paths: &[Vec<(i32, i32)>],
+    duration_ms: u32,
+) -> Option<GestureAnswer> {
+    let bridge = bridge.clone();
+    let paths: Vec<Value> = paths
+        .iter()
+        .map(|path| {
+            Value::Array(
+                path.iter()
+                    .map(|(x, y)| serde_json::json!([x, y]))
+                    .collect(),
+            )
+        })
+        .collect();
+    let payload = serde_json::json!({ "paths": paths, "duration_ms": duration_ms });
+    bridge
+        .call(crate::device::CMD_A11Y_GESTURE, payload)
+        .await
+        .ok()
+        .map(|answer| GestureAnswer::parse(&answer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +689,123 @@ mod tests {
         let reference: DeviceBridgeRef = std::sync::Arc::new(Broken);
         let failed = fetch(&reference, None).await.expect_err("unreachable");
         assert_eq!(failed.code, A11Y_BRIDGE_ERROR);
+    }
+
+    // ── Node actions ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_press_answer_says_whether_the_next_rung_should_try() {
+        let done = ActionAnswer::parse(&serde_json::json!({ "ok": true, "accepted": 1 }));
+        assert!(done.ok);
+        assert!(!done.falls_through());
+        assert!(!done.node_is_gone());
+
+        // A control without the action: the control is still there, so a
+        // gesture or a tap lands on the thing that was meant.
+        let unknown = ActionAnswer::parse(
+            &serde_json::json!({ "ok": false, "accepted": 0, "reason": "unknown_action" }),
+        );
+        assert!(unknown.falls_through());
+        assert!(!unknown.node_is_gone());
+
+        // A control that offered it and refused: the same answer, for the same
+        // reason.
+        let refused = ActionAnswer::parse(
+            &serde_json::json!({ "ok": false, "accepted": 0, "reason": "action_refused" }),
+        );
+        assert!(refused.falls_through());
+    }
+
+    #[test]
+    fn a_gone_node_ends_the_ladder_rather_than_falling_through() {
+        // The one case that must NOT fall back to coordinates: a tap at the old
+        // centre would hit whatever took the node's place.
+        let gone = ActionAnswer::parse(
+            &serde_json::json!({ "ok": false, "accepted": 0, "reason": "node_gone" }),
+        );
+        assert!(gone.node_is_gone());
+        assert!(!gone.falls_through());
+        assert!(gone.describe().contains("gone"), "{}", gone.describe());
+    }
+
+    #[test]
+    fn an_answer_that_says_nothing_is_not_a_success() {
+        // An older bridge, or a malformed reply: the only safe reading is that
+        // the action did not happen.
+        let silent = ActionAnswer::parse(&serde_json::json!({}));
+        assert!(!silent.ok);
+        assert!(silent.falls_through());
+    }
+
+    #[test]
+    fn node_actions_carry_the_names_the_kotlin_side_switches_on() {
+        let wire: Vec<&str> = [
+            NodeAction::Click,
+            NodeAction::LongClick,
+            NodeAction::Focus,
+            NodeAction::ScrollForward,
+            NodeAction::ScrollBackward,
+            NodeAction::SetText,
+        ]
+        .iter()
+        .map(|action| action.wire())
+        .collect();
+        assert_eq!(
+            wire,
+            vec![
+                "click",
+                "longClick",
+                "focus",
+                "scrollForward",
+                "scrollBackward",
+                "setText"
+            ]
+        );
+        assert_eq!(NodeAction::press(false), NodeAction::Click);
+        assert_eq!(NodeAction::press(true), NodeAction::LongClick);
+    }
+
+    #[tokio::test]
+    async fn an_action_names_the_node_by_ref_and_carries_the_text() {
+        let bridge = std::sync::Arc::new(crate::device::tests::MockDeviceBridge::new(
+            serde_json::json!({ "ok": true, "accepted": 1 }),
+        ));
+        let reference: DeviceBridgeRef = bridge.clone();
+        let answer = act(&reference, 7, NodeAction::SetText, Some("09:30"), 1)
+            .await
+            .expect("answer");
+        assert!(answer.ok);
+        let calls = bridge.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, crate::device::CMD_A11Y_ACTION);
+        assert_eq!(calls[0].1["ref"], 7);
+        assert_eq!(calls[0].1["action"], "setText");
+        assert_eq!(calls[0].1["text"], "09:30");
+    }
+
+    #[tokio::test]
+    async fn a_gesture_goes_out_as_json_paths() {
+        let bridge = std::sync::Arc::new(crate::device::tests::MockDeviceBridge::new(
+            serde_json::json!({ "ok": true }),
+        ));
+        let reference: DeviceBridgeRef = bridge.clone();
+        let answer = gesture(&reference, &[vec![(10, 20), (10, 20)]], 80)
+            .await
+            .expect("answer");
+        assert!(answer.ok);
+        let calls = bridge.calls();
+        assert_eq!(calls[0].0, crate::device::CMD_A11Y_GESTURE);
+        assert_eq!(calls[0].1["paths"], serde_json::json!([[[10, 20], [10, 20]]]));
+        assert_eq!(calls[0].1["duration_ms"], 80);
+    }
+
+    #[test]
+    fn a_service_that_is_off_is_how_a_gesture_says_it_does_not_exist() {
+        let absent =
+            GestureAnswer::parse(&serde_json::json!({ "ok": false, "reason": "no_service" }));
+        assert!(absent.no_service());
+        let cancelled =
+            GestureAnswer::parse(&serde_json::json!({ "ok": false, "reason": "cancelled" }));
+        assert!(!cancelled.no_service());
     }
 }
