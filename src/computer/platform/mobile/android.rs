@@ -87,6 +87,10 @@ impl PlatformToolSet for AndroidToolset {
             // tree, and wait for the screen instead of observing it again.
             Box::new(super::android_tools::AdbQueryTool::new()),
             Box::new(super::android_tools::AdbWaitTool::new()),
+            // One call for several known steps. Each step still goes through
+            // `android_input`/`android_app_manager`, so nothing a single call
+            // checks is skipped — what it saves is the model's turns.
+            Box::new(super::android_tools::AdbRunTool::new()),
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
@@ -661,6 +665,28 @@ impl AdbInputTool {
     }
 }
 
+/// The one spelling of a keycode every dispatcher understands.
+///
+/// `input keyevent` accepts either a name (`KEYCODE_ENTER`, `ENTER`) or a
+/// number, and so did this tool by passing the string straight through. The
+/// display helper does not: it reflects the named field on `android.view.
+/// KeyEvent` (`DevicePlugin.kt`, `op: "key"`), so a bare `ENTER` is an
+/// `NoSuchFieldException` there. Normalising at the one place the key op is
+/// built means a name works on both paths, and a number is left alone because
+/// both accept it.
+fn normalize_keycode(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return trimmed.to_string();
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("KEYCODE_") {
+        upper
+    } else {
+        format!("KEYCODE_{upper}")
+    }
+}
+
 /// Quote a string as a single shell word for the *device* shell.
 ///
 /// A single-quoted word may not contain a quote, so an embedded `'` has to close
@@ -716,6 +742,17 @@ fn parse_tap_steps(value: Option<&Value>) -> Result<Vec<(i64, i64)>, String> {
     if items.is_empty() {
         return Err("action 'sequence' needs at least one step".to_string());
     }
+    // A sequence is one dispatch, so the ladder, the gate and the pace all see
+    // it as one action — but it lands as many taps. Unbounded, it is a way to
+    // do fifty taps in the shape of one before any of them has an effect to
+    // read. The cap is the per-call budget a person could watch.
+    if items.len() > MAX_SEQUENCE_STEPS {
+        return Err(format!(
+            "action 'sequence' takes at most {MAX_SEQUENCE_STEPS} steps, got {} — split it, \
+             checking the screen between the halves",
+            items.len()
+        ));
+    }
     items
         .iter()
         .enumerate()
@@ -729,6 +766,12 @@ fn parse_tap_steps(value: Option<&Value>) -> Result<Vec<(i64, i64)>, String> {
         })
         .collect()
 }
+
+/// The most taps one `sequence` may dispatch.
+///
+/// The same ceiling `android_run` puts on a command list: beyond it a single
+/// call is no longer something the screen's own feedback can keep up with.
+pub(super) const MAX_SEQUENCE_STEPS: usize = 30;
 
 /// Build the device-shell command(s) that type `text`.
 ///
@@ -1071,12 +1114,11 @@ impl Tool for AdbInputTool {
                 ),
                 Err(msg) => return Ok(ToolExecutionResult::error(msg)),
             },
-            "key" => InputOp::Key(
+            "key" => InputOp::Key(normalize_keycode(
                 args.get("keycode")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("HOME")
-                    .to_string(),
-            ),
+                    .unwrap_or("HOME"),
+            )),
             "gesture" => match parse_gesture_paths(args.get("paths")) {
                 Ok(paths) => InputOp::Gesture {
                     paths,
@@ -4024,9 +4066,18 @@ pub struct UiDump {
     ///
     /// Not a change detector and not a version of the app: it identifies the
     /// enumeration the indices in this dump belong to, so a call can say which
-    /// read it was working from. Re-reading an unchanged screen yields the same
-    /// name; an element key is what survives the screen changing.
+    /// read it was working from. Every read gets its own name, because two
+    /// reads of the same screen are still two different enumerations to a
+    /// caller holding indices from one of them. An element *key* is what
+    /// survives the screen changing.
     pub snapshot: String,
+    /// The source capped the node list, so this tree is a prefix of the screen.
+    ///
+    /// Only the in-process accessibility walk caps (`A11yBridge.MAX_NODES`);
+    /// `uiautomator dump` writes whatever it saw. A caller looking for an
+    /// element in a truncated tree has not seen the whole screen, and a caller
+    /// matching more than the cap cannot count the matches.
+    pub truncated: bool,
 }
 
 /// Name a reading of the tree.
@@ -4077,6 +4128,7 @@ pub(super) async fn dump_ui(
                     source: "accessibility",
                     package: snapshot.package,
                     snapshot: snapshot_id,
+                    truncated: snapshot.truncated,
                 })
             }
             Err(unavailable) => Err(DumpFailure::new(
@@ -4100,6 +4152,7 @@ pub(super) async fn dump_ui(
                         source: "accessibility",
                         package: snapshot.package,
                         snapshot: snapshot_id,
+                        truncated: snapshot.truncated,
                     });
                 }
                 Ok(_) => {
@@ -4132,6 +4185,8 @@ pub(super) async fn dump_ui(
         source: "uiautomator",
         package: parse_package(&xml),
         snapshot: snapshot_id,
+        // The dump writes what the window held; it has no cap of its own.
+        truncated: false,
     })
 }
 
@@ -4804,6 +4859,18 @@ mod tests {
         assert!(cmd.starts_with("input text '"), "got {cmd}");
         assert!(cmd.ends_with('\''), "got {cmd}");
         assert!(cmd.contains("$(whoami)"), "got {cmd}");
+    }
+
+    #[test]
+    fn a_keycode_name_works_on_both_dispatch_paths() {
+        // `input keyevent` takes both spellings, the display helper only takes
+        // the field name — so the bare name is normalised where the op is built.
+        assert_eq!(normalize_keycode("ENTER"), "KEYCODE_ENTER");
+        assert_eq!(normalize_keycode(" enter "), "KEYCODE_ENTER");
+        assert_eq!(normalize_keycode("KEYCODE_ENTER"), "KEYCODE_ENTER");
+        // A number is accepted by both dispatchers and must not be prefixed.
+        assert_eq!(normalize_keycode("66"), "66");
+        assert_eq!(normalize_keycode(""), "");
     }
 
     #[test]

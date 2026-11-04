@@ -160,8 +160,9 @@ re-inspect to verify
 
 These are implemented as additional `PlatformToolSet`s registered alongside desktop/server sets.
 
-The Android set carries five higher-level tools on top of the raw ones, each of
-which replaces a turn the model would otherwise spend driving them by hand:
+The Android set carries a set of higher-level tools on top of the raw ones,
+each of which replaces turns the model would otherwise spend driving them by
+hand:
 
 | Tool | What it removes |
 |---|---|
@@ -169,9 +170,18 @@ which replaces a turn the model would otherwise spend driving them by hand:
 | `android_find` | scrolling until something appears: returns the coordinates once it does, or says how far it looked |
 | `android_query` | reading the whole tree to answer "is there a 发送 button" or "how many rows": matches by text / resource id / class and returns one line per hit, with the total |
 | `android_wait` | "observe, then observe again a second later": waits for an element to appear or go, or for the screen to settle, and on timeout says what is actually there |
+| `android_run` | one turn per tap: runs up to 30 known steps in one call, finding each target again on the live screen before acting, and stops at the first step whose aftermath says the rest are unsafe — an app switch, an app landing on the user's screen, or a screen the tree cannot describe |
 | `android_dialog` | describing a dialog: reads its text and buttons, and presses one only if exactly one button matches |
 | `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
 | `android_ocr` | the screenshot reader, for screens whose accessibility tree describes nothing |
+
+`android_run` delegates every step to `android_input` / `android_app_manager`,
+so the risk check, approval gate, repetition ladder and app lease still see each
+step individually — a compound action does not get to skip the checks a single
+call goes through. It also reports which read path it worked through: the
+in-process accessibility service answers in milliseconds and allows 30 steps,
+while the `uiautomator` fallback costs a subprocess and an SD-card round trip
+per read, so it caps a run at 10 steps and says so.
 
 Two behaviours apply across the set. Every `android_input` (and `android_dialog`
 press) re-reads the screen afterwards and reports `effect: changed / unchanged /

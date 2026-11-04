@@ -441,6 +441,34 @@ pub async fn watch_and_check_spill(
 /// This app's own package — its task is the UI, never a spill.
 pub const SELF_PACKAGE: &str = "net.syscity.desktop";
 
+/// Whether `package` is a *chooser*: the system's share sheet, "open with…",
+/// or the intent resolver in any of its vendor spellings.
+///
+/// It matters twice. A run stops when a step leaves the screen it was acting on
+/// — and a chooser is exactly that: the target the remaining steps name is no
+/// longer on the screen, because a sheet is. And it is the clearest sign that
+/// the step wanted a *choice* it was not given, which no later step can make
+/// on its behalf.
+pub fn is_chooser(package: &str) -> bool {
+    let lowered = package.to_ascii_lowercase();
+    lowered.contains("intentresolver")
+        || lowered.ends_with("chooser")
+        || lowered.contains(".chooser")
+        // Some vendors ship the resolver under `android.internal.app.…`.
+        || lowered.contains("resolveractivity")
+}
+
+/// The package on top is a system dialog a person answers, not an app the agent
+/// navigated into.
+///
+/// Android's permission prompts, the "USB debugging connected" sheet, a crash
+/// dialog: they belong to the platform, not to the task.
+pub fn is_system_overlay(package: &str) -> bool {
+    package == "android"
+        || package == "com.android.systemui"
+        || package.starts_with("com.google.android.permissioncontroller")
+}
+
 /// Packages that are never a spill: the launcher and the system UI sit on the
 /// user's screen by design.
 fn is_not_a_spill(package: &str) -> bool {
@@ -663,6 +691,26 @@ mod tests {
         let arrivals = vec![arrival(42, "com.example.chat", 1_100, 3, 0)];
         let spills = spilled_by_action(&arrivals, 1_000, 3_000, 7, &[], SELF_PACKAGE);
         assert!(spills.is_empty(), "{spills:?}");
+    }
+
+    #[test]
+    fn a_chooser_is_recognised_under_its_vendor_spellings() {
+        // The stock resolver, then the names OEM skins give the same sheet.
+        // What they have in common is the question, not the package.
+        assert!(is_chooser("com.android.intentresolver"));
+        assert!(is_chooser("com.android.internal.app.IntentResolver"));
+        assert!(is_chooser("com.miui.chooser"));
+        assert!(is_chooser("com.huawei.android.ChooserActivity"));
+        assert!(!is_chooser("com.example.chat"));
+        assert!(!is_chooser("com.android.settings"));
+    }
+
+    #[test]
+    fn a_platform_prompt_is_not_an_app_the_agent_opened() {
+        assert!(is_system_overlay("com.google.android.permissioncontroller"));
+        assert!(is_system_overlay("android"));
+        assert!(is_system_overlay("com.android.systemui"));
+        assert!(!is_system_overlay("com.example.chat"));
     }
 
     #[test]
