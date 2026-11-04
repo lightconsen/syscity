@@ -502,6 +502,11 @@ pub struct Readiness {
     pub main: Option<ScreenTop>,
     /// One entry per display the helper owns.
     pub displays: Vec<ScreenTop>,
+    /// Every task on every display, when the helper could read the list.
+    ///
+    /// `None` is "it could not say", which is not "there are none": the second
+    /// licenses ending a process and the first does not.
+    pub tasks: Option<Vec<ScreenTask>>,
 }
 
 /// The task on top of one display.
@@ -560,6 +565,32 @@ impl Readiness {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // A helper from an older build sends no `tasks` key at all, which
+            // has to read as "it cannot say" — that is what keeps a launch
+            // from ending a process on a list nobody produced.
+            tasks: answer.get("tasks").and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let display = item
+                            .get("display")
+                            .and_then(Value::as_i64)
+                            .and_then(|id| i32::try_from(id).ok())?;
+                        Some(ScreenTask {
+                            display,
+                            task: item
+                                .get("task")
+                                .and_then(Value::as_i64)
+                                .and_then(|id| i32::try_from(id).ok())
+                                .unwrap_or(-1),
+                            package: item
+                                .get("package")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            }),
         }
     }
 
@@ -571,6 +602,39 @@ impl Readiness {
         }
         self.displays.iter().find(|top| top.display == display)
     }
+
+    /// Every display `package` has a task on, from the helper's full task list.
+    ///
+    /// Readiness' per-display tops are enough to decide whether a write still
+    /// means what it did, and not enough to decide whether a process may be
+    /// ended: an app can hold a *background* task on a display whose top task
+    /// belongs to something else, and ending the process would close it too.
+    ///
+    /// `None` means the answer is not known — no helper, or a task list the
+    /// helper could not read. That is not the same as an empty list ("no tasks
+    /// anywhere"), and the caller must not end a process on a guess.
+    pub fn displays_holding(&self, package: &str) -> Option<Vec<i32>> {
+        if !self.helper {
+            return None;
+        }
+        let tasks = self.tasks.as_ref()?;
+        Some(
+            tasks
+                .iter()
+                .filter(|task| task.package.as_deref() == Some(package))
+                .map(|task| task.display)
+                .collect(),
+        )
+    }
+}
+
+/// One task the helper can see, on one display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenTask {
+    /// The display it is on; `0` is the user's own.
+    pub display: i32,
+    pub task: i32,
+    pub package: Option<String>,
 }
 
 /// A brightness grid: how many columns and rows, and one value per cell.
@@ -1083,6 +1147,54 @@ mod tests {
         assert_eq!(state.top_of(3).map(|top| top.task), Some(11));
         assert!(state.top_of(4).is_none());
         assert_eq!(state.top_of(0).map(|top| top.task), Some(7));
+    }
+
+    #[tokio::test]
+    async fn the_task_list_says_which_displays_hold_one_app() {
+        // The per-display tops cannot answer this: an app can hold a background
+        // task on a display whose top task is something else, and ending its
+        // process would close that too.
+        let state = VirtualDisplay::readiness(&bridge(json!({
+            "ok": true,
+            "helper": true,
+            "locked": false,
+            "main": { "task": 7, "package": "com.example.chat" },
+            "displays": [ { "id": 3, "task": 11, "package": "com.example.mail" } ],
+            "tasks": [
+                { "display": 0, "task": 7, "package": "com.example.chat" },
+                { "display": 3, "task": 11, "package": "com.example.mail" },
+                { "display": 3, "task": 12, "package": "com.example.chat" }
+            ]
+        })))
+        .await
+        .expect("readiness");
+        assert_eq!(state.displays_holding("com.example.chat"), Some(vec![0, 3]));
+        assert_eq!(state.displays_holding("com.example.video"), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_cannot_list_tasks_does_not_license_ending_a_process() {
+        // An older build sends no `tasks` key. "I cannot say" and "there are
+        // none" are different answers, and only the second may end a process.
+        let state = VirtualDisplay::readiness(&bridge(json!({
+            "ok": true,
+            "helper": true,
+            "main": { "task": 7, "package": "com.example.chat" },
+            "displays": []
+        })))
+        .await
+        .expect("readiness");
+        assert_eq!(state.displays_holding("com.example.chat"), None);
+        // A helper that is not running cannot answer either, even when it sent
+        // an empty list.
+        let down = VirtualDisplay::readiness(&bridge(json!({
+            "ok": true,
+            "helper": false,
+            "tasks": []
+        })))
+        .await
+        .expect("readiness");
+        assert_eq!(down.displays_holding("com.example.chat"), None);
     }
 
     #[tokio::test]

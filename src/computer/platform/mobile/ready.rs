@@ -165,6 +165,18 @@ mod tests {
                 task: 11,
                 package: Some("com.example.chat".to_string()),
             }],
+            tasks: Some(vec![
+                super::super::display::ScreenTask {
+                    display: 0,
+                    task: 7,
+                    package: Some("com.example.chat".to_string()),
+                },
+                super::super::display::ScreenTask {
+                    display: 3,
+                    task: 11,
+                    package: Some("com.example.chat".to_string()),
+                },
+            ]),
         }
     }
 

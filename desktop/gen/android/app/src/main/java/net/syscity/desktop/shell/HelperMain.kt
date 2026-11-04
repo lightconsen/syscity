@@ -585,9 +585,15 @@ object HelperMain {
             // Assembled and serialised by the pure half, so the rules about
             // "empty" and "unknown" are one implementation with tests rather
             // than duplicated here against a live Binder.
-            val tasks = runCatching { TaskQuery.current() }.getOrNull().orEmpty()
+            //
+            // `null` from the query is kept as `null`, not flattened to an
+            // empty list: the host reads "nothing anywhere" from an empty list,
+            // and that is exactly the answer that lets it end a process.
+            val tasks = runCatching { TaskQuery.current() }.getOrNull()
             val open = synchronized(lock) { this@Stub.displays.keys.toList() }
-            return ReadinessReport.toJson(ReadinessReport.of(tasks, open, locked))
+            return ReadinessReport.toJson(
+                ReadinessReport.of(tasks.orEmpty(), open, locked, allTasks = tasks),
+            )
         }
 
         private fun paste(displayId: Int, text: String, replace: Boolean): Int {

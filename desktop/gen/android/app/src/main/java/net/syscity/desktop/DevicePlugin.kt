@@ -871,6 +871,10 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
                 .put("locked", parsed.optBoolean("locked", false))
                 .put("main", parsed.optJSONObject("main") ?: JSObject())
                 .put("displays", parsed.optJSONArray("displays") ?: JSONArray())
+              // Kept as absent when the helper could not read the list: the
+              // host tells "no tasks anywhere" from "cannot say" by the key not
+              // being there, and only the first licenses ending a process.
+              parsed.optJSONArray("tasks")?.let { out.put("tasks", it) }
             }
           }
           "frame_signature" -> {

@@ -20,6 +20,15 @@ internal object ReadinessReport {
         val main: Top,
         /** One entry per display this helper owns, keyed by display id. */
         val displays: Map<Int, Top>,
+        /**
+         * Every task on every display, or `null` when the list could not be
+         * read.
+         *
+         * A per-display top says what is showing; this says what else the app
+         * is holding behind it, which is what decides whether its process may
+         * be ended.
+         */
+        val allTasks: List<MainScreenLog.Task>? = null,
     ) {
         /**
          * What a display holds now: `null` when this helper does not own it,
@@ -42,8 +51,19 @@ internal object ReadinessReport {
      * reported as `-1` rather than omitted: "empty" and "not known" are the
      * same answer to the only question being asked — is there a screen here
      * that a coordinate could be wrong about.
+     *
+     * `allTasks` is the whole list, sent as well for a caller that has to
+     * decide whether an app's process may be ended: a per-display top says what
+     * is *showing*, and ending a process also closes the background tasks
+     * behind it. `null` is "could not read the list", which must not be sent as
+     * an empty array — the host reads "nothing anywhere" from that.
      */
-    fun of(tasks: List<MainScreenLog.Task>, open: List<Int>, locked: Boolean): State {
+    fun of(
+        tasks: List<MainScreenLog.Task>,
+        open: List<Int>,
+        locked: Boolean,
+        allTasks: List<MainScreenLog.Task>? = tasks,
+    ): State {
         fun topOf(display: Int): Top {
             val top = tasks.firstOrNull { it.displayId == display }
             return Top(task = top?.taskId ?: -1, packageName = top?.packageName)
@@ -52,6 +72,7 @@ internal object ReadinessReport {
             locked = locked,
             main = topOf(0),
             displays = open.associateWith { topOf(it) },
+            allTasks = allTasks,
         )
     }
 
@@ -65,10 +86,23 @@ internal object ReadinessReport {
         for ((id, top) in state.displays) {
             displays.put(json(top).put("id", id))
         }
-        return org.json.JSONObject()
+        val root = org.json.JSONObject()
             .put("locked", state.locked)
             .put("main", json(state.main))
             .put("displays", displays)
-            .toString()
+        state.allTasks?.let { tasks ->
+            root.put(
+                "tasks",
+                org.json.JSONArray(
+                    tasks.map {
+                        org.json.JSONObject()
+                            .put("display", it.displayId)
+                            .put("task", it.taskId)
+                            .put("package", it.packageName ?: org.json.JSONObject.NULL)
+                    },
+                ),
+            )
+        }
+        return root.toString()
     }
 }

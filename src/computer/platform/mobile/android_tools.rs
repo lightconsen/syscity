@@ -1739,6 +1739,15 @@ impl Tool for AdbHandToUserTool {
 
 // ── Virtual display ────────────────────────────────────────────────────────
 
+/// How long a launch is watched for the app to reach the top of the display.
+///
+/// `am start -W` returns when the activity reports idle, which for a cold start
+/// of a heavy app is how long the *process* took, not how long the first frame
+/// took to become the top task. Five seconds is Mika's number, and it is a
+/// ceiling rather than a target: a display that already shows the app or a
+/// chooser ends the wait on its first read.
+const LAUNCH_SETTLE: Duration = Duration::from_secs(5);
+
 /// Create and drive a second display, so the task does not take the phone.
 #[derive(Debug)]
 pub struct AdbDisplayTool {
@@ -1777,9 +1786,12 @@ impl Tool for AdbDisplayTool {
         "Run a task on a second screen so the user keeps using the phone. `start` creates the \
          display and returns its id; every later call passes that id. Apps opened on it do not \
          appear on the user's screen, and on Android 14+ it holds its own focus, so typing there \
-         does not steal the user's keyboard. `frame` returns a PNG of that display. This needs \
-         the Syscity app running on the phone; a desktop controlling a remote device has no \
-         second screen to offer."
+         does not steal the user's keyboard. `launch` ends the app first when nothing else is \
+         holding it, starts it warm when another display still has a task of it, and refuses \
+         when the person is using it on their own screen; the result's `cold_start` says which \
+         happened and `opened` says what came to the top (the app, a chooser, or something else). \
+         `frame` returns a PNG of that display. This needs the Syscity app running on the phone; \
+         a desktop controlling a remote device has no second screen to offer."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1792,7 +1804,7 @@ impl Tool for AdbDisplayTool {
                         "start", "restart", "stop", "status", "limits", "frame", "launch",
                         "tap", "swipe", "text", "paste", "key", "mute", "sound"
                     ],
-                    "description": "start creates the display; limits says how many may be open; restart replaces a stale helper; the rest act on it. 'paste' carries non-ASCII text, which `text` cannot. 'mute' silences the app on this display and 'sound' gives it back; launching an app mutes it already."
+                    "description": "start creates the display; limits says how many may be open; restart replaces a stale helper; the rest act on it. 'paste' carries non-ASCII text, which `text` cannot. 'mute' silences the app on this display and 'sound' gives it back; launching an app mutes it already. 'launch' may end the app first, start it warm, or refuse — the result says which."
                 },
                 "display": {
                     "type": "integer",
@@ -2093,6 +2105,71 @@ impl Tool for AdbDisplayTool {
             }
         }
 
+        // `launch` on a display is the one write that has to decide about the
+        // app's *process* before it starts anything: a clean start means ending
+        // it first, and ending it is not local. The decision needs the whole
+        // task list, which only the helper can read, so it is taken here — after
+        // the gate and the lease, before anything is dispatched.
+        let mut cold_start: Option<super::coldstart::ColdStart> = None;
+        if action == "launch" {
+            let package = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
+            let state = super::display::VirtualDisplay::readiness(&bridge)
+                .await
+                .ok();
+            let main = state.as_ref().and_then(|state| state.top_of(0));
+            // "In use" is a task the person is *looking at*, and the launcher is
+            // where the phone sits rather than something they opened — so it
+            // never holds a launch back.
+            let visible_on_main = main
+                .and_then(|top| top.package.as_deref())
+                .is_some_and(|shown| shown == package && !super::coldstart::is_home(shown));
+            let decision = match state.as_ref().and_then(|s| s.displays_holding(package)) {
+                Some(displays) => {
+                    super::coldstart::ColdStart::decide(&displays, id, visible_on_main)
+                }
+                // The task list could not be read. Ending a process on a guess
+                // is the one move that cannot be undone, so this is a warm
+                // start — the person's screen is still visible in readiness and
+                // still refuses.
+                None => super::coldstart::ColdStart::unaware(visible_on_main),
+            };
+            if !decision.allowed() {
+                return Ok(ToolExecutionResult::error(decision.describe(package)).with_data(
+                    serde_json::json!({
+                        "display": id,
+                        "action": action,
+                        "cold_start": decision.as_str(),
+                        "launched": false,
+                    }),
+                ));
+            }
+            if decision.ends_process() {
+                // `am force-stop` reaches the whole app, on every display and in
+                // the background — which is exactly why the decision above had
+                // to establish that nothing else was holding it.
+                let argv = adb_args(&device, &["shell", "am", "force-stop", package]);
+                let stopped =
+                    run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await;
+                match stopped {
+                    Ok((status, _, _)) if status.success() => {}
+                    Ok((_, _, stderr)) => {
+                        return Ok(ToolExecutionResult::error(format!(
+                            "Refused: `{package}` could not be ended before starting it \
+                             ({stderr}). Nothing was started — starting it now would leave \
+                             whatever it had before on screen and call that a fresh start."
+                        )))
+                    }
+                    Err(e) => {
+                        return Ok(ToolExecutionResult::error(format!(
+                            "Refused: `adb` could not end `{package}` before starting it \
+                             ({e}). Nothing was started."
+                        )))
+                    }
+                }
+            }
+            cold_start = Some(decision);
+        }
+
         // Whether the phone is still in the state this write was computed for:
         // the helper still alive, the person's screen unlocked, this display
         // still holding the app it held. `launch` is exempt — it is the
@@ -2149,14 +2226,36 @@ impl Tool for AdbDisplayTool {
             }));
         }
 
+        // What the launch turned into, once the display has been asked. Only a
+        // launch has one: every other action is judged by the screen it acted
+        // on, and this is the screen a launch *moved to*.
+        let mut opened: Option<super::coldstart::Opened> = None;
         let result = match action {
             "stop" => display.close().await.map(|_| "Display closed.".to_string()),
             "launch" => {
                 let package = args.get("package").and_then(|v| v.as_str()).unwrap_or("");
-                display
-                    .launch(package)
-                    .await
-                    .map(|_| format!("Opened {package} on display {id} (muted)."))
+                match display.launch(package).await {
+                    Ok(()) => {
+                        // `am start -W` returns when the activity reports idle
+                        // — for a chooser, without the app ever arriving. So the
+                        // display is asked what actually came to the top, and
+                        // the answer is the result rather than the command's
+                        // exit.
+                        opened =
+                            super::coldstart::await_opened(&bridge, id, package, LAUNCH_SETTLE)
+                                .await;
+                        let mut text = format!("Opened {package} on display {id} (muted).");
+                        if let Some(rest) = opened
+                            .as_ref()
+                            .and_then(|opened| opened.describe(package, id))
+                        {
+                            text.push(' ');
+                            text.push_str(&rest);
+                        }
+                        Ok(text)
+                    }
+                    Err(failed) => Err(failed),
+                }
             }
             "frame" => match display.screenshot().await {
                 Ok(frame) => {
@@ -2307,6 +2406,25 @@ impl Tool for AdbDisplayTool {
                 ToolExecutionResult::success(text).with_data(serde_json::json!({
                     "display": id,
                     "action": action,
+                    // A launch carries three extra facts, and they are the
+                    // ones a caller has to branch on: whether the process was
+                    // ended first, and what actually came to the top — the app,
+                    // a chooser, or something else.
+                    "cold_start": cold_start.map(super::coldstart::ColdStart::as_str),
+                    "opened": opened.as_ref().map(|opened| serde_json::json!({
+                        "state": opened.as_str(),
+                        "task": match opened {
+                            super::coldstart::Opened::Here { task } => Some(*task),
+                            _ => None,
+                        },
+                        "package": match opened {
+                            super::coldstart::Opened::Chooser { package }
+                            | super::coldstart::Opened::Elsewhere { package: Some(package) } => {
+                                Some(package.clone())
+                            }
+                            _ => None,
+                        },
+                    })),
                     "risk": clearance.note(),
                     "risk_approved": clearance.asked,
                     "paced": pace_note,
@@ -7068,6 +7186,7 @@ mod readiness_tests {
                 package: Some("com.example.chat".to_string()),
             }),
             displays,
+            tasks: None,
         }
     }
 
