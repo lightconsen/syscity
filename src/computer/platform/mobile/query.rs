@@ -95,6 +95,11 @@ pub enum Condition {
     /// Two readings in a row describe the same screen: whatever was happening
     /// has stopped.
     Stable,
+    /// The phone reported an event (a window, a content change, a
+    /// notification). Unlike the other three this is answered by the device's
+    /// event stream, not by reading the tree — it is "something happened",
+    /// where `appear` is "this specific thing is there".
+    Event,
 }
 
 impl Condition {
@@ -103,15 +108,26 @@ impl Condition {
             "appear" | "appears" => Ok(Self::Appear),
             "disappear" | "disappears" | "gone" => Ok(Self::Disappear),
             "stable" | "settle" | "settled" => Ok(Self::Stable),
-            other => {
-                Err(format!("condition must be 'appear', 'disappear' or 'stable', not {other:?}"))
-            }
+            "event" | "change" | "changed" => Ok(Self::Event),
+            other => Err(format!(
+                "condition must be 'appear', 'disappear', 'stable' or 'event', not {other:?}"
+            )),
         }
     }
 
     /// Whether waiting on this condition needs something to look for.
+    ///
+    /// `stable` and `event` both wait on something the screen does not name:
+    /// the first on the screen stopping, the second on the phone saying
+    /// anything happened.
     pub fn needs_query(self) -> bool {
-        !matches!(self, Self::Stable)
+        matches!(self, Self::Appear | Self::Disappear)
+    }
+
+    /// Whether this condition is answered by the device's event stream rather
+    /// than by reading the tree.
+    pub fn reads_events(self) -> bool {
+        matches!(self, Self::Event)
     }
 
     /// Whether one reading satisfies the condition.
@@ -124,6 +140,9 @@ impl Condition {
             Self::Appear => matches > 0,
             Self::Disappear => matches == 0,
             Self::Stable => seen_twice,
+            // An event condition is met by receiving an event, which is a
+            // different loop entirely; a screen reading never satisfies it.
+            Self::Event => false,
         }
     }
 
@@ -133,6 +152,7 @@ impl Condition {
             Self::Appear => "appear",
             Self::Disappear => "disappear",
             Self::Stable => "stable",
+            Self::Event => "event",
         }
     }
 }
@@ -207,6 +227,8 @@ mod tests {
         assert_eq!(Condition::parse("appear"), Ok(Condition::Appear));
         assert_eq!(Condition::parse(" Gone "), Ok(Condition::Disappear));
         assert_eq!(Condition::parse("settled"), Ok(Condition::Stable));
+        assert_eq!(Condition::parse(" Event "), Ok(Condition::Event));
+        assert_eq!(Condition::parse("changed"), Ok(Condition::Event));
         assert!(Condition::parse("blink").is_err());
     }
 
@@ -218,12 +240,24 @@ mod tests {
         assert!(!Condition::Disappear.met(1, true));
         assert!(Condition::Stable.met(0, true));
         assert!(!Condition::Stable.met(3, false));
+        // A screen reading never satisfies `event`: it is answered by the
+        // event stream, and answering it from a tree would be a false positive.
+        assert!(!Condition::Event.met(5, true));
     }
 
     #[test]
-    fn only_stable_waits_without_something_to_look_for() {
+    fn only_appear_and_disappear_need_something_to_look_for() {
         assert!(Condition::Appear.needs_query());
         assert!(Condition::Disappear.needs_query());
         assert!(!Condition::Stable.needs_query());
+        assert!(!Condition::Event.needs_query());
+    }
+
+    #[test]
+    fn only_event_is_answered_by_the_event_stream() {
+        assert!(Condition::Event.reads_events());
+        for condition in [Condition::Appear, Condition::Disappear, Condition::Stable] {
+            assert!(!condition.reads_events(), "{condition:?}");
+        }
     }
 }

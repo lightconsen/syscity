@@ -57,6 +57,17 @@ syscity = { path = "..", default-features = false, features = ["intel-macos"] }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 syscity = { path = "..", default-features = false, features = ["mobile"] }
 
+# JNI, for the one direction the bridge could not do before: the phone pushing
+# device events into Rust (`src/events.rs`). Android only — nothing else in this
+# crate touches JNI, and desktop builds do not compile it.
+#
+# Pinned to 0.21 on purpose: `Cargo.lock` already holds jni 0.21.1 (tauri's own
+# Android dependency) and 0.22.4 (another chain). This resolves to the 0.21.1
+# that is already in the tree, so neither `cargo deny` nor `cargo audit` gains a
+# coordinate.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 # `link_apple_library` compiles the app's Swift plugin (mobile-ios/) into the

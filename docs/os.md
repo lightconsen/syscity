@@ -169,9 +169,10 @@ hand:
 | `android_collect` | read-scroll-read over a long list or chat: one call returns the text in screen order, and says why it stopped |
 | `android_find` | scrolling until something appears: returns the coordinates once it does, or says how far it looked |
 | `android_query` | reading the whole tree to answer "is there a 发送 button" or "how many rows": matches by text / resource id / class and returns one line per hit, with the total |
-| `android_wait` | "observe, then observe again a second later": waits for an element to appear or go, or for the screen to settle, and on timeout says what is actually there |
+| `android_wait` | "observe, then observe again a second later": waits for an element to appear or go, for the screen to settle, or for the phone to report any change at all (`condition: event`), and on timeout says what is actually there |
 | `android_extract` | reading a screen as text: `text` returns readable lines in order, `list` one entry per row of a list, `form` one entry per input field with its label and inferred kind (a password's contents are never read) |
 | `android_run` | one turn per tap: runs up to 30 known steps in one call, finding each target again on the live screen before acting, and stops at the first step whose aftermath says the rest are unsafe — an app switch, an app landing on the user's screen, or a screen the tree cannot describe |
+| `android_event` | polling for "did anything happen": reads the accessibility service's log of window changes, content changes and notifications as facts — kind, app, time, and the notification's text — with a cursor so the next call returns only what is new |
 | `android_dialog` | describing a dialog: reads its text and buttons, and presses one only if exactly one button matches |
 | `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
 | `android_ocr` | the screenshot reader, for screens whose accessibility tree describes nothing |
@@ -183,6 +184,33 @@ call goes through. It also reports which read path it worked through: the
 in-process accessibility service answers in milliseconds and allows 30 steps,
 while the `uiautomator` fallback costs a subprocess and an SD-card round trip
 per read, so it caps a run at 10 steps and says so.
+
+The event stream has two halves and the tool always says which one answered.
+On the phone itself, with the accessibility service on, the service **pushes**
+each event into Rust through a JNI callback, so `android_wait condition=event`
+is a `select!` between the next event and the deadline — nothing polls, and no
+Binder thread is held. When the service is off, or the host is a desktop driving
+the phone over ADB, only the service's bounded ring (512 events) is readable, so
+the wait polls that ring instead and reports `source: buffer`; with no service
+at all the answer is `source: unavailable` rather than a silent timeout.
+
+An event is a fact about *when*, never a picture of the screen: it does not
+carry the tree, so a waiting turn still reads the screen at the moment it
+returns. Notification events arrive once, when a notification is posted;
+listing or dismissing notifications is a different grant
+(`NotificationListenerService`) and is not part of this.
+
+The same stream shortens the other two tools. `android_run` no longer re-reads
+the tree after every acting step just to learn whether the app changed — the
+window event says so, and its result reports `app_change_source: events` when
+that path was used (`tree` when no stream exists, in which case the read is
+still taken). A run only trusts the stream when the service is on and the
+running binding actually delivers window events; otherwise silence would mean
+"nothing was sent", not "nothing happened". `android_input`'s effect check
+likewise starts from a content event and waits for 400 ms of quiet, then reads
+the tree once to say what the screen became — instead of reading it twice to
+prove it stopped changing. Both fall back to the polling behaviour when the
+stream is absent, and both say which path answered.
 
 Two behaviours apply across the set. Every `android_input` (and `android_dialog`
 press) re-reads the screen afterwards and reports `effect: changed / unchanged /

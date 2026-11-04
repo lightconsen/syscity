@@ -93,6 +93,9 @@ impl PlatformToolSet for AndroidToolset {
             Box::new(super::android_tools::AdbRunTool::new()),
             // The same screen, read as data rather than as tap targets.
             Box::new(super::android_tools::AdbExtractTool::new()),
+            // What the phone says has happened, without reading the screen:
+            // windows, content changes and notifications, as facts.
+            Box::new(super::android_tools::AdbEventTool::new()),
             Box::new(super::android_tools::AdbDialogTool::new()),
             Box::new(super::android_tools::AdbSystemActionTool::new()),
             Box::new(super::android_tools::AdbOcrTool::new()),
@@ -1284,6 +1287,18 @@ impl Tool for AdbInputTool {
             _ => None,
         };
 
+        // The event subscription is taken here, before the action, so an event
+        // the action causes is still in the channel when the settle starts.
+        // Taking it afterwards would miss exactly the event wanted. It is
+        // detached from what the channel already holds by the settle itself.
+        let mut settle_stream = if verify { settle_events(target) } else { None };
+        // Whatever the channel held before the action is history: a content
+        // event from the previous screen would otherwise make the settle
+        // return at its first quiet moment and never see this action's.
+        if let Some(receiver) = settle_stream.as_mut() {
+            while receiver.try_recv().is_ok() {}
+        }
+
         // Whether the text went in by clipboard rather than by keystrokes —
         // the result says which, because the two fail in different ways.
         let pasted =
@@ -1465,11 +1480,12 @@ impl Tool for AdbInputTool {
             .as_ref()
             .map(|elements| (before_fingerprint.unwrap_or_default(), elements.clone()));
         let before_pixels = watched.as_ref().and_then(|(pixels, _)| pixels.as_ref());
-        let mut settle = settle_after_action_with_pixels_from(
+        let mut settle = settle_after_action_with_pixels_and_events_from(
             &device,
             target,
             before_copy,
             before_pixels,
+            settle_stream,
             settle_budget,
         )
         .await;
@@ -1585,6 +1601,10 @@ impl Tool for AdbInputTool {
             "device": serial,
             "effect": settle.effect,
             "pixels_changed": settle.pixel_changed,
+            // What answered first: `events` (a content event, then quiet) or
+            // `tree` (the poll). The model does not need it to act, but it is
+            // how "the stream is working on this phone" is visible at all.
+            "first_signal": settle.first_signal,
             "spill": spills.first().map(|s| serde_json::json!({
                 "task": s.task_id,
                 "package": s.package,
@@ -3517,6 +3537,10 @@ pub struct Settle {
     pub diff: Option<TreeDiff>,
     /// The app on screen when the screen settled.
     pub package: Option<String>,
+    /// Who said the screen changed, when the event stream answered first:
+    /// `events` (a content event, then silence) or `tree` (the poll). `None`
+    /// when no stream was available and nothing was claimed about it.
+    pub first_signal: Option<&'static str>,
 }
 
 impl Settle {
@@ -3596,6 +3620,23 @@ pub async fn settle_after_action_from(
     before: Option<(u64, Vec<UiElement>)>,
     budget_ms: u64,
 ) -> Settle {
+    settle_after_action_and_events_from(device, target, before, settle_events(target), budget_ms)
+        .await
+}
+
+/// [`settle_after_action_from`] with the event stream passed in.
+///
+/// The caller must have subscribed *before* the action: events are pushed, so
+/// what the action changed is already in the channel when this is called, and
+/// an event that arrived while nobody was subscribed was dropped by the
+/// channel. Split out so a test can supply its own stream.
+pub async fn settle_after_action_and_events_from(
+    device: &Option<String>,
+    target: Target,
+    before: Option<(u64, Vec<UiElement>)>,
+    events: Option<tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>>,
+    budget_ms: u64,
+) -> Settle {
     let started = std::time::Instant::now();
     let budget = budget_ms.clamp(SETTLE_MIN_MS, SETTLE_MAX_MS);
     let before_fingerprint = before.as_ref().map(|(fingerprint, _)| *fingerprint);
@@ -3605,7 +3646,78 @@ pub async fn settle_after_action_from(
     let mut after_package: Option<String> = None;
     let mut failure: Option<String> = None;
 
+    // The phone's own account of what changed, when it can be had: a content
+    // event starts the wait immediately, and the quiet that follows it says
+    // the screen has stopped moving — both without reading the tree. The tree
+    // is then read *once*, to say what the screen is now, instead of twice to
+    // prove it stopped changing. The subscription is taken by the caller
+    // *before* the action, because an event posted between the action and this
+    // call has already been delivered (or dropped if nobody was listening).
+    //
+    // Silence alone proves nothing: a stream that is not delivering content
+    // events is silent on a screen that moved, too. So the stream is only
+    // allowed to end the wait once it has *spoken* — `announced_at` stays
+    // `None` otherwise, and the two-identical-reads rule answers as before.
+    let mut first_signal: Option<&'static str> = None;
+    let mut read_taken = false;
+    let mut events = events;
+    let mut announced_at: Option<std::time::Instant> = events.as_mut().and_then(|receiver| {
+        // What the action caused may already be queued.
+        let mut last = None;
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if settle_event_matters(&event, None) {
+                        last = Some(started);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => last = Some(started),
+                Err(_) => break,
+            }
+        }
+        last
+    });
+
     loop {
+        // With a stream, a content change is the first signal: the screen
+        // announced it, so the tree does not have to be polled to discover it.
+        // Quiet for `SETTLE_CONTENT_QUIET_MS` after that announcement is the
+        // second signal — the screen stopped changing, which is what the
+        // polling loop waits for two identical reads to conclude.
+        if let Some(receiver) = events.as_mut() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => {
+                        if settle_event_matters(&event, after_package.as_deref()) {
+                            announced_at = Some(std::time::Instant::now());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        announced_at = Some(std::time::Instant::now());
+                    }
+                    // Nothing queued right now: the stream is live.
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    // The phone side went away; polling is all that is left.
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        events = None;
+                        break;
+                    }
+                }
+            }
+        }
+        // The stream has spoken, the screen has been read once *since* it
+        // spoke, and nothing new has been said: the screen stopped moving.
+        // One read already says what it stopped on — no second read to prove
+        // it is still the same.
+        //
+        // The first pass is exempt: an action can leave the channel silent for
+        // a moment before the phone starts drawing, and ending the wait on
+        // that would be the old "unchanged" in a new dress.
+        let quiet = read_taken
+            && announced_at.is_some_and(|at| {
+                at.elapsed() >= std::time::Duration::from_millis(SETTLE_CONTENT_QUIET_MS)
+            });
+
         match dump_ui(device, target).await {
             Ok(dump) => {
                 let fingerprint = tree_fingerprint(&dump.elements);
@@ -3613,9 +3725,15 @@ pub async fn settle_after_action_from(
                 previous = Some(fingerprint);
                 after_package = dump.package;
                 last = Some(dump.elements);
-                if stable && started.elapsed().as_millis() as u64 >= SETTLE_MIN_MS {
+                if quiet {
+                    first_signal = Some("events");
                     break;
                 }
+                if stable && started.elapsed().as_millis() as u64 >= SETTLE_MIN_MS {
+                    first_signal = Some("tree");
+                    break;
+                }
+                read_taken = true;
             }
             Err(failed) => {
                 failure = Some(failed.code.to_string());
@@ -3652,6 +3770,7 @@ pub async fn settle_after_action_from(
                 pixel_changed: None,
                 diff: diff.filter(|diff| diff.changed() > 0),
                 package: after_package,
+                first_signal,
             }
         }
         None => Settle {
@@ -3662,7 +3781,47 @@ pub async fn settle_after_action_from(
             pixel_changed: None,
             diff: None,
             package: None,
+            first_signal,
         },
+    }
+}
+
+/// How long the screen must stay quiet after a content event before it counts
+/// as settled.
+///
+/// Cancels the animation burst: a list that slides in raises several content
+/// events over a few hundred milliseconds, and only the last one is followed by
+/// silence. Shorter than the polling rule's quarter second because the event
+/// already proved that something happened — this only waits for it to stop.
+const SETTLE_CONTENT_QUIET_MS: u64 = 400;
+
+/// The event stream a settle may consult, if this device has a usable one.
+///
+/// Only the user's own display raises these events; a virtual display is
+/// invisible to the accessibility service that reports them, so a settle there
+/// keeps polling. `None` means "no stream": the poll is then the only signal.
+pub fn settle_events(
+    target: Target,
+) -> Option<tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>> {
+    match target {
+        Target::Screen => Some(crate::device::bridge()?.events()?),
+        Target::Display(_) => None,
+    }
+}
+
+/// Whether an event says the screen the action was on moved.
+///
+/// A window change is a different place and is left to the caller's own
+/// package check; a content change is the screen redrawing. Notifications from
+/// other apps appear without the screen changing, so they are not evidence
+/// either way.
+fn settle_event_matters(event: &crate::device::DeviceEvent, package: Option<&str>) -> bool {
+    match event.kind {
+        crate::device::EventKind::Content => {
+            package.is_none_or(|package| event.package.is_empty() || event.package == package)
+        }
+        crate::device::EventKind::Window => false,
+        crate::device::EventKind::Notification => false,
     }
 }
 
@@ -3701,7 +3860,30 @@ pub async fn settle_after_action_with_pixels_from(
     before_pixels: Option<&super::display::FrameSignature>,
     budget_ms: u64,
 ) -> Settle {
-    let mut settled = settle_after_action_from(device, target, before, budget_ms).await;
+    settle_after_action_with_pixels_and_events_from(
+        device,
+        target,
+        before,
+        before_pixels,
+        settle_events(target),
+        budget_ms,
+    )
+    .await
+}
+
+/// [`settle_after_action_with_pixels_from`] with the event stream passed in,
+/// so an action can subscribe before it fires (see
+/// [`settle_after_action_and_events_from`]).
+pub async fn settle_after_action_with_pixels_and_events_from(
+    device: &Option<String>,
+    target: Target,
+    before: Option<(u64, Vec<UiElement>)>,
+    before_pixels: Option<&super::display::FrameSignature>,
+    events: Option<tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>>,
+    budget_ms: u64,
+) -> Settle {
+    let mut settled =
+        settle_after_action_and_events_from(device, target, before, events, budget_ms).await;
 
     let Some(before_pixels) = before_pixels else {
         return settled;
@@ -5593,10 +5775,38 @@ mod tests {
             pixel_changed: None,
             diff: None,
             package: None,
+            first_signal: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.starts_with("Effect unknown"), "{verdict}");
         assert!(verdict.contains("SCREEN_NEVER_IDLE"), "{verdict}");
+    }
+
+    #[test]
+    fn only_a_content_event_from_this_screen_ends_a_settle_early() {
+        let event = |kind, package: &str| crate::device::DeviceEvent {
+            seq: 1,
+            kind,
+            package: package.to_string(),
+            at_uptime_ms: 1,
+            title: None,
+            text: None,
+            truncated: false,
+        };
+        use crate::device::EventKind;
+        // The screen redrawing is the signal; a window change is a different
+        // place (the caller's package check owns that) and a notification from
+        // another app appears without the screen moving.
+        assert!(settle_event_matters(&event(EventKind::Content, "com.a"), Some("com.a")));
+        assert!(!settle_event_matters(&event(EventKind::Window, "com.b"), Some("com.a")));
+        assert!(!settle_event_matters(&event(EventKind::Notification, "com.a"), Some("com.a")));
+        // A content event from a different app is that app redrawing, not this
+        // screen moving — and an app that *came to the top* raises a window
+        // event, which the caller's own package check handles.
+        assert!(!settle_event_matters(&event(EventKind::Content, "com.b"), Some("com.a")));
+        // Before the first read the package is unknown, so any content event
+        // counts — dropping it would miss the action's own first frame.
+        assert!(settle_event_matters(&event(EventKind::Content, "com.b"), None));
     }
 
     #[test]
@@ -5609,6 +5819,7 @@ mod tests {
             pixel_changed: None,
             diff: None,
             package: None,
+            first_signal: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.contains("unchanged"), "{verdict}");
@@ -5625,6 +5836,7 @@ mod tests {
             pixel_changed: None,
             diff: None,
             package: None,
+            first_signal: None,
         };
         let verdict = settle.verdict();
         assert!(verdict.contains("changed"), "{verdict}");
@@ -5715,6 +5927,7 @@ mod tests {
             pixel_changed: None,
             diff: None,
             package: None,
+            first_signal: None,
         };
         assert_eq!(settle.pixel_changed, None);
         assert_eq!(settle.effect, EFFECT_UNCHANGED);

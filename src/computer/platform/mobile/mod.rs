@@ -22,8 +22,8 @@ pub mod takeover;
 
 pub use android::AndroidToolset;
 pub use android_tools::{
-    AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbExtractTool, AdbFindTool, AdbHandToUserTool,
-    AdbOcrTool, AdbQueryTool, AdbRunTool, AdbSystemActionTool, AdbWaitTool,
+    AdbCollectTool, AdbDialogTool, AdbDisplayTool, AdbEventTool, AdbExtractTool, AdbFindTool,
+    AdbHandToUserTool, AdbOcrTool, AdbQueryTool, AdbRunTool, AdbSystemActionTool, AdbWaitTool,
 };
 pub use ios::IosToolset;
 

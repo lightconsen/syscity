@@ -8422,6 +8422,7 @@ name = "syscity-desktop"
 version = "0.3.16"
 dependencies = [
  "async-trait",
+ "jni 0.21.1",
  "rand 0.10.3",
  "serde",
  "serde_json",

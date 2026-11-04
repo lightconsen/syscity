@@ -487,12 +487,64 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
     invoke.resolve(snapshot)
   }
 
-  /** `accessibilityStatus` — is the service switched on, and is it connected? */
+  /**
+   * `accessibilityStatus` — is the service switched on, is it connected, and
+   * which event types is the running binding subscribed to?
+   *
+   * The last one is not decoration. `accessibilityEventTypes` is read by the
+   * system when it binds the service, which happens once per enable: after an
+   * update, the old subscription stays in force until the user toggles the
+   * service off and on. Reporting the bound types makes "the code handles
+   * notifications but the binding predates that" a visible state instead of a
+   * stream that is silently empty.
+   */
   @Command
   fun accessibilityStatus(invoke: Invoke) {
     val out = JSObject()
     out.put("enabled", A11yBridge.isEnabled(appActivity))
     out.put("connected", A11yBridge.isConnected())
+    val eventTypes = DeviceEvents.subscription()
+    out.put("subscribedEventTypes", eventTypes ?: JSONObject.NULL)
+    out.put("notificationTimeout", DeviceEvents.notificationTimeout() ?: JSONObject.NULL)
+    // The event types this build *handles*, so Rust can name the gap instead
+    // of a bare bitmask.
+    out.put("handledEventTypes", JSONArray(DeviceEvents.SUBSCRIBED_TYPES.toTypedArray()))
+    out.put("eventStream", if (DeviceEvents.streamAvailable()) "push" else "broken")
+    invoke.resolve(out)
+  }
+
+  /**
+   * `accessibilityEvents` — the recent event facts, oldest first.
+   *
+   * The push path wakes a waiting tool in Rust; this is how a tool that was not
+   * waiting yet catches up on what it missed (`since` is the cursor the last
+   * answer carried). Nothing here reads the screen: an event is a fact about
+   * when something changed, not a picture of it.
+   *
+   * `stream` says whether new events will also arrive by push (`push`), only
+   * land in this buffer because the native hand-off is broken (`broken`), or
+   * cannot happen at all because the service is off (`off` — Rust reports that
+   * as `unavailable`).
+   */
+  @Command
+  fun accessibilityEvents(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val since = if (args.has("since") && !args.isNull("since")) args.optLong("since", 0) else null
+    val kind = args.optString("kind", "").trim().takeIf { it.isNotEmpty() }
+    val limit = args.optInt("limit", 50).coerceIn(1, 200)
+    val out = JSObject()
+    val events = JSONArray()
+    for (event in DeviceEvents.history(since, kind, limit)) {
+      events.put(JSONObject(event.toJson()))
+    }
+    out.put("events", events)
+    out.put("cursor", DeviceEvents.cursor())
+    out.put("dropped", DeviceEvents.dropped())
+    out.put("oldest", DeviceEvents.oldest() ?: JSONObject.NULL)
+    out.put("stream", if (DeviceEvents.streamAvailable()) "push" else "broken")
+    out.put("enabled", A11yBridge.isEnabled(appActivity))
+    out.put("connected", A11yBridge.isConnected())
+    out.put("subscribedEventTypes", DeviceEvents.subscription() ?: JSONObject.NULL)
     invoke.resolve(out)
   }
 

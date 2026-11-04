@@ -2830,6 +2830,127 @@ const RUN_OPS: [&str; 11] = [
     "launch", "tap", "type", "clear", "scroll", "swipe", "key", "back", "wait", "assert", "observe",
 ];
 
+/// How long a step waits for the phone to report a window change.
+///
+/// A transition's event is pushed while the step's own input is still settling,
+/// so it is normally already queued when the step returns; the grace only
+/// covers the lag. Waiting longer would tax every step on a screen that does
+/// not move — exactly the case the per-step tree read was slow for.
+const RUN_EVENT_GRACE_MS: u64 = 200;
+
+/// What a step's aftermath looked like to the event stream.
+enum WatchVerdict {
+    /// The phone moved to this app, which is not the one the run is in.
+    Moved(String),
+    /// Still in the expected app (or no window change at all).
+    Still,
+    /// The stream cannot answer — the run must fall back to reading the tree.
+    Unavailable,
+}
+
+/// The phone's own account of what changed, watched across a run.
+///
+/// With a push channel, a run no longer re-reads the tree after every step just
+/// to learn whether the app changed: the window event says so, and it says so
+/// without a bridge call. On a host without one (a desktop driving a phone over
+/// ADB, or the service off) the watch is inert and the run keeps the per-step
+/// read — a missing stream is never a reason to stop checking.
+///
+/// Events describe the user's own display, which is why a run against a virtual
+/// display does not use this even when the channel exists.
+struct EventWatch {
+    receiver: Option<tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>>,
+    /// The stream fell behind or closed: what it said can no longer be
+    /// trusted to be complete, so the run reads the tree instead.
+    degraded: bool,
+}
+
+impl EventWatch {
+    /// Attach to the event stream, if this device really has one.
+    ///
+    /// A channel existing is not enough to trust its silence: the phone must
+    /// have the service on, and the running binding must deliver window
+    /// changes, or "no event" would mean "nothing was ever sent" and the run
+    /// would fail to notice an app switch. One status read per run pays for
+    /// that, and only when a channel exists at all.
+    async fn attach() -> Self {
+        let Some(bridge) = crate::device::bridge().cloned() else {
+            return Self::with_channel(None);
+        };
+        let Some(receiver) = bridge.events() else {
+            return Self::with_channel(None);
+        };
+        if let Some(status) = read_a11y_status().await {
+            if status.enabled == Some(false) {
+                return Self::with_channel(None);
+            }
+            if let Some(mask) = status.subscribed_event_types {
+                if mask & crate::device::EventKind::Window.subscription_bit() == 0 {
+                    return Self::with_channel(None);
+                }
+            }
+        }
+        Self::with_channel(Some(receiver))
+    }
+
+    fn with_channel(
+        mut receiver: Option<tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>>,
+    ) -> Self {
+        // Anything already queued happened before the run started and is not
+        // this run's business.
+        if let Some(channel) = receiver.as_mut() {
+            while channel.try_recv().is_ok() {}
+        }
+        Self { receiver, degraded: false }
+    }
+
+    /// Whether this watch can answer at all.
+    fn available(&self) -> bool {
+        self.receiver.is_some() && !self.degraded
+    }
+
+    /// The next window event from an app other than `expected`, within `grace`.
+    ///
+    /// "Another app" is the whole test: a new activity of the *same* package is
+    /// still the run's screen, and the next step's own read decides whether its
+    /// targets survived. A chooser and a system prompt come through as their
+    /// own packages, so the caller can tell them apart by name.
+    async fn moved(&mut self, expected: Option<&str>, grace: std::time::Duration) -> WatchVerdict {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let Some(receiver) = self.receiver.as_mut() else {
+            return WatchVerdict::Unavailable;
+        };
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            tokio::select! {
+                incoming = receiver.recv() => match incoming {
+                    Ok(event) => {
+                        if event.kind != crate::device::EventKind::Window
+                            || event.package.is_empty()
+                            || expected.is_some_and(|package| package == event.package)
+                        {
+                            continue;
+                        }
+                        return WatchVerdict::Moved(event.package);
+                    }
+                    // The subscriber fell behind: an event that would have
+                    // answered is gone, so the stream stops being evidence.
+                    Err(RecvError::Lagged(_)) => {
+                        self.degraded = true;
+                        return WatchVerdict::Unavailable;
+                    }
+                    Err(RecvError::Closed) => {
+                        self.receiver = None;
+                        return WatchVerdict::Unavailable;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => return WatchVerdict::Still,
+            }
+        }
+    }
+}
+
 /// Run several commands in one call, re-locating each target first.
 #[derive(Debug)]
 pub struct AdbRunTool {
@@ -3013,6 +3134,13 @@ impl Tool for AdbRunTool {
         let mut steps: Vec<RunStep> = Vec::with_capacity(commands.len());
         let mut stop: Option<(String, usize)> = None;
         let mut unreadable = 0_usize;
+        // The event stream answers "did the app change" for a run on the user's
+        // display; everywhere else it is inert and the per-step read does.
+        let mut watch = match target {
+            Target::Screen => EventWatch::attach().await,
+            Target::Display(_) => EventWatch::with_channel(None),
+        };
+        let mut checked_by_events = 0_usize;
 
         for (index, command) in commands.iter().enumerate() {
             let n = index + 1;
@@ -3043,20 +3171,38 @@ impl Tool for AdbRunTool {
             // asked for — a chooser it cannot answer, a prompt only a person
             // can — and otherwise becomes the baseline for the steps after it.
             if op == "launch" {
-                match dump_ui(&device, target).await {
-                    Ok(after) => {
-                        if let Some(now) = after.package.as_deref() {
-                            if let Some(failure) = launch_interrupted(now, n) {
-                                step.fail_in_place(&failure);
-                                stop = Some((failure.code.to_string(), n));
-                                steps.push(step);
-                                break;
-                            }
-                            expected_package = Some(now.to_string());
+                let launched = match watch.available() {
+                    true => match watch
+                        .moved(
+                            expected_package.as_deref(),
+                            Duration::from_millis(RUN_EVENT_GRACE_MS),
+                        )
+                        .await
+                    {
+                        WatchVerdict::Moved(package) => Some(package),
+                        _ => None,
+                    },
+                    false => None,
+                };
+                let launch_read = match launched {
+                    Some(package) => Some(package),
+                    None => dump_ui(&device, target)
+                        .await
+                        .ok()
+                        .and_then(|after| after.package),
+                };
+                match launch_read {
+                    Some(now) => {
+                        if let Some(failure) = launch_interrupted(&now, n) {
+                            step.fail_in_place(&failure);
+                            stop = Some((failure.code.to_string(), n));
+                            steps.push(step);
+                            break;
                         }
+                        expected_package = Some(now);
                         steps.push(step);
                     }
-                    Err(_) => {
+                    None => {
                         // A launch that cannot be read back changed nothing for
                         // this run's purposes; the next step's own read will say
                         // where it got to. Three in a row is a dead phone.
@@ -3081,56 +3227,89 @@ impl Tool for AdbRunTool {
             // Doing this per step is what makes the next step's read safe: the
             // whole premise of a run is that each target is found again, and a
             // different app is a different set of targets.
-            let after = match dump_ui(&device, target).await {
-                Ok(dump) => {
-                    unreadable = 0;
-                    dump
-                }
-                Err(_) => {
-                    unreadable += 1;
-                    // One unreadable screen is a transition; three in a row is
-                    // a phone that needs a person.
-                    if unreadable >= 3 {
-                        let failure = StepError::new(
-                            STOP_SCREEN_NEEDS_REVIEW,
-                            "the screen stopped being readable for three steps in a row",
-                        );
-                        step.fail_in_place(&failure);
-                        stop = Some((STOP_SCREEN_NEEDS_REVIEW.to_string(), n));
+            //
+            // The event stream answers that question — "the app changed" —
+            // without a bridge call. When it answered, this loop takes no read
+            // at all: content changes are already in the step's own result, and
+            // "the tree cannot describe this screen" is answered where it
+            // matters, by the step whose target cannot be found
+            // ([`locate_step_target`]).
+            let moved_to = match watch
+                .moved(expected_package.as_deref(), Duration::from_millis(RUN_EVENT_GRACE_MS))
+                .await
+            {
+                WatchVerdict::Moved(package) => Some(package),
+                WatchVerdict::Still | WatchVerdict::Unavailable => None,
+            };
+            let from_events = watch.available();
+            if from_events {
+                checked_by_events += 1;
+            }
+            let after: Option<UiDump> = if from_events {
+                None
+            } else {
+                match dump_ui(&device, target).await {
+                    Ok(dump) => {
+                        unreadable = 0;
+                        Some(dump)
                     }
-                    steps.push(step);
-                    if stop.is_some() {
-                        break;
+                    Err(_) => {
+                        unreadable += 1;
+                        // One unreadable screen is a transition; three in a row
+                        // is a phone that needs a person.
+                        if unreadable >= 3 {
+                            let failure = StepError::new(
+                                STOP_SCREEN_NEEDS_REVIEW,
+                                "the screen stopped being readable for three steps in a row",
+                            );
+                            step.fail_in_place(&failure);
+                            stop = Some((STOP_SCREEN_NEEDS_REVIEW.to_string(), n));
+                        }
+                        steps.push(step);
+                        if stop.is_some() {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             };
 
             // Every check below ends the run; the step it is attached to is
-            // the one whose aftermath was caught.
-            let halted = match (expected_package.as_deref(), after.package.as_deref()) {
-                (Some(before), Some(now)) if before != now => match launch_interrupted(now, n) {
-                    Some(opened) => Some(opened),
-                    None => Some(StepError::new(
-                        STOP_APP_SWITCHED,
-                        format!(
-                            "the screen was in {before} and is now in {now}, so the remaining \
-                             steps no longer target the screen they were written for"
-                        ),
-                    )),
-                },
-                _ => None,
-            };
+            // the one whose aftermath was caught. The app change itself comes
+            // from the event stream when it could answer, and from this read
+            // otherwise.
+            let changed_app = moved_to.or_else(|| {
+                match (
+                    expected_package.as_deref(),
+                    after.as_ref().and_then(|dump| dump.package.as_deref()),
+                ) {
+                    (Some(before), Some(now)) if before != now => Some(now.to_string()),
+                    _ => None,
+                }
+            });
+            let halted = changed_app.map(|now| match launch_interrupted(&now, n) {
+                Some(opened) => opened,
+                None => StepError::new(
+                    STOP_APP_SWITCHED,
+                    format!(
+                        "the screen was in {} and is now in {now}, so the remaining steps no \
+                         longer target the screen they were written for",
+                        expected_package.as_deref().unwrap_or("another app")
+                    ),
+                ),
+            });
             // A screen the tree cannot describe is a screen the next step's
             // locate cannot work on. Saying so now, with the app named, is more
             // useful than thirty identical failures.
             let halted = halted.or_else(|| {
-                (assess_tree(&after.elements) == TreeQuality::Unusable).then(|| {
-                    StepError::new(
-                        STOP_SCREEN_NEEDS_REVIEW,
-                        "the accessibility tree describes none of this screen — read the \
-                         screenshot (android_observe) before continuing",
-                    )
+                after.as_ref().and_then(|dump| {
+                    (assess_tree(&dump.elements) == TreeQuality::Unusable).then(|| {
+                        StepError::new(
+                            STOP_SCREEN_NEEDS_REVIEW,
+                            "the accessibility tree describes none of this screen — read the \
+                             screenshot (android_observe) before continuing",
+                        )
+                    })
                 })
             });
             // An action on a display can start something that lands on the
@@ -3205,6 +3384,7 @@ impl Tool for AdbRunTool {
                          longer.",
                     );
                 }
+                text.push_str(&app_change_note(checked_by_events));
                 text.push_str("\n\nThe screen is now:\n\n");
                 text.push_str(&format_ui_summary(&dump.elements));
                 if dump.truncated {
@@ -3258,6 +3438,7 @@ impl Tool for AdbRunTool {
             final_read.as_ref().ok(),
             source,
             serial,
+            checked_by_events,
         )))
     }
 }
@@ -3270,6 +3451,7 @@ fn run_data(
     final_read: Option<&UiDump>,
     source: &'static str,
     device: Option<String>,
+    checked_by_events: usize,
 ) -> Value {
     serde_json::json!({
         "ok": stopped.is_none(),
@@ -3291,11 +3473,27 @@ fn run_data(
         // own service and costs a bridge call per read; `uiautomator` is ADB's
         // dump and costs a subprocess.
         "read_source": source,
+        // How many steps learned "the app changed" from the event stream
+        // instead of a tree read. Zero means the per-step read was the only
+        // evidence available on this phone.
+        "app_change_source": if checked_by_events > 0 { "events" } else { "tree" },
+        "checked_by_events": checked_by_events,
         "max_steps": if source == "uiautomator" { RUN_MAX_STEPS_FALLBACK } else { RUN_MAX_STEPS },
         "truncated": final_read.is_some_and(|dump| dump.truncated),
         "elements": final_read.map(|dump| dump.elements.clone()),
         "device": device,
     })
+}
+
+/// What a run says about how it noticed app changes.
+fn app_change_note(checked_by_events: usize) -> String {
+    if checked_by_events == 0 {
+        return String::new();
+    }
+    format!(
+        "\n\nApp changes were watched through the phone's event stream for {checked_by_events} \
+         step(s), so no tree was re-read just to notice one."
+    )
 }
 
 /// What a stop reason means, in a sentence.
@@ -3797,6 +3995,391 @@ fn list_text(rows: &[ExtractRow], truncated: bool) -> String {
     text
 }
 
+// ── Events ─────────────────────────────────────────────────────────────────
+
+/// Wait for the phone to report a change, instead of polling the screen.
+///
+/// The push channel is the point of this tool: while the accessibility service
+/// is on, the phone calls into Rust as each window, content change or
+/// notification happens, so a wait is a `select!` between an incoming event and
+/// the deadline — no Binder thread held, no tree re-read every 250 ms. When the
+/// service is off, or the host is a desktop driving a phone over ADB, there is
+/// no push channel; this falls back to reading the service's ring
+/// (`accessibilityEvents`) on the same 250 ms cadence and says so in `source`.
+///
+/// What an event is *not*: a picture of the screen. It says "something changed
+/// in this app at this time", and the screen still has to be read afterwards.
+/// `condition: event` is therefore for "wait until something happens", and
+/// `appear`/`disappear` remain the tools for "wait until this specific thing".
+#[derive(Debug)]
+pub struct AdbEventTool {
+    device: Option<String>,
+}
+
+impl Default for AdbEventTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbEventTool {
+    pub fn new() -> Self {
+        Self { device: None }
+    }
+
+    pub fn with_device(mut self, device: String) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+/// How many events one call returns by default.
+const EVENT_DEFAULT_LIMIT: usize = 20;
+/// The most one call returns.
+const EVENT_MAX_LIMIT: usize = 200;
+
+/// Read the phone's event ring.
+///
+/// `since` is the cursor from a previous answer; `None` starts from the oldest
+/// event still buffered. The bridge is looked up process-wide for the same
+/// reason the tree read is: events belong to the device, and the tool set that
+/// asks may be several layers below the one holding a bridge reference.
+async fn read_events(
+    since: Option<u64>,
+    kind: Option<crate::device::EventKind>,
+    limit: usize,
+) -> Result<crate::device::EventPage, String> {
+    let bridge = crate::device::bridge().cloned().ok_or_else(|| {
+        "The device event stream only exists inside the Syscity app on the phone itself — this \
+         host has no accessibility service. Wait on the screen instead (android_wait with \
+         condition 'appear', 'disappear' or 'stable')."
+            .to_string()
+    })?;
+    read_events_from(bridge, since, kind, limit).await
+}
+
+/// The payload for one `accessibilityEvents` call.
+///
+/// `since` and `kind` are omitted rather than sent as null: the Kotlin side
+/// treats an absent field as "no filter", and a null is a value it has to
+/// special-case.
+fn event_query(
+    since: Option<u64>,
+    kind: Option<crate::device::EventKind>,
+    limit: usize,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "limit": limit });
+    if let Some(since) = since {
+        payload["since"] = serde_json::json!(since);
+    }
+    if let Some(kind) = kind {
+        payload["kind"] = serde_json::json!(kind.label());
+    }
+    payload
+}
+
+/// [`read_events`] against a given bridge, so the call can be asserted without
+/// installing the process-wide one.
+async fn read_events_from(
+    bridge: crate::device::DeviceBridgeRef,
+    since: Option<u64>,
+    kind: Option<crate::device::EventKind>,
+    limit: usize,
+) -> Result<crate::device::EventPage, String> {
+    let answer = bridge
+        .call(crate::device::CMD_A11Y_EVENTS, event_query(since, kind, limit))
+        .await
+        .map_err(|e| format!("The phone could not be asked for events ({e})"))?;
+    crate::device::EventPage::parse(&answer).map_err(|detail| {
+        format!(
+            "This Syscity build on the phone does not report device events ({detail}); update \
+             the app on the phone, or wait on the screen instead."
+        )
+    })
+}
+
+/// The service's own status, as `accessibilityStatus` reports it.
+///
+/// Separate from the event page because the two answer different questions:
+/// the page says what happened, this says whether the stream can happen at
+/// all. `handled_event_types` is what *this build* asks for; the page's
+/// `subscribed_event_types` is what the running binding actually delivers, and
+/// the difference between them is an app update that has not been followed by
+/// a service toggle.
+async fn read_a11y_status() -> Option<crate::device::A11yStatus> {
+    let bridge = crate::device::bridge().cloned()?;
+    let answer = bridge
+        .call(crate::device::CMD_A11Y_STATUS, serde_json::json!({}))
+        .await
+        .ok()?;
+    Some(crate::device::A11yStatus::parse(&answer))
+}
+
+/// What one event wait observed.
+struct EventWait {
+    events: Vec<crate::device::DeviceEvent>,
+    cursor: u64,
+    source: &'static str,
+    waited_ms: u64,
+}
+
+/// Wait for the next event of `kind`, or the deadline.
+///
+/// Push first: subscribing *before* the baseline cursor is read is what keeps
+/// the gap closed — an event that lands between the two is in the channel, and
+/// the sequence filter discards only history that predates the wait.
+async fn wait_for_event(
+    since: u64,
+    kind: Option<crate::device::EventKind>,
+    budget: Duration,
+) -> Result<EventWait, String> {
+    let bridge = crate::device::bridge().cloned().ok_or_else(|| {
+        "The device event stream only exists inside the Syscity app on the phone itself — this \
+         host has no accessibility service. Wait on the screen instead (android_wait with \
+         condition 'appear', 'disappear' or 'stable')."
+            .to_string()
+    })?;
+    wait_for_event_on(bridge, since, kind, budget).await
+}
+
+/// [`wait_for_event`] against a given bridge.
+///
+/// Split out because the channel and the ring come from the same bridge, and a
+/// test has to supply both — the process-wide one can be installed only once.
+async fn wait_for_event_on(
+    bridge: crate::device::DeviceBridgeRef,
+    since: u64,
+    kind: Option<crate::device::EventKind>,
+    budget: Duration,
+) -> Result<EventWait, String> {
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + budget;
+
+    if let Some(mut receiver) = bridge.events() {
+        // Subscribe first, then read the ring: an event posted between the two
+        // is in the channel *and* in the ring, so nothing falls in the gap.
+        // (The reverse order would miss exactly the event that triggered the
+        // wait.)
+        let page = read_events_from(bridge.clone(), Some(since), kind, EVENT_MAX_LIMIT).await?;
+        if !page.events.is_empty() {
+            let waited_ms = started.elapsed().as_millis() as u64;
+            return Ok(EventWait {
+                cursor: page.cursor.max(since),
+                events: page.events,
+                source: crate::device::EVENT_SOURCE_BUFFER,
+                waited_ms,
+            });
+        }
+        loop {
+            tokio::select! {
+                incoming = receiver.recv() => match incoming {
+                    Ok(event) => {
+                        if event.seq > since && event.matches(kind) {
+                            let waited_ms = started.elapsed().as_millis() as u64;
+                            return Ok(EventWait {
+                                cursor: event.seq,
+                                events: vec![event],
+                                source: crate::device::EVENT_SOURCE_PUSH,
+                                waited_ms,
+                            });
+                        }
+                    }
+                    // The subscriber fell behind. The events are not lost —
+                    // the ring has them — so this is a reason to read the
+                    // ring, not a failure.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let page = read_events_from(
+                            bridge.clone(),
+                            Some(since),
+                            kind,
+                            EVENT_MAX_LIMIT,
+                        )
+                        .await?;
+                        let waited_ms = started.elapsed().as_millis() as u64;
+                        return Ok(EventWait {
+                            cursor: page.cursor.max(since),
+                            events: page.events,
+                            source: crate::device::EVENT_SOURCE_BUFFER,
+                            waited_ms,
+                        });
+                    }
+                    // The phone side went away (the channel was dropped).
+                    // Fall through to the ring.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        let waited_ms = started.elapsed().as_millis() as u64;
+        return Ok(EventWait {
+            events: Vec::new(),
+            cursor: since,
+            source: crate::device::EVENT_SOURCE_PUSH,
+            waited_ms,
+        });
+    }
+
+    // No push channel: poll the ring. Same cadence as the screen poll, because
+    // the reason for it is the same — a person could not see a change faster.
+    let poll = Duration::from_millis(WAIT_POLL_MS);
+    loop {
+        let page = read_events_from(bridge.clone(), Some(since), kind, EVENT_MAX_LIMIT).await?;
+        if !page.events.is_empty() {
+            let waited_ms = started.elapsed().as_millis() as u64;
+            let source = page.source();
+            return Ok(EventWait {
+                events: page.events,
+                cursor: page.cursor,
+                source,
+                waited_ms,
+            });
+        }
+        if started.elapsed() >= budget {
+            let waited_ms = started.elapsed().as_millis() as u64;
+            let source = page.source();
+            return Ok(EventWait {
+                events: Vec::new(),
+                cursor: page.cursor.max(since),
+                source,
+                waited_ms,
+            });
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+#[async_trait]
+impl Tool for AdbEventTool {
+    fn name(&self) -> &str {
+        "android_event"
+    }
+
+    fn description(&self) -> &str {
+        "Read what the phone says has happened recently: windows opening, content changing, \
+         notifications arriving. Each event is a fact — kind, app, time, and the notification's \
+         text — not a picture of the screen, so read the screen separately when you need to act. \
+         Pass the returned `cursor` back as `since` next time to get only what is new. `source` \
+         says whether events are being pushed live or only read from the buffer."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        create_schema(
+            "Read recent device events",
+            serde_json::json!({
+                "since": {
+                    "type": "integer",
+                    "description": "The `cursor` from a previous call: return only events after it."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["any", "window", "content", "notification"],
+                    "description": "Only this kind of event (default any)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many events to return (default 20, max 200)."
+                },
+                "device": { "type": "string", "description": DEVICE_PARAM }
+            }),
+            Vec::<String>::new(),
+        )
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        _context: &ToolContext,
+    ) -> crate::Result<ToolExecutionResult> {
+        // `device` is validated for the same reason every other tool does it:
+        // an empty serial means "ask the wrong phone", and the ring is read
+        // from whichever bridge this process installed.
+        if let Err(refusal) = resolve_device(&args, self.device.as_deref()) {
+            return Ok(ToolExecutionResult::error(refusal));
+        }
+        let kind = match crate::device::EventKind::parse_filter(
+            args.get("kind").and_then(Value::as_str).unwrap_or("any"),
+        ) {
+            Ok(kind) => kind,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+        let since = args.get("since").and_then(Value::as_u64);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(EVENT_DEFAULT_LIMIT)
+            .clamp(1, EVENT_MAX_LIMIT);
+
+        let page = match read_events(since, kind, limit).await {
+            Ok(page) => page,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        };
+
+        if let Some(reason) = page.unavailable_reason() {
+            // Say *which* half is missing. "The service is off" and "the
+            // service is on but this build's subscription predates the event
+            // types" are the same empty answer with different fixes, and the
+            // status command is the only place that distinction exists.
+            let status = read_a11y_status().await.unwrap_or_default();
+            let mut text = reason;
+            if let Some(detail) = status.subscription_gap() {
+                text.push('\n');
+                text.push_str(&detail);
+            }
+            return Ok(ToolExecutionResult::error(text).with_data(serde_json::json!({
+                "code": "event_stream_unavailable",
+                "events": [],
+                "source": crate::device::EVENT_SOURCE_UNAVAILABLE,
+                "enabled": status.enabled,
+                "connected": status.connected,
+                "subscribed_event_types": status.subscribed_event_types,
+                "handled_event_types": status.handled_event_types,
+            })));
+        }
+
+        // A `since` older than the buffer can answer is a real answer, but a
+        // misleading one: say what was lost instead of showing a gap.
+        let missed = since.filter(|since| page.dropped > 0 && *since < page.oldest.unwrap_or(0));
+        let mut text = if page.events.is_empty() {
+            "No new events.".to_string()
+        } else {
+            format!("{} event(s):", page.events.len())
+        };
+        for event in &page.events {
+            text.push_str("\n- ");
+            text.push_str(&event.describe());
+        }
+        if let Some(since) = missed {
+            text.push_str(&format!(
+                "\n\nEvents after cursor {since} have already rolled out of the phone's buffer, \
+                 so this list is not the complete history. Read the screen for the current state."
+            ));
+        }
+        if let Some(kind) = kind {
+            if page.subscription_covers(kind) == Some(false) {
+                text.push_str(&format!(
+                    "\n\nThe service is bound without the `{}` event type: the app on the phone \
+                     was updated with a new subscription but has not been re-enabled since. \
+                     Toggle Syscity's accessibility service off and on in Settings to fix it.",
+                    kind.label()
+                ));
+            }
+        }
+        text.push_str(&format!("\ncursor: {} (pass it as `since`)", page.cursor));
+
+        Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+            "events": page.events,
+            "cursor": page.cursor,
+            "dropped": page.dropped,
+            "oldest": page.oldest,
+            "source": page.source(),
+            "enabled": page.enabled,
+            "connected": page.connected,
+            "subscribed_event_types": page.subscribed_event_types,
+        })))
+    }
+}
+
 // ── Query ──────────────────────────────────────────────────────────────────
 
 /// Find controls on the current screen without reading the whole tree.
@@ -4010,6 +4593,95 @@ const WAIT_DEFAULT_MS: u64 = 10_000;
 /// wait that runs out still returns an answer the model can act on.
 const WAIT_MAX_MS: u64 = 30_000;
 
+/// The `condition: event` half of `android_wait`.
+///
+/// Separate from the polling loop because it is answered by a different thing:
+/// the phone's event stream rather than a reading of the tree. The baseline
+/// cursor is taken first so "an event arrived" means "…after this call
+/// started"; the screen is then read once, at the moment the wait returns, so
+/// the answer still says where the phone got to.
+async fn wait_on_events(
+    device: &Option<String>,
+    args: &Value,
+    budget: Duration,
+) -> crate::Result<ToolExecutionResult> {
+    let kind = match crate::device::EventKind::parse_filter(
+        args.get("kind").and_then(Value::as_str).unwrap_or("any"),
+    ) {
+        Ok(kind) => kind,
+        Err(message) => return Ok(ToolExecutionResult::error(message)),
+    };
+    // A caller that already read `android_event` has a cursor; otherwise the
+    // ring's current head is the baseline, so only later events count.
+    let since = match args.get("since").and_then(Value::as_u64) {
+        Some(since) => since,
+        None => match read_events(None, None, 1).await {
+            Ok(page) => page.cursor,
+            Err(message) => return Ok(ToolExecutionResult::error(message)),
+        },
+    };
+    let wait = match wait_for_event(since, kind, budget).await {
+        Ok(wait) => wait,
+        Err(message) => return Ok(ToolExecutionResult::error(message)),
+    };
+
+    let waited_ms = wait.waited_ms;
+    let (met, mut text) = if wait.events.is_empty() {
+        (
+            false,
+            format!(
+                "No {} event within {waited_ms} ms. The phone may be idle, or the change you \
+                 expect may not raise an accessibility event; read the screen with \
+                 android_ui_tree to see where it got to.",
+                kind.map_or("device", |kind| kind.label())
+            ),
+        )
+    } else {
+        let mut text = format!("{} event(s) after {waited_ms} ms:", wait.events.len());
+        for event in &wait.events {
+            text.push_str("\n- ");
+            text.push_str(&event.describe());
+        }
+        (true, text)
+    };
+    if wait.source == crate::device::EVENT_SOURCE_BUFFER {
+        text.push_str(
+            "\n\nEvents are being read from the phone's buffer, not pushed: Syscity's \
+             accessibility service is off or the native hand-off is unavailable. The wait still \
+             works, at polling latency.",
+        );
+    }
+
+    // The screen at the moment the wait ended — a wait whose answer is only
+    // "something happened" leaves the caller needing to look anyway.
+    let target = match Target::from_args(args) {
+        Ok(target) => target,
+        Err(message) => return Ok(ToolExecutionResult::error(message)),
+    };
+    let screen = dump_ui(device, target).await;
+    let elements = match &screen {
+        Ok(dump) => dump.elements.clone(),
+        Err(_) => Vec::new(),
+    };
+    Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
+        "met": met,
+        "condition": condition_label(),
+        "events": wait.events,
+        "cursor": wait.cursor,
+        "waited_ms": waited_ms,
+        "source": wait.source,
+        "elements": elements,
+        "read_source": screen.as_ref().ok().map(|dump| dump.source),
+        "device": resolved_serial(device).await,
+    })))
+}
+
+/// The label `wait_on_events` reports; one place, so it cannot drift from
+/// [`super::query::Condition::Event::label`].
+fn condition_label() -> &'static str {
+    super::query::Condition::Event.label()
+}
+
 #[async_trait]
 impl Tool for AdbWaitTool {
     fn name(&self) -> &str {
@@ -4020,10 +4692,12 @@ impl Tool for AdbWaitTool {
         "Wait for the screen to reach a state, instead of reading it again a second later and \
          hoping. `condition: appear` waits for an element matching `text`/`resource_id`/`class` to \
          show up (a result, a button, a loaded list); `disappear` waits for it to go (a spinner, a \
-         dialog); `stable` waits for the screen to stop changing. Returns whether it got there, \
-         how long it waited, and the screen as it was at that moment. When it times out it says \
-         so and shows what is actually on screen, so a failure is information rather than another \
-         blind retry."
+         dialog); `stable` waits for the screen to stop changing; `event` waits for the phone to \
+         report any change at all — a window opening, content changing, a notification arriving — \
+         which is the cheapest wait when you do not know what the next screen looks like. Returns \
+         whether it got there, how long it waited, and the screen as it was at that moment. When \
+         it times out it says so and shows what is actually on screen, so a failure is information \
+         rather than another blind retry."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -4032,8 +4706,18 @@ impl Tool for AdbWaitTool {
             serde_json::json!({
                 "condition": {
                     "type": "string",
-                    "description": "appear (default), disappear, or stable.",
-                    "enum": ["appear", "disappear", "stable"]
+                    "description": "appear (default), disappear, stable, or event.",
+                    "enum": ["appear", "disappear", "stable", "event"]
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["any", "window", "content", "notification"],
+                    "description": "For condition 'event': only this kind (default any)."
+                },
+                "since": {
+                    "type": "integer",
+                    "description": "For condition 'event': only count events after this cursor \
+                                    (the `cursor` android_event returned). Default: now."
                 },
                 "text": {
                     "type": "string",
@@ -4097,6 +4781,9 @@ impl Tool for AdbWaitTool {
                 .unwrap_or(WAIT_DEFAULT_MS)
                 .clamp(WAIT_POLL_MS, WAIT_MAX_MS),
         );
+        if condition.reads_events() {
+            return wait_on_events(&device, &args, budget).await;
+        }
         let poll = Duration::from_millis(WAIT_POLL_MS);
         let started = std::time::Instant::now();
         let mut previous: Option<u64> = None;
@@ -4132,6 +4819,8 @@ impl Tool for AdbWaitTool {
                         "The screen settled after {waited} ms ({} element(s)).",
                         dump.elements.len()
                     ),
+                    // `wait_on_events` answers this one before the loop starts.
+                    super::query::Condition::Event => unreachable!("event waits return early"),
                 };
                 if let Some(found) = query.as_ref().and_then(|q| q.find(&dump.elements, 1).pop()) {
                     text.push_str(&format!(
@@ -4170,6 +4859,8 @@ impl Tool for AdbWaitTool {
                         "The screen was still changing after {waited} ms; it may be animating or \
                          loading. Read it with android_ui_tree to see where it got to."
                     ),
+                    // `wait_on_events` answers this one before the loop starts.
+                    super::query::Condition::Event => unreachable!("event waits return early"),
                 };
                 return Ok(ToolExecutionResult::success(text).with_data(serde_json::json!({
                     "met": false,
@@ -4318,6 +5009,310 @@ mod tests {
         assert!(!is_dialog_class("android.widget.Button"));
     }
 
+    // ── Events ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn every_condition_the_wait_schema_offers_is_one_it_can_answer() {
+        let schema = AdbWaitTool::new().parameters_schema();
+        let offered: Vec<&str> = schema["properties"]["condition"]["enum"]
+            .as_array()
+            .expect("an enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        // If the schema and the parser disagree, the model is offered a value
+        // that is refused — the exact failure this test exists to prevent.
+        for value in &offered {
+            assert!(
+                super::super::query::Condition::parse(value).is_ok(),
+                "{value} is in the schema but not in the parser"
+            );
+        }
+        assert!(offered.contains(&"event"));
+        // `wait_on_events` reads `since`; the schema has to offer it or a
+        // model can never pass a cursor and gets "events from now" only.
+        assert!(schema["properties"]["since"].is_object());
+    }
+
+    #[tokio::test]
+    async fn the_ring_is_read_through_the_bridge_command() {
+        let bridge =
+            std::sync::Arc::new(crate::device::tests::MockDeviceBridge::new(serde_json::json!({
+                "events": [],
+                "cursor": 4,
+                "stream": "push",
+                "enabled": true,
+                "connected": true,
+            })));
+        let page = super::read_events_from(bridge.clone(), None, None, 10)
+            .await
+            .expect("a page");
+        assert!(page.events.is_empty());
+        assert_eq!(page.cursor, 4);
+        assert_eq!(page.source(), crate::device::EVENT_SOURCE_PUSH);
+        let calls = bridge.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, crate::device::CMD_A11Y_EVENTS);
+        assert_eq!(calls[0].1["limit"], 10);
+    }
+
+    /// A bridge with an event channel and a canned ring answer.
+    struct EventBridge {
+        sender: tokio::sync::broadcast::Sender<crate::device::DeviceEvent>,
+        page: Value,
+    }
+
+    impl EventBridge {
+        fn new(page: Value) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                sender: tokio::sync::broadcast::channel(16).0,
+                page,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::device::DeviceBridge for EventBridge {
+        async fn call(&self, _command: &str, _payload: Value) -> crate::Result<Value> {
+            Ok(self.page.clone())
+        }
+
+        fn events(&self) -> Option<tokio::sync::broadcast::Receiver<crate::device::DeviceEvent>> {
+            Some(self.sender.subscribe())
+        }
+    }
+
+    fn empty_page() -> Value {
+        serde_json::json!({
+            "events": [], "cursor": 3, "dropped": 0, "oldest": Value::Null,
+            "stream": "push", "enabled": true, "connected": true,
+        })
+    }
+
+    fn window_event(seq: u64, package: &str) -> crate::device::DeviceEvent {
+        crate::device::DeviceEvent {
+            seq,
+            kind: crate::device::EventKind::Window,
+            package: package.to_string(),
+            at_uptime_ms: seq,
+            title: None,
+            text: None,
+            truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_window_event_from_another_app_is_what_a_run_calls_a_switch() {
+        let sender = tokio::sync::broadcast::channel(8).0;
+        let mut watch = EventWatch::with_channel(Some(sender.subscribe()));
+        let poster = sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = poster.send(window_event(1, "com.example.other"));
+        });
+        let verdict = watch
+            .moved(Some("com.example.chat"), Duration::from_millis(1_000))
+            .await;
+        assert!(matches!(verdict, WatchVerdict::Moved(ref app) if app == "com.example.other"));
+        assert!(watch.available());
+    }
+
+    #[tokio::test]
+    async fn a_window_event_from_the_same_app_is_not_a_switch() {
+        // A new activity inside the run's own app is still the run's screen;
+        // the next step's read decides whether its targets survived.
+        let sender = tokio::sync::broadcast::channel(8).0;
+        let mut watch = EventWatch::with_channel(Some(sender.subscribe()));
+        let poster = sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = poster.send(window_event(1, "com.example.chat"));
+        });
+        let verdict = watch
+            .moved(Some("com.example.chat"), Duration::from_millis(120))
+            .await;
+        assert!(matches!(verdict, WatchVerdict::Still));
+    }
+
+    #[tokio::test]
+    async fn history_from_before_the_run_does_not_count_as_a_switch() {
+        // The channel is process-wide; an event from the previous run must not
+        // abort this one before its first step has even run.
+        let sender = tokio::sync::broadcast::channel(8).0;
+        let _ = sender.send(window_event(1, "com.example.other"));
+        let mut watch = EventWatch::with_channel(Some(sender.subscribe()));
+        let verdict = watch
+            .moved(Some("com.example.chat"), Duration::from_millis(30))
+            .await;
+        assert!(matches!(verdict, WatchVerdict::Still));
+    }
+
+    #[tokio::test]
+    async fn a_watch_without_a_channel_says_so_rather_than_going_quiet() {
+        let mut watch = EventWatch::with_channel(None);
+        assert!(!watch.available());
+        // The caller must read the tree: "no event" here means "nobody could
+        // have sent one", which is not evidence that the app did not change.
+        assert!(matches!(
+            watch
+                .moved(Some("com.example.chat"), Duration::from_millis(10))
+                .await,
+            WatchVerdict::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lagging_stream_stops_being_evidence() {
+        // A missed event could have been the switch; the watch must say so and
+        // let the run fall back to reading the tree.
+        let (sender, _) = tokio::sync::broadcast::channel(1);
+        let mut watch = EventWatch::with_channel(Some(sender.subscribe()));
+        let _ = sender.send(window_event(1, "a"));
+        let _ = sender.send(window_event(2, "b"));
+        let _ = sender.send(window_event(3, "c"));
+        let verdict = watch
+            .moved(Some("com.example.chat"), Duration::from_millis(200))
+            .await;
+        assert!(matches!(verdict, WatchVerdict::Unavailable));
+        assert!(!watch.available());
+    }
+
+    #[test]
+    fn a_run_reports_whether_events_or_the_tree_watched_for_switches() {
+        let from_events = run_data_with(3);
+        assert_eq!(from_events["app_change_source"], "events");
+        assert_eq!(from_events["checked_by_events"], 3);
+        let from_tree = run_data_with(0);
+        assert_eq!(from_tree["app_change_source"], "tree");
+    }
+
+    fn run_data_with(checked_by_events: usize) -> Value {
+        run_data(&[], 0, None, None, "accessibility", None, checked_by_events)
+    }
+
+    #[tokio::test]
+    async fn an_event_wakes_the_wait_immediately() {
+        let bridge = EventBridge::new(empty_page());
+        let sender = bridge.sender.clone();
+        tokio::spawn(async move {
+            // Let the wait reach its select! before posting: the test is about
+            // the push path, not about buffering before a subscriber exists.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sender.send(crate::device::DeviceEvent {
+                seq: 4,
+                kind: crate::device::EventKind::Notification,
+                package: "com.example.chat".to_string(),
+                at_uptime_ms: 10,
+                title: Some("Alice".to_string()),
+                text: Some("Are you free?".to_string()),
+                truncated: false,
+            });
+        });
+        let wait = wait_for_event_on(bridge, 3, None, Duration::from_millis(2_000))
+            .await
+            .expect("a wait");
+        assert_eq!(wait.events.len(), 1);
+        assert_eq!(wait.events[0].seq, 4);
+        assert_eq!(wait.source, crate::device::EVENT_SOURCE_PUSH);
+        assert!(wait.waited_ms < 1_000, "waited {} ms", wait.waited_ms);
+    }
+
+    #[tokio::test]
+    async fn an_event_of_another_kind_does_not_satisfy_the_wait() {
+        let bridge = EventBridge::new(empty_page());
+        let sender = bridge.sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = sender.send(crate::device::DeviceEvent {
+                seq: 4,
+                kind: crate::device::EventKind::Content,
+                package: "com.example".to_string(),
+                at_uptime_ms: 10,
+                title: None,
+                text: None,
+                truncated: false,
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = sender.send(crate::device::DeviceEvent {
+                seq: 5,
+                kind: crate::device::EventKind::Notification,
+                package: "com.example".to_string(),
+                at_uptime_ms: 11,
+                title: None,
+                text: None,
+                truncated: false,
+            });
+        });
+        let wait = wait_for_event_on(
+            bridge,
+            3,
+            Some(crate::device::EventKind::Notification),
+            Duration::from_millis(2_000),
+        )
+        .await
+        .expect("a wait");
+        assert_eq!(wait.events[0].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn history_before_the_wait_is_taken_from_the_ring() {
+        // The event that woke the model may have been posted before the tool
+        // ran. It is in the ring, and the cursor filter keeps it.
+        let bridge = EventBridge::new(serde_json::json!({
+            "events": [
+                { "seq": 4, "kind": "window", "package": "a", "atUptimeMs": 1 },
+                { "seq": 5, "kind": "window", "package": "b", "atUptimeMs": 2 },
+            ],
+            "cursor": 5, "stream": "push", "enabled": true, "connected": true,
+        }));
+        let wait = wait_for_event_on(bridge, 3, None, Duration::from_millis(500))
+            .await
+            .expect("a wait");
+        assert_eq!(wait.events.len(), 2);
+        assert_eq!(wait.source, crate::device::EVENT_SOURCE_BUFFER);
+        assert_eq!(wait.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn a_silent_phone_times_out_without_failing() {
+        let bridge = EventBridge::new(empty_page());
+        let started = std::time::Instant::now();
+        let wait = wait_for_event_on(bridge, 3, None, Duration::from_millis(120))
+            .await
+            .expect("a wait");
+        assert!(wait.events.is_empty());
+        assert_eq!(wait.cursor, 3);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn a_bridge_without_a_channel_polls_the_ring() {
+        // A desktop driving a phone over ADB: no push, but the ring is still
+        // there and the wait has to work through it.
+        let bridge =
+            std::sync::Arc::new(crate::device::tests::MockDeviceBridge::new(serde_json::json!({
+                "events": [{ "seq": 9, "kind": "content", "package": "a", "atUptimeMs": 1 }],
+                "cursor": 9, "stream": "broken", "enabled": true, "connected": true,
+            })));
+        let wait = wait_for_event_on(bridge, 8, None, Duration::from_millis(500))
+            .await
+            .expect("a wait");
+        assert_eq!(wait.events.len(), 1);
+        assert_eq!(wait.source, crate::device::EVENT_SOURCE_BUFFER);
+    }
+
+    #[test]
+    fn an_event_wait_payload_carries_the_cursor_and_the_kind() {
+        // The Kotlin side filters by the same three fields; a typo in either
+        // name silently returns everything.
+        let payload = event_query(Some(7), Some(crate::device::EventKind::Notification), 5);
+        assert_eq!(payload["since"], 7);
+        assert_eq!(payload["kind"], "notification");
+        assert_eq!(payload["limit"], 5);
+        assert!(event_query(None, None, 5).get("since").is_none());
+        assert!(event_query(None, None, 5).get("kind").is_none());
+    }
+
     #[test]
     fn tool_names_are_stable() {
         assert_eq!(AdbCollectTool::new().name(), "android_collect");
@@ -4330,6 +5325,7 @@ mod tests {
         assert_eq!(AdbWaitTool::new().name(), "android_wait");
         assert_eq!(AdbRunTool::new().name(), "android_run");
         assert_eq!(AdbExtractTool::new().name(), "android_extract");
+        assert_eq!(AdbEventTool::new().name(), "android_event");
     }
 
     fn element(

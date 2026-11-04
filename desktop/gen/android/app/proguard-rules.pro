@@ -23,3 +23,12 @@
 # started by name (`app_process ... net.syscity.desktop.helper.HelperMain`), so
 # R8 cannot see the entry point and would rename or drop it in a release build.
 -keep class net.syscity.desktop.helper.** { *; }
+
+# JNI entry points. Defensive, not load-bearing: the default rules already keep
+# classes with native methods
+# (`-keepclasseswithmembernames,includedescriptorclasses class * { native <methods>; }`),
+# and the generated `Rust` class demonstrably keeps its name in a release build.
+# This exists so `NativeEvents` does not depend on that default rule surviving an
+# AGP upgrade. Note the helper rule above is *not* precedent for this one: that
+# one exists because `app_process` starts the class by name.
+-keep class net.syscity.desktop.NativeEvents { *; }

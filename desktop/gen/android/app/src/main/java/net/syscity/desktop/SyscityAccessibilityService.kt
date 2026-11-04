@@ -14,9 +14,15 @@ import android.view.accessibility.AccessibilityWindowInfo
  * The platform's accessibility API is the only way to see what is on screen
  * without a subprocess: `uiautomator dump` costs a shell round trip and an
  * `/sdcard` file, and cannot see anything but the default display. This service
- * hands the same data to Rust through [A11yBridge] on demand — it is not an
- * event-driven shadow of the screen, and it keeps no history, because a stale
- * tree is worse than no tree.
+ * hands the same data to Rust through [A11yBridge] on demand — reads are always
+ * taken when the agent asks for one, and nothing here ever caches a tree.
+ *
+ * What it *does* keep is a bounded log of event **facts** — a window changed, a
+ * notification was posted, at what time, in which app — so a waiting agent is
+ * woken by the change instead of polling for it. That is not the stale-tree
+ * design this service refused: an event records that something happened, never
+ * what the screen looked like when it did. The tree is still read fresh,
+ * afterwards, by whoever was woken.
  *
  * The user enables it in Settings › Accessibility › Syscity; nothing here can
  * (or should) do that for them. `DevicePlugin.accessibilityStatus` reports
@@ -31,13 +37,21 @@ class SyscityAccessibilityService : AccessibilityService() {
   override fun onServiceConnected() {
     super.onServiceConnected()
     A11yBridge.attach(this)
+    // The service's own configuration is only known here, and the event types
+    // in it are what the system bound. Reporting them makes "code updated, old
+    // subscription still in force" visible instead of a silently empty stream.
+    runCatching {
+      serviceInfo?.let { DeviceEvents.noteSubscription(it.eventTypes, it.notificationTimeout) }
+    }.onFailure { Log.w(TAG, "could not read the service's event subscription", it) }
   }
 
   override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-    // Nothing to do per event: a snapshot is taken when the agent asks for one.
-    // Collecting events here would mean holding a tree that goes stale between
-    // reads, which is exactly the failure the indexed-tap safety net exists to
-    // catch.
+    if (event == null) return
+    // Classification is a pure function of the event; the log and the hand-off
+    // to Rust happen in [DeviceEvents]. Nothing here touches the window tree:
+    // an event is a fact about *when*, and the tree is read by whoever acts on
+    // the wake-up.
+    DeviceEvents.record(event)
   }
 
   override fun onInterrupt() {
@@ -46,6 +60,7 @@ class SyscityAccessibilityService : AccessibilityService() {
 
   override fun onUnbind(intent: Intent?): Boolean {
     A11yBridge.detach(this)
+    DeviceEvents.onServiceUnbound()
     return super.onUnbind(intent)
   }
 

@@ -7,12 +7,24 @@
   move here with the virtual display) but turning it on later would otherwise
   require the user to toggle the service off and on again.
 
-  The event types are deliberately narrow: the service takes snapshots on
-  request and keeps no history, so subscribing to a stream of events would only
-  wake the process for nothing.
+  The event types are what lets the agent be *woken* rather than poll: the
+  service keeps a bounded log of event facts (kind, package, time, and the text
+  a notification carried) and a cursor into it — never a tree, and never a
+  snapshot of anybody's screen. Reading the tree is still on demand, so a stale
+  tree cannot happen; the events only say when a read is worth taking.
+
+  `typeNotificationStateChanged` is what makes notifications arrive at all: a
+  service that does not subscribe to it is never woken for one. The other two
+  cover the screen itself.
+
+  `accessibilityEventTypes` is read by the system when it binds the service,
+  which happens once per enable. After an app update the old subscription stays
+  in force until the user toggles the service off and on again —
+  `accessibilityStatus` reports the event types the service is actually bound
+  to, so that state is visible instead of silently empty.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeNotificationStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
     android:canRetrieveWindowContent="true"

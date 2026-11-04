@@ -2,6 +2,12 @@
 //!
 //! Embeds the Syscity Gateway and serves it to the Tauri WebView.
 
+// The crate is safe code apart from one place: the JNI callback in `events.rs`,
+// which is `#[no_mangle] extern "system"` by definition. Nothing else in this
+// crate uses `unsafe`, and `#[no_mangle]` cannot be written inside a `safe`
+// wrapper.
+#![cfg_attr(not(target_os = "android"), deny(unsafe_code))]
+
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
@@ -9,6 +15,12 @@ use tokio::sync::Mutex;
 
 mod connection;
 use connection::{ConnectionConfig, ConnectionMode};
+
+/// Push events from the phone into Rust (mobile only; see the module docs).
+///
+/// Compiled on every target so `publish` can be tested on a host; the JNI
+/// export itself is Android-only.
+mod events;
 
 /// A writer that duplicates output to both stdout and a log file.
 ///
@@ -93,6 +105,24 @@ mod mobile_device {
                     ))
                 })
         }
+
+        /// The push half of the event stream, when the platform has one.
+        ///
+        /// Android fills the channel from `NativeEvents.onDeviceEvent`; the
+        /// `accessibilityEvents` bridge command remains the buffer half either
+        /// way, so returning `None` here degrades to polling the ring rather
+        /// than to no events at all. iOS has no accessibility service, so the
+        /// channel stays empty and nothing subscribes to it.
+        fn events(&self) -> Option<tokio::sync::broadcast::Receiver<syscity::device::DeviceEvent>> {
+            #[cfg(target_os = "android")]
+            {
+                super::events::sender().map(|sender| sender.subscribe())
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                None
+            }
+        }
     }
 
     /// Build the `"device"` plugin. Its setup registers the Kotlin
@@ -103,6 +133,12 @@ mod mobile_device {
             .setup(|app, api| {
                 #[cfg(target_os = "android")]
                 {
+                    // The event channel must exist before the Kotlin side can
+                    // post its first event, and before the gateway asks for a
+                    // subscription: both happen after this setup, but neither
+                    // is ordered against the other, so this is the only moment
+                    // that is definitely first.
+                    super::events::init();
                     let handle =
                         api.register_android_plugin("net.syscity.desktop", "DevicePlugin")?;
                     app.manage(TauriDeviceBridge { plugin: handle });

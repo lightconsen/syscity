@@ -17,8 +17,13 @@
 //! desktop path changes behaviour.
 // INVARIANTS-NONE: bridge trait and drivers; no local persistent state.
 
+mod events;
 mod tools;
 
+pub use events::{
+    A11yStatus, DeviceEvent, EventKind, EventPage, EventStream, EVENT_SOURCE_BUFFER,
+    EVENT_SOURCE_PUSH, EVENT_SOURCE_UNAVAILABLE,
+};
 pub(crate) use tools::NO_BRIDGE_MSG;
 pub use tools::{
     DeviceCameraTool, DeviceGeolocateTool, DeviceHapticTool, DeviceNotifyTool, DeviceOpenUrlTool,
@@ -88,6 +93,14 @@ pub const CMD_OPEN_URL: &str = "openUrl";
 pub const CMD_A11Y_TREE: &str = "accessibilityTree";
 /// Whether the accessibility service is enabled and connected.
 pub const CMD_A11Y_STATUS: &str = "accessibilityStatus";
+/// Recent device events from the accessibility service's ring (see [`events`]).
+///
+/// The push half of the same stream is not a command: it is a JNI callback from
+/// the phone's own Kotlin side (`NativeEvents.onDeviceEvent`), received in the
+/// `desktop` crate and published through [`DeviceBridge::events`]. This command
+/// is the buffer half — history from before a waiter started listening, and the
+/// only path when the callback is missing.
+pub const CMD_A11Y_EVENTS: &str = "accessibilityEvents";
 /// Read text out of a base64 PNG with the on-device ML Kit model.
 ///
 /// Only the mobile build has no `vision` feature, so this is how OCR works on
@@ -147,6 +160,23 @@ pub trait DeviceBridge: Send + Sync {
         command: &str,
         payload: serde_json::Value,
     ) -> crate::Result<serde_json::Value>;
+
+    /// A subscription to events pushed by the platform, if this bridge has one.
+    ///
+    /// `None` — the default — means "this bridge has no push channel", and a
+    /// caller must fall back to polling the `accessibilityEvents` ring (which
+    /// [`DeviceEvent`] history is still available through) or the screen. It
+    /// is *not* an error: a desktop driving a phone over ADB has no
+    /// accessibility service to push from, and a phone whose native hand-off
+    /// failed still has the ring.
+    ///
+    /// `broadcast` drops events when nobody is subscribed: that is deliberate,
+    /// because an event nobody was waiting for is served by the ring instead.
+    /// Subscribe *before* triggering whatever the wait is for, or the first
+    /// event can land in the gap.
+    fn events(&self) -> Option<tokio::sync::broadcast::Receiver<DeviceEvent>> {
+        None
+    }
 }
 
 /// A wrapper so tools can cheaply pass an optional bridge around.
