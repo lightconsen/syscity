@@ -11,7 +11,7 @@
 //! satisfies a condition — so the polling loop in the tools can be driven
 //! without a device and the rules can be tested directly.
 
-use super::android::{element_label, UiElement};
+use super::{element_label, UiElement};
 
 /// What to look for in the tree.
 ///

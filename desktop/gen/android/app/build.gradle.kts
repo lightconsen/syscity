@@ -96,7 +96,7 @@ dependencies {
     // **bundled** Chinese model ships inside the APK: it works offline and on
     // devices without Google Play services, unlike the unbundled variants that
     // fetch a model through GMS on first use. `ocr_png` in
-    // `src/computer/platform/mobile/android.rs` is the only caller.
+    // `src/computer/platform/android/ocr.rs` is the only caller.
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")

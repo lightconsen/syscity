@@ -195,7 +195,7 @@ parts** compile out for `android`/`ios`: the X11/Wayland/macOS/Windows
 adapters, `use_loop`, `vision`, screen/mouse/keyboard tools. Those have no
 mobile semantics; they are replaced by mobile-native capabilities in P4.
 
-**Keep `platform/mobile/` compiled in.** Its tool sets are platform-agnostic
+**Keep `platform/android/` and `platform/ios/` compiled in.** Its tool sets are platform-agnostic
 (`target_os: []`) and §4.10 retargets them at the host device — blanket-
 excluding the whole `src/computer/` module would delete the P4.5
 differentiator along with the desktop code.
@@ -310,7 +310,7 @@ Mobile builds must handle these dependencies explicitly:
 
 ### 4.10 On-device automation (Android)
 
-Once Syscity runs on the phone, the existing `platform/mobile/` tool surface
+Once Syscity runs on the phone, the existing `platform/android/` and `platform/ios/` tool surface
 (`android_input`, `android_screenshot`, `android_app_manager`,
 `android_ui_tree`) can be retargeted at the *host* device — turning "Syscity
 controls a phone" from a desktop-bridge feature into the app's
@@ -442,7 +442,7 @@ Goal: prove the core compiles and runs on Android.
 |---|---|---|
 | 1.1 | Define the `mobile` feature profile: `--no-default-features` + explicit opt-ins (webchat, `plugins` (wasmtime cross-compile canary, §2.3), `embedded-assets` (SPA compiled into the binary, §4.12), `sqlite/bundled`, `libsqlite3-sys/bundled`); excludes llama-cpp-2, ort, chromiumoxide, keyring, channels | `Cargo.toml` |
 | 1.2 | `SYSCITY_HOME` env override | `src/dirs.rs` |
-| 1.3 | cfg-exclude the desktop-control parts of `src/computer/` on mobile (keep `platform/mobile/`, §4.2) | `src/computer/mod.rs` |
+| 1.3 | cfg-exclude the desktop-control parts of `src/computer/` on mobile (keep `platform/android/` and `platform/ios/`, §4.2) | `src/computer/mod.rs` |
 | 1.4 | Rust `aarch64-linux-android` toolchain + build target wired | `Cargo.toml`, CI |
 | 1.5 | Headless smoke test: gateway starts, SQLite opens under sandbox path, HTTP responds | test harness |
 
@@ -507,7 +507,7 @@ Goal: turn "Syscity on a phone" into "a phone-native Syscity".
 | 4.2 | SAF/`content://` adapter for user-file access | Android |
 | 4.3 | Background wake: `WorkManager` / `BGTaskScheduler` for cron/heartbeat (§4.7) | optional enhancement |
 | 4.4 | iOS build (scoped-down tool surface) | post-Android |
-| 4.5 | On-device automation: AccessibilityService bridge and/or loopback ADB; retarget the existing `platform/mobile/` tool surface at the host device (§4.10) | Android; the differentiator |
+| 4.5 | On-device automation: AccessibilityService bridge and/or loopback ADB; retarget the existing `platform/android/` and `platform/ios/` tool surface at the host device (§4.10) | Android; the differentiator |
 | 4.6 | Shortcuts/App Intents bus: run shortcuts, `x-callback-url` results, App Group channel; expose syscity's own App Intents (§4.11) | iOS; replaces UI automation |
 
 ---
@@ -544,7 +544,7 @@ Goal: turn "Syscity on a phone" into "a phone-native Syscity".
 - Delegation is process-internal: `src/agent/subagent_registry.rs`,
   `src/delegation/` (tasks keyed `delegation:<run_id>`)
 - Existing mobile device bridges (retargeted at the host in §4.10):
-  `src/computer/platform/mobile/` (Android ADB / iOS libimobiledevice)
+  `src/computer/platform/{android,ios}/` (Android ADB / iOS libimobiledevice)
 
 ---
 

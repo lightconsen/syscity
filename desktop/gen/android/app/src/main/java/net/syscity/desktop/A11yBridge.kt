@@ -12,7 +12,7 @@ import org.json.JSONObject
 /**
  * Snapshot of the focused window, for the Rust side.
  *
- * The payload is the contract with `src/computer/platform/mobile/a11y.rs`:
+ * The payload is the contract with `src/computer/platform/android/a11y.rs`:
  *
  * ```
  * { "enabled": true,

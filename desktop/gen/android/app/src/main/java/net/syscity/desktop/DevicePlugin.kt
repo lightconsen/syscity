@@ -611,7 +611,7 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
    * `ocr` — read the text in a screenshot with the on-device ML Kit model.
    *
    * The screenshot arrives base64-encoded because the caller (`ocr_png` in
-   * `src/computer/platform/mobile/android.rs`) already has the PNG bytes in
+   * `src/computer/platform/android/ocr.rs`) already has the PNG bytes in
    * the Rust process and there is no cheaper way to hand them across the
    * bridge. Decoding and recognition both block, so they run on the serial
    * executor; the answer is resolved back on the main thread like every other
@@ -662,7 +662,7 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
    * a JavaScript-drawn login form has no nodes to read or tap. This command
    * hands the page itself: `open`, `read`, `click`, `type`, `script`, plus
    * `back`/`forward`/`reload`/`close`/`status`. Protocol and tests live in
-   * `src/computer/platform/mobile/web/mod.rs`; this is the on-device half.
+   * `src/computer/platform/android/web/mod.rs`; this is the on-device half.
    *
    * The `shim` is `page.js` from the Rust binary, sent with `open` and
    * re-injected by the bridge after every navigation — one copy of it, in the
@@ -715,7 +715,7 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
    * allows. See `shell/HelperHub.kt`.
    *
    * A pass-through on purpose: the protocol lives in
-   * `src/computer/platform/mobile/display.rs`, which is where it is validated
+   * `src/computer/platform/android/display.rs`, which is where it is validated
    * and where the tests are. This side's jobs are getting off the main thread
    * and moving frames — a PNG is over a Binder transaction's size budget, so it
    * comes back as a file descriptor.

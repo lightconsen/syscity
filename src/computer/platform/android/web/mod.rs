@@ -346,7 +346,7 @@ impl Tool for AdbWebTool {
                     "type": "boolean",
                     "description": "click: read the page again afterwards and say what changed. Default true; false saves a round trip when the page is known not to change."
                 },
-                "device": { "type": "string", "description": super::android::DEVICE_PARAM }
+                "device": { "type": "string", "description": super::DEVICE_PARAM }
             }),
             vec!["action"],
         )
@@ -357,7 +357,7 @@ impl Tool for AdbWebTool {
         args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
-        let device = match super::android::resolve_device(&args, self.device.as_deref()) {
+        let device = match super::resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
             Err(refusal) => return Ok(ToolExecutionResult::error(refusal)),
         };
@@ -400,7 +400,7 @@ impl AdbWebTool {
         if let Err(refused) = check_target(url, &NavigationPolicy::default()).await {
             return ToolExecutionResult::error(refused);
         }
-        let _target = super::android::lock_device(device).await;
+        let _target = super::lock_device(device).await;
         let request = json!({ "op": "open", "url": url, "shim": PAGE_JS });
         match call(bridge, request).await {
             Ok(answer) => match WebPage::parse(&answer) {
@@ -412,7 +412,7 @@ impl AdbWebTool {
     }
 
     async fn read(&self, bridge: &DeviceBridgeRef, device: &Option<String>) -> ToolExecutionResult {
-        let _target = super::android::lock_device(device).await;
+        let _target = super::lock_device(device).await;
         match call(bridge, json!({ "op": "read" })).await {
             Ok(answer) => match WebPage::parse(&answer) {
                 Ok(page) => describe_page(&page, "Read"),
@@ -440,7 +440,7 @@ impl AdbWebTool {
                 "`click` needs `index`: the number a read gave the control",
             );
         };
-        let _target = super::android::lock_device(device).await;
+        let _target = super::lock_device(device).await;
         let before = match self.read_page(bridge).await {
             Ok(page) => page,
             Err(failed) => return ToolExecutionResult::error(explain(failed)),
@@ -564,7 +564,7 @@ impl AdbWebTool {
         let Some(value) = args.get("value").and_then(Value::as_str) else {
             return ToolExecutionResult::error("`type` needs `value`");
         };
-        let _target = super::android::lock_device(device).await;
+        let _target = super::lock_device(device).await;
         // The field is looked up before it is typed into, so a stale number is
         // a refusal that names the re-read rather than a write into whatever
         // took its place.
@@ -603,7 +603,7 @@ impl AdbWebTool {
         let Some(source) = args.get("script").and_then(Value::as_str) else {
             return ToolExecutionResult::error("`script` needs the expression to evaluate");
         };
-        let _target = super::android::lock_device(device).await;
+        let _target = super::lock_device(device).await;
         match call(bridge, json!({ "op": "script", "script": source })).await {
             Ok(answer) => {
                 let result = answer.get("result").cloned().unwrap_or(Value::Null);
@@ -620,7 +620,7 @@ impl AdbWebTool {
         device: &Option<String>,
         action: &str,
     ) -> ToolExecutionResult {
-        let _target = super::android::lock_device(device).await;
+        let _target = super::lock_device(device).await;
         match call(bridge, json!({ "op": action })).await {
             Ok(answer) => match action {
                 "status" => {

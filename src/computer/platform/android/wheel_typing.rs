@@ -9,8 +9,8 @@
 
 use serde_json::Value;
 
-use super::android::{adb_args, Target, UiElement};
 use super::run_cmd;
+use super::{adb_args, Target, UiElement};
 
 /// The default time a typed value is given to settle.
 const TYPE_SETTLE_MS: u64 = 250;
@@ -93,8 +93,7 @@ async fn type_over_adb(device: &Option<String>, field: &UiElement, value: &str) 
     }
     tokio::time::sleep(std::time::Duration::from_millis(TYPE_SETTLE_MS)).await;
 
-    let text =
-        format!("input text {}", super::android::sh_quote(&super::android::input_encode(value)));
+    let text = format!("input text {}", super::sh_quote(&super::input_encode(value)));
     let argv = adb_args(device, &["shell", &text]);
     let typed = matches!(
         run_cmd("adb", &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>()).await,
@@ -123,7 +122,7 @@ async fn read_editable_row(
     target: Target,
     args: &Value,
 ) -> Option<UiElement> {
-    let dump = super::android::dump_ui(device, target).await.ok()?;
+    let dump = super::dump_ui(device, target).await.ok()?;
     let anchor = locate_anchor(&dump.elements, args)?;
     let (left, top, right, bottom) = anchor.bounds;
     dump.elements
@@ -146,7 +145,7 @@ fn locate_anchor<'a>(elements: &'a [UiElement], args: &Value) -> Option<&'a UiEl
         .and_then(|v| v.as_str())
         .filter(|key| !key.trim().is_empty())
     {
-        return super::android::relocate(elements, key.trim()).ok();
+        return super::relocate(elements, key.trim()).ok();
     }
     let index = args.get("target").and_then(|v| v.as_u64())?;
     elements.get(usize::try_from(index).ok()?.checked_sub(1)?)
@@ -192,7 +191,7 @@ pub(super) async fn perform_scroll(wheel_element: &UiElement, forward: bool, cou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::platform::mobile::android::NodeState;
+    use crate::computer::platform::android::NodeState;
 
     fn element(index: usize, text: &str, bounds: (i32, i32, i32, i32)) -> UiElement {
         let mut element = UiElement::with_state(

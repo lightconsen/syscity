@@ -372,7 +372,7 @@ pub fn plan_steps(commands: &[serde_json::Value]) -> Vec<Planned> {
             // irreversible control the plan did not name is refused at run
             // time, which is where that answer first exists.
             "key" => text("keycode")
-                .map(super::android::normalize_keycode)
+                .map(super::normalize_keycode)
                 .filter(|code| super::risk::is_submit_key(code))
                 .map(|code| Offer {
                     risk: Risk::Send,
@@ -627,7 +627,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::computer::platform::mobile::risk::Risk;
+    use crate::computer::platform::android::risk::Risk;
     use crate::tools::ask_user::AskQueue;
 
     fn offer() -> Offer {

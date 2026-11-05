@@ -203,7 +203,7 @@ pub(super) async fn handle_device_adb_status(
     if state.device.bridge.read().await.is_none() {
         return WsResponse::err(&req.id, "UNSUPPORTED_PLATFORM", crate::device::NO_BRIDGE_MSG);
     }
-    match crate::computer::platform::mobile::adb_status().await {
+    match crate::computer::platform::android::adb::adb_status().await {
         Ok(data) => WsResponse::ok(&req.id, data),
         Err(e) => WsResponse::err(&req.id, "DEVICE_COMMAND_FAILED", format!("{}", e)),
     }
@@ -228,7 +228,7 @@ pub(super) async fn handle_device_adb_pair(
     if state.device.bridge.read().await.is_none() {
         return WsResponse::err(&req.id, "UNSUPPORTED_PLATFORM", crate::device::NO_BRIDGE_MSG);
     }
-    match crate::computer::platform::mobile::adb_pair(
+    match crate::computer::platform::android::adb::adb_pair(
         payload.port,
         &payload.code,
         payload.connect_port,

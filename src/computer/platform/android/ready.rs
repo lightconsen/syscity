@@ -23,8 +23,8 @@
 //! *before* the action and blocks it, rather than a verdict on the action
 //! afterwards.
 
-use super::android::Target;
 use super::display::{Readiness, DISPLAY_UNAVAILABLE};
+use super::Target;
 
 /// Why the phone is not ready for this write.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use super::android::{element_label, UiElement};
+use super::{element_label, UiElement};
 use crate::memory::effectiveness::{EffectivenessConfig, EffectivenessStats};
 
 /// The file under the memory directory, when one can be resolved.
@@ -662,7 +662,7 @@ pub fn describe(facts: &[FactRecall]) -> Option<String> {
 pub fn first_dialog(elements: &[UiElement]) -> Option<String> {
     let roots: Vec<&UiElement> = elements
         .iter()
-        .filter(|element| super::android_tools::is_dialog_class(&element.class))
+        .filter(|element| super::tools::is_dialog_class(&element.class))
         .collect();
     if roots.is_empty() {
         return None;

@@ -23,8 +23,8 @@
 
 use serde_json::{json, Value};
 
-use super::android::{format_ui_summary, tree_fingerprint, UiElement};
 use super::display::{DisplayError, VirtualDisplay, DISPLAY_UNAVAILABLE};
+use super::{format_ui_summary, tree_fingerprint, UiElement};
 use crate::device::CMD_VIRTUAL_DISPLAY;
 
 /// The user took over and handed back.
@@ -112,10 +112,9 @@ pub async fn hand_to_user(
 
     // 4. Read it. The fingerprint comparison is what turns "I'm done" into
     //    evidence the model can act on.
-    let elements =
-        super::android::dump_ui_elements(&None, super::android::Target::Display(display_id))
-            .await
-            .unwrap_or_default();
+    let elements = super::dump_ui_elements(&None, super::Target::Display(display_id))
+        .await
+        .unwrap_or_default();
     let after = if elements.is_empty() {
         None
     } else {

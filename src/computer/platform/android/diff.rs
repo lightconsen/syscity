@@ -21,13 +21,13 @@
 //!   present from an absent past. Past that share, the full list is short by
 //!   comparison to the reconstruction.
 //!
-//! Element identity is [`super::android::element_key`], which is what survives
+//! Element identity is [`super::element_key`], which is what survives
 //! a screen changing — not the index, which is only a position in one read.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use super::android::UiElement;
+use super::UiElement;
 
 /// How many past reads are kept for diffing.
 ///
@@ -114,7 +114,7 @@ impl UiDelta {
 
 /// Compare two reads by element identity.
 ///
-/// The same two passes [`super::android::tree_diff`] uses, and for the same
+/// The same two passes [`super::tree_diff`] uses, and for the same
 /// reason: pair identical rows in place first, then let the leftovers pair as
 /// movement, and only then call the rest gone. One inserted row at the top of a
 /// list must read as one arrival, not as every row moving.
@@ -285,21 +285,21 @@ pub fn describe(delta: &UiDelta) -> String {
         text.push_str("\nAppeared:");
         for element in &delta.added {
             text.push('\n');
-            text.push_str(&super::android::format_ui_element(element));
+            text.push_str(&super::format_ui_element(element));
         }
     }
     if !delta.removed.is_empty() {
         text.push_str("\nLeft:");
         for element in &delta.removed {
             text.push('\n');
-            text.push_str(&super::android::format_ui_element(element));
+            text.push_str(&super::format_ui_element(element));
         }
     }
     if !delta.moved.is_empty() {
         text.push_str("\nMoved:");
         for element in &delta.moved {
             text.push('\n');
-            text.push_str(&super::android::format_ui_element(element));
+            text.push_str(&super::format_ui_element(element));
         }
     }
     text
@@ -308,7 +308,7 @@ pub fn describe(delta: &UiDelta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::platform::mobile::android::NodeState;
+    use crate::computer::platform::android::NodeState;
 
     fn row(index: usize, text: &str, y: i32) -> UiElement {
         let mut element = UiElement::with_state(

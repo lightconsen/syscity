@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 
-use super::android::{NodeState, UiElement};
+use super::{NodeState, UiElement};
 use crate::device::{DeviceBridgeRef, CMD_A11Y_TREE};
 
 /// The service is not enabled (or not connected yet).

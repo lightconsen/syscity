@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
-use super::android::{element_label, UiElement};
+use super::{element_label, UiElement};
 
 /// One user on the phone, as `pm list users` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +388,7 @@ pub fn describe_choices(choices: &[Choice]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::platform::mobile::android::UiElement;
+    use crate::computer::platform::android::UiElement;
 
     fn button(label: &str) -> UiElement {
         let mut element = UiElement::new(

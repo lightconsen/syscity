@@ -653,7 +653,7 @@ The browser is the agent's, with its own cookies: it has no session from the
 user's browser, so a site that needs a login starts logged out. `close` discards
 even those, and the next `open` starts over.
 
-The page half of the protocol is one script, `src/computer/platform/mobile/web/page.js`,
+The page half of the protocol is one script, `src/computer/platform/android/web/page.js`,
 carried in the Rust binary and sent with `open`; the Kotlin side re-injects it
 after every page load, since a navigation replaces the document and with it every
 function the previous one had.

@@ -21,7 +21,8 @@ Platform capability sets for Syscity — organizes platform-specific tools by en
 | Linux Desktop (X11) | `platform/x11/` | X11 desktop tools |
 | macOS | `platform/macos/` | macOS-specific desktop automation |
 | Windows | `platform/windows/` | Windows-specific desktop automation |
-| Mobile | `platform/mobile/` | On-device (Android/iOS) platform tools |
+| Android | `platform/android/` | Android devices over ADB |
+| iOS | `platform/ios/` | iOS devices over libimobiledevice |
 
 ## Key Types
 

@@ -26,7 +26,7 @@ import org.json.JSONObject
  * services. The unbundled variants download a model through GMS on first use
  * and are the wrong choice here.
  *
- * The wire contract with `src/computer/platform/mobile/android.rs`:
+ * The wire contract with `src/computer/platform/android/ocr.rs`:
  *
  * ```
  * in:  { "pngBase64": "<base64 of a PNG>" }

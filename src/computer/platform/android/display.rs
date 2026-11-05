@@ -176,7 +176,7 @@ impl VirtualDisplay {
                 format!("the frame at {path} could not be read ({e})"),
             )
         })?;
-        let (width, height) = super::android::png_dimensions(&png).unwrap_or((0, 0));
+        let (width, height) = super::png_dimensions(&png).unwrap_or((0, 0));
         Ok(DisplayFrame { png, width, height })
     }
 
@@ -947,16 +947,18 @@ pub async fn ensure_helper(
     // argv[0] because `adb_args` returns only the arguments — `run_cmd`
     // prepends the program name, but this builds the request by hand.
     let mut argv: Vec<String> = vec!["adb".into()];
-    argv.extend(super::android::adb_args(&device, &["shell", &command]));
+    argv.extend(super::adb_args(&device, &["shell", &command]));
     let request = crate::tools::process_runner::ProcessRequest::argv(
         &argv.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    let (status, _, stderr) = super::run_cmd_with(&request).await.map_err(|e| {
-        DisplayError::new(
-            DISPLAY_UNAVAILABLE,
-            format!("could not reach adb to start the display helper ({e})"),
-        )
-    })?;
+    let (status, _, stderr) = super::super::common::run_cmd_with(&request)
+        .await
+        .map_err(|e| {
+            DisplayError::new(
+                DISPLAY_UNAVAILABLE,
+                format!("could not reach adb to start the display helper ({e})"),
+            )
+        })?;
     if !status.success() {
         return Err(DisplayError::new(
             DISPLAY_UNAVAILABLE,
@@ -985,8 +987,7 @@ pub async fn ensure_helper(
 /// shell since Android 9, and this runs *as* the shell — the obvious call
 /// answers "Permission denied".
 async fn app_uid(device: &Option<String>, package: &str) -> Result<u32, DisplayError> {
-    let args =
-        super::android::adb_args(device, &["shell", "pm", "list", "packages", "-U", package]);
+    let args = super::adb_args(device, &["shell", "pm", "list", "packages", "-U", package]);
     let (status, stdout, stderr) =
         super::run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
             .await
@@ -1081,7 +1082,7 @@ fn preferred_serial(devices: &[Value]) -> Option<String> {
 
 /// The installed APK path for `package`, from `pm path`.
 async fn apk_path(device: &Option<String>, package: &str) -> Result<String, DisplayError> {
-    let args = super::android::adb_args(device, &["shell", "pm", "path", package]);
+    let args = super::adb_args(device, &["shell", "pm", "path", package]);
     let (status, stdout, stderr) =
         super::run_cmd("adb", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
             .await

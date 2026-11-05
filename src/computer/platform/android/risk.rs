@@ -27,7 +27,7 @@
 //! tap is classified from the element whose bounds contain it — the same thing
 //! the user sees under their finger.
 
-use super::android::UiElement;
+use super::UiElement;
 
 /// What kind of action is about to happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,7 +520,7 @@ fn classify_element(element: &UiElement) -> Option<Offer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::platform::mobile::android::NodeState;
+    use crate::computer::platform::android::NodeState;
 
     fn element(text: &str, bounds: (i32, i32, i32, i32)) -> UiElement {
         UiElement::new(

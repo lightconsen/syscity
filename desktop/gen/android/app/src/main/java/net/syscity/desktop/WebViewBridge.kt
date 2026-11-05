@@ -36,7 +36,7 @@ import org.json.JSONTokener
  * the page is the path that works in both, and it is the fallback the plan
  * names for exactly this reason.
  *
- * # The wire contract with `src/computer/platform/mobile/web/mod.rs`
+ * # The wire contract with `src/computer/platform/android/web/mod.rs`
  *
  * ```
  * in:  { "op": "open", "url": "https://…", "shim": "<page.js source>" }

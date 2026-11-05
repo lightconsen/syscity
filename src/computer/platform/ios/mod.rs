@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{has_idevice, run_cmd};
+use super::common::{has_command, run_cmd};
 use crate::computer::platform::screen;
 use crate::computer::platform::{OsControlScope, PlatformConstraints, PlatformToolSet};
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
@@ -63,7 +63,7 @@ impl PlatformToolSet for IosToolset {
     }
 
     fn is_available(&self) -> bool {
-        has_idevice()
+        has_command("idevice_id")
     }
 
     /// None of the three shared judgments yet — and saying so is the point.

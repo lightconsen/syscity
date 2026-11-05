@@ -200,7 +200,7 @@ pub fn classify(facts: &Facts) -> Diagnosis {
             needs_human: true,
             takeover_reason: Some("unlock".to_string()),
             cause: Some("the phone is locked or asleep".to_string()),
-            hint: crate::computer::platform::mobile::ready::PHONE_LOCKED_HINT.to_string(),
+            hint: crate::computer::platform::android::ready::PHONE_LOCKED_HINT.to_string(),
         };
     }
 
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(verdict.state, ScreenState::NeedsHuman);
         assert_eq!(verdict.takeover_reason.as_deref(), Some("unlock"));
         // The hint is the readiness refusal, not a second wording of it.
-        assert_eq!(verdict.hint, crate::computer::platform::mobile::ready::PHONE_LOCKED_HINT);
+        assert_eq!(verdict.hint, crate::computer::platform::android::ready::PHONE_LOCKED_HINT);
     }
 
     #[test]

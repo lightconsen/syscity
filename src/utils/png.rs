@@ -1,7 +1,7 @@
 //! PNG header parsing.
 //!
 //! Three private readers of the same chunk already exist — `office/docx.rs`,
-//! `computer/platform/mobile/android.rs`, and an inline one in
+//! `computer/platform/android/tree.rs`, and an inline one in
 //! `computer/platform/macos/screenshot.rs`. They are deliberately left alone:
 //! their contracts differ, so folding them together is a decision about which
 //! one wins rather than a move. The macOS reader also accepts JPEG and never

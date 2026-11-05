@@ -63,7 +63,7 @@ pub const CMD_REQUEST_PERMISSION: &str = "requestPermission";
 // The bundled adb client runs inside the Rust process via the platform
 // process_runner (AndroidShellRunner resolves <nativeLibDir>/adb), shared by
 // the `device_adb_pair`/`device_adb_status` agent tools and the `device.adb.*`
-// WS handlers (src/computer/platform/mobile/mod.rs). The Kotlin plugin never
+// WS handlers (src/computer/platform/android/adb.rs). The Kotlin plugin never
 // execs adb.
 /// Sync the cron schedule into WorkManager for background wake (4.3).
 pub const CMD_CRON_SYNC: &str = "syncCronSchedule";
@@ -128,14 +128,14 @@ pub const CMD_OCR: &str = "ocr";
 pub const CMD_A11Y_SETTINGS: &str = "openAccessibilitySettings";
 
 /// Forward one op to the virtual-display helper (see
-/// [`crate::computer::platform::mobile::display`]).
+/// [`crate::computer::platform::android::display`]).
 ///
 /// The payload is the op itself (`{"op": "create", ...}`) and the answer is the
 /// helper's, so the Kotlin side stays a pass-through and the protocol lives in
 /// one place — the Rust client that validates it.
 pub const CMD_VIRTUAL_DISPLAY: &str = "virtualDisplay";
 
-/// The agent's own browser (see [`crate::computer::platform::mobile::web`]).
+/// The agent's own browser (see [`crate::computer::platform::android::web`]).
 ///
 /// The payload is the op itself (`{"op": "open", "url": …, "shim": …}`) and the
 /// answer is the bridge's, so the on-device side stays a pass-through and the

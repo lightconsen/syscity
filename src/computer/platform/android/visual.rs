@@ -56,10 +56,10 @@ use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::android::{
+use super::wheel::normalize;
+use super::{
     capture_png, dump_ui, element_label, png_dimensions, resolve_device, resolved_serial, Target,
 };
-use super::wheel::normalize;
 use crate::providers::{CompletionRequest, Message};
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
 
@@ -132,7 +132,7 @@ pub enum Quality {
 }
 
 /// A rectangle in device pixels, `(x1, y1, x2, y2)`, the same space as
-/// [`super::android::UiElement::bounds`].
+/// [`super::UiElement::bounds`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BBox {
     pub x1: i32,
@@ -290,7 +290,7 @@ pub fn pick(mut candidates: Vec<Candidate>) -> Finding {
 }
 
 /// Match the search against a tree read.
-pub fn match_elements(elements: &[super::android::UiElement], search: &Search) -> Finding {
+pub fn match_elements(elements: &[super::UiElement], search: &Search) -> Finding {
     let candidates = elements
         .iter()
         .filter_map(|element| {
@@ -313,7 +313,7 @@ pub fn match_elements(elements: &[super::android::UiElement], search: &Search) -
 }
 
 /// Match the search against OCR lines.
-pub fn match_lines(lines: &[super::android::OcrLine], search: &Search) -> Finding {
+pub fn match_lines(lines: &[super::OcrLine], search: &Search) -> Finding {
     let candidates = lines
         .iter()
         .filter_map(|line| {
@@ -475,7 +475,7 @@ async fn ask_vision(
 ///
 /// What this catches is the case that matters: a list scrolled, a dialog
 /// appeared, an app came to the front. Those move whole cells, not a hairline,
-/// and [`crate::computer::platform::mobile::display::SIGNATURE_MIN_CELLS`] is
+/// and [`crate::computer::platform::android::display::SIGNATURE_MIN_CELLS`] is
 /// where "a hairline" stops counting as a change.
 ///
 /// It is derived from the decoded pixels and is stable across encoders, so a
@@ -520,13 +520,12 @@ pub fn screen_print_blocking(png: &[u8]) -> Result<(ScreenPrint, (u32, u32)), St
     // The grid the rest of the toolset computes from a frame. `Pixmap` stores
     // premultiplied RGBA in the same byte order `luma_grid_from_rgba` reads, and
     // a screenshot is fully opaque, so the two grids mean the same thing.
-    let grid =
-        super::android::luma_grid_from_rgba(pixmap.data(), width, height).ok_or_else(|| {
-            format!(
-                "{VISUAL_UNAVAILABLE}: a {width}x{height} screenshot is too small to compare \
+    let grid = super::luma_grid_from_rgba(pixmap.data(), width, height).ok_or_else(|| {
+        format!(
+            "{VISUAL_UNAVAILABLE}: a {width}x{height} screenshot is too small to compare \
                  against a later one"
-            )
-        })?;
+        )
+    })?;
     Ok((
         ScreenPrint {
             cells: grid.cells,
@@ -557,13 +556,12 @@ pub fn annotate_blocking(png: &[u8], bounds: BBox) -> Result<(ScreenPrint, Vec<u
         format!("{VISUAL_UNAVAILABLE}: the screenshot is not a PNG this build can read ({error})")
     })?;
     let (width, height) = (pixmap.width(), pixmap.height());
-    let grid =
-        super::android::luma_grid_from_rgba(pixmap.data(), width, height).ok_or_else(|| {
-            format!(
-                "{VISUAL_UNAVAILABLE}: a {width}x{height} screenshot is too small to compare \
+    let grid = super::luma_grid_from_rgba(pixmap.data(), width, height).ok_or_else(|| {
+        format!(
+            "{VISUAL_UNAVAILABLE}: a {width}x{height} screenshot is too small to compare \
                  against a later one"
-            )
-        })?;
+        )
+    })?;
     if !bounds.inside(width, height) {
         return Err(format!(
             "{VISUAL_UNAVAILABLE}: the box ({}, {})-({}, {}) is not inside the {}x{} screenshot — \
@@ -962,8 +960,8 @@ impl Tool for AdbFindVisuallyTool {
                     "type": "string",
                     "description": "Optional: the exact text the control shows, when you know it. It is what the tree and OCR are matched against; `target` is then only the description. Without it, `target` is used for both."
                 },
-                "display": { "type": "integer", "description": super::android::DISPLAY_PARAM },
-                "device": { "type": "string", "description": super::android::DEVICE_PARAM }
+                "display": { "type": "integer", "description": super::DISPLAY_PARAM },
+                "device": { "type": "string", "description": super::DEVICE_PARAM }
             }),
             vec!["target"],
         )
@@ -996,7 +994,7 @@ impl Tool for AdbFindVisuallyTool {
         // this tool that can take seconds — and a search that names an icon is
         // precisely the one a vision call is in the middle of when another
         // writer would otherwise press it.
-        let _target = super::android::lock_target(&device, target).await;
+        let _target = super::lock_target(&device, target).await;
 
         // The first capture brackets the search with the second one below.
         let mut before = match capture_png(&device, target).await {
@@ -1016,16 +1014,11 @@ impl Tool for AdbFindVisuallyTool {
         // alone does not stop a write to the *same app* on another display, and
         // the two captures below would then bracket somebody else's edit and
         // report the screen as moved without saying why.
-        let held = super::android::app_completed(
-            &device,
-            dump.as_ref().and_then(|dump| dump.package.as_deref()),
-        );
-        let lease = super::android::lease_app(
-            &device,
-            dump.as_ref().and_then(|dump| dump.package.as_deref()),
-            held,
-        )
-        .await;
+        let held =
+            super::app_completed(&device, dump.as_ref().and_then(|dump| dump.package.as_deref()));
+        let lease =
+            super::lease_app(&device, dump.as_ref().and_then(|dump| dump.package.as_deref()), held)
+                .await;
         if lease.stale {
             // Somebody wrote to this app while this call was waiting. The tree
             // and the picture in hand both describe a moment before that write,
@@ -1077,7 +1070,7 @@ impl Tool for AdbFindVisuallyTool {
             Finding::Ambiguous(candidates) => {
                 Err(Refused::ambiguous("the accessibility tree", &candidates, &search))
             }
-            Finding::None => match super::android::ocr_png(&before).await {
+            Finding::None => match super::ocr_png(&before).await {
                 Ok(lines) => {
                     attempts.ocr_lines = Some(lines.len());
                     match match_lines(&lines, &search) {
@@ -1287,7 +1280,7 @@ impl Tool for AdbFindVisuallyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::platform::mobile::android::{OcrLine, UiElement};
+    use crate::computer::platform::android::{OcrLine, UiElement};
 
     fn element(label: &str, clickable: bool, bounds: (i32, i32, i32, i32)) -> UiElement {
         UiElement::new(

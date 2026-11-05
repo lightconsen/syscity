@@ -531,7 +531,7 @@ pub struct ComputerConfig {
 ///
 /// The rule the phone follows is: a tap that sends something to another
 /// person, moves money, places an order or deletes data is classified by its
-/// label (see `computer::platform::mobile::risk`). When a human is reachable
+/// label (see `computer::platform::android::risk`). When a human is reachable
 /// it is asked about; when nobody is there it runs and says in its result what
 /// it judged the tap to be, so the transcript carries the risk even though no
 /// one approved it.

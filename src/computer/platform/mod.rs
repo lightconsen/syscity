@@ -238,10 +238,12 @@ fn is_service_available(name: &str) -> bool {
     }
 }
 
+pub mod android;
+pub mod common;
+pub mod ios;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
-pub mod mobile;
 pub mod registry;
 pub mod screen;
 pub mod server_operator;
@@ -249,10 +251,11 @@ pub mod wayland;
 pub mod windows;
 pub mod x11;
 
+pub use android::AndroidToolset;
+pub use ios::IosToolset;
 pub use linux::LinuxToolset;
 #[cfg(target_os = "macos")]
 pub use macos::MacosToolset;
-pub use mobile::{AndroidToolset, IosToolset};
 pub use registry::PlatformCapabilityRegistry;
 pub use screen::{
     changed_threshold, classify as classify_effect, content_event_matters, place_changed, Effect,

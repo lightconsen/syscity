@@ -350,7 +350,7 @@ mod tests {
     /// the device adb will pick, so it must not pretend to.
     #[tokio::test]
     async fn an_unnamed_device_takes_the_kind_lock() {
-        use crate::computer::platform::mobile::android::device_lock_key;
+        use crate::computer::platform::android::device_lock_key;
         assert_eq!(device_lock_key(&None), ANDROID);
         assert_eq!(
             device_lock_key(&Some("emulator-5554".to_string())),
