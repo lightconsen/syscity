@@ -931,6 +931,30 @@ impl Tool for AdbObserveTool {
             data["fallback"] = note["fallback"].clone();
             summary.push_str(&format!("\n\n{}", reason.describe()));
         }
+
+        // What this phone already knows about the app being read, when the
+        // read supports it. Said after the elements, so the screen the model
+        // is looking at stays the answer and the remembered facts read as a
+        // prior. A read whose package is unknown gets nothing: a hint about
+        // the wrong app is worse than no hint.
+        if let Some(package) = dump.package.as_deref() {
+            let knowledge = super::knowledge::global()
+                .for_screen(package, &dump.elements)
+                .await;
+            if let Some(note) = super::knowledge::describe(&knowledge) {
+                summary.push_str("\n\n");
+                summary.push_str(&note);
+                super::knowledge::global().mark_shown(&knowledge).await;
+                data["knowledge"] = serde_json::json!(knowledge
+                    .iter()
+                    .map(|fact| serde_json::json!({
+                        "kind": format!("{:?}", fact.kind),
+                        "text": fact.text,
+                    }))
+                    .collect::<Vec<_>>());
+            }
+        }
+
         Ok(ToolExecutionResult::success(with_note(summary, note)).with_data(data))
     }
 }
@@ -2464,59 +2488,124 @@ impl AdbAppManagerTool {
         if pkg.trim().is_empty() {
             return Ok(ToolExecutionResult::error("launch needs `package` — the app to start"));
         }
+        let pkg = pkg.trim();
 
-        let component = match args.get("activity").and_then(|v| v.as_str()) {
-            Some(a) if !a.trim().is_empty() => Some(format!("{}/{}", pkg, a.trim())),
-            Some(_) => Some(format!("{}/{}", pkg, ".MainActivity")),
-            None => self.resolve_component(device, pkg).await,
+        // What this phone already learned about the app: the entry that worked
+        // last time, the first screen, the question it asked. It is a prior,
+        // not an instruction — an entry the phone refuses falls through to
+        // resolving, and the fact is marked wrong.
+        let known = super::knowledge::global().recall(pkg).await;
+        let known_entry = known
+            .iter()
+            .find_map(|fact| fact.launch_entry().map(str::to_string));
+
+        // `activity` from the caller still wins: an explicit request is not a
+        // memory to be second-guessed.
+        let explicit = match args.get("activity").and_then(|v| v.as_str()) {
+            Some(a) if !a.trim().is_empty() => Some(format!("{pkg}/{}", a.trim())),
+            Some(_) => Some(format!("{pkg}/.MainActivity")),
+            None => None,
         };
 
-        let Some(component) = component else {
-            return Ok(ToolExecutionResult::error(format!(
-                "launch_no_entry: no launcher activity found for `{pkg}` — it may have none \
-                 (a service, a shortcut-only app), or it may not be installed. \
-                 `android_app_manager action=list_packages` shows what is."
-            ))
-            .with_data(serde_json::json!({
-                "device": resolved_serial(device).await,
-                "reason": "launch_no_entry",
-            })));
-        };
+        // The entry to try first. A remembered entry is tried as-is — the
+        // probe it saves is the whole point — and a refusal by the platform
+        // sends the launch back through a fresh resolve rather than reporting
+        // that the app has no entry.
+        let mut component = explicit.clone().or_else(|| known_entry.clone());
+        let mut from_memory = explicit.is_none() && known_entry.is_some();
+        let mut retried = false;
 
-        let argv = adb_args(device, &["shell", "am", "start", "-W", "-n", &component]);
-        let outcome = super::run_cmd_timeout(
-            "adb",
-            &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            LAUNCH_TIMEOUT,
-        )
-        .await;
+        let (component, verdict, detail, timed_out) = loop {
+            let entry = match component.take() {
+                Some(entry) => entry,
+                None => match self.resolve_component(device, pkg).await {
+                    Some(entry) => {
+                        super::knowledge::global()
+                            .record(
+                                pkg,
+                                super::knowledge::FactKind::LaunchEntry,
+                                &entry,
+                                Vec::new(),
+                            )
+                            .await;
+                        entry
+                    }
+                    None => {
+                        return Ok(ToolExecutionResult::error(format!(
+                            "launch_no_entry: no launcher activity found for `{pkg}` — it may \
+                             have none (a service, a shortcut-only app), or it may not be \
+                             installed. `android_app_manager action=list_packages` shows what is."
+                        ))
+                        .with_data(serde_json::json!({
+                            "device": resolved_serial(device).await,
+                            "reason": "launch_no_entry",
+                        })))
+                    }
+                },
+            };
 
-        let (verdict, detail, timed_out) = match outcome {
-            super::RunOutcome::Finished { status, stdout, stderr } => {
-                let _ = status;
-                let verdict = parse_am_start_output(&stdout, &stderr);
-                let detail = if stderr.trim().is_empty() {
-                    stdout.trim().to_string()
-                } else {
-                    format!("{}\n{}", stdout.trim(), stderr.trim())
-                };
-                (verdict, detail, false)
-            }
-            super::RunOutcome::TimedOut { stdout, stderr } => (
-                LaunchOutcome::Unknown,
-                format!(
-                    "no answer within {} ms (the launch may still complete)\n{}\n{}",
-                    LAUNCH_TIMEOUT.as_millis(),
-                    stdout.trim(),
-                    stderr.trim()
+            let argv = adb_args(device, &["shell", "am", "start", "-W", "-n", &entry]);
+            let outcome = super::run_cmd_timeout(
+                "adb",
+                &argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                LAUNCH_TIMEOUT,
+            )
+            .await;
+
+            let (verdict, detail, timed_out) = match outcome {
+                super::RunOutcome::Finished { status, stdout, stderr } => {
+                    let _ = status;
+                    let verdict = parse_am_start_output(&stdout, &stderr);
+                    let detail = if stderr.trim().is_empty() {
+                        stdout.trim().to_string()
+                    } else {
+                        format!("{}\n{}", stdout.trim(), stderr.trim())
+                    };
+                    (verdict, detail, false)
+                }
+                super::RunOutcome::TimedOut { stdout, stderr } => (
+                    LaunchOutcome::Unknown,
+                    format!(
+                        "no answer within {} ms (the launch may still complete)\n{}\n{}",
+                        LAUNCH_TIMEOUT.as_millis(),
+                        stdout.trim(),
+                        stderr.trim()
+                    ),
+                    true,
                 ),
-                true,
-            ),
-            super::RunOutcome::Failed(why) => {
-                return Ok(ToolExecutionResult::error(format!("could not run `adb`: {why}")))
-            }
-        };
+                super::RunOutcome::Failed(why) => {
+                    return Ok(ToolExecutionResult::error(format!("could not run `adb`: {why}")))
+                }
+            };
 
+            // The platform refused a remembered entry: it is out of date, and
+            // the app is worth one more try from a fresh resolve.
+            if verdict == LaunchOutcome::Failed && from_memory && !retried {
+                retried = true;
+                if let Some(fact) = known
+                    .iter()
+                    .find(|fact| fact.kind == super::knowledge::FactKind::LaunchEntry)
+                {
+                    super::knowledge::global().mark(fact, false).await;
+                }
+                from_memory = false;
+                continue;
+            }
+
+            // A remembered entry that started the app held up.
+            if from_memory
+                && matches!(verdict, LaunchOutcome::Started | LaunchOutcome::AlreadyInFront)
+            {
+                if let Some(fact) = known
+                    .iter()
+                    .find(|fact| fact.kind == super::knowledge::FactKind::LaunchEntry)
+                {
+                    super::knowledge::global().mark(fact, true).await;
+                }
+            }
+
+            break (entry, verdict, detail, timed_out);
+        };
         // "Already in front" is Android declining to restart an app that is
         // already open. The app is on screen, which is all the caller asked for.
         let started = matches!(verdict, LaunchOutcome::Started | LaunchOutcome::AlreadyInFront);
@@ -2528,10 +2617,30 @@ impl AdbAppManagerTool {
         // until the screen says what rose to the top. Read it here rather than
         // reporting "started" and leaving the caller to discover the question
         // on its next observation.
-        let chooser = if started {
-            self.launch_chooser(device).await
+        //
+        // The same read is what the app is learned from, so it is taken once:
+        // a chooser is not the app, and a screen whose own tree names a
+        // different package is not the app either — both leave nothing to
+        // record, and the first screen of the app that was asked for is never
+        // confused with the surface that opened instead.
+        let landing = if started {
+            dump_ui(device, Target::Screen).await.ok()
         } else {
             None
+        };
+        let chooser = match landing.as_ref() {
+            Some(dump) => self.chooser_in(device, dump).await,
+            None => None,
+        };
+
+        // What was learned on the way: the first screen the launch landed on.
+        // The entry itself was written where it was resolved, so only the
+        // screen is left to read. Best-effort: a launch that worked is not
+        // failed by a note that could not be written, and a chooser is not the
+        // app, so nothing is learned from a question.
+        let learned = match landing.as_ref() {
+            Some(dump) if chooser.is_none() => self.learn_first_screen(pkg, dump, &known).await,
+            _ => None,
         };
 
         let sentence = match (&chooser, verdict) {
@@ -2553,6 +2662,16 @@ impl AdbAppManagerTool {
                 format!("`adb` exited without a status for `{pkg}`; observe before acting.")
             }
         };
+        // The remembered first screen, when it is still the one on the phone.
+        let prior = if learned.is_none() {
+            super::knowledge::describe(&known)
+        } else {
+            learned.clone()
+        };
+        let (sentence, prior) = match prior {
+            Some(note) => (format!("{sentence}\n{note}"), Some(note)),
+            None => (sentence, None),
+        };
 
         let status_word = match (&chooser, verdict) {
             (Some(_), _) => "chooser",
@@ -2570,6 +2689,7 @@ impl AdbAppManagerTool {
             "launched": started,
             "timed_out": timed_out,
             "status": status_word,
+            "remembered": prior,
             "chooser": chooser.map(|choices| serde_json::json!({
                 "package": pkg,
                 "options": choices.iter().map(|choice| serde_json::json!({
@@ -2587,22 +2707,92 @@ impl AdbAppManagerTool {
         })
     }
 
+    /// What this phone remembers about the apps, and a way to forget one.
+    ///
+    /// Knowledge is written by the tools that learn it, so the only thing a
+    /// caller needs is to see it — and to drop it when it is wrong in a way no
+    /// screen will correct (an app the person uninstalled, a fact recorded on a
+    /// device they no longer use).
+    async fn app_knowledge(&self, args: &Value) -> crate::Result<ToolExecutionResult> {
+        let package = args
+            .get("package")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if args
+            .get("forget")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let Some(package) = package else {
+                return Ok(ToolExecutionResult::error(
+                    "forget needs `package` — say which app's knowledge to drop",
+                ));
+            };
+            let removed = super::knowledge::global().forget(package).await;
+            return Ok(ToolExecutionResult::success(if removed == 0 {
+                format!("Nothing was remembered about `{package}`, so nothing was dropped.")
+            } else {
+                format!("Dropped {removed} fact(s) remembered about `{package}`.")
+            })
+            .with_data(serde_json::json!({ "package": package, "forgotten": removed })));
+        }
+
+        let facts = match package {
+            Some(package) => super::knowledge::global().recall(package).await,
+            None => super::knowledge::global()
+                .facts()
+                .await
+                .into_iter()
+                .map(|fact| super::knowledge::FactRecall {
+                    package: fact.package,
+                    kind: fact.kind,
+                    text: fact.text,
+                    labels: fact.labels,
+                })
+                .collect(),
+        };
+
+        if facts.is_empty() {
+            let scope = package
+                .map(|package| format!("about `{package}`"))
+                .unwrap_or_else(|| "about any app".to_string());
+            return Ok(ToolExecutionResult::success(format!(
+                "Nothing is remembered {scope} yet. Knowledge is written when an app is launched: \
+                 the entry that worked, the first screen it offered, and any question it asked."
+            )));
+        }
+
+        let mut lines = vec![format!("{} remembered fact(s):", facts.len())];
+        for fact in &facts {
+            lines.push(format!("  · {} — {}: {}", fact.package, fact.kind.as_str(), fact.text));
+        }
+        Ok(ToolExecutionResult::success(lines.join("\n")).with_data(serde_json::json!({
+            "count": facts.len(),
+            "facts": facts.iter().map(|fact| serde_json::json!({
+                "package": fact.package,
+                "kind": format!("{:?}", fact.kind),
+                "text": fact.text,
+                "labels": fact.labels,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
     /// Whether what came to the front after a launch is the system asking
     /// which copy of an app to open, and what the options are.
     ///
-    /// Best-effort in both directions. The tree may be unreadable (a phone
-    /// whose accessibility service is off, a screen the platform hides); the
-    /// user list may be unreadable (no shell). Neither is a launch failure, and
+    /// Best-effort in both directions. The tree has already been read by the
+    /// caller, which is why it is passed in rather than taken again; the user
+    /// list may be unreadable (no shell). Neither is a launch failure, and
     /// neither is a reason to guess: the answer is `None` and the launch is
     /// reported as the `am start` verdict said.
-    async fn launch_chooser(
+    async fn chooser_in(
         &self,
         device: &Option<String>,
+        dump: &UiDump,
     ) -> Option<Vec<super::profiles::Choice>> {
         let users = super::profiles::users(device).await?;
-        // `am start` without `--display` puts the launch on whichever screen
-        // the person is using, so that is the tree the question is in.
-        let dump = dump_ui(device, Target::Screen).await.ok()?;
         let current = super::profiles::current_user(device)
             .await
             .unwrap_or(super::profiles::OWNER);
@@ -2611,6 +2801,73 @@ impl AdbAppManagerTool {
             .filter(|user| user.id != current)
             .collect();
         super::profiles::chooser_options(&dump.elements, &others)
+    }
+
+    /// Read the screen a launch landed on, and remember what it offers.
+    ///
+    /// Two facts come out of one read, and only when the read is honest about
+    /// which app it is looking at: the screen's own tree names its package, so
+    /// a launch that landed somewhere else (a chooser, a redirect into a
+    /// browser) is not attributed to the app that was asked for.
+    ///
+    /// What was already known is marked here rather than in a separate pass:
+    /// this is the one moment a remembered first screen can be compared with
+    /// the real one, so a fact that no longer describes the app loses standing
+    /// exactly where it was tested.
+    ///
+    /// Returns the note to append to the launch's answer, when a remembered
+    /// fact was confirmed or contradicted. `None` on a first launch, or when
+    /// nothing could be read.
+    async fn learn_first_screen(
+        &self,
+        pkg: &str,
+        dump: &UiDump,
+        known: &[super::knowledge::FactRecall],
+    ) -> Option<String> {
+        // The tree says which app it belongs to. A read that cannot say, or
+        // says something else, is not this app's first screen — a redirect
+        // into a browser or a launcher would otherwise teach us that the app's
+        // first screen is somebody else's.
+        if dump.package.as_deref() != Some(pkg) {
+            return None;
+        }
+
+        let labels = super::knowledge::home_facts(&dump.elements);
+        if labels.is_empty() {
+            return None;
+        }
+
+        let mut note = None;
+        if let Some(fact) = known
+            .iter()
+            .find(|fact| fact.kind == super::knowledge::FactKind::Home)
+        {
+            let held = super::knowledge::home_matches(&fact.labels, &dump.elements);
+            super::knowledge::global().mark(fact, held).await;
+            if !held && !fact.labels.is_empty() {
+                note = Some(format!(
+                    "The first screen does not match what was remembered about `{pkg}` (it used \
+                     to offer {}), so that recollection no longer holds.",
+                    fact.labels.join(", ")
+                ));
+            }
+        }
+
+        let text = labels.join(", ");
+        super::knowledge::global()
+            .record(pkg, super::knowledge::FactKind::Home, &format!("offers {text}"), labels)
+            .await;
+
+        // A dialog on the first screen is the question the app asks before it
+        // is usable; remembering it lets the next launch expect it instead of
+        // being surprised by it.
+        if let Some(dialog) = super::knowledge::first_dialog(&dump.elements) {
+            super::knowledge::global()
+                .record(pkg, super::knowledge::FactKind::Dialog, &dialog, Vec::new())
+                .await;
+        }
+
+        note
     }
 
     /// List the apps installed here, and which of them are also installed in
@@ -2777,7 +3034,9 @@ impl Tool for AdbAppManagerTool {
         "Install, launch, force-stop, or list apps on an Android device. 'completed' means the \
          adb command was dispatched, not that the app started — observe afterwards to see. \
          `list_packages` marks an app also installed in another profile (`also_in`); `launch` of \
-         such an app can raise the system's \"which copy?\" question, reported as `chooser`."
+         such an app can raise the system's \"which copy?\" question, reported as `chooser`. \
+         `launch` remembers the entry that worked and the first screen it landed on, and later \
+         launches start from that memory; `knowledge` shows what is remembered, per app."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -2786,12 +3045,16 @@ impl Tool for AdbAppManagerTool {
             serde_json::json!({
                 "action": {
                     "type": "string",
-                    "description": "install | launch | force_stop | list_packages",
-                    "enum": ["install", "launch", "force_stop", "list_packages"]
+                    "description": "install | launch | force_stop | list_packages | knowledge",
+                    "enum": ["install", "launch", "force_stop", "list_packages", "knowledge"]
                 },
                 "package": { "type": "string", "description": "Package name (e.g. com.example.app)" },
                 "activity": { "type": "string", "description": "Activity class (launch)" },
                 "apk_path": { "type": "string", "description": "Local path to APK (install)" },
+                "forget": {
+                    "type": "boolean",
+                    "description": "With action=knowledge and a package: drop everything remembered about it."
+                },
                 "device": { "type": "string", "description": DEVICE_PARAM }
             }),
             vec!["action"],
@@ -2820,6 +3083,9 @@ impl Tool for AdbAppManagerTool {
         }
         if action == "list_packages" {
             return self.list_packages(&device).await;
+        }
+        if action == "knowledge" {
+            return self.app_knowledge(&args).await;
         }
 
         let argv = match action {

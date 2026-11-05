@@ -18,6 +18,7 @@ pub mod display;
 pub mod gate;
 pub mod guard;
 pub mod ios;
+pub mod knowledge;
 pub mod pacing;
 pub mod profiles;
 pub mod query;

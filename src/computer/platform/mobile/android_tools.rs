@@ -771,7 +771,7 @@ impl AdbDialogTool {
 }
 
 /// Classes that mean "this node is (part of) a dialog".
-fn is_dialog_class(class: &str) -> bool {
+pub(super) fn is_dialog_class(class: &str) -> bool {
     let lowered = class.to_ascii_lowercase();
     lowered.contains("dialog") || lowered.contains("popupwindow") || lowered.contains("alert")
 }

@@ -249,6 +249,52 @@ execution, and a model that remembers a name from an earlier turn should not
 have to rediscover it. Opening a group is a fact about this host rather than
 about one conversation — the phone is one device.
 
+### What the phone already knows about an app
+
+A launch spends two probes finding the entry point — `cmd package
+resolve-activity`, then `monkey` when that fails — and every task then spends a
+turn re-reading a first screen somebody already read. Both are facts about the
+app that do not change between runs, so the tools write them down
+(`computer::platform::mobile::knowledge`) and read them back the next time that
+package comes up.
+
+Three kinds of fact are recorded, all from work the tools were doing anyway:
+
+| Fact | Written when | Used for |
+|---|---|---|
+| `launch_entry` | a launch resolved a component, or a remembered one started the app | starting the app without the two probes |
+| `home` | a launch landed on a screen whose own tree named the package | saying what the first screen offers, and noticing when it changed |
+| `dialog` | that first screen held a dialog with text | expecting the question instead of being surprised by it |
+
+A remembered entry is tried first and costs nothing when it works. When the
+platform refuses it, the launch is **retried once** from a fresh resolve rather
+than reported as an app with no entry, and the remembered fact is marked wrong.
+That is the shape of every fact here: a prior that shortens the path, never an
+authority that overrides the phone.
+
+Recall is by context, not by injection. Nothing is added to the system prompt
+ahead of time; `android_app_manager launch` carries what it knows about that
+app, and `android_observe` carries the first-screen and dialog facts only when
+this read **matches** them — half of a remembered first screen's names still
+being on screen, or the remembered dialog actually being on it. Knowledge that
+does not match is not evidence of anything, and offering it would tell the model
+it is looking at a screen it is not. A note that was just said is held quiet for
+fifteen minutes, so six observations in a row carry one sentence, not six.
+
+What keeps these facts honest is the feedback, not an author. Each one carries
+the same hit/miss counters the memory system uses
+(`memory::effectiveness`): a fact the screen contradicts is marked wrong, and
+after three contradictions with a low hit rate it is dropped. `home` is the
+exception to accumulation — one app has one first screen, so a new description
+replaces the old one instead of competing with it. `android_app_manager
+action=knowledge` shows what is remembered (optionally for one `package`) and
+`{"forget": true}` drops it.
+
+The store lives at `memory/app_knowledge.json` — written through a temporary
+file and a rename, read once per process, and treated as a cache on every
+failure path: an unreadable or corrupt file is a miss, not an error, because
+every fact in it can be relearned by launching the app.
+
 ### What an action is about to do
 
 A wrong screen is recoverable. The right screen with the wrong button under the
