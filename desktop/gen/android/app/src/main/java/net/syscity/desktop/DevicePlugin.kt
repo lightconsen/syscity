@@ -95,6 +95,15 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   /** In-flight camera capture target, resolved by the activity-result callback. */
   private var pendingCameraFile: File? = null
 
+  /**
+   * The agent's own browser, created on the first `webView` call.
+   *
+   * Lazily, and on the main thread: constructing a `WebView` outside the
+   * main thread is a crash on some API levels, and an agent that never opens
+   * a page should not pay for a browser engine at start-up.
+   */
+  private val webViewBridge by lazy { WebViewBridge(appActivity) }
+
   companion object {
     private const val CHANNEL_NOTIFY = "agent_notify"
   }
@@ -643,9 +652,43 @@ class DevicePlugin(activity: Activity) : Plugin(activity) {
   }
 
   // ─────────────────────────────────────────────
-  // Virtual display (shell helper, second screen)
+  // The agent's browser
   // ─────────────────────────────────────────────
 
+  /**
+   * `webView` — open and drive a page in a WebView this process owns.
+   *
+   * The accessibility tree of a WebView sees the native view, not the page, so
+   * a JavaScript-drawn login form has no nodes to read or tap. This command
+   * hands the page itself: `open`, `read`, `click`, `type`, `script`, plus
+   * `back`/`forward`/`reload`/`close`/`status`. Protocol and tests live in
+   * `src/computer/platform/mobile/web/mod.rs`; this is the on-device half.
+   *
+   * The `shim` is `page.js` from the Rust binary, sent with `open` and
+   * re-injected by the bridge after every navigation — one copy of it, in the
+   * crate that owns the protocol.
+   */
+  @Command
+  fun webView(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val op = args.optString("op")
+    // Straight to the main thread: the bridge creates the WebView there, and
+    // every callback it waits on arrives there too. Nothing here blocks, so a
+    // worker hop would only add a queue a second caller could overtake.
+    mainHandler.post {
+      try {
+        webViewBridge.handle(op, args) { answer -> invoke.resolve(answer) }
+      } catch (t: Throwable) {
+        // A create or a load that threw must still answer: an unresolved
+        // invoke holds the Rust caller until its own timeout.
+        invoke.reject("the browser call failed: ${t.message}", "NO_WEBVIEW")
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // Virtual display (shell helper, second screen)
+  // ─────────────────────────────────────────────
   /**
    * Say that a write was refused because a person is using the display.
    *

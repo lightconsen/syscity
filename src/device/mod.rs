@@ -135,6 +135,13 @@ pub const CMD_A11Y_SETTINGS: &str = "openAccessibilitySettings";
 /// one place — the Rust client that validates it.
 pub const CMD_VIRTUAL_DISPLAY: &str = "virtualDisplay";
 
+/// The agent's own browser (see [`crate::computer::platform::mobile::web`]).
+///
+/// The payload is the op itself (`{"op": "open", "url": …, "shim": …}`) and the
+/// answer is the bridge's, so the on-device side stays a pass-through and the
+/// protocol, the retries and the wording live in the Rust client.
+pub const CMD_WEB_VIEW: &str = "webView";
+
 /// The bridge, for code that cannot be handed one.
 ///
 /// The Android toolset reads the accessibility tree from deep inside its read

@@ -105,6 +105,10 @@ impl PlatformToolSet for AndroidToolset {
             // Why this screen looks the way it does: a blank, a spinner, a
             // protected window, or a person the agent must hand it to.
             Box::new(super::android_tools::AdbDiagnoseTool::new()),
+            // The phone's own browser: a page that draws itself in JavaScript
+            // has no nodes for the accessibility tree, so it is read and
+            // pressed through the DOM instead.
+            Box::new(super::web::AdbWebTool::new()),
             // The second screen: the user keeps the phone while a task runs,
             // and a step they have to do themselves goes back to them.
             Box::new(super::android_tools::AdbDisplayTool::new()),
@@ -7057,6 +7061,18 @@ mod tests {
             .map(|t| t.name().to_string())
             .collect();
         assert!(names.contains(&"android_observe".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn test_android_toolset_exposes_the_web_tool() {
+        // The phone's browser is one more member of the set, so it is offered
+        // by the same profile switch as the rest of the screen tools.
+        let names: Vec<String> = AndroidToolset::new()
+            .tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(names.contains(&"android_web".to_string()), "{names:?}");
     }
 
     // ── Device targeting ────────────────────────────────────────────────

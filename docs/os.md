@@ -176,6 +176,7 @@ hand:
 | `android_dialog` | describing a dialog: reads its text and buttons, and presses one only if exactly one button matches |
 | `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
 | `android_ocr` | the screenshot reader, for screens whose accessibility tree describes nothing |
+| `android_web` | a page drawn in JavaScript: opens it in the phone's own WebView and reads and presses its DOM, which no accessibility node describes |
 
 `android_run` delegates every step to `android_input` / `android_app_manager`,
 so the risk check, approval gate, repetition ladder and app lease still see each
@@ -431,6 +432,52 @@ The result says which one it used (`source`), because a read that disagrees with
 what you expected should be traceable to where it came from. The same
 in-process path reads a virtual display: pass `display: <id>` to any of the
 screen tools and the service selects that display's windows instead.
+
+### A page drawn in JavaScript (`android_web`)
+
+A WebView node in the accessibility tree says "WebView" and nothing else: the
+page's text lives in the page, not in a native view. So a login form rendered by
+JavaScript is invisible to `android_ui_tree`, `android_query`, the extractor and
+OCR alike — they all read the same empty node. `android_web` opens the page in a
+WebView Syscity owns and asks the page itself:
+
+```text
+android_web action=open url=https://example.com/login  → page (title, text, controls)
+android_web action=read
+android_web action=type  index=1 value=alice
+android_web action=type  index=2 value=…
+android_web action=click index=3
+android_web action=script script="document.querySelector('#err').textContent"
+```
+
+A read numbers the controls it found (`1..n`) and a click or type addresses that
+numbering, so the stale-`ref` rule is the same one the accessibility path has: a
+navigation or a re-render makes the numbers mean something else, and an index
+that is no longer in the fresh read is refused rather than pressed. A press is
+still a press — the label is classified, asking a human when one is reachable,
+and counted by the repetition ladder — and `open` walks the same SSRF guard as
+`web_fetch`.
+
+The browser is the agent's, with its own cookies: it has no session from the
+user's browser, so a site that needs a login starts logged out. `close` discards
+even those, and the next `open` starts over.
+
+The page half of the protocol is one script, `src/computer/platform/mobile/web/page.js`,
+carried in the Rust binary and sent with `open`; the Kotlin side re-injects it
+after every page load, since a navigation replaces the document and with it every
+function the previous one had.
+
+**Why not CDP.** The desktop browser stack is `chromiumoxide` behind the
+`browser` feature, which the `mobile` profile leaves off — turning it on adds
+twenty crates — and CDP reaches a WebView only when the app is debuggable
+(`setWebContentsDebuggingEnabled`, then a `localabstract:webview_devtools_remote_<pid>`
+forward). Release APKs, the build that runs unattended, have no CDP endpoint at
+all. Evaluating a small script in the page works in every build and needs no new
+dependency.
+
+The tool only exists inside the phone app, because only that process can create a
+`WebView` cheaply. A desktop driving a remote phone is told so and pointed back at
+the accessibility tree.
 
 ### A second screen (`android_display`)
 

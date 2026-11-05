@@ -24,6 +24,7 @@ pub mod query;
 pub mod ready;
 pub mod risk;
 pub mod takeover;
+pub mod web;
 pub mod wheel;
 pub mod wheel_typing;
 
@@ -34,6 +35,7 @@ pub use android_tools::{
     AdbSystemActionTool, AdbWaitTool,
 };
 pub use ios::IosToolset;
+pub use web::AdbWebTool;
 
 /// Check whether a command is available on PATH.
 fn has_command(cmd: &str) -> bool {
