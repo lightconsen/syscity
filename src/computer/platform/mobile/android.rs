@@ -150,6 +150,17 @@ impl PlatformToolSet for AndroidToolset {
     fn tool_groups(&self) -> &'static [crate::computer::platform::ToolGroupSpec] {
         TIER_GROUPS
     }
+
+    /// Android makes all three of the shared judgments.
+    ///
+    /// Every action is followed by a settle that classifies the effect, a write
+    /// is read back from the field, and the accessibility service reports
+    /// events a wait can be ended by. The words and the rules are the common
+    /// ones in [`crate::computer::platform::screen`]; what this declaration
+    /// adds is the statement that they are answers here, not fallbacks.
+    fn screen_semantics(&self) -> crate::computer::platform::screen::ScreenSemantics {
+        crate::computer::platform::screen::ScreenSemantics::ALL
+    }
 }
 
 /// The optional groups, by what a turn is trying to do.
@@ -612,12 +623,17 @@ fn subject_for(
 
 /// One change to the screen, as the post-action check saw it.
 ///
-/// `effect` is [`EFFECT_CHANGED`], [`EFFECT_UNCHANGED`] or [`EFFECT_UNKNOWN`],
-/// as the post-action check reported it.
+/// The effect vocabulary is the shared one in
+/// [`crate::computer::platform::screen`]; this maps it onto the ladder's
+/// coarser three. A word the shared layer does not know is not a verdict, so it
+/// counts as [`crate::computer::platform::screen::Effect::Unknown`] rather than
+/// as progress.
 pub(super) fn guard_outcome(effect: &str) -> super::guard::Outcome {
-    match effect {
-        EFFECT_CHANGED => super::guard::Outcome::Changed,
-        EFFECT_UNCHANGED => super::guard::Outcome::Unchanged,
+    match crate::computer::platform::screen::Effect::parse(effect) {
+        Some(crate::computer::platform::screen::Effect::Changed) => super::guard::Outcome::Changed,
+        Some(crate::computer::platform::screen::Effect::Unchanged) => {
+            super::guard::Outcome::Unchanged
+        }
         _ => super::guard::Outcome::Unknown,
     }
 }
@@ -2276,7 +2292,7 @@ impl Tool for AdbInputTool {
             // What answered first: `events` (a content event, then quiet) or
             // `tree` (the poll). The model does not need it to act, but it is
             // how "the stream is working on this phone" is visible at all.
-            "first_signal": settle.first_signal,
+            "first_signal": settle.first_signal.map(|signal| signal.as_str()),
             "spill": spills.first().map(|s| serde_json::json!({
                 "task": s.task_id,
                 "package": s.package,
@@ -4193,9 +4209,9 @@ async fn read_back_write(
     let reacted = screen_echoed(before, &after.elements, text);
     let verdict = readback_verdict(text, &actual, baseline.as_deref(), reacted);
     Readback {
-        verdict,
+        verdict: verdict.as_str(),
         actual: Some(actual),
-        note: (verdict == READBACK_UNKNOWN).then(|| {
+        note: (verdict == ReadbackVerdict::Unknown).then(|| {
             "the field still reads what it did before the write, but the screen shows the typed \
              text, so the app received it and this field cannot confirm where it landed"
                 .to_string()
@@ -4446,6 +4462,17 @@ pub fn tree_fingerprint(elements: &[UiElement]) -> u64 {
 }
 
 // ── Write readback ─────────────────────────────────────────────────────────
+//
+// The verdicts and the rules that produce them are the shared ones in
+// [`crate::computer::platform::screen`]: an iOS set driving WebDriverAgent has
+// the same write-and-verify problem and should reach the same answer. What is
+// Android's is the *locating* — finding the field that was written to in an
+// accessibility tree — and that stays below.
+
+pub use crate::computer::platform::screen::{
+    readback_matches, readback_verdict, ReadbackVerdict, READBACK_MATCH, READBACK_MISMATCH,
+    READBACK_UNKNOWN,
+};
 
 /// The field read back after `this` much silence, or `None` to skip the check.
 ///
@@ -4454,17 +4481,10 @@ pub fn tree_fingerprint(elements: &[UiElement]) -> u64 {
 /// and expects to read back.
 const READBACK_DELAY_MS: u64 = 250;
 
-/// The text the screen actually holds matches what was typed.
-pub const READBACK_MATCH: &str = "match";
-/// It holds something else.
-pub const READBACK_MISMATCH: &str = "mismatch";
-/// The field could not be read back — no field was found, it is a password
-/// box, or the tree could not be read at all.
-pub const READBACK_UNKNOWN: &str = "unknown";
-
 /// One field's answer after a write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Readback {
+    /// One of the `READBACK_*` words.
     pub verdict: &'static str,
     /// What the field holds now, when it could be read.
     pub actual: Option<String>,
@@ -4480,17 +4500,6 @@ impl Readback {
             note: Some(note.into()),
         }
     }
-}
-
-/// Compare what was typed with what the field holds.
-///
-/// Whitespace is stripped on both sides: an auto-formatted phone number inserts
-/// spaces as it goes, and that is the field formatting, not the text being
-/// wrong. Case and punctuation are compared exactly — "Hello" and "hello" are
-/// two different messages, and the field is where the difference matters.
-pub fn readback_matches(written: &str, read: &str) -> bool {
-    let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    norm(written) == norm(read)
 }
 
 /// The field a write should be read back from, given the tree *before* the
@@ -4528,30 +4537,6 @@ pub fn locate_for_readback(before: &[UiElement], point: (i32, i32)) -> Option<&U
         })
 }
 
-/// Decide the verdict from what was written, what the field reads now, and
-/// what it read before the write.
-///
-/// A field that answers the same thing it did before is normally a mismatch —
-/// the write did not take. It is `unknown` instead when the screen meanwhile
-/// showed text containing what was typed (an autocomplete suggestion, a
-/// counter, the text echoed in a preview): the app clearly received the input,
-/// and this field just cannot confirm the content. Claiming a mismatch there
-/// would send a caller round a loop of retries that write the text twice.
-pub fn readback_verdict(
-    written: &str,
-    actual: &str,
-    baseline: Option<&str>,
-    reacted: bool,
-) -> &'static str {
-    if readback_matches(written, actual) {
-        return READBACK_MATCH;
-    }
-    if baseline.is_some_and(|base| base == actual) && reacted {
-        return READBACK_UNKNOWN;
-    }
-    READBACK_MISMATCH
-}
-
 /// Whether the screen after the write shows text derived from what was typed.
 ///
 /// The evidence that an unreadable field nevertheless received the input: the
@@ -4576,69 +4561,23 @@ fn screen_echoed(before: &[UiElement], after: &[UiElement], written: &str) -> bo
 }
 
 // ── Action effect ──────────────────────────────────────────────────────────
+//
+// The five effect words and the rules that produce them live in
+// [`crate::computer::platform::screen`], because none of them are Android's:
+// an iOS set driving WebDriverAgent asks the same questions and should get
+// the same answers. What is Android's is the *evidence* — the tree fingerprint,
+// the element identity, the screenshots — and that stays here.
 
-/// The screen was different after the action.
-pub const EFFECT_CHANGED: &str = "changed";
-/// The screen was the same after the action.
-pub const EFFECT_UNCHANGED: &str = "unchanged";
-/// The effect could not be judged — the tree could not be read.
-pub const EFFECT_UNKNOWN: &str = "unknown";
-/// Something moved, but the app stayed and the screen's structure did not
-/// change — a tick, a highlight, a toast, a spinner.
-///
-/// Worth its own word: `unchanged` tells a caller the action missed, and
-/// `changed` tells it the screen went somewhere. A tap that ticked a checkbox
-/// is neither, and folding it into `changed` was hiding the degree.
-pub const EFFECT_SMALL_CHANGE: &str = "small_change";
-/// The action moved the task to a different app or a different place.
-///
-/// Only knowable when the foreground package was read before and after. A
-/// screen that changed without the package changing is [`EFFECT_CHANGED`].
-pub const EFFECT_PLACE_CHANGED: &str = "place_changed";
+pub use crate::computer::platform::screen::{
+    EFFECT_CHANGED, EFFECT_PLACE_CHANGED, EFFECT_SMALL_CHANGE, EFFECT_UNCHANGED, EFFECT_UNKNOWN,
+};
 
 /// How the element list changed between two reads.
 ///
-/// Counts rather than a yes/no: "three rows appeared" and "the whole page was
-/// replaced" are different answers, and only the second means the action left
-/// this screen. Elements are identified by [`element_key`] — the part that
-/// survives the write that is being judged — and matched as a multiset, so two
-/// identical rows are two rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TreeDiff {
-    pub added: usize,
-    pub removed: usize,
-    /// Same key, different bounds.
-    pub moved: usize,
-    /// Same key, different label.
-    pub edited: usize,
-}
-
-impl TreeDiff {
-    /// Total number of elements that are not in the same place, or not the
-    /// same, as before.
-    pub fn changed(&self) -> usize {
-        self.added + self.removed + self.moved + self.edited
-    }
-
-    /// One line for the result text, or `None` when nothing changed.
-    pub fn describe(&self) -> Option<String> {
-        if self.changed() == 0 {
-            return None;
-        }
-        let mut parts = Vec::new();
-        for (count, what) in [
-            (self.added, "appeared"),
-            (self.removed, "left"),
-            (self.moved, "moved"),
-            (self.edited, "changed text"),
-        ] {
-            if count > 0 {
-                parts.push(format!("{count} {what}"));
-            }
-        }
-        Some(format!("Compared with before: {}.", parts.join(", ")))
-    }
-}
+/// The counting rules and the wording are the shared ones in
+/// [`crate::computer::platform::screen`]; what is Android's is the identity
+/// used to pair rows — see [`tree_diff`].
+pub use crate::computer::platform::screen::TreeDelta as TreeDiff;
 
 /// Compare two reads of the screen by element identity.
 ///
@@ -4697,21 +4636,13 @@ pub fn tree_diff(before: &[UiElement], after: &[UiElement]) -> TreeDiff {
     diff
 }
 
-/// How many changed elements make a screen "changed" rather than "small".
-///
-/// Proportional with a floor: three changed elements is a real change on a
-/// short screen, and ten percent of a long one. Below either, the screen moved
-/// but did not go anywhere.
-fn changed_threshold(total: usize) -> usize {
-    (total * 10).div_ceil(100).max(3)
-}
-
 /// The effect verdict, from what was observed after the action.
 ///
-/// Ordered so the most specific answer wins: a new app is a place change even
-/// if the tree also changed; a canvas that moved under a motionless tree is a
-/// small change; and a tree that could not be read twice is unknown, not
-/// unchanged.
+/// The judgment itself is the shared one — see
+/// [`crate::computer::platform::screen::classify`] — and this wrapper exists
+/// only so the Android code keeps its `&'static str` result, which is what the
+/// result payload has always carried. Anything new should use
+/// [`crate::computer::platform::screen::Effect`] directly.
 pub fn classify_effect(
     before_package: Option<&str>,
     after_package: Option<&str>,
@@ -4721,28 +4652,16 @@ pub fn classify_effect(
     before_fingerprint: Option<u64>,
     after_fingerprint: Option<u64>,
 ) -> &'static str {
-    if matches!((before_package, after_package), (Some(before), Some(after)) if before != after) {
-        return EFFECT_PLACE_CHANGED;
-    }
-    let Some(diff) = diff else {
-        return EFFECT_UNKNOWN;
-    };
-    let same_tree = before_fingerprint.is_some() && before_fingerprint == after_fingerprint;
-    if same_tree {
-        return if pixels_changed == Some(true) {
-            EFFECT_SMALL_CHANGE
-        } else {
-            EFFECT_UNCHANGED
-        };
-    }
-    if before_fingerprint.is_none() {
-        return EFFECT_UNKNOWN;
-    }
-    if diff.changed() >= changed_threshold(shown) {
-        EFFECT_CHANGED
-    } else {
-        EFFECT_SMALL_CHANGE
-    }
+    crate::computer::platform::screen::classify(
+        before_package,
+        after_package,
+        diff,
+        shown,
+        pixels_changed,
+        before_fingerprint,
+        after_fingerprint,
+    )
+    .as_str()
 }
 
 /// How often the screen is polled while waiting for it to settle.
@@ -4773,9 +4692,12 @@ pub struct Settle {
     /// The app on screen when the screen settled.
     pub package: Option<String>,
     /// Who said the screen changed, when the event stream answered first:
-    /// `events` (a content event, then silence) or `tree` (the poll). `None`
-    /// when no stream was available and nothing was claimed about it.
-    pub first_signal: Option<&'static str>,
+    /// [`Signal::Events`](crate::computer::platform::screen::Signal::Events)
+    /// (a content event, then silence) or
+    /// [`Signal::Tree`](crate::computer::platform::screen::Signal::Tree) (the
+    /// poll). `None` when no stream was available and nothing was claimed
+    /// about it.
+    pub first_signal: Option<crate::computer::platform::screen::Signal>,
 }
 
 impl Settle {
@@ -4893,7 +4815,7 @@ pub async fn settle_after_action_and_events_from(
     // events is silent on a screen that moved, too. So the stream is only
     // allowed to end the wait once it has *spoken* — `announced_at` stays
     // `None` otherwise, and the two-identical-reads rule answers as before.
-    let mut first_signal: Option<&'static str> = None;
+    let mut first_signal: Option<crate::computer::platform::screen::Signal> = None;
     let mut read_taken = false;
     let mut events = events;
     let mut announced_at: Option<std::time::Instant> = events.as_mut().and_then(|receiver| {
@@ -4961,11 +4883,11 @@ pub async fn settle_after_action_and_events_from(
                 after_package = dump.package;
                 last = Some(dump.elements);
                 if quiet {
-                    first_signal = Some("events");
+                    first_signal = Some(crate::computer::platform::screen::Signal::Events);
                     break;
                 }
                 if stable && started.elapsed().as_millis() as u64 >= SETTLE_MIN_MS {
-                    first_signal = Some("tree");
+                    first_signal = Some(crate::computer::platform::screen::Signal::Tree);
                     break;
                 }
                 read_taken = true;
@@ -5030,6 +4952,12 @@ pub async fn settle_after_action_and_events_from(
 /// already proved that something happened — this only waits for it to stop.
 const SETTLE_CONTENT_QUIET_MS: u64 = 400;
 
+fn settle_event_matters(event: &crate::device::DeviceEvent, package: Option<&str>) -> bool {
+    // The rule is shared — see `platform::screen::content_event_matters` — so
+    // an iOS set with an event stream reaches the same answer.
+    crate::computer::platform::screen::content_event_matters(event, package)
+}
+
 /// The event stream a settle may consult, if this device has a usable one.
 ///
 /// Only the user's own display raises these events; a virtual display is
@@ -5041,22 +4969,6 @@ pub fn settle_events(
     match target {
         Target::Screen => Some(crate::device::bridge()?.events()?),
         Target::Display(_) => None,
-    }
-}
-
-/// Whether an event says the screen the action was on moved.
-///
-/// A window change is a different place and is left to the caller's own
-/// package check; a content change is the screen redrawing. Notifications from
-/// other apps appear without the screen changing, so they are not evidence
-/// either way.
-fn settle_event_matters(event: &crate::device::DeviceEvent, package: Option<&str>) -> bool {
-    match event.kind {
-        crate::device::EventKind::Content => {
-            package.is_none_or(|package| event.package.is_empty() || event.package == package)
-        }
-        crate::device::EventKind::Window => false,
-        crate::device::EventKind::Notification => false,
     }
 }
 
@@ -7172,30 +7084,21 @@ mod tests {
         assert!(!readback_matches("done.", "done"));
     }
 
-    #[test]
-    fn the_field_holding_the_text_is_a_match() {
-        assert_eq!(readback_verdict("hi", "hi", None, false), READBACK_MATCH);
-        assert_eq!(readback_verdict("hi", "hi", Some(""), false), READBACK_MATCH);
-    }
+    // The verdict *rules* are tested with the shared layer in
+    // `platform::screen`; these cover the field being read back on Android.
 
     #[test]
-    fn different_text_is_a_mismatch() {
-        assert_eq!(readback_verdict("hi", "ho", None, false), READBACK_MISMATCH);
-    }
-
-    #[test]
-    fn a_field_that_did_not_move_but_saw_the_text_is_unknown_not_a_mismatch() {
-        // The field answers the same hint whatever is typed, while the screen
-        // echoed the text: the input arrived, this field cannot confirm it, and
-        // calling that a mismatch would loop the caller into typing twice.
+    fn a_readback_carries_the_shared_word_not_a_private_one() {
+        let judged = readback_verdict("hi", "hi", None, false);
+        assert_eq!(judged, ReadbackVerdict::Match);
         assert_eq!(
-            readback_verdict("hi", "Type a message", Some("Type a message"), true),
-            READBACK_UNKNOWN
-        );
-        // Same stuck field without any echo: the write really did nothing.
-        assert_eq!(
-            readback_verdict("hi", "Type a message", Some("Type a message"), false),
-            READBACK_MISMATCH
+            Readback {
+                verdict: judged.as_str(),
+                actual: Some("hi".to_string()),
+                note: None,
+            }
+            .verdict,
+            READBACK_MATCH
         );
     }
 

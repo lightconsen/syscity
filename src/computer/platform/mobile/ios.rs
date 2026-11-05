@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{has_idevice, run_cmd};
+use crate::computer::platform::screen;
 use crate::computer::platform::{OsControlScope, PlatformConstraints, PlatformToolSet};
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
 
@@ -63,6 +64,20 @@ impl PlatformToolSet for IosToolset {
 
     fn is_available(&self) -> bool {
         has_idevice()
+    }
+
+    /// None of the three shared judgments yet — and saying so is the point.
+    ///
+    /// This set can list devices, screenshot, and install or launch an app, but
+    /// it has no UI automation: no tree to re-read after an action (so no
+    /// effect verdict), no field to read back, and no event stream. A caller
+    /// that asks for one of those gets "this device set cannot answer" rather
+    /// than a bare `unknown` that looks like a read failure. When WebDriverAgent
+    /// lands here, this becomes
+    /// [`ScreenSemantics::ALL`](crate::computer::platform::ScreenSemantics::ALL)
+    /// and the tools inherit the same words Android uses.
+    fn screen_semantics(&self) -> screen::ScreenSemantics {
+        screen::ScreenSemantics::NONE
     }
 }
 

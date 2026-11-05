@@ -249,6 +249,33 @@ execution, and a model that remembers a name from an earlier turn should not
 have to rediscover it. Opening a group is a fact about this host rather than
 about one conversation — the phone is one device.
 
+### The judgments every device set shares
+
+The words above — `effect: changed / unchanged / unknown`, plus the
+`small_change` and `place_changed` degrees, the `match / mismatch / unknown`
+read-back verdicts, and the "a content event means the screen moved" rule — are
+not Android's. They are the answers to questions any device set has to ask:
+*did the action change the screen*, *did the written text land*, *is the screen
+still moving*. They live in `computer::platform::screen`, one layer above the
+Android code, so an iOS set driving WebDriverAgent and a future Windows-ARM set
+driving an Android subsystem reach the same conclusions instead of each
+re-deriving them.
+
+What stays platform-shaped is the evidence, not the verdict: reading an
+accessibility tree, hashing an element, locating the field that was written to,
+comparing screenshots. A set calls the shared `classify`, `readback_verdict` and
+`content_event_matters` with its own observations and gets back the same five
+words.
+
+Each set then **says which judgments it makes** (`PlatformToolSet::
+screen_semantics`), and `list_capabilities` reports it as `judges: ["effect",
+"readback", "events"]`. Android answers all three. The iOS set answers none yet
+— it can list devices, screenshot and launch an app, but has no UI automation,
+so no effect verdict, no read-back and no event stream. Stating the absence is
+what keeps a bare `unknown` honest: "the field could not be read" and "this
+device never reads a field back" are different facts, and only the set knows
+which one it is.
+
 ### What the phone already knows about an app
 
 A launch spends two probes finding the entry point — `cmd package

@@ -19,6 +19,14 @@ pub struct CapabilityInfo {
     /// The optional tool groups this set offers, if it offers any.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupInfo>,
+    /// The shared action judgments this set makes: `effect`, `readback`,
+    /// `events`.
+    ///
+    /// Named here because the words are shared across device sets and the
+    /// absences are not: a set that omits `readback` is saying a successful
+    /// write was never verified, which is a different fact from a failed one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub judges: Vec<String>,
 }
 
 /// One optional group of tools: what it gives you, and whether it is open.
@@ -149,6 +157,7 @@ impl Tool for ListCapabilitiesTool {
                     available,
                     reason,
                     groups,
+                    judges: judged(set.screen_semantics()),
                 });
             }
             infos
@@ -198,6 +207,27 @@ impl Tool for ListCapabilitiesTool {
     }
 }
 
+/// The judgment words a set makes, for the capability report.
+///
+/// Empty for a set that makes none — the field is skipped rather than shown as
+/// an empty list, so "says nothing" and "says nothing is judged" stay different
+/// readings.
+fn judged(semantics: crate::computer::platform::ScreenSemantics) -> Vec<String> {
+    use crate::computer::platform::Judgment;
+    Judgment::ALL
+        .into_iter()
+        .filter(|judgment| semantics.makes(*judgment))
+        .map(|judgment| {
+            match judgment {
+                Judgment::Effect => "effect",
+                Judgment::Readback => "readback",
+                Judgment::Events => "events",
+            }
+            .to_string()
+        })
+        .collect()
+}
+
 fn has_display() -> bool {
     std::env::var("DISPLAY").is_ok()
         || std::env::var("WAYLAND_DISPLAY").is_ok()
@@ -215,6 +245,40 @@ mod tests {
         let tool = ListCapabilitiesTool::new();
         assert_eq!(tool.name(), "list_capabilities");
         assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn the_report_says_which_judgments_a_set_makes() {
+        use crate::computer::platform::{Judgment, ScreenSemantics};
+        assert_eq!(judged(ScreenSemantics::ALL), vec!["effect", "readback", "events"]);
+        // A set that makes none says nothing rather than listing three
+        // negatives — the field is about what is answered.
+        assert!(judged(ScreenSemantics::NONE).is_empty());
+        let effect_only = ScreenSemantics {
+            judges_effect: true,
+            ..ScreenSemantics::NONE
+        };
+        assert_eq!(judged(effect_only), vec!["effect"]);
+        for judgment in Judgment::ALL {
+            assert_eq!(
+                ScreenSemantics::ALL.makes(judgment),
+                judged(ScreenSemantics::ALL).len() == 3
+            );
+        }
+    }
+
+    #[test]
+    fn the_android_set_answers_all_three_and_ios_answers_none() {
+        // The shared vocabulary is only shared if a set is held to saying which
+        // part of it it can apply.
+        let sets = crate::computer::platform::all_known_toolsets();
+        let android = sets
+            .iter()
+            .find(|set| set.id() == "android")
+            .expect("android");
+        assert_eq!(android.screen_semantics(), crate::computer::platform::ScreenSemantics::ALL);
+        let ios = sets.iter().find(|set| set.id() == "ios").expect("ios");
+        assert_eq!(ios.screen_semantics(), crate::computer::platform::ScreenSemantics::NONE);
     }
 
     fn tiering() -> Arc<crate::tools::tiering::ToolTiering> {

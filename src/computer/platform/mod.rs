@@ -117,6 +117,21 @@ pub trait PlatformToolSet: Send + Sync {
         &[]
     }
 
+    /// Which of the shared action judgments this set actually makes.
+    ///
+    /// The vocabularies — the five effect words, the three read-back verdicts,
+    /// the event rule — are defined once in [`screen`] so that a second set
+    /// inherits them instead of re-deriving them. This is where a set states
+    /// which of them it can honestly answer: a caller told `unknown` deserves
+    /// to know whether that is "the screen could not be read" or "this device
+    /// never reads a field back".
+    ///
+    /// The default is [`ScreenSemantics::NONE`], because a set that has not
+    /// said it makes these judgments should not be assumed to.
+    fn screen_semantics(&self) -> screen::ScreenSemantics {
+        screen::ScreenSemantics::NONE
+    }
+
     /// Whether this set is available on the current platform.
     fn is_available(&self) -> bool {
         self.constraints().check()
@@ -228,6 +243,7 @@ pub mod linux;
 pub mod macos;
 pub mod mobile;
 pub mod registry;
+pub mod screen;
 pub mod server_operator;
 pub mod wayland;
 pub mod windows;
@@ -238,6 +254,12 @@ pub use linux::LinuxToolset;
 pub use macos::MacosToolset;
 pub use mobile::{AndroidToolset, IosToolset};
 pub use registry::PlatformCapabilityRegistry;
+pub use screen::{
+    changed_threshold, classify as classify_effect, content_event_matters, place_changed, Effect,
+    Judgment, ReadbackVerdict, ScreenSemantics, Signal, TreeDelta, EFFECT_CHANGED,
+    EFFECT_PLACE_CHANGED, EFFECT_SMALL_CHANGE, EFFECT_UNCHANGED, EFFECT_UNKNOWN, READBACK_MATCH,
+    READBACK_MISMATCH, READBACK_UNKNOWN,
+};
 pub use server_operator::{Diagnosis, ServerOperator, SystemInspector, SystemSnapshot};
 pub use wayland::LinuxDesktopWaylandToolset;
 pub use windows::WindowsToolset;
