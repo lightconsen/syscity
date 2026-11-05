@@ -2123,6 +2123,57 @@ impl Tool for AdbDisplayTool {
                 };
                 super::gate::check(offer, context, &subject, before_package.as_deref()).await
             }
+            // A key press on a display is the same act as on the phone: one
+            // that activates the focused control presses it, and in a chat
+            // field that is the send. The tree has to be read to judge it —
+            // what has the focus is only on the screen — so this costs one
+            // read, and only for the key action.
+            "key" => {
+                let keycode = super::android::normalize_keycode(described_keycode(&args));
+                let dump = super::android::dump_ui(&device, Target::Display(id)).await;
+                let (offer, subject) = match dump {
+                    Ok(dump) => {
+                        before_package = dump.package.clone();
+                        before_fingerprint = Some(super::android::tree_fingerprint(&dump.elements));
+                        let offer = super::risk::classify_key(&dump.elements, &keycode);
+                        let subject = match &offer {
+                            Some(offer) => match offer.element.as_deref() {
+                                Some(control) => format!(
+                                    "press {keycode} on \"{control}\" on display {id} — {}",
+                                    offer.describe()
+                                ),
+                                None => format!(
+                                    "press {keycode} on display {id} — {}",
+                                    offer.describe()
+                                ),
+                            },
+                            None => format!("press {keycode} on display {id}"),
+                        };
+                        (offer, subject)
+                    }
+                    // The read failed, so nothing here can be judged. Like a
+                    // tap on an unreadable screen, the action proceeds and the
+                    // reply carries no `risk` for it.
+                    Err(_) => (None, format!("press {keycode} on display {id}")),
+                };
+                super::gate::check(offer, context, &subject, before_package.as_deref()).await
+            }
+            // Text on a display is typed, not pressed: `input text` cannot
+            // carry a line break, so a newline in `text` is dropped rather than
+            // sent, and a paste inserts. Neither commits anything — the enter
+            // that does is its own `key` call — so there is no offer to make.
+            "text" | "paste" => {
+                let dump = super::android::dump_ui(&device, Target::Display(id)).await;
+                if let Ok(dump) = dump {
+                    before_package = dump.package.clone();
+                    before_fingerprint = Some(super::android::tree_fingerprint(&dump.elements));
+                }
+                Ok(super::gate::Clearance {
+                    offer: None,
+                    asked: false,
+                    granted: None,
+                })
+            }
             // `launch` starts an app, so the app it is about to open is the app
             // this write will be in — named by the argument, since there is no
             // screen to read it from yet.
@@ -2139,8 +2190,6 @@ impl Tool for AdbDisplayTool {
                     granted: None,
                 })
             }
-            // Nothing a paste types is what commits it; the button afterwards
-            // is the tap, and that tap is classified on its own.
             _ => Ok(super::gate::Clearance {
                 offer: None,
                 asked: false,
@@ -2168,7 +2217,18 @@ impl Tool for AdbDisplayTool {
                     )))
                 }
             };
-            let now = super::risk::classify_point(&fresh.elements, tap_pixels.0, tap_pixels.1);
+            // The same question the original classification asked, asked
+            // again against the screen as it is now: a tap is judged by what
+            // is under it, a key by the control it activates, and nothing else
+            // reaches past the phone on a display.
+            let now = match action {
+                "tap" => super::risk::classify_point(&fresh.elements, tap_pixels.0, tap_pixels.1),
+                "key" => super::risk::classify_key(
+                    &fresh.elements,
+                    &super::android::normalize_keycode(described_keycode(&args)),
+                ),
+                _ => None,
+            };
             if let Err(withheld) =
                 super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
             {
@@ -2640,6 +2700,8 @@ pub const STOP_TARGET_NOT_FOUND: &str = "target_not_found";
 pub const STOP_FAILED: &str = "failed";
 pub const STOP_CONDITION_UNMET: &str = "condition_unmet";
 pub const STOP_FINAL_READ_FAILED: &str = "final_read_failed";
+/// A person declined the run's plan, so none of its steps ran.
+pub const STOP_PLAN_REFUSED: &str = "plan_refused";
 /// The run asked for more steps than the slow read path can afford.
 pub const STOP_STEP_BUDGET: &str = "step_budget_exceeded";
 
@@ -2892,11 +2954,15 @@ fn locate_step_target(
     }
 }
 
-/// An `android_input` call pinned to this run's device.
-fn input_tool(device: &Option<String>) -> AdbInputTool {
-    match device {
+/// An `android_input` call pinned to this run's device and plan.
+fn input_tool(device: &Option<String>, plan: Option<&super::gate::Plan>) -> AdbInputTool {
+    let tool = match device {
         Some(serial) => AdbInputTool::new().with_device(serial.clone()),
         None => AdbInputTool::new(),
+    };
+    match plan {
+        Some(plan) => tool.under_plan(plan.clone()),
+        None => tool,
     }
 }
 
@@ -3007,6 +3073,13 @@ fn effect_of(result: &ToolExecutionResult) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The key a display action names, as the caller wrote it.
+fn described_keycode(args: &Value) -> &str {
+    args.get("keycode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("BACK")
+}
+
 /// The `Target` a step addresses.
 fn step_target(display: Option<i64>) -> Target {
     match display.and_then(|id| i32::try_from(id).ok()) {
@@ -3025,6 +3098,7 @@ async fn run_step(
     context: &ToolContext,
     device: &Option<String>,
     display: Option<i64>,
+    plan: Option<&super::gate::Plan>,
     command: &Value,
 ) -> Result<Option<String>, StepError> {
     let op = command.get("op").and_then(Value::as_str).unwrap_or("");
@@ -3089,7 +3163,7 @@ async fn run_step(
                 tap_args.insert("verify".to_string(), Value::Bool(false));
             }
             let tapped = call_tool(
-                input_tool(device)
+                input_tool(device, plan)
                     .execute(Value::Object(tap_args), context)
                     .await,
                 op,
@@ -3120,7 +3194,7 @@ async fn run_step(
                         Value::String(vec!["KEYCODE_DEL"; length].join(" ")),
                     );
                     let cleared = call_tool(
-                        input_tool(device)
+                        input_tool(device, plan)
                             .execute(Value::Object(clear_args), context)
                             .await,
                         "clear",
@@ -3140,7 +3214,7 @@ async fn run_step(
             type_args.insert("action".to_string(), Value::String("text".to_string()));
             type_args.insert("text".to_string(), Value::String(text.to_string()));
             let typed = call_tool(
-                input_tool(device)
+                input_tool(device, plan)
                     .execute(Value::Object(type_args), context)
                     .await,
                 "type",
@@ -3164,7 +3238,7 @@ async fn run_step(
             args.insert("action".to_string(), Value::String("key".to_string()));
             args.insert("keycode".to_string(), Value::String(keycode));
             let result = call_tool(
-                input_tool(device)
+                input_tool(device, plan)
                     .execute(Value::Object(args), context)
                     .await,
                 op,
@@ -3185,7 +3259,7 @@ async fn run_step(
             args.insert("x2".to_string(), Value::Number(to.0.into()));
             args.insert("y2".to_string(), Value::Number(to.1.into()));
             let result = call_tool(
-                input_tool(device)
+                input_tool(device, plan)
                     .execute(Value::Object(args), context)
                     .await,
                 op,
@@ -3221,7 +3295,7 @@ async fn run_step(
                 args.insert("x2".to_string(), Value::Number(to.0.into()));
                 args.insert("y2".to_string(), Value::Number(to.1.into()));
                 let result = call_tool(
-                    input_tool(device)
+                    input_tool(device, plan)
                         .execute(Value::Object(args), context)
                         .await,
                     "scroll",
@@ -3691,6 +3765,25 @@ impl Tool for AdbRunTool {
         }
 
         let mut expected_package = opening.package.clone();
+        // The run's irreversible steps, named before any of them runs.
+        //
+        // A run cannot ask about each step — thirty questions, each with less
+        // context than the plan — so its plan is put to a person once, here,
+        // and every step that was named then runs on that yes. A step the plan
+        // did not name still meets the ordinary gate below.
+        let planned = super::gate::plan_steps(commands);
+        let plan =
+            match super::gate::approve_plan(planned, context, opening.package.as_deref()).await {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    return Ok(ToolExecutionResult::error(refusal.reason).with_data(
+                        serde_json::json!({
+                            "code": STOP_PLAN_REFUSED,
+                            "steps_requested": commands.len(),
+                        }),
+                    ))
+                }
+            };
         let mut steps: Vec<RunStep> = Vec::with_capacity(commands.len());
         let mut stop: Option<(String, usize)> = None;
         let mut unreadable = 0_usize;
@@ -3710,7 +3803,7 @@ impl Tool for AdbRunTool {
                 .unwrap_or("")
                 .to_string();
 
-            let mut step = match run_step(context, &device, display, command).await {
+            let mut step = match run_step(context, &device, display, Some(&plan), command).await {
                 Ok(effect) => RunStep::new(n, &op).executed(effect.as_deref()),
                 Err(failure) => {
                     let code = failure.code.to_string();
@@ -3927,7 +4020,7 @@ impl Tool for AdbRunTool {
         let total = commands.len();
         let stopped = stop.as_ref().map(|(code, at)| (code.as_str(), *at));
 
-        let (success, text) = match (&final_read, &stop) {
+        let (success, mut text) = match (&final_read, &stop) {
             (Ok(dump), None) => {
                 let mut text = format!(
                     "Ran all {total} step(s) through the {source} read path:\n{}",
@@ -3986,33 +4079,58 @@ impl Tool for AdbRunTool {
             ),
         };
 
+        let plan_note = plan.note();
+        if let (true, Some(note)) = (success, plan_note.as_deref()) {
+            text.push('\n');
+            text.push('\n');
+            text.push_str(note);
+        }
         let result = if success {
             ToolExecutionResult::success(text)
         } else {
             ToolExecutionResult::error(text)
         };
-        Ok(result.with_data(run_data(
-            &steps,
+        Ok(result.with_data(run_data(RunReport {
+            steps: &steps,
             total,
             stopped,
-            final_read.as_ref().ok(),
+            plan: &plan,
+            final_read: final_read.as_ref().ok(),
             source,
-            serial,
+            device: serial,
             checked_by_events,
-        )))
+        })))
     }
 }
 
-/// The JSON a run reports, beside its text answer.
-fn run_data(
-    steps: &[RunStep],
+/// What a run did, as JSON, beside its text answer.
+///
+/// Grouped rather than passed one by one: a run reports a lot of small facts,
+/// and a signature with eleven arguments is one nobody can read at the call
+/// site.
+struct RunReport<'a> {
+    steps: &'a [RunStep],
     total: usize,
-    stopped: Option<(&str, usize)>,
-    final_read: Option<&UiDump>,
+    stopped: Option<(&'a str, usize)>,
+    plan: &'a super::gate::Plan,
+    final_read: Option<&'a UiDump>,
     source: &'static str,
     device: Option<String>,
     checked_by_events: usize,
-) -> Value {
+}
+
+/// The JSON a run reports, beside its text answer.
+fn run_data(report: RunReport<'_>) -> Value {
+    let RunReport {
+        steps,
+        total,
+        stopped,
+        plan,
+        final_read,
+        source,
+        device,
+        checked_by_events,
+    } = report;
     serde_json::json!({
         "ok": stopped.is_none(),
         "stopped": stopped.map(|(reason, step)| {
@@ -4041,6 +4159,17 @@ fn run_data(
         "max_steps": if source == "uiautomator" { RUN_MAX_STEPS_FALLBACK } else { RUN_MAX_STEPS },
         "truncated": final_read.is_some_and(|dump| dump.truncated),
         "elements": final_read.map(|dump| dump.elements.clone()),
+        // The irreversible steps the run named before it started, and whether
+        // a person allowed them. Absent — no key at all — for a run with
+        // nothing irreversible in it, which is the ordinary case.
+        "plan": plan.note().map(|note| serde_json::json!({
+            "note": note,
+            "approved": plan.grant.is_some(),
+            "steps": plan.planned.iter().map(|step| serde_json::json!({
+                "what": step.what,
+                "risk": step.risk.label(),
+            })).collect::<Vec<_>>(),
+        })),
         "device": device,
     })
 }
@@ -7123,7 +7252,19 @@ mod tests {
     }
 
     fn run_data_with(checked_by_events: usize) -> Value {
-        run_data(&[], 0, None, None, "accessibility", None, checked_by_events)
+        run_data(RunReport {
+            steps: &[],
+            total: 0,
+            stopped: None,
+            plan: &crate::computer::platform::mobile::gate::Plan {
+                grant: None,
+                planned: Vec::new(),
+            },
+            final_read: None,
+            source: "accessibility",
+            device: None,
+            checked_by_events,
+        })
     }
 
     #[tokio::test]

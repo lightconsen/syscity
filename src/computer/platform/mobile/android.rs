@@ -436,6 +436,92 @@ fn action_signature(op: &InputOp, before: Option<&[UiElement]>) -> String {
     }
 }
 
+/// What an input is about to do, before it happens.
+///
+/// One place, because every kind of input asks the same question and the
+/// answer has to be the same before dispatch and after an approval. A swipe
+/// and a multi-finger gesture move the screen without pressing anything, and
+/// have no answer.
+///
+/// - a single tap is judged by the element under it, or by the label a located
+///   control carried when the tree could not name it;
+/// - a tap *sequence* is judged by its strongest step — a chain whose first
+///   tap pays is a payment however harmless the rest looks;
+/// - typed text is judged only by the line break in it, because that is the
+///   enter `input text` emits, and in a chat field it is the send;
+/// - a key press is judged by the control it activates, if it activates one.
+fn classify_input(
+    op: &InputOp,
+    elements: &[UiElement],
+    args: &Value,
+    visual: Option<&super::visual::VisualTarget>,
+) -> Option<super::risk::Offer> {
+    match op {
+        InputOp::Taps(points) if points.len() == 1 => match visual {
+            // The label the location carried: a name read off the screen,
+            // whether by the tree, by OCR or by the model.
+            Some(located) => super::risk::classify_named(&located.label),
+            None => match args.get("target").and_then(|v| v.as_u64()) {
+                Some(index) => super::risk::classify_tap(elements, usize::try_from(index).ok()),
+                None => super::risk::classify_point(elements, points[0].0, points[0].1),
+            },
+        },
+        // Raw coordinates with no element to name each one by. Every step that
+        // lands on something the tree knows is classified, and the strongest
+        // hit answers for the chain.
+        InputOp::Taps(points) => super::risk::classify_sequence(elements, points),
+        InputOp::Text(text) => super::risk::classify_pressed_text(elements, text),
+        InputOp::Key(keycode) => super::risk::classify_key(elements, keycode),
+        InputOp::Swipe { .. } | InputOp::Gesture { .. } => None,
+    }
+}
+
+/// How the approval question names the action.
+///
+/// The subject has to say what a person is approving in terms they recognise:
+/// which control, or which field the enter lands in, and in which app.
+fn subject_for(
+    op: &InputOp,
+    offer: Option<&super::risk::Offer>,
+    visual: Option<&super::visual::VisualTarget>,
+    package: Option<&str>,
+) -> String {
+    let point = match op {
+        InputOp::Taps(points) if points.len() == 1 => Some(points[0]),
+        _ => None,
+    };
+    let subject = match op {
+        InputOp::Taps(_) => offer
+            .and_then(|o| o.element.clone())
+            .or_else(|| {
+                // A located control with no readable label — an icon — is
+                // still something the question has to name, or a person is
+                // being asked to approve "tap (540, 1200)".
+                visual.map(|located| {
+                    format!("tap the control at ({}, {})", located.center.0, located.center.1)
+                })
+            })
+            .map(|label| format!("tap \"{label}\""))
+            .unwrap_or_else(|| match point {
+                Some((x, y)) => format!("tap ({x}, {y})"),
+                None => "tap a sequence of points".to_string(),
+            }),
+        InputOp::Text(_) => match offer.and_then(|o| o.element.as_deref()) {
+            Some(field) if !field.is_empty() => {
+                format!("type text into \"{field}\" and press enter")
+            }
+            _ => "type text and press enter".to_string(),
+        },
+        InputOp::Key(keycode) => format!("press {keycode}"),
+        InputOp::Swipe { .. } => "swipe".to_string(),
+        InputOp::Gesture { .. } => "send a multi-finger gesture".to_string(),
+    };
+    match package {
+        Some(package) => format!("{subject} in {package}"),
+        None => subject,
+    }
+}
+
 // ── Touch tracking ─────────────────────────────────────────────────────────
 
 /// One change to the screen, as the post-action check saw it.
@@ -842,6 +928,13 @@ fn since_fallback(reason: super::diff::FullReason) -> serde_json::Value {
 #[derive(Debug)]
 pub struct AdbInputTool {
     device: Option<String>,
+    /// The run this call is a step of, when it is one.
+    ///
+    /// A run puts its whole plan to a person once instead of asking about each
+    /// of thirty steps; the plan travels with the step so that the step's own
+    /// gate can check it is still the step that was described. Set only by
+    /// `android_run`.
+    plan: Option<super::gate::Plan>,
 }
 
 impl Default for AdbInputTool {
@@ -852,11 +945,17 @@ impl Default for AdbInputTool {
 
 impl AdbInputTool {
     pub fn new() -> Self {
-        Self { device: None }
+        Self { device: None, plan: None }
     }
 
     pub fn with_device(mut self, device: String) -> Self {
         self.device = Some(device);
+        self
+    }
+
+    /// Run this call as one step of an already-approved sequence.
+    pub fn under_plan(mut self, plan: super::gate::Plan) -> Self {
+        self.plan = Some(plan);
         self
     }
 
@@ -888,7 +987,7 @@ impl AdbInputTool {
 /// `NoSuchFieldException` there. Normalising at the one place the key op is
 /// built means a name works on both paths, and a number is left alone because
 /// both accept it.
-fn normalize_keycode(raw: &str) -> String {
+pub(super) fn normalize_keycode(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.chars().all(|c| c.is_ascii_digit()) {
         return trimmed.to_string();
@@ -1530,68 +1629,69 @@ impl Tool for AdbInputTool {
             return Ok(ToolExecutionResult::error(reason.to_string()));
         }
 
-        let clearance = match &op {
-            InputOp::Taps(points) if points.len() == 1 => {
-                let offer = match visual_target.as_ref() {
-                    // The label the location carried: a name read off the
-                    // screen, whether by the tree, by OCR or by the model.
-                    Some(located) => super::risk::classify_named(&located.label),
-                    None => match args.get("target").and_then(|v| v.as_u64()) {
-                        Some(index) => super::risk::classify_tap(
-                            before.as_deref().unwrap_or(&[]),
-                            usize::try_from(index).ok(),
-                        ),
-                        None => super::risk::classify_point(
-                            before.as_deref().unwrap_or(&[]),
-                            points[0].0,
-                            points[0].1,
-                        ),
-                    },
-                };
-                let subject = offer
+        let classified =
+            classify_input(&op, before.as_deref().unwrap_or(&[]), &args, visual_target.as_ref());
+        let clearance = match &self.plan {
+            // A step of an approved run. The plan's yes covers the steps it
+            // named, and those steps do not ask again; a step it did *not*
+            // name is an action nobody has been asked about yet, and it goes
+            // through the ordinary gate below rather than being refused for
+            // the plan's omission — a run whose target text did not match
+            // what the screen calls the button should not become un-runnable.
+            Some(plan)
+                if classified
                     .as_ref()
-                    .and_then(|o| o.element.clone())
-                    .or_else(|| {
-                        // A located control with no readable label — an icon —
-                        // is still something the question has to name, or a
-                        // person is being asked to approve "tap (540, 1200)".
-                        visual_target.as_ref().map(|located| {
-                            format!(
-                                "tap the control at ({}, {})",
-                                located.center.0, located.center.1
-                            )
-                        })
+                    .is_some_and(|offer| plan.accounts_for(offer)) =>
+            {
+                plan.clearance(classified.as_ref(), before_package.as_deref())
+                    .unwrap_or(super::gate::Clearance {
+                        offer: classified.clone(),
+                        asked: false,
+                        granted: None,
                     })
-                    .map(|label| format!("tap \"{label}\""))
-                    .unwrap_or_else(|| format!("tap ({}, {})", points[0].0, points[0].1));
-                let subject = match before_package.as_deref() {
-                    Some(package) => format!("{subject} in {package}"),
-                    None => subject,
-                };
-                match super::gate::check(offer, context, &subject, before_package.as_deref()).await
-                {
-                    Ok(clearance) => clearance,
-                    Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
-                }
             }
-            _ => {
-                // A multi-point `sequence` is a series of taps at raw
-                // coordinates with no element to name them by; the other ops
-                // (swipe, text, key, gesture) are not taps at all.
-                super::gate::Clearance {
+            // An ordinary call, or a step the plan never named: classified and
+            // put to a human on its own.
+            _ => match classified {
+                Some(offer) => {
+                    let subject = subject_for(
+                        &op,
+                        Some(&offer),
+                        visual_target.as_ref(),
+                        before_package.as_deref(),
+                    );
+                    match super::gate::check(
+                        Some(offer),
+                        context,
+                        &subject,
+                        before_package.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(clearance) => clearance,
+                        Err(refusal) => return Ok(ToolExecutionResult::error(refusal.reason)),
+                    }
+                }
+                None => super::gate::Clearance {
                     offer: None,
                     asked: false,
                     granted: None,
-                }
-            }
+                },
+            },
         };
+        // Whether this call is a step of a run rather than a question of its
+        // own. The re-read below exists because a *question* left the screen
+        // unattended for as long as a person took to read it; a step was
+        // approved as part of a plan read immediately before the run started,
+        // and re-reading after every step would cost the run its whole point.
+        let plan_approved = self.plan.as_ref().is_some_and(|plan| plan.grant.is_some());
 
         // The question was open for as long as the person took to read it, and
         // a phone screen moves under a question: a message arrives and the row
         // under the finger becomes a different row. What they approved was the
         // button described in the question. Before dispatching, check that the
         // same thing is still under the finger — one re-read, and only when
-        // somebody actually said yes.
+        // somebody actually said yes to *this* call.
         if clearance.granted.is_some() {
             let fresh = match dump_ui(&device, target).await {
                 Ok(fresh) => fresh,
@@ -1609,31 +1709,12 @@ impl Tool for AdbInputTool {
                     )))
                 }
             };
-            let now = match &op {
-                InputOp::Taps(points) if points.len() == 1 => {
-                    let recorded = points[0];
-                    match visual_target.as_ref() {
-                        // The control a person approved is named by the label
-                        // the location carried. Without a readable label there
-                        // is nothing to compare, and the classifier returns
-                        // what it does for any other unnamed point.
-                        Some(located) if located.label.trim().is_empty() => {
-                            super::risk::classify_point(&fresh.elements, recorded.0, recorded.1)
-                        }
-                        Some(located) => super::risk::classify_named(&located.label),
-                        None => match args.get("target").and_then(|v| v.as_u64()) {
-                            Some(index) => super::risk::classify_tap(
-                                &fresh.elements,
-                                usize::try_from(index).ok(),
-                            ),
-                            None => {
-                                super::risk::classify_point(&fresh.elements, recorded.0, recorded.1)
-                            }
-                        },
-                    }
-                }
-                _ => None,
-            };
+            // The same judgement, made again against the screen as it is now.
+            // Everything that turns an action into the approved thing — the
+            // element under a tap, the field an enter lands in, the strongest
+            // step of a sequence — is asked again rather than remembered: the
+            // question sat open for as long as the person took to read it.
+            let now = classify_input(&op, &fresh.elements, &args, visual_target.as_ref());
             if let Err(withheld) =
                 super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
             {
@@ -1645,10 +1726,17 @@ impl Tool for AdbInputTool {
             // have moved a row down. Ask the screen the question the handle was
             // issued with, exactly as the tap would have before the question was
             // put to them.
-            if let Some(located) = visual_target.as_ref() {
-                if let Err(refused) = super::visual::confirm(located, &device, target).await {
-                    return Ok(ToolExecutionResult::error(refused.message)
-                        .with_data(serde_json::json!({ "code": refused.code })));
+            //
+            // Skipped when the call runs under a sequence's approval: there is
+            // nothing a person approved *for this step*, and a handle resolved
+            // a moment ago belongs to the plan's own read, not to a question
+            // that sat open while somebody read it.
+            if !plan_approved {
+                if let Some(located) = visual_target.as_ref() {
+                    if let Err(refused) = super::visual::confirm(located, &device, target).await {
+                        return Ok(ToolExecutionResult::error(refused.message)
+                            .with_data(serde_json::json!({ "code": refused.code })));
+                    }
                 }
             }
         }
@@ -5695,6 +5783,101 @@ impl Tool for AdbStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What an input is, before it happens ─────────────────────────────
+    //
+    // The gate now covers text and key events as well as taps, and the
+    // judgement has to be the same both times it is made — before dispatch,
+    // and again after an approval. These cover the shape of that judgement
+    // without a phone: a `classify_input` that disagrees with itself would
+    // refuse every approved action as "no longer there".
+
+    fn text_field(label: &str, bounds: (i32, i32, i32, i32), focused: bool) -> UiElement {
+        UiElement::with_state(
+            1,
+            Some(label.to_string()),
+            None,
+            None,
+            "EditText".to_string(),
+            true,
+            true,
+            NodeState {
+                editable: true,
+                focused,
+                ..NodeState::default()
+            },
+            bounds,
+        )
+    }
+
+    #[test]
+    fn a_sequence_is_judged_by_the_strongest_step_under_it() {
+        let elements = vec![UiElement::new(
+            1,
+            Some("立即付款".to_string()),
+            None,
+            None,
+            "Button".to_string(),
+            true,
+            true,
+            (0, 0, 400, 100),
+        )];
+        let op = InputOp::Taps(vec![(100, 50), (900, 900)]);
+        let offer = classify_input(&op, &elements, &Value::Null, None).expect("a payment");
+        assert_eq!(offer.risk, super::super::risk::Risk::Pay);
+    }
+
+    #[test]
+    fn a_typed_line_break_is_a_send_and_plain_typing_is_not() {
+        let box_ = text_field("", (0, 0, 800, 120), true);
+        let args = Value::Null;
+        assert_eq!(
+            classify_input(&InputOp::Text("你好".to_string()), &[box_.clone()], &args, None),
+            None
+        );
+        let offer = classify_input(&InputOp::Text("你好\n".to_string()), &[box_], &args, None)
+            .expect("a send");
+        assert_eq!(offer.risk, super::super::risk::Risk::Send);
+        assert_eq!(offer.matched, "换行");
+    }
+
+    #[test]
+    fn an_activating_key_is_judged_and_a_back_key_is_not() {
+        let box_ = text_field("", (0, 0, 800, 120), true);
+        let args = Value::Null;
+        assert_eq!(
+            classify_input(&InputOp::Key("KEYCODE_BACK".to_string()), &[box_.clone()], &args, None),
+            None
+        );
+        assert!(classify_input(&InputOp::Key("KEYCODE_ENTER".to_string()), &[box_], &args, None)
+            .is_some());
+    }
+
+    #[test]
+    fn a_swipe_moves_the_screen_without_pressing_anything() {
+        let op = InputOp::Swipe { from: (0, 0), to: (10, 10) };
+        assert_eq!(classify_input(&op, &[], &Value::Null, None), None);
+    }
+
+    #[test]
+    fn the_question_names_the_field_the_text_lands_in() {
+        // A person reading "type text and press enter" has no idea which
+        // conversation it is; the field's own label is what makes it a
+        // question worth answering.
+        let offer = super::super::risk::Offer {
+            risk: super::super::risk::Risk::Send,
+            matched: "换行".to_string(),
+            element: Some("和小明的对话".to_string()),
+        };
+        let subject = subject_for(
+            &InputOp::Text("好的\n".to_string()),
+            Some(&offer),
+            None,
+            Some("com.example.chat"),
+        );
+        assert!(subject.contains("和小明的对话"), "{subject}");
+        assert!(subject.contains("com.example.chat"), "{subject}");
+    }
 
     // ── Launch entry resolution ─────────────────────────────────────────
     //

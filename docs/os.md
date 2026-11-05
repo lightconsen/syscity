@@ -221,15 +221,32 @@ every tree read is graded `usable / partial / unusable`; below usable the tool
 falls back to OCR and returns the text as tappable lines rather than an empty
 list.
 
-### What a tap is about to do
+### What an action is about to do
 
 A wrong screen is recoverable. The right screen with the wrong button under the
 finger is not: a message reaches someone it cannot be unsent to, money leaves an
-account, a delete is gone. Before `android_input` dispatches a tap, and before
-`android_dialog` presses a button, the label of the element receiving it is
-classified (`computer::platform::mobile::risk`) into `send`, `submit`, `pay`,
-`delete` or `order`. It is a word list, and it is tuned to be wrong toward asking:
-a hit reports the word that caused it, so a refusal can be argued with.
+account, a delete is gone. Before `android_input` dispatches, and before
+`android_dialog` presses a button, the action is classified
+(`computer::platform::mobile::risk`) into `send`, `submit`, `pay`, `delete` or
+`order`. It is a word list, and it is tuned to be wrong toward asking: a hit
+reports the word that caused it, so a refusal can be argued with.
+
+Coverage is by shape of action, not only by tap:
+
+| Action | Judged by |
+|---|---|
+| a single tap | the label of the element under it (by index, by key, by a located control's label, or by the smallest element containing the point) |
+| a `sequence` of taps | its strongest step — a chain whose first tap pays is a payment however harmless the rest looks |
+| `text` containing a line break | the field it lands in: `input text` emits `KEYCODE_ENTER` between lines, and in a chat field that is the send |
+| a `key` press of an activating key (ENTER / NUMPAD_ENTER / DPAD_CENTER / SPACE) | the control it activates: a focused button is that button, a focused field is submitted by it, and a field with no reported focus is still where the enter goes |
+| `clear`, `swipe`, a multi-finger `gesture` | nothing: they move or edit the screen without committing it |
+
+A line break is not classified when it lands in a **search box** — Enter there
+runs the search, which reading a different result undoes, and asking about every
+search would make the agent unusable. A search box is recognised by its
+resource id, its class, its content description, or the "搜索" button on the same
+row; a "发送" button on that row wins, so a chat box captioned "搜索或提问" is
+still a chat box.
 
 Two shapes of label are deliberately not classified, because they are far more
 common on a screen than the button itself:
@@ -244,7 +261,7 @@ compound: "提交订单" is an *order*, not a submit — a submit is the one kin
 deployment may choose to wave through (`[computer.mobile] ask_kinds`), and a
 "提交订单" button classified as a submit would be waved through with it.
 
-Then the gate (`mobile::gate`) decides whether the tap may run:
+Then the gate (`mobile::gate`) decides whether the action may run:
 
 | Situation | What happens |
 |---|---|
@@ -258,7 +275,7 @@ bounds an agent with nobody watching is pacing, not refusal.
 
 ```toml
 [computer.mobile]
-# Ask when someone can answer. Off: the taps run, still reporting `risk`.
+# Ask when someone can answer. Off: the actions run, still reporting `risk`.
 ask_before_irreversible = true
 # Only these kinds are asked about. `submit` is intentionally absent.
 ask_kinds = ["send", "pay", "delete", "order"]
@@ -267,8 +284,8 @@ pace_outward = true
 ```
 
 Every `android_input`/`android_dialog` result carries `risk` (a sentence naming
-what the tap looked like) and `risk_approved` (`true` when a human said yes, and
-therefore also absent when there was nobody to ask).
+what the action looked like) and `risk_approved` (`true` when a human said yes,
+and therefore also absent when there was nobody to ask).
 
 ### An approval is a description, not a mood
 
@@ -278,19 +295,58 @@ different row. So a yes is recorded as **what it was about**, not as permission
 to do the next thing:
 
 ```rust
-struct Grant { package: Option<String>, risk: Risk, label: Option<String>, subject: String }
+struct Grant { package: Option<String>, risk: Risk, label: Option<String>, subject: String,
+               plan: Option<Vec<Planned>> }
 ```
 
 Right before dispatch, when — and only when — somebody actually said yes, the
-screen is read again and the tap is classified again. `gate::verify` refuses if
-the app is different, if the kind of action is different, or if the element is
-not the one described, and the refusal says which. An approval for "发送 in
-com.example.chat" does not become an approval for the same label in a mail app,
-and it does not become one for a different button that happens to be there now.
+screen is read again and the action is classified again by the same rules.
+`gate::verify` refuses if the app is different, if the kind of action is
+different, or if the element is not the one described, and the refusal says
+which. An approval for "发送 in com.example.chat" does not become an approval for
+the same label in a mail app, and it does not become one for a different button
+that happens to be there now. The same holds for a typed line break: the field
+the enter lands in on the second read is the one that has to be the field that
+was approved.
 
 The re-read is deliberately conditional. Nobody asked, nobody's answer needs
-re-checking, and paying for an extra tree read on every unattended tap would be
-cost with no question attached.
+re-checking, and paying for an extra tree read on every unattended action would
+be cost with no question attached.
+
+### A run is approved as a plan
+
+`android_run` is a plan made in one turn and carried out over the next thirty,
+so it cannot ask about each step: that is thirty questions, and the person
+answering them has less context than the plan does. It is instead put to a human
+**once**, before the first step runs, with every irreversible step named:
+
+```
+The agent wants to run a 30-step sequence on this phone in com.example.chat.
+These steps cannot be taken back:
+  1. tap "发送" (this looks like a send action)
+  2. type into "消息" and press enter (this looks like a send action)
+Allow all of them?
+```
+
+The answer is bound the same way a single approval is. Each step is checked
+against the plan as it runs: a step the plan named runs on the plan's yes, with
+a grant carrying that step's declared kind and label; a step the plan did *not*
+name meets the ordinary gate and asks its own question. A step that turns out to
+be a different kind of action than the one declared — the run wrote "tap 发送"
+and the screen calls the button something else — still gets asked about, so a
+target text that does not match the screen does not silently become the gap.
+
+A refused plan runs nothing, and the result carries `code: plan_refused`. An
+unattended run (cron, goals) runs its plan and reports it: `plan` on the result
+says what the steps were and that nobody was asked. Either way a run with
+nothing irreversible in it has no `plan` key at all — that is an ordinary run,
+and it asks nobody.
+
+One consequence is deliberate: a step of an approved plan does **not** re-read
+the screen before dispatch the way a single approved call does. The question
+that made the re-read necessary — a person reading it for up to a minute — was
+asked once, before the run started; re-reading after every step would cost the
+run its whole point and answer a question nobody asked.
 
 ### The ladder in front of a repeated action
 

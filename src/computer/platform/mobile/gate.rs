@@ -72,28 +72,81 @@ pub struct Grant {
     pub label: Option<String>,
     /// What the person read, for the mismatch message.
     pub subject: String,
+    /// For an approval of a whole sequence: the steps it covered.
+    ///
+    /// `None` for a single action, which is then bound by `risk` and `label`
+    /// above. A sequence is approved once for every step it declared, and each
+    /// of those steps is still checked against the declaration when it runs —
+    /// so one yes is not a licence for anything the sequence did not say.
+    pub plan: Option<Vec<Planned>>,
+}
+
+/// One step a sequence declared before it started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    /// The kind of action, as classified from the step's own arguments.
+    pub risk: Risk,
+    /// The label the step names, when it can be known before the step runs.
+    pub label: Option<String>,
+    /// The step in a person's words, for the question and the result.
+    pub what: String,
 }
 
 impl Grant {
     fn describes(&self, offer: &Offer, package: Option<&str>) -> bool {
-        // The kind must match: approving a send is not approving a payment
-        // because the screen changed under the same label.
-        self.risk == offer.risk
-            // The app must match when either side knows it. A missing package
-            // on one side means the tree could not name one, not that any app
-            // will do.
-            && match (self.package.as_deref(), package) {
-                (Some(approved), Some(now)) => approved == now,
-                _ => true,
+        // The app must match when either side knows it. A missing package
+        // on one side means the tree could not name one, not that any app
+        // will do.
+        if !match (self.package.as_deref(), package) {
+            (Some(approved), Some(now)) => approved == now,
+            _ => true,
+        } {
+            return false;
+        }
+        match &self.plan {
+            // An approval of a sequence covers the steps it declared, one at a
+            // time, and only those.
+            Some(plan) => plan.iter().any(|step| {
+                step.risk == offer.risk
+                    && label_agrees(step.label.as_deref(), offer.element.as_deref())
+            }),
+            // The kind must match: approving a send is not approving a payment
+            // because the screen changed under the same label.
+            None => {
+                self.risk == offer.risk
+                    && label_agrees(self.label.as_deref(), offer.element.as_deref())
             }
-            // And the label, when there was one: the same app can hold the same
-            // risk on two different buttons, and the person approved one of
-            // them.
-            && match (self.label.as_deref(), offer.element.as_deref()) {
-                (Some(approved), Some(now)) => approved == now,
-                (Some(_), None) => false,
-                _ => true,
-            }
+        }
+    }
+
+    /// The single-action grant one declared step of this plan amounts to.
+    ///
+    /// Keeping the *declared* label rather than the one seen now is the point:
+    /// the step still has to be the step that was described, or [`verify`]
+    /// withholds it.
+    fn step(&self, planned: &Planned) -> Self {
+        Self {
+            package: self.package.clone(),
+            risk: planned.risk,
+            label: planned.label.clone(),
+            subject: planned.what.clone(),
+            plan: None,
+        }
+    }
+}
+
+/// Whether an approved label and the label seen now are the same action.
+///
+/// A missing label on the *offer* is not a match for a named one: the person
+/// approved a named button, and "something unnameable is there now" is the
+/// screen having moved on. A missing label on the approval accepts anything of
+/// the same kind — that is the "focus unknown" enter, and the kind is all that
+/// was ever known about it.
+fn label_agrees(approved: Option<&str>, now: Option<&str>) -> bool {
+    match (approved, now) {
+        (Some(approved), Some(now)) => approved == now,
+        (Some(_), None) => false,
+        _ => true,
     }
 }
 
@@ -184,6 +237,286 @@ pub fn reaches_outward(risk: Risk) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub reason: String,
+}
+
+/// What a run's sequence was approved for.
+///
+/// A run is a plan made in one turn and carried out over the next thirty, so
+/// it cannot ask about each step: that is thirty questions, and the person
+/// answering them has less information than the plan does. It is instead put
+/// to a human once, with every irreversible step named — and then each of
+/// those steps is checked against the plan as it runs, so the approval covers
+/// what was described and nothing that took its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// What a person approved, when there was one to ask. Empty when the run
+    /// was unattended, in which case the steps still check against `planned`
+    /// but nothing external was promised.
+    pub grant: Option<Grant>,
+    /// Every irreversible step the run declared, in order.
+    pub planned: Vec<Planned>,
+}
+
+impl Plan {
+    /// Whether the plan already accounts for this action.
+    ///
+    /// A run calls this before dispatching a step: if the step is one the plan
+    /// named, the person's yes already covers it and the step must not ask
+    /// again. A step the plan did *not* name is left to the ordinary gate,
+    /// which asks its own question — so an unplanned send still meets a
+    /// person.
+    pub fn accounts_for(&self, offer: &Offer) -> bool {
+        self.planned.iter().any(|step| {
+            step.risk == offer.risk && label_agrees(step.label.as_deref(), offer.element.as_deref())
+        })
+    }
+
+    /// What this plan adds to a step's result, or `None` for an ordinary run.
+    pub fn note(&self) -> Option<String> {
+        if self.planned.is_empty() {
+            return None;
+        }
+        let kinds = self
+            .planned
+            .iter()
+            .map(|step| step.risk.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(if self.grant.is_some() {
+            format!(
+                "Approved as a whole: {} irreversible step(s) ({kinds}) were named in the plan \
+                 and a human allowed them.",
+                self.planned.len()
+            )
+        } else {
+            format!(
+                "{} irreversible step(s) ({kinds}) in this run; nobody was asked, so they ran \
+                 and this is the record.",
+                self.planned.len()
+            )
+        })
+    }
+
+    /// The approval a single step of this plan runs under.
+    ///
+    /// `None` when the step is not one the plan declared — which is the case
+    /// that matters: the screen's own classifier should not be able to produce
+    /// a different kind mid-run than the plan asked about, and if it does, the
+    /// step is refused rather than quietly run on an approval meant for
+    /// something else.
+    pub fn clearance(&self, offer: Option<&Offer>, package: Option<&str>) -> Option<Clearance> {
+        let Some(offer) = offer else {
+            return Some(Clearance {
+                offer: None,
+                asked: false,
+                granted: None,
+            });
+        };
+        let matched = self.planned.iter().find(|step| {
+            step.risk == offer.risk && label_agrees(step.label.as_deref(), offer.element.as_deref())
+        })?;
+        // The grant names the app it was given for; a step that is now in
+        // another app is not covered, even by a plan — and then nobody has
+        // been asked about *this* step, which is what `asked` reports.
+        let granted = self
+            .grant
+            .as_ref()
+            .filter(|grant| match (grant.package.as_deref(), package) {
+                (Some(approved), Some(now)) => approved == now,
+                _ => true,
+            })
+            .map(|grant| grant.step(matched));
+        Some(Clearance {
+            offer: Some(offer.clone()),
+            asked: granted.is_some(),
+            granted,
+        })
+    }
+}
+
+/// Read a plan's steps out of the arguments a run declared.
+///
+/// Each step is classified by the same rules a single call would use, so a
+/// step cannot be described as one thing in the plan and be another at run
+/// time without the mismatch being visible. The classification is from the
+/// arguments alone: there is no tree yet, and a plan written before the first
+/// read is a plan about intent, not about a particular screen.
+pub fn plan_steps(commands: &[serde_json::Value]) -> Vec<Planned> {
+    let mut planned = Vec::new();
+    for command in commands {
+        let op = command
+            .get("op")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let text = |key: &str| command.get(key).and_then(|value| value.as_str());
+        let target = text("targetText");
+        let offer = match op {
+            // A step's own target is a label the model wrote down. It is the
+            // only thing known before the step runs, and the same words a
+            // person would read in the question.
+            "tap" => target.and_then(super::risk::classify_named),
+            // A type step commits when its text ends in a newline — that is
+            // the enter `input text` emits. It is described without the
+            // field's label: the label is known only once the screen the step
+            // will type into has been read, and binding to a guess would
+            // refuse the run for the step being the step.
+            "type" => text("text")
+                .filter(|text| text.contains('\n'))
+                .map(|_| Offer {
+                    risk: Risk::Send,
+                    matched: "换行".to_string(),
+                    element: None,
+                }),
+            // Likewise a key: which control it activates is a property of the
+            // screen the step runs on. A step that turns out to activate an
+            // irreversible control the plan did not name is refused at run
+            // time, which is where that answer first exists.
+            "key" => text("keycode")
+                .map(super::android::normalize_keycode)
+                .filter(|code| super::risk::is_submit_key(code))
+                .map(|code| Offer {
+                    risk: Risk::Send,
+                    matched: code,
+                    element: None,
+                }),
+            _ => None,
+        };
+        let Some(offer) = offer else {
+            continue;
+        };
+        if !reaches_outward(offer.risk) {
+            continue;
+        }
+        planned.push(Planned {
+            risk: offer.risk,
+            label: offer.element.clone(),
+            what: describe_step(op, target, &offer),
+        });
+    }
+    planned
+}
+
+/// A step in the words a person reading the question would use.
+fn describe_step(op: &str, target: Option<&str>, offer: &Offer) -> String {
+    let place = target
+        .map(|label| format!(" \"{label}\""))
+        .or_else(|| offer.element.as_ref().map(|label| format!(" \"{label}\"")))
+        .unwrap_or_default();
+    match op {
+        "tap" => format!("tap{place}"),
+        "type" => format!("type into{place} and press enter"),
+        "clear" => format!("clear{place}"),
+        "key" => format!("press {}", offer.matched),
+        other => format!("{other}{place}"),
+    }
+}
+
+/// Put a run's whole plan to a human, once.
+///
+/// A run is a plan made in one turn and carried out over the next thirty, so
+/// it cannot ask about each step: that is thirty questions, and the person
+/// answering them has less information than the plan does. It is instead put
+/// to a human once, with every irreversible step named — and then each of
+/// those steps is checked against the plan as it runs (see [`Plan::clearance`]).
+///
+/// Nothing to ask about when no step is irreversible: that is an ordinary run,
+/// and the caller gets a plan with no steps and no grant in it.
+pub async fn approve_plan(
+    planned: Vec<Planned>,
+    ctx: &ToolContext,
+    package: Option<&str>,
+) -> Result<Plan, Refusal> {
+    if planned.is_empty() {
+        return Ok(Plan { grant: None, planned });
+    }
+    let config = ctx.mobile_control();
+    let asks_any = planned.iter().any(|step| config.asks(step.risk.label()));
+    if !asks_any || !crate::tools::ask_user::can_ask_a_human(ctx) {
+        return Ok(Plan { grant: None, planned });
+    }
+    let Some(queue) = ctx.ask_queue.clone() else {
+        return Ok(Plan { grant: None, planned });
+    };
+
+    let steps = planned
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            format!(
+                "\n  {}. {} (this looks like a {} action)",
+                index + 1,
+                step.what,
+                step.risk.label()
+            )
+        })
+        .collect::<String>();
+    let in_app = package
+        .map(|package| format!(" in {package}"))
+        .unwrap_or_default();
+    let question = format!(
+        "The agent wants to run a {count}-step sequence on this phone{in_app}. These steps \
+         cannot be taken back:{steps}\nAllow all of them?",
+        count = planned.len()
+    );
+
+    let conversation_id = ctx.conversation_id.clone();
+    use crate::tools::ask_user::{AskRequest, PendingQuestion};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let id = queue
+        .submit(PendingQuestion {
+            request: AskRequest {
+                id: format!("mobile-plan-{}", uuid::Uuid::new_v4()),
+                conversation_id,
+                question,
+                options: vec!["Allow".to_string(), "Refuse".to_string()],
+                required: true,
+                default: None,
+            },
+            response_tx: Some(tx),
+        })
+        .await;
+
+    let answer = match tokio::time::timeout(ASK_TIMEOUT, rx).await {
+        Ok(Ok(answer)) => answer,
+        _ => {
+            queue.cancel(&id).await;
+            return Err(Refusal {
+                reason: format!(
+                    "this run would {} and nobody answered within {}s; nothing was done",
+                    planned
+                        .iter()
+                        .map(|step| step.what.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ASK_TIMEOUT.as_secs()
+                ),
+            });
+        }
+    };
+
+    if !answer.trim().eq_ignore_ascii_case("allow") {
+        return Err(Refusal {
+            reason: format!(
+                "a human refused this run: it would {}",
+                planned
+                    .iter()
+                    .map(|step| step.what.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    Ok(Plan {
+        grant: Some(Grant {
+            package: package.map(str::to_string),
+            // The grant as a whole is bound by its plan, not by one risk.
+            risk: planned[0].risk,
+            label: None,
+            subject: format!("a {}-step sequence", planned.len()),
+            plan: Some(planned.clone()),
+        }),
+        planned,
+    })
 }
 
 /// Decide whether `offer` may proceed, asking a human when there is one and
@@ -277,6 +610,7 @@ pub async fn check(
                 risk: offer.risk,
                 label: offer.element.clone(),
                 subject: subject.to_string(),
+                plan: None,
             }),
             offer: Some(offer),
             asked: true,
@@ -493,5 +827,184 @@ mod tests {
             .expect("allowed");
         verify(&clearance, None, Some("something.else"))
             .expect("nothing was approved, so nothing binds");
+    }
+
+    // ── A run's plan, approved once ────────────────────────────────────────
+
+    fn step(risk: Risk, label: Option<&str>, what: &str) -> Planned {
+        Planned {
+            risk,
+            label: label.map(str::to_string),
+            what: what.to_string(),
+        }
+    }
+
+    fn commands() -> Vec<serde_json::Value> {
+        serde_json::json!([
+            { "op": "tap", "targetText": "搜索" },
+            { "op": "tap", "targetText": "发送" },
+            { "op": "type", "targetText": "消息", "text": "你好" },
+            { "op": "type", "targetText": "消息", "text": "你好\n" },
+            { "op": "key", "keycode": "ENTER" },
+            { "op": "key", "keycode": "BACK" }
+        ])
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_plan_names_only_the_steps_that_cannot_be_taken_back() {
+        // The tap on a search box, the typing with no line break and the back
+        // key are not decisions; the send, the enter-terminated text and the
+        // bare enter are.
+        let planned = plan_steps(&commands());
+        let whats: Vec<&str> = planned.iter().map(|step| step.what.as_str()).collect();
+        assert_eq!(
+            whats,
+            vec![
+                "tap \"发送\"",
+                "type into \"消息\" and press enter",
+                "press KEYCODE_ENTER"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_approved_as_a_whole_and_binds_each_step() {
+        let queue = Arc::new(AskQueue::new());
+        let responder = answer(Arc::clone(&queue), "Allow");
+        let plan = approve_plan(
+            vec![
+                step(Risk::Send, Some("发送"), "tap \"发送\""),
+                step(Risk::Pay, Some("付款"), "tap \"付款\""),
+            ],
+            &context(queue),
+            Some("com.example.chat"),
+        )
+        .await
+        .expect("allowed");
+        responder.await.unwrap();
+
+        let send = Offer {
+            risk: Risk::Send,
+            matched: "发送".to_string(),
+            element: Some("发送".to_string()),
+        };
+        let clearance = plan
+            .clearance(Some(&send), Some("com.example.chat"))
+            .expect("the send was in the plan");
+        assert!(clearance.asked, "the plan's yes covers the step");
+        verify(&clearance, Some(&send), Some("com.example.chat"))
+            .expect("it is still the send that was approved");
+
+        // The plan named a payment; this is a delete, which nobody approved.
+        let delete = Offer {
+            risk: Risk::Delete,
+            matched: "删除".to_string(),
+            element: Some("删除".to_string()),
+        };
+        assert!(plan
+            .clearance(Some(&delete), Some("com.example.chat"))
+            .is_none());
+        assert!(!plan.accounts_for(&delete));
+    }
+
+    #[tokio::test]
+    async fn a_plan_approval_does_not_cover_the_same_step_in_another_app() {
+        let queue = Arc::new(AskQueue::new());
+        let responder = answer(Arc::clone(&queue), "Allow");
+        let plan = approve_plan(
+            vec![step(Risk::Send, Some("发送"), "tap \"发送\"")],
+            &context(queue),
+            Some("com.example.chat"),
+        )
+        .await
+        .expect("allowed");
+        responder.await.unwrap();
+
+        let send = Offer {
+            risk: Risk::Send,
+            matched: "发送".to_string(),
+            element: Some("发送".to_string()),
+        };
+        let clearance = plan
+            .clearance(Some(&send), Some("com.example.other"))
+            .expect("it is a step the plan named");
+        assert!(!clearance.asked, "a different app is not the approved one");
+        assert!(clearance.granted.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_plan_with_nothing_irreversible_asks_nobody() {
+        let queue = Arc::new(AskQueue::new());
+        let plan = approve_plan(Vec::new(), &context(Arc::clone(&queue)), None)
+            .await
+            .expect("nothing to ask about");
+        assert!(plan.grant.is_none());
+        assert!(plan.note().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_plan_runs_nothing() {
+        // A question nobody answered is not consent: the run does not begin.
+        // Cancelled from the queue's side, which is the same outcome as a
+        // timeout — the answer channel drops and there is no yes in it.
+        let queue = Arc::new(AskQueue::new());
+        let canceller = {
+            let queue = Arc::clone(&queue);
+            let mut events = queue.event_tx.subscribe();
+            tokio::spawn(async move {
+                while let Ok(event) = events.recv().await {
+                    if let crate::tools::ask_user::AskEvent::Required(question) = event {
+                        queue.cancel(&question.ask_id).await;
+                        return;
+                    }
+                }
+            })
+        };
+        let refused = approve_plan(
+            vec![step(Risk::Send, Some("发送"), "tap \"发送\"")],
+            &context(Arc::clone(&queue)),
+            Some("com.example.chat"),
+        )
+        .await
+        .expect_err("silence is not a yes");
+        canceller.await.unwrap();
+        assert!(refused.reason.contains("发送"), "{}", refused.reason);
+        assert!(refused.reason.contains("nothing was done"), "{}", refused.reason);
+    }
+
+    #[tokio::test]
+    async fn a_refused_plan_says_what_it_would_have_done() {
+        let queue = Arc::new(AskQueue::new());
+        let responder = answer(Arc::clone(&queue), "Refuse");
+        let refused = approve_plan(
+            vec![
+                step(Risk::Pay, Some("付款"), "tap \"付款\""),
+                step(Risk::Send, Some("发送"), "tap \"发送\""),
+            ],
+            &context(queue),
+            None,
+        )
+        .await
+        .expect_err("refused");
+        responder.await.unwrap();
+        assert!(refused.reason.contains("付款"), "{}", refused.reason);
+        assert!(refused.reason.contains("发送"), "{}", refused.reason);
+    }
+
+    #[tokio::test]
+    async fn an_unattended_run_records_its_plan_without_asking() {
+        // A cron turn: the steps still run, and the plan is what the transcript
+        // says they were.
+        let planned = vec![step(Risk::Send, Some("发送"), "tap \"发送\"")];
+        let plan = approve_plan(planned, &ToolContext::new("system", "cron:nightly"), None)
+            .await
+            .expect("unattended runs are paced, not refused");
+        assert!(plan.grant.is_none());
+        let note = plan.note().expect("the plan is recorded");
+        assert!(note.contains("send"), "{note}");
+        assert!(note.contains("nobody was asked"), "{note}");
     }
 }
