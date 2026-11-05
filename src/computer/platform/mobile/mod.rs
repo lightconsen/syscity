@@ -24,6 +24,7 @@ pub mod query;
 pub mod ready;
 pub mod risk;
 pub mod takeover;
+pub mod visual;
 pub mod web;
 pub mod wheel;
 pub mod wheel_typing;
@@ -35,6 +36,7 @@ pub use android_tools::{
     AdbSystemActionTool, AdbWaitTool,
 };
 pub use ios::IosToolset;
+pub use visual::AdbFindVisuallyTool;
 pub use web::AdbWebTool;
 
 /// Check whether a command is available on PATH.

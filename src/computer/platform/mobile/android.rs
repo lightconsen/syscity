@@ -109,6 +109,11 @@ impl PlatformToolSet for AndroidToolset {
             // has no nodes for the accessibility tree, so it is read and
             // pressed through the DOM instead.
             Box::new(super::web::AdbWebTool::new()),
+            // Finding a control the tree cannot name: the tree first, then OCR
+            // of the screenshot, then the configured vision provider for an
+            // icon with no text — and a second screenshot to prove the box
+            // still points where the match was read.
+            Box::new(super::visual::AdbFindVisuallyTool::new()),
             // The second screen: the user keeps the phone while a task runs,
             // and a step they have to do themselves goes back to them.
             Box::new(super::android_tools::AdbDisplayTool::new()),
@@ -1042,6 +1047,10 @@ impl Tool for AdbInputTool {
                     "type": "string",
                     "description": "The `snapshot` of the read the reference came from. Optional; when the live read has a different snapshot the reference is still resolved by key, and the result says the screen had changed."
                 },
+                "visual": {
+                    "type": "string",
+                    "description": "A `@vN` handle from android_find_visually. The tap goes to the located control and is refused (VISUAL_STALE) when the screen no longer matches the one the box was drawn on. Use it for controls the accessibility tree cannot name, such as icons and canvas-drawn buttons."
+                },
                 "x": { "type": "integer", "description": "X coordinate in pixels (tap/swipe). No safety net — prefer `target`. A pixel always wins over `x_pct`." },
                 "y": { "type": "integer", "description": "Y coordinate in pixels (tap/swipe). No safety net — prefer `target`." },
                 "x2": { "type": "integer", "description": "End X in pixels (swipe)" },
@@ -1244,6 +1253,12 @@ impl Tool for AdbInputTool {
         // the approval re-check run before anything leaves this process.
         let mut pressed: Option<(Via, (i32, i32))> = None;
         let mut press_target: Option<UiElement> = None;
+        // A tap by `visual` handle. It is deliberately *not* a `press_target`:
+        // the tree has no node for a control the accessibility API cannot
+        // describe, and an accessibility action addressed to the wrong node
+        // would press something else. It goes by shell injection at the point
+        // the handle names, which is what a person's finger would do.
+        let mut visual_target: Option<super::visual::VisualTarget> = None;
         // The screen a 0–999 coordinate is a fraction of. The read above already
         // knows it on every path that produced one, so a percent costs nothing
         // extra; only a caller that actually used a percent on a screen whose
@@ -1259,7 +1274,34 @@ impl Tool for AdbInputTool {
         };
         let op = match action {
             "tap" => {
-                if let Some(key) = args
+                // A handle from `android_find_visually` is checked before
+                // anything else that would name a point. It is a stronger
+                // reference than an index or a key: the element it names may be
+                // the one thing on screen the tree cannot describe, so there is
+                // nothing to relocate it *by* — the screen it was located on
+                // is the reference, and a screenshot that no longer matches it
+                // is a refusal rather than a tap at a place the control left.
+                let visual = args
+                    .get("visual")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|handle| !handle.is_empty());
+                if let Some(handle) = visual {
+                    match super::visual::resolve(handle, &device, target).await {
+                        // The screenshot comes back with the handle but is not
+                        // kept: the effect check below takes its own "before"
+                        // picture, and that one has to be of the moment the
+                        // press starts from, not of the moment it was resolved.
+                        Ok((located, _png)) => {
+                            visual_target = Some(located.clone());
+                            InputOp::Taps(vec![located.center])
+                        }
+                        Err(refused) => {
+                            return Ok(ToolExecutionResult::error(refused.message)
+                                .with_data(serde_json::json!({ "code": refused.code })))
+                        }
+                    }
+                } else if let Some(key) = args
                     .get("key")
                     .and_then(|v| v.as_str())
                     .filter(|k| !k.trim().is_empty())
@@ -1383,7 +1425,17 @@ impl Tool for AdbInputTool {
         // approve the twelfth identical send would be asking them to endorse a
         // loop the agent should have noticed itself; the ladder refuses that
         // without troubling anyone.
-        let signature = action_signature(&op, before.as_deref());
+        // A tap on a located control is classified by the label the search
+        // read, not by whatever the tree has at that point: the whole reason
+        // the handle exists is that the tree does not describe this control,
+        // and an unclassified press on an icon that turns out to say "删除"
+        // is exactly the send this check is for.
+        let signature = match visual_target.as_ref() {
+            Some(located) if !located.label.trim().is_empty() => {
+                format!("tap:{}", located.label.trim())
+            }
+            _ => action_signature(&op, before.as_deref()),
+        };
         let guard_key = super::guard::Guard::bucket_key(
             &context.conversation_id,
             &format!("{}:{}", device.as_deref().unwrap_or("-"), target.display_id()),
@@ -1395,20 +1447,36 @@ impl Tool for AdbInputTool {
 
         let clearance = match &op {
             InputOp::Taps(points) if points.len() == 1 => {
-                let offer = match args.get("target").and_then(|v| v.as_u64()) {
-                    Some(index) => super::risk::classify_tap(
-                        before.as_deref().unwrap_or(&[]),
-                        usize::try_from(index).ok(),
-                    ),
-                    None => super::risk::classify_point(
-                        before.as_deref().unwrap_or(&[]),
-                        points[0].0,
-                        points[0].1,
-                    ),
+                let offer = match visual_target.as_ref() {
+                    // The label the location carried: a name read off the
+                    // screen, whether by the tree, by OCR or by the model.
+                    Some(located) => super::risk::classify_named(&located.label),
+                    None => match args.get("target").and_then(|v| v.as_u64()) {
+                        Some(index) => super::risk::classify_tap(
+                            before.as_deref().unwrap_or(&[]),
+                            usize::try_from(index).ok(),
+                        ),
+                        None => super::risk::classify_point(
+                            before.as_deref().unwrap_or(&[]),
+                            points[0].0,
+                            points[0].1,
+                        ),
+                    },
                 };
                 let subject = offer
                     .as_ref()
                     .and_then(|o| o.element.clone())
+                    .or_else(|| {
+                        // A located control with no readable label — an icon —
+                        // is still something the question has to name, or a
+                        // person is being asked to approve "tap (540, 1200)".
+                        visual_target.as_ref().map(|located| {
+                            format!(
+                                "tap the control at ({}, {})",
+                                located.center.0, located.center.1
+                            )
+                        })
+                    })
                     .map(|label| format!("tap \"{label}\""))
                     .unwrap_or_else(|| format!("tap ({}, {})", points[0].0, points[0].1));
                 let subject = match before_package.as_deref() {
@@ -1459,13 +1527,24 @@ impl Tool for AdbInputTool {
             let now = match &op {
                 InputOp::Taps(points) if points.len() == 1 => {
                     let recorded = points[0];
-                    match args.get("target").and_then(|v| v.as_u64()) {
-                        Some(index) => {
-                            super::risk::classify_tap(&fresh.elements, usize::try_from(index).ok())
-                        }
-                        None => {
+                    match visual_target.as_ref() {
+                        // The control a person approved is named by the label
+                        // the location carried. Without a readable label there
+                        // is nothing to compare, and the classifier returns
+                        // what it does for any other unnamed point.
+                        Some(located) if located.label.trim().is_empty() => {
                             super::risk::classify_point(&fresh.elements, recorded.0, recorded.1)
                         }
+                        Some(located) => super::risk::classify_named(&located.label),
+                        None => match args.get("target").and_then(|v| v.as_u64()) {
+                            Some(index) => super::risk::classify_tap(
+                                &fresh.elements,
+                                usize::try_from(index).ok(),
+                            ),
+                            None => {
+                                super::risk::classify_point(&fresh.elements, recorded.0, recorded.1)
+                            }
+                        },
                     }
                 }
                 _ => None,
@@ -1474,6 +1553,18 @@ impl Tool for AdbInputTool {
                 super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
             {
                 return Ok(ToolExecutionResult::error(withheld.reason));
+            }
+            // A located control has no node to re-read, so the tree above cannot
+            // say whether it is still there: the label is the same word it was
+            // when the person approved it, and the thing wearing that label may
+            // have moved a row down. Ask the screen the question the handle was
+            // issued with, exactly as the tap would have before the question was
+            // put to them.
+            if let Some(located) = visual_target.as_ref() {
+                if let Err(refused) = super::visual::confirm(located, &device, target).await {
+                    return Ok(ToolExecutionResult::error(refused.message)
+                        .with_data(serde_json::json!({ "code": refused.code })));
+                }
             }
         }
 
@@ -1915,6 +2006,10 @@ impl Tool for AdbInputTool {
             "paced": pace_note,
             "reference_moved": snapshot_note.is_some(),
             "guard": ladder.note(),
+            // Which `@vN` this tap went to, when it went by handle rather than
+            // by index or key — so the transcript says a visual tap was a
+            // visual tap, and a re-search can be matched to the press it led to.
+            "visual": visual_target.as_ref().map(|located| located.handle.clone()),
         })))
     }
 }
@@ -3007,7 +3102,12 @@ fn node_depth(node: roxmltree::Node<'_, '_>) -> u32 {
 /// Uses the byte-safe runner: the PNG has to reach the encoder exactly as the
 /// device produced it, and the `String` variant of `run_cmd` would replace every
 /// non-UTF-8 byte with U+FFFD and corrupt the image.
-async fn capture_png(device: &Option<String>, target: Target) -> crate::Result<Vec<u8>> {
+///
+/// `pub(super)` because a tool that reasons about the picture itself rather
+/// than only handing it to the model needs the same bytes: the visual search
+/// takes one before and one after its match, and drawing a marker on a second
+/// capture is what turns "here is roughly where" into "this is the control".
+pub(super) async fn capture_png(device: &Option<String>, target: Target) -> crate::Result<Vec<u8>> {
     if let Target::Display(id) = target {
         // The helper owns the display's surface, so the frame comes from it
         // rather than from `screencap` (which would photograph the user's
@@ -7073,6 +7173,18 @@ mod tests {
             .map(|t| t.name().to_string())
             .collect();
         assert!(names.contains(&"android_web".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn test_android_toolset_exposes_the_visual_search_tool() {
+        // Where the tree and OCR both come up empty, the search that can still
+        // name an icon is offered by the same profile switch as the rest.
+        let names: Vec<String> = AndroidToolset::new()
+            .tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(names.contains(&"android_find_visually".to_string()), "{names:?}");
     }
 
     // ── Device targeting ────────────────────────────────────────────────

@@ -177,6 +177,7 @@ hand:
 | `android_system_action` | tapping through alarm / timer / calendar / share / settings UI, via Android's own intents |
 | `android_ocr` | the screenshot reader, for screens whose accessibility tree describes nothing |
 | `android_web` | a page drawn in JavaScript: opens it in the phone's own WebView and reads and presses its DOM, which no accessibility node describes |
+| `android_find_visually` | finding a control the tree cannot name: three passes (tree, then OCR of the screenshot, then the vision provider for an icon with no text), a red box drawn on a second screenshot to confirm, and a `@vN` handle `android_input` re-checks before tapping |
 
 `android_run` delegates every step to `android_input` / `android_app_manager`,
 so the risk check, approval gate, repetition ladder and app lease still see each
@@ -411,6 +412,7 @@ a `snapshot` naming that enumeration.
 |---|---|
 | `target` (an index) | nothing — it is checked against the live read and refused if the element is gone, changed or not clickable (`target_description` makes the check exact) |
 | `key` + optional `snapshot` | the list moving: the element is looked up again in the live tree. `reference_moved: true` in the result says the screen had changed since the read |
+| `visual` (a `@vN` handle) | a control the tree cannot describe: the screen is re-captured and the handle is refused (`VISUAL_STALE`) if it is no longer the screen the control was found on. See `android_find_visually` |
 
 A key that finds nothing, or finds several elements that are indistinguishable
 from each other, is refused as `STALE_REF` with the candidates listed. The
@@ -478,6 +480,65 @@ dependency.
 The tool only exists inside the phone app, because only that process can create a
 `WebView` cheaply. A desktop driving a remote phone is told so and pointed back at
 the accessibility tree.
+
+### A control the tree cannot name (`android_find_visually`)
+
+`android_ui_tree` answers with nodes, and a node is only as good as what the app
+told the accessibility service. A custom-drawn toolbar, a canvas game, a map
+pin, a toggle whose label is a picture: the node says `View` and no more. The
+screenshot does say what is there, so `android_find_visually` reads the screen
+instead of the tree, in three passes, each more expensive than the last:
+
+1. **The accessibility tree.** An exact label match wins; a substring match is
+   the fallback. This is the only pass that costs no screenshot decode.
+2. **OCR of the screenshot.** The text ML Kit reads (`android_ocr`'s source),
+   with the box of each line. A printed label the tree never exposed arrives
+   here.
+3. **The vision provider**, only when both above miss — an icon with no text at
+   all. The screenshot goes to whatever multimodal provider the user has already
+   configured, because a vision model cannot run on the phone. With no such
+   provider the answer is an explicit `VISUAL_NO_PROVIDER` degradation that says
+   the icon pass was not run and what to do instead, never a silent miss.
+
+```text
+android_find_visually target="the settings gear icon"
+  → @v1 center=(1012,138) box=(984,110)-(1040,166), marked screenshot attached
+android_input visual="@v1"
+```
+
+The answer is *where*, not a press: the tap goes back through `android_input`,
+which is where the risk classifier, the approval gate and the repetition ladder
+live. So a visual tap is governed exactly as a tree tap is, with the located
+label — not the pixel — as what gets classified. Passing `visual=` is
+deliberately not a `press_target`: an accessibility action addressed to the
+nearest node would press something the handle never named, so the tap is
+injected at the handle's point, as a finger would be.
+
+**The red box is a check, not decoration.** The tool captures the screen before
+it reads and again after it matches, draws the box on the second capture, and
+refuses (`VISUAL_MOVED`) if the two are not the same screen: a match found on one
+picture and drawn on another names whatever has since moved into that place. The
+comparison is a 12×24 brightness grid with the same tolerance `android_input`'s
+aftermath check uses, not an exact comparison — a status-bar clock or a blinking
+cursor repaints between two captures of a screen nobody touched, and an exact
+test would refuse every search. A scroll, a dialog or an app switch moves whole
+cells and is caught.
+
+**The handle carries the screen it was confirmed on.** `android_input
+visual="@vN"` re-captures and refuses (`VISUAL_STALE`) if that screen has changed
+since, so a handle names a control only while it is still where it was found.
+Handles live in the process and only the last eight are kept; an expired one is
+`VISUAL_UNKNOWN` and one search away from a fresh answer.
+
+The marked screenshot reaches the model as an attachment, through the same
+component store the other screenshot tools use: a base64 payload inside a tool
+result is elided before the model ever sees it, so the picture travels as the
+reference line the request-time materializer turns into an image block.
+
+Two searches that both match — two rows both reading "Delete", or a card and its
+label — are refused (`VISUAL_AMBIGUOUS`) with each candidate's box listed, rather
+than one of them being picked. The next call adds `text=` with the exact label or
+names the element from `android_ui_tree`.
 
 ### A second screen (`android_display`)
 
