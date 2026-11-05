@@ -52,6 +52,7 @@ fn tool_context(conversation: &str) -> ToolContext {
         mobile: None,
         steers: None,
         trace: None,
+        tiering: None,
     }
 }
 

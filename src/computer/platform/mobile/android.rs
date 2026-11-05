@@ -128,7 +128,93 @@ impl PlatformToolSet for AndroidToolset {
     fn is_available(&self) -> bool {
         has_adb()
     }
+
+    /// The six tools a turn needs before it has decided anything.
+    ///
+    /// Reading the screen, pressing at a point, typing, opening an app, asking
+    /// the screen what changed, and handing the phone back to its person. Every
+    /// other tool in the set is a specialisation of one of these — a different
+    /// way to read, a longer way to press — and is opened when the turn says
+    /// what it is trying to do.
+    fn core_tools(&self) -> &'static [&'static str] {
+        &[
+            "android_observe",
+            "android_input",
+            "android_app_manager",
+            "android_verify",
+            "android_wait",
+            "android_hand_to_user",
+        ]
+    }
+
+    fn tool_groups(&self) -> &'static [crate::computer::platform::ToolGroupSpec] {
+        TIER_GROUPS
+    }
 }
+
+/// The optional groups, by what a turn is trying to do.
+///
+/// Grouped by task rather than by module: a model that has decided to find a
+/// control needs `android_find`, `android_query` and `android_ui_tree`
+/// regardless of which file they live in.
+static TIER_GROUPS: &[crate::computer::platform::ToolGroupSpec] = &[
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.read",
+        about: "Read the screen in a form other than the default: the raw tree, \
+                an extract of a list, screenshots, or a diff.",
+        tools: &[
+            "android_ui_tree",
+            "android_screenshot",
+            "android_extract",
+            "android_collect",
+        ],
+    },
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.locate",
+        about: "Find one control by name, by OCR, or by the model — for a screen whose \
+                tree does not name what the task calls it.",
+        tools: &[
+            "android_find",
+            "android_query",
+            "android_ocr",
+            "android_find_visually",
+        ],
+    },
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.sequence",
+        about: "Run a known sequence of steps in one call, for a task long enough that \
+                reading between every step would cost more than doing it.",
+        tools: &["android_run"],
+    },
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.system",
+        about: "The phone's own controls: dialogs, system actions, a wheel, and the \
+                accessibility events that say when something changed.",
+        tools: &[
+            "android_dialog",
+            "android_system_action",
+            "android_set_wheel",
+            "android_event",
+        ],
+    },
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.web",
+        about: "The phone's browser, driven through the page instead of the tree.",
+        tools: &["android_web"],
+    },
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.diagnose",
+        about: "Why a screen looks the way it does — a blank, a spinner, a protected \
+                window — and the second display for a task the person keeps.",
+        tools: &["android_diagnose", "android_display"],
+    },
+    crate::computer::platform::ToolGroupSpec {
+        id: "android.connect",
+        about: "Pairing the phone with its own loopback adbd, and reporting the state \
+                of that connection.",
+        tools: &["device_adb_pair", "device_adb_status"],
+    },
+];
 
 // ── Device targeting ───────────────────────────────────────────────────────
 
@@ -7445,6 +7531,66 @@ mod tests {
             .collect();
         assert!(names.contains(&"device_adb_pair".to_string()));
         assert!(names.contains(&"device_adb_status".to_string()));
+    }
+
+    #[test]
+    fn every_android_tool_is_core_or_grouped() {
+        // The registry leaves a tool in neither list visible, so an unclassified
+        // tool is not lost — but it is also never opened by a group, which
+        // means no tier and no line in the catalog. Adding a tool has to say
+        // which of the two it is, and this is where that is enforced.
+        let set = AndroidToolset::new();
+        let core: std::collections::HashSet<&str> = set.core_tools().iter().copied().collect();
+        let grouped: std::collections::HashSet<&str> = set
+            .tool_groups()
+            .iter()
+            .flat_map(|group| group.tools.iter().copied())
+            .collect();
+
+        for tool in set.tools() {
+            let name = tool.name();
+            assert!(
+                core.contains(name) || grouped.contains(name),
+                "{name} is offered by AndroidToolset but named in neither core_tools nor a group"
+            );
+        }
+    }
+
+    #[test]
+    fn the_core_is_the_small_set_a_turn_needs() {
+        // Six, because that is the claim the tiering makes: reading, pressing,
+        // opening, verifying, waiting and handing back. A seventh belongs in a
+        // group, and this test is where that gets decided.
+        let set = AndroidToolset::new();
+        assert_eq!(set.core_tools().len(), 6, "{:?}", set.core_tools());
+    }
+
+    #[test]
+    fn no_group_names_a_core_tool() {
+        // A group that names a core tool says nothing the core list has not
+        // already said, and makes the group's tool count a lie.
+        let set = AndroidToolset::new();
+        let core: std::collections::HashSet<&str> = set.core_tools().iter().copied().collect();
+        for group in set.tool_groups() {
+            for name in group.tools {
+                assert!(!core.contains(name), "group {} names core tool {name}", group.id);
+            }
+        }
+    }
+
+    #[test]
+    fn no_tool_belongs_to_two_groups() {
+        // Two groups could both claim a tool; opening one would make it visible
+        // while the other still counted it as hidden. One home per tool.
+        let set = AndroidToolset::new();
+        let mut seen = std::collections::HashMap::new();
+        for group in set.tool_groups() {
+            for name in group.tools {
+                if let Some(previous) = seen.insert(*name, group.id) {
+                    panic!("{name} is in both {previous} and {}", group.id);
+                }
+            }
+        }
     }
 
     #[test]

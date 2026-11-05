@@ -96,6 +96,12 @@ pub struct ToolRegistry {
     /// When present for a tool, its `description` replaces the static
     /// `Tool::description()` in every emitted `FunctionDefinition`.
     metadata: std::sync::RwLock<HashMap<String, super::metadata::ToolDescriptionMeta>>,
+    /// Which tools wait behind a closed capability group.
+    ///
+    /// Declared once from the platform sets; empty until then, and empty means
+    /// nothing is hidden. Only the advertisement is filtered by it — a call by
+    /// name still finds the tool (see [`ToolTiering`]).
+    tiering: std::sync::Arc<super::tiering::ToolTiering>,
 }
 
 /// Whether this call overwrites a named file.
@@ -152,6 +158,7 @@ impl Default for ToolRegistry {
             todo_state: None,
             spill_threshold: Some(Self::DEFAULT_SPILL_THRESHOLD),
             metadata: std::sync::RwLock::new(HashMap::new()),
+            tiering: std::sync::Arc::new(super::tiering::ToolTiering::new()),
         }
     }
 }
@@ -206,6 +213,7 @@ impl ToolRegistry {
             todo_state: None,
             spill_threshold: Some(Self::DEFAULT_SPILL_THRESHOLD),
             metadata: std::sync::RwLock::new(HashMap::new()),
+            tiering: std::sync::Arc::new(super::tiering::ToolTiering::new()),
         }
     }
 
@@ -234,6 +242,7 @@ impl ToolRegistry {
             todo_state: None,
             spill_threshold: Some(Self::DEFAULT_SPILL_THRESHOLD),
             metadata: std::sync::RwLock::new(HashMap::new()),
+            tiering: std::sync::Arc::new(super::tiering::ToolTiering::new()),
         }
     }
 
@@ -358,6 +367,13 @@ impl ToolRegistry {
             return true;
         }
 
+        // A tool waiting in a closed capability group is not advertised. It is
+        // still callable by name — see `ToolTiering` for why this hides a
+        // schema and nothing else.
+        if self.tiering.is_dormant(name) {
+            return true;
+        }
+
         // Plan mode hides non-read-only tools from the advertised toolset;
         // the per-call gate below is the backstop for anything that was
         // advertised before the mode flipped mid-turn.
@@ -432,6 +448,57 @@ impl ToolRegistry {
     }
 
     // ── Versioned description metadata (§十一) ──────────────────────────────
+
+    /// The capability groups this registry hides tools behind, shared with any
+    /// context that needs to report or open them.
+    ///
+    /// Empty until [`declare_tiers`](Self::declare_tiers) is called, which
+    /// means nothing is hidden — the behaviour a test or a registry with no
+    /// platform sets gets for free. Cloned `Arc` because the handles outlive
+    /// any one turn and `list_capabilities` runs off a `ToolContext`.
+    pub fn tiering(&self) -> Arc<super::tiering::ToolTiering> {
+        self.tiering.clone()
+    }
+
+    /// Read the capability groups out of the platform sets that are exported.
+    ///
+    /// A set's core tools are always offered; everything else it names in a
+    /// group waits to be opened. A set that declares no groups is left alone —
+    /// declaring nothing and declaring "everything is hidden" are the same
+    /// silence otherwise, and only one of them is safe. A tool named in neither
+    /// a group nor the core list also stays visible: something nobody has
+    /// classified must not become invisible because of it. A set's completeness
+    /// is a test's business, not the registry's, and asking every set to build
+    /// its tools here would cost a device probe on every startup.
+    pub fn declare_tiers(&self, sets: &[&dyn crate::computer::platform::PlatformToolSet]) {
+        let mut groups = Vec::new();
+        for set in sets {
+            let specs = set.tool_groups();
+            let core: std::collections::HashSet<&str> = set.core_tools().iter().copied().collect();
+            for spec in specs {
+                // A tool a set calls core is not hidden by a group that also
+                // names it: the core list is the set's own statement about
+                // what must be available.
+                let tools: Vec<String> = spec
+                    .tools
+                    .iter()
+                    .filter(|name| !core.contains(*name))
+                    .map(|name| name.to_string())
+                    .collect();
+                if tools.is_empty() {
+                    continue;
+                }
+                groups.push(super::tiering::ToolGroup {
+                    set_id: set.id().to_string(),
+                    id: spec.id.to_string(),
+                    about: spec.about.to_string(),
+                    tools,
+                    open: false,
+                });
+            }
+        }
+        self.tiering.declare(groups);
+    }
 
     /// Set (or replace) the runtime description override for `name`.
     ///
@@ -916,11 +983,17 @@ impl ToolRegistry {
     /// Get all tools as function definitions (excludes blocked and degraded
     /// tools). Includes both statically- and dynamically-registered tools.
     /// Runtime description overrides (§十一) replace static descriptions.
+    ///
+    /// Tools waiting in a closed capability group are excluded here too: this
+    /// is what the goal runner advertises with, and a tier that held only for
+    /// [`get_available`](Self::get_available) would be no tier at all.
     pub fn get_definitions(&self) -> Vec<FunctionDefinition> {
-        self.iter_tools(|name| !self.is_blocked(name) && !self.is_degraded(name))
-            .into_iter()
-            .map(|(name, tool)| self.definition_for(&name, &tool))
-            .collect()
+        self.iter_tools(|name| {
+            !self.is_blocked(name) && !self.is_degraded(name) && !self.tiering.is_dormant(name)
+        })
+        .into_iter()
+        .map(|(name, tool)| self.definition_for(&name, &tool))
+        .collect()
     }
 
     /// Get all available tools for a given context.
@@ -2867,6 +2940,132 @@ mod tests {
         assert!(result.success);
         assert!(ran.load(Ordering::SeqCst), "tool must run after approval");
         approver.await.expect("approver task");
+    }
+
+    // ── capability tiers ──────────────────────────────────────────────────
+
+    fn tiering_registry() -> (ToolRegistry, Arc<crate::tools::tiering::ToolTiering>, Arc<AtomicBool>)
+    {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(spy("core_tool", ran.clone()));
+        registry.register(spy("grouped_tool", ran.clone()));
+        registry
+            .tiering()
+            .declare(vec![crate::tools::tiering::ToolGroup {
+                set_id: "fake".to_string(),
+                id: "fake.group".to_string(),
+                about: "the grouped tools".to_string(),
+                tools: vec!["grouped_tool".to_string()],
+                open: false,
+            }]);
+        let tiering = registry.tiering();
+        (registry, tiering, ran)
+    }
+
+    /// A dormant tool is not advertised — that is the whole saving — but it is
+    /// still registered and still found by name.
+    #[tokio::test]
+    async fn a_dormant_tool_is_not_advertised_but_still_runs() {
+        let (registry, tiering, ran) = tiering_registry();
+        let ctx = ToolContext::default();
+
+        let advertised: Vec<String> = registry
+            .get_available(&ctx)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert!(advertised.contains(&"core_tool".to_string()), "{advertised:?}");
+        assert!(!advertised.contains(&"grouped_tool".to_string()), "{advertised:?}");
+
+        assert!(registry.has("grouped_tool"), "hiding a schema is not deregistering");
+        let result = registry
+            .execute_call(&call("grouped_tool"), &ctx)
+            .await
+            .expect("a named tool still runs");
+        assert!(result.success);
+        assert!(ran.load(Ordering::SeqCst));
+
+        // And opening the group puts it back in the advertisement.
+        tiering.open("fake.group").expect("group exists");
+        let advertised: Vec<String> = registry
+            .get_available(&ctx)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert!(advertised.contains(&"grouped_tool".to_string()), "{advertised:?}");
+    }
+
+    /// `declare_tiers` reads the sets, not the registry, so a set that names no
+    /// groups must leave its tools visible — otherwise every platform set that
+    /// has not opted in would silently disappear.
+    fn sets() -> Vec<Box<dyn crate::computer::platform::PlatformToolSet>> {
+        vec![
+            Box::new(FakeSet {
+                id: "plain",
+                groups: &[],
+                core: &[],
+            }),
+            Box::new(FakeSet {
+                id: "tiered",
+                groups: &[crate::computer::platform::ToolGroupSpec {
+                    id: "tiered.group",
+                    about: "some",
+                    tools: &["tiered_b"],
+                }],
+                core: &["tiered_a"],
+            }),
+        ]
+    }
+
+    struct FakeSet {
+        id: &'static str,
+        groups: &'static [crate::computer::platform::ToolGroupSpec],
+        core: &'static [&'static str],
+    }
+
+    impl crate::computer::platform::PlatformToolSet for FakeSet {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn name(&self) -> &str {
+            self.id
+        }
+        fn description(&self) -> &str {
+            "fake"
+        }
+        fn constraints(&self) -> &crate::computer::platform::PlatformConstraints {
+            static NONE: std::sync::OnceLock<crate::computer::platform::PlatformConstraints> =
+                std::sync::OnceLock::new();
+            NONE.get_or_init(Default::default)
+        }
+        fn tools(&self) -> Vec<BoxedTool> {
+            vec![
+                spy("plain_a", Arc::new(AtomicBool::new(false))),
+                spy("plain_b", Arc::new(AtomicBool::new(false))),
+            ]
+        }
+        fn core_tools(&self) -> &'static [&'static str] {
+            self.core
+        }
+        fn tool_groups(&self) -> &'static [crate::computer::platform::ToolGroupSpec] {
+            self.groups
+        }
+    }
+
+    #[test]
+    fn a_set_that_declares_no_groups_hides_nothing() {
+        let registry = ToolRegistry::new();
+        let sets = sets();
+        let borrowed: Vec<&dyn crate::computer::platform::PlatformToolSet> =
+            sets.iter().map(|set| set.as_ref()).collect();
+        registry.declare_tiers(&borrowed);
+
+        assert!(!registry.tiering().is_dormant("plain_a"));
+        assert!(!registry.tiering().is_dormant("plain_b"));
+        // The set that did declare: core stays, grouped waits.
+        assert!(!registry.tiering().is_dormant("tiered_a"));
+        assert!(registry.tiering().is_dormant("tiered_b"));
     }
 
     /// `NeedsApproval` with no approval queue must surface `execute()`'s

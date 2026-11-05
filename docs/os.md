@@ -221,6 +221,34 @@ every tree read is graded `usable / partial / unusable`; below usable the tool
 falls back to OCR and returns the text as tappable lines rather than an empty
 list.
 
+The set is offered in two tiers. Six tools are always advertised — observe,
+input, app manager, verify, wait, hand back to the person — because a turn that
+has not decided what it is doing still needs to look, press and give the phone
+back. The rest are grouped by what the turn is trying to do, and a group is
+offered only after it is opened:
+
+| Group | Tools | Open it when |
+|---|---|---|
+| `android.read` | `android_ui_tree`, `android_screenshot`, `android_extract`, `android_collect` | the default read is not the right shape — a raw tree, a list as data, or a picture |
+| `android.locate` | `android_find`, `android_query`, `android_ocr`, `android_find_visually` | the tree does not name the control the task names |
+| `android.sequence` | `android_run` | the task is long enough that reading between every step costs more than doing it |
+| `android.system` | `android_dialog`, `android_system_action`, `android_set_wheel`, `android_event` | the phone's own controls and events are the subject |
+| `android.web` | `android_web` | the page draws itself in JavaScript |
+| `android.diagnose` | `android_diagnose`, `android_display` | a screen looks wrong, or the task needs the second display |
+| `android.connect` | `device_adb_pair`, `device_adb_status` | the connection itself is the thing to fix |
+
+`list_capabilities` reports the groups and takes `{"open": "<group id>"}`,
+after which the group's tools appear in the next request. The system prompt
+names every group and the call that opens it, because a tool nobody advertises
+is only usable if something says it exists.
+
+Tiering hides a schema, not a capability. A tool in a closed group is still
+registered and still runs when called by name: withholding a definition from
+the advertisement must never be what stands between an approved action and its
+execution, and a model that remembers a name from an earlier turn should not
+have to rediscover it. Opening a group is a fact about this host rather than
+about one conversation — the phone is one device.
+
 ### What an action is about to do
 
 A wrong screen is recoverable. The right screen with the wrong button under the

@@ -72,15 +72,31 @@ impl PlatformCapabilityRegistry {
             .collect()
     }
 
-    /// Export tools from all available sets into a `ToolRegistry`.
+    /// Export tools from all available sets into a `ToolRegistry`, and declare
+    /// the groups each set holds back.
+    ///
+    /// The two go together because the groups name tools that only exist once
+    /// the set is exported: declaring with nothing exported would hide nothing,
+    /// and exporting without declaring would offer everything, which is what
+    /// this replaces. A tool in a closed group is still callable by name; what
+    /// is withheld is its schema in the advertisement.
     pub fn export_to_tool_registry(
         &self,
         registry: &mut ToolRegistry,
         strategy: ToolConflictStrategy,
     ) {
-        let mut seen = HashSet::new();
+        let sets = self.available_sets();
+        Self::export_sets(&sets, registry, strategy);
+        registry.declare_tiers(&sets);
+    }
 
-        for set in self.available_sets() {
+    fn export_sets(
+        sets: &[&dyn PlatformToolSet],
+        registry: &mut ToolRegistry,
+        strategy: ToolConflictStrategy,
+    ) {
+        let mut seen = HashSet::new();
+        for set in sets {
             for tool in set.tools() {
                 let name = tool.name().to_string();
                 if seen.contains(&name) {
@@ -107,29 +123,13 @@ impl PlatformCapabilityRegistry {
         max_scope: OsControlScope,
         strategy: ToolConflictStrategy,
     ) {
-        let mut seen = HashSet::new();
-
-        for set in self.available_sets() {
-            if set.scope() > max_scope {
-                continue;
-            }
-            for tool in set.tools() {
-                let name = tool.name().to_string();
-                if seen.contains(&name) {
-                    match strategy {
-                        ToolConflictStrategy::Reject => {
-                            panic!("Tool '{}' conflicts between platform tool sets", name);
-                        }
-                        ToolConflictStrategy::Override => {
-                            registry.register(tool);
-                        }
-                    }
-                } else {
-                    seen.insert(name.clone());
-                    registry.register(tool);
-                }
-            }
-        }
+        let sets: Vec<&dyn PlatformToolSet> = self
+            .available_sets()
+            .into_iter()
+            .filter(|set| set.scope() <= max_scope)
+            .collect();
+        Self::export_sets(&sets, registry, strategy);
+        registry.declare_tiers(&sets);
     }
 
     /// Clear availability cache.

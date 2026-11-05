@@ -41,6 +41,7 @@ fn tool_context() -> ToolContext {
         mobile: None,
         steers: None,
         trace: None,
+        tiering: None,
     }
 }
 

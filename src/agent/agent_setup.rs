@@ -268,10 +268,14 @@ impl Agent {
             Some(queue) => ctx.with_approval_queue(Arc::clone(queue)),
             None => ctx,
         };
-        match self.tools.ask_queue() {
+        let ctx = match self.tools.ask_queue() {
             Some(queue) => ctx.with_ask_queue(Arc::clone(queue)),
             None => ctx,
-        }
+        };
+        // The capability groups ride along the same way, so the one tool that
+        // reports them (`list_capabilities`) reads and opens the same table the
+        // registry filters its advertisement by.
+        ctx.with_tiering(self.tools.tiering())
     }
 
     /// Attach a `SessionStore` for turn persistence.

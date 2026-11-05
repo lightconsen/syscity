@@ -60,6 +60,26 @@ impl PlatformConstraints {
     }
 }
 
+/// An optional group of tools a set offers only when asked.
+///
+/// A set with twenty tools and a model that has not yet decided to use the
+/// phone is twenty schemas of prompt for no decision. The groups split them:
+/// everything in `core_tools` is offered always, and a tool named here is
+/// offered only after someone opens its group (see
+/// [`crate::tools::list_capabilities`]). What belongs together is a fact about
+/// the toolset — "locating a control", "reading a list as data" — so it is
+/// declared here rather than on each tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolGroupSpec {
+    /// Stable key the caller names when it opens the group, e.g.
+    /// `"android.locate"`.
+    pub id: &'static str,
+    /// One line for the catalog: what opening the group gives you.
+    pub about: &'static str,
+    /// The tool names in this group.
+    pub tools: &'static [&'static str],
+}
+
 /// A set of tools scoped to a specific platform / environment.
 pub trait PlatformToolSet: Send + Sync {
     /// Unique identifier, e.g. `"linux-server"`.
@@ -81,6 +101,21 @@ pub trait PlatformToolSet: Send + Sync {
 
     /// Tools provided by this set.
     fn tools(&self) -> Vec<Box<dyn Tool>>;
+
+    /// Tools offered without opening anything.
+    ///
+    /// Only meaningful together with [`tool_groups`](Self::tool_groups): this
+    /// list names the tools that must stay visible when the rest are held
+    /// back. A set that declares no groups has no tiering at all, whatever it
+    /// returns here.
+    fn core_tools(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The optional groups this set offers, each opened by name.
+    fn tool_groups(&self) -> &'static [ToolGroupSpec] {
+        &[]
+    }
 
     /// Whether this set is available on the current platform.
     fn is_available(&self) -> bool {
@@ -258,16 +293,68 @@ pub fn host_environment_summary() -> String {
 
     for set in sets {
         if set.is_available() {
-            available.push((set.id().to_string(), set.name().to_string()));
+            available.push(capability_row(set.id(), set.name(), set.tool_groups()));
         }
     }
 
     if !available.is_empty() {
         let _ = writeln!(&mut buf, "Available capabilities:");
-        for (id, name) in &available {
-            let _ = writeln!(&mut buf, "  - {} ({})", name, id);
+        for row in &available {
+            let _ = write!(&mut buf, "{row}");
         }
     }
 
     buf
+}
+
+/// One set's row in the host summary, with the groups it holds back.
+///
+/// Most of a large set is not advertised, and a model that cannot see a tool
+/// cannot ask for it. Naming the groups is what turns the tiering into a
+/// choice instead of a blind spot: the tool itself is withheld, but the fact
+/// that it exists is not.
+fn capability_row(id: &str, name: &str, groups: &[ToolGroupSpec]) -> String {
+    use std::fmt::Write;
+
+    let mut row = format!("  - {name} ({id})\n");
+    for group in groups {
+        let _ = writeln!(
+            &mut row,
+            "      · {} — {} (not advertised yet; open with \
+             `list_capabilities {{\"open\": \"{}\"}}`)",
+            group.id, group.about, group.id
+        );
+    }
+    row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_row_names_the_groups_it_holds_back() {
+        // A tool nobody advertises is only usable if something says it exists.
+        // The summary must name the groups — and the open-call that reveals
+        // them — or the tiering is a blind spot rather than a choice.
+        let android = all_known_toolsets()
+            .into_iter()
+            .find(|set| set.id() == "android")
+            .expect("the android set is always known");
+        assert!(!android.tool_groups().is_empty(), "android declares no groups");
+
+        let row = capability_row("android", "Android Device Bridge", android.tool_groups());
+        for group in android.tool_groups() {
+            assert!(row.contains(group.id), "{} missing from:\n{row}", group.id);
+            assert!(row.contains(group.about), "{} about missing", group.id);
+        }
+        assert!(row.contains("list_capabilities"), "{row}");
+    }
+
+    #[test]
+    fn a_set_with_no_groups_adds_no_lines() {
+        let row = capability_row("ios", "iOS Device Bridge", &[]);
+        assert_eq!(row.lines().count(), 1, "{row}");
+        assert!(!row.contains("list_capabilities"), "{row}");
+    }
 }

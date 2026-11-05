@@ -290,6 +290,14 @@ pub struct ToolContext {
     /// an agent turn (tests, one-off tool use), where there is no turn to
     /// trace.
     pub trace: Option<Arc<dyn TurnTrace>>,
+    /// The registry's capability tiers, for the one tool that reads and opens
+    /// them (`list_capabilities`).
+    ///
+    /// Attached by the agent that owns the registry, not carried in by the
+    /// caller: the groups are a property of this host's tool sets. `None`
+    /// outside an agent turn, where there is nothing tiered and asking would
+    /// have no subject.
+    pub tiering: Option<Arc<crate::tools::tiering::ToolTiering>>,
 }
 
 /// The part of a turn an independently-invoked tool may write to.
@@ -398,6 +406,12 @@ impl ToolContext {
     }
     pub fn plugin_allowlist(&self) -> Option<&[String]> {
         self.sandbox.plugin_allowlist.as_deref()
+    }
+
+    /// The registry's capability tiers, when this context is inside an agent
+    /// turn.
+    pub fn tiering(&self) -> Option<&crate::tools::tiering::ToolTiering> {
+        self.tiering.as_deref()
     }
 
     /// Create a new tool context
@@ -535,6 +549,13 @@ impl ToolContext {
     /// Attach the ask queue so `ask_user` can suspend for a human answer.
     pub fn with_ask_queue(mut self, queue: Arc<AskQueue>) -> Self {
         self.ask_queue = Some(queue);
+        self
+    }
+
+    /// Attach the registry's capability tiers, so `list_capabilities` can
+    /// report and open the optional tool groups.
+    pub fn with_tiering(mut self, tiering: Arc<crate::tools::tiering::ToolTiering>) -> Self {
+        self.tiering = Some(tiering);
         self
     }
 

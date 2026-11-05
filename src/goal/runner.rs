@@ -580,6 +580,7 @@ impl GoalRunner {
             .with_workspace_root(self.paths.workspace_data_dir())
             .with_model_name(model.clone())
             .with_provider_name("model_router");
+        let tool_ctx = tool_ctx.with_tiering(self.tools.tiering());
 
         for iteration in 0..MAX_TOOL_ITERATIONS {
             // Check cancellation between iterations.
@@ -748,7 +749,8 @@ impl GoalRunner {
         let tool_ctx = ToolContext::new("system", &self.id)
             .with_workspace_root(self.paths.workspace_data_dir())
             .with_model_name(model.clone())
-            .with_provider_name("model_router");
+            .with_provider_name("model_router")
+            .with_tiering(self.tools.tiering());
 
         let mut final_content: Option<String> = None;
 

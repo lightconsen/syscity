@@ -337,6 +337,7 @@ mod tests {
             mobile: None,
             steers: None,
             trace: None,
+            tiering: None,
         }
     }
 
