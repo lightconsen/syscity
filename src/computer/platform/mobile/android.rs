@@ -854,8 +854,16 @@ fn encode_tap_sequence(steps: &[(i32, i32)]) -> String {
         .join("; ")
 }
 
-/// Read a `steps` argument as a list of `{ x, y }` taps.
-fn parse_tap_steps(value: Option<&Value>) -> Result<Vec<(i64, i64)>, String> {
+/// Read a `steps` argument as a list of taps.
+///
+/// Each step is `{ x, y }` in pixels or `{ x_pct, y_pct }` in the 0–999 space
+/// (a pixel pair wins when both are given). `size` is the screen those
+/// percentages are a percentage of, and is only consulted for a step that
+/// actually names one.
+fn parse_tap_steps(
+    value: Option<&Value>,
+    size: Option<(i32, i32)>,
+) -> Result<Vec<super::coords::Point>, String> {
     let Some(Value::Array(items)) = value else {
         return Err("action 'sequence' requires a 'steps' array of { x, y } taps".to_string());
     };
@@ -877,14 +885,50 @@ fn parse_tap_steps(value: Option<&Value>) -> Result<Vec<(i64, i64)>, String> {
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let x = item.get("x").and_then(Value::as_i64);
-            let y = item.get("y").and_then(Value::as_i64);
-            match (x, y) {
-                (Some(x), Some(y)) => Ok((x, y)),
-                _ => Err(format!("step {i} needs integer 'x' and 'y'")),
+            let has = |key: &str| item.get(key).and_then(Value::as_i64).is_some();
+            // A step is one point, and both of its axes have to come from the
+            // same space. Half a pixel pair, or a pair split across the two
+            // spaces, would otherwise be read as "the missing axis is zero" —
+            // a tap at the left edge the caller never asked for.
+            let pixels = has("x") && has("y");
+            let percents = has("x_pct") && has("y_pct");
+            let partial =
+                (has("x") || has("y")) != pixels || (has("x_pct") || has("y_pct")) != percents;
+            if partial {
+                return Err(format!(
+                    "step {i} needs both of 'x' and 'y' (or both of 'x_pct' and 'y_pct')"
+                ));
             }
+            if !pixels && !percents {
+                return Err(format!("step {i} needs integer 'x' and 'y'"));
+            }
+            super::coords::resolve(item, super::coords::TAP, size)
+                .map_err(|refused| format!("step {i}: {refused}"))
         })
         .collect()
+}
+
+/// The screen a 0–999 coordinate is a fraction of.
+///
+/// A read that just happened already knows it, and that is the screen the
+/// coordinates were going to be measured against — so the dump is preferred to
+/// asking again, which for the user's screen would be a second round trip. Only
+/// when the read failed does this fall back to `wm size`, which describes the
+/// default display: a virtual display has a size of its own that `wm` does not
+/// know about, so there the honest answer is "unknown" and a percent is refused
+/// rather than converted against the wrong screen.
+pub(super) async fn coordinate_space(
+    device: &Option<String>,
+    target: Target,
+    from_dump: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
+    if let Some(size) = from_dump.filter(|(width, height)| *width > 0 && *height > 0) {
+        return Some(size);
+    }
+    match target {
+        Target::Display(_) => None,
+        Target::Screen => super::android_tools::screen_size(device, None).await,
+    }
 }
 
 /// The most taps one `sequence` may dispatch.
@@ -935,7 +979,10 @@ impl Tool for AdbInputTool {
          curved drag), and non-ASCII text is typed by pasting it — both are things `input` \
          cannot do. A tap named by `target` or `key` is pressed as a control first (an \
          accessibility action on the element itself), then as a service gesture, and only then \
-         by shell injection; the result's `via` says which was used."
+         by shell injection; the result's `via` says which was used. Every coordinate \
+         argument also takes a 0–999 form (`x_pct` / `y_pct`, `x2_pct` / `y2_pct`): \
+         pixels still win when both are given, and the result's `coordinates` reports \
+         both spaces, so a point measured on one screen can be reused on another."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -964,14 +1011,15 @@ impl Tool for AdbInputTool {
                 },
                 "steps": {
                     "type": "array",
-                    "description": "For 'sequence': taps to dispatch back to back in one call, for a control that will auto-fade before your next turn. Each is { \"x\": int, \"y\": int }.",
+                    "description": "For 'sequence': taps to dispatch back to back in one call, for a control that will auto-fade before your next turn. Each is { \"x\": int, \"y\": int } in pixels, or { \"x_pct\": int, \"y_pct\": int } in the 0–999 space.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "x": { "type": "integer" },
-                            "y": { "type": "integer" }
-                        },
-                        "required": ["x", "y"]
+                            "y": { "type": "integer" },
+                            "x_pct": { "type": "integer", "minimum": 0, "maximum": 999 },
+                            "y_pct": { "type": "integer", "minimum": 0, "maximum": 999 }
+                        }
                     }
                 },
                 "target": {
@@ -990,10 +1038,34 @@ impl Tool for AdbInputTool {
                     "type": "string",
                     "description": "The `snapshot` of the read the reference came from. Optional; when the live read has a different snapshot the reference is still resolved by key, and the result says the screen had changed."
                 },
-                "x": { "type": "integer", "description": "X coordinate (tap/swipe). No safety net — prefer `target`." },
-                "y": { "type": "integer", "description": "Y coordinate (tap/swipe). No safety net — prefer `target`." },
-                "x2": { "type": "integer", "description": "End X (swipe)" },
-                "y2": { "type": "integer", "description": "End Y (swipe)" },
+                "x": { "type": "integer", "description": "X coordinate in pixels (tap/swipe). No safety net — prefer `target`. A pixel always wins over `x_pct`." },
+                "y": { "type": "integer", "description": "Y coordinate in pixels (tap/swipe). No safety net — prefer `target`." },
+                "x2": { "type": "integer", "description": "End X in pixels (swipe)" },
+                "y2": { "type": "integer", "description": "End Y in pixels (swipe)" },
+                "x_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "X as 0–999 across the screen (tap/swipe/sequence): 0 is the left edge, 999 the right. Use it when you know where on the screen something is but not the screen's size — including the far end of a swipe when sent as `x2_pct`."
+                },
+                "y_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "Y as 0–999 down the screen (tap/swipe/sequence): 0 is the top edge, 999 the bottom."
+                },
+                "x2_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "End X as 0–999 (swipe)."
+                },
+                "y2_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "End Y as 0–999 (swipe)."
+                },
                 "text": { "type": "string", "description": "Text to type" },
                 "keycode": { "type": "string", "description": "Android keycode name or number" },
                 "verify": {
@@ -1052,11 +1124,15 @@ impl Tool for AdbInputTool {
         // the action opened.
         let mut before_package: Option<String> = None;
         let mut before_snapshot: Option<String> = None;
+        // The screen the read saw, kept for the 0–999 coordinate space: a
+        // percent argument is a percent *of this*, and it is already in hand.
+        let mut before_screen: Option<(i32, i32)> = None;
         let pointed_at_an_element = args.get("target").is_some() || args.get("key").is_some();
         let mut before = match dump_ui(&device, target).await {
             Ok(dump) => {
                 before_package = dump.package;
                 before_snapshot = Some(dump.snapshot);
+                before_screen = dump.screen;
                 Some(dump.elements)
             }
             Err(failed) => {
@@ -1083,6 +1159,7 @@ impl Tool for AdbInputTool {
                 Ok(dump) if dump.package == before_package => {
                     before_package = dump.package;
                     before_snapshot = Some(dump.snapshot);
+                    before_screen = dump.screen;
                     before = Some(dump.elements);
                 }
                 Ok(dump) => {
@@ -1163,6 +1240,19 @@ impl Tool for AdbInputTool {
         // the approval re-check run before anything leaves this process.
         let mut pressed: Option<(Via, (i32, i32))> = None;
         let mut press_target: Option<UiElement> = None;
+        // The screen a 0–999 coordinate is a fraction of. The read above already
+        // knows it on every path that produced one, so a percent costs nothing
+        // extra; only a caller that actually used a percent on a screen whose
+        // read failed pays for the `wm size` fallback. Asked only for the three
+        // actions that take a point: a `_pct` key beside a `text` action is not
+        // a coordinate and must not buy a round trip.
+        let screen = if matches!(action, "tap" | "swipe" | "sequence")
+            && super::coords::uses_percent(&args)
+        {
+            coordinate_space(&device, target, before_screen).await
+        } else {
+            before_screen
+        };
         let op = match action {
             "tap" => {
                 if let Some(key) = args
@@ -1219,23 +1309,28 @@ impl Tool for AdbInputTool {
                         }
                         // Raw coordinates: no safety net, the caller is on its own.
                         None => {
-                            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-                            InputOp::Taps(vec![(
-                                i32::try_from(x).unwrap_or(0),
-                                i32::try_from(y).unwrap_or(0),
-                            )])
+                            let point =
+                                match super::coords::resolve(&args, super::coords::TAP, screen) {
+                                    Ok(point) => point,
+                                    Err(refused) => return Ok(ToolExecutionResult::error(refused)),
+                                };
+                            InputOp::Taps(vec![point.pixels()])
                         }
                     }
                 }
             }
             "swipe" => {
-                let value = |key: &str| {
-                    i32::try_from(args.get(key).and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0)
-                };
-                InputOp::Swipe {
-                    from: (value("x"), value("y")),
-                    to: (value("x2"), value("y2")),
+                match (
+                    super::coords::resolve(&args, super::coords::TAP, screen),
+                    super::coords::resolve(&args, super::coords::END, screen),
+                ) {
+                    (Ok(from), Ok(to)) => InputOp::Swipe {
+                        from: from.pixels(),
+                        to: to.pixels(),
+                    },
+                    (Err(refused), _) | (_, Err(refused)) => {
+                        return Ok(ToolExecutionResult::error(refused))
+                    }
                 }
             }
             "text" => {
@@ -1247,15 +1342,8 @@ impl Tool for AdbInputTool {
                 }
                 InputOp::Text(text.to_string())
             }
-            "sequence" => match parse_tap_steps(args.get("steps")) {
-                Ok(steps) => InputOp::Taps(
-                    steps
-                        .into_iter()
-                        .map(|(x, y)| {
-                            (i32::try_from(x).unwrap_or(0), i32::try_from(y).unwrap_or(0))
-                        })
-                        .collect(),
-                ),
+            "sequence" => match parse_tap_steps(args.get("steps"), screen) {
+                Ok(steps) => InputOp::Taps(steps.iter().map(|point| point.pixels()).collect()),
                 Err(msg) => return Ok(ToolExecutionResult::error(msg)),
             },
             "key" => InputOp::Key(normalize_keycode(
@@ -1605,6 +1693,22 @@ impl Tool for AdbInputTool {
         };
 
         let serial = resolved_serial(&device).await;
+        // Where the finger actually went, in both spaces. A caller that sent a
+        // percent gets its own step back; one that sent pixels — or pointed at
+        // an element — gets the percent that names that pixel, which is what
+        // makes a coordinate reusable on a screen of another size. A sequence
+        // is several taps and is not described here: its own steps were already
+        // coordinates, and reporting only the first would name one of N.
+        let coordinates = match &op {
+            InputOp::Taps(points) if points.len() == 1 => {
+                super::coords::from_pixels(points[0].0, points[0].1, screen).json()
+            }
+            InputOp::Swipe { from, to } => serde_json::json!({
+                "from": super::coords::from_pixels(from.0, from.1, screen).json(),
+                "to": super::coords::from_pixels(to.0, to.1, screen).json(),
+            }),
+            _ => Value::Null,
+        };
         if !verify {
             // No re-read was asked for, so the screen did not move as far as
             // this call knows — recorded as unknown, which the ladder does not
@@ -1638,6 +1742,7 @@ impl Tool for AdbInputTool {
                 "device": serial,
                 "effect": "unverified",
                 "via": via.map(Via::as_str),
+                "coordinates": coordinates,
                 "risk": clearance.note(),
                 "risk_approved": clearance.asked,
                 "paced": pace_note,
@@ -1802,6 +1907,7 @@ impl Tool for AdbInputTool {
             })),
             "risk": clearance.note(),
             "risk_approved": clearance.asked,
+            "coordinates": coordinates,
             "paced": pace_note,
             "reference_moved": snapshot_note.is_some(),
             "guard": ladder.note(),
@@ -5898,23 +6004,38 @@ mod tests {
     #[test]
     fn steps_parse_from_the_argument() {
         let args = serde_json::json!([{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }]);
-        assert_eq!(parse_tap_steps(Some(&args)).unwrap(), vec![(1, 2), (3, 4)]);
+        let steps = parse_tap_steps(Some(&args), None).unwrap();
+        assert_eq!(steps.iter().map(|p| p.pixels()).collect::<Vec<_>>(), vec![(1, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn steps_may_name_percents() {
+        // A sequence written for a screen the caller has not measured: each
+        // step is a fraction of whatever is there.
+        let args = serde_json::json!([{ "x_pct": 500, "y_pct": 0 }, { "x_pct": 0, "y_pct": 999 }]);
+        let steps = parse_tap_steps(Some(&args), Some((1080, 2400))).unwrap();
+        assert_eq!(steps.iter().map(|p| p.pixels()).collect::<Vec<_>>(), vec![(540, 0), (0, 2399)]);
+        // The same steps on an unsized screen are refused, not guessed at.
+        let refused = parse_tap_steps(Some(&args), None).unwrap_err();
+        assert!(refused.contains("step 0"), "{refused}");
     }
 
     #[test]
     fn malformed_steps_are_rejected_with_a_reason() {
-        assert!(parse_tap_steps(None)
+        assert!(parse_tap_steps(None, None)
             .unwrap_err()
             .contains("requires a 'steps' array"));
-        assert!(parse_tap_steps(Some(&serde_json::json!([])))
+        assert!(parse_tap_steps(Some(&serde_json::json!([])), None)
             .unwrap_err()
             .contains("at least one"));
         let missing_y = serde_json::json!([{ "x": 1 }]);
-        assert!(parse_tap_steps(Some(&missing_y))
-            .unwrap_err()
-            .contains("step 0"));
-        let wrong_type = serde_json::json!([{ "x": "1", "y": 2 }]);
-        assert!(parse_tap_steps(Some(&wrong_type)).is_err());
+        let error = parse_tap_steps(Some(&missing_y), None).unwrap_err();
+        assert!(error.contains("step 0"), "{error}");
+        // A half-named percent is caught by the same rule as a half-named pixel
+        // pair rather than silently starting at zero.
+        let only_y = serde_json::json!([{ "y_pct": 5 }]);
+        let error = parse_tap_steps(Some(&only_y), Some((1080, 2400))).unwrap_err();
+        assert!(error.contains("step 0"), "{error}");
     }
 
     /// A binary payload must survive as bytes.

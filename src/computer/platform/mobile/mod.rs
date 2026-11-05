@@ -11,6 +11,7 @@ pub mod a11y;
 pub mod android;
 pub mod android_tools;
 pub mod coldstart;
+pub mod coords;
 pub mod diagnose;
 pub mod diff;
 pub mod display;

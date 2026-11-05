@@ -45,7 +45,10 @@ impl Direction {
 }
 
 /// The device's screen size, from the dump or from `wm size`.
-async fn screen_size(device: &Option<String>, from_dump: Option<(i32, i32)>) -> Option<(i32, i32)> {
+pub(super) async fn screen_size(
+    device: &Option<String>,
+    from_dump: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
     if let Some(size) = from_dump {
         return Some(size);
     }
@@ -670,6 +673,13 @@ impl Tool for AdbFindTool {
                 ))
                 .with_data(serde_json::json!({
                     "found": found,
+                    // The screen the centre is a point of, so the caller can
+                    // name it in the 0–999 space — which is what keeps a
+                    // coordinate usable on a screen of another size.
+                    "screen": size.map(|(width, height)| serde_json::json!({
+                        "width": width,
+                        "height": height,
+                    })),
                     "scrolls": step,
                     "device": resolved_serial(&device).await,
                 })));
@@ -1791,7 +1801,9 @@ impl Tool for AdbDisplayTool {
          when the person is using it on their own screen; the result's `cold_start` says which \
          happened and `opened` says what came to the top (the app, a chooser, or something else). \
          `frame` returns a PNG of that display. This needs the Syscity app running on the phone; \
-         a desktop controlling a remote device has no second screen to offer."
+         a desktop controlling a remote device has no second screen to offer. Coordinate \
+         arguments also take a 0–999 form (`x_pct` / `y_pct` / `x2_pct` / `y2_pct`) measured \
+         against this display; pixels still win when both are given."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1816,10 +1828,34 @@ impl Tool for AdbDisplayTool {
                 },
                 "width": { "type": "integer", "description": "start: display width (default 1080)." },
                 "height": { "type": "integer", "description": "start: display height (default 2400)." },
-                "x": { "type": "integer", "description": "tap / swipe start X." },
-                "y": { "type": "integer", "description": "tap / swipe start Y." },
-                "x2": { "type": "integer", "description": "swipe end X." },
-                "y2": { "type": "integer", "description": "swipe end Y." },
+                "x": { "type": "integer", "description": "tap / swipe start X, in pixels. A pixel wins over `x_pct`." },
+                "y": { "type": "integer", "description": "tap / swipe start Y, in pixels." },
+                "x2": { "type": "integer", "description": "swipe end X, in pixels." },
+                "y2": { "type": "integer", "description": "swipe end Y, in pixels." },
+                "x_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "tap / swipe start X as 0–999 across this display (0 left, 999 right), when its size is not known to the caller. The size is read from the display itself."
+                },
+                "y_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "tap / swipe start Y as 0–999 down this display."
+                },
+                "x2_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "swipe end X as 0–999."
+                },
+                "y2_pct": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 999,
+                    "description": "swipe end Y as 0–999."
+                },
                 "duration": { "type": "integer", "description": "swipe duration in ms (default 300)." },
                 "text": { "type": "string", "description": "text to type on the display." },
                 "keycode": { "type": "string", "description": "key to press, e.g. BACK or ENTER." },
@@ -1987,14 +2023,51 @@ impl Tool for AdbDisplayTool {
         // the coordinates alone say nothing.
         let mut before_package: Option<String> = None;
         let mut before_fingerprint: Option<u64> = None;
-        let tap_point = (
-            i32::try_from(args.get("x").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0),
-            i32::try_from(args.get("y").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or(0),
-        );
+        // A 0–999 point is a fraction of *this* display, whose size the phone's
+        // `wm size` does not describe — it describes the user's screen. The
+        // size comes from the display's own tree, read once here and kept: a
+        // tap needs that read anyway for the risk classification below.
+        let needs_size = super::coords::uses_percent(&args);
+        let early = if needs_size && matches!(action, "tap" | "swipe") {
+            match super::android::dump_ui(&device, Target::Display(id)).await {
+                Ok(dump) => Some(dump),
+                Err(failed) => {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "Refused: this write names a point in the 0–999 space, which needs \
+                         display {id}'s size, and the display could not be read ({}). Nothing \
+                         was done. Pass `x` / `y` in pixels instead.",
+                        failed.message
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+        let display_size = early.as_ref().and_then(|dump| dump.screen);
+        // Only `tap` and `swipe` take a point; every other action's `x` is not
+        // a coordinate and must not be read as one.
+        let (tap_point, swipe_end) = if matches!(action, "tap" | "swipe") {
+            let tap = match super::coords::resolve(&args, super::coords::TAP, display_size) {
+                Ok(point) => point,
+                Err(refused) => return Ok(ToolExecutionResult::error(refused)),
+            };
+            let end = match super::coords::resolve(&args, super::coords::END, display_size) {
+                Ok(point) => point,
+                Err(refused) => return Ok(ToolExecutionResult::error(refused)),
+            };
+            (tap, end)
+        } else {
+            (super::coords::Point::default(), super::coords::Point::default())
+        };
+        let tap_pixels = tap_point.pixels();
         let clearance = match action {
             "tap" => {
-                let (x, y) = tap_point;
-                let offer = match super::android::dump_ui(&device, Target::Display(id)).await {
+                let (x, y) = tap_pixels;
+                let read = match early {
+                    Some(dump) => Ok(dump),
+                    None => super::android::dump_ui(&device, Target::Display(id)).await,
+                };
+                let offer = match read {
                     Ok(dump) => {
                         before_package = dump.package;
                         before_fingerprint = Some(super::android::tree_fingerprint(&dump.elements));
@@ -2059,7 +2132,7 @@ impl Tool for AdbDisplayTool {
                     )))
                 }
             };
-            let now = super::risk::classify_point(&fresh.elements, tap_point.0, tap_point.1);
+            let now = super::risk::classify_point(&fresh.elements, tap_pixels.0, tap_pixels.1);
             if let Err(withheld) =
                 super::gate::verify(&clearance, now.as_ref(), fresh.package.as_deref())
             {
@@ -2191,10 +2264,14 @@ impl Tool for AdbDisplayTool {
         let reads_only =
             matches!(action, "frame" | "status" | "limits" | "stop" | "mute" | "sound");
         let signature = match action {
-            "tap" => format!("tap@{}:{}", tap_point.0, tap_point.1),
+            "tap" => format!("tap@{}:{}", tap_pixels.0, tap_pixels.1),
             "swipe" => {
-                let value = |key: &str| args.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-                format!("swipe@{}:{}>{}:{}", value("x"), value("y"), value("x2"), value("y2"))
+                // The *resolved* pixels, not the arguments: two swipes written
+                // one in each space are the same gesture, and a percent swipe
+                // must not read as `swipe@0:0>0:0` to the ladder.
+                let (x, y) = tap_pixels;
+                let (x2, y2) = swipe_end.pixels();
+                format!("swipe@{x}:{y}>{x2}:{y2}")
             }
             "text" => {
                 let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -2304,10 +2381,9 @@ impl Tool for AdbDisplayTool {
                 Err(failed) => Err(failed),
             },
             "tap" => {
-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                let (x, y) = tap_pixels;
                 display
-                    .tap(i32::try_from(x).unwrap_or(0), i32::try_from(y).unwrap_or(0))
+                    .tap(x, y)
                     .await
                     .map(|_| format!("Tapped ({x}, {y}) on display {id}."))
             }
@@ -2317,17 +2393,7 @@ impl Tool for AdbDisplayTool {
                 };
                 let duration = u32::try_from(value("duration", 300).max(1)).unwrap_or(300);
                 display
-                    .swipe(
-                        (
-                            i32::try_from(value("x", 0)).unwrap_or(0),
-                            i32::try_from(value("y", 0)).unwrap_or(0),
-                        ),
-                        (
-                            i32::try_from(value("x2", 0)).unwrap_or(0),
-                            i32::try_from(value("y2", 0)).unwrap_or(0),
-                        ),
-                        duration,
-                    )
+                    .swipe(tap_pixels, swipe_end.pixels(), duration)
                     .await
                     .map(|_| format!("Swiped on display {id}."))
             }
@@ -2468,6 +2534,17 @@ impl Tool for AdbDisplayTool {
                     }),
                     "risk": clearance.note(),
                     "risk_approved": clearance.asked,
+                    // Where the write landed, in both spaces, for the actions
+                    // that have a point. Absent for the rest rather than
+                    // reporting an origin nothing touched.
+                    "coordinates": match action {
+                        "tap" => tap_point.json(),
+                        "swipe" => serde_json::json!({
+                            "from": tap_point.json(),
+                            "to": swipe_end.json(),
+                        }),
+                        _ => serde_json::Value::Null,
+                    },
                     "paced": pace_note,
                     "guard": ladder.note(),
                 }))
@@ -2808,6 +2885,62 @@ fn step_args(device: &Option<String>, display: Option<i64>) -> serde_json::Map<S
     args
 }
 
+/// One point a run step names, in pixels.
+///
+/// A step written in the 0–999 space is a fraction of the screen the step acts
+/// on, and that screen has to be read to learn its size. The caller does that
+/// read once per step (see [`step_coordinate_space`]) and passes it in, so a
+/// swipe's two ends share one read rather than paying for one each.
+fn adopted_point(
+    command: &Value,
+    keys: super::coords::Keys,
+    size: Option<(i32, i32)>,
+) -> Result<(i32, i32), StepError> {
+    let names_point = [keys.x, keys.y, keys.x_pct, keys.y_pct]
+        .iter()
+        .any(|key| command.get(*key).is_some());
+    if !names_point {
+        // The step named no point at all. `coords::resolve` would answer the
+        // origin, but a swipe written without one is a mistake, not a zero.
+        return Err(StepError::new(
+            STOP_FAILED,
+            format!(
+                "swipe needs `{}` / `{}` (or `{}` / `{}`)",
+                keys.x, keys.y, keys.x_pct, keys.y_pct
+            ),
+        ));
+    }
+    super::coords::resolve(command, keys, size)
+        .map(|point| point.pixels())
+        .map_err(|refused| StepError::new(STOP_FAILED, refused))
+}
+
+/// The screen a step's 0–999 points are a fraction of, when it names any.
+///
+/// `None` for a step that stays in pixels: it costs no read, which is what
+/// keeps every existing `android_run` step exactly as cheap as it was. A step
+/// that does name a percent pays for one read — the size is not obtainable any
+/// other way for a virtual display, and `wm size` describes the wrong screen.
+async fn step_coordinate_space(
+    command: &Value,
+    target: Target,
+    device: &Option<String>,
+) -> Result<Option<(i32, i32)>, StepError> {
+    if !super::coords::uses_percent(command) {
+        return Ok(None);
+    }
+    let dump = dump_ui(device, target).await.map_err(|failure| {
+        StepError::new(
+            STOP_FAILED,
+            format!(
+                "could not read the screen to turn the 0–999 point into pixels: {}",
+                failure.message
+            ),
+        )
+    })?;
+    Ok(super::android::coordinate_space(device, target, dump.screen).await)
+}
+
 /// Run one delegated tool and turn a refusal into a step error.
 async fn call_tool(
     result: crate::Result<ToolExecutionResult>,
@@ -2996,14 +3129,17 @@ async fn run_step(
             Ok(effect_of(&result))
         }
         "swipe" => {
+            // The step's own points may be a percent of the screen the step is
+            // acting on; the size is read once and shared by both ends.
+            let space = step_coordinate_space(command, target, device).await?;
+            let from = adopted_point(command, super::coords::TAP, space)?;
+            let to = adopted_point(command, super::coords::END, space)?;
             let mut args = step_args(device, display);
             args.insert("action".to_string(), Value::String("swipe".to_string()));
-            for key in ["x", "y", "x2", "y2"] {
-                let value = command.get(key).and_then(Value::as_i64).ok_or_else(|| {
-                    StepError::new(STOP_FAILED, format!("swipe needs integer `{key}`"))
-                })?;
-                args.insert(key.to_string(), Value::Number(value.into()));
-            }
+            args.insert("x".to_string(), Value::Number(from.0.into()));
+            args.insert("y".to_string(), Value::Number(from.1.into()));
+            args.insert("x2".to_string(), Value::Number(to.0.into()));
+            args.insert("y2".to_string(), Value::Number(to.1.into()));
             let result = call_tool(
                 input_tool(device)
                     .execute(Value::Object(args), context)
@@ -3388,10 +3524,34 @@ impl Tool for AdbRunTool {
                                 "type": "integer",
                                 "description": "For 'scroll': how many screenfuls (default 1, max 20)."
                             },
-                            "x": { "type": "integer", "description": "For 'swipe': start x." },
-                            "y": { "type": "integer", "description": "For 'swipe': start y." },
-                            "x2": { "type": "integer", "description": "For 'swipe': end x." },
-                            "y2": { "type": "integer", "description": "For 'swipe': end y." },
+                            "x": { "type": "integer", "description": "For 'swipe': start x, in pixels." },
+                            "y": { "type": "integer", "description": "For 'swipe': start y, in pixels." },
+                            "x2": { "type": "integer", "description": "For 'swipe': end x, in pixels." },
+                            "y2": { "type": "integer", "description": "For 'swipe': end y, in pixels." },
+                            "x_pct": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 999,
+                                "description": "For 'swipe': start x as 0–999 across the screen, when its size is not known."
+                            },
+                            "y_pct": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 999,
+                                "description": "For 'swipe': start y as 0–999 down the screen."
+                            },
+                            "x2_pct": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 999,
+                                "description": "For 'swipe': end x as 0–999."
+                            },
+                            "y2_pct": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 999,
+                                "description": "For 'swipe': end y as 0–999."
+                            },
                             "keycode": {
                                 "type": "string",
                                 "description": "For 'key': the Android keycode name, e.g. ENTER."
@@ -7474,5 +7634,58 @@ mod readiness_tests {
     fn no_displays_says_so_rather_than_nothing() {
         let text = describe_readiness(&state(false, Vec::new()));
         assert!(text.contains("No displays are open"), "{text}");
+    }
+
+    // ── Run steps in the 0–999 space ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_run_swipe_without_a_point_is_refused_before_any_read() {
+        // No `adb` here, and none is needed: the refusal happens before the
+        // step is allowed to reach the screen at all.
+        let error = adopted_point(&serde_json::json!({}), super::super::coords::TAP, None)
+            .expect_err("no point");
+        assert_eq!(error.code, STOP_FAILED);
+        assert!(error.detail.contains("x_pct"), "{}", error.detail);
+    }
+
+    #[tokio::test]
+    async fn a_run_swipe_in_pixels_is_taken_as_given() {
+        // The pixel path never asks for a size, so a run step keeps working —
+        // and keeps costing what it did — on a phone with no read to spare.
+        assert!(step_coordinate_space(
+            &serde_json::json!({ "x": 1, "y": 2 }),
+            Target::Screen,
+            &None
+        )
+        .await
+        .expect("no percent, no read")
+        .is_none());
+        let point = adopted_point(
+            &serde_json::json!({ "x2": 300, "y2": 40 }),
+            super::super::coords::END,
+            None,
+        )
+        .expect("pixels");
+        assert_eq!(point, (300, 40));
+    }
+
+    #[tokio::test]
+    async fn a_run_swipe_percent_needs_a_screen_and_a_failed_read_says_so() {
+        // A percent step pays for one read, and when there is no phone to ask
+        // the step says that rather than converting against a guessed size.
+        let error =
+            step_coordinate_space(&serde_json::json!({ "x_pct": 500 }), Target::Screen, &None)
+                .await
+                .expect_err("no screen to read");
+        assert_eq!(error.code, STOP_FAILED);
+        assert!(error.detail.contains("0–999"), "{}", error.detail);
+        // With nothing to convert against, the point is refused, not zeroed.
+        let error = adopted_point(
+            &serde_json::json!({ "x_pct": 500, "y_pct": 500 }),
+            super::super::coords::TAP,
+            None,
+        )
+        .expect_err("no size");
+        assert!(error.detail.contains("pixels"), "{}", error.detail);
     }
 }
