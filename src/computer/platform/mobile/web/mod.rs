@@ -473,10 +473,11 @@ impl AdbWebTool {
 
         let signature = format!("web:click:{}", element.name);
         let guard_key = super::guard::Guard::bucket_key(&context.conversation_id, "web");
-        if let super::guard::Verdict::Refuse(reason) =
-            super::guard::Guard::global().check(&guard_key, &signature)
+        if let Some(reason) = super::guard::Guard::global()
+            .check(&guard_key, &signature)
+            .refusal()
         {
-            return ToolExecutionResult::error(reason);
+            return ToolExecutionResult::error(reason.to_string());
         }
 
         let pressed = match call(bridge, json!({ "op": "click", "index": index })).await {

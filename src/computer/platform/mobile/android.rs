@@ -455,6 +455,80 @@ fn ladder_note(verdict: &super::guard::Verdict) -> Option<String> {
     verdict.note().map(str::to_string)
 }
 
+/// The guard bucket a read tool is counted in.
+///
+/// The same key shape the write tools use, so a read and a tap on one phone
+/// are counted together: reading a screen the task is stuck on is part of the
+/// same loop, and a separate bucket would let it run forever.
+pub(super) fn guard_key_for(context: &ToolContext, device: Option<&str>, target: Target) -> String {
+    super::guard::Guard::bucket_key(
+        &context.conversation_id,
+        &format!("{}:{}", device.unwrap_or("-"), target.display_id()),
+    )
+}
+
+/// Record a read of the screen and return the note to attach to its result.
+///
+/// `content` is the screen's fingerprint: the same one twice means the screen
+/// has not moved under the reader, which is the signal that reading it again
+/// cannot answer a new question. An empty read has no fingerprint — one that
+/// saw nothing is not a read of an unchanged screen.
+pub(super) fn read_note(key: &str, tool: &str, elements: &[UiElement]) -> Option<String> {
+    let content = (!elements.is_empty()).then(|| tree_fingerprint(elements));
+    super::guard::Guard::global().record_read(key, tool, content)
+}
+
+/// [`read_note`] for a read that came back as OCR lines rather than a tree.
+pub(super) fn read_note_ocr(key: &str, tool: &str, lines: &[OcrLine]) -> Option<String> {
+    let content = (!lines.is_empty()).then(|| ocr_fingerprint(lines));
+    super::guard::Guard::global().record_read(key, tool, content)
+}
+
+/// A fingerprint of what OCR read, so "the same screen" can be recognised
+/// without the tree.
+///
+/// Only the text is hashed, not the coordinates: the same words in the same
+/// order are the same screen to a reader, and a one-pixel shift in where a line
+/// was boxed is not a change worth spending a turn on.
+fn ocr_fingerprint(lines: &[OcrLine]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in lines {
+        std::hash::Hash::hash(&line.text.trim(), &mut hasher);
+    }
+    std::hash::Hasher::finish(&hasher)
+}
+
+/// A result's text with the ladder's note appended, when there is one.
+pub(super) fn with_note(text: String, note: Option<String>) -> String {
+    match note {
+        Some(note) => format!("{text} {note}"),
+        None => text,
+    }
+}
+
+/// Record a failed action and return the note to append to its error.
+///
+/// `recoverable` is whether retrying the same call could work: a dispatch the
+/// shell refused or a temporary ADB fault can, a missing capability cannot. The
+/// ladder turns a run of these into a note, then a refusal on the *next* call —
+/// a model that keeps re-issuing a call that keeps failing is the one loop with
+/// no screen to see it in.
+///
+/// The note is attached to the error rather than only to the next result: the
+/// model is looking at this failure now, which is the moment the ladder has
+/// something to say. The refusal is left to `check`, where it can stop the call
+/// before it runs.
+pub(super) fn note_failure(key: &str, signature: &str, recoverable: bool) -> Option<String> {
+    let ladder = super::guard::Guard::global();
+    ladder.record_failure(key, recoverable);
+    ladder.check(key, signature).note().map(str::to_string)
+}
+
+/// Record that an action worked, ending any failure streak on this target.
+pub(super) fn note_success(key: &str) {
+    super::guard::Guard::global().record_success(key);
+}
+
 // ── ADB Observe Tool ───────────────────────────────────────────────────────
 
 /// Screenshot **and** UI tree from one call, with the coordinate space made
@@ -521,7 +595,7 @@ impl Tool for AdbObserveTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         // Resolved before the lock, because the lock is the device: a call that
         // names a serial does not wait for one that names another.
@@ -534,6 +608,15 @@ impl Tool for AdbObserveTool {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
+        // Refused before the capture: at this point the answer is one the model
+        // already has, and a screenshot is the most expensive read there is.
+        let guard_key = guard_key_for(context, device.as_deref(), target);
+        if let Some(reason) = super::guard::Guard::global()
+            .check_read(&guard_key, "android_observe")
+            .refusal()
+        {
+            return Ok(ToolExecutionResult::error(reason.to_string()));
+        }
         let since = super::diff::since_arg(&args).map(str::to_string);
         let png = match capture_png(&device, target).await {
             Ok(png) => png,
@@ -616,9 +699,11 @@ impl Tool for AdbObserveTool {
                 serde_json::json!(coordinate_space_consistent(dump.screen, shot));
             data["source"] = serde_json::json!(dump.source);
             data["device"] = serde_json::json!(resolved_serial(&device).await);
-            return Ok(ToolExecutionResult::success(text).with_data(data));
+            let note = read_note(&guard_key, "android_observe", &dump.elements);
+            return Ok(ToolExecutionResult::success(with_note(text, note)).with_data(data));
         }
         let consistent = coordinate_space_consistent(dump.screen, shot);
+        let note = read_note(&guard_key, "android_observe", &dump.elements);
 
         let quality = assess_tree(&dump.elements);
         let mut summary = format_ui_summary(&dump.elements);
@@ -674,7 +759,7 @@ impl Tool for AdbObserveTool {
             data["fallback"] = note["fallback"].clone();
             summary.push_str(&format!("\n\n{}", reason.describe()));
         }
-        Ok(ToolExecutionResult::success(summary).with_data(data))
+        Ok(ToolExecutionResult::success(with_note(summary, note)).with_data(data))
     }
 }
 
@@ -1441,8 +1526,8 @@ impl Tool for AdbInputTool {
             &format!("{}:{}", device.as_deref().unwrap_or("-"), target.display_id()),
         );
         let ladder = super::guard::Guard::global().check(&guard_key, &signature);
-        if let super::guard::Verdict::Refuse(reason) = &ladder {
-            return Ok(ToolExecutionResult::error(reason.clone()));
+        if let Some(reason) = ladder.refusal() {
+            return Ok(ToolExecutionResult::error(reason.to_string()));
         }
 
         let clearance = match &op {
@@ -1728,8 +1813,10 @@ impl Tool for AdbInputTool {
                                     cause: Some(Box::new(e)),
                                 })?;
                         if !status.success() {
-                            return Ok(ToolExecutionResult::error(format!(
-                                "adb input failed: {stderr}"
+                            let note = note_failure(&guard_key, &signature, true);
+                            return Ok(ToolExecutionResult::error(with_note(
+                                format!("adb input failed: {stderr}"),
+                                note,
                             )));
                         }
                     }
@@ -1745,7 +1832,8 @@ impl Tool for AdbInputTool {
                         // paste carries whatever the app can render, and puts
                         // the user's own clipboard back afterwards.
                         if let Err(message) = paste_on_display(id, text).await {
-                            return Ok(ToolExecutionResult::error(message));
+                            let note = note_failure(&guard_key, &signature, true);
+                            return Ok(ToolExecutionResult::error(with_note(message, note)));
                         }
                         pasted = true;
                     }
@@ -1754,7 +1842,8 @@ impl Tool for AdbInputTool {
                 // sent again, and a pasted text is already in.
                 if !pasted && pressed.is_none() {
                     if let Err(message) = dispatch_display(id, &op).await {
-                        return Ok(ToolExecutionResult::error(message));
+                        let note = note_failure(&guard_key, &signature, true);
+                        return Ok(ToolExecutionResult::error(with_note(message, note)));
                     }
                 }
                 pasted
@@ -1900,8 +1989,17 @@ impl Tool for AdbInputTool {
 
         // The ladder learns what this did. It counts the screen's answer, not
         // the action's: three different taps that all leave the same screen are
-        // one stuck screen, and the streak is what says so.
-        super::guard::Guard::global().record(&guard_key, &signature, guard_outcome(settle.effect));
+        // one stuck screen, and the streak is what says so. The screen it left
+        // is the frame — without one, a model wandering through the same two
+        // screens is invisible. An unread tree is not a frame, so nothing is
+        // claimed about where the task is.
+        let outcome = guard_outcome(settle.effect);
+        let frame = (!settle.elements.is_empty()).then(|| tree_fingerprint(&settle.elements));
+        super::guard::Guard::global().record_with(&guard_key, &signature, outcome, frame);
+        // The action reached the phone. Whether it did what was asked is what
+        // the settle decided; the failure ladder counts calls that never got
+        // that far.
+        note_success(&guard_key);
 
         let mut text = format!("Input '{action}' sent. {}", settle.verdict());
         if let Some(note) = via.and_then(Via::note) {
@@ -5169,7 +5267,7 @@ impl Tool for AdbUiTreeTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
@@ -5182,6 +5280,16 @@ impl Tool for AdbUiTreeTool {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
+        // Reading the same unchanged screen over and over is the read-side
+        // loop, and it is refused before the ADB round trip rather than after:
+        // the answer would be the one the model already has.
+        let guard_key = guard_key_for(context, device.as_deref(), target);
+        if let Some(reason) = super::guard::Guard::global()
+            .check_read(&guard_key, "android_ui_tree")
+            .refusal()
+        {
+            return Ok(ToolExecutionResult::error(reason.to_string()));
+        }
         let since = super::diff::since_arg(&args).map(str::to_string);
         let dump = match dump_ui(&device, target).await {
             Ok(dump) => dump,
@@ -5190,6 +5298,7 @@ impl Tool for AdbUiTreeTool {
                     .with_data(serde_json::json!({ "code": failure.code })))
             }
         };
+        let note = read_note(&guard_key, "android_ui_tree", &dump.elements);
         if let Some(answer) = since_answer(device.as_deref(), target, since.as_deref(), &dump) {
             let (text, data) = match answer {
                 SinceAnswer::Delta { text, data } => (text, data),
@@ -5202,7 +5311,7 @@ impl Tool for AdbUiTreeTool {
                     })
                 }
             };
-            return Ok(ToolExecutionResult::success(text).with_data(data));
+            return Ok(ToolExecutionResult::success(with_note(text, note)).with_data(data));
         }
         let elements = dump.elements;
         let quality = assess_tree(&elements);
@@ -5225,16 +5334,18 @@ impl Tool for AdbUiTreeTool {
                 }
             }
         }
-        Ok(ToolExecutionResult::success(summary).with_data(serde_json::json!({
-            "count": elements.len(),
-            "quality": quality.as_str(),
-            "advice": quality.advice(),
-            "ocr": ocr_text,
-            "source": dump.source,
-            "snapshot": dump.snapshot,
-            "elements": elements,
-            "device": resolved_serial(&device).await,
-        })))
+        Ok(
+            ToolExecutionResult::success(with_note(summary, note)).with_data(serde_json::json!({
+                "count": elements.len(),
+                "quality": quality.as_str(),
+                "advice": quality.advice(),
+                "ocr": ocr_text,
+                "source": dump.source,
+                "snapshot": dump.snapshot,
+                "elements": elements,
+                "device": resolved_serial(&device).await,
+            })),
+        )
     }
 }
 

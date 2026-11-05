@@ -294,24 +294,51 @@ cost with no question attached.
 
 ### The ladder in front of a repeated action
 
-An agent on a phone fails in three shapes, and they are not the same shape:
+An agent on a phone fails in more than one shape, and they are not the same
+shape:
 
 - **the same action, over and over** — a tap that worked once is retried because
   the model misread the result;
 - **no effect** — the actions differ, the screen does not move: a disabled
   button, a field that will not focus, a list scrolled to the end;
 - **going in circles** — two or three screens cycling: open the sheet, close the
-  sheet, open the sheet.
+  sheet, open the sheet;
+- **coming back to the same place** — not a short cycle, but a wander that keeps
+  returning to a screen it has already been on;
+- **reading the same thing again** — the screen has not changed and neither has
+  the answer, but the model asks again;
+- **failing repeatedly** — a tool call that errors is retried unchanged.
 
-`mobile::guard` counts all three per conversation per screen, and answers with a
-ladder: a note the model can still act on, then a stronger note, then a refusal
-that says to read the screen and do something else. The numbers are Mika's
-`GuardRules` — repeats at 3/6/12, a no-effect streak at 3/6/9, a cycle of period
-2 or 3 at 6/12 — over a 20-minute window, and only `Unchanged` counts as "no
-effect": a screen that could not be re-read is not evidence that it did not move,
-and counting it would punish exactly the apps whose trees are hardest to read.
+`mobile::guard` counts all of them per conversation per screen, and answers with
+a ladder: a note the model can still act on, then a stronger note, then a
+refusal that says to read the screen and do something else. The numbers are
+Mika's `GuardRules`, over a 20-minute window:
 
-Two ordering decisions carry the design:
+| Signal | Note | Stop |
+|---|---|---|
+| the same action again | 3, 6 | 12 |
+| the same read tool again, whatever it answered | 6, 9 | 15 |
+| actions in a row that changed nothing | 3, 6, 9 | 12 |
+| the same unchanged screen read again | 5, 8 | 12 |
+| consecutive failures (from the 4th, the note says what else to try) | 2, 4 | 8 |
+| a failure that cannot be retried | 1 | 3 |
+| back to a state already seen since the last new one | 3, 6 | budget ÷ 4, min 10 |
+| rounds through two or three states | 2, 4 | budget ÷ 5, min 6 |
+| actions in a row that reached no new state | 8, 16 | budget ÷ 2, min 24 |
+
+The budget-scaled stops are the task's own step ceiling where the caller knows
+it and 60 where it does not: a long task is allowed to wander proportionally
+longer before the safety net closes. Each rung is announced **once** — at three
+the model is told, and telling it again at four would spend its attention on
+something it already knows. A stop is never suppressed, because the action it
+refuses would otherwise go through on the second attempt.
+
+Only `Unchanged` counts as "no effect": a screen that could not be re-read is
+not evidence that it did not move, and counting it would punish exactly the apps
+whose trees are hardest to read. The same applies to reads — a read that
+returned nothing is not a read of an unchanged screen.
+
+Three ordering decisions carry the design:
 
 - **The ladder runs before the gate.** Asking somebody to approve the twelfth
   identical send is asking them to endorse a loop the agent should have caught
@@ -320,6 +347,11 @@ Two ordering decisions carry the design:
 - **A blocked action is not recorded.** The ladder counts what an action did;
   an action that never ran is not evidence it should be tried again. That is also
   why the readiness check below runs first.
+- **A read is counted too.** `android_ui_tree`, `android_observe`,
+  `android_collect` and `android_ocr` feed the same bucket: reading a screen the
+  task is stuck on is part of the same loop, and a separate bucket would let it
+  run forever. The read-side refusal happens before the capture or the tree
+  dump, so a refused read costs one call instead of a screenshot.
 
 The bucket is keyed by conversation *and* screen, so two conversations driving
 the same phone do not stop each other for doing different things, while one

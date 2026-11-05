@@ -360,7 +360,7 @@ impl Tool for AdbCollectTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
@@ -384,11 +384,22 @@ impl Tool for AdbCollectTool {
             None => Direction::Down,
         };
 
+        let guard_key = super::android::guard_key_for(context, device.as_deref(), target);
+        if let Some(reason) = super::guard::Guard::global()
+            .check_read(&guard_key, "android_collect")
+            .refusal()
+        {
+            return Ok(ToolExecutionResult::error(reason.to_string()));
+        }
         let mut seen = std::collections::HashSet::new();
         let mut screens: Vec<(Vec<ReadLine>, &'static str)> = Vec::new();
         let mut size: Option<(i32, i32)> = None;
         let mut stop = "reached max_screens";
         let mut cost = 0_usize;
+        // The screen the last successful read left the task on. Only the last
+        // one: a collect that scrolled twelve screens ended on the twelfth, and
+        // that is where the task is now.
+        let mut last_read: Option<u64> = None;
         // Whether any screen was read through OCR. Reported once, at the end:
         // the per-screen tag is on the lines, but the model needs to know
         // before it trusts the text that some of it was read from pixels.
@@ -407,6 +418,8 @@ impl Tool for AdbCollectTool {
                 }
             };
             size = screen_size(&device, dump.screen).await.or(size);
+            last_read = (!dump.elements.is_empty())
+                .then(|| super::android::tree_fingerprint(&dump.elements));
 
             // OCR is a helper, not a second main path: the tree is exact and
             // cheap, so it is read alone while it describes the screen. It is
@@ -544,7 +557,13 @@ impl Tool for AdbCollectTool {
             }
         }
 
-        Ok(ToolExecutionResult::success(text).with_data(data))
+        // The collect is one read of wherever it ended up. Recorded with the
+        // last screen's fingerprint, not the first: the task is now on the
+        // screen the scrolling stopped at, and that is the one the next read
+        // would be a re-read of.
+        let note =
+            super::guard::Guard::global().record_read(&guard_key, "android_collect", last_read);
+        Ok(ToolExecutionResult::success(super::android::with_note(text, note)).with_data(data))
     }
 }
 
@@ -959,11 +978,11 @@ impl Tool for AdbDialogTool {
         );
         let signature = format!("dialog:{wanted}");
         let ladder = super::guard::Guard::global().check(&guard_key, &signature);
-        if let super::guard::Verdict::Refuse(reason) = &ladder {
+        if let Some(reason) = ladder.refusal() {
             return Ok(ToolExecutionResult::error(if clearance.asked {
                 format!("{reason} (An approval was given but unused; nothing was pressed.)")
             } else {
-                reason.clone()
+                reason.to_string()
             }));
         }
 
@@ -1057,11 +1076,14 @@ impl Tool for AdbDialogTool {
 
         // The ladder learns what the press did, judged by the screen rather
         // than the dispatch: a dialog that reappears is the same screen, and
-        // that is the stuck state this counts.
-        super::guard::Guard::global().record(
+        // that is the stuck state this counts. The screen it left is the
+        // frame, so a dialog that keeps coming back is a cycle and not just a
+        // repeated press.
+        super::guard::Guard::global().record_with(
             &guard_key,
             &signature,
             super::android::guard_outcome(settle.effect),
+            Some(tree_fingerprint(&settle.elements)),
         );
 
         // A dialog button that reaches outward counts toward the pace exactly
@@ -1505,7 +1527,7 @@ impl Tool for AdbOcrTool {
     async fn execute(
         &self,
         args: Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let device = match resolve_device(&args, self.device.as_deref()) {
             Ok(device) => device,
@@ -1515,14 +1537,28 @@ impl Tool for AdbOcrTool {
             Ok(target) => target,
             Err(message) => return Ok(ToolExecutionResult::error(message)),
         };
+        // A read loop is refused before the ADB work, not after: the screen has
+        // been read repeatedly without telling the model anything new.
+        let guard_key = super::android::guard_key_for(context, device.as_deref(), target);
+        if let Some(reason) = super::guard::Guard::global()
+            .check_read(&guard_key, "android_ocr")
+            .refusal()
+        {
+            return Ok(ToolExecutionResult::error(reason.to_string()));
+        }
         match ocr_screen(&device, target).await {
-            Ok(lines) => Ok(ToolExecutionResult::success(format_ocr_lines(&lines)).with_data(
-                serde_json::json!({
+            Ok(lines) => {
+                let note = super::android::read_note_ocr(&guard_key, "android_ocr", &lines);
+                Ok(ToolExecutionResult::success(super::android::with_note(
+                    format_ocr_lines(&lines),
+                    note,
+                ))
+                .with_data(serde_json::json!({
                     "lines": lines,
                     "count": lines.len(),
                     "device": resolved_serial(&device).await,
-                }),
-            )),
+                })))
+            }
             Err(message) => {
                 Ok(ToolExecutionResult::error(format!("OCR is unavailable: {message}")))
             }
@@ -2293,13 +2329,13 @@ impl Tool for AdbDisplayTool {
         } else {
             super::guard::Guard::global().check(&guard_key, &signature)
         };
-        if let super::guard::Verdict::Refuse(reason) = &ladder {
+        if let Some(reason) = ladder.refusal() {
             // A refusal to take an action that was already approved has to say
             // so: the person is not being asked again, and nothing was done.
             return Ok(ToolExecutionResult::error(if clearance.asked {
                 format!("{reason} (An approval was given but unused; nothing was sent.)")
             } else {
-                reason.clone()
+                reason.to_string()
             }));
         }
 
@@ -2468,17 +2504,25 @@ impl Tool for AdbDisplayTool {
         // fingerprint to compare against; the rest are recorded as unseen,
         // which the ladder does not count as "nothing happened".
         if !reads_only {
-            let outcome = match before_fingerprint {
+            let (outcome, frame) = match before_fingerprint {
                 Some(was) => match super::android::dump_ui(&device, Target::Display(id)).await {
-                    Ok(now) if super::android::tree_fingerprint(&now.elements) == was => {
-                        super::guard::Outcome::Unchanged
+                    Ok(now) => {
+                        let now = super::android::tree_fingerprint(&now.elements);
+                        let outcome = if now == was {
+                            super::guard::Outcome::Unchanged
+                        } else {
+                            super::guard::Outcome::Changed
+                        };
+                        (outcome, Some(now))
                     }
-                    Ok(_) => super::guard::Outcome::Changed,
-                    Err(_) => super::guard::Outcome::Unknown,
+                    Err(_) => (super::guard::Outcome::Unknown, None),
                 },
-                None => super::guard::Outcome::Unknown,
+                None => (super::guard::Outcome::Unknown, None),
             };
-            super::guard::Guard::global().record(&guard_key, &signature, outcome);
+            super::guard::Guard::global().record_with(&guard_key, &signature, outcome, frame);
+            if result.is_ok() {
+                super::android::note_success(&guard_key);
+            }
         }
 
         // Same pace as `android_input`, and likewise after the action: the
