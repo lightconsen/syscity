@@ -286,6 +286,42 @@ mod tests {
     /// The variable that turns this test binary into a lock-holding child.
     const CHILD_ENV: &str = "SYSCITY_FILE_LOCK_HOLD";
 
+    /// A path to this test binary that is still executable if the name cargo
+    /// gave it has gone away, plus the scratch file that keeps it alive.
+    ///
+    /// `current_exe()` is not a path you can necessarily spawn. On Linux it
+    /// reads `/proc/self/exe`, and when the inode has no remaining name — a
+    /// rebuild or an installer renamed over the binary — the kernel reports
+    /// `… (deleted)` instead, which no `execve` will accept. Spawning it then
+    /// fails with `ENOENT`, and the test fails for a reason that has nothing
+    /// to do with locking. That is the flake this guards: `spawn the holding
+    /// child: Os { code: 2, kind: NotFound }` in jobs that ran the full suite.
+    ///
+    /// A hard link beside the binary covers the rename case: it names the same
+    /// inode, so replacing the cargo output leaves this one executable, and it
+    /// must be that same directory because a hard link cannot cross a
+    /// filesystem. If the name is already gone there is nothing to link, and
+    /// Linux's `/proc/self/exe` — which still resolves to the live inode — is
+    /// copied out instead.
+    fn stable_self_exe() -> (PathBuf, Option<PathBuf>) {
+        let exe = std::env::current_exe().expect("the test binary path");
+        let Some(dir) = exe.parent() else {
+            return (exe, None);
+        };
+        let link = dir.join(format!(".file-lock-holder-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        if std::fs::hard_link(&exe, &link).is_ok() {
+            return (link.clone(), Some(link));
+        }
+        #[cfg(target_os = "linux")]
+        if std::fs::copy("/proc/self/exe", &link).is_ok() {
+            return (link.clone(), Some(link));
+        }
+        // Nothing better available: the original path is still worth an
+        // attempt, and a failure here reports what actually happened.
+        (exe, None)
+    }
+
     /// The child half of [`a_lock_is_held_by_another_process`].
     ///
     /// Re-executing the test binary is the only way to get a genuinely
@@ -321,7 +357,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cross.lock");
-        let exe = std::env::current_exe().expect("the test binary path");
+        let (exe, cleanup) = stable_self_exe();
 
         let mut child = std::process::Command::new(&exe)
             .args([
@@ -368,6 +404,13 @@ mod tests {
         child.wait().expect("reap the holding child");
         let after = FileLock::acquire(&path, Duration::from_secs(5));
         assert!(after.is_ok(), "the lock outlived the process: {after:?}");
+
+        // The hard link served its purpose; the tempdir it lived in does not
+        // own it, so remove it here rather than leaving a copy of the test
+        // binary in `target/debug/deps`.
+        if let Some(link) = cleanup {
+            let _ = std::fs::remove_file(link);
+        }
     }
 
     /// A contended target, counted: the peak number of simultaneous holders of
