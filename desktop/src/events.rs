@@ -115,7 +115,7 @@ mod android {
     /// an escaping panic would abort Syscity itself rather than fail one event.
     #[no_mangle]
     pub extern "system" fn Java_net_syscity_desktop_NativeEvents_onDeviceEvent(
-        env: JNIEnv,
+        mut env: JNIEnv,
         _class: JClass,
         payload: JString,
     ) {
