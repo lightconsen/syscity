@@ -8,7 +8,7 @@
 //!
 //! ```rust
 //! use syscity::computer::sensitive_ui::SensitiveUiDetector;
-//! use syscity::computer::types::{Rect, UiElement};
+//! use syscity::computer::types::{Rect, Tri, UiElement};
 //!
 //! let detector = SensitiveUiDetector::new();
 //! let ui_tree = UiElement {
@@ -16,14 +16,15 @@
 //!     role: "window".to_string(),
 //!     label: None,
 //!     value: None,
-//!     bounds: Rect {
+//!     bounds: Some(Rect {
 //!         x: 0,
 //!         y: 0,
 //!         width: 100,
 //!         height: 100,
-//!     },
-//!     enabled: true,
-//!     focused: false,
+//!     }),
+//!     enabled: Tri::Known(true),
+//!     focused: Tri::Known(false),
+//!     actions: None,
 //!     children: vec![],
 //!
 //!     children_count: None,
