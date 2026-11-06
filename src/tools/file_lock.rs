@@ -322,6 +322,158 @@ mod tests {
         (exe, None)
     }
 
+    /// How many times to re-try a spawn the kernel refused as `ETXTBSY`.
+    ///
+    /// The window this covers is a fork-to-exec gap, which is milliseconds —
+    /// but the gap belongs to *another* thread's child, and the coverage job
+    /// forks a lot of them around this test. Forty tries at fifty milliseconds
+    /// is about two seconds, far more than the gap needs and still short
+    /// enough that reaching the end means the file really is held open for
+    /// writing, which is worth reporting rather than retrying forever.
+    const SPAWN_ATTEMPTS: usize = 40;
+
+    /// How long to wait between those attempts.
+    const SPAWN_BACKOFF: Duration = Duration::from_millis(50);
+
+    /// One retry policy: attempts to make and how long to wait between them.
+    #[derive(Clone, Copy)]
+    struct RetryBudget {
+        attempts: usize,
+        backoff: Duration,
+    }
+
+    /// The budget a real spawn uses.
+    const SPAWN_BUDGET: RetryBudget = RetryBudget {
+        attempts: SPAWN_ATTEMPTS,
+        backoff: SPAWN_BACKOFF,
+    };
+
+    /// Run `attempt` until it stops reporting the file as busy, or the retry
+    /// budget runs out.
+    ///
+    /// Split from [`spawn_retrying_busy`], and takes the budget as a value, so
+    /// the retry policy can be tested with a synthetic error and a budget of
+    /// microseconds: whether a write handle actually produces `ETXTBSY` is an
+    /// operating-system property (the BSD family does not enforce it), so a
+    /// test that provoked it for real would pass or fail by host rather than
+    /// by behaviour — and one that waited out the production budget would
+    /// spend two seconds of the suite doing it.
+    fn retry_while_busy<T>(
+        budget: RetryBudget,
+        mut attempt: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut tries = 0;
+        loop {
+            match attempt() {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && tries + 1 < budget.attempts =>
+                {
+                    tries += 1;
+                    std::thread::sleep(budget.backoff);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Spawn, retrying while the kernel reports the executable as busy.
+    ///
+    /// `ETXTBSY` means the file being executed was open for writing at the
+    /// instant of `execve`, by any process — and `Command::spawn` is
+    /// fork-then-exec, so a child forked by *another thread of this test
+    /// process* inherits every fd it had open, including write handles the
+    /// child does not know about, and holds them until it execs. Our own exec
+    /// then lands inside that gap and is refused. Nothing is actually wrong
+    /// with the binary: the refusal clears as soon as the other child execs.
+    ///
+    /// This is what CI showed in the coverage job (`spawn the holding child:
+    /// Os { code: 26, kind: ExecutableFileBusy }`) while the same test passed
+    /// in the plain `Test` job: the instrumented binary is far larger, so the
+    /// gap is longer and the suite spawns more helpers around it.
+    ///
+    /// Retrying is the fix rather than skipping: the cross-process guarantee is
+    /// exactly what this test exists to prove, and dropping it in the one job
+    /// that runs the whole suite would leave it unproven where it matters.
+    fn spawn_retrying_busy(
+        mut build: impl FnMut() -> std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        retry_while_busy(SPAWN_BUDGET, || build().spawn())
+    }
+
+    /// A busy error is ridden out until the attempt succeeds, and a different
+    /// error is reported immediately rather than being retried as if it were
+    /// busy.
+    ///
+    /// The budget is microseconds rather than the production half-second: the
+    /// policy is what is under test, and spending the real budget would hold a
+    /// slot in the suite's thread pool for two seconds alongside tests that
+    /// are sensitive to exactly that.
+    #[test]
+    fn busy_errors_are_retried_and_other_errors_are_not() {
+        let refused = || std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy);
+        let budget = RetryBudget {
+            attempts: 5,
+            backoff: Duration::from_micros(1),
+        };
+
+        // Busy twice, then fine: the third attempt's value is what comes back.
+        let mut calls = 0;
+        let got = retry_while_busy(budget, || {
+            calls += 1;
+            if calls < 3 {
+                Err(refused())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(got.expect("the third attempt succeeds"), 3);
+        assert_eq!(calls, 3, "the retry stopped early");
+
+        // A different failure is the answer on the first attempt: retrying it
+        // would only delay a real error.
+        let mut calls = 0;
+        let got = retry_while_busy(budget, || -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(
+            got.expect_err("not found is not retryable").kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(calls, 1, "a non-busy error was retried");
+
+        // Busy forever: the budget is a real bound, and the busy error is what
+        // the caller sees — not a made-up timeout.
+        let mut calls = 0;
+        let got = retry_while_busy(budget, || -> std::io::Result<()> {
+            calls += 1;
+            Err(refused())
+        });
+        assert_eq!(
+            got.expect_err("a permanently busy file fails").kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        assert_eq!(calls, budget.attempts, "the attempt budget was not used");
+    }
+
+    /// The production budget is the one CI needs: long enough to ride out a
+    /// fork-to-exec gap on a machine forking helpfully-sized test binaries.
+    #[test]
+    fn the_spawn_budget_outlasts_a_fork_to_exec_gap() {
+        assert!(
+            SPAWN_BUDGET.attempts >= 20,
+            "too few attempts ({}): a busy executable would fail spuriously",
+            SPAWN_BUDGET.attempts
+        );
+        let total = SPAWN_BUDGET.backoff * (SPAWN_BUDGET.attempts as u32 - 1);
+        assert!(total >= Duration::from_secs(1), "total retry window is only {total:?}");
+        assert!(
+            total <= Duration::from_secs(10),
+            "a held file would stall the caller for {total:?}"
+        );
+    }
+
     /// The child half of [`a_lock_is_held_by_another_process`].
     ///
     /// Re-executing the test binary is the only way to get a genuinely
@@ -359,8 +511,9 @@ mod tests {
         let path = dir.path().join("cross.lock");
         let (exe, cleanup) = stable_self_exe();
 
-        let mut child = std::process::Command::new(&exe)
-            .args([
+        let mut child = spawn_retrying_busy(|| {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
                 "--exact",
                 "tools::file_lock::tests::child_process_holds_the_lock",
                 "--nocapture",
@@ -369,9 +522,10 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The harness chatter would interleave with the handshake.
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the holding child");
+            .stderr(Stdio::null());
+            cmd
+        })
+        .expect("spawn the holding child");
 
         let mut line = String::new();
         let mut reader = BufReader::new(child.stdout.as_mut().expect("child stdout"));
