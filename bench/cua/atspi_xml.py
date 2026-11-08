@@ -45,7 +45,7 @@ def _text(value):
     return text or None
 
 
-def _bounds(accessible):
+def _bounds(accessible, pyatspi=None, states=None):
     try:
         extents = accessible.queryComponent().getExtents(0)  # ATSPI_COORD_TYPE_SCREEN
     except Exception:
@@ -53,9 +53,18 @@ def _bounds(accessible):
     x, y, width, height = extents.x, extents.y, extents.width, extents.height
     if width <= 0 or height <= 0:
         return None
-    # A window manager that has not mapped a scrollbar yet reports
-    # INT32_MIN for its origin; such a box would resolve clicks off-screen.
     if x < -10000 or y < -10000:
+        return None
+    # `visible` means the widget is laid out; `showing` means it is actually
+    # inside its scroll viewport. A button pushed past the bottom of a short
+    # window keeps its layout box and keeps reporting `visible`, but it is not
+    # on screen — and handing that box to the agent sends the click into
+    # whatever is behind the window. `click-button`'s 256x256 window holds six
+    # buttons and grows to eight: the target lands on a fourth row below the
+    # fold, the tree still says "button at y=620", and a click there hits the
+    # bare desktop. Dropping the box is the honest answer — the element exists,
+    # but this read knows no point on screen for it.
+    if states is not None and "visible" in states and "showing" not in states:
         return None
     return x, y, width, height
 
@@ -218,7 +227,7 @@ def build(accessible, pyatspi, depth, counter, parent, real_boxes=None):
         states = _states(accessible, pyatspi)
         if states:
             node.set("states", states)
-        bounds = _bounds(accessible)
+        bounds = _bounds(accessible, pyatspi, states.split() if states else None)
         # An option row inside a `<select>` popup reports the combo box's own
         # box until the popup opens; while it is open the real row is a
         # different element entirely. Substituting the real one is the only way

@@ -196,7 +196,7 @@ pub struct TreeDiffResult {
     pub added: Vec<String>,
     /// Elements present only in the before-snapshot.
     pub removed: Vec<String>,
-    /// Elements present in both but with state changes (enabled/value/bounds).
+    /// Elements present in both but with state changes (enabled/value/focus/bounds).
     pub changed: Vec<String>,
 }
 
@@ -411,6 +411,41 @@ fn element_key(el: &UiElement) -> (&str, Option<&str>) {
     (el.role.as_str(), el.label.as_deref())
 }
 
+/// Whether an element of this role can hold keyboard focus.
+///
+/// Window managers and web engines mark the *window* or *container* that has
+/// the pointer's attention as focused too, and that flag flips when a click
+/// lands outside it. A focus transition on such an element is not evidence
+/// that the click did anything to the content; a transition on a control that
+/// accepts typing is.
+fn takes_keyboard_focus(role: &str) -> bool {
+    // Roles arrive in two spellings: the session's vocabulary (`spin_button`)
+    // and a platform's raw name (`spin button`). Both mean the same control.
+    let key: String = role
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "textfield"
+            | "textfieldpassword"
+            | "button"
+            | "checkbox"
+            | "radiobutton"
+            | "combobox"
+            | "menuitem"
+            | "tab"
+            | "slider"
+            | "spinbutton"
+            | "searchfield"
+            | "link"
+            | "entry"
+            | "edit"
+    ) || key.contains("textfield")
+        || key.contains("edit")
+}
+
 fn describe(el: &UiElement) -> String {
     match &el.label {
         Some(l) if !l.is_empty() => format!("{} \"{}\"", el.role, l),
@@ -431,6 +466,30 @@ fn diff_elements(before: &[UiElement], after: &[UiElement], path: &str, out: &mu
                 if b.value != a.value {
                     out.changed
                         .push(format!("{} value: {:?} → {:?}", child_path, b.value, a.value));
+                }
+                // A *read* focus change is a change: clicking a field moves
+                // focus to it, and that is often the entire visible effect of
+                // a correct click on a segmented control (a date input's
+                // month/day/year sub-fields highlight a few pixels of
+                // themselves, far below the pixel diff's threshold). Without
+                // this the click read as a no-op, the ladder escalated, and
+                // the keyboard rung typed into a control that was already
+                // focused — corrupting a value that was on its way to being
+                // right. Only two *answers* are compared: an unread focus on
+                // either side is Unknown, not a transition to "false".
+                //
+                // Only a control that can take keyboard input counts. A window
+                // or container losing focus is what a click *outside* it looks
+                // like; treating that as a working action is the opposite of
+                // what the evidence means.
+                if takes_keyboard_focus(&b.role) {
+                    match (b.focused.known(), a.focused.known()) {
+                        (Some(before), Some(after)) if before != after => {
+                            out.changed
+                                .push(format!("{} focus: {} → {}", child_path, before, after));
+                        }
+                        _ => {}
+                    }
                 }
                 if b.bounds != a.bounds {
                     // Geometry the read did not publish is not "moved to";
@@ -543,6 +602,70 @@ mod tests {
         let diff = tree_diff(&before, &after);
         assert_eq!(diff.changed.len(), 1);
         assert!(diff.changed[0].contains("enabled: false → true"));
+    }
+
+    #[test]
+    fn tree_diff_detects_focus_change() {
+        // The whole point: a click that only moves focus is a real effect.
+        // A segmented date control highlights a few dozen pixels — below the
+        // pixel diff's threshold — so this verdict is the only thing that
+        // stops the ladder from escalating and typing into a focused field.
+        let mut before_seg = el("spin button", Some("month"), vec![]);
+        before_seg.focused = crate::computer::Tri::Known(false);
+        let mut after_seg = el("spin button", Some("month"), vec![]);
+        after_seg.focused = crate::computer::Tri::Known(true);
+        let before = vec![el("window", Some("App"), vec![before_seg])];
+        let after = vec![el("window", Some("App"), vec![after_seg])];
+        let diff = tree_diff(&before, &after);
+        assert_eq!(diff.changed.len(), 1);
+        assert!(diff.changed[0].contains("focus: false → true"), "{:?}", diff.changed);
+        assert!(diff.has_changes());
+    }
+
+    #[test]
+    fn tree_diff_ignores_unread_focus() {
+        // `Unknown` is "nobody asked", not "false": two unread sides are not a
+        // transition, and a one-sided read is not evidence of a move.
+        let before = vec![el("button", Some("OK"), vec![])];
+        let mut after = vec![el("button", Some("OK"), vec![])];
+        after[0].focused = crate::computer::Tri::Known(true);
+        assert!(!tree_diff(&before, &after).has_changes());
+        assert!(!tree_diff(&after, &before).has_changes());
+        let mut absent = vec![el("button", Some("OK"), vec![])];
+        absent[0].focused = crate::computer::Tri::Absent;
+        assert!(!tree_diff(&before, &absent).has_changes());
+    }
+
+    /// A window losing its activation is what a click landing *outside* it
+    /// looks like. Counting that as an effect verified the wrong action: the
+    /// screen shows the click went somewhere else, so the ladder has to keep
+    /// escalating rather than report success.
+    #[test]
+    fn a_window_losing_activation_is_not_a_working_action() {
+        let mut before_win = el("window", Some("App"), vec![]);
+        before_win.focused = crate::computer::Tri::Known(true);
+        let mut after_win = el("window", Some("App"), vec![]);
+        after_win.focused = crate::computer::Tri::Known(false);
+        let diff = tree_diff(&[before_win], &[after_win]);
+        assert!(!diff.has_changes(), "{:?}", diff.changed);
+
+        // A container is the same story: it is not a control the model clicks.
+        let mut before_doc = el("document web", Some("Page"), vec![]);
+        before_doc.focused = crate::computer::Tri::Known(true);
+        let mut after_doc = el("document web", Some("Page"), vec![]);
+        after_doc.focused = crate::computer::Tri::Known(false);
+        assert!(!tree_diff(&[before_doc], &[after_doc]).has_changes());
+    }
+
+    /// The counterpart: the same transition on a control that takes typing is
+    /// a real effect, so the guard is a filter and not a blanket disable.
+    #[test]
+    fn a_field_losing_focus_is_still_a_reported_change() {
+        let mut before_field = el("text_field", Some("Name"), vec![]);
+        before_field.focused = crate::computer::Tri::Known(true);
+        let mut after_field = el("text_field", Some("Name"), vec![]);
+        after_field.focused = crate::computer::Tri::Known(false);
+        assert!(tree_diff(&[before_field], &[after_field]).has_changes());
     }
 
     #[test]

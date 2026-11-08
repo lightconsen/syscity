@@ -559,10 +559,19 @@ fn element_from_node(node: roxmltree::Node<'_, '_>) -> UiElement {
         } else {
             Tri::Known(!states.contains("disabled"))
         },
+        // Focus is where keyboard input goes, and AT-SPI says so with
+        // `focused` — on the entry, the button, the spin button. `active` is a
+        // different fact: it marks the window or container that has the
+        // pointer's attention, and a frame carries it while nothing inside is
+        // focused at all. Reading `active` as focus made clicking the empty
+        // desktop look like a state change, because the window dropped
+        // `active` — an action that landed *outside* the window verified as if
+        // it had worked. The native x11 reader has always used
+        // `STATE_FOCUSED` alone; this now agrees with it.
         focused: if states.is_empty() {
             Tri::Unknown
         } else {
-            Tri::Known(states.contains("focused") || states.contains("active"))
+            Tri::Known(states.contains("focused"))
         },
         actions: None,
         children: node
@@ -1053,6 +1062,41 @@ mod tests {
         let entry = &desktop.children[0].children[0].children[1];
         assert_eq!(entry.role, "text_field");
         assert_eq!(entry.bounds, Some(Rect::new(100, 100, 200, 30)));
+    }
+
+    #[test]
+    fn a_window_being_active_is_not_a_control_holding_focus() {
+        // A frame advertises `active` while nothing inside it is focused, and
+        // loses `active` when the click landed outside it. If that read as a
+        // focus change, clicking the empty desktop would verify as a working
+        // action — which is the whole failure this distinction prevents.
+        let xml = r#"<desktop>
+          <frame role="frame" name="App" states="showing visible active"
+            x="0" y="0" width="200" height="200">
+            <entry role="entry" name="Name" states="showing visible focusable"
+              x="10" y="10" width="100" height="20"/>
+          </frame>
+        </desktop>"#;
+        let roots = parse_at_spi(xml).unwrap();
+        assert_eq!(roots[0].focused, Tri::Known(false), "the frame's activation is not focus");
+        assert_eq!(
+            roots[0].children[0].focused,
+            Tri::Known(false),
+            "a focusable but unfocused entry is not focused"
+        );
+    }
+
+    #[test]
+    fn at_spi_focused_is_a_focus_answer_and_active_alone_is_not() {
+        let xml = r#"<desktop>
+          <frame role="frame" name="App" states="showing visible active">
+            <entry role="entry" name="Name" states="showing visible focused focusable"
+              x="10" y="10" width="100" height="20"/>
+          </frame>
+        </desktop>"#;
+        let roots = parse_at_spi(xml).unwrap();
+        assert_eq!(roots[0].children[0].focused, Tri::Known(true));
+        assert_eq!(roots[0].focused, Tri::Known(false));
     }
 
     #[test]

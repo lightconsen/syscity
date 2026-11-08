@@ -982,5 +982,49 @@ class OptionBoxTest(unittest.TestCase):
         self.assertEqual(boxes["Pear"], (310, 440, 80, 20))
 
 
+class OffscreenBoxTest(unittest.TestCase):
+    """`visible` is laid out; `showing` is on screen.
+
+    `click-button`'s window is 256x256 and its grid grows to eight buttons, so
+    the target can land on a fourth row below the fold. AT-SPI keeps reporting
+    that row's layout box (`visible`, no `showing`), and a click at those
+    coordinates lands on the bare desktop behind the window — which is how v5
+    and v6 were lost with a click at y=620 in a window ending at y=557.
+    """
+
+    class _Component:
+        def __init__(self, box):
+            self._box = box
+
+        def getExtents(self, coord_type):  # noqa: N802 - pyatspi's name
+            class Extents:
+                pass
+
+            e = Extents()
+            e.x, e.y, e.width, e.height = self._box
+            return e
+
+    def _bounds(self, box, states):
+        class Accessible:
+            def queryComponent(self):  # noqa: N802 - pyatspi's name
+                return OffscreenBoxTest._Component(box)
+
+        return atspi_xml._bounds(Accessible(), None, states)
+
+    def test_a_laid_out_but_unshown_button_has_no_clickable_box(self):
+        self.assertIsNone(self._bounds((541, 575, 96, 42), ["visible", "focusable"]))
+
+    def test_a_shown_button_keeps_its_box(self):
+        self.assertEqual(
+            self._bounds((541, 377, 96, 42), ["showing", "visible", "focusable"]),
+            (541, 377, 96, 42),
+        )
+
+    def test_states_the_reader_could_not_read_leave_the_box_alone(self):
+        # No state list is not "not showing": an unread flag must not erase
+        # geometry the platform did publish.
+        self.assertEqual(self._bounds((10, 10, 20, 20), None), (10, 10, 20, 20))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
