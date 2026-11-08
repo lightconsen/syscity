@@ -482,6 +482,65 @@ python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 对照 `drag-slider` 5/5：它同样是拖拽，但模型用"点击滑块 + 方向键"绕过，说明任务本身
 在键盘下可达——所以它不在上限里。
 
+#### 14 个失败变体的逐条归因
+
+68 个变体里失败 14 个。跑完之后逐个回放了轨迹，并在**真实 bench-web 容器**里复现验证，
+而不是只看结论：
+
+| variant | 归因 | 证据 |
+|---|---|---|
+| `drag-drop` v0–v4（5） | **环境**：合成拖拽不可达 | 见上 |
+| `date-picker` v0–v3（4） | 模型没走通（任务本身可达） | 见下 |
+| `fill-form` v2（1） | 模型失败；但发现并修掉了一个胶水 bug | 见下 |
+| `select-dropdown` v1 | **胶水 bug**（已修） | 见下 |
+| `right-click-menu` v3 | 模型偷懒 | 只右键一次就 `final_answer`，轨迹里没有点菜单的动作；实测该页 AX 完全正确（`menu item 'Delete' (406,256,55,27)`） |
+| `video-player` v3 | 模型偷懒 | 点了一下滑块就宣布"Slider moved to 26%，Nudging it up"，然后停止；实测 `input[type=range]` 用一次合成点击就能精确落到 30% |
+| `spreadsheet-cell` v2 | 点错格子 | 目标 C3 中心是 (668,332)，模型点了 (545,369)——那是 B4。它随后在 B4 里输入公式，并声称完成 |
+
+`date-picker` 这 4 个不能说成"环境不可达"，因为**同一个任务的 v4 模型过了**：打开
+picker、点 spin button 加一天。可达但不轻松——v0 只键入月份就退出，v1 在 25 步时
+`MAX_STEPS_EXCEEDED`（还绕道 terminal/playwright），v2 点两下后断言"工具层拒绝新动作"
+（无法复现），v3 用方向键漂了。它们的 oracle 全 0 是因为 oracle 自己坏（往
+`input[type=date]` 里键入，WebKitGTK 不认），不是环境。
+
+`select-dropdown` 的 bug 是我这边的，值得记下来：折叠状态的 `<select>` 里，AT-SPI 把
+**每一个 option 都报告在 combo box 自己的框上**——四个选项坐标完全相同。`atspi_xml.py`
+原样输出，模型无从区分，点 "Banana" 实际点在 combo box 上，于是把菜单关掉了。
+
+展开后真实坐标在另一个顶层 `window` → `tree table` → `table cell` 子树里：
+
+```
+combo box 'Fruit selection dropdown' (213,187,185,52)
+  menu item 'Banana' (213,187,185,52)      ← 折叠态假坐标，仍在树里排在前面
+window '' (213,239,185,102)
+  table cell 'Banana' (236,291,159,23)     ← 真实位置
+```
+
+`real_option_boxes()` 现在把这类 option 的框换成真实那个，规则收得很紧：只有在
+combo box 自己框上的、且 popup 里该标签唯一时才替换；popup 关着时（0×0 的 menu）
+不产出任何东西，树保持原样。修完后在容器里点一次真实坐标，`<select>` 的值确实变成
+了 Banana。所以 `select-dropdown` 不是环境问题。
+
+`fill-form` v2 的理由原本是环境问题，但它是胶水问题：模型先滚一次 `scroll(-500)`，再滚
+`scroll(-40000)`，然后转去拖滚动条，最后写下"Scrolling via wheel/drag is refused by the
+remote endpoint"。端点没有拒绝——syscity 把滚动 `amount` 换算成 `clicks * 100` 个滚轮
+click（`osworld.rs:758`），而 `xdotool click --repeat` 默认**每两次之间停 100 ms**。于是
+`scroll(-500)` 要 51 秒，超过 HTTP 的 30 秒超时，请求被掐断，模型看到的就是一个失败。
+实测（容器内，用 CDP 读 `window.scrollY`）：
+
+```
+xdotool click --repeat 500 5            51.07s   scrollY 0 -> 5369
+xdotool click --delay 0 --repeat 500 5   0.27s   scrollY 0 -> 5369
+```
+
+距离完全一样，Chromium 只是把密集的滚轮事件合并了。`pyautogui_shim` 的 `scroll` /
+`hscroll` 现在显式传 `--delay 0`，`scroll(-500)` 从 51 秒降到 0.24 秒。
+
+修完之后**重跑了三遍 `fill-form` v2，仍然都是 0**：滚动不再卡住了（有一遍把表单填完并
+点了提交），但提交后的字段值仍有错，三遍分别在不同步骤收尾。所以这个变体**依然算模型
+失败，不是环境上限**——分母不减。写在这里是因为它是这轮唯一一个"看起来像环境、其实是
+胶水"的失败，也正是上限规则要求把机制写清楚的原因。
+
 另外记录一个**与胶水无关**、但这次一起修掉的真 bug：`sensitive_ui` 把 `"pin"` 当子串匹配，
 于是 `spin_button` 命中——date-picker 的月/日/年数字调节器、任何数量框都被标成密码字段，
 模型收到"不要在此输入凭据"的警告后放弃输入。改成整词匹配后 `spin_button` 不再误报，

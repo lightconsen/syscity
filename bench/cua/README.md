@@ -40,9 +40,10 @@ python3 bench/cua/score.py <run-dir> --json   # machine
 | **reachable** | accuracy over the variants this environment can actually solve | the model, with the environment's own limits removed |
 
 They are not interchangeable and neither may be presented as the other. On this
-host (container-only, `runc`, darwin/arm64) they differ by roughly one point;
-on an environment where more of the suite is broken the gap would be large, and
-a raw number alone would read as model weakness.
+host (container-only, `runc`, darwin/arm64) they are **0.794 raw and 0.857
+reachable** — six points apart, all of it one task. On an environment where more
+of the suite is broken the gap would be larger, and a raw number alone would read
+as model weakness.
 
 ## The environment ceiling
 
@@ -107,6 +108,49 @@ Add the task to `unreachable_tasks` with every variant's measured
 even one variant is reachable — by the oracle or by the model — the task stays
 in the denominator, and `score.py` will say so rather than apply the exclusion.
 
+## Where the 14 failures come from
+
+At 0.794 raw, 14 of 68 variants fail. Every one was replayed from its trajectory
+and re-tested in a real `bench-web` container — the split matters, because only
+five of them are the environment's fault:
+
+| variant | cause | evidence |
+|---|---|---|
+| `drag-drop` v0–v4 | **environment** | synthetic drag is rejected; `dragstart` never fires, and the target has no other route |
+| `date-picker` v0–v3 | model | the model solves v4 of the *same task*, so the environment reaches it. Its oracle is 0 on all five only because `solve_task` types into `input[type=date]`, which WebKitGTK ignores |
+| `fill-form` v2 | model (a glue bug was found on the way, and fixed) | see below |
+| `select-dropdown` v1 | **glue bug — fixed and re-verified at reward 1** | see below |
+| `right-click-menu` v3 | model gave up | one right-click, then `final_answer`; the page's AX is correct (`menu item 'Delete' (406,256,55,27)`) |
+| `video-player` v3 | model gave up | one slider click, read "26%", said "nudging it up", stopped; a single synthetic click puts `input[type=range]` at 30% exactly |
+| `spreadsheet-cell` v2 | model aimed wrong | target C3 is (668,332); it clicked (545,369), which is B4, then typed the formula there and claimed C3 |
+
+Only the two glue bug rows changed the accounting. `select-dropdown` v1 goes from
+0 to 1 once `real_option_boxes()` is in place. `fill-form` v2 does **not**: after
+the scroll fix it was re-run three times and still scored 0 (one run did fill the
+form and submit, but the field values were wrong). It stays a model failure and
+stays in the denominator — which is the point of the rule below, and the reason
+a "glue bug" does not get to mean "excluded".
+
+### A timeout is not a refusal
+
+`fill-form` v2's own answer was *"Scrolling via wheel/drag is refused by the
+remote endpoint"*. The endpoint refused nothing. syscity encodes a scroll
+`amount` as `amount * 100` wheel clicks (`osworld.rs:758`), and `xdotool click
+--repeat` sleeps **100 ms between clicks by default**. So `scroll(-500)` took
+51 s, blew the remote client's 30 s request timeout, and arrived at the model as
+a failure it had to explain. Measured in the container with CDP reading
+`window.scrollY`:
+
+```
+xdotool click --repeat 500 5            51.07s   scrollY 0 -> 5369
+xdotool click --delay 0 --repeat 500 5   0.27s   scrollY 0 -> 5369
+```
+
+Identical distance — Chromium coalesces the dense wheel events. `scroll` and
+`hscroll` now pass `--delay 0`, and `WheelTest` pins it. This is the case that
+justifies the ceiling's third rule: before calling a failure environmental,
+check that the mechanism is understood rather than inferred from whatever the
+model said while giving up.
 
 ## The shim has to prove its work
 
@@ -116,3 +160,20 @@ assumes — `xdotool` prints `No such key name` and exits 0 on a key it does not
 know; `xclip -loops 1` pastes into nothing because a browser asks for `TARGETS`
 first; a drag needs a real sequence of motion events, not an origin→target jump.
 Each is covered by a test.
+
+`atspi_xml.py` has the same problem in a quieter form: a **closed `<select>`
+reports every option at the combo box's own box**, so all four options of a
+dropdown arrive at identical coordinates. A model told to pick "Banana" clicks
+there, hits the combo box, and closes the menu — which is exactly how
+`select-dropdown` v1 was lost. The real rows only exist while the popup is open,
+in a separate top-level `window` → `tree table` → `table cell` subtree; the
+stale copies under the combo box are still in the tree and come first.
+
+`real_option_boxes()` remaps only the options whose reported box is
+*provably* the collapsed fiction, and is deliberately conservative: a label is
+remapped only when every copy under the combo box shares the combo box's own
+box, a closed popup (a 0×0 `menu`) yields nothing so the tree is unchanged, and
+a label appearing twice in a popup is skipped rather than guessed. Re-running
+`select-dropdown` v1 against the fixed shim scores **1**, where it previously
+scored 0 with the model correctly diagnosing "the accessibility coords for menu
+items are wrong" and then giving up.

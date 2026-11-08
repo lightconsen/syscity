@@ -13,6 +13,14 @@ MAX_DEPTH = 60
 
 SKIP_ROLES = {"redundant object"}
 
+#: Roles a closed `<select>` puts its options under, where every option reports
+#: the combo box's own box. See [`real_option_boxes`].
+POPUP_ROLES = {"combo box"}
+
+#: Roles that hold the real, on-screen option rows once a popup is open.
+DEMUX_CONTAINER_ROLES = {"window", "tree table"}
+DEMUX_ITEM_ROLES = {"table cell", "menu item", "list item"}
+
 # State name reported in the `states` attribute -> AT-SPI constant.
 STATE_NAMES = (
     ("showing", "STATE_SHOWING"),
@@ -91,7 +99,107 @@ def _value(accessible):
     return value
 
 
-def build(accessible, pyatspi, depth, counter, parent):
+def _walk(accessible, depth=0, counter=None):
+    """Yield `(role, name, box)` for `accessible` and every descendant."""
+    if counter is None:
+        counter = [0]
+    if depth > MAX_DEPTH or counter[0] >= MAX_NODES:
+        return
+    counter[0] += 1
+    try:
+        role = accessible.getRoleName() or "unknown"
+        name = _text(accessible.name)
+        box = _bounds(accessible)
+    except Exception:
+        return
+    yield role, name, box
+    try:
+        count = accessible.childCount
+    except Exception:
+        count = 0
+    for index in range(count):
+        try:
+            child = accessible.getChildAtIndex(index)
+        except Exception:
+            continue
+        if child is None:
+            continue
+        yield from _walk(child, depth + 1, counter)
+
+
+def real_option_boxes(nodes):
+    """Real on-screen boxes for `<select>` options, keyed by label.
+
+    A closed `<select>`'s options are all reported at the combo box's own box.
+    Clicking "Banana" there just closes the menu, and the model has no way to
+    tell two options apart — which is exactly how `select-dropdown` was lost.
+
+    When the popup is *open* the real rows are live in a top-level `window` →
+    `tree table` → `table cell` subtree, but the stale copies under the combo
+    box are still in the tree and still come first, so a reader that takes what
+    it is given never sees the real box.
+
+    This maps label -> correct box for exactly the options whose reported box is
+    demonstrably the collapsed fiction, and leaves every other node alone:
+
+    * a label is remapped only when every copy of it under the combo box shares
+      the combo box's own box;
+    * a popup that is *closed* is a `menu` of size 0×0, so it yields no rows and
+      the tree comes out exactly as before;
+    * a label that appears more than once in a popup is skipped, not guessed at.
+
+    `nodes` is the output of [`_walk`] over one application.
+    """
+    nodes = list(nodes)
+
+    popups = []        # [[(label, box), ...], ...] one per popup container
+    boxes = {}         # label -> real box, only when unambiguous
+    combo_boxes = {}   # combo box label -> its own box
+    option_boxes = {}  # combo box label -> {option label: [reported box, ...]}
+
+    # A popup container is never nested inside the combo box it belongs to, so
+    # once one starts, the rows that follow are the popup's, not the combo
+    # box's. `in_popup` says which kind of row the next one is; `owner` says
+    # whose options they are.
+    owner = None
+    in_popup = False
+    for role, name, box in nodes:
+        if role in DEMUX_CONTAINER_ROLES:
+            in_popup = True
+            popups.append([])
+        elif role in POPUP_ROLES:
+            in_popup = False
+            owner = name
+            if name and box:
+                combo_boxes[name] = box
+        elif owner and name and role in DEMUX_ITEM_ROLES:
+            if in_popup:
+                popups[-1].append((name, box))
+            else:
+                option_boxes.setdefault(owner, {}).setdefault(name, []).append(box)
+
+    # A popup labels rows unambiguously only if each label appears once in it.
+    for rows in popups:
+        seen = {}
+        for label, box in rows:
+            seen.setdefault(label, []).append(box)
+        for label, found in seen.items():
+            if len(found) == 1 and found[0] is not None and label not in boxes:
+                boxes[label] = found[0]
+
+    out = {}
+    for owner, options in option_boxes.items():
+        own = combo_boxes.get(owner)
+        for label, reported in options.items():
+            if label not in boxes:
+                continue
+            if any(box is not None and box != own for box in reported):
+                continue  # the page reports a distinct box; believe it
+            out[label] = boxes[label]
+    return out
+
+
+def build(accessible, pyatspi, depth, counter, parent, real_boxes=None):
     if depth > MAX_DEPTH or counter[0] >= MAX_NODES:
         return
     counter[0] += 1
@@ -111,6 +219,12 @@ def build(accessible, pyatspi, depth, counter, parent):
         if states:
             node.set("states", states)
         bounds = _bounds(accessible)
+        # An option row inside a `<select>` popup reports the combo box's own
+        # box until the popup opens; while it is open the real row is a
+        # different element entirely. Substituting the real one is the only way
+        # a click can land on the option the caller asked for.
+        if real_boxes and role in DEMUX_ITEM_ROLES and name in real_boxes:
+            bounds = real_boxes[name]
         if bounds is not None:
             x, y, width, height = bounds
             node.set("x", str(x))
@@ -138,7 +252,7 @@ def build(accessible, pyatspi, depth, counter, parent):
                 continue
         except Exception:
             pass
-        build(child, pyatspi, depth + 1, counter, node)
+        build(child, pyatspi, depth + 1, counter, node, real_boxes)
 
 
 def _is_showing(accessible, pyatspi):
@@ -178,6 +292,9 @@ def main():
     desktop = pyatspi.Registry.getDesktop(0)
     root = ET.Element("desktop")
     counter = [0]
+    # Read once from the whole desktop: an open `<select>` puts its real rows in
+    # a top-level `window`, not under the application that owns the combo box.
+    real_boxes = _desktop_option_boxes(desktop, pyatspi)
     for index in range(desktop.childCount):
         if counter[0] >= MAX_NODES:
             break
@@ -187,8 +304,29 @@ def main():
             continue
         if app is None or not _is_showing(app, pyatspi):
             continue
-        build(app, pyatspi, 1, counter, root)
+        build(app, pyatspi, 1, counter, root, real_boxes)
     sys.stdout.write(ET.tostring(root, encoding="unicode"))
+
+
+def _desktop_option_boxes(desktop, pyatspi):
+    """`real_option_boxes` over every application on the desktop."""
+    found = {}
+    try:
+        count = desktop.childCount
+    except Exception:
+        return found
+    for index in range(count):
+        try:
+            app = desktop.getChildAtIndex(index)
+        except Exception:
+            continue
+        if app is None:
+            continue
+        try:
+            found.update(real_option_boxes(_walk(app)))
+        except Exception:
+            continue
+    return found
 
 
 if __name__ == "__main__":

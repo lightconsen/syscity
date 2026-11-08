@@ -120,6 +120,7 @@ from sycity_agent import (  # noqa: E402
 # tested on any machine, since `subprocess.Popen` is what gets replaced.
 import pyautogui_shim as shim  # noqa: E402
 import score  # noqa: E402
+import atspi_xml  # noqa: E402
 
 CHECK_YES = "import pyautogui\npyautogui.click(1, 2, button='left')\n"
 
@@ -632,6 +633,43 @@ class SilentDropTest(unittest.TestCase):
             shim._xdotool("getdisplaygeometry")
 
 
+class WheelTest(unittest.TestCase):
+    """A scroll must not spend xdotool's default delay per wheel click.
+
+    syscity turns one scroll `amount` into 100 wheel clicks. `xdotool click`
+    waits 100 ms between repeats unless told otherwise, so the default made a
+    single scroll take tens of seconds, past the remote client's 30 s timeout —
+    which the model then read as "the endpoint refuses scroll" (fill-form v2).
+    The distance is identical either way; only the wall clock changes.
+    """
+
+    def setUp(self):
+        self._saved = shim._xdotool
+        self.calls = []
+        shim._xdotool = lambda *args: self.calls.append(args) or ""
+        self.addCleanup(setattr, shim, "_xdotool", self._saved)
+
+    def test_a_scroll_passes_no_inter_click_delay(self):
+        shim.scroll(-500, x=600, y=400)
+        click = [call for call in self.calls if call[:1] == ("click",)][-1]
+        self.assertIn("--delay", click)
+        self.assertEqual(click[click.index("--delay") + 1], "0")
+        self.assertEqual(click[-2:], (500, 5))
+
+    def test_wheel_up_is_button_four(self):
+        shim.scroll(3)
+        self.assertEqual(self.calls[-1][-1], 4)
+
+    def test_horizontal_scroll_uses_the_same_delay(self):
+        shim.hscroll(-2)
+        self.assertEqual(self.calls[-1][-1], 7)
+        self.assertEqual(self.calls[-1][self.calls[-1].index("--delay") + 1], "0")
+
+    def test_a_zero_scroll_still_sends_one_click(self):
+        shim.scroll(0)
+        self.assertEqual(self.calls[-1][-2:], (1, 5))
+
+
 class DragTest(unittest.TestCase):
     """A drag must produce a *sequence*, not two endpoints.
 
@@ -865,6 +903,83 @@ class ScoreTest(unittest.TestCase):
         self.assertIn("drag-drop", ceiling.oracle)
         # date-picker cost me a wrong answer once; it must stay out.
         self.assertNotIn("date-picker", ceiling.oracle)
+
+
+class OptionBoxTest(unittest.TestCase):
+    """A closed `<select>` reports every option at the combo box's own box.
+
+    Clicking "Banana" there just closes the menu, which is how `select-dropdown
+    v1` was lost. When the popup opens, the real rows live in a top-level
+    `window` → `tree table`; `real_option_boxes` has to find them without
+    disturbing a tree that was already correct.
+    """
+
+    COMBO = (213, 187, 185, 52)
+
+    def nodes(self, popup_open):
+        """The shape a real pywebview `<select>` reports, open or closed."""
+        nodes = [
+            ("application", "gw3.py", None),
+            ("frame", "S", (200, 150, 510, 334)),
+            ("combo box", "Fruit selection dropdown", self.COMBO),
+            ("menu", None, None),
+            ("menu item", "-- Select a fruit --", self.COMBO),
+            ("menu item", "Apple", self.COMBO),
+            ("menu item", "Banana", self.COMBO),
+        ]
+        if popup_open:
+            nodes += [
+                ("window", None, (213, 239, 185, 102)),
+                ("tree table", None, (214, 240, 183, 100)),
+                ("table cell", "-- Select a fruit --", (236, 241, 159, 23)),
+                ("table cell", "Apple", (236, 266, 159, 23)),
+                ("table cell", "Banana", (236, 291, 159, 23)),
+            ]
+        return nodes
+
+    def test_an_open_popup_gives_each_option_its_real_box(self):
+        boxes = atspi_xml.real_option_boxes(self.nodes(popup_open=True))
+        self.assertEqual(boxes["Banana"], (236, 291, 159, 23))
+        self.assertEqual(boxes["Apple"], (236, 266, 159, 23))
+        self.assertNotIn("Fruit selection dropdown", boxes)
+
+    def test_a_closed_popup_changes_nothing(self):
+        # The popup is a 0x0 menu, so there is no real box to substitute and the
+        # tree must come out exactly as the platform reported it.
+        self.assertEqual(atspi_xml.real_option_boxes(self.nodes(popup_open=False)), {})
+
+    def test_a_distinct_reported_box_is_believed(self):
+        # A page that really draws its rows in place reports distinct boxes; the
+        # popup must not overwrite them.
+        nodes = self.nodes(popup_open=True)
+        nodes = [
+            (r, n, (900, 900, 10, 10) if (r, n) == ("menu item", "Apple") else b)
+            for r, n, b in nodes
+        ]
+        boxes = atspi_xml.real_option_boxes(nodes)
+        self.assertNotIn("Apple", boxes)
+        self.assertIn("Banana", boxes)
+
+    def test_an_ambiguous_label_is_skipped(self):
+        # Two rows in the popup with the same label: no way to know which one
+        # the caller means, so neither is offered.
+        nodes = self.nodes(popup_open=True)
+        nodes.append(("table cell", "Banana", (236, 316, 159, 23)))
+        self.assertNotIn("Banana", atspi_xml.real_option_boxes(nodes))
+
+    def test_the_popup_rows_are_not_mistaken_for_the_combo_boxes(self):
+        # The popup follows the combo box in tree order; treating its rows as
+        # more options of the combo box made the substitution never fire. A
+        # label unique to the popup proves the rows were read as the popup's.
+        nodes = self.nodes(popup_open=True)
+        nodes += [
+            ("combo box", "Second", (300, 400, 100, 30)),
+            ("menu item", "Pear", (300, 400, 100, 30)),
+            ("window", None, (300, 430, 100, 60)),
+            ("table cell", "Pear", (310, 440, 80, 20)),
+        ]
+        boxes = atspi_xml.real_option_boxes(nodes)
+        self.assertEqual(boxes["Pear"], (310, 440, 80, 20))
 
 
 if __name__ == "__main__":

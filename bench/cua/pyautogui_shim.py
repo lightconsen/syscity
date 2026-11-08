@@ -146,14 +146,30 @@ def scroll(clicks, x=None, y=None):
         moveTo(x, y)
     # PyAutoGUI counts wheel clicks; X button 4 is up and 5 is down.
     button = 4 if clicks > 0 else 5
-    _xdotool("click", "--repeat", max(1, abs(int(clicks))), button)
+    _wheel(button, max(1, abs(int(clicks))))
 
 
 def hscroll(clicks, x=None, y=None):
     if x is not None and y is not None:
         moveTo(x, y)
     button = 6 if clicks > 0 else 7
-    _xdotool("click", "--repeat", max(1, abs(int(clicks))), button)
+    _wheel(button, max(1, abs(int(clicks))))
+
+
+#: Between repeated wheel clicks. `xdotool click --repeat` defaults to 100 ms,
+#: which is fine for a double-click and ruinous for a scroll: syscity converts
+#: one scroll *amount* into 100 wheel clicks, so the default delay turns a single
+#: scroll into 10 s, and the 30 s HTTP timeout into a hard ceiling at amount 3.
+#: A timed-out request arrives at the model as "the endpoint refused this", and
+#: that is exactly the wrong conclusion — the wheel works, it was just slow.
+#: Chromium coalesces wheel events, so dropping the delay loses no distance.
+WHEEL_DELAY_MS = 0
+
+
+def _wheel(button, clicks):
+    _xdotool(
+        "click", "--delay", str(WHEEL_DELAY_MS), "--repeat", clicks, button
+    )
 
 
 # ── Keyboard ────────────────────────────────────────────────────────────────
