@@ -181,17 +181,15 @@ impl SensitiveUiDetector {
     // ------------------------------------------------------------------
 
     fn is_password_field(&self, role: &str, label: &str) -> bool {
-        let role_signals = [
-            "password",
-            "secure_text",
-            "password_field",
-            "passwort",
-            "pin",
-        ];
+        // `pin` cannot be matched as a substring: `spin_button` contains it, so
+        // every number stepper — a date picker's month/day/year segments, a
+        // quantity field — was reported as a password input and carried the
+        // "do not enter credentials here" warning. It is matched as a whole word
+        // instead, which is what a PIN actually is.
+        let role_signals = ["password", "secure_text", "password_field", "passwort"];
         let label_signals = [
             "password",
             "passwort",
-            "pin",
             "密钥",
             "密码",
             "口令",
@@ -202,6 +200,8 @@ impl SensitiveUiDetector {
 
         role_signals.iter().any(|s| role.contains(s))
             || label_signals.iter().any(|s| label.contains(s))
+            || contains_word(role, "pin")
+            || contains_word(label, "pin")
     }
 
     fn is_payment_field(&self, _role: &str, label: &str) -> bool {
@@ -280,6 +280,16 @@ impl SensitiveUiDetector {
 
         is_dialog && signals.iter().any(|s| combined.contains(s))
     }
+}
+
+/// Whether `haystack` contains `word` as a delimited token.
+///
+/// Used for short signals like `pin`, whose substring form appears inside
+/// unrelated names — `spin_button` is the one that mattered.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|token| token == word)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,5 +384,46 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| matches!(f.category, SensitiveUiType::PasswordField)));
+    }
+
+    #[test]
+    fn test_a_spin_button_is_not_a_password_field() {
+        // `spin_button` contains `pin`; matching it as a substring flagged every
+        // date picker and number stepper as a credential field.
+        let detector = SensitiveUiDetector::new();
+        for role in ["spin_button", "spinbutton", "number_field"] {
+            let tree = make_node(role, None);
+            assert!(detector.scan_tree(&tree).is_empty(), "{role} was reported as sensitive");
+        }
+    }
+
+    #[test]
+    fn test_a_real_pin_field_still_matches() {
+        let detector = SensitiveUiDetector::new();
+        for (role, label) in [
+            ("text_field", Some("Enter your PIN")),
+            ("text_field", Some("pin")),
+            ("pin_field", None),
+        ] {
+            let tree = make_node(role, label);
+            assert!(
+                detector
+                    .scan_tree(&tree)
+                    .iter()
+                    .any(|f| matches!(f.category, SensitiveUiType::PasswordField)),
+                "{role}/{label:?} should be a password field"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_word_needs_a_boundary() {
+        assert!(contains_word("enter pin", "pin"));
+        assert!(contains_word("pin", "pin"));
+        assert!(contains_word("pin_field", "pin"));
+        // The caller lower-cases first; the helper itself does not.
+        assert!(!contains_word("PIN code", "pin"));
+        assert!(!contains_word("spin_button", "pin"));
+        assert!(!contains_word("pinned", "pin"));
     }
 }

@@ -398,12 +398,28 @@ token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M
 
 - `@register_agent("syscity") class SyscityAgent(BaseAgent)`，实现 `name()` 与
   `async perform_task(...)`，返回 `AgentResult`（token 数 + `FailureMode`）。
-- 先把 `session` 接成一个 `syscity bench run --computer-url` 够得着的 HTTP 地址，剩下的
-  与 OSWorld 完全一样：一次跑完，按 `actions` 回放。
-- 轨迹、ATIF、`summary.json` 都由 `cb` 写，不自己造。
-- 为什么不在 M2 一起写：`session` 是 cua SDK 的 `DesktopSession`，不是 OSWorld 的 HTTP
-  协议，地址怎么接出来只有在真 sandbox 里试过才算数。照文档猜一遍接口，正是本文最不想要
-  的那种"看起来写完了"。
+- **地址怎么接出来**（这是 M4 唯一真正的未知，已在真 sandbox 上试通）：
+  `cua_bridge.py` 在 guest 里跑一个 HTTP 服务应答 `/screenshot`、`/accessibility`、
+  `/screen_size`、`/execute`，`sandbox.tunnel.forward(8765)` 把它暴露到 host，那个 URL
+  就是 `--computer-url`。guest 没有 pyautogui，`pyautogui_shim.py` 用 xdotool/xclip 顶上；
+  `atspi_xml.py` 把 AT-SPI 树渲染成 `parse_at_spi` 读得懂的 XML。
+- **形态是 direct，不是 replay**：`/execute` 真的在 guest 里执行片段，所以 syscity 决策
+  时看到的画面就是动作改变的画面上。回放会是更弱的测量（决策时的屏幕和动作生效时的屏幕
+  不再是同一块），因此这里刻意不用。
+- 轨迹、ATIF、`summary.json` 都由 `cb` 写，不自己造；轨迹通过 `Tracing.record(...)`
+  （不是可调用对象）交出去。
+- **shim 必须自己验证，不能相信退出码**：xdotool 遇到不认识的键名只往 stderr 打一句
+  `No such key name`、退出码仍是 0；`xclip -loops 1` 在 Chromium/GTK 里粘不出东西，因为
+  浏览器先问 `TARGETS` 再要正文，一次性的服务端被这一步用光。两者都会让模型"看起来"
+  做错了它其实做对了的题——`typing-input` 0/5、`fill-form` 0/3 全部是剪贴板那一处，
+  date-picker 里失效的 `page_up` 全部是键名那一处。因此 `_xdotool` 把 `No such key name`
+  当失败，`_key_name` 遇到没有显式映射的名字直接抛错，`copy()` 要读回来确认才返回。
+  浏览器拖拽还要求中间有足够多的 move 事件，一次 origin→target 的跳跃会被当成点击，
+  `drop` 永远不触发，所以 `moveTo(duration=…)` 至少要插值 `DRAG_MIN_STEPS` 个点。
+- syscity 起不来 / 跑挂 / 结果里 `error` 非空，一律抛 `SyscityRunFailed`，记成基础设施
+  错误而不是"做错了一题"。
+- 跑法见 [`bench/README.md`](../bench/README.md)。`PYTHONPATH=$PWD` 是必需的：`cb` 用点分
+  路径 import agent，但不会把工作目录放进 `sys.path`。
 
 ---
 
@@ -415,8 +431,63 @@ token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M
 | **M1** ✅ | `syscity bench run` + `### ANSWER ###` 契约 | 对着假服务器跑通一次完整 Agent 任务；输出 JSON 可被 `jq` 读 | 0.5 天 |
 | **M2** ⏳ | `bench/osworld/run.py` 回放模式（代码写完，单测过；等 VM） | `test_small` 抽 5 题手跑，动作真的落在 VM 上（截图对比 + 人工看） | 1 天 |
 | **M3** ⏳ | `syscity bench serve` 步进协议（代码写完，单测过；等 VM）；可选 `pyatspi` ax 动作 | 同一批 5 题在步进模式下重跑，结果与回放模式差异可解释 | 1–1.5 天 |
-| **M4** | `bench/cua/sycity_agent.py` + `cua-bench-basic` | 13 题跑完，`summary.json` 有 `pass_at_k` | 0.5–1 天 |
+| **M4** ✅ | `bench/cua/sycity_agent.py` + guest bridge + `cua-bench-basic` | 在真 sandbox 上跑通并出分，`summary.json` 有 `pass_at_k` | 0.5–1 天 |
 | **M5** | 全量：OSWorld 369 题 × 1 trial（先 a11y-only），结果进 ledger | 分数、infra 错误、阶梯分布三张表齐全 | 人工触发 |
+
+### M4 实测结果（2026-11-08，本机 arm64 Mac，`--runtime runc`）
+
+`cua-bench-basic` 全量 68 个 variant，`deepseek-v4-flash`，`--max-steps 25`。
+两个数，含义不同，不能互相替代：
+
+| | 数 | 说明 |
+|---|---|---|
+| 原始分 | **54/68 = 0.794** | `summary.json` 的 `avg_reward`，**报分用这个** |
+| 可达分 | **54/63 = 0.857** | 剔除 `drag-drop` 后的模型分；见 `bench/cua/ceiling.json` |
+| 环境上限 | 1 个任务（5 variant） | 只有 `drag-drop`，且有机制层面的证据 |
+
+```bash
+python3 bench/cua/score.py <run-dir>     # 两个数并列输出
+```
+
+**先前给出的 0.927 作废。** 那是按"整题扣除 `date-picker`/`fill-form`/`drag-drop`"
+算的，两处都错：
+
+1. **`fill-form` 的 oracle 实际全过（3/3）**，模型也过了 v0/v1 —— 它根本不在上限里。
+2. **`date-picker` 的 oracle 五个 variant 全是 0，但模型 v4 得 1。** 说明日期选择器
+   在这个环境里是好用的，坏的是 oracle 自己：`solve_task` 用 `TypeAction` 往
+   `input[type=date]` 里打字，WebKitGTK 不认（复跑两次均为 0）。模型则是点开取器、
+   按调节按钮选中的。把整题当作环境上限，等于把模型真做出来的题算成"不可达"。
+
+同样的反例还有 `spreadsheet-cell v4` 和 `video-player v2`：oracle 都是 0，模型都是 1。
+所以 **oracle=0 不等于环境不可达**，它也可能只是 oracle 坏了。
+
+现在 `ceiling.json` 只收满足三个条件的任务，`score.py` 在报分时逐条校验：
+
+- oracle 在该任务的**每一个** variant 上都是 0（`null` 是"没测"，不是 0，会直接否决）；
+- 模型在**任何一个** variant 上都没得 1；
+- 失败机制清楚，写进文件。
+
+三条缺一不可。第一条防止按 variant 挑着扣（那正好会专扣模型做错的题，等于作弊），
+第二条防止坏 oracle 冒充环境上限（模型做出来了，就证明环境通得过）。
+
+**实测的 oracle 基线**：全量 68 个 variant 的 oracle 平均分 **0.824**（56/68）；
+12 个 variant 的 oracle 为 0，其中模型反而解出了 3 个。
+
+`drag-drop`（0/5，oracle 也 0/5）是唯一进入上限的任务。机制确认过：在真实 bench-web
+容器里注入页面级监听，`mousedown`/`mousemove`/`mouseup` 都到达页面，`dragstart` 从不
+触发，30 个密集插值点也一样。`cua-spacesd` 自己的诊断字符串写着
+`WebKitGTK rejects synthetic XSendEvent input`，真实拖拽路径要 `/dev/uinput`，容器里没有。
+拖放目标只对 `drop` 事件有反应，没有键盘/点击的绕行路径。
+
+对照 `drag-slider` 5/5：它同样是拖拽，但模型用"点击滑块 + 方向键"绕过，说明任务本身
+在键盘下可达——所以它不在上限里。
+
+另外记录一个**与胶水无关**、但这次一起修掉的真 bug：`sensitive_ui` 把 `"pin"` 当子串匹配，
+于是 `spin_button` 命中——date-picker 的月/日/年数字调节器、任何数量框都被标成密码字段，
+模型收到"不要在此输入凭据"的警告后放弃输入。改成整词匹配后 `spin_button` 不再误报，
+真正的 `pin` 字段仍然命中。这一处在 `date-picker` 上直接可见：修前 0/5（且两次打满 25 步），
+修后 1/5、其余都以 `final_answer` 正常收尾。
+
 
 ### 已经落地的部分（2026-10-29）
 
@@ -501,8 +572,8 @@ x86_64，但慢 10–50 倍，跑 LibreOffice/Chrome 没有意义。结论：**�
 | 需求 | 现状 | 结论 |
 |---|---|---|
 | VMware Fusion / KVM 跑 OSWorld 镜像 | 都没有（`vmrun` 不存在，Docker 未启） | 换一台 x86_64 + `/dev/kvm` 的机器（裸金属或开了嵌套虚拟化的云主机） |
-| Docker（Cua container 模式） | OrbStack 已装、未启 | 启用后可用 `--runtime gvisor` |
-| `cb` / `cua-spacesd` | 未装 | M4 前 `uv tool install`（以官方 README 为准） |
+| Docker（Cua container 模式） | OrbStack 已装并启用 | `--runtime runc` 可用；`gvisor` 需要 `runsc`，本机没装 |
+| `cb` / `cua-spacesd` | `cb` 已装（v0.3.1，`uv tool install cua-bench`）；spacesd 不需要 | 已跑通 `cua-bench-basic` |
 | `uv` | 有 | — |
 | 默认模型 | `deepseek-v4-flash`，无 vision | a11y-only 下限分；视觉口径单列 |
 

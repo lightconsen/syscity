@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "dataset": "cua-bench-basic@1.0",
+  "image": "ghcr.io/trycua/bench-web@sha256:3b7e1d9d4e34694175cf1b44ffefc09b557c94b1c8f946fe50646d68df39ca87",
+  "target": "local (container, runtime runc) on darwin/arm64",
+  "measured_at": "2026-11-08",
+  "how_verified": [
+    "The whole dataset was run against the official oracle, i.e. the dataset's",
+    "own reference solutions:",
+    "  cb run dataset cua-bench-basic@1.0 --oracle --on local --runtime runc \\",
+    "    --image <image above> -j 2 --output-dir <dir>",
+    "and the same dataset was then run with the model. A task is listed here",
+    "only when the oracle scores 0 on EVERY variant AND the model scored 1 on",
+    "NO variant, and the failure has a mechanism that is understood.",
+    "That conjunction is the point. date-picker is the counterexample: its",
+    "oracle scores 0 on all five variants (it types into input[type=date], which",
+    "WebKitGTK ignores), yet the model solved v4 by clicking the picker's spin",
+    "buttons — so the task is reachable and the oracle, not the environment, is",
+    "what fails. A single-variant reading of 'oracle == 0' would have called",
+    "date-picker an environment limit and inflated the score.",
+    "score.py enforces the same conjunction at report time and refuses a",
+    "declaration the run contradicts."
+  ],
+  "oracle_baseline": {
+    "variants": 68,
+    "oracle_avg_reward": 0.824,
+    "oracle_zero_variants": [
+      "date-picker v0", "date-picker v1", "date-picker v2", "date-picker v3",
+      "date-picker v4", "drag-drop v0", "drag-drop v1", "drag-drop v2",
+      "drag-drop v3", "drag-drop v4", "spreadsheet-cell v4", "video-player v2"
+    ],
+    "note": "of these, the model solved date-picker v4, spreadsheet-cell v4 and video-player v2, which is how their tasks were shown reachable"
+  },
+  "unreachable_tasks": {
+    "drag-drop": {
+      "reason": "HTML5 drag-and-drop needs synthetic drag input, and WebKitGTK rejects it under runc without /dev/uinput.",
+      "mechanism_evidence": "Page-side event listeners in a real bench-web container confirm mousedown, mousemove and mouseup all arrive at the page while dragstart never fires — even with 30 dense interpolated steps. cua-spacesd's own diagnostic string says 'WebKitGTK rejects synthetic XSendEvent input'; its real path needs /dev/uinput, absent here.",
+      "no_alternate_route": "The drop target only reacts to a drop event, so click/keyboard workarounds are not available. (drag-slider is the contrast: also a drag, but reachable by click-then-arrow-keys, and it scores 1 on all five variants.)",
+      "oracle_reward": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 0.0,
+        "3": 0.0,
+        "4": 0.0
+      }
+    }
+  },
+  "notes": [
+    "date-picker and fill-form are deliberately NOT listed. The model scored 1",
+    "on date-picker v4 and fill-form v0/v1, so those tasks are reachable here.",
+    "fill-form's oracle also passes all three variants.",
+    "A variant the model solved is never excluded, whatever its oracle did:",
+    "exclusion exists to stop a broken environment reading as model weakness,",
+    "and a solved variant is proof the environment worked."
+  ]
+}

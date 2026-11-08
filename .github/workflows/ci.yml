@@ -343,9 +343,13 @@ jobs:
         run: python3 --version
 
       - name: Test the benchmark glue
-        # Pure Python, no VM, no model: the syscity binary is stubbed. Guards
-        # the replay contract that `bench run`'s `actions` field feeds.
-        run: python3 bench/osworld/test_sycity_agent.py
+        # Pure Python, no VM, no model, no Cua Bench install: the syscity binary
+        # and cua_bench's agent interface are stubbed. Guards the replay
+        # contract that `bench run`'s `actions` field feeds, and the Cua Bench
+        # bridge handoff and infrastructure-error boundary.
+        run: |
+          python3 bench/osworld/test_sycity_agent.py
+          python3 bench/cua/test_sycity_agent.py
 
       - name: Run tests
         run: "cargo test --all-features -- --skip e2e:: --nocapture"
