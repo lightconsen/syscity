@@ -151,9 +151,11 @@ a ceiling: `date-picker`'s oracle fails all five variants while the model has
 solved one, and `spreadsheet-cell`/`video-player` each have an oracle-failing
 variant the model passes. See [`cua/README.md`](cua/README.md).
 
-Two full runs at the same 0.794 agreed on only 58 of 68 variants, so treat a
-single run's failure list as a sample, not a verdict. What is stable is the
-score and the one task in the ceiling.
+Four full runs at the same settings scored 0.794, 0.794, 0.735 and 0.721, and
+two of those back-to-back 0.794s agreed on only 58 of 68 variants. Treat a
+single run's failure list as a sample, not a verdict, and judge a fix by
+re-running the variants it targets rather than by comparing two totals. See
+[`cua/README.md`](cua/README.md).
 
 ### Why there is a bridge
 

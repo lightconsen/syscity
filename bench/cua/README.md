@@ -40,10 +40,26 @@ python3 bench/cua/score.py <run-dir> --json   # machine
 | **reachable** | accuracy over the variants this environment can actually solve | the model, with the environment's own limits removed |
 
 They are not interchangeable and neither may be presented as the other. On this
-host (container-only, `runc`, darwin/arm64) they are **0.794 raw and 0.857
+host (container-only, `runc`, darwin/arm64) they are **0.72 raw and 0.78
 reachable** — six points apart, all of it one task. On an environment where more
 of the suite is broken the gap would be larger, and a raw number alone would read
 as model weakness.
+
+### Run to run, this number moves more than it looks
+
+Four full 68-variant runs at the same settings scored **0.794, 0.794, 0.735 and
+0.721** — a spread of seven points with nothing changed between the first two.
+Across those four runs, compared cell by cell, only **48 of the 65 cells that
+completed in every run gave the same answer every time**; 17 flipped at least
+once. A majority vote over the four gives 56/65 = 0.8615, *above* every single
+run — a single run understates the model by roughly the amount of the flips.
+
+So a single run cannot settle a four-point question. When judging whether a
+change helped, re-run the specific variants it was meant to fix — several times
+— instead of comparing two full-run totals. Two cases where that mattered:
+`click-button` v5/v6 read 0/2 in one run and 7/7 on re-run, and
+`right-click-menu` read 2/5 in a full run and 3/3 on three standalone re-runs.
+Both were sampling noise, not regressions.
 
 ## The environment ceiling
 
@@ -76,9 +92,10 @@ and `video-player v2` (oracle 0, model 1 in the first) are the same story. A
 rule keyed on "oracle == 0" alone would have called all three an environment
 limit and quietly raised the score; an earlier version of this file did exactly
 that and reported an inflated **0.927**. The figure with the guards in place is
-**0.794 raw / 0.857 reachable**.
+**0.72 raw / 0.78 reachable**, and the *best* of the four runs was 0.79 — see the
+variance section above.
 
-### The number is stable; the per-variant cells are not
+### Two runs at the same score still disagreed on ten cells
 
 Two full 68-variant runs with the same shim and model, back to back, both scored
 **0.794** — but they agreed on only **58 of 68** variants. Ten flipped, five each
@@ -133,26 +150,51 @@ Add the task to `unreachable_tasks` with every variant's measured
 even one variant is reachable — by the oracle or by the model — the task stays
 in the denominator, and `score.py` will say so rather than apply the exclusion.
 
-## Where the 14 failures come from
+## Where the failures come from
 
-At 0.794 raw, 14 of 68 variants fail. These are the *classes* of failure, taken
-from replaying the trajectories and re-testing each in a real `bench-web`
-container. Which variant lands in which class moves between runs — see above —
-so read this as what a failure means, not as a fixed roster:
+Around 0.72–0.79 raw, 14–19 of 68 variants fail depending on the run. These are
+the *classes* of failure, taken from replaying the trajectories and re-testing
+each in a real `bench-web` container. Which variant lands in which class moves
+between runs — see above — so read this as what a failure means, not as a fixed
+roster:
 
 | failure | cause | evidence |
 |---|---|---|
 | `drag-drop` (all 5) | **environment** | synthetic drag is rejected; `dragstart` never fires, and the target has no other route |
-| `date-picker` (4–5 of 5) | model | the environment reaches it; its oracle is 0 on all five only because `solve_task` types into `input[type=date]`, which WebKitGTK ignores |
+| `date-picker` (4–5 of 5) | model | the environment reaches it; its oracle is 0 on all five only because `solve_task` types into `input[type=date]`, which WebKitGTK ignores. Segmented `mm/dd/yyyy` sub-fields take no synthetic text at all — but a calendar-cell click does commit, and the model has passed one variant by that route |
 | `video-player`'s volume variants | model, wrong layer | told to set volume to 75%, it ran `pactl set-sink-volume` in a terminal instead of moving the on-page slider; the task scores the player, not the ALSA mixer |
-| `right-click-menu` v4-class | model gave up | one right-click, then `final_answer` claiming the menu "isn't visible" |
+| `right-click-menu` misses | model stopped early, plus a race | usually one right-click then `final_answer`; the menu is there in the tree. 3/3 standalone re-runs passed at 2 steps each, so this class is mostly sampling |
 | `fill-form`, `spreadsheet-cell` misses | model aimed wrong | clicks a cell or field one row off, then reports success |
+| `click-button` v5/v6 | **glue bug — fixed** | see below |
 | `select-dropdown` v1 | **glue bug — fixed, rewards 1 on re-run** | see below |
 
-Apart from the `select-dropdown` bug, none of these is the glue's fault. The
-rest is the model stopping early, aiming at the wrong cell, or solving the task
-in the wrong layer — genuine model results, and the reason the raw number is the
+Apart from the three fixed glue bugs, none of these is the glue's fault. The rest
+is the model stopping early, aiming at the wrong cell, or solving the task in
+the wrong layer — genuine model results, and the reason the raw number is the
 one to quote.
+
+### A click at a coordinate the tree published, but the window had cropped
+
+`click-button`'s window is 256×256 and its button grid grows to eight buttons, so
+the target can land on a fourth row **below the fold**. AT-SPI keeps reporting
+that row's layout box — flagged `visible` but not `showing` — and a click at
+those coordinates lands on the bare desktop behind the window. Fixed twice over,
+because both halves were wrong:
+
+* `atspi_xml.py` now withholds the box for a node that is `visible` without
+  `showing`. The element still appears in the tree (it exists), it just has no
+  clickable point. Measured in a container: of eight buttons in the 256-px
+  window, six keep their real boxes and the two on the cropped row lose theirs.
+* `parse_at_spi` no longer reads AT-SPI's `active` as keyboard focus. `active`
+  marks the *window* that has the pointer's attention; a frame carries it while
+  nothing inside is focused. Reading it as focus meant that clicking **outside**
+  the window (the window drops `active`) verified as a working action — which is
+  exactly how a click at y=620 in a window ending at y=557 came back "clicked
+  Close" while the real button was untouched. The native x11 reader had always
+  used `STATE_FOCUSED` alone; the two now agree, and `tree_diff` additionally
+  only counts a focus transition on a role that can hold keyboard focus.
+
+After the fix `click-button` scored 7/7 in the next full run.
 
 ### A timeout is not a refusal
 
