@@ -40,19 +40,27 @@ python3 bench/cua/score.py <run-dir> --json   # machine
 | **reachable** | accuracy over the variants this environment can actually solve | the model, with the environment's own limits removed |
 
 They are not interchangeable and neither may be presented as the other. On this
-host (container-only, `runc`, darwin/arm64) they are **0.72 raw and 0.78
-reachable** — six points apart, all of it one task. On an environment where more
-of the suite is broken the gap would be larger, and a raw number alone would read
-as model weakness.
+host (container-only, `runc`, darwin/arm64) the latest full run is **0.809 raw
+and 0.873 reachable** — six points apart, all of it one task. On an environment
+where more of the suite is broken the gap would be larger, and a raw number alone
+would read as model weakness.
 
 ### Run to run, this number moves more than it looks
 
-Four full 68-variant runs at the same settings scored **0.794, 0.794, 0.735 and
-0.721** — a spread of seven points with nothing changed between the first two.
-Across those four runs, compared cell by cell, only **48 of the 65 cells that
-completed in every run gave the same answer every time**; 17 flipped at least
-once. A majority vote over the four gives 56/65 = 0.8615, *above* every single
-run — a single run understates the model by roughly the amount of the flips.
+Six full 68-variant runs scored **0.794, 0.794, 0.735, 0.721, 0.750 and 0.809** —
+a spread of nine points. The first four differ from each other only by sampling:
+nothing changed between them. Across the first four, compared cell by cell, only
+**48 of the 65 cells that completed in every run gave the same answer every
+time**; 17 flipped at least once. A majority vote over the four gives 56/65 =
+0.8615, *above* every single run — a single run understates the model by roughly
+the amount of the flips.
+
+The last two are not pure noise: 0.750 and 0.809 were measured across a settle
+fix (below), and the tasks that fix was aimed at moved with it —
+`select-dropdown` 3/5 → 5/5 and `right-click-menu` 2/5 → 4–5/5. That is the
+honest reading of the two runs as a pair, not a claim that the fix is worth seven
+points; re-running the specific variants is the only way to tell the two apart,
+which is what the next paragraph says.
 
 So a single run cannot settle a four-point question. When judging whether a
 change helped, re-run the specific variants it was meant to fix — several times
@@ -60,6 +68,41 @@ change helped, re-run the specific variants it was meant to fix — several time
 `click-button` v5/v6 read 0/2 in one run and 7/7 on re-run, and
 `right-click-menu` read 2/5 in a full run and 3/3 on three standalone re-runs.
 Both were sampling noise, not regressions.
+
+### The settle window, and why "0.0% changed" was sometimes a lie
+
+A step used to settle with `initial_delay_ms: 150`, `poll_interval_ms: 120`,
+`max_rounds: 4` — a window of 150 + 3 × 120 = **510 ms**. For an action whose
+repaint lands after that, two problems compounded:
+
+1. **Two polls compared against each other, not against the baseline.** The
+   loop stopped at the first pair of identical frames — which is equally what
+   "the screen has not started changing yet" looks like.
+2. **The adapter's screenshot cache answered both polls with one frame.** A
+   capture is reused for 250 ms, longer than the 120 ms poll spacing, so the
+   first poll returned the *same stored frame* the baseline was stored from.
+   The loop's first comparison was therefore trivially stable.
+
+Measured on the real image, a right-click that opens a context menu repaints
+**205 ms** after the click on a good run and **1.4 s** on a slow one — both
+outside or at the edge of the old window. The agent was told "0.0% changed in
+pixels", concluded its right-click had done nothing, and answered honestly that
+the menu never opened. It had.
+
+The fix has two halves, both in `src/computer/session.rs` and
+`src/computer/remote/osworld.rs`:
+
+* `SettleConfig::min_window_ms` (default 1200 ms): until *something* has
+  changed, keep comparing **against the baseline** and keep polling. Once a
+  change is seen, consecutive frames decide "settled" as before. An action that
+  visibly works still settles immediately; only the ambiguous case waits.
+* `ComputerAdapter::screenshot_fresh`, which the settle loop now calls, and
+  which `OsworldDesktop` implements to bypass its reuse window. The cached
+  `screenshot` is still what the model's own reads use.
+
+Two regression tests pin both directions: a repaint landing after the first
+polls is seen and verified, and a screen that never repaints is still reported
+unchanged (the window ends the search; it does not promise a change).
 
 ## The environment ceiling
 
@@ -92,8 +135,8 @@ and `video-player v2` (oracle 0, model 1 in the first) are the same story. A
 rule keyed on "oracle == 0" alone would have called all three an environment
 limit and quietly raised the score; an earlier version of this file did exactly
 that and reported an inflated **0.927**. The figure with the guards in place is
-**0.72 raw / 0.78 reachable**, and the *best* of the four runs was 0.79 — see the
-variance section above.
+**0.809 raw / 0.873 reachable** on the latest full run; the four runs before the
+settle fix ranged 0.721–0.794 — see the variance section above.
 
 ### Two runs at the same score still disagreed on ten cells
 

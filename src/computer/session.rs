@@ -53,6 +53,23 @@ pub struct SettleConfig {
     pub max_rounds: usize,
     /// Pixel-change percentage below which the screen counts as settled.
     pub stable_threshold: f32,
+    /// The shortest time an action gets to show *any* effect before "no
+    /// change" is accepted as the answer.
+    ///
+    /// Two consecutive identical captures are ambiguous: the screen may have
+    /// stopped changing, or it may not have started yet. Without this floor
+    /// the loop reads the second case as the first — and a repaint that lands
+    /// one poll late is reported to the model as "0.0% changed in pixels",
+    /// which is exactly the claim that makes a working click look dead and
+    /// send the ladder typing into a field it already filled.
+    ///
+    /// Measured on WebKitGTK in the bench image: a context menu opens 205 ms
+    /// after the right-click on a good run and 1.4 s on a slow one, so a
+    /// window built from polls alone (150 ms + 3 × 120 ms) ends before the
+    /// paint it was waiting for. The floor is only paid when nothing has
+    /// changed yet; an action that does visibly change the screen still
+    /// settles as soon as two captures agree.
+    pub min_window_ms: u64,
 }
 
 impl Default for SettleConfig {
@@ -60,8 +77,11 @@ impl Default for SettleConfig {
         Self {
             initial_delay_ms: 150,
             poll_interval_ms: 120,
-            max_rounds: 4,
+            // Enough rounds to cover `min_window_ms` at this poll spacing,
+            // since `poll_interval_ms` is what sets the loop's real cadence.
+            max_rounds: 12,
             stable_threshold: 0.5,
+            min_window_ms: 1_200,
         }
     }
 }
@@ -1167,6 +1187,11 @@ impl ComputerSession {
         let cfg = self.config.settle;
         let mut previous = before.cloned();
         let mut settled_shot = None;
+        let started = std::time::Instant::now();
+        let floor = Duration::from_millis(cfg.min_window_ms);
+        // With no baseline there is nothing to be "not changed from", so the
+        // floor would only cost time without answering anything.
+        let mut observed_change = before.is_none();
 
         for round in 0..cfg.max_rounds.max(1) {
             let delay = if round == 0 {
@@ -1192,10 +1217,16 @@ impl ComputerSession {
             // The capture is part of what the step pays for: a screenshot
             // that outlasts the budget is a setTimeout from outside, which is
             // exactly what the budget exists to avoid.
+            //
+            // `screenshot_fresh` rather than `screenshot`: a settle poll that
+            // the adapter answers from its own short-lived cache returns the
+            // frame it already gave us, and two identical frames are this
+            // loop's definition of "settled". That is how a click whose
+            // repaint was 200 ms away got reported as "0.0% changed".
             let shot = match crate::computer::budget::within(
                 budget,
                 "a settle screenshot",
-                self.adapter.screenshot(None),
+                self.adapter.screenshot_fresh(None),
             )
             .await
             {
@@ -1210,18 +1241,36 @@ impl ComputerSession {
                 }
             };
 
-            let stable = match &previous {
-                Some(prev) => {
-                    !prev.base64.is_empty()
-                        && !shot.base64.is_empty()
-                        && pixel_diff(prev, &shot).change_percentage < cfg.stable_threshold
-                }
-                None => false,
+            // Which frame "settled" is measured against. Until the action has
+            // shown *some* effect, the comparison that matters is against the
+            // baseline: the repaint may not have begun, and two frames of the
+            // old screen agreeing with each other says nothing about the new
+            // one. Once a change is seen, consecutive frames are the right
+            // pair — that is what "stopped moving" means.
+            let reference = if observed_change {
+                previous.as_ref()
+            } else {
+                before.or(previous.as_ref())
             };
+            let change = reference
+                .filter(|r| !r.base64.is_empty() && !shot.base64.is_empty())
+                .map(|r| pixel_diff(r, &shot).change_percentage);
+            let stable = change.is_some_and(|pct| pct < cfg.stable_threshold);
+            if change.is_some_and(|pct| pct >= cfg.stable_threshold) {
+                observed_change = true;
+            }
+
             settled_shot = Some(shot.clone());
             previous = Some(shot);
             if stable {
-                break;
+                // Settled — but "the screen stopped changing" and "the screen
+                // has not started changing" look identical from two captures.
+                // Until something has changed, keep looking: a repaint that
+                // lands one poll late used to be reported to the model as
+                // "0.0% changed", which reads as "the click did nothing".
+                if observed_change || started.elapsed() >= floor {
+                    break;
+                }
             }
         }
 
@@ -1994,6 +2043,7 @@ mod tests {
                 poll_interval_ms: 0,
                 max_rounds: 1,
                 stable_threshold: 0.5,
+                min_window_ms: 0,
             },
             ..SessionConfig::default()
         })
@@ -2585,6 +2635,7 @@ mod tests {
                 poll_interval_ms: 0,
                 max_rounds: 1,
                 stable_threshold: 0.5,
+                min_window_ms: 0,
             },
             delivery: DeliveryMode::Background,
             ..SessionConfig::default()
@@ -2637,6 +2688,7 @@ mod tests {
                 poll_interval_ms: 0,
                 max_rounds: 1,
                 stable_threshold: 0.5,
+                min_window_ms: 0,
             },
             ..SessionConfig::default()
         });
@@ -2778,6 +2830,7 @@ mod tests {
                 poll_interval_ms: 0,
                 max_rounds: 1,
                 stable_threshold: 0.5,
+                min_window_ms: 0,
             },
             step_budget: Some(Duration::from_millis(20)),
             ..SessionConfig::default()
@@ -2825,5 +2878,166 @@ mod tests {
         assert!(waited <= 200, "sleeps what fits: {waited}");
         let budget = outcome.budget.expect("budget");
         assert!(budget["remaining_ms"].as_u64().expect("remaining") <= 5, "{budget}");
+    }
+
+    /// An adapter whose screen stays on the baseline for a while and only
+    /// then repaints, the way WebKitGTK does when a native popup is opened.
+    ///
+    /// Every capture before `paint_after` returns the baseline frame; from
+    /// then on it returns a visibly different one.
+    struct LatePaintingAdapter {
+        screens: std::sync::Mutex<Vec<(std::time::Instant, Screenshot)>>,
+        paint_after: Duration,
+        started: std::time::Instant,
+    }
+
+    impl LatePaintingAdapter {
+        fn new(paint_after: Duration) -> Self {
+            Self {
+                screens: std::sync::Mutex::new(Vec::new()),
+                paint_after,
+                started: std::time::Instant::now(),
+            }
+        }
+
+        /// Frames in the order they were handed out, for asserting the loop
+        /// kept looking rather than stopping at the first agreement.
+        fn captures(&self) -> usize {
+            self.screens.lock().expect("lock").len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerAdapter for LatePaintingAdapter {
+        async fn screenshot(&self, _region: Option<Rect>) -> crate::computer::Result<Screenshot> {
+            // Distinct base64 per frame, so `pixel_diff` sees the change a
+            // real repaint would produce.
+            let painted = self.started.elapsed() >= self.paint_after;
+            let frame = if painted {
+                "after-the-paint"
+            } else {
+                "before-the-paint"
+            };
+            let shot = Screenshot::new(frame.to_string(), 100, 100);
+            self.screens
+                .lock()
+                .expect("lock")
+                .push((std::time::Instant::now(), shot.clone()));
+            Ok(shot)
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(&self, _action: DesktopAction) -> crate::computer::Result<ActionResult> {
+            Ok(ActionResult::success("clicked"))
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+
+        async fn display_geometry(
+            &self,
+        ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+            Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                0, 0, 100, 100,
+            )
+            .primary()]))
+        }
+    }
+
+    /// A repaint that lands after the first couple of polls must still be
+    /// seen. The bug this pins: the settle loop compared consecutive frames
+    /// only, so two captures taken before the paint agreed with each other,
+    /// the loop declared the screen settled, and the step reported "0.0%
+    /// changed in pixels" — to the model, "your click did nothing".
+    ///
+    /// Measured on WebKitGTK in the bench image: a context menu that a
+    /// right-click opens lands 205 ms after the click on a good run and
+    /// 1.4 s on a slow one, against a window of 150 ms + 3 x 120 ms.
+    #[tokio::test]
+    async fn a_repaint_that_lands_after_the_first_polls_is_still_seen() {
+        let adapter = Arc::new(LatePaintingAdapter::new(Duration::from_millis(400)));
+        let session = ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 50,
+                poll_interval_ms: 50,
+                max_rounds: 30,
+                stable_threshold: 0.5,
+                min_window_ms: 1_200,
+            },
+            ..SessionConfig::default()
+        });
+
+        let outcome = session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(10, 10)),
+                button: MouseButton::Left,
+            })
+            .await
+            .expect("an outcome");
+
+        assert!(
+            adapter.captures() > 3,
+            "kept polling past the pre-paint agreements, saw {} captures",
+            adapter.captures()
+        );
+        let diff = outcome.diff.expect("a diff");
+        assert!(
+            diff.has_meaningful_changes(),
+            "the late repaint is the change: {}",
+            diff.summary()
+        );
+        assert_eq!(
+            outcome.verification,
+            StepVerification::Verified,
+            "a repaint is a working action: {}",
+            diff.summary()
+        );
+    }
+
+    /// The counterpart: an action that really does nothing must still be
+    /// reported as nothing. The floor is a window, not a promise.
+    #[tokio::test]
+    async fn a_screen_that_never_repaints_is_still_reported_as_unchanged() {
+        // A paint time longer than any window this test allows.
+        let adapter = Arc::new(LatePaintingAdapter::new(Duration::from_secs(30)));
+        let session = ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 10,
+                poll_interval_ms: 10,
+                max_rounds: 40,
+                stable_threshold: 0.5,
+                min_window_ms: 120,
+            },
+            ..SessionConfig::default()
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(10, 10)),
+                button: MouseButton::Left,
+            })
+            .await
+            .expect("an outcome");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the window ends the search instead of polling forever: {:?}",
+            started.elapsed()
+        );
+        let diff = outcome.diff.expect("a diff");
+        assert!(!diff.has_meaningful_changes(), "{}", diff.summary());
+        assert_eq!(outcome.verification, StepVerification::Failed);
     }
 }

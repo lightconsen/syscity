@@ -219,9 +219,30 @@ impl ComputerAdapter for OsworldDesktop {
         Ok(shot)
     }
 
+    /// Capture without the reuse window.
+    ///
+    /// Until this existed, `screenshot` answered from a 250 ms cache, and the
+    /// settle loop — which samples 120 ms apart — got the *same frame* on its
+    /// first poll. Two identical frames are the loop's definition of "the
+    /// screen has stopped changing", so it stopped there and reported "0.0%
+    /// changed", while the click's repaint was still 200 ms to several seconds
+    /// away. A fresh capture is what makes the loop's question ("has it
+    /// changed?") answerable at all.
+    async fn screenshot_fresh(&self, region: Option<Rect>) -> Result<Screenshot> {
+        if let Some(region) = region {
+            return Err(ComputerError::UnsupportedPlatform(format!(
+                "a remote desktop capture covers the whole screen; a {}x{} region at ({},{}) \
+                 was requested",
+                region.width, region.height, region.x, region.y
+            )));
+        }
+        let shot = self.capture().await?;
+        self.store_screenshot(&shot).await;
+        Ok(shot)
+    }
+
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {
-        // AT-SPI exposes one desktop, and the tree already contains every
-        // application window on it: filtering by `app` would only hide the
+        // AT-SPI exposes one desktop, and the tree already contains every        // application window on it: filtering by `app` would only hide the
         // rest. The argument is accepted and ignored rather than silently
         // pretending to have filtered.
         if app.is_some() {

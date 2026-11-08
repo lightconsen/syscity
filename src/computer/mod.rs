@@ -153,6 +153,20 @@ pub trait ComputerAdapter: Send + Sync {
     /// Capture a screenshot of the full screen or a sub-region.
     async fn screenshot(&self, region: Option<Rect>) -> Result<Screenshot>;
 
+    /// Capture the screen, bypassing any reuse window the adapter keeps.
+    ///
+    /// The default is [`screenshot`](Self::screenshot): an adapter that
+    /// captures on every call needs nothing more. An adapter that serves a
+    /// recent capture from a cache must override this, because the settle loop
+    /// compares frames taken tens of milliseconds apart around an action, and
+    /// a cache that answers both from one stored frame makes "the screen has
+    /// not changed yet" and "the screen has not started changing" look the
+    /// same — the second being read as the first is how a click that worked
+    /// gets reported as a no-op.
+    async fn screenshot_fresh(&self, region: Option<Rect>) -> Result<Screenshot> {
+        self.screenshot(region).await
+    }
+
     /// Read the accessibility UI tree of the active application.
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>>;
 
