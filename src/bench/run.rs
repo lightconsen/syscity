@@ -462,6 +462,18 @@ fn bench_prompt_suffix(available: &str) -> String {
            whether the screen actually changed.\n\
          - Prefer element ids from the accessibility tree over guessed coordinates; re-read \
            the tree when an id goes stale.\n\
+         - Never end a turn by announcing what you are about to do — \"let me retry\", \"now I \
+           will\", \"advancing to...\". Either do it and look, or say why you cannot. An \
+           announced intent scores as a failure, because nothing happened.\n\
+         - A click whose only visible effect is focus moving to a field did work. Check the \
+           tree for focus; do not repeat the click or type elsewhere because the pixels \
+           barely moved.\n\
+         - Segmented fields (dates, times, numbers) take keyboard input one segment at a \
+           time: clicking the field selects a segment, and digits overwrite that segment. \
+           Paste often does nothing. A date field's calendar button opens a grid — picking a \
+           day there is a complete selection, and its header arrows change month and year.\n\
+         - Only report success you can see on screen. If the screen does not show the result, \
+           say so plainly rather than describing what the task asked for.\n\
          - Work until the task is done, then reply with one short paragraph saying what you \
            did and what is now on screen. Do not ask for confirmation.\n\n\
          Available tools: {available}.\n"
@@ -512,6 +524,28 @@ mod tests {
         let suffix = bench_prompt_suffix("computer, screen_state, time, todo");
         assert!(suffix.contains("computer, screen_state, time, todo"));
         assert!(suffix.contains("nobody to answer"));
+    }
+
+    /// The failures the dataset actually produced, as prompt rules. Each of
+    /// these is a documented failure mode: answers that ended on "let me retry"
+    /// (12 of 28 failing variants), clicks whose only effect was focus moving
+    /// (the date picker, which then escalated and typed into a focused field),
+    /// and native segmented date fields, whose only reliable route is the
+    /// calendar grid.
+    #[test]
+    fn the_prompt_forbids_the_failure_modes_it_was_written_for() {
+        let suffix = bench_prompt_suffix("computer");
+        assert!(
+            suffix.contains("Never end a turn by announcing"),
+            "a run must not be able to end on a promise: {suffix}"
+        );
+        assert!(suffix.contains("only visible effect is focus moving"));
+        assert!(suffix.contains("Segmented fields"));
+        assert!(suffix.contains("calendar"));
+        assert!(
+            suffix.contains("Only report success you can see"),
+            "an unverified claim of success is the worst failure mode here"
+        );
     }
 
     #[test]
