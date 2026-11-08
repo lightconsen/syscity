@@ -292,6 +292,65 @@ impl HttpGatewayClient {
         }
     }
 
+    /// The header set for one request: the provider's static headers, then auth,
+    /// then the request's own defaults.
+    ///
+    /// Assembled as one map rather than as successive `.header()` calls because
+    /// `reqwest`'s `.header()` *appends*: a name that appears both in the
+    /// defaults and in `extra_headers` would be sent twice. The OpenAI provider
+    /// puts a `Content-Type` in `extra_headers`, so this really happened — and
+    /// DeepSeek answers a request carrying two `Content-Type` headers with
+    /// `415 Unsupported Media Type`.
+    ///
+    /// Precedence is deliberate: the request's own headers last, because what a
+    /// request is doing outranks a provider's blanket default. Streaming sets
+    /// `Accept: text/event-stream`, and a provider's static
+    /// `Accept: application/json` must not win over it. Auth goes last of the
+    /// shared headers for the same reason — a provider cannot override the
+    /// credential actually in use.
+    fn request_headers(
+        &self,
+        auth_name: &str,
+        auth_value: &str,
+        defaults: &[(&str, &str)],
+    ) -> crate::Result<HeaderMap> {
+        let mut headers = HeaderMap::with_capacity(defaults.len() + self.extra_headers.len() + 1);
+
+        for (name, value) in &self.extra_headers {
+            headers.insert(name.clone(), value.clone());
+        }
+
+        let auth = reqwest::header::HeaderName::from_bytes(auth_name.as_bytes()).map_err(|e| {
+            crate::error::SyscityError::Validation(format!(
+                "unusable auth header name {auth_name}: {e}"
+            ))
+        })?;
+        let value = reqwest::header::HeaderValue::from_str(auth_value).map_err(|e| {
+            // The value is a credential: name the header, never the value.
+            crate::error::SyscityError::Validation(format!(
+                "the {auth_name} header value is not a valid header value: {e}"
+            ))
+        })?;
+        headers.insert(auth, value);
+
+        for (name, value) in defaults {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                crate::error::SyscityError::Validation(format!(
+                    "unusable default header name {name}: {e}"
+                ))
+            })?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                crate::error::SyscityError::Validation(format!(
+                    "unusable default header value for {}: {e}",
+                    name.as_str()
+                ))
+            })?;
+            headers.insert(name, value);
+        }
+
+        Ok(headers)
+    }
+
     /// Execute a request with auth, retry, and timeout handling.
     ///
     /// Retries only on transient failures: network timeouts/connection errors
@@ -402,26 +461,22 @@ impl GatewayClient for HttpGatewayClient {
         let credential = self.credential.read().await.clone();
         let (auth_name, auth_value) = self.auth_for_credential(&credential);
         let timeout = *self.timeout.read().await;
-        let extra = self.extra_headers.clone();
 
         let resp = self
             .execute_with_retry(|| {
                 let url = url.clone();
                 let auth_value = auth_value.clone();
-                let extra = extra.clone();
                 async move {
-                    let mut builder = self
-                        .inner
+                    let headers = self.request_headers(
+                        auth_name,
+                        &auth_value,
+                        &[("Content-Type", "application/json")],
+                    )?;
+
+                    self.inner
                         .post(&url)
                         .timeout(timeout)
-                        .header(auth_name, auth_value)
-                        .header("Content-Type", "application/json");
-
-                    for (name, value) in extra.iter() {
-                        builder = builder.header(name, value);
-                    }
-
-                    builder
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await
@@ -447,26 +502,22 @@ impl GatewayClient for HttpGatewayClient {
         let credential = self.credential.read().await.clone();
         let (auth_name, auth_value) = self.auth_for_credential(&credential);
         let timeout = *self.timeout.read().await;
-        let extra = self.extra_headers.clone();
 
         let resp = self
             .execute_with_retry(|| {
                 let url = url.clone();
                 let auth_value = auth_value.clone();
-                let extra = extra.clone();
                 async move {
-                    let mut builder = self
-                        .inner
+                    let headers = self.request_headers(
+                        auth_name,
+                        &auth_value,
+                        &[("Content-Type", "application/json")],
+                    )?;
+
+                    self.inner
                         .post(&url)
                         .timeout(timeout)
-                        .header(auth_name, auth_value)
-                        .header("Content-Type", "application/json");
-
-                    for (name, value) in extra.iter() {
-                        builder = builder.header(name, value);
-                    }
-
-                    builder
+                        .headers(headers)
                         .json(body)
                         .send()
                         .await
@@ -492,12 +543,10 @@ impl GatewayClient for HttpGatewayClient {
         let credential = self.credential.read().await.clone();
         let (auth_name, auth_value) = self.auth_for_credential(&credential);
         let timeout = *self.timeout.read().await;
-        let extra = self.extra_headers.clone();
 
         self.execute_with_retry(|| {
             let url = url.clone();
             let auth_value = auth_value.clone();
-            let extra = extra.clone();
             // Rebuilt on every attempt: a `Form` is consumed by `multipart()`,
             // so a retry that reused one would send an empty body.
             async move {
@@ -522,17 +571,17 @@ impl GatewayClient for HttpGatewayClient {
                     }
                 }
 
-                let mut builder = self
-                    .inner
+                let mut headers = self.request_headers(auth_name, &auth_value, &[])?;
+                // `multipart()` sets its own `Content-Type` with the boundary it
+                // chose, and appends rather than replaces — so a provider's
+                // static `Content-Type: application/json` would ride along next
+                // to it. The body is the authority here.
+                headers.remove(reqwest::header::CONTENT_TYPE);
+
+                self.inner
                     .post(&url)
                     .timeout(timeout)
-                    .header(auth_name, auth_value);
-
-                for (name, value) in extra.iter() {
-                    builder = builder.header(name, value);
-                }
-
-                builder
+                    .headers(headers)
                     .multipart(form)
                     .send()
                     .await
@@ -550,25 +599,23 @@ impl GatewayClient for HttpGatewayClient {
         let url = self.url(path);
         let credential = self.credential.read().await.clone();
         let (auth_name, auth_value) = self.auth_for_credential(&credential);
-        let extra = self.extra_headers.clone();
 
         self.execute_with_retry(|| {
             let url = url.clone();
             let auth_value = auth_value.clone();
-            let extra = extra.clone();
             async move {
-                let mut builder = self
-                    .inner
+                let headers = self.request_headers(
+                    auth_name,
+                    &auth_value,
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("Accept", "text/event-stream"),
+                    ],
+                )?;
+
+                self.inner
                     .post(&url)
-                    .header(auth_name, auth_value)
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "text/event-stream");
-
-                for (name, value) in extra.iter() {
-                    builder = builder.header(name, value);
-                }
-
-                builder
+                    .headers(headers)
                     .json(body)
                     .send()
                     .await
@@ -583,24 +630,17 @@ impl GatewayClient for HttpGatewayClient {
         let credential = self.credential.read().await.clone();
         let (auth_name, auth_value) = self.auth_for_credential(&credential);
         let timeout = *self.timeout.read().await;
-        let extra = self.extra_headers.clone();
 
         self.execute_with_retry(|| {
             let url = url.clone();
             let auth_value = auth_value.clone();
-            let extra = extra.clone();
             async move {
-                let mut builder = self
-                    .inner
+                let headers = self.request_headers(auth_name, &auth_value, &[])?;
+
+                self.inner
                     .get(&url)
                     .timeout(timeout)
-                    .header(auth_name, auth_value);
-
-                for (name, value) in extra.iter() {
-                    builder = builder.header(name, value);
-                }
-
-                builder
+                    .headers(headers)
                     .send()
                     .await
                     .map_err(crate::error::SyscityError::Http)
@@ -883,5 +923,143 @@ mod tests {
                 .unwrap();
 
         client.refresh_credential_if_needed().await.unwrap();
+    }
+
+    /// Fails a request that carries any header more than once.
+    ///
+    /// A duplicate is invisible over a lenient server, so tests that care about
+    /// it reject the request explicitly rather than merely checking that a
+    /// header is present.
+    struct NoDuplicateHeaders;
+
+    impl wiremock::Match for NoDuplicateHeaders {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            let mut seen = std::collections::HashSet::new();
+            request
+                .headers
+                .iter()
+                .all(|(name, _)| seen.insert(name.clone()))
+        }
+    }
+
+    /// A header a provider puts in `extra_headers` must be *replaced*, not
+    /// appended next to the one the client sets.
+    ///
+    /// The OpenAI provider registers `Content-Type: application/json` as a
+    /// static header while `post_json`/`post_json_streaming` also set one. With
+    /// `reqwest`'s `.header()` (which appends) that produced two `Content-Type`
+    /// headers per request, and DeepSeek rejects such a request with
+    /// `415 Unsupported Media Type: Expected request with Content-Type:
+    /// application/json`.
+    #[tokio::test]
+    async fn provider_headers_do_not_duplicate_the_client_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat"))
+            .and(NoDuplicateHeaders)
+            // One plain request and one streaming request.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        extra_headers.insert("User-Agent", reqwest::header::HeaderValue::from_static("curl/8.7.1"));
+
+        let client = HttpGatewayClient::new(
+            server.uri(),
+            Credential::api_key("test"),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_extra_headers(extra_headers);
+
+        let result = client
+            .post_json::<TestBody, serde_json::Value>("/chat", &TestBody { msg: "hi".to_string() })
+            .await;
+        assert!(result.is_ok(), "request rejected: {result:?}");
+
+        let result = client
+            .post_json_streaming("/chat", &TestBody { msg: "hi".to_string() })
+            .await;
+        assert!(result.is_ok(), "streaming request rejected: {result:?}");
+    }
+
+    /// The request's own headers win over a provider's blanket defaults.
+    ///
+    /// Streaming needs `Accept: text/event-stream`, and the OpenAI provider
+    /// registers `Accept: application/json` for every request. If the blanket
+    /// value won, a stream request would ask for a whole JSON document and the
+    /// caller would hang waiting for events that never come.
+    #[tokio::test]
+    async fn the_requests_own_headers_win_over_provider_defaults() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat"))
+            .and(wiremock::matchers::header("Accept", "text/event-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: {}\n\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+
+        let client = HttpGatewayClient::new(
+            server.uri(),
+            Credential::api_key("test"),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_extra_headers(extra_headers);
+
+        client
+            .post_json_streaming("/chat", &TestBody { msg: "hi".to_string() })
+            .await
+            .expect("the stream request should have asked for SSE");
+    }
+
+    /// A `Content-Type` a provider registers must not poison a multipart body,
+    /// whose own boundary-bearing `Content-Type` is the only correct one.
+    #[tokio::test]
+    async fn a_provider_content_type_does_not_break_multipart() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(NoDuplicateHeaders)
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+
+        let client = HttpGatewayClient::new(
+            server.uri(),
+            Credential::api_key("test"),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_extra_headers(extra_headers);
+
+        let parts = [MultipartPart::Text {
+            name: "model".to_string(),
+            value: "w".to_string(),
+        }];
+        client
+            .post_multipart_streaming("/audio/transcriptions", &parts)
+            .await
+            .expect("a multipart request should carry exactly one Content-Type");
     }
 }
