@@ -441,7 +441,7 @@ token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M
 
 | | 数 | 说明 |
 |---|---|---|
-| 原始分 | **54/68 = 0.794** | `summary.json` 的 `avg_reward`，**报分用这个** |
+| 原始分 | **54/68 = 0.794** | `summary.json` 的 `avg_reward`，**报分用这个**；两次全量都是这个数 |
 | 可达分 | **54/63 = 0.857** | 剔除 `drag-drop` 后的模型分；见 `bench/cua/ceiling.json` |
 | 环境上限 | 1 个任务（5 variant） | 只有 `drag-drop`，且有机制层面的证据 |
 
@@ -449,16 +449,22 @@ token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M
 python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 ```
 
+**注意总分稳定不代表逐格稳定。** 修完两个胶水 bug 之后重跑全量，总分仍是 0.794，但
+68 个变体里只有 58 个和上一轮一致——10 个翻转，五上五下（详见下文"总分稳定、格子不稳定"）。
+所以正确读数是"0.794 ± 几次翻转"，不是"某一轮的失败清单"。
+
 **先前给出的 0.927 作废。** 那是按"整题扣除 `date-picker`/`fill-form`/`drag-drop`"
 算的，两处都错：
 
 1. **`fill-form` 的 oracle 实际全过（3/3）**，模型也过了 v0/v1 —— 它根本不在上限里。
-2. **`date-picker` 的 oracle 五个 variant 全是 0，但模型 v4 得 1。** 说明日期选择器
+2. **`date-picker` 的 oracle 五个 variant 全是 0，但模型拿到过 1**（v4 在第一次全量里
+   得 1；第二次全量里它退化成 0，而 `video-player` v3 又补上一个 1）。说明日期选择器
    在这个环境里是好用的，坏的是 oracle 自己：`solve_task` 用 `TypeAction` 往
    `input[type=date]` 里打字，WebKitGTK 不认（复跑两次均为 0）。模型则是点开取器、
    按调节按钮选中的。把整题当作环境上限，等于把模型真做出来的题算成"不可达"。
 
-同样的反例还有 `spreadsheet-cell v4` 和 `video-player v2`：oracle 都是 0，模型都是 1。
+同样的反例还有 `spreadsheet-cell` 和 `video-player`：oracle 为 0 的
+`spreadsheet-cell v4` 两次全量模型都过了，oracle 为 0 的 `video-player v2` 第一次也过了。
 所以 **oracle=0 不等于环境不可达**，它也可能只是 oracle 坏了。
 
 现在 `ceiling.json` 只收满足三个条件的任务，`score.py` 在报分时逐条校验：
@@ -482,26 +488,47 @@ python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 对照 `drag-slider` 5/5：它同样是拖拽，但模型用"点击滑块 + 方向键"绕过，说明任务本身
 在键盘下可达——所以它不在上限里。
 
-#### 14 个失败变体的逐条归因
+#### 14 个失败变体的归因
 
-68 个变体里失败 14 个。跑完之后逐个回放了轨迹，并在**真实 bench-web 容器**里复现验证，
-而不是只看结论：
+68 个变体里失败 14 个。逐个回放轨迹、并在**真实 bench-web 容器**里复现验证之后，失败
+分成几类；但先说一件比分类更重要的事：
 
-| variant | 归因 | 证据 |
+**总分稳定，具体格子不稳定。** 同样的 shim、同样的模型，背靠背跑了两次全量，两次都是
+**0.794**，但 68 个变体里只有 **58 个**结果一致，10 个发生了翻转，正好五上五下：
+
+```
+date-picker v4      1 -> 0        right-click-menu v3  0 -> 1
+right-click-menu v4 1 -> 0        select-dropdown   v1 0 -> 1
+select-dropdown v2  1 -> 0        spreadsheet-cell  v2 0 -> 1
+video-player v2     1 -> 0        video-player      v3 0 -> 1
+video-player v5     1 -> 0        fill-form         v2 0 -> 1
+```
+
+单独重跑这 6 个翻转的变体，5 个落在第二次全量的结果上（`select-dropdown` v2 回到 1，
+和第一轮一致）。其中两个格子的翻转有**已知原因**（`select-dropdown` v1 和 `fill-form` v2
+的胶水 bug，已修），其余是 25 步预算下模型提前收工造成的采样噪声。两次总分相同是因为
+翻转正好互相抵消，那是巧合，不是保证。这正是上限必须按**任务**而不是按变体声明的理由：按格子
+判，第一次运行会得出"`date-picker` 不可达"，第二次会得出"`right-click-menu` 不可达"，
+两个结论都过不了对方那一轮。
+
+分类如下（哪一变体落在哪一类会随运行变化，所以读作"这类失败意味着什么"）：
+
+| 失败类 | 归因 | 证据 |
 |---|---|---|
-| `drag-drop` v0–v4（5） | **环境**：合成拖拽不可达 | 见上 |
-| `date-picker` v0–v3（4） | 模型没走通（任务本身可达） | 见下 |
-| `fill-form` v2（1） | 模型失败；但发现并修掉了一个胶水 bug | 见下 |
-| `select-dropdown` v1 | **胶水 bug**（已修） | 见下 |
-| `right-click-menu` v3 | 模型偷懒 | 只右键一次就 `final_answer`，轨迹里没有点菜单的动作；实测该页 AX 完全正确（`menu item 'Delete' (406,256,55,27)`） |
-| `video-player` v3 | 模型偷懒 | 点了一下滑块就宣布"Slider moved to 26%，Nudging it up"，然后停止；实测 `input[type=range]` 用一次合成点击就能精确落到 30% |
-| `spreadsheet-cell` v2 | 点错格子 | 目标 C3 中心是 (668,332)，模型点了 (545,369)——那是 B4。它随后在 B4 里输入公式，并声称完成 |
+| `drag-drop`（5/5） | **环境**：合成拖拽不可达 | 见上 |
+| `date-picker`（每轮 4–5 个） | 模型 | 环境可达；oracle 全 0 是因为 `solve_task` 往 `input[type=date]` 键入，WebKitGTK 不认 |
+| `video-player` 的音量变体 | 模型用错层 | 要求音量 75%，它开终端跑 `pactl set-sink-volume`，而评测看的是页内播放器，不是 ALSA mixer |
+| `right-click-menu` v4 类 | 模型放弃 | 只右键一次就 `final_answer`，声称菜单"看不见" |
+| `fill-form` / `spreadsheet-cell` 的漏 | 点错位置 | 点偏一格/一个字段，然后报告完成 |
+| `select-dropdown` v1 | **胶水 bug（已修，重跑得 1）** | 见下 |
 
-`date-picker` 这 4 个不能说成"环境不可达"，因为**同一个任务的 v4 模型过了**：打开
-picker、点 spin button 加一天。可达但不轻松——v0 只键入月份就退出，v1 在 25 步时
-`MAX_STEPS_EXCEEDED`（还绕道 terminal/playwright），v2 点两下后断言"工具层拒绝新动作"
-（无法复现），v3 用方向键漂了。它们的 oracle 全 0 是因为 oracle 自己坏（往
-`input[type=date]` 里键入，WebKitGTK 不认），不是环境。
+除 `select-dropdown` 那个之外，这些都不是胶水的锅：是模型提前停止、点偏格子、或者用错
+了一层去解题——真实的模型结果，也正是原始分该拿来报的原因。
+
+`date-picker` 不能说成"环境不可达"：**同一个任务的某个变体模型过了**（打开 picker、
+点 spin button）。可达但不轻松——失败的那些里，有的只键入月份就退出，有的在 25 步时
+`MAX_STEPS_EXCEEDED`（还绕道 terminal/playwright），有的用方向键漂了。它们的 oracle 全 0
+是因为 oracle 自己坏，不是环境。
 
 `select-dropdown` 的 bug 是我这边的，值得记下来：折叠状态的 `<select>` 里，AT-SPI 把
 **每一个 option 都报告在 combo box 自己的框上**——四个选项坐标完全相同。`atspi_xml.py`
@@ -519,9 +546,9 @@ window '' (213,239,185,102)
 `real_option_boxes()` 现在把这类 option 的框换成真实那个，规则收得很紧：只有在
 combo box 自己框上的、且 popup 里该标签唯一时才替换；popup 关着时（0×0 的 menu）
 不产出任何东西，树保持原样。修完后在容器里点一次真实坐标，`<select>` 的值确实变成
-了 Banana。所以 `select-dropdown` 不是环境问题。
+了 Banana；该变体重跑得 1。所以 `select-dropdown` 不是环境问题。
 
-`fill-form` v2 的理由原本是环境问题，但它是胶水问题：模型先滚一次 `scroll(-500)`，再滚
+`fill-form` v2 曾经的理由是环境问题，其实是胶水问题：模型先滚一次 `scroll(-500)`，再滚
 `scroll(-40000)`，然后转去拖滚动条，最后写下"Scrolling via wheel/drag is refused by the
 remote endpoint"。端点没有拒绝——syscity 把滚动 `amount` 换算成 `clicks * 100` 个滚轮
 click（`osworld.rs:758`），而 `xdotool click --repeat` 默认**每两次之间停 100 ms**。于是
@@ -536,10 +563,10 @@ xdotool click --delay 0 --repeat 500 5   0.27s   scrollY 0 -> 5369
 距离完全一样，Chromium 只是把密集的滚轮事件合并了。`pyautogui_shim` 的 `scroll` /
 `hscroll` 现在显式传 `--delay 0`，`scroll(-500)` 从 51 秒降到 0.24 秒。
 
-修完之后**重跑了三遍 `fill-form` v2，仍然都是 0**：滚动不再卡住了（有一遍把表单填完并
-点了提交），但提交后的字段值仍有错，三遍分别在不同步骤收尾。所以这个变体**依然算模型
-失败，不是环境上限**——分母不减。写在这里是因为它是这轮唯一一个"看起来像环境、其实是
-胶水"的失败，也正是上限规则要求把机制写清楚的原因。
+但修完不会自动变成稳定通过：修完立刻单独重跑三遍 v2 仍然都是 0（有一遍填完并提交了，
+但字段值不对），下一次全量里它却是 1、整个任务 3/3。页面现在可达了，剩下的漏是模型的。
+这一条也正是上限规则要求"机制必须写清楚"的原因——模型的解释（"端点拒绝"）和真实机制
+（"请求超时"）完全是两回事。
 
 另外记录一个**与胶水无关**、但这次一起修掉的真 bug：`sensitive_ui` 把 `"pin"` 当子串匹配，
 于是 `spin_button` 命中——date-picker 的月/日/年数字调节器、任何数量框都被标成密码字段，

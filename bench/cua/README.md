@@ -70,16 +70,41 @@ three hold:
 
 That second rule is not hypothetical. `date-picker`'s oracle scores **0 on all
 five variants** — its `solve_task` types into `input[type=date]`, which WebKitGTK
-ignores — yet the model solved v4 by opening the picker and using its spin
-buttons. So the picker works and the *oracle* is what fails. `spreadsheet-cell
-v4` and `video-player v2` are the same story. A rule keyed on "oracle == 0"
-alone would have called all three an environment limit and quietly raised the
-score; an earlier version of this file did exactly that and reported an inflated
-**0.927**. The figure with the guards in place is **0.794 raw / 0.857 reachable**.
+ignores — yet the model has solved one of them. So the picker works and the
+*oracle* is what fails. `spreadsheet-cell v4` (oracle 0, model 1 in both runs)
+and `video-player v2` (oracle 0, model 1 in the first) are the same story. A
+rule keyed on "oracle == 0" alone would have called all three an environment
+limit and quietly raised the score; an earlier version of this file did exactly
+that and reported an inflated **0.927**. The figure with the guards in place is
+**0.794 raw / 0.857 reachable**.
 
-Whole-task, all-or-nothing exclusion is deliberate too: excluding variant by
-variant would let a run drop precisely the variants the model failed, which is
-cherry-picking rather than a ceiling.
+### The number is stable; the per-variant cells are not
+
+Two full 68-variant runs with the same shim and model, back to back, both scored
+**0.794** — but they agreed on only **58 of 68** variants. Ten flipped, five each
+way:
+
+```
+date-picker v4      1 -> 0        right-click-menu v3  0 -> 1
+right-click-menu v4 1 -> 0        select-dropdown   v1 0 -> 1
+select-dropdown v2  1 -> 0        spreadsheet-cell  v2 0 -> 1
+video-player v2     1 -> 0        video-player      v3 0 -> 1
+video-player v5     1 -> 0        fill-form         v2 0 -> 1
+```
+
+Re-running six of those flips on its own settled five of them the way run 2 did
+(`select-dropdown` v2 came back 1, matching run 1 instead). Two cells were wrong
+for a *known* reason and are now fixed — `select-dropdown` v1 and `fill-form`
+v2 — but the rest is sampling noise: a 25-step budget and a model that stops
+early. The score is the same in both runs because the flips cancelled out; that
+is a coincidence, not a guarantee.
+
+This is why the ceiling is declared per **task**, never per variant. A per-cell
+rule would read run 1 as evidence that `date-picker` is limited and run 2 as
+evidence that `right-click-menu` is, and neither claim survives the other run.
+And whole-task, all-or-nothing exclusion is deliberate for the same reason:
+excluding variant by variant would let a run drop precisely the variants the
+model failed, which is cherry-picking rather than a ceiling.
 
 ### What is actually limited here
 
@@ -110,26 +135,24 @@ in the denominator, and `score.py` will say so rather than apply the exclusion.
 
 ## Where the 14 failures come from
 
-At 0.794 raw, 14 of 68 variants fail. Every one was replayed from its trajectory
-and re-tested in a real `bench-web` container — the split matters, because only
-five of them are the environment's fault:
+At 0.794 raw, 14 of 68 variants fail. These are the *classes* of failure, taken
+from replaying the trajectories and re-testing each in a real `bench-web`
+container. Which variant lands in which class moves between runs — see above —
+so read this as what a failure means, not as a fixed roster:
 
-| variant | cause | evidence |
+| failure | cause | evidence |
 |---|---|---|
-| `drag-drop` v0–v4 | **environment** | synthetic drag is rejected; `dragstart` never fires, and the target has no other route |
-| `date-picker` v0–v3 | model | the model solves v4 of the *same task*, so the environment reaches it. Its oracle is 0 on all five only because `solve_task` types into `input[type=date]`, which WebKitGTK ignores |
-| `fill-form` v2 | model (a glue bug was found on the way, and fixed) | see below |
-| `select-dropdown` v1 | **glue bug — fixed and re-verified at reward 1** | see below |
-| `right-click-menu` v3 | model gave up | one right-click, then `final_answer`; the page's AX is correct (`menu item 'Delete' (406,256,55,27)`) |
-| `video-player` v3 | model gave up | one slider click, read "26%", said "nudging it up", stopped; a single synthetic click puts `input[type=range]` at 30% exactly |
-| `spreadsheet-cell` v2 | model aimed wrong | target C3 is (668,332); it clicked (545,369), which is B4, then typed the formula there and claimed C3 |
+| `drag-drop` (all 5) | **environment** | synthetic drag is rejected; `dragstart` never fires, and the target has no other route |
+| `date-picker` (4–5 of 5) | model | the environment reaches it; its oracle is 0 on all five only because `solve_task` types into `input[type=date]`, which WebKitGTK ignores |
+| `video-player`'s volume variants | model, wrong layer | told to set volume to 75%, it ran `pactl set-sink-volume` in a terminal instead of moving the on-page slider; the task scores the player, not the ALSA mixer |
+| `right-click-menu` v4-class | model gave up | one right-click, then `final_answer` claiming the menu "isn't visible" |
+| `fill-form`, `spreadsheet-cell` misses | model aimed wrong | clicks a cell or field one row off, then reports success |
+| `select-dropdown` v1 | **glue bug — fixed, rewards 1 on re-run** | see below |
 
-Only the two glue bug rows changed the accounting. `select-dropdown` v1 goes from
-0 to 1 once `real_option_boxes()` is in place. `fill-form` v2 does **not**: after
-the scroll fix it was re-run three times and still scored 0 (one run did fill the
-form and submit, but the field values were wrong). It stays a model failure and
-stays in the denominator — which is the point of the rule below, and the reason
-a "glue bug" does not get to mean "excluded".
+Apart from the `select-dropdown` bug, none of these is the glue's fault. The
+rest is the model stopping early, aiming at the wrong cell, or solving the task
+in the wrong layer — genuine model results, and the reason the raw number is the
+one to quote.
 
 ### A timeout is not a refusal
 
@@ -151,6 +174,11 @@ Identical distance — Chromium coalesces the dense wheel events. `scroll` and
 justifies the ceiling's third rule: before calling a failure environmental,
 check that the mechanism is understood rather than inferred from whatever the
 model said while giving up.
+
+It did **not** turn `fill-form` into a reliable pass on its own. Three standalone
+re-runs of v2 right after the fix still scored 0 (one filled and submitted the
+form but with wrong values); the next full run scored it 1 and took the task to
+3/3. The page is reachable now, and the remaining misses are the model's.
 
 ## The shim has to prove its work
 

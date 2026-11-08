@@ -147,9 +147,13 @@ cb run task <dataset>/drag-drop --variant-id 0 --oracle \
 synthetic HTML5 drag input, which WebKitGTK rejects under `runc` without
 `/dev/uinput`. `drag-slider` is the contrast — also a drag, but reachable by
 click-then-arrow-keys, and it passes. Note that oracle=0 alone is *not* proof of
-a ceiling: `date-picker`'s oracle fails all five variants while the model solves
-one, and `spreadsheet-cell`/`video-player` each have an oracle-failing variant
-the model passes. See [`cua/README.md`](cua/README.md).
+a ceiling: `date-picker`'s oracle fails all five variants while the model has
+solved one, and `spreadsheet-cell`/`video-player` each have an oracle-failing
+variant the model passes. See [`cua/README.md`](cua/README.md).
+
+Two full runs at the same 0.794 agreed on only 58 of 68 variants, so treat a
+single run's failure list as a sample, not a verdict. What is stable is the
+score and the one task in the ceiling.
 
 ### Why there is a bridge
 
