@@ -1288,3 +1288,193 @@ async fn test_cancelling_stops_a_streaming_reply() {
         started.elapsed()
     );
 }
+
+// ── the duplicate-call guard vs. a desktop the agent is changing ──────────
+
+/// A tool that counts how many times it actually ran.
+///
+/// `deduplicate` lets one test stand in for both kinds: the `grep`-shaped tool
+/// whose repeats are meaningless, and the `computer`-shaped one whose repeats
+/// are the action itself.
+struct CountingTool {
+    name: &'static str,
+    deduplicate: bool,
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for CountingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "counts its own invocations"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::tools::sdk::ToolCapabilities {
+            deduplicate_identical_calls: self.deduplicate,
+            ..Default::default()
+        }
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _context: &crate::tools::ToolContext,
+    ) -> crate::Result<crate::tools::ToolExecutionResult> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::tools::ToolExecutionResult::success("ran"))
+    }
+}
+
+/// A provider that asks for the same call on every round, for `rounds` rounds,
+/// then answers.
+struct SameCallEveryRound {
+    name: String,
+    arguments: String,
+    rounds: usize,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for SameCallEveryRound {
+    fn name(&self) -> &str {
+        "same-call-every-round"
+    }
+
+    fn default_model(&self) -> &str {
+        "test-model"
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn max_context(&self) -> usize {
+        128_000
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+        let offered_tools = request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty());
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n >= self.rounds || !offered_tools {
+            return Ok(CompletionResponse {
+                message: Message::assistant("done"),
+                model: self.default_model().to_string(),
+                usage: Some(Usage::default()),
+                finish_reason: Some("stop".to_string()),
+            });
+        }
+        let mut message = Message::assistant("");
+        message.tool_calls = Some(vec![crate::providers::ToolCall {
+            id: format!("call_{n}"),
+            call_type: "function".to_string(),
+            function: crate::providers::FunctionCall {
+                name: self.name.clone(),
+                arguments: self.arguments.clone(),
+            },
+            index: None,
+            result: None,
+        }]);
+        Ok(CompletionResponse {
+            message,
+            model: self.default_model().to_string(),
+            usage: Some(Usage::default()),
+            finish_reason: Some("tool_calls".to_string()),
+        })
+    }
+
+    async fn stream(&self, _request: CompletionRequest) -> crate::Result<CompletionStream> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(CompletionChunk {
+            content: Some("done".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            is_done: true,
+            error: None,
+            usage: None,
+        });
+        Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx)))
+    }
+
+    async fn health_check(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    async fn set_credential(
+        &self,
+        _credential: crate::model_router::Credential,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+async fn run_same_call_repeatedly(
+    name: &'static str,
+    deduplicate: bool,
+    rounds: usize,
+) -> (usize, crate::providers::CompletionResponse) {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut registry = crate::tools::ToolRegistry::new();
+    registry.register(Box::new(CountingTool {
+        name,
+        deduplicate,
+        runs: runs.clone(),
+    }));
+
+    let provider = Arc::new(SameCallEveryRound {
+        name: name.to_string(),
+        // Deliberately the pair that ended four of five Cua Bench date-picker
+        // runs: a second click on the same calendar arrow.
+        arguments: r#"{"action":"click","x":617,"y":375}"#.to_string(),
+        rounds,
+        calls: AtomicUsize::new(0),
+    });
+    let agent = crate::agent::Agent::new(
+        crate::agent::AgentConfig::default(),
+        provider,
+        Arc::new(registry),
+    );
+    let mut context = Context::new("conv-repeat", "You are a test assistant", 100_000);
+    context.add_message(Message::user("click it again"));
+    let response = agent.get_completion(&mut context, "user").await.unwrap();
+    (runs.load(Ordering::SeqCst), response)
+}
+
+/// A tool that acts on a world its own earlier calls changed must run every
+/// time it is asked, even with byte-identical arguments.
+///
+/// This is the Cua Bench date-picker failure: the model clicked a calendar's
+/// "previous month" arrow, then clicked the same pixel again to step a second
+/// month, and the engine skipped the second click as a duplicate. With every
+/// proposed call filtered, the turn was force-closed mid-edit, so the agent
+/// gave up one step short. The tool declares that repeats are meaningful; the
+/// guard has to consult that.
+#[tokio::test]
+async fn an_identical_call_to_a_tool_that_changes_the_world_runs_every_time() {
+    let (runs, response) = run_same_call_repeatedly("computer", false, 3).await;
+    assert_eq!(runs, 3, "each click is a new action, not a repeat of the last");
+    assert_eq!(response.message.content, "done");
+}
+
+/// The loop protection it replaced still applies where it was written for: a
+/// tool whose result depends only on its arguments is asked once, and asking
+/// again is the loop the guard exists to break.
+#[tokio::test]
+async fn an_identical_call_to_a_pure_tool_is_still_skipped() {
+    let (runs, response) = run_same_call_repeatedly("grep", true, 3).await;
+    assert_eq!(runs, 1, "one read of a fixed input, not three");
+    assert_eq!(
+        response.message.content, "done",
+        "the skipped rounds still close with a real answer"
+    );
+}

@@ -79,6 +79,22 @@ pub struct ToolCapabilities {
     /// treated as read-only, so plan mode (which admits only read-only
     /// tools) hides and refuses it rather than exposing a possible write.
     pub read_only: bool,
+    /// Whether an identical `(tool, arguments)` pair later in the same turn is
+    /// necessarily a no-op.
+    ///
+    /// The engine skips a call whose name and arguments byte-match one already
+    /// executed, which is right for a tool that reads one fixed input: a
+    /// second `grep` over the same file cannot say anything the first did not.
+    /// It is wrong for a tool that acts on a world its own earlier calls
+    /// changed. Clicking a calendar's "previous month" arrow twice means two
+    /// months; reading the screen twice means two different screens. Ten
+    /// identical `screen_state {}` calls are also just ten reads — harmless,
+    /// and bounded by the turn's tool budget.
+    ///
+    /// The default is `true` (skip repeats), preserving the loop protection
+    /// this guard was written for. Tools that track mutable external state opt
+    /// out and say why here.
+    pub deduplicate_identical_calls: bool,
 }
 
 impl ToolCapabilities {
@@ -101,6 +117,7 @@ impl Default for ToolCapabilities {
             idempotent: false,
             compensation: None,
             read_only: false,
+            deduplicate_identical_calls: true,
         }
     }
 }
@@ -490,6 +507,7 @@ mod tests {
             idempotent: false,
             compensation: Some("delete the file it wrote"),
             read_only: false,
+            deduplicate_identical_calls: true,
         };
         let json = serde_json::to_string(&caps).unwrap();
         assert!(json.contains("requires_approval"));

@@ -228,6 +228,12 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
             // clicks a second time, which is rarely what a retry means.
             idempotent: false,
             compensation: None,
+            // A repeat is a new action, not a stale one. Clicking the same
+            // calendar arrow advances a second month; pressing the same arrow
+            // key steps a second segment. The generic "same tool, same
+            // arguments" guard would end the turn on the second click and
+            // report the task unsolved.
+            deduplicate_identical_calls: false,
             ..Default::default()
         }
     }

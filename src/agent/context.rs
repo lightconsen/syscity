@@ -181,7 +181,15 @@ impl Context {
         }
     }
 
-    /// Check if a tool call with these parameters was already executed
+    /// Whether this exact call already ran in this turn, and so can be
+    /// skipped.
+    ///
+    /// The caller decides whether repeats are meaningless for the tool — see
+    /// [`ToolCapabilities::deduplicate_identical_calls`]. This only answers
+    /// the bookkeeping question, so the policy stays in one place: the tool's
+    /// own declaration, not a special case per call site.
+    ///
+    /// [`ToolCapabilities::deduplicate_identical_calls`]: crate::tools::sdk::ToolCapabilities::deduplicate_identical_calls
     pub fn is_tool_call_duplicate(&self, tool_name: &str, params: &str) -> bool {
         let key = format!("{}:{}", tool_name, params);
         self.executed_tool_calls.contains(&key)

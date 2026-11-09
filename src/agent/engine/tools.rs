@@ -53,6 +53,25 @@ fn budget_reminder(context: &Context) -> Option<String> {
 }
 
 impl Agent {
+    /// Whether the same `(tool, arguments)` pair later in this turn cannot mean
+    /// anything new.
+    ///
+    /// The duplicate guard exists to stop a model looping on a failing
+    /// `grep`. It is only sound for tools whose result depends on nothing but
+    /// their arguments. A desktop tool's arguments do not describe the screen
+    /// it acts on — the screen is the hidden input, and the tool's own earlier
+    /// calls change it. So a click that repeats is a second click, a second
+    /// `screen_state` is a second screenshot, and the tool declares that in
+    /// [`ToolCapabilities::deduplicate_identical_calls`] rather than every call
+    /// site knowing the exception.
+    ///
+    /// [`ToolCapabilities::deduplicate_identical_calls`]: crate::tools::sdk::ToolCapabilities::deduplicate_identical_calls
+    fn repeats_are_meaningless(&self, tool_name: &str) -> bool {
+        self.tools
+            .get_capabilities(tool_name)
+            .deduplicate_identical_calls
+    }
+
     /// Handle tool calls from the LLM
     pub(crate) async fn handle_tool_calls(
         &self,
@@ -110,7 +129,9 @@ impl Agent {
             .filter(|tc| {
                 let tool_name = &tc.function.name;
                 let tool_args = &tc.function.arguments;
-                if context.is_tool_call_duplicate(tool_name, tool_args) {
+                if self.repeats_are_meaningless(tool_name)
+                    && context.is_tool_call_duplicate(tool_name, tool_args)
+                {
                     warn!("Duplicate tool call detected: {} with same args, skipping", tool_name);
                     false
                 } else {
@@ -383,7 +404,9 @@ impl Agent {
             .filter(|tc| {
                 let tool_name = &tc.function.name;
                 let tool_args = &tc.function.arguments;
-                if context.is_tool_call_duplicate(tool_name, tool_args) {
+                if self.repeats_are_meaningless(tool_name)
+                    && context.is_tool_call_duplicate(tool_name, tool_args)
+                {
                     warn!("Duplicate tool call detected: {} with same args, skipping", tool_name);
 
                     // Notify about duplicate via progress callback

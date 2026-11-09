@@ -161,6 +161,9 @@ The result states the image's pixel→screen-point mapping (`coordinate_space`) 
             requires_approval: false,
             risk_level: RiskLevel::Low,
             categories: vec!["computer".to_string(), "desktop".to_string()],
+            // The screen it reads is the one its own earlier calls changed, so
+            // the same request twice is two observations, not one repeated.
+            deduplicate_identical_calls: false,
             ..Default::default()
         }
     }
