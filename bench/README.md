@@ -132,8 +132,8 @@ lives in [`cua/ceiling.json`](cua/ceiling.json). Exclusion is per task and needs
 all three of: oracle 0 on every variant, no variant solved by the model, and an
 understood mechanism. A model success is proof the environment reached the task
 and vetoes the exclusion outright — `date-picker`'s oracle fails all five
-variants while the model solves one, so the oracle is what is broken there, not
-the environment.
+variants while the model now solves all five, so the oracle is what is broken
+there, not the environment.
 
 Before reading a low score as a model failure, run the oracle for that variant:
 
@@ -147,15 +147,17 @@ cb run task <dataset>/drag-drop --variant-id 0 --oracle \
 synthetic HTML5 drag input, which WebKitGTK rejects under `runc` without
 `/dev/uinput`. `drag-slider` is the contrast — also a drag, but reachable by
 click-then-arrow-keys, and it passes. Note that oracle=0 alone is *not* proof of
-a ceiling: `date-picker`'s oracle fails all five variants while the model has
-solved one, and `spreadsheet-cell`/`video-player` each have an oracle-failing
+a ceiling: `date-picker`'s oracle fails all five variants while the model passes
+all five, and `spreadsheet-cell`/`video-player` each have an oracle-failing
 variant the model passes. See [`cua/README.md`](cua/README.md).
 
-Four full runs at the same settings scored 0.794, 0.794, 0.735 and 0.721, and
-two of those back-to-back 0.794s agreed on only 58 of 68 variants. Treat a
-single run's failure list as a sample, not a verdict, and judge a fix by
-re-running the variants it targets rather than by comparing two totals. See
-[`cua/README.md`](cua/README.md).
+Six full runs at the same settings scored 0.794, 0.794, 0.735, 0.721, 0.750 and
+0.809, and two of those back-to-back 0.794s agreed on only 58 of 68 variants. A
+seventh, after the duplicate-call fix, scored 0.838; the two after the
+screen-reporting fix scored **0.910 and 0.912** (0.984 reachable both times),
+differing on two of the 67 variants scored in both. Treat a single run's failure
+list as a sample, not a verdict, and judge a fix by re-running the variants it
+targets rather than by comparing two totals. See [`cua/README.md`](cua/README.md).
 
 ### Why there is a bridge
 

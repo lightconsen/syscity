@@ -14,9 +14,9 @@
     "NO variant, and the failure has a mechanism that is understood.",
     "That conjunction is the point. date-picker is the counterexample: its",
     "oracle scores 0 on all five variants (it types into input[type=date], which",
-    "WebKitGTK ignores), yet the model solved v4 by clicking the picker's spin",
-    "buttons — so the task is reachable and the oracle, not the environment, is",
-    "what fails. A single-variant reading of 'oracle == 0' would have called",
+    "WebKitGTK ignores), yet the model solves all five by clicking the picker's",
+    "spin buttons — so the task is reachable and the oracle, not the environment,",
+    "is what fails. A single-variant reading of 'oracle == 0' would have called",
     "date-picker an environment limit and inflated the score.",
     "score.py enforces the same conjunction at report time and refuses a",
     "declaration the run contradicts."
@@ -29,7 +29,7 @@
       "date-picker v4", "drag-drop v0", "drag-drop v1", "drag-drop v2",
       "drag-drop v3", "drag-drop v4", "spreadsheet-cell v4", "video-player v2"
     ],
-    "note": "of these, the model solved date-picker v4, spreadsheet-cell v4 and video-player v2, which is how their tasks were shown reachable"
+    "note": "of these, the model solved all five date-picker variants plus spreadsheet-cell v4 and video-player v2, which is how those tasks were shown reachable"
   },
   "unreachable_tasks": {
     "drag-drop": {
@@ -47,8 +47,8 @@
   },
   "notes": [
     "date-picker and fill-form are deliberately NOT listed. The model scored 1",
-    "on date-picker v4 and fill-form v0/v1, so those tasks are reachable here.",
-    "fill-form's oracle also passes all three variants.",
+    "on every date-picker variant and on fill-form v0/v1, so those tasks are",
+    "reachable here. fill-form's oracle also passes all three variants.",
     "A variant the model solved is never excluded, whatever its oracle did:",
     "exclusion exists to stop a broken environment reading as model weakness,",
     "and a solved variant is proof the environment worked."

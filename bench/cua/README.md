@@ -40,27 +40,46 @@ python3 bench/cua/score.py <run-dir> --json   # machine
 | **reachable** | accuracy over the variants this environment can actually solve | the model, with the environment's own limits removed |
 
 They are not interchangeable and neither may be presented as the other. On this
-host (container-only, `runc`, darwin/arm64) the latest full run is **0.809 raw
-and 0.873 reachable** — six points apart, all of it one task. On an environment
-where more of the suite is broken the gap would be larger, and a raw number alone
-would read as model weakness.
+host (container-only, `runc`, darwin/arm64) the latest two full runs are **0.910
+and 0.912 raw, 0.984 reachable both times** (`61/67` and `62/68` raw, `61/62` and
+`62/63` reachable — the first run has one errored variant, so 67 scored). The
+seven-point gap between raw and reachable is almost entirely `drag-drop`, the one
+task this environment cannot reach. On an environment where more of the suite is
+broken the gap would be larger, and a raw number alone would read as model
+weakness.
 
 ### Run to run, this number moves more than it looks
 
-Six full 68-variant runs scored **0.794, 0.794, 0.735, 0.721, 0.750 and 0.809** —
-a spread of nine points. The first four differ from each other only by sampling:
-nothing changed between them. Across the first four, compared cell by cell, only
-**48 of the 65 cells that completed in every run gave the same answer every
-time**; 17 flipped at least once. A majority vote over the four gives 56/65 =
-0.8615, *above* every single run — a single run understates the model by roughly
-the amount of the flips.
+Nine full 68-variant runs scored **0.794, 0.794, 0.735, 0.721, 0.750, 0.809,
+0.838, 0.910 and 0.912** — a spread of nineteen points, and not one population.
+The first four differ from each other only by sampling, because nothing changed
+between them. Across those four, compared cell by cell, only **48 of the 65
+cells that completed in every run gave the same answer every time**; 17 flipped
+at least once. A majority vote over the four gives 56/65 = 0.8615, *above* any of
+them — a single run understates the model by roughly the amount of the flips.
 
-The last two are not pure noise: 0.750 and 0.809 were measured across a settle
-fix (below), and the tasks that fix was aimed at moved with it —
-`select-dropdown` 3/5 → 5/5 and `right-click-menu` 2/5 → 4–5/5. That is the
-honest reading of the two runs as a pair, not a claim that the fix is worth seven
-points; re-running the specific variants is the only way to tell the two apart,
-which is what the next paragraph says.
+The 0.750 and 0.809 pair is not pure noise: it was measured across a settle fix
+(below), and the tasks that fix was aimed at moved with it — `select-dropdown`
+3/5 → 5/5 and `right-click-menu` 2/5 → 4–5/5. That is the honest reading of the
+two runs as a pair, not a claim that the fix is worth seven points; re-running
+the specific variants is the only way to tell the two apart, which is what the
+next paragraph says.
+
+The last three are a different regime, and only the last two are comparable to
+each other. The 0.838 run was the first after the duplicate-call guard, and it
+is where `date-picker` went **0/5 → 5/5** — a fix to the agent loop, not to the
+bench glue (see "A repeated action is not a repeated call", below). The 0.910
+and 0.912 runs came after the screen-reporting fix. On the 67 variants scored in
+both, they differ on two cells and cancel out — `fill-form v0` passed in the
+first and not the second, `typing-input v4` the other way round — so the two
+runs land on the same **61/67**; the second only looks higher because the
+first's `right-click-menu v2` was an infrastructure error (the completion
+stream dropped) and so was never scored. Against 0.838, five cells moved and all
+five moved up: four `toggle-switch` variants coming back, plus `typing-input v2`.
+The toggle half is the unstyled-page sample described below — an environment
+recovery, not a gain. The honest statement is that the score has been **0.91
+across two consecutive runs**, with a reachable ceiling of 0.984, and that 0.838
+is not the number to compare this against without saying why.
 
 So a single run cannot settle a four-point question. When judging whether a
 change helped, re-run the specific variants it was meant to fix — several times
@@ -129,13 +148,13 @@ three hold:
 
 That second rule is not hypothetical. `date-picker`'s oracle scores **0 on all
 five variants** — its `solve_task` types into `input[type=date]`, which WebKitGTK
-ignores — yet the model has solved one of them. So the picker works and the
+ignores — yet the model now solves all five of them. So the picker works and the
 *oracle* is what fails. `spreadsheet-cell v4` (oracle 0, model 1 in both runs)
 and `video-player v2` (oracle 0, model 1 in the first) are the same story. A
 rule keyed on "oracle == 0" alone would have called all three an environment
 limit and quietly raised the score; an earlier version of this file did exactly
 that and reported an inflated **0.927**. The figure with the guards in place is
-**0.809 raw / 0.873 reachable** on the latest full run; the four runs before the
+**0.912 raw / 0.984 reachable** on the latest full run; the four runs before the
 settle fix ranged 0.721–0.794 — see the variance section above.
 
 ### Two runs at the same score still disagreed on ten cells
@@ -195,7 +214,7 @@ in the denominator, and `score.py` will say so rather than apply the exclusion.
 
 ## Where the failures come from
 
-Around 0.72–0.79 raw, 14–19 of 68 variants fail depending on the run. These are
+Across the nine runs 5–19 of 68 variants fail depending on the run. These are
 the *classes* of failure, taken from replaying the trajectories and re-testing
 each in a real `bench-web` container. Which variant lands in which class moves
 between runs — see above — so read this as what a failure means, not as a fixed
@@ -204,17 +223,87 @@ roster:
 | failure | cause | evidence |
 |---|---|---|
 | `drag-drop` (all 5) | **environment** | synthetic drag is rejected; `dragstart` never fires, and the target has no other route |
-| `date-picker` (4–5 of 5) | model | the environment reaches it; its oracle is 0 on all five only because `solve_task` types into `input[type=date]`, which WebKitGTK ignores. Segmented `mm/dd/yyyy` sub-fields take no synthetic text at all — but a calendar-cell click does commit, and the model has passed one variant by that route |
+| `spreadsheet-cell` misses | model aimed wrong | clicks a cell one row off, then reports success |
 | `video-player`'s volume variants | model, wrong layer | told to set volume to 75%, it ran `pactl set-sink-volume` in a terminal instead of moving the on-page slider; the task scores the player, not the ALSA mixer |
-| `right-click-menu` misses | model stopped early, plus a race | usually one right-click then `final_answer`; the menu is there in the tree. 3/3 standalone re-runs passed at 2 steps each, so this class is mostly sampling |
-| `fill-form`, `spreadsheet-cell` misses | model aimed wrong | clicks a cell or field one row off, then reports success |
 | `click-button` v5/v6 | **glue bug — fixed** | see below |
 | `select-dropdown` v1 | **glue bug — fixed, rewards 1 on re-run** | see below |
+| `date-picker`, every variant | **agent-loop bug — fixed, 5/5** | see below |
+| `toggle-switch` (4 of 5) | **environment, not the model** | the page rendered its content but no styling — see below |
+| `typing-input v4`, `fill-form v0` misses | **undiagnosed — typing did not land cleanly** | see below |
 
-Apart from the three fixed glue bugs, none of these is the glue's fault. The rest
-is the model stopping early, aiming at the wrong cell, or solving the task in
-the wrong layer — genuine model results, and the reason the raw number is the
-one to quote.
+Apart from the three fixed glue bugs and the one agent-loop bug, none of these is
+the glue's fault. The rest is the model stopping early, aiming at the wrong
+cell, or solving the task in the wrong layer — genuine model results, and the
+reason the raw number is the one to quote.
+
+The undiagnosed pair is the one class deliberately given no side. Both are
+`MAX_STEPS_EXCEEDED` with reward 0, and both say the same thing from inside: the
+keystrokes did not land cleanly. `typing-input v4` reported that the field
+"drops the first keystroke of every `type` action", so `The quick…` became
+`he quick…`, and that its correction attempts (`ctrl+a`, `Home`, `Delete`) all
+declared no change. `fill-form v0` reported the Age field double-registering
+(`25252252525`, then `225`, finally `25`) with keystrokes arriving late enough to
+burn the budget. Both sit downstream of `type` moving to `pyautogui.write`
+instead of the clipboard — the change that made `date-picker` reachable — so the
+open question is whether keystrokes also made long strings into a plain text
+field worse. Neither is a hard failure — `typing-input v4` passes two runs in
+three and `fill-form v0` one in three — so this is a lead, not a diagnosis.
+Until it is measured, count it as neither a glue bug nor a model failure.
+
+### A repeated action is not a repeated call
+
+Every desktop variant of `date-picker` failed in one run and every one passed in
+the next. The cause was in `src/agent/engine`, not `bench/cua`: a guard written
+to stop a model looping on a failing `grep` compared `(tool name, arguments)`
+against everything already executed in the turn and **skipped any byte-identical
+repeat**.
+
+On a shell that guard is right — the same `grep` over the same file cannot say
+anything new. On a desktop it is wrong: a second click on a calendar's "previous
+month" arrow is a *second* month, and a second `screen_state` is a *different*
+screen. The turn ended with the guard's own note ("NOT_EXECUTED") and the model
+concluded it had failed.
+
+`ToolCapabilities::deduplicate_identical_calls` now decides this per tool. It
+defaults to `true` — the loop protection stays for pure reads — and `computer`
+and `screen_state` set it to `false` with the reason recorded in
+`src/tools/{computer,screen_state}.rs`. Two engine tests pin both directions: an
+identical call to a world-changing tool runs every time, and an identical call
+to a pure tool still runs once.
+
+`date-picker` scored **5/5** in the next full run. One wrinkle in reading that
+run: three variants (`date-picker v4`, `video-player v5` and `v6`) have
+`status: "failed"` with `error: MAX_STEPS_EXCEEDED` yet `reward: 1.0` — they
+finished the task and ran out of steps on the way out. `status` counts a run as
+completed only when the agent stops cleanly; `avg_reward` counts the reward. The
+score is the evaluator's, so 57/68 stands. A later run scored
+`spreadsheet-cell v0` the same way — failed on steps, reward 1.
+
+### The toggle that was not there
+
+`toggle-switch` scored 5/5 in six consecutive full runs, then 1/5 in one. The
+cause was not the agent: in that run **the page rendered without its
+stylesheet**. The task's HTML loads Tailwind from `cdn.jsdelivr.net` inside the
+sandbox, and when that fetch fails the page still renders — as unstyled text.
+The evidence is in the accessibility tree, which reports the switch's real
+layout box:
+
+```
+styled   button "Toggle notifications" at (785,282) 44x24
+unstyled button "Toggle notifications" at (428,353) 16x10
+```
+
+An unstyled switch is a 16×10 target with no visible on/off state, sitting under
+a text label — the model clicked the label (`focus: false → true`), pressed
+space, saw no change, and reported that the toggle did not respond. That run's
+`click-button` buttons were a single row of grey text where the styled page draws
+a blue two-column grid, and its `select-dropdown` was plain text where the styled
+page draws a card — so the failure is a property of the run, not of the task.
+
+A same-binary re-run of all five variants scored **5/5, one click each**, and the
+tree shows the styled box. Two full runs since then have also scored it 5/5, so
+treat a `toggle-switch` miss as an environment sample until the styled geometry
+is confirmed: the 16×10 box is the tell.
 
 ### A click at a coordinate the tree published, but the window had cropped
 

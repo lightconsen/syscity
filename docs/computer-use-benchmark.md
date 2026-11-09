@@ -434,30 +434,44 @@ token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M
 | **M4** ✅ | `bench/cua/sycity_agent.py` + guest bridge + `cua-bench-basic` | 在真 sandbox 上跑通并出分，`summary.json` 有 `pass_at_k` | 0.5–1 天 |
 | **M5** | 全量：OSWorld 369 题 × 1 trial（先 a11y-only），结果进 ledger | 分数、infra 错误、阶梯分布三张表齐全 | 人工触发 |
 
-### M4 实测结果（2026-11-08，本机 arm64 Mac，`--runtime runc`）
+### M4 实测结果（2026-11-09，本机 arm64 Mac，`--runtime runc`）
 
 `cua-bench-basic` 全量 68 个 variant，`deepseek-v4-flash`，`--max-steps 25`。
 两个数，含义不同，不能互相替代：
 
 | | 数 | 说明 |
 |---|---|---|
-| 原始分 | **49/68 = 0.721**（四次全量区间 0.72–0.79，最好一次 0.794） | `summary.json` 的 `avg_reward`，**报分用这个** |
-| 可达分 | **49/63 = 0.778** | 剔除 `drag-drop` 后的模型分；见 `bench/cua/ceiling.json` |
+| 原始分 | **62/68 = 0.912**（九次全量区间 0.72–0.91，最近两次 0.910 / 0.912） | `summary.json` 的 `avg_reward`，**报分用这个** |
+| 可达分 | **62/63 = 0.984** | 剔除 `drag-drop` 后的模型分；见 `bench/cua/ceiling.json` |
 | 环境上限 | 1 个任务（5 variant） | 只有 `drag-drop`，且有机制层面的证据 |
 
 ```bash
 python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 ```
 
-**单轮总分不能用来判断一次改动的好坏。** 四次全量（设置完全一致）分别得 0.794、
+**单轮总分不能用来判断一次改动的好坏。** 最早四次全量（设置完全一致）分别得 0.794、
 0.794、0.735、0.721，前后差 7 分而中间没有任何改动。逐格比对四轮：65 个格子
 只有 **48 个每次都同答案**，17 个至少翻转过一次。四轮多数票合成是 56/65 = 0.8615，
 比任何单轮都高——单轮分数**低估**了模型。
 
 所以判断一个修复有没有用，要**重跑它针对的那几个 variant、多跑几次**，不要拿两轮总分
 相减。两次差点误判：`click-button` v5/v6 在一轮里 0/2、重跑后 7/7；`right-click-menu`
-一轮 2/5、单独重跑三次 3/3。两个都是抽样噪声，不是回归。正确的读数是"0.72–0.79 这个
-区间"，不是"某一轮的失败清单"。
+一轮 2/5、单独重跑三次 3/3。两个都是抽样噪声，不是回归。
+
+**0.838 那一次全量里的 `date-picker` 5/5 是真涨，但涨在 agent 循环上，不是胶水。** 原因是
+`src/agent/engine` 里那个 `(工具名, 参数)` 完全相同就跳过的去重保护——它本是为"模型对着
+一个失败的 `grep` 死循环"写的，在桌面上是错的：日历"上个月"箭头点第二下是**第二个月**，
+`screen_state` 读第二遍是**另一块屏**。现在由 `ToolCapabilities::deduplicate_identical_calls`
+逐工具决定，默认 `true` 保住纯读的循环保护，`computer` / `screen_state` 显式设
+`false`。见 `bench/cua/README.md` 的 "A repeated action is not a repeated call"。
+
+**最近两轮（`--max-steps 25`、同一二进制）稳定在 0.910 / 0.912。** 两轮在都计分的 67 个
+variant 上只差两格（`fill-form v0` 一过一不过、`typing-input v4` 反过来），刚好抵消；
+第二轮看着高 0.002，是因为第一轮的 `right-click-menu v2` 撞上了一次基础设施错误
+（completion stream 中途断开），根本没进分母。从 0.838 到 0.91，变了 5 格、全往上：
+`toggle-switch` 的四个变体回来、`typing-input v2` 补上。前者就是下一节说的"页面没加载
+样式"那轮环境样本恢复了，不是模型变强。所以要说的是"连续两轮 0.91、可达上限 0.984"，
+而不是把 0.838 当成基线。
 
 **先前给出的 0.927 作废。** 那是按"整题扣除 `date-picker`/`fill-form`/`drag-drop`"
 算的，两处都错：
@@ -483,7 +497,8 @@ python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 第二条防止坏 oracle 冒充环境上限（模型做出来了，就证明环境通得过）。
 
 **实测的 oracle 基线**：全量 68 个 variant 的 oracle 平均分 **0.824**（56/68）；
-12 个 variant 的 oracle 为 0，其中模型反而解出了 3 个。
+12 个 variant 的 oracle 为 0，其中模型反而解出了 7 个（`date-picker` 全部五个、
+`spreadsheet-cell v4`、`video-player v2`）。
 
 `drag-drop`（0/5，oracle 也 0/5）是唯一进入上限的任务。机制确认过：在真实 bench-web
 容器里注入页面级监听，`mousedown`/`mousemove`/`mouseup` 都到达页面，`dragstart` 从不
@@ -496,10 +511,10 @@ python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 
 #### 失败变体的归因
 
-0.72–0.79 原始分下，每轮有 14–19 个变体失败。逐个回放轨迹、并在**真实 bench-web 容器**
+0.72–0.91 原始分下，每轮有 5–19 个变体失败。逐个回放轨迹、并在**真实 bench-web 容器**
 里复现验证之后，失败分成几类；但先说一件比分类更重要的事：
 
-**同一轮的总分和失败清单都是抽样。** 四次全量（设置完全一致）分别得 0.794、0.794、
+**同一轮的总分和失败清单都是抽样。** 最早四次全量（设置完全一致）分别得 0.794、0.794、
 0.735、0.721，前后差 7 分而中间没有任何改动。逐格比对：65 个共同格子
 只有 **48 个每次都同答案**，17 个至少翻过一次。按多数票合成是 56/65 = 0.8615，
 比任何单轮都高——说明单轮分数**低估**了模型，低的那部分正是翻转。
@@ -530,20 +545,46 @@ video-player v5     1 -> 0        fill-form         v2 0 -> 1
 | 失败类 | 归因 | 证据 |
 |---|---|---|
 | `drag-drop`（5/5） | **环境**：合成拖拽不可达 | 见上 |
-| `date-picker`（每轮 4–5 个） | 模型 | 环境可达；oracle 全 0 是因为 `solve_task` 往 `input[type=date]` 键入，WebKitGTK 不认。分段 `mm/dd/yyyy` 子字段也不收合成文本，但点日历格子能提交，模型已经这样过了 v4 |
 | `video-player` 的音量变体 | 模型用错层 | 要求音量 75%，它开终端跑 `pactl set-sink-volume`，而评测看的是页内播放器，不是 ALSA mixer |
-| `right-click-menu` 的漏 | 模型提前停 + 采样 | 通常只右键一次就 `final_answer`，声称菜单"看不见"；单独重跑三次均 2 步通过 |
-| `fill-form` / `spreadsheet-cell` 的漏 | 点错位置 | 点偏一格/一个字段，然后报告完成 |
+| `fill-form` / `spreadsheet-cell` 的漏 | 点错位置 | 点偏一格/一个字段，然后报告完成。最近两轮的漏是另一类，见下 |
 | `click-button` v5/v6 | **胶水 bug（已修）** | 见下 |
 | `select-dropdown` v1 | **胶水 bug（已修，重跑得 1）** | 见下 |
+| `date-picker` 全部五个 | **agent 循环 bug（已修，5/5）** | 见下 |
+| `toggle-switch`（5 个里 4 个） | **环境：页面没加载样式** | 见下 |
+| `fill-form` v0 / `typing-input` v4 的漏 | **未定**：两处都报"按键没干净落地"，还没查出是 shim 还是页面 | 见下 |
 
-除这两个（现在是三个）胶水 bug 之外，这些都不是胶水的锅：是模型提前停止、点偏格子、
-或者用错了一层去解题——真实的模型结果，也正是原始分该拿来报的原因。
+除这三个胶水 bug 和一个 agent 循环 bug 之外，这些都不是胶水的锅：是模型提前停止、
+点偏格子、或者用错了一层去解题——真实的模型结果，也正是原始分该拿来报的原因。
 
-`date-picker` 不能说成"环境不可达"：**同一个任务的某个变体模型过了**（打开 picker、
-点 spin button）。可达但不轻松——失败的那些里，有的只键入月份就退出，有的在 25 步时
-`MAX_STEPS_EXCEEDED`（还绕道 terminal/playwright），有的用方向键漂了。它们的 oracle 全 0
-是因为 oracle 自己坏，不是环境。
+有一类**故意不归因**。`typing-input v4`（0.912 那轮）和 `fill-form v0`（0.910 那轮）
+都是 `MAX_STEPS_EXCEEDED`、reward 0，而且都从里面报了同一件事——按键没有干净落地：
+`typing-input v4` 说这个输入框"每次 `type` 吞掉第一个按键"，于是 `The quick…` 变成了
+`he quick…`，而它的修正尝试（`ctrl+a`、`Home`、`Delete`）全被报成没有变化；
+`fill-form v0` 说 Age 字段反复重复写入（`25252252525`，然后 `225`，最后 `25`），
+按键延迟到把预算烧完。两处都在 `type` 改走 `pyautogui.write`（正是让 date-picker 可达
+的那次改动）的下游，所以真正的问题可能是：按键路径让长字符串打进普通文本框变差了。
+注意两边都不是稳定失败——`typing-input v4` 三次里过两次、`fill-form v0` 三次里过一次
+——所以这是线索，不是结论。查清之前，两边账都不记。
+
+`date-picker` 不能说成"环境不可达"：oracle 五个 variant 全 0，是因为 `solve_task` 往
+`input[type=date]` 键入，WebKitGTK 不认；而模型现在**五个全过**。环境和任务都是好的，
+坏的是 oracle。修前模型每轮 0–1 个，修后 5/5——改动在 `src/agent/engine` 的重复调用
+守卫，不在 `bench/cua`。
+
+`toggle-switch` 也**不是模型的锅**，但和 `drag-drop` 不同，它不进上限：连续六次全量它
+都是 5/5，第七次突然 1/5。原因是那一轮**页面没加载样式**——任务 HTML 在 sandbox 里从
+`cdn.jsdelivr.net` 取 Tailwind，取不到时页面照样渲染，只是裸文本。可访问性树里直接
+看得到：
+
+```
+有样式   button "Toggle notifications" at (785,282) 44x24
+无样式   button "Toggle notifications" at (428,353) 16x10
+```
+
+16×10 的开关没有可见的开关状态，模型点的是旁边的文字标签。同一轮里 `click-button`
+的按钮是一行灰字（有样式时是蓝色两列网格）、`select-dropdown` 是纯文本（有样式时是
+卡片），所以这是那一轮的属性，不是任务的。同二进制重跑五个 variant 得 **5/5、
+每次一键**；之后两轮全量它也重新是 5/5。
 
 `select-dropdown` 的 bug 是我这边的，值得记下来：折叠状态的 `<select>` 里，AT-SPI 把
 **每一个 option 都报告在 combo box 自己的框上**——四个选项坐标完全相同。`atspi_xml.py`
@@ -603,8 +644,9 @@ xdotool click --delay 0 --repeat 500 5   0.27s   scrollY 0 -> 5369
 另外记录一个**与胶水无关**、但这次一起修掉的真 bug：`sensitive_ui` 把 `"pin"` 当子串匹配，
 于是 `spin_button` 命中——date-picker 的月/日/年数字调节器、任何数量框都被标成密码字段，
 模型收到"不要在此输入凭据"的警告后放弃输入。改成整词匹配后 `spin_button` 不再误报，
-真正的 `pin` 字段仍然命中。这一处在 `date-picker` 上直接可见：修前 0/5（且两次打满 25 步），
-修后 1/5、其余都以 `final_answer` 正常收尾。
+真正的 `pin` 字段仍然命中。这一处在 `date-picker` 上当时直接可见：修前 0/5（且两次打满
+25 步），修后 1/5、其余都以 `final_answer` 正常收尾。把 `date-picker` 带到 5/5 的是后来
+那个重复调用守卫的修复（见上），不是这一处。
 
 
 ### 已经落地的部分（2026-10-29）
