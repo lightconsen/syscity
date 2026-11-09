@@ -36,7 +36,9 @@ use crate::computer::rollback::RollbackManager;
 use crate::computer::sensitive_ui::{SensitiveUiDetector, SensitiveUiFinding};
 use crate::computer::use_loop::StepVerification;
 use crate::computer::verification::{VerificationConfig, VerificationCriteria, VerificationEngine};
-use crate::computer::vision::{is_screen_mutating_action, pixel_diff, ScreenDiff, ScreenState};
+use crate::computer::vision::{
+    action_changes_geometry, is_screen_mutating_action, pixel_diff, ScreenDiff, ScreenState,
+};
 use crate::computer::{
     ActionEffect, ActionResult, ActionTarget, ClickTarget, ComputerAdapter, ComputerError,
     DeliveryMode, DesktopAction, Escalation, Rung, Screenshot, UiElement,
@@ -1344,12 +1346,24 @@ impl ComputerSession {
                         return Ok((hint.verification, None, Some(hint)));
                     }
                 }
-                self.verify_by_diff(tree_before, screenshot_before, screenshot_after, state_after)
-                    .await
-                    .map(|(verification, diff)| (verification, diff, None))
+                self.verify_by_diff(
+                    action,
+                    tree_before,
+                    screenshot_before,
+                    screenshot_after,
+                    state_after,
+                )
+                .await
+                .map(|(verification, diff)| (verification, diff, None))
             }
             _ if is_screen_mutating_action(action) => self
-                .verify_by_diff(tree_before, screenshot_before, screenshot_after, state_after)
+                .verify_by_diff(
+                    action,
+                    tree_before,
+                    screenshot_before,
+                    screenshot_after,
+                    state_after,
+                )
                 .await
                 .map(|(verification, diff)| (verification, diff, None)),
             _ => Ok((StepVerification::Unverifiable, None, None)),
@@ -1357,8 +1371,14 @@ impl ComputerSession {
     }
 
     /// Compare pre/post screen state.
+    ///
+    /// `geometry_counts` is true only for the actions whose whole point is a
+    /// bounds change. For everything else a `moved:`-only diff is the desktop
+    /// reflowing, not the action landing — and reporting it as verified is
+    /// how a click that did nothing kept telling the model it had worked.
     async fn verify_by_diff(
         &self,
+        action: &DesktopAction,
         tree_before: Option<&[UiElement]>,
         screenshot_before: Option<&Screenshot>,
         screenshot_after: Option<&Screenshot>,
@@ -1379,9 +1399,12 @@ impl ComputerSession {
             ScreenState::from_parts(tree_before.unwrap_or(&[]).to_vec(), shot_before.clone());
         let after = ScreenState::from_parts(tree_after, shot_after.clone());
         let diff = before.diff(&after);
-        let changed = diff.has_meaningful_changes();
+        let changed = diff.evidences_action(action_changes_geometry(action));
         if !changed {
-            tracing::info!("verification: no visible change ({})", diff.summary());
+            tracing::info!(
+                "verification: no change attributable to the action ({})",
+                diff.summary()
+            );
         }
         let verdict = if changed {
             StepVerification::Verified
@@ -2072,7 +2095,7 @@ mod tests {
         // the same answer.
         let session = headless_session();
         let (outcome, diff) = session
-            .verify_by_diff(None, None, None, None)
+            .verify_by_diff(&DesktopAction::Screenshot { region: None }, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(outcome, StepVerification::Unverifiable);
@@ -2082,7 +2105,13 @@ mod tests {
         // An empty screenshot is the same situation: nothing to compare.
         let empty = Screenshot::new(String::new(), 0, 0);
         let (outcome, _) = session
-            .verify_by_diff(None, Some(&empty), Some(&empty), None)
+            .verify_by_diff(
+                &DesktopAction::Screenshot { region: None },
+                None,
+                Some(&empty),
+                Some(&empty),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(outcome, StepVerification::Unverifiable);

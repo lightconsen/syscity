@@ -470,8 +470,24 @@ fn bench_prompt_suffix(available: &str) -> String {
            barely moved.\n\
          - Segmented fields (dates, times, numbers) take keyboard input one segment at a \
            time: clicking the field selects a segment, and digits overwrite that segment. \
-           Paste often does nothing. A date field's calendar button opens a grid — picking a \
-           day there is a complete selection, and its header arrows change month and year.\n\
+           Paste often does nothing. **In this desktop's web engine, clicking a date or time \
+           segment also opens a native calendar/clock popup that swallows every keystroke** \
+           — press Escape once after clicking the segment, then type, and the digits land. \
+           The change event fires by itself when the last segment is entered; no Tab or \
+           Return is needed. A date field's calendar button opens a grid — picking a day \
+           there is a complete selection, and its header arrows change month and year.\n\
+         - Type one segment at a time, as its own action, then move on. Typing `01152024` \
+           into a month segment sets month 24 and leaves day and year untouched: the digits \
+           do not spill into the next segment. So the sequence is click the month segment, \
+           Escape, type `01`; click the day segment, Escape, type `15`; click the year \
+           segment, Escape, type `2024`. A `right` arrow also advances to the next segment \
+           and needs no second Escape, which costs two fewer actions per date.\n\
+         - Escape is per click. Every click on a date segment re-opens the popup, so press \
+           Escape again after each one — not only the first.\n\
+         - Read the field back after typing. The tree lists each element's value when it has \
+           one; for a date that is three separate segments (month, day, year), so check all \
+           three rather than trusting that the typing landed. A year segment still reading \
+           the current year means the year was never typed, not that the task is done.\n\
          - Only report success you can see on screen. If the screen does not show the result, \
            say so plainly rather than describing what the task asked for.\n\
          - Work until the task is done, then reply with one short paragraph saying what you \

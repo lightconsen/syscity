@@ -478,6 +478,25 @@ fn trust_line(ui_source: &str) -> String {
     )
 }
 
+/// Longest element value rendered inline before it is shortened.
+const MAX_INLINE_VALUE_CHARS: usize = 120;
+
+/// Shorten a value to a single readable line.
+///
+/// A value is one line of an outline, not a document: a newline in a text
+/// area's contents would break the indentation the tree depends on, and a
+/// 4 KB paste would spend the outline's line budget on itself.
+fn clamp_inline(value: &str, max: usize) -> String {
+    let flattened = value.replace(['\n', '\r'], " ");
+    let mut chars = flattened.chars();
+    let head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// Render a UI element and its children as an indented outline.
 /// Returns `false` when the line cap was hit (tree truncated).
 fn format_element(
@@ -520,6 +539,23 @@ fn format_element(
     } else {
         format!(" [id={}]", el.id)
     };
+    // The current value is what makes a segmented control readable at all. A
+    // date input is three anonymous spin buttons to AT-SPI — `month`,
+    // `day`, `year` — and the only thing that says whether the typing landed
+    // is their values. Leaving them out of the outline meant the model could
+    // not confirm a date it had just entered, and the full JSON that does
+    // carry them was being cut from the `[data]` fold by its byte budget.
+    //
+    // A sensitive field is the one exception: its value is the secret the
+    // scan just warned about, so it stays off the line. Long values are
+    // shortened rather than printing a paragraph.
+    let value_part = match (sensitive.get(&el.id), el.value.as_deref()) {
+        (Some(_), _) => String::new(),
+        (None, Some(value)) if !value.is_empty() => {
+            format!(" = {:?}", clamp_inline(value, MAX_INLINE_VALUE_CHARS))
+        }
+        _ => String::new(),
+    };
     // Inline the reason the model must slow down on *this* line, rather than
     // leaving it to a header it may skim past.
     let sensitive_part = sensitive
@@ -534,8 +570,16 @@ fn format_element(
         .map(|b| format!(" at ({},{}) {}x{}", b.x, b.y, b.width, b.height))
         .unwrap_or_default();
     out.push_str(&format!(
-        "{}{}{}{}{}{}{}{}\n",
-        indent, el.role, label_part, state, focus_part, geometry_part, id_part, sensitive_part
+        "{}{}{}{}{}{}{}{}{}\n",
+        indent,
+        el.role,
+        label_part,
+        state,
+        focus_part,
+        geometry_part,
+        id_part,
+        value_part,
+        sensitive_part
     ));
     for child in &el.children {
         format_element(child, depth + 1, out, lines, max_lines, sensitive);
@@ -886,6 +930,63 @@ mod tests {
         let mut lines = 0;
         format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
         assert!(out.contains("[id=s0000002a:0.1]"), "{out}");
+    }
+
+    /// A segmented control is three anonymous spin buttons to AT-SPI, and its
+    /// value is the only thing that says whether the typing landed. The
+    /// outline used to omit it, and the full JSON that carries it was cut
+    /// from the `[data]` fold by its byte budget — so the model could enter a
+    /// date and never read back what it had entered.
+    #[test]
+    fn format_element_shows_a_readable_value() {
+        let mut month = el("spin button", Some("month"), vec![]);
+        month.value = Some("1.0".to_string());
+        let mut out = String::new();
+        let mut lines = 0;
+        format_element(&month, 0, &mut out, &mut lines, 100, &no_sensitive());
+        assert!(out.contains("= \"1.0\""), "{out}");
+
+        // No value, no `=`: an empty element keeps its old line.
+        let mut lines = 0;
+        let mut out = String::new();
+        format_element(
+            &el("button", Some("OK"), vec![]),
+            0,
+            &mut out,
+            &mut lines,
+            100,
+            &no_sensitive(),
+        );
+        assert!(!out.contains(" = "), "{out}");
+    }
+
+    /// The value is a field's contents, so a secret must not be drawn beside
+    /// the warning that says it is one.
+    #[test]
+    fn a_sensitive_field_does_not_render_its_value() {
+        let mut tree = el("text_field", Some("Password"), vec![]);
+        tree.id = "s1:0.2".to_string();
+        tree.value = Some("hunter2".to_string());
+        let mut sensitive = HashMap::new();
+        sensitive.insert("s1:0.2".to_string(), "password_field");
+        let mut out = String::new();
+        let mut lines = 0;
+        format_element(&tree, 0, &mut out, &mut lines, 100, &sensitive);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains("[sensitive: password_field]"), "{out}");
+    }
+
+    /// A text area holds whole paragraphs; the outline is one line per
+    /// element, and an embedded newline would break its indentation.
+    #[test]
+    fn a_long_value_stays_on_one_short_line() {
+        let mut tree = el("text area", Some("Notes"), vec![]);
+        tree.value = Some(format!("line one\nline two {}", "x".repeat(400)));
+        let mut out = String::new();
+        let mut lines = 0;
+        format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains('…'), "{out}");
     }
 
     #[test]

@@ -1066,7 +1066,71 @@ const TOOL_DATA_ELIDED_KEYS: &[&str] = &[
     "image_base64",
     "elements",
     "tree",
+    "ui_tree",
 ];
+
+/// Render the part of an oversized payload the caller cannot act without.
+///
+/// Only a UI tree has a meaningful summary: the elements that carry a value,
+/// or that hold focus, or that just appeared — which is exactly the set a
+/// caller uses to tell "the typing landed" from "it went nowhere". Everything
+/// else stays a size placeholder, because a screenshot has no smaller honest
+/// form.
+fn summarise_payload(key: &str, data: &Value) -> Option<String> {
+    let field = match key {
+        "ui_tree" | "elements" | "tree" => data.get(key)?,
+        _ => return None,
+    };
+    let elements: &[Value] = field.as_array()?;
+    let mut lines: Vec<String> = Vec::new();
+    collect_notable(elements, 0, &mut lines);
+    if lines.is_empty() {
+        return None;
+    }
+    let mut summary =
+        format!("{key} — elements that carry a value, hold focus or are pressable, depth-first:");
+    for line in lines {
+        summary.push('\n');
+        summary.push_str(&line);
+    }
+    Some(summary)
+}
+
+/// Depth-first walk collecting the elements whose state the caller can act on.
+///
+/// Bounded: a busy desktop has thousands of nodes, and this text is a hint
+/// next to the outline, not a second copy of it.
+fn collect_notable(elements: &[Value], depth: usize, lines: &mut Vec<String>) {
+    const MAX_LINES: usize = 24;
+    const MAX_DEPTH: usize = 12;
+    for element in elements {
+        if lines.len() >= MAX_LINES || depth > MAX_DEPTH {
+            return;
+        }
+        let role = element.get("role").and_then(Value::as_str).unwrap_or("?");
+        let label = element.get("label").and_then(Value::as_str);
+        let value = element.get("value").and_then(Value::as_str);
+        let focused = element.get("focused").and_then(Value::as_str) == Some("known_true")
+            || element.get("focused") == Some(&Value::Bool(true));
+        let notable = value.is_some_and(|v| !v.is_empty()) || focused;
+        if notable {
+            let mut line = format!("{}{role}", "  ".repeat(depth));
+            if let Some(label) = label.filter(|l| !l.is_empty()) {
+                line.push_str(&format!(" {label:?}"));
+            }
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                line.push_str(&format!(" = {value:?}"));
+            }
+            if focused {
+                line.push_str(" [focused]");
+            }
+            lines.push(line);
+        }
+        if let Some(children) = element.get("children").and_then(Value::as_array) {
+            collect_notable(children, depth + 1, lines);
+        }
+    }
+}
 
 /// Render structured tool data as text for the model.
 ///
@@ -1078,32 +1142,51 @@ fn fold_tool_data(data: &Value) -> Option<String> {
         .copied()
         .filter(|key| data.get(*key).is_some_and(|v| !v.is_null()))
         .collect();
-    let rendered = if elided.is_empty() {
-        let masked = crate::secrets::mask_json_value(data);
-        serde_json::to_string(&masked).ok()?
-    } else {
-        let mut trimmed = data.clone();
-        let mut placeholders = Vec::new();
-        if let Some(obj) = trimmed.as_object_mut() {
-            for key in &elided {
-                if let Some(value) = obj.remove(*key) {
-                    let size = match &value {
-                        Value::Array(arr) => format!("{} items", arr.len()),
-                        Value::String(s) => format!("{} chars", s.chars().count()),
-                        _ => "payload".to_string(),
-                    };
-                    placeholders.push(format!("{key}: {size} omitted"));
-                }
+    // Every field except the elided payloads is small and carried in full;
+    // the byte budget below applies only to the oversized ones, so an
+    // ordinary result never loses its `effect`/`rung` because a neighbouring
+    // field was long.
+    let mut out = String::new();
+    let mut placeholders = Vec::new();
+    let mut trimmed = data.clone();
+    if let Some(obj) = trimmed.as_object_mut() {
+        for key in &elided {
+            if let Some(value) = obj.remove(*key) {
+                let size = match &value {
+                    Value::Array(arr) => format!("{} items", arr.len()),
+                    Value::String(s) => format!("{} chars", s.chars().count()),
+                    _ => "payload".to_string(),
+                };
+                placeholders.push(format!("{key}: {size} omitted"));
             }
         }
-        let masked = crate::secrets::mask_json_value(&trimmed);
-        let mut out = serde_json::to_string(&masked).ok()?;
-        if !placeholders.is_empty() {
-            out.push_str(&format!(" ({})", placeholders.join(", ")));
+    }
+    // Every field except the elided payloads is small and carried in full;
+    // the byte budget below applies only to the oversized ones, so an
+    // ordinary result never loses its `effect`/`rung` because a neighbouring
+    // field was long.
+    let masked = crate::secrets::mask_json_value(&trimmed);
+    let rest = serde_json::to_string(&masked).ok()?;
+    if rest != "{}" {
+        out.push_str(&rest);
+    }
+    // The oversized fields are summarised, not dropped: a 4 KB UI tree is
+    // worth a handful of *lines*, because the field's value — the only thing
+    // that says whether typing landed — lives there and nowhere else in the
+    // message. Dropping the tree whole meant a date picker's `1.0 / 15.0 /
+    // 2024.0` never reached the model at all.
+    for key in &elided {
+        if let Some(summary) = summarise_payload(key, data) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&summary);
         }
-        out
-    };
-    let rendered = crate::tools::head_tail_truncate(&rendered, TOOL_DATA_FOLD_LIMIT);
+    }
+    if !placeholders.is_empty() {
+        out.push_str(&format!(" ({})", placeholders.join(", ")));
+    }
+    let rendered = crate::tools::head_tail_truncate(&out, TOOL_DATA_FOLD_LIMIT);
     if rendered.trim().is_empty() || rendered == "{}" {
         return None;
     }
@@ -1337,6 +1420,49 @@ mod tool_result_fold_tests {
         let content = result.to_tool_result("c").content;
         assert!(content.len() < TOOL_DATA_FOLD_LIMIT + 200, "{} bytes", content.len());
         assert!(content.contains("bytes omitted"), "the truncation says so");
+    }
+
+    /// A UI tree is elided as a payload, but the elements that carry a value
+    /// or hold focus are exactly what the caller needs to tell "the typing
+    /// landed" from "it went nowhere". Dropping the tree whole meant a date
+    /// picker's `1.0 / 15.0 / 2024.0` never reached the model.
+    #[test]
+    fn an_elided_tree_still_reports_its_values() {
+        let tree = json!([{
+            "role": "window",
+            "label": "Date Picker Task",
+            "value": null,
+            "focused": "known_true",
+            "children": [
+                { "role": "spin button", "label": "month", "value": "1.0", "focused": "known_true" },
+                { "role": "spin button", "label": "day", "value": "15.0", "focused": "known_false" },
+                { "role": "button", "label": "OK", "value": null, "focused": "known_false" },
+            ]
+        }]);
+        let result = ToolExecutionResult::success("read").with_data(json!({ "ui_tree": tree }));
+        let content = result.to_tool_result("c").content;
+        assert!(content.contains("spin button \"month\" = \"1.0\""), "{content}");
+        assert!(content.contains("spin button \"day\" = \"15.0\""), "{content}");
+        assert!(content.contains("[focused]"), "{content}");
+        // The button has neither, and the outline is a summary, not a copy.
+        assert!(!content.contains("\"OK\""), "{content}");
+    }
+
+    /// The regression that started this: a result whose only bulky field is a
+    /// tree still carries its small fields in full, so `effect` survives.
+    #[test]
+    fn the_small_fields_survive_a_bulky_tree() {
+        let tree: Vec<Value> = (0..800)
+            .map(|i| json!({ "role": "button", "label": format!("b{i}") }))
+            .collect();
+        let result = ToolExecutionResult::success("clicked").with_data(json!({
+            "ui_tree": tree,
+            "effect": "confirmed",
+            "rung": "pixel",
+        }));
+        let content = result.to_tool_result("c").content;
+        assert!(content.contains("\"effect\":\"confirmed\""), "{content}");
+        assert!(content.contains("\"rung\":\"pixel\""), "{content}");
     }
 }
 

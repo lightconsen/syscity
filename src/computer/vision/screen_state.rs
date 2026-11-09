@@ -16,6 +16,21 @@ use super::TextBlock;
 use crate::computer::types::{Rect, UiElement};
 use crate::computer::{ComputerAdapter, DesktopAction, Result, Screenshot};
 
+/// Whether the action's whole intended effect *is* a bounds change.
+///
+/// For these, a diff whose only content is `moved:` entries is the success
+/// case. For every other action the same diff is the desktop reflowing, and
+/// counting it as a working action is how a click on nothing verified.
+pub fn action_changes_geometry(action: &DesktopAction) -> bool {
+    matches!(
+        action,
+        DesktopAction::MoveWindow { .. }
+            | DesktopAction::ResizeWindow { .. }
+            | DesktopAction::MinimizeWindow { .. }
+            | DesktopAction::MaximizeWindow { .. }
+    )
+}
+
 /// Whether an action is expected to visibly change the screen — only these
 /// get pre/post verification snapshots.
 pub fn is_screen_mutating_action(action: &DesktopAction) -> bool {
@@ -137,6 +152,41 @@ impl ScreenDiff {
         self.pixel.change_percentage >= 0.5 || self.tree.has_changes()
     }
 
+    /// Whether the diff is evidence that *an action* did something, as
+    /// opposed to the desktop's own chrome tidying itself up.
+    ///
+    /// `has_meaningful_changes` answers "is the screen different"; this
+    /// answers "did the thing I asked for happen". They are not the same
+    /// question, and conflating them is how a step that changed nothing on
+    /// the target reported `effect=confirmed`: xfce4-panel re-lays itself out
+    /// between any two captures, so `tree.has_changes()` was true on every
+    /// step regardless of what was clicked.
+    ///
+    /// A window or panel that only *moved* is not evidence. Pixel change is,
+    /// a state transition (`value:`/`focus:`/`enabled:`) is, and elements
+    /// appearing or disappearing are — but the last two only after the
+    /// phantom-add bug in [`diff_elements`] is gone, which is why the
+    /// matcher pairs equal-keyed siblings one-for-one.
+    ///
+    /// `geometry_counts` is for the actions whose whole point is geometry —
+    /// `move_window`, `resize_window`, `minimize_window`, `maximize_window`.
+    /// For those a bounds change is the expected effect, not churn.
+    pub fn evidences_action(&self, geometry_counts: bool) -> bool {
+        if self.pixel.change_percentage >= 0.5 {
+            return true;
+        }
+        if !self.tree.added.is_empty() || !self.tree.removed.is_empty() {
+            return true;
+        }
+        if geometry_counts {
+            return !self.tree.changed.is_empty();
+        }
+        self.tree
+            .changed
+            .iter()
+            .any(|entry| !entry.contains(" moved: "))
+    }
+
     /// Compact one-paragraph summary for LLM consumption.
     pub fn summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -177,6 +227,24 @@ impl ScreenDiff {
         } else {
             parts.join("; ")
         }
+    }
+
+    /// The rendering of the facts, followed by what they do *not* establish.
+    ///
+    /// [`summary`](Self::summary) lists what moved; a page of `moved:` lines
+    /// and no `value:`/`focus:` line says the window manager tidied itself
+    /// up. The model reads the same text either way unless it is told which
+    /// one it is looking at.
+    pub fn summary_for_action(&self, geometry_counts: bool) -> String {
+        let summary = self.summary();
+        if summary == "no visible change detected" || self.evidences_action(geometry_counts) {
+            return summary;
+        }
+        format!(
+            "{summary}\nOnly geometry changed: no element's value, focus or enabled state did, \
+             and too few pixels moved to count. That is the desktop reflowing, not the action \
+             taking effect."
+        )
     }
 }
 
@@ -454,11 +522,26 @@ fn describe(el: &UiElement) -> String {
 }
 
 fn diff_elements(before: &[UiElement], after: &[UiElement], path: &str, out: &mut TreeDiffResult) {
+    // Pair equal-keyed siblings **one for one**, not "does one exist at all".
+    // A panel that re-enumerates leaves several siblings sharing a
+    // `(role, label)` key; the old `after.iter().find(..)` handed every one of
+    // them the same counterpart, and the `added` pass then compared against
+    // the *whole* before-list, so a key that was already there could still be
+    // reported as newly added. Eighteen identical `button "Applications"`
+    // entries in one diff are what that looked like — and they consumed the
+    // diff quota that the element actually clicked needed.
+    let mut matched = vec![false; after.len()];
     for b in before {
         let key = element_key(b);
         let child_path = format!("{}/{}", path, describe(b));
-        match after.iter().find(|a| element_key(a) == key) {
-            Some(a) => {
+        let counterpart = after
+            .iter()
+            .enumerate()
+            .position(|(i, a)| !matched[i] && element_key(a) == key);
+        match counterpart {
+            Some(idx) => {
+                matched[idx] = true;
+                let a = &after[idx];
                 if b.enabled != a.enabled {
                     out.changed
                         .push(format!("{} enabled: {} → {}", child_path, b.enabled, a.enabled));
@@ -510,15 +593,40 @@ fn diff_elements(before: &[UiElement], after: &[UiElement], path: &str, out: &mu
             None => out.removed.push(child_path),
         }
     }
-    for a in after {
-        let key = element_key(a);
-        if !before.iter().any(|b| element_key(b) == key) {
+    for (idx, a) in after.iter().enumerate() {
+        if !matched[idx] {
             out.added.push(format!("{}/{}", path, describe(a)));
         }
     }
 }
 
+/// How much a `changed:` entry is worth keeping when the list has to be cut.
+///
+/// The quota is small on purpose, and it is spent in walk order unless
+/// something reorders it. On a desktop with a taskbar, the panel's layout
+/// churn produces twenty `moved:` lines before the window the action went to
+/// is reached at all, so a field's `value:` change — the only line that says
+/// the action worked — was always the part that got omitted.
+fn change_priority(entry: &str) -> u8 {
+    if entry.contains(" value: ") || entry.contains(" focus: ") || entry.contains(" enabled: ") {
+        0
+    } else if entry.contains(" moved: ") {
+        2
+    } else {
+        1
+    }
+}
+
 fn truncate_diff(out: &mut TreeDiffResult) {
+    // Collapse repeats first. Repeats share a path, so they are the same
+    // element read twice, not two elements — and each copy of
+    // `button "Applications"` was costing a line of the quota.
+    for list in [&mut out.added, &mut out.removed, &mut out.changed] {
+        collapse_repeats(list);
+    }
+    // Then keep the entries that answer "did it work" and drop the ones that
+    // only say "the desktop moved".
+    out.changed.sort_by_key(|entry| change_priority(entry));
     for list in [&mut out.added, &mut out.removed, &mut out.changed] {
         if list.len() > MAX_DIFF_ENTRIES {
             let omitted = list.len() - MAX_DIFF_ENTRIES;
@@ -526,6 +634,25 @@ fn truncate_diff(out: &mut TreeDiffResult) {
             list.push(format!("… {} more omitted", omitted));
         }
     }
+}
+
+/// Replace a run of identical entries with one entry and a count.
+fn collapse_repeats(list: &mut Vec<String>) {
+    let mut collapsed: Vec<String> = Vec::with_capacity(list.len());
+    let mut i = 0;
+    while i < list.len() {
+        let mut run = 1;
+        while i + run < list.len() && list[i + run] == list[i] {
+            run += 1;
+        }
+        if run > 1 {
+            collapsed.push(format!("{} (×{})", list[i], run));
+        } else {
+            collapsed.push(list[i].clone());
+        }
+        i += run;
+    }
+    *list = collapsed;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -666,6 +793,114 @@ mod tests {
         let mut after_field = el("text_field", Some("Name"), vec![]);
         after_field.focused = crate::computer::Tri::Known(false);
         assert!(tree_diff(&[before_field], &[after_field]).has_changes());
+    }
+
+    /// A panel that re-enumerates presents several siblings with the same
+    /// `(role, label)` key. Matching "does one exist at all" gave every one of
+    /// them the same counterpart and then reported the *whole* key as newly
+    /// added — 18 identical `button "Applications"` lines, and the tree diff
+    /// said the screen had changed even when the action left it alone.
+    #[test]
+    fn repeated_sibling_keys_are_not_reported_as_added() {
+        let panel = |count: usize| {
+            let buttons = (0..count)
+                .map(|_| el("button", Some("Applications"), vec![]))
+                .collect();
+            vec![el("panel", None, buttons)]
+        };
+        let diff = tree_diff(&panel(3), &panel(3));
+        assert!(diff.added.is_empty(), "{:?}", diff.added);
+        assert!(diff.removed.is_empty(), "{:?}", diff.removed);
+        assert!(!diff.has_changes());
+
+        // One extra copy really is one addition, not three.
+        let diff = tree_diff(&panel(2), &panel(3));
+        assert_eq!(diff.added.len(), 1, "{:?}", diff.added);
+        assert!(diff.removed.is_empty(), "{:?}", diff.removed);
+    }
+
+    /// The quota is 20 entries per category. A taskbar's layout churn fills
+    /// `changed` on its own, before the window the action went to is reached,
+    /// so the `value:` line — the only one that says the action worked — was
+    /// the part that got omitted.
+    #[test]
+    fn a_value_change_survives_a_flood_of_geometry_churn() {
+        let window = |with_value: bool| {
+            let panel = (0..40)
+                .map(|i| {
+                    let mut b = el("button", Some("Applications"), vec![]);
+                    b.bounds = Some(Rect::new(i * 10, 0, 10, 26));
+                    b
+                })
+                .collect::<Vec<_>>();
+            let mut month = el("spin button", Some("month"), vec![]);
+            month.value = Some(if with_value { "1.0" } else { "0.0" }.to_string());
+            vec![
+                el("panel", None, panel),
+                el("window", Some("Date Picker Task"), vec![month]),
+            ]
+        };
+        let diff = tree_diff(&window(false), &window(true));
+        assert!(diff.has_changes());
+        let joined = diff.changed.join(" | ");
+        assert!(
+            joined.contains("value: Some(\"0.0\") → Some(\"1.0\")"),
+            "the value change was crowded out: {joined}"
+        );
+    }
+
+    /// Repeats are the same element read twice; each copy was costing a line
+    /// of the quota.
+    #[test]
+    fn repeated_diff_entries_are_collapsed() {
+        let mut out = TreeDiffResult {
+            added: vec!["/p/button \"Applications\"".to_string(); 6],
+            ..Default::default()
+        };
+        truncate_diff(&mut out);
+        assert_eq!(out.added.len(), 1, "{:?}", out.added);
+        assert!(out.added[0].ends_with("(×6)"), "{:?}", out.added);
+    }
+
+    /// The point of `evidences_action`: a desktop that only reflows is not
+    /// evidence that a click landed.
+    #[test]
+    fn geometry_only_churn_is_not_evidence_an_action_worked() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 0.0,
+                changed_regions: vec![],
+            },
+            tree: TreeDiffResult {
+                changed: vec![
+                    "/application \"xfce4-panel\"/window moved: (0,0) 96x26 → (96,0) 408x26"
+                        .to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        assert!(diff.has_meaningful_changes(), "the screen did change");
+        assert!(!diff.evidences_action(false), "but not because of the action");
+        assert!(diff.evidences_action(true), "unless the action was to move it");
+        assert!(diff
+            .summary_for_action(false)
+            .contains("Only geometry changed"));
+
+        // A value or focus transition is evidence for any action.
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 0.0,
+                changed_regions: vec![],
+            },
+            tree: TreeDiffResult {
+                changed: vec![
+                    "/window/spin button \"month\" value: Some(\"0.0\") → Some(\"1.0\")"
+                        .to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        assert!(diff.evidences_action(false));
     }
 
     #[test]

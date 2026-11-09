@@ -781,9 +781,16 @@ async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionR
     let mut tool_result = action_result_to_tool_result(result).await;
 
     if let Some(diff) = &diff {
+        // A bounds change is the expected effect for a window move/resize, and
+        // desktop churn for everything else. The summary says which one the
+        // reader is looking at, because the raw `moved:` list does not.
+        let geometry_counts = matches!(
+            action,
+            "move_window" | "resize_window" | "minimize_window" | "maximize_window"
+        );
         tool_result
             .output
-            .push_str(&format!("\n\n[verification] {}", diff.summary()));
+            .push_str(&format!("\n\n[verification] {}", diff.summary_for_action(geometry_counts)));
     }
 
     if let Some(evidence) = &evidence {

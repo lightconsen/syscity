@@ -748,14 +748,29 @@ fn click_code(x: i32, y: i32, button: MouseButton, double: bool) -> String {
     format!("import pyautogui\npyautogui.{call}({x}, {y}, button='{button}')\n")
 }
 
-/// Type text by pasting it.
+/// Type text into whatever holds focus.
 ///
-/// `pyautogui.write` is limited to the keyboard's own characters — a Chinese
-/// sentence, a path with unusual punctuation or a long paragraph arrives
-/// truncated or raises. The clipboard carries any string, and the paste is one
-/// keystroke.
+/// Two paths, chosen by what the text is rather than by what fails:
+///
+/// * **Short printable ASCII** is typed as keystrokes. It has to be. A
+///   segmented control — a date field's month/day/year, a time field's
+///   hours/minutes — accepts digits key by key and ignores a paste outright:
+///   WebKitGTK's `input[type=date]` has no text buffer to paste into, so
+///   `ctrl+v` is a no-op that raises nothing. The old snippet tried the
+///   clipboard first and only fell back on an exception, so the fallback
+///   never ran and the digits were silently lost — to the model, a `type`
+///   that "reported success but nothing changed".
+/// * **Anything else** (non-ASCII, multi-line, long) goes through the
+///   clipboard, because `pyautogui.write` can only produce the keyboard's own
+///   characters. The fallback stays for a clipboard that refuses.
 fn type_code(text: &str) -> String {
     let literal = python_string(text);
+    if types_as_keystrokes(text) {
+        return format!(
+            "import pyautogui\n\
+             pyautogui.write({literal}, interval=0.02)\n"
+        );
+    }
     format!(
         "import time\n\
          import pyautogui\n\
@@ -768,6 +783,17 @@ fn type_code(text: &str) -> String {
          except Exception:\n\
          \x20   pyautogui.write({literal}, interval=0.02)\n"
     )
+}
+
+/// Whether keystrokes can produce this text at all.
+///
+/// ASCII, printable, and short. The length bound keeps a pasted paragraph on
+/// the clipboard path, where it costs one round trip instead of one keypress
+/// per character.
+fn types_as_keystrokes(text: &str) -> bool {
+    text.chars().count() <= 64
+        && !text.is_empty()
+        && text.chars().all(|c| c.is_ascii_graphic() || c == ' ')
 }
 
 fn keys_code(keys: &[String]) -> Result<String> {
@@ -1157,11 +1183,25 @@ mod tests {
     }
 
     #[test]
-    fn typing_goes_through_the_clipboard_with_a_typed_fallback() {
+    fn short_ascii_is_typed_because_a_segmented_field_ignores_a_paste() {
+        // Measured in the bench image: `input[type=date]`'s month/day/year
+        // segments take digits key by key and drop `ctrl+v` without raising,
+        // so a clipboard-first snippet lost the text and reported success.
+        let code = type_code("01");
+        assert!(code.contains("pyautogui.write(\"01\""), "{code}");
+        assert!(!code.contains("ctrl"), "no paste for a segmented field: {code}");
+    }
+
+    #[test]
+    fn text_keystrokes_cannot_produce_still_goes_through_the_clipboard() {
         let code = type_code("名字 \"quoted\"\nline");
         assert!(code.contains("pyperclip.copy(\"名字 \\\"quoted\\\"\\nline\")"), "{code}");
         assert!(code.contains("pyautogui.hotkey('ctrl', 'v')"), "{code}");
         assert!(code.contains("pyautogui.write("), "{code}");
+
+        // A long single-line paste is one round trip, not 200 keypresses.
+        let long = "a".repeat(200);
+        assert!(type_code(&long).contains("ctrl"), "a paragraph belongs on the clipboard");
     }
 
     #[test]
