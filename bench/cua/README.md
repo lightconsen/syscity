@@ -87,10 +87,13 @@ that separates it from 0.910 is `right-click-menu v2`, which was an
 infrastructure error in that run and so was never scored.) That is not a claim
 the fix is worth 1.4 points. `fill-form v0` alternated 0, 1, 0, 1 across the
 last four runs and `typing-input v4` had already passed in the 0.912 run, so
-both were within the range each cell showed before the fix. What the fix *does*
+both were within the range each cell showed before the fix. A three-round
+controlled A/B against a pre-fix copy of the glue (`typing-input v4` 2/3 → 3/3,
+`fill-form v0` 3/3 → 3/3, p = 1.0) puts the same bound on it. What the fix *does*
 change is that a correct `type` now reports as verified instead of falling
 through to a pixel diff that cannot see a 43-character edit, which is what
-stopped the model retyping on top of text that already landed (see "A webview
+stopped the model retyping on top of text that already landed — the same A/B
+measures 0/6 → 5/6 turns with the value in the tree, p = 0.015 (see "A webview
 text field's value was never in the tree", below). The honest statement is that
 the score has been **0.91–0.93 across three consecutive runs**, with a reachable
 ceiling that is now 1.000 because the only task this environment excludes is
@@ -300,11 +303,49 @@ paragraph would become an editable field — and `password text`, because there
 log and the trace. A date input reports no value either before or after the
 change, so the `date-picker` path is untouched.
 
-Verified by re-running both variants against the same image: `typing-input v4`
-reward 1 (47s) and `fill-form v0` reward 1 (250s), with the tree now carrying
-`text_field "Text input field" = "The quick brown fox jumps over the lazy dog"`.
 `fill-form v0`'s Age field had the same cause: `25` landed first time and the
 "double registration" was three retypes of text that was already right.
+
+A single re-run per arm already showed reward 1, and the `typing-input` one
+showed the value in the tree, but that is one observation either way. The
+controlled version is twelve runs: three rounds, each round running both
+variants against the fixed tree and then both against a pre-fix copy of
+`bench/cua/` (every file identical except `atspi_xml.py` at the commit before
+the fix), interleaved so any drift in the model, the image or the host hits both
+arms.
+
+| | `typing-input v4` | `fill-form v0` |
+|---|---|---|
+| pre-fix | 1, 1, **0** (74s, 57s, 184s) | 1, 1, 1 (120s, 148s, 128s) |
+| fixed | 1, 1, 1 (35s, 80s, 31s) | 1, 1, 1 (103s, 166s, 99s) |
+
+**On reward this is nothing.** 5/6 against 6/6, Fisher exact p = 1.0. Both cells
+were known to flip before the fix and three samples per arm cannot move a
+two-in-three cell. Do not quote this table as a score gain.
+
+**The mechanism is where the measurement lands**, and there the split is clean:
+
+| | pre-fix | fixed | p |
+|---|---|---|---|
+| turns whose tree carried the typed value (`typing-input`) | 0/3 | 3/3 | 0.10 |
+| turns whose tree carried the typed value (`fill-form`) | 0/3 | 2/3 | 0.40 |
+| both tasks together | **0/6** | **5/6** | **0.015** |
+| `type` steps whose effect verified as `confirmed` | 9/22 (41%) | 14/17 (82%) | 0.020 |
+
+The value shows up in both read paths — the `ui_tree` section of a
+`screen_state` call as well as a `computer` `read_ui_tree` — which is why
+`fill-form` carries it in two turns out of three and not all three: one turn
+never asked for the tree at all.
+
+The retype loop reproduces on one side only. The pre-fix `typing-input v4` that
+failed took 184s and 18 calls: `type` reported `suspected_noop`, then `ctrl+a`,
+`ctrl+c`, `clipboard_get`, a click on a stale element id, `shift+Home`,
+`BackSpace`, another `type`, `ctrl+c` again. The three fixed runs took **3, 6 and
+2** calls (pre-fix: 8, 5, 18), mean 105s → 49s. That is the same failure the
+0.910 run showed, now with a control beside it.
+
+Run directories: `ab-data/prefix-r{1,2,3}` and `ab-data/fix-r{1,2,3}` under the
+job tmp tree; each holds one `result.json` per variant.
 
 ### A repeated action is not a repeated call
 
