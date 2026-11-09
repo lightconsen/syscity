@@ -13,6 +13,27 @@ MAX_DEPTH = 60
 
 SKIP_ROLES = {"redundant object"}
 
+#: Roles whose text is behind `queryText` rather than `queryValue`.
+#:
+#: WebKitGTK's `entry` — what every `input` and `textarea` in a pywebview task
+#: window exposes — raises `NotImplementedError` from `queryValue()` while
+#: `queryText()` returns the real content. Asking only `queryValue` therefore
+#: published no value for any webview text field, and the typing verifier had
+#: nothing to compare: `typed_value_hint` needs an editable field whose value
+#: moved, so it returned None and verification fell through to the pixel diff,
+#: where 43 characters landing in one field is 0.0% of the screen.
+#:
+#: Deliberately not every role: AT-SPI's `text` role (static document text) is
+#: mapped to `text_field` by the reader, so giving it a value would turn every
+#: paragraph into an editable field and make the field counts disagree between
+#: the before and after trees. Only controls the user types into.
+#:
+#: `password text` is excluded on purpose. It raises from `queryValue` the same
+#: way, but `queryText` there answers with the plaintext — publishing it would
+#: put a credential into the turn log and the trace. A masked field already
+#: falls back to the pixel diff, which is the right answer for it.
+TEXT_VALUE_ROLES = {"entry", "text field"}
+
 #: Roles a closed `<select>` puts its options under, where every option reports
 #: the combo box's own box. See [`real_option_boxes`].
 POPUP_ROLES = {"combo box"}
@@ -100,11 +121,23 @@ def _states(accessible, pyatspi):
     return " ".join(names)
 
 
-def _value(accessible):
+def _value(accessible, role=None):
+    """The value attribute: `queryValue`, falling back to `queryText`.
+
+    The fallback is for WebKitGTK entries, where `queryValue` is not
+    implemented at all — see [`TEXT_VALUE_ROLES`]. A node that answers neither
+    publishes no value, which is the honest answer: "not readable" is not "".
+    """
     try:
         value = _text(accessible.queryValue().currentValue)
     except Exception:
-        return None
+        value = None
+    if value is None and role in TEXT_VALUE_ROLES:
+        try:
+            text = accessible.queryText()
+            value = _text(text.getText(0, text.characterCount))
+        except Exception:
+            return None
     return value
 
 
@@ -216,7 +249,7 @@ def build(accessible, pyatspi, depth, counter, parent, real_boxes=None):
         node = ET.SubElement(parent, "node")
         role = accessible.getRoleName() or "unknown"
         name = _text(accessible.name)
-        value = _value(accessible)
+        value = _value(accessible, role)
         if value is not None and value == name:
             value = None
         node.set("role", role)

@@ -124,6 +124,11 @@ import atspi_xml  # noqa: E402
 
 CHECK_YES = "import pyautogui\npyautogui.click(1, 2, button='left')\n"
 
+#: Sentinel for an AT-SPI accessor that is not implemented on a node —
+#: WebKitGTK raises NotImplementedError from `queryValue()`, which is a
+#: different thing from a node that answers with None.
+_MISSING = object()
+
 FAKE_SYSCITY = """#!/usr/bin/env python3
 import json, sys
 
@@ -980,6 +985,85 @@ class OptionBoxTest(unittest.TestCase):
         ]
         boxes = atspi_xml.real_option_boxes(nodes)
         self.assertEqual(boxes["Pear"], (310, 440, 80, 20))
+
+
+class TextValueTest(unittest.TestCase):
+    """A webview text field's value comes from `queryText`, not `queryValue`.
+
+    WebKitGTK's `entry` raises `NotImplementedError` from `queryValue()` and
+    answers `queryText()` with the real content. Asking only `queryValue`
+    published no value for any pywebview text field, so `typed_value_hint` in
+    the session had nothing to compare and every `type` fell through to the
+    pixel diff — where 43 characters in one field measure 0.0% changed. That is
+    the "typing did not land cleanly" class: `typing-input` v4 and `fill-form`
+    v0 both reported `suspected_noop` for typing that had in fact arrived, and
+    the model then retyped on top of text that was already there.
+    """
+
+    class _Value:
+        def __init__(self, current):
+            self.currentValue = current
+
+    class _Text:
+        def __init__(self, text):
+            self._text = text
+            self.characterCount = len(text)
+
+        def getText(self, start, end):  # noqa: N802 - pyatspi's name
+            return self._text[start:end]
+
+    def _accessible(self, *, value=None, text=None):
+        class Accessible:
+            def queryValue(self):  # noqa: N802 - pyatspi's name
+                if value is _MISSING:
+                    raise NotImplementedError
+                return TextValueTest._Value(value)
+
+            def queryText(self):  # noqa: N802 - pyatspi's name
+                if text is _MISSING:
+                    raise NotImplementedError
+                return TextValueTest._Text(text)
+
+        return Accessible()
+
+    def test_a_webkit_entry_reports_its_text(self):
+        accessible = self._accessible(value=_MISSING, text="The quick brown fox")
+        self.assertEqual(
+            atspi_xml._value(accessible, "entry"), "The quick brown fox"
+        )
+
+    def test_a_native_value_still_wins(self):
+        # Where the platform does implement queryValue (GTK's own widgets),
+        # nothing changes: the fallback never runs.
+        accessible = self._accessible(value="0.5", text=_MISSING)
+        self.assertEqual(atspi_xml._value(accessible, "entry"), "0.5")
+
+    def test_an_unreadable_node_publishes_no_value(self):
+        # "Not readable" is not "": a diff of two empty strings would claim the
+        # field changed when nothing was read at all.
+        accessible = self._accessible(value=_MISSING, text=_MISSING)
+        self.assertIsNone(atspi_xml._value(accessible, "entry"))
+
+    def test_roles_that_are_not_typed_into_are_left_alone(self):
+        # AT-SPI's static `text` role is mapped to `text_field` by the reader.
+        # Giving it a value would make every paragraph look editable and break
+        # the field-for-field comparison `typed_value_hint` depends on.
+        accessible = self._accessible(value=_MISSING, text="Some paragraph")
+        self.assertIsNone(atspi_xml._value(accessible, "text"))
+
+    def test_a_password_field_is_never_read_back(self):
+        # `queryText` answers with the plaintext on a WebKitGTK password
+        # entry. Publishing it would put a credential into the turn log and
+        # the trace — the field is masked, and the pixel diff is the answer.
+        accessible = self._accessible(value=_MISSING, text="hunter2")
+        self.assertIsNone(atspi_xml._value(accessible, "password text"))
+
+    def test_an_empty_field_is_indistinguishable_from_no_value(self):
+        # Documented consequence, not a bug being blessed: `_text` trims to
+        # None, so a field that was emptied publishes nothing. A cleared field
+        # is a pixel-visible change anyway, so the diff still sees it.
+        accessible = self._accessible(value=_MISSING, text="")
+        self.assertIsNone(atspi_xml._value(accessible, "entry"))
 
 
 class OffscreenBoxTest(unittest.TestCase):

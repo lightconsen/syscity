@@ -441,8 +441,8 @@ token）。探针把这段等待换成 3 秒，并且**先跑再开任务**是 M
 
 | | 数 | 说明 |
 |---|---|---|
-| 原始分 | **62/68 = 0.912**（九次全量区间 0.72–0.91，最近两次 0.910 / 0.912） | `summary.json` 的 `avg_reward`，**报分用这个** |
-| 可达分 | **62/63 = 0.984** | 剔除 `drag-drop` 后的模型分；见 `bench/cua/ceiling.json` |
+| 原始分 | **63/68 = 0.926**（九次全量区间 0.72–0.93，最近三次 0.910 / 0.912 / 0.926） | `summary.json` 的 `avg_reward`，**报分用这个** |
+| 可达分 | **63/63 = 1.000** | 剔除 `drag-drop` 后的模型分；见 `bench/cua/ceiling.json` |
 | 环境上限 | 1 个任务（5 variant） | 只有 `drag-drop`，且有机制层面的证据 |
 
 ```bash
@@ -465,13 +465,22 @@ python3 bench/cua/score.py <run-dir>     # 两个数并列输出
 逐工具决定，默认 `true` 保住纯读的循环保护，`computer` / `screen_state` 显式设
 `false`。见 `bench/cua/README.md` 的 "A repeated action is not a repeated call"。
 
-**最近两轮（`--max-steps 25`、同一二进制）稳定在 0.910 / 0.912。** 两轮在都计分的 67 个
+**最近三轮（`--max-steps 25`、同一二进制）是 0.910 / 0.912 / 0.926。** 前两轮在都计分的 67 个
 variant 上只差两格（`fill-form v0` 一过一不过、`typing-input v4` 反过来），刚好抵消；
-第二轮看着高 0.002，是因为第一轮的 `right-click-menu v2` 撞上了一次基础设施错误
+0.912 看着高 0.002，是因为 0.910 那轮的 `right-click-menu v2` 撞上了一次基础设施错误
 （completion stream 中途断开），根本没进分母。从 0.838 到 0.91，变了 5 格、全往上：
 `toggle-switch` 的四个变体回来、`typing-input v2` 补上。前者就是下一节说的"页面没加载
-样式"那轮环境样本恢复了，不是模型变强。所以要说的是"连续两轮 0.91、可达上限 0.984"，
-而不是把 0.838 当成基线。
+样式"那轮环境样本恢复了，不是模型变强。
+
+第三轮（0.926）是 webview 取值修复之后跑的，除 `drag-drop` 外全部通过，原始分和可达分
+第一次同为 63/63。**这并不说明那个修复值 1.4 分**：相对 0.912 那一轮，计分的格子里只差
+一格（`fill-form v0` 回来）；相对 0.910 那一轮也只差一格（`typing-input v4` 回来，正是
+修复针对的那格——0.910 那轮的 `right-click-menu v2` 撞上基础设施错误没计分，不能算进
+差异）。而 `fill-form v0` 最近四轮是 0、1、0、1 交替，`typing-input v4` 在 0.912 那轮
+本来就过了——两格都在修复前各自的历史范围内。修复真正改变的是"打对了字，这次 report 成
+已验证"，不再掉进看不见 43 字符改动的像素比对里，因此模型不会在已经落地的文本上重打一遍
+（见下文那一节）。所以要说的是"连续三轮 0.91–0.93、可达上限 1.000（唯一剔除项就是
+`drag-drop`）"，而不是把 0.838 当成基线。
 
 **先前给出的 0.927 作废。** 那是按"整题扣除 `date-picker`/`fill-form`/`drag-drop`"
 算的，两处都错：
@@ -546,25 +555,47 @@ video-player v5     1 -> 0        fill-form         v2 0 -> 1
 |---|---|---|
 | `drag-drop`（5/5） | **环境**：合成拖拽不可达 | 见上 |
 | `video-player` 的音量变体 | 模型用错层 | 要求音量 75%，它开终端跑 `pactl set-sink-volume`，而评测看的是页内播放器，不是 ALSA mixer |
-| `fill-form` / `spreadsheet-cell` 的漏 | 点错位置 | 点偏一格/一个字段，然后报告完成。最近两轮的漏是另一类，见下 |
+| `fill-form` / `spreadsheet-cell` 的漏（点错位置那类） | 点错位置 | 点偏一格/一个字段，然后报告完成。`fill-form` v0 最近两次的漏是另一类（webview 取值），见下 |
 | `click-button` v5/v6 | **胶水 bug（已修）** | 见下 |
 | `select-dropdown` v1 | **胶水 bug（已修，重跑得 1）** | 见下 |
 | `date-picker` 全部五个 | **agent 循环 bug（已修，5/5）** | 见下 |
 | `toggle-switch`（5 个里 4 个） | **环境：页面没加载样式** | 见下 |
-| `fill-form` v0 / `typing-input` v4 的漏 | **未定**：两处都报"按键没干净落地"，还没查出是 shim 还是页面 | 见下 |
+| `fill-form` v0 / `typing-input` v4 的漏 | **胶水 bug（已修）：webview 文本框的值从来没进过树** | 见下 |
 
-除这三个胶水 bug 和一个 agent 循环 bug 之外，这些都不是胶水的锅：是模型提前停止、
+除**四个**胶水 bug 和一个 agent 循环 bug 之外，这些都不是胶水的锅：是模型提前停止、
 点偏格子、或者用错了一层去解题——真实的模型结果，也正是原始分该拿来报的原因。
 
-有一类**故意不归因**。`typing-input v4`（0.912 那轮）和 `fill-form v0`（0.910 那轮）
-都是 `MAX_STEPS_EXCEEDED`、reward 0，而且都从里面报了同一件事——按键没有干净落地：
-`typing-input v4` 说这个输入框"每次 `type` 吞掉第一个按键"，于是 `The quick…` 变成了
-`he quick…`，而它的修正尝试（`ctrl+a`、`Home`、`Delete`）全被报成没有变化；
-`fill-form v0` 说 Age 字段反复重复写入（`25252252525`，然后 `225`，最后 `25`），
-按键延迟到把预算烧完。两处都在 `type` 改走 `pyautogui.write`（正是让 date-picker 可达
-的那次改动）的下游，所以真正的问题可能是：按键路径让长字符串打进普通文本框变差了。
-注意两边都不是稳定失败——`typing-input v4` 三次里过两次、`fill-form v0` 三次里过一次
-——所以这是线索，不是结论。查清之前，两边账都不记。
+`typing-input v4`（0.910 那轮）和 `fill-form v0`（0.912 那轮）都是
+`MAX_STEPS_EXCEEDED`、reward 0，从里面都报了"按键没干净落地"，一开始记成未定。
+实测之后结论是**胶水 bug**，不是 shim、不是页面、也不是模型。
+
+在 `bench-web` 容器里用任务自己的 pywebview 窗口复现：同样的 `pyautogui_shim.write`
+连跑六次，43 个字符每次都完整落进 DOM；`fill-form` 四个字段同样都落对了。
+没落地的是**读回来的那一半**：
+
+- `atspi_xml.py::_value` 只问 `queryValue()`。WebKitGTK 的 `entry`（任务窗口里每个
+  `input`/`textarea` 都是它）在这个方法上直接抛 `NotImplementedError`，真值是
+  `queryText()` 才答。于是 webview 文本框在树里**没有任何 value**。
+- 这直接关掉了 `type` 验证的树那一路：`typed_value_hint` 要在一个值变过的可编辑字段上
+  比对文本，字段全是 `None` 时它返回 `None`，验证退回像素 diff。
+- 像素 diff 看不见往短文本框里打字。用真帧量过：43 个字符打进 352×42 的框，按验证器
+  的 32×32 块、阈值 30 算是 **0.0%**；清空它（`Delete`）才是 0.9%——失败那轮里唯一
+  验证通过的一步，正是把字删掉的那一步。
+
+所以文字早就进去了、屏幕没报出来、模型被告知"no visible change detected"，于是它压在
+已有文本上重打：探针里 type 再 retype 正好得到 43+43 个字符，`ctrl+a` 也确实全选，
+但一个报"无变化"的 `Home` 会诱出一个只删一个字符的 `Delete`。`#The quick…` 里的 `#`
+是模型自己为了排查打的，不是重复按键。
+
+修法是 `atspi_xml.py` 里一处回退：`entry` 和 `text field` 在 `queryValue()` 不可用时
+改问 `queryText()`。有两个角色故意排除：静态 `text`（读取器会把它映射成 `text_field`，
+给了值每个段落都会变成可编辑字段）和 `password text`（那里 `queryText` 返回明文，会把
+凭据写进 turn 日志和轨迹）。date 输入框改前改后都不报值，`date-picker` 路径不受影响。
+
+同一镜像重跑验证：`typing-input v4` reward 1（47s）、`fill-form v0` reward 1（250s），
+树里已有 `text_field "Text input field" = "The quick brown fox jumps over the lazy dog"`。
+`fill-form v0` 的 Age 字段同理：`25` 第一次就对了，所谓"重复写入"是对着已经正确的内容
+又重打了三次。
 
 `date-picker` 不能说成"环境不可达"：oracle 五个 variant 全 0，是因为 `solve_task` 往
 `input[type=date]` 键入，WebKitGTK 不认；而模型现在**五个全过**。环境和任务都是好的，

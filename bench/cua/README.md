@@ -40,18 +40,18 @@ python3 bench/cua/score.py <run-dir> --json   # machine
 | **reachable** | accuracy over the variants this environment can actually solve | the model, with the environment's own limits removed |
 
 They are not interchangeable and neither may be presented as the other. On this
-host (container-only, `runc`, darwin/arm64) the latest two full runs are **0.910
-and 0.912 raw, 0.984 reachable both times** (`61/67` and `62/68` raw, `61/62` and
-`62/63` reachable — the first run has one errored variant, so 67 scored). The
-seven-point gap between raw and reachable is almost entirely `drag-drop`, the one
-task this environment cannot reach. On an environment where more of the suite is
-broken the gap would be larger, and a raw number alone would read as model
-weakness.
+host (container-only, `runc`, darwin/arm64) the latest full run is **0.926 raw,
+1.000 reachable** (`63/68` and `63/63`); the two before it were 0.910 and 0.912
+raw (0.984 reachable both times). The gap between raw and reachable is entirely
+`drag-drop`, the one task this environment cannot reach. On an environment where
+more of the suite is broken the gap would be larger, and a raw number alone would
+read as model weakness.
 
 ### Run to run, this number moves more than it looks
 
 Nine full 68-variant runs scored **0.794, 0.794, 0.735, 0.721, 0.750, 0.809,
-0.838, 0.910 and 0.912** — a spread of nineteen points, and not one population.
+0.838, 0.910 and 0.912**, and a tenth **0.926** — a spread of twenty points, and
+not one population.
 The first four differ from each other only by sampling, because nothing changed
 between them. Across those four, compared cell by cell, only **48 of the 65
 cells that completed in every run gave the same answer every time**; 17 flipped
@@ -65,21 +65,36 @@ two runs as a pair, not a claim that the fix is worth seven points; re-running
 the specific variants is the only way to tell the two apart, which is what the
 next paragraph says.
 
-The last three are a different regime, and only the last two are comparable to
-each other. The 0.838 run was the first after the duplicate-call guard, and it
-is where `date-picker` went **0/5 → 5/5** — a fix to the agent loop, not to the
-bench glue (see "A repeated action is not a repeated call", below). The 0.910
-and 0.912 runs came after the screen-reporting fix. On the 67 variants scored in
-both, they differ on two cells and cancel out — `fill-form v0` passed in the
-first and not the second, `typing-input v4` the other way round — so the two
-runs land on the same **61/67**; the second only looks higher because the
-first's `right-click-menu v2` was an infrastructure error (the completion
-stream dropped) and so was never scored. Against 0.838, five cells moved and all
-five moved up: four `toggle-switch` variants coming back, plus `typing-input v2`.
-The toggle half is the unstyled-page sample described below — an environment
-recovery, not a gain. The honest statement is that the score has been **0.91
-across two consecutive runs**, with a reachable ceiling of 0.984, and that 0.838
-is not the number to compare this against without saying why.
+The last four are a different regime. The 0.838 run was the first after the
+duplicate-call guard, and it is where `date-picker` went **0/5 → 5/5** — a fix to
+the agent loop, not to the bench glue (see "A repeated action is not a repeated
+call", below). The 0.910 and 0.912 runs came after the screen-reporting fix. On
+the 67 variants scored in both, they differ on two cells and cancel out —
+`fill-form v0` passed in the first and not the second, `typing-input v4` the
+other way round — so the two runs land on the same **61/67**; the second only
+looks higher because the first's `right-click-menu v2` was an infrastructure
+error (the completion stream dropped) and so was never scored. Against 0.838,
+five cells moved and all five moved up: four `toggle-switch` variants coming
+back, plus `typing-input v2`. The toggle half is the unstyled-page sample
+described below — an environment recovery, not a gain.
+
+The 0.926 run is the one after the webview-value fix, and it is the cleanest
+reading of the model so far: every variant outside `drag-drop` passed, so raw
+and reachable coincide at 63/63. Against the 0.912 run it differs in exactly one
+cell — `fill-form v0`, back up — and against the 0.910 run in exactly one scored
+cell: `typing-input v4`, which is the one the fix was aimed at. (The other cell
+that separates it from 0.910 is `right-click-menu v2`, which was an
+infrastructure error in that run and so was never scored.) That is not a claim
+the fix is worth 1.4 points. `fill-form v0` alternated 0, 1, 0, 1 across the
+last four runs and `typing-input v4` had already passed in the 0.912 run, so
+both were within the range each cell showed before the fix. What the fix *does*
+change is that a correct `type` now reports as verified instead of falling
+through to a pixel diff that cannot see a 43-character edit, which is what
+stopped the model retyping on top of text that already landed (see "A webview
+text field's value was never in the tree", below). The honest statement is that
+the score has been **0.91–0.93 across three consecutive runs**, with a reachable
+ceiling that is now 1.000 because the only task this environment excludes is
+`drag-drop`.
 
 So a single run cannot settle a four-point question. When judging whether a
 change helped, re-run the specific variants it was meant to fix — several times
@@ -154,8 +169,12 @@ and `video-player v2` (oracle 0, model 1 in the first) are the same story. A
 rule keyed on "oracle == 0" alone would have called all three an environment
 limit and quietly raised the score; an earlier version of this file did exactly
 that and reported an inflated **0.927**. The figure with the guards in place is
-**0.912 raw / 0.984 reachable** on the latest full run; the four runs before the
-settle fix ranged 0.721–0.794 — see the variance section above.
+**0.926 raw / 1.000 reachable** on the latest full run — close to that inflated
+number by coincidence, not by construction: raw is 0.926 because five
+`drag-drop` variants failed and everything else passed, and reachable is 1.000
+because `drag-drop` is the only exclusion and the model is 63/63 on the rest.
+The four runs before the settle fix ranged 0.721–0.794 — see the variance
+section above.
 
 ### Two runs at the same score still disagreed on ten cells
 
@@ -229,26 +248,63 @@ roster:
 | `select-dropdown` v1 | **glue bug — fixed, rewards 1 on re-run** | see below |
 | `date-picker`, every variant | **agent-loop bug — fixed, 5/5** | see below |
 | `toggle-switch` (4 of 5) | **environment, not the model** | the page rendered its content but no styling — see below |
-| `typing-input v4`, `fill-form v0` misses | **undiagnosed — typing did not land cleanly** | see below |
+| `typing-input v4`, `fill-form v0` misses | **glue bug — fixed, both reward 1 on re-run** | see below |
 
-Apart from the three fixed glue bugs and the one agent-loop bug, none of these is
-the glue's fault. The rest is the model stopping early, aiming at the wrong
+None of the fixed glue bugs, nor the agent-loop bug, is the model's fault or the
+environment's. The rest is the model stopping early, aiming at the wrong
 cell, or solving the task in the wrong layer — genuine model results, and the
 reason the raw number is the one to quote.
 
-The undiagnosed pair is the one class deliberately given no side. Both are
-`MAX_STEPS_EXCEEDED` with reward 0, and both say the same thing from inside: the
-keystrokes did not land cleanly. `typing-input v4` reported that the field
-"drops the first keystroke of every `type` action", so `The quick…` became
-`he quick…`, and that its correction attempts (`ctrl+a`, `Home`, `Delete`) all
-declared no change. `fill-form v0` reported the Age field double-registering
-(`25252252525`, then `225`, finally `25`) with keystrokes arriving late enough to
-burn the budget. Both sit downstream of `type` moving to `pyautogui.write`
-instead of the clipboard — the change that made `date-picker` reachable — so the
-open question is whether keystrokes also made long strings into a plain text
-field worse. Neither is a hard failure — `typing-input v4` passes two runs in
-three and `fill-form v0` one in three — so this is a lead, not a diagnosis.
-Until it is measured, count it as neither a glue bug nor a model failure.
+### A webview text field's value was never in the tree
+
+This is the one class that took a measurement to settle rather than a
+trajectory read. Both `typing-input v4` and `fill-form v0` reported, from
+inside the run, that typing had not landed: `typing-input`'s agent said the
+field "drops the first keystroke of every `type` action", and `fill-form`'s said
+the Age field double-registered (`25252252525`, then `225`, finally `25`). Both
+were `MAX_STEPS_EXCEEDED` with reward 0, and both sat downstream of `type`
+moving to `pyautogui.write`, which made it a plausible regression.
+
+It is not. Reproduced in a `bench-web` container with the task's own pywebview
+window, `pyautogui.write` delivered all 43 characters on every one of six
+attempts, and `pyautogui_shim` never dropped a keystroke. What went wrong was
+the read on the way back:
+
+* `atspi_xml.py::_value` asked every node only `queryValue()`. WebKitGTK's
+  `entry` — what every `input` and `textarea` in a task window exposes — raises
+  `NotImplementedError` there, while `queryText()` answers with the real
+  content. So a webview text field published **no value at all**.
+* That silently disabled the tree half of typing verification.
+  `typed_value_hint` needs an editable field whose value moved to compare
+  against the text; with every field reading `None`, it returned `None` and
+  `verify` fell through to the pixel diff.
+* The pixel diff cannot see typing into a short field. Measured on the real
+  frames: 43 characters landing in the 352x42 input changed 0.0% of the screen
+  at the verifier's 32x32-block threshold of 30, and clearing it with `Delete`
+  changed 0.9% — the one step that verified in the failed run was the one that
+  emptied the field.
+
+So the typing landed, the screen did not report it, and the model was told
+"no visible change detected". It then retyped on top of text that was already
+there: in a probe of the same sequence, type-then-retype produced exactly the
+43+43 characters the agent saw, and `ctrl+a` did select everything, but a
+`Home` that reports no change invites a `Delete` that removes one character.
+The `#` in `#The quick…` was the model's own diagnostic prefix, typed on
+purpose.
+
+The fix is one fallback in `atspi_xml.py`: roles `entry` and `text field` ask
+`queryText()` when `queryValue()` is not implemented. Two roles are excluded
+on purpose — static `text`, because the reader maps it to `text_field` and every
+paragraph would become an editable field — and `password text`, because there
+`queryText` returns the plaintext, which would write a credential into the turn
+log and the trace. A date input reports no value either before or after the
+change, so the `date-picker` path is untouched.
+
+Verified by re-running both variants against the same image: `typing-input v4`
+reward 1 (47s) and `fill-form v0` reward 1 (250s), with the tree now carrying
+`text_field "Text input field" = "The quick brown fox jumps over the lazy dog"`.
+`fill-form v0`'s Age field had the same cause: `25` landed first time and the
+"double registration" was three retypes of text that was already right.
 
 ### A repeated action is not a repeated call
 

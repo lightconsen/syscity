@@ -155,7 +155,9 @@ Six full runs at the same settings scored 0.794, 0.794, 0.735, 0.721, 0.750 and
 0.809, and two of those back-to-back 0.794s agreed on only 58 of 68 variants. A
 seventh, after the duplicate-call fix, scored 0.838; the two after the
 screen-reporting fix scored **0.910 and 0.912** (0.984 reachable both times),
-differing on two of the 67 variants scored in both. Treat a single run's failure
+differing on two of the 67 variants scored in both; the one after the
+webview-value fix scored **0.926** (1.000 reachable), the first run in which
+every variant outside `drag-drop` passed. Treat a single run's failure
 list as a sample, not a verdict, and judge a fix by re-running the variants it
 targets rather than by comparing two totals. See [`cua/README.md`](cua/README.md).
 
