@@ -4,6 +4,8 @@
 > 步进协议都已写完并过了单测，**还没在真 VM 上跑过**；M4、M5 是计划。
 > 最后更新：2026-10-29
 > 相关文档：[`benchmark.md`](benchmark.md)（GAIA/BFCL 的接入方法与本仓库的基准口径）、
+> [`computer-use-benchmark-catalog.md`](computer-use-benchmark-catalog.md)（有哪些基准、
+> 哪些本机能跑、`/dev/uinput` 这条硬约束）、
 > [`modules/computer.md`](modules/computer.md)（动作阶梯、五种效果、后台投递）、
 > [`eval-status.md`](eval-status.md)（评测方法论）。
 

@@ -27,6 +27,14 @@ cb run dataset cua-bench-basic@1.0 \
 `PYTHONPATH=$PWD` is not optional — `cb` imports the agent by dotted path but
 does not put the working directory on `sys.path`.
 
+`cua-bench-basic@1.0` is not the only dataset this glue can drive. `cb dataset
+list` (v0.3.1) also has `cua-bench-kicad@1.0` (25 KiCad tasks, one variant each)
+and `cua-bench-workflows@1.0` (52 variants: OpenShot and Unity). The same command
+works, verbatim, with the name swapped — but neither has ever been run, and they
+use `ghcr.io/trycua/linux:24.04` rather than `bench-web`, so nothing below is
+known to hold on them. See
+[`docs/computer-use-benchmark-catalog.md`](../../docs/computer-use-benchmark-catalog.md).
+
 ## The two scores
 
 ```bash
