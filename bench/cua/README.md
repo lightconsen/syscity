@@ -30,10 +30,43 @@ does not put the working directory on `sys.path`.
 `cua-bench-basic@1.0` is not the only dataset this glue can drive. `cb dataset
 list` (v0.3.1) also has `cua-bench-kicad@1.0` (25 KiCad tasks, one variant each)
 and `cua-bench-workflows@1.0` (52 variants: OpenShot and Unity). The same command
-works, verbatim, with the name swapped — but neither has ever been run, and they
-use `ghcr.io/trycua/linux:24.04` rather than `bench-web`, so nothing below is
-known to hold on them. See
-[`docs/computer-use-benchmark-catalog.md`](../../docs/computer-use-benchmark-catalog.md).
+works, verbatim, with the name swapped; both were run on 2026-11-10 and the
+results are worth knowing before you spend an afternoon on them.
+
+**OpenShot is the useful one.** It is a native Qt5/PyQt5 application
+(`openshot-qt 3.1.1`, `libqt5core5t64 5.15.13`) rather than the `bench-web`
+pywebview window, so it is the first evidence that `atspi_xml.py` and
+`pyautogui_shim.py` hold on a non-WebKit desktop. `create_project` (v0) scored
+**1.0** at `--max-steps 25` on 2 of 3 runs (a third returned 0.0 with the model
+believing it had saved), so treat it as a sporadic pass, not a stable one. The
+`add_title` variants do not pass, and the reason is inside syscity, not in the
+benchmark: OpenShot's accessibility subtree includes an off-screen `Emojis`
+toolbar at `(-725,-600)` holding 119 `listitem`s, and the default
+`max_tree_lines=100` spends its whole budget there — every outline read during
+an `add_title` run ended in `… (tree truncated)` with no `timeline` or `track`
+node at all. See `src/tools/screen_state.rs:502`.
+
+**kicad does not work on arm64, for an environmental reason.** The task installs
+`ppa:kicad/kicad-9.0-releases`, whose `noble` index has no `kicad` package for
+arm64 (2974-byte `Packages.gz`, zero matches; amd64 has one, 5575 bytes). apt
+falls back to Ubuntu's `7.0.11+dfsg-1build4`, which cannot open the dataset's
+10 starter schematics — they are stamped `(version 20250114)`, and
+`kicad-cli sch export netlist` on them exits 3 with `Failed to load schematic
+file`. The other 15 tasks start from an empty directory. All 6 agent runs —
+on 4 tasks, at 25 and 45 steps — scored 0; the oracle's 1.0 is meaningless because
+`solve_task` writes `reference.net` straight to the output path without touching
+KiCad.
+
+**Unity can never score here.** `session.apps.unity.install()` pipes a key
+download through `wget`, which this image does not have (it has `curl`), so
+setup "completes" in ~2 s having installed nothing and leaves a desktop shortcut
+pointing at a missing `/opt/unityhub/unityhub`. Even if it installed,
+`unity-tasks/main.py` grades with Windows `cmd` syntax (`%USERPROFILE%`,
+`if exist … (echo FOUND) else …`, `findstr`) in 11 places, which is a bash
+syntax error on Linux.
+
+See [`docs/computer-use-benchmark-catalog.md`](../../docs/computer-use-benchmark-catalog.md)
+for the per-variant numbers and how each fact was measured.
 
 ## The two scores
 

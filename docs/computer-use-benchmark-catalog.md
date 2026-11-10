@@ -1,7 +1,7 @@
-# Computer Use 基准清单：已跑的、零成本能跑的、接不了的
+# Computer Use 基准清单：已跑的、试跑过的、接不了的
 
-> 状态：盘点完成（2026-11-10）。本文只记录**事实与成本**，不重新论证接入方式。
-> 接入方法见 [`computer-use-benchmark.md`](computer-use-benchmark.md)；评测口径见
+> 状态：盘点完成（2026-11-10），三个数据集都已跑过。本文只记录**事实与成本**，不重新论证
+> 接入方式。接入方法见 [`computer-use-benchmark.md`](computer-use-benchmark.md)；评测口径见
 > [`eval-status.md`](eval-status.md)。
 > 最后更新：2026-11-10
 
@@ -15,11 +15,13 @@
 |---|---|---|
 | **已接并出分** | 胶水在 `bench/` 里，跑过真环境，有可引用的分数 | Cua Bench `basic` |
 | **接好但没跑** | 胶水写完、单测过，缺环境 | OSWorld(-Verified) |
-| **零胶水可跑** | 同一个 `cb` 命令、同一份 `bench/cua/` 就能跑，但从没跑过 | `cua-bench-kicad`、`cua-bench-workflows` |
+| **零胶水、已试跑** | 同一个 `cb` 命令、同一份 `bench/cua/` 就能跑；跑了，分数分两部分看 | `cua-bench-kicad`（4 个 task 全 0）、`cua-bench-workflows`（OpenShot 最高 1.0，Unity 恒 0） |
 | **未接** | 需要新环境或新胶水 | WAA、AndroidWorld、WebArena 系、WorkArena、macOSWorld 等 |
 
-中间两档的区别容易被含混过去：OSWorld 是**代码就绪、环境缺**，kicad/workflows
-是**环境就绪、代码未经检验**。两者都不是"没做"。
+中间两档的区别容易被含混过去：OSWorld 是**代码就绪、环境缺**；kicad/workflows
+在 2026-11-10 跑过之后，结论是**胶水成立、环境各自坏在不同地方**——kicad 坏在 arm64 没有
+KiCad 9，Unity 坏在上游 `wget` 和 Windows-only 判分，OpenShot 是唯一真正跑起来的那个。
+逐项证据在 §二。
 
 ---
 
@@ -60,7 +62,7 @@ Thunderbird 十个域。它和 Cua Bench 共用同一个适配器和同一份 `s
 
 ---
 
-## 二、零胶水成本、但从未跑过
+## 二、零胶水成本、已试跑（2026-11-10）
 
 `cb dataset list` 在 v0.3.1 里还有两个数据集。它们和 `basic` 用**完全相同的调用形状**：
 
@@ -72,30 +74,97 @@ PYTHONPATH=$PWD SYSCITY_BIN=$PWD/target/debug/syscity \
   --on local --runtime runc -j 2 --max-steps 25 --output-dir <dir>
 ```
 
+**这一天把两个数据集都跑了。** 结论先写在这里，逐条证据在下面：
+
+| 数据集 | 跑了多少 | 分数 | 这个分数说明什么 |
+|---|---|---|---|
+| `cua-bench-kicad` | oracle 1 + agent 6（4 个 task） | **0/4 个 task，6 次 agent 全 0** | 环境坏：arm64 装不上 KiCad 9 |
+| `cua-bench-workflows` / OpenShot | 4 个 variant（v0–v3），25 与 45 两档步数，共 8 次 | **部分通过**：`create_project` 3 跑 2 个 1.0，`add_title` 最好 0.75 | 胶水成立，卡在 a11y 子树被截断 |
+| `cua-bench-workflows` / Unity | 1 个 variant | **0.0** | 环境坏 + 判分脚本是 Windows `cmd` 语法 |
+
+最重要的单个结果是 **OpenShot 的 `create_project`（v0）拿到 1.000**：那是第一次证明
+`cua_bridge` / `atspi_xml` / `pyautogui_shim` 这套胶水在一个**原生 Qt5 桌面应用**上成立，
+而不只是 `bench-web` 的 pywebview。§4.2 记的"所有基准都只出 a11y-only 下限分"这条约束，
+现在有了一个非 WebKit 的正面样本。
+
 ### 2.1 `cua-bench-kicad@1.0`
 
 | 项 | 值 |
 |---|---|
 | 规模 | **25 个 task，每个 1 个 variant**（共 25 个 variant） |
-| 镜像 | `ghcr.io/trycua/linux:24.04`（**不是** `bench-web`） |
+| 镜像 | `ghcr.io/trycua/linux:24.04`（**不是** `bench-web`），4.62 GB，digest `sha256:f4414…`，`uname -m` = aarch64 |
 | 应用 | KiCad：原理图编辑、网表导出 |
 | 判分 | 上游的 `compare_kicad_netlists`，比对导出的 `output.net` |
 | 来源 | Snorkel AI + Cua 的提交任务，`category = "eda"` |
 
-任务分两类，正好压到两套不同的能力：
+**实测（4 个 task，6 次 agent + 1 次 oracle）：**
 
-- **改值/改参数**（"Modify R2 to produce an output of 1.8V"、"Change the voltage source
-  from 9V to 5V"）——在已有原理图里定位一个元件、双击、改属性。
-- **从零画图**（"Design a microphone preamplifier…"、"Design a 555 timer-based LED
-  flasher…"）——纯画布 + 对话框 + 元件库搜索。
+| 跑法 | task | 步数 | 状态 | reward |
+|---|---|---|---|---|
+| oracle | `154d0750` | — | completed，121 s | **1.0**（见下，这条不作数） |
+| agent | `154d0750` / `a6414tw4` / `55f2eefb` / `34877be3` | 25 | `MAX_STEPS_EXCEEDED` | 0 / 0 / 0 / 0 |
+| agent | `a6414tw4` / `34877be3` | 45 | `✓ completed`（496 s / 478 s） | 0 / 0 |
 
-**为什么它值得先跑**：这是唯一能立刻回答"`bench/cua/` 这套胶水是不是只对 WebKitGTK 成立的
-数据集"。`atspi_xml.py` 里 `queryText()` 那个修复、`_bounds` 的 `visible`/`showing` 区分、
-`pyautogui_shim` 的键名表，全都是在 `bench-web` 的 pywebview 窗口上验证出来的。KiCad 是
-Qt/GTK 原生应用，a11y 树的形状不一样。
+**oracle 的 1.0 是个假信号。** 每个 task 的 `solve_task` 直接把自带的 `reference.net`
+写给 `/home/cua/kicad_project/output.net`，根本不经过 KiCad：
 
-**已知的风险**：`pyautogui_shim` 只实现了 syscity 片段用到的那几个 pyautogui 名字。KiCad 的
-画布拖线是 `dragTo`，而且很可能同样撞上 §四 的合成输入问题。这不是 bug，是没测过。
+```python
+# cua-bench-kicad/<task>/main.py
+async def solve(task_cfg, session):
+    await session.write_bytes(f"{_REMOTE_PROJECT_DIR}/output.net",
+                              (_HARNESS_DIR / "reference.net").read_bytes())
+```
+
+所以"oracle 满分"只证明评测器能读文件，**不能**证明 GUI 路径可用。
+
+**根因：arm64 上没有 KiCad 9。** 任务装的是 `ppa:kicad/kicad-9.0-releases`。查这个 PPA 的
+`noble` 索引，两个架构不一样：
+
+```bash
+# arm64
+$ curl -sL .../binary-arm64/Packages.gz | gunzip | grep -c '^Package: kicad$'
+0                       # 索引总长 2974 字节
+# amd64
+$ curl -sL .../binary-amd64/Packages.gz | gunzip | grep -c '^Package: kicad$'
+1                       # 索引总长 5575 字节，kicad 9.0.9~ubuntu24.04.1
+```
+
+arm64 上 `apt-get install kicad` 于是静默回落到 Ubuntu 24.04 自带的
+**`7.0.11+dfsg-1build4`**。而数据集里的 10 张起始原理图全部是 KiCad 9 格式。直接测：
+
+```bash
+$ kicad-cli sch export netlist <starter>.kicad_sch -o /tmp/out.net
+$ head -2 <starter>.kicad_sch
+(kicad_sch	(version 20250114)
+Failed to load schematic file          # exit=3，没有产出文件
+```
+
+这不是推断：`dpkg-query` 报 `7.0.11+dfsg-1build4`，文件头报 `20250114`，`kicad-cli` 报
+`Failed to load schematic file`。模型自己的 turn summary 也是同一句话——
+"the `.kicad_sch` file was created by a newer KiCad than the installed 7.0
+(`20250114` or later required)"。
+
+**25 个 task 分成两类，其中一类在这个环境下无解：**
+
+| 类别 | 数量 | `initial/` | 本环境能不能做 |
+|---|---|---|---|
+| 改已有原理图（"Modify R2 to produce 1.8V"） | 10 | 1 张 `.kicad_sch`，`(version 20250114)` | **不能**——KiCad 7 打不开 |
+| 从零画图（"Design a 555 timer LED flasher"） | 15 | **空** | 能，但纯画布，没测通 |
+
+10 个 starter 是 `154d0750 / 1625e97a / 2c11fe94 / 55f2eefb / 589da233 / 733d278a /
+84ec333e / 9ca3ef44 / d1c655da / d5947ae7`。剩下的 15 个连起始文件都没有。
+
+**6 次 agent 的失败形态分两种，都值得记：**
+
+- `a6414tw4`（45 步，`completed`）：任务是"建一个空网表"。模型把网表和 project 建到了
+  `~/cua/empty_netlist`，不是 `/home/cua/kicad_project`，评测器自然找不到。
+- `34877be3`（45 步，`completed`）：从零画图，BT1/R1/D1/D2 真画出来了，但最后一步
+  "导出网表"没做完。画布操作本身没失败——失败在收尾。
+- 25 步那 4 个全是 `MAX_STEPS_EXCEEDED`：装 KiCad + 开 GUI + 画图，25 步不够。
+
+**这里没验证到的**：a11y 树在 Qt 画布上到底长什么样。kicad 一个 task 都没走到"用 id
+点元素"的程度，所以"`atspi_xml` 在非 WebKit 应用上是否成立"这个原本要问的问题，
+kicad 回答不了。OpenShot 回答了（见 2.2）。
 
 ### 2.2 `cua-bench-workflows@1.0`
 
@@ -105,11 +174,78 @@ Qt/GTK 原生应用，a11y 树的形状不一样。
 | 镜像 | `ghcr.io/trycua/linux:24.04` |
 | 形态 | 多步时序任务：建项目 → 加片段 → 设参数 → 保存到指定路径 |
 
-它考的是**跨应用、多步、有中间状态**的任务，跟 `basic` 的单窗口小部件是两个轴。代价是这类
-任务对实现细节（对话框的层级、保存路径、模板名字）极其敏感，失败时很难分清是模型错还是
-胶水错。
+**OpenShot 才是关键的那一半。** 它装的是 Ubuntu 的 `openshot-qt 3.1.1+dfsg1-1`，
+基于 **Qt5 / PyQt5**（`libqt5core5t64 5.15.13`），不是 WebKitGTK。判分只看文件：
+`.osp` 项目文件存在 → 0.25，title SVG 的 `sodipodi:docname` 匹配模板 → 0.5，SVG 里有
+`Welcome` → 0.75，`.osp` 里有 `@assets/title/` 的 clip → 1.0。
 
-**建议**：先跑 kicad。workflows 的定位更像"压力测试"，不适合当第一个新轴。
+逐次结果（`reward` 取 `trajectory.json` 的 `final_metrics.extra.reward`；括号里是那次
+的 tool step 数与墙钟）：
+
+| 轮次 | variant | 任务 | 步数上限 | 结果 |
+|---|---|---|---|---|
+| 单独跑 | v0 | 建项目 `MyFirstVideo` | 25 | **1.0**（17 步 / 786 s） |
+| 4 并跑 | v0 | 同上 | 25 | **1.0**（19 步 / 834 s） |
+| 3 并跑 | v0 | 同上 | 25 | 0.0（21 步 / 1288 s，模型声称存好了，评测器没找到） |
+| 3 并跑 | v1 | `Bar 1` 标题 | 25 | 0.0（20 步，`MAX_STEPS_EXCEEDED`） |
+| 3 并跑 | v2 | `Bar 2` 标题 | 25 | **0.25**（22 步，只存下了项目文件） |
+| 4 并跑 | v1 / v2 / v3 | `Bar 1` / `Bar 2` / `Bar 3` | 25 | 全 0.0（19 / 21 / 18 步，均 `MAX_STEPS_EXCEEDED`） |
+| 3 并跑 | v1 / v0 / v2 | — | 45 | 全部 `did not finish within 1800s` |
+| 3 并跑 | v3 | `Bar 3` 标题 | 45 | **0.75**（37 步，`MAX_STEPS_EXCEEDED`） |
+
+`v3` 的 0.75 是能拆开的：项目存对了、`Bar 3.svg` 也生成了，只差"把 SVG 拖到时间线
+Track 5 上并改成 Welcome"。模型自己在总结里写得很清楚："No title clip is on the
+timeline — Track 5 and Track 4 are still empty"。
+
+**同一个 v0 三次跑出 1.0 / 1.0 / 0.0，说明 `create_project` 不是稳的。** 第三次那轮
+（3 并跑）模型的叙述是"Save Project As → 文件名 `MyFirstVideo.osp` → 回车"，评测却读到
+0.0；两次 1.0 分别只花 17 和 19 步。样本只有 3 次，不下结论，但**不要把它当成一个
+1.0 的稳态**。
+
+**45 步在 OpenShot 上大部分是空转，撞的是墙钟不是步数。** 45 步那轮 4 个里有 3 个报的是
+`SyscityRunFailed: syscity did not finish within 1800s`（`timeout` 默认 1800 s，见
+`bench/cua/sycity_agent.py:215`），不是 `MAX_STEPS_EXCEEDED`。setup 光装 `openshot-qt`
+就要 109–272 s，剩下的时间走不完 45 步。只有排到最后的 v3 活到了评测。
+**在这个数据集上调步数之前先调 `timeout`，否则加步数是空转。**
+
+**为什么 `add_title` 卡住：OpenShot 的 a11y 子树被截断到只剩一个屏幕外的隐藏窗口。**
+`screen_state` 默认 `max_tree_lines=100`，而 OpenShot 主窗口下面挂着一个坐标
+`(-725,-600)`、在屏幕外的 `Emojis` 工具窗，里面有 119 个 emoji `listitem`。这 100 行
+预算在到达时间线之前就用光了，模型看到的是：
+
+```
+application "openshot"
+  window "* Untitled Project [HD 720p 30 fps] - OpenShot Video Editor"
+    window "Emojis" at (-725,-600) 230x156
+      ... 119 个 listitem "Alien"/"Smiley"/"Angry face" ...
+… (tree truncated)
+```
+
+实测那一轮 openshot 子树 10862 字符、其中 46 个 emoji `listitem`；另一轮 `add_title` 的
+4 次 `screen_state` 读到的子树分别是 635 / 11508 / 3890 / 5383 字符，emoji `listitem`
+0 / 48 / 15 / 22 个，**四次全部带 `… (tree truncated)`，而且 "timeline" 和 "track"
+一次都没出现**。这不是"模型不会拖拽"，是**它压根看不到轨道**。
+（`format_element` 是从根深度优先、按行数硬砍，见 `src/tools/screen_state.rs:502`；
+没有按窗口可见性裁剪，这个工具窗坐标在屏幕外但仍被渲染。为什么截断落在 emoji 窗口上
+而没有落在更靠前的菜单栏上，取决于 OpenShot 暴露给 AT-SPI 的兄弟顺序——这一次实测的
+形状就是上面那段，换了窗口状态会变。）
+
+**Unity 那一半在本机恒为 0，两个独立原因，都要记：**
+
+1. **上游 bug，不是环境缺件。** `unity-tasks` 的 setup 调 `session.apps.unity.install()`，
+   用 `wget` 拉 Unity 的签名 key。**这个镜像里没有 `wget`**（有 `curl`），于是那条
+   `wget ... | apt-key add` 静默失败，`Setup complete in 2.12s` 什么都没装。
+   `~/Desktop/UnityHub.desktop` 却已经写好了，指向不存在的 `/opt/unityhub/unityhub`。
+   模型双击它，得到 `Failed to execute child process "/opt/unityhub/unityhub"
+   (No such file or directory)`。补上 `curl` + `gpg --dearmor` 后
+   `apt-cache policy unityhub` 能给出 `3.22.6`（arm64 有包），所以这里是上游能修、
+   我们不打算改的。
+2. **判分脚本写死了 Windows。** `unity-tasks/main.py` 里 11 处 `%USERPROFILE%`、
+   `if exist ... (echo FOUND) else (echo NOT_FOUND)`、`dir /S /B`、`findstr`。这些命令
+   在 Linux 的 bash 下是**语法错误**（`bash: syntax error near unexpected token '('`），
+   评测器第一步 `if "FOUND" not in stdout` 就返回 0.0。也就是说，**即便 Unity 装好了，
+   这个数据集在本机也拿不到非零分**。Unity 任务本来就是给 Windows 写的
+   （`main.py` 里那行被注释掉的 `"os_type": "windows"` 就是证据）。
 
 ### 2.3 registry 里还有但装不了
 
@@ -235,6 +371,8 @@ WebKitGTK rejects synthetic XSendEvent input and this session has no real target
 | arm64 | AndroidWorld 官方镜像要 amd64；emulator 包在 arm64 上有已知问题 | 上游 README |
 | 无 ServiceNow 实例 | WorkArena 系不可接 | — |
 | 默认模型无 vision（`deepseek-v4-flash`） | 所有基准都只出 a11y-only 下限分 | 见 `computer-use-benchmark.md` §一 |
+| `screen_state` 默认 `max_tree_lines=100` | 子树大（挂着隐藏的工具窗）的原生应用会被截断到看不见主窗口 | §2.2 的 OpenShot 实测 |
+| 一次任务 1800 s 墙钟上限 | 45 步跑满时的真实上限 | `bench/cua/sycity_agent.py:215` 的 `timeout` 默认值 |
 
 ---
 
@@ -248,23 +386,40 @@ OSWorld VM HTTP 协议的适配器，同时服务两套。所以成本分两块�
 | **胶水** | 把基准的任务喂给 `syscity bench run`，把结果翻译成它的判分接口 | 半天到一天（已由 OSWorld/Cua 验证） |
 | **环境** | 让基准的环境在这台机器上起来 | 天到周，或者换机器 |
 
-`cua-bench-kicad` 和 `cua-bench-workflows` 属于**两者都为零**的那一档——这就是它们排在最
-前面的原因。AndroidWorld 属于**胶水小、环境大**，WAA / OSWorld 属于**胶水零（已就绪）、
-环境大**。
+`cua-bench-kicad` 和 `cua-bench-workflows` 在纸面上属于**两者都为零**的那一档。2026-11-10
+跑完之后，这个判断要改：**胶水确实为零（一行没改就驱动起来了），但环境不为零**——它们各自
+坏在一个具体的地方（kicad 缺 arm64 的 KiCad 9；Unity 缺 `wget` 且判分是 Windows 语法；
+OpenShot 缺的是 syscity 自己的 a11y 裁剪）。这三处都不是"接入成本"，是**上游/本机缺陷**，
+要分开记账，否则会把它们误算成"接 kicad 要修一天胶水"。
+
+AndroidWorld 属于**胶水小、环境大**，WAA / OSWorld 属于**胶水零（已就绪）、环境大**。
 
 ---
 
-## 六、建议顺序
+## 六、建议顺序（2026-11-10 跑过之后重排）
 
-1. **跑 `cua-bench-kicad@1.0` 的两三个 variant。** 零新代码，半小时，直接回答"胶水是不是
-   只对 bench-web 成立"。这是当前信息量最高的一步，也是唯一能在不换机器的前提下开新轴的。
-2. **再跑一轮 `cua-bench-basic` 全量。** 把 0.926 从"一次"变成"两三次里的一次"，别让单轮
+上一版把"先跑 kicad，半小时"排第一，理由是"零成本、信息量最高"。**这条被证伪了**：
+kicad 花掉的是一个 4.62 GB 镜像的 ~28 分钟拉取（`ghcr.io/trycua/linux:24.04`）加上 6 次
+agent 跑，换来的是"arm64 装不上 KiCad 9"这一条环境结论，**关于胶水本身一个字都没答**——
+连"a11y 树在 Qt 应用上是否可用"都没答到，因为没有一个 kicad task 走到按 id 点元素。
+真正回答那个问题的是一次 OpenShot 跑（v0 的 1.0）。按这个重排：
+
+1. **OpenShot 的原生应用回归样本**：`create_project`（v0）单跑一次约 13 分钟
+   （setup 里约 2 分钟装 `openshot-qt`），3 跑 2 中。适合每次动 `atspi_xml.py` /
+   `pyautogui_shim.py` 之后重跑一轮——它是唯一一个不依赖 `bench-web` 的正面样本。
+   注意它**不是稳态**（见 §2.2），重跑时按"3 次里中几次"记，不要按单次记。
+2. **修 `screen_state` 的树裁剪**，再跑 `add_title`。§2.2 的截断是当前**唯一一个可以在本机
+   修掉**的、真实挡住分数的缺陷。修完后 `add_title` 的 43 个 variant 才是可测的。
+3. **再跑一轮 `cua-bench-basic` 全量。** 把 0.926 从"一次"变成"两三次里的一次"，别让单轮
    结果当稳态。
-3. **等 x86 + `/dev/kvm` 的机器就绪，跑 OSWorld `test_small` 5 题。** 胶水已经在仓库里，
+4. **kicad 在 arm64 上放弃**，除非拿到 x86 机器或升级到有 arm64 KiCad 9 的镜像。10 个
+   starter task 在本机是硬阻塞，15 个 blank task 只测纯画布、信息量低于成本。
+5. **Unity 子集在 Linux 上恒为 0**，判分脚本就是 Windows 语法的。要用它得先上游改成
+   跨平台，不在我们这一档里。
+6. **等 x86 + `/dev/kvm` 的机器就绪，跑 OSWorld `test_small` 5 题。** 胶水已经在仓库里，
    缺的只是机器。
-4. **`cua-bench-workflows` 当压力测试，排在 kicad 之后。**
-5. **WAA 排在 OSWorld 之后**，两者同源，信息增量小于成本。
-6. **其余（AndroidWorld、WebArena 系、WorkArena、macOSWorld、WebVoyager）暂不接**，
+7. **WAA 排在 OSWorld 之后**，两者同源，信息增量小于成本。
+8. **其余（AndroidWorld、WebArena 系、WorkArena、macOSWorld、WebVoyager）暂不接**，
    理由见 §三。
 
 ---
@@ -284,5 +439,14 @@ OSWorld VM HTTP 协议的适配器，同时服务两套。所以成本分两块�
 | WebArena / VisualWebArena / WorkArena / WebVoyager | 各自仓库 README |
 | macOSWorld 规模 | 按 `tasks/<类别>` 下的文件数合计：38+29+35+12+29+30+29 = 202 |
 | `/dev/uinput` 三层 | §4.1 里的四条 `docker run` 命令，加上特权容器里的 `UI_DEV_CREATE` 探针，均在本机执行 |
+| kicad 的 6 次 agent 与 1 次 oracle | `cb run dataset cua-bench-kicad@1.0 --task-filter <id> --on local --runtime runc --max-steps {25,45}`；结果读 `<run>/summary.json` 与每个 variant 的 `trajectory.json` 的 `final_metrics.extra.reward` |
+| KiCad PPA 的架构差异 | `curl -sL http://ppa.launchpad.net/kicad/kicad-9.0-releases/ubuntu/dists/noble/main/binary-{arm64,amd64}/Packages.gz`，比字节数与 `^Package: kicad$` 计数 |
+| `kicad-cli` 打不开起始原理图 | 在 `ghcr.io/trycua/linux:24.04` 容器里 `apt-get install kicad`，`dpkg-query -W kicad` 得 `7.0.11+dfsg-1build4`，对 `initial/**/*.kicad_sch`（头行 `(version 20250114)`）跑 `kicad-cli sch export netlist`，exit 3 + `Failed to load schematic file` |
+| kicad 的 10/15 拆分 | 逐个数每个 task 的 `initial/**/*.kicad_sch`，非空 10 个、空 15 个 |
+| OpenShot 是 Qt5 不是 WebKitGTK | 沙箱里 `apt-cache policy openshot-qt` → `3.1.1+dfsg1-1`；`dpkg -l libqt5core5t64` → `5.15.13+dfsg-1ubuntu1` |
+| OpenShot a11y 子树被截断 | 读 `~/.syscity/turns/<date>/<uuid>/full.json` 里 `screen_state` 的 `result`：`application "openshot"` 子树 10862 字符、46 个 emoji `listitem`、无 timeline / track 节点；`add_title` 那轮 4 次读取全部 `… (tree truncated)` |
+| Unity 缺 `wget` | 容器里 `command -v wget` 无输出、`command -v curl` 有；沙箱里 `ls /opt/unityhub` 不存在；模型双击桌面图标得 `Failed to execute child process "/opt/unityhub/unityhub"` |
+| Unity 补 `curl`+`gpg` 后能装 | 同一容器里 `curl -fsSL https://hub.unity3d.com/linux/keys/public` + `gpg --dearmor` → `apt-cache policy unityhub` 给出 `3.22.6`（arm64） |
+| Unity 判分是 Windows 语法 | `unity-tasks/main.py` 里 11 处 `%USERPROFILE%`；把那条 `if exist ... (echo FOUND)` 直接交给 bash，得 `syntax error near unexpected token '('` |
 
 上游都在快速迭代。**接任一基准之前把上面这几条命令重跑一遍**，别信本文的旧数。
