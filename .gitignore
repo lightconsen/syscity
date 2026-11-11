@@ -103,3 +103,5 @@ evals/capability/gaia_l1_answers.json
 
 # Python bytecode from the benchmark importers
 __pycache__/
+
+secrets/
