@@ -27,6 +27,16 @@ if no section matches, the release falls back to auto-generated notes.
 - The Seatbelt group-kill test's 300 ms timeout was shorter than the time a
   loaded runner needs to exec the sandboxed shell, so it asserted on output
   that had not been produced yet and failed intermittently on a full-suite run.
+- The `Security Audit` job is green again. `cargo audit` was failing on
+  `RUSTSEC-2026-0459` (SQLite `CVE-2026-119375`: a crafted database + `-wal`
+  pair can make queries return uninitialized page-cache memory), published
+  2026-10-30. The bundled SQLite is 3.46.0 and the fix needs
+  `libsqlite3-sys >= 0.39.0`, which `sqlx-sqlite 0.9.0` cannot reach — it pins
+  `<0.38.0`, and every release inside that window bundles a pre-3.54 SQLite
+  (0.37.0 → 3.51.3, 0.38.2 → 3.53.2). Waived with the reasoning written out in
+  both `.cargo/audit.toml` and `deny.toml`, tracked in #259, and removed the
+  stale `RUSTSEC-2024-0320` waiver for `yaml-rust` (no longer in the graph at
+  all, so `cargo deny` had been reporting `advisory-not-detected`).
 
 ## [0.3.18] - 2026-11-11
 
