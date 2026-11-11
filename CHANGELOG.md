@@ -11,6 +11,23 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- The shell tool now creates its default working directory when a fresh root
+  has not laid it out yet. A missing `~/.syscity/workspace` (or a test root's
+  `<root>/workspace`) made every fenced command fail with
+  `Execution failed: No such file or directory` on macOS, where the Seatbelt
+  runner — unlike Linux's Landlock and Windows' AppContainer — never created
+  the fence root. An explicit `working_dir` is still left alone: a path the
+  caller named and that does not exist is a fact about its command.
+- `tests/computer_contract.rs` builds again: the three `SettleConfig`
+  initializers gained the `min_window_ms` field they were missing since
+  `12ddbd4d`, which had been failing the `Test`, `Test (macOS)` and
+  `Code Coverage` jobs since 2026-11-09.
+- The Seatbelt group-kill test's 300 ms timeout was shorter than the time a
+  loaded runner needs to exec the sandboxed shell, so it asserted on output
+  that had not been produced yet and failed intermittently on a full-suite run.
+
 ## [0.3.18] - 2026-11-11
 
 ### Highlights

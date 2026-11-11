@@ -355,6 +355,9 @@ fn session(adapter: Arc<ContractAdapter>) -> ComputerSession {
             poll_interval_ms: 0,
             max_rounds: 1,
             stable_threshold: 0.5,
+            // No effect window: these contract tests drive one capture per
+            // step and would otherwise each wait out the 1200 ms floor.
+            min_window_ms: 0,
         },
         ..SessionConfig::default()
     })
@@ -368,6 +371,9 @@ fn background_session(adapter: Arc<ContractAdapter>) -> ComputerSession {
             poll_interval_ms: 0,
             max_rounds: 1,
             stable_threshold: 0.5,
+            // No effect window: these contract tests drive one capture per
+            // step and would otherwise each wait out the 1200 ms floor.
+            min_window_ms: 0,
         },
         ..SessionConfig::default()
     })
@@ -677,6 +683,9 @@ async fn a_spent_budget_is_a_refusal_that_names_the_budget() {
             poll_interval_ms: 0,
             max_rounds: 1,
             stable_threshold: 0.5,
+            // No effect window: these contract tests drive one capture per
+            // step and would otherwise each wait out the 1200 ms floor.
+            min_window_ms: 0,
         },
         step_budget: Some(std::time::Duration::from_millis(20)),
         ..SessionConfig::default()

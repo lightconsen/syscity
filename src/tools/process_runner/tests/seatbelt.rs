@@ -267,16 +267,21 @@ mod seatbelt {
         let runner = MacSeatbeltRunner::default();
         let tmp = tempfile::tempdir().unwrap();
         let ws = std::fs::canonicalize(tmp.path()).unwrap();
-        // `sleep 5` is a descendant of the sandboxed sh; a plain kill of
+        // `sleep 30` is a descendant of the sandboxed sh; a plain kill of
         // the wrapper would orphan it and leave the output pipe open.
         let req = ProcessRequest {
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "echo partial-out; sleep 5".to_string(),
+                "echo partial-out; sleep 30".to_string(),
             ],
             fence: Some(fence(ws.to_str().unwrap(), &[])),
-            timeout: Some(Duration::from_millis(300)),
+            // Generous on purpose: the clock has to cover `sandbox-exec`
+            // exec'ing the shell before the echo runs, and on a runner
+            // already running thousands of tests that start-up cost is most
+            // of the window. A tight timeout made this read the echo that
+            // had not happened yet as output that had been dropped.
+            timeout: Some(Duration::from_secs(8)),
             ..Default::default()
         };
         let started = std::time::Instant::now();
@@ -288,9 +293,9 @@ mod seatbelt {
             out.stdout_string()
         );
         // The group kill must reap the sandboxed grandchild promptly; if
-        // the orphan still held the pipe, this await would block ~5s.
+        // the orphan still held the pipe, this await would wait it out.
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(12),
             "timeout must not wait for the orphaned sleep"
         );
     }

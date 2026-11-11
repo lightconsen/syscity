@@ -188,9 +188,11 @@ impl Tool for ShellTool {
         }
 
         // Get working directory
-        let working_dir = args["working_dir"]
+        let requested_dir = args["working_dir"]
             .as_str()
-            .map(|p| context.resolve_path(std::path::Path::new(p)))
+            .map(|p| context.resolve_path(std::path::Path::new(p)));
+        let explicit_dir = requested_dir.is_some();
+        let working_dir = requested_dir
             .or_else(|| self.default_cwd.clone())
             .unwrap_or_else(|| context.workspace_root().clone());
 
@@ -200,6 +202,25 @@ impl Tool for ShellTool {
                 "Working directory '{}' is outside the workspace or not in the allowlist",
                 working_dir.display()
             )));
+        }
+
+        // A defaulted cwd is the runtime's own scratch area, which a fresh
+        // root may not have created yet — spawn would fail with ENOENT
+        // against a directory the agent never named. Only the default gets
+        // created: a path the model asked for and that does not exist is a
+        // fact about its command, not something to paper over.
+        //
+        // Linux (`landlock_available`) and Windows (`appcontainer`) already
+        // create the fence root as a side effect of fencing; this makes macOS
+        // and the unfenced case behave the same.
+        if !explicit_dir {
+            if let Err(e) = std::fs::create_dir_all(&working_dir) {
+                warn!(
+                    "Could not create the default working directory {}: {}",
+                    working_dir.display(),
+                    e
+                );
+            }
         }
 
         info!("Executing shell command: {}", command_str);
