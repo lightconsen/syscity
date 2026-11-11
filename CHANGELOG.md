@@ -9,10 +9,27 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
-## [Unreleased]
+## [0.3.19] - 2026-11-11
+
+### Changed
+
+- The marketing site no longer carries a pricing/plans/credits section: the
+  three plan cards and the "试用 Syscity 云端" call to action are gone, leaving
+  the nav button and the footer link as the only way to the cloud.
 
 ### Fixed
 
+- The `Android APK` job pins its JDK (`actions/setup-java`, Temurin 21). The
+  job used to rely on whatever JDK `ubuntu-latest` shipped, and the image has
+  moved to 25, which Gradle 8.14.3 refuses to run on: `Unsupported class file
+  major version 69` inside Kotlin's semantic analysis. 21 is inside both
+  Gradle's supported range and AGP 8.11's floor.
+- `tests/tui_pty.rs`'s resize test waits for the repaint rather than for the
+  first byte after the resize. ratatui's `Terminal::resize` clears the whole
+  screen (`ClearType::All`) when the width shrinks, so that first window could
+  legitimately hold only a clear sequence and a newline — which is what failed
+  the `Test` job on CI (`both the status row and the composer survived the
+  resize: "\n"`) while passing locally.
 - The shell tool now creates its default working directory when a fresh root
   has not laid it out yet. A missing `~/.syscity/workspace` (or a test root's
   `<root>/workspace`) made every fenced command fail with

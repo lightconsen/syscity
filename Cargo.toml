@@ -1,6 +1,6 @@
 [package]
 name = "syscity"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2021"
 rust-version = "1.97"
 authors = ["Syscity Contributors"]
