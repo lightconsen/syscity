@@ -66,20 +66,27 @@ impl Running {
         }
     }
 
-    /// Wait until the TUI has written anything past `from`.
+    /// Wait until everything written past `from` contains every `needle`.
     ///
     /// The assertion a resize needs: something was drawn, without asking for a
-    /// particular string — the TUI's own repaint is the evidence.
-    async fn expect_growth(&self, from: usize, why: &str) {
+    /// particular geometry — the TUI's own repaint is the evidence. But growth
+    /// alone is not enough after a resize: ratatui's `Terminal::resize` clears
+    /// the whole screen (`ClearType::All`) when the width shrinks, so the bytes
+    /// in the first growth window can be a clear sequence and nothing else.
+    /// That is what made this flaky on CI — the assertion ran against `"\n"`.
+    /// Waiting for the repaint itself removes the race without weakening the
+    /// check.
+    async fn expect_text_after(&self, from: usize, needles: &[&str], why: &str) {
         let deadline = Instant::now() + WAIT;
         loop {
-            if self.snapshot().len() > from {
+            let raw = self.snapshot();
+            let text = plain(raw.get(from..).unwrap_or_default());
+            if needles.iter().all(|needle| text.contains(needle)) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "no output past byte {from} ({why}): {:?}",
-                plain(&self.snapshot())
+                "no {needles:?} after byte {from} ({why}): {text:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -590,7 +597,11 @@ async fn a_resize_redraws_within_the_new_bounds() {
     // which shares an event queue with `event::poll` (crossterm documents that
     // they block each other) and made this test flaky on CI for reasons that
     // had nothing to do with the width.
-    tui.expect_growth(resized_at, "a frame at the new width")
+    //
+    // Waiting for the composer and the status row rather than for mere growth:
+    // on a width shrink ratatui clears the screen before it repaints, so the
+    // first bytes past `resized_at` are the clear sequence alone.
+    tui.expect_text_after(resized_at, &["v", "> "], "the composer and status row at the new width")
         .await;
 
     let raw = tui.snapshot();

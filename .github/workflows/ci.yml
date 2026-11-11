@@ -570,10 +570,17 @@ jobs:
     # is here to prove. R8 shrinking is therefore **not** covered: that only
     # happens in a signed release build.
     #
-    # The runner image already carries the SDK (`ANDROID_HOME`), three NDKs
-    # and a JDK 17; tauri-cli picks the newest NDK it finds, so no SDK
-    # install step is needed. `desktop/gen/android` is committed, so
-    # `tauri android init` must not run.
+    # The runner image already carries the SDK (`ANDROID_HOME`) and three
+    # NDKs; tauri-cli picks the newest NDK it finds, so no SDK install step is
+    # needed. `desktop/gen/android` is committed, so `tauri android init` must
+    # not run.
+    #
+    # The JDK, however, is pinned explicitly. The image's default JDK is not a
+    # contract: it moved to 25, and Gradle 8.14.3 (`gradle-wrapper.properties`)
+    # runs on Java up to 24 only, so the build died in Kotlin's semantic
+    # analysis with `Unsupported class file major version 69`. Tauri prints
+    # the same thing as a warning before Gradle fails. 21 is inside both
+    # Gradle's supported range and AGP 8.11's floor (17).
     runs-on: ubuntu-latest
     needs: check
     # Drafts skip the expensive half; the cheap jobs below still run.
@@ -620,6 +627,14 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # Both the wrapper warm-up below and `cargo tauri android build` start
+      # Gradle from `JAVA_HOME`/`PATH`, so this must come first.
+      - name: Setup JDK
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21"
 
       # The 130 MB distribution is not part of the checkout, so every run that
       # does not restore this cache pays for it. Keyed on the distribution
