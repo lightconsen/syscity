@@ -128,14 +128,21 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
 
   /** In Tauri mode, listen for the `gateway-ready` event from the backend. */
   private async waitForTauriGateway() {
+    // Whether the backend already told us a base URL through `get_api_url`.
+    // That command reads the host's own state, so it answers correctly even
+    // when the `gateway-ready` event has already been missed.
+    let haveBase = false;
     try {
       const { listen } = await import("@tauri-apps/api/event");
       const { invoke } = await import("@tauri-apps/api/core");
       // Pre-resolve the gateway URL from the Tauri command (port already detected).
       try {
         const apiUrl = await invoke<string>("get_api_url");
-        setGatewayBase(apiUrl);
-        this.gatewayUrl = apiUrl.replace(/^http/, "ws") + "/ws";
+        if (apiUrl) {
+          setGatewayBase(apiUrl);
+          this.gatewayUrl = apiUrl.replace(/^http/, "ws") + "/ws";
+          haveBase = true;
+        }
       } catch {
         // Fallback if command unavailable
       }
@@ -154,16 +161,32 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       } catch {
         // Not a mobile build — no token required.
       }
-      // Wait for the gateway-ready event so we know the backend is listening.
+      // `gateway-ready` is emitted **once**, as soon as the embedded gateway
+      // binds — which can be before this bundle finishes loading. Waiting on
+      // it alone left the UI on its loading spinner forever whenever the
+      // event won that race: nothing else ever called `connect()`. So this
+      // listener is a *subscription* (it re-points at a gateway that is
+      // announced later: a reused one dying, a remote coming back), and the
+      // connection itself is opened below from `get_api_url`.
       await listen<string>("gateway-ready", (event) => {
         const apiUrl = event.payload;
+        const next = apiUrl.replace(/^http/, "ws") + "/ws";
+        const moved = next !== this.gatewayUrl;
         setGatewayBase(apiUrl);
-        this.gatewayUrl = apiUrl.replace(/^http/, "ws") + "/ws";
-        this.connect();
+        this.gatewayUrl = next;
+        // An announcement for the gateway we already reached must not open a
+        // second socket. If the host is still starting, `connect` is already
+        // retrying against this base.
+        if (moved || (this.currentStatus === "disconnected" && !this.ws)) {
+          this.connect();
+        }
       });
+      // Connect from the command's answer. If the gateway is not listening
+      // yet, the attempt fails and the normal reconnect path retries.
+      if (haveBase) this.connect();
     } catch {
       // Fallback: connect anyway with best guess URL
-      this.gatewayUrl = "ws://127.0.0.1:18080/ws";
+      if (!this.gatewayUrl) this.gatewayUrl = "ws://127.0.0.1:18080/ws";
       this.connect();
     }
   }

@@ -548,8 +548,19 @@ pub fn run() {
                         {
                             // Desktop local: reuse an existing local gateway
                             // (e.g. the CLI daemon) or start the embedded one.
+                            //
+                            // "Answers `/live`" is not the same as "usable by
+                            // this app": anything can sit on the port. An `adb
+                            // forward tcp:18080` from the Android emulator is
+                            // the real case — it answers `/live` with a healthy
+                            // gateway that requires the emulator's per-install
+                            // token, so every WebSocket upgrade from here is
+                            // refused and the window shows a permanent spinner.
+                            // Probe the upgrade itself before adopting it.
                             let configured = configured_gateway_port().await;
-                            if gateway_healthy("127.0.0.1", configured).await {
+                            let reusable = gateway_healthy("127.0.0.1", configured).await
+                                && ws_upgrade_probe("127.0.0.1", configured, None).await == "ok";
+                            if reusable {
                                 eprintln!(
                                     "Reusing existing Syscity Gateway on http://127.0.0.1:{}",
                                     configured

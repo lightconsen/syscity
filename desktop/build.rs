@@ -66,7 +66,7 @@ fn copy_dir_recursive(source: &Path, target: &Path, ignore_prefixes: &[&str]) ->
         if entry.file_type()?.is_dir() {
             copy_dir_recursive(&entry.path(), &dest, ignore_prefixes)?;
         } else {
-            fs::copy(&entry.path(), &dest)?;
+            fs::copy(entry.path(), &dest)?;
         }
     }
     Ok(())
