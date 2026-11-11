@@ -11,6 +11,96 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-11-11
+
+### Highlights
+
+- **The phone is a first-class platform.** Android and iOS move out of
+  `src/computer/platform/mobile/` to sit beside `linux`, `macos`, `windows`,
+  `x11` and `wayland`, and with them comes the whole working set a real phone
+  task needs: read a screen as text, rows or form fields; find a control the tree
+  cannot name and show where it is; turn a wheel picker in one call; read only
+  what changed since the last screen; say where a tap is as a fraction; ask
+  before a tap that cannot be taken back; press a control, then a finger, then
+  the shell; run several steps in one call; and end an app only when nobody else
+  is holding it.
+- **Cua Bench is scored on this machine, honestly.** `bench/cua/` runs syscity as
+  the agent inside a `cua-bench` sandbox and reports two numbers instead of one:
+  **0.926 raw / 1.000 reachable** on the latest full run, beside a documented
+  run-to-run spread of 0.838–0.926. Five `drag-drop` variants are the only
+  failures, and the environment cannot deliver them at all (see the catalog
+  doc), so raw and reachable are kept apart rather than silently reconciled.
+- **A desktop action is judged by what changed on screen.** Three faults that had
+  been hiding each other are fixed: the element diff drowned in its own noise
+  when sibling widgets were identical, a repaint that had not landed yet read as
+  "no change", and a click that landed outside the window read as one that
+  worked. Separately, the duplicate-call guard no longer treats a repeated
+  desktop action as a duplicate call — the screen it acts on has changed.
+- **The tool schema is tiered.** Six core tools stay advertised and eighteen more
+  sit in seven task-shaped groups, opened by `list_capabilities`. The system
+  prompt names every closed group, so the model can ask for a tool it cannot yet
+  see; a closed group hides a schema, never a capability.
+
+### Added
+
+- **`android_extract`**: read a screen as `text` (labels in reading order,
+  deduplicated, cut at 50k characters with an explicit `truncated`), `list`
+  (rows grouped by vertical extent overlap, not by centre — a tall label and a
+  short icon in one row have centres far apart), or `form` (one entry per input
+  field with the label found to its left or above, a kind inferred from it, and
+  the current value; a password field's contents are never returned).
+- **Tool groups and `list_capabilities`** (`src/tools/`): groups are declared by
+  the platform set, because what belongs together is a fact about the set, not
+  the tool. A set that declares nothing has no tiering. An opened group stays
+  open host-wide — the phone is one device.
+- **Mobile CI** (`.github/workflows/`): `android` builds the debug APK on
+  `ubuntu-latest` and `ios-unsigned` builds with `--no-sign` on push. Nothing in
+  CI compiled the phone builds before this.
+- **`bench/cua/`**: the Cua Bench glue — `sycity_agent.py` (one `bench run` per
+  task, acting live), `cua_bridge.py` (the OSWorld VM protocol answered from
+  inside the sandbox), `atspi_xml.py`, `pyautogui_shim.py`, `ceiling.json` and
+  `score.py`. The ceiling is machine-readable because "how much of this
+  environment works" is a fact a score cannot tell you by itself.
+- **`docs/computer-use-benchmark-catalog.md`**: which Computer Use benchmarks
+  exist, which run here, and which cannot — with the `/dev/uinput` finding
+  behind `drag-drop` written down with the commands that produced it.
+
+### Changed
+
+- **`src/computer/platform/mobile/` is gone.** Android and iOS now sit under
+  `src/computer/platform/`; `platform/common.rs` keeps the genuinely shared part
+  (running a child and reading back status/text, bytes or a timeout), and
+  `platform/android/adb.rs` takes everything that never related to iOS.
+- **The action judgments are shared across device sets** rather than duplicated
+  per platform, so a phone and a desktop answer "did this tap land" the same way.
+- **wasmtime 50.0.1**, and zip 9.1.2 in place of the 0.13 line that carried the
+  zstd advisories. Three crates that could not compile for iOS are gone.
+
+### Fixed
+
+- **A click outside the window no longer reads as one that worked.**
+  `click-button` v5/v6 were lost to a coordinate AT-SPI published but the window
+  had cropped: the node is flagged `visible` but not `showing`, and the click
+  lands on the bare desktop behind it. `atspi_xml._bounds` withholds it.
+- **A closed `<select>`'s options publish their real boxes.** They were all
+  reported at the combo box's own coordinates, so a click meant for "Banana"
+  landed on the combo box and closed the menu.
+- **A webview text field's value is read from `queryText()`.** WebKitGTK's
+  `entry` raises `NotImplementedError` from `queryValue()`, so no webview field
+  ever published a value — which silently disabled the tree half of typing
+  verification and left the pixel diff, which cannot see a 43-character edit.
+- **The element diff no longer drowns in its own noise.** Pairing is one-for-one,
+  so 18 identical `button "Applications"` siblings stop generating 18 bogus
+  `added:` lines and spending the per-list quota on panel churn.
+- **One `Content-Type` per request.** `reqwest`'s `.header()` appends, so a
+  provider registering `Content-Type` in `extra_headers` sent two; DeepSeek
+  answers that with `415 Unsupported Media Type`, which read as a model fault.
+- **A repeated desktop action is not a duplicate call.** That guard was written
+  for a model looping on a failing `grep`; a desktop tool's arguments do not
+  describe the screen it acts on.
+- **The lock holder is spawned from a path that still exists**, riding out
+  `ETXTBSY` when it does not yet.
+
 ## [0.3.16] - 2026-10-30
 
 ### Highlights
