@@ -250,7 +250,7 @@ export function Sidebar({
 
   return (
     <aside
-      className={`shrink-0 h-full flex flex-col bg-rail transition-all duration-300 overflow-x-hidden ${
+      className={`shrink-0 h-full flex flex-col bg-rail transition-all duration-300 overflow-x-hidden select-none ${
         collapsed ? "w-16" : "w-64"
       }`}
     >
@@ -663,7 +663,7 @@ function SessionRow({
           onKeyDown={handleKeyDown}
           onBlur={handleBlur}
           autoFocus
-          className="w-full text-sm px-2 py-1 rounded-md bg-card text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20"
+          className="w-full text-sm px-2 py-1 rounded-md bg-card text-primary border border-subtle focus:outline-none focus:ring-2 focus:ring-primary-500/20 select-text"
         />
       </div>
     );

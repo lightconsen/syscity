@@ -134,6 +134,47 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
   );
 }
 
+/**
+ * Startup screen, shown while the app is still deciding what to render.
+ *
+ * It is the only thing on screen for the first seconds — the gateway has to
+ * come up, connect and list models before the chat (or the welcome page) can
+ * be shown — so it carries the product mark, says what is happening, and
+ * grows a second line if the wait is not as quick as usual. A bare 24px
+ * spinner gave no way to tell "starting" from "stuck".
+ */
+function StartingScreen({ t }: { t: (key: string) => string }) {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSlow(true), 6000);
+    return () => window.clearTimeout(timer);
+  }, []);
+  return (
+    <div
+      className="flex items-center justify-center bg-page text-primary"
+      style={{
+        paddingTop: "env(safe-area-inset-top)",
+        paddingBottom: "env(safe-area-inset-bottom)",
+        height: "100lvh",
+      }}
+    >
+      <div className="flex flex-col items-center text-center px-8">
+        <img
+          src="/syscity.png"
+          alt="Syscity"
+          className="w-20 h-20 rounded-2xl shadow-sm animate-pulse"
+          draggable={false}
+        />
+        <div className="mt-6 w-10 h-10 border-[3px] border-subtle border-t-primary-500 rounded-full animate-spin" />
+        <div className="mt-6 text-lg font-semibold">{t("App.startingTitle")}</div>
+        <div className="mt-1.5 text-sm text-secondary max-w-xs">
+          {slow ? t("App.startingHintSlow") : t("App.startingHint")}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── ChatApp ── */
 function ChatApp() {
   const { t } = useTranslation("app");
@@ -813,22 +854,9 @@ function ChatApp() {
     }
   }, [sessionItems, transport]);
 
-  // Gate: until we have confirmed whether an LLM is configured, show a
-  // minimal centered loading screen (prevents flashing the chat).
-  if (needsSetup === null) {
-    return (
-      <div
-        className="flex items-center justify-center bg-page text-primary"
-        style={{
-          paddingTop: "env(safe-area-inset-top)",
-          paddingBottom: "env(safe-area-inset-bottom)",
-          height: "100lvh",
-        }}
-      >
-        <div className="w-6 h-6 border-2 border-subtle border-t-primary-500 rounded-full animate-spin" />
-      </div>
-    );
-  }
+  // Gate: until we have confirmed whether an LLM is configured, show the
+  // startup screen (prevents flashing a chat that has nothing behind it).
+  if (needsSetup === null) return <StartingScreen t={t} />;
 
   // No LLM configured yet — show the first-launch welcome screen.
   if (needsSetup) {
@@ -836,20 +864,7 @@ function ChatApp() {
   }
 
   // LLM configured but the identity wizard state is still resolving.
-  if (onboardingDone === null) {
-    return (
-      <div
-        className="flex items-center justify-center bg-page text-primary"
-        style={{
-          paddingTop: "env(safe-area-inset-top)",
-          paddingBottom: "env(safe-area-inset-bottom)",
-          height: "100lvh",
-        }}
-      >
-        <div className="w-6 h-6 border-2 border-subtle border-t-primary-500 rounded-full animate-spin" />
-      </div>
-    );
-  }
+  if (onboardingDone === null) return <StartingScreen t={t} />;
 
   // LLM configured but identity not set yet — show the first-launch wizard.
   if (!onboardingDone) {

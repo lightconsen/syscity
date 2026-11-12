@@ -44,7 +44,7 @@ const iconBtnCls =
  *   identity strip's left edge therefore tracks the sidebar's right edge
  *   — the titlebar "follows" the pane split below it. On macOS the
  *   native traffic lights overlay this zone (titleBarStyle Overlay);
- *   expanded content clears them with pl-[72px], and when collapsed the
+ *   expanded content clears them with pl-[88px], and when collapsed the
  *   zone is fully covered by the lights, so the toggle moves just after
  *   it (the zone itself stays empty).
  * - tauri-macos: the root carries data-tauri-drag-region="deep" so the whole
@@ -107,7 +107,7 @@ export function Titlebar({
 
   return (
     <div
-      className="h-11 shrink-0 flex items-center bg-page border-b border-subtle pr-2 pl-2 md:pl-0"
+      className="h-11 shrink-0 flex items-center bg-page border-b border-subtle pr-2 pl-2 md:pl-0 select-none"
       style={
         showSafeAreaTop
           ? { paddingTop: "env(safe-area-inset-top)" }
@@ -136,14 +136,14 @@ export function Titlebar({
       <div
         className={`hidden md:flex shrink-0 h-full items-center bg-rail transition-all duration-300 ${
           sidebarCollapsed ? "w-16" : "w-64"
-        } ${sidebarCollapsed ? "justify-center" : isMac ? "pl-[72px]" : "pl-3"}`}
+        } ${sidebarCollapsed ? "justify-center" : isMac ? "pl-[88px]" : "pl-3"}`}
       >
         {!sidebarCollapsed && (
           <>
             <img
               src="/syscity.png"
               alt="Syscity"
-              className="w-6 h-6 shrink-0"
+              className="w-6 h-6 shrink-0 mr-2"
               draggable={false}
             />
             <span className="text-sm font-semibold text-primary min-w-0 truncate">

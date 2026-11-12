@@ -4,5 +4,8 @@
   "App.agentDeleteMessage": "将永久删除该 Agent 的目录：人格文件、工作区、数据与记忆。此操作不可恢复。",
   "App.agentDeleteConfirm": "删除",
   "App.agentRenameFailed": "重命名 Agent 失败",
-  "App.agentDeleteFailed": "删除 Agent 失败"
+  "App.agentDeleteFailed": "删除 Agent 失败",
+  "App.startingTitle": "正在启动 Syscity",
+  "App.startingHint": "正在连接网关…",
+  "App.startingHintSlow": "仍在连接 — 网关可能正在启动 Agent 和工具，请稍候几秒。"
 }

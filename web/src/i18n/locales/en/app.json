@@ -4,5 +4,8 @@
   "App.agentDeleteMessage": "Deletes the agent's directory for good — personality files, workspace, data and memory. This cannot be undone.",
   "App.agentDeleteConfirm": "Delete",
   "App.agentRenameFailed": "Failed to rename the agent",
-  "App.agentDeleteFailed": "Failed to delete the agent"
+  "App.agentDeleteFailed": "Failed to delete the agent",
+  "App.startingTitle": "Starting Syscity",
+  "App.startingHint": "Connecting to the gateway…",
+  "App.startingHintSlow": "Still connecting — the gateway may be starting its agents and tools. This can take a few seconds."
 }

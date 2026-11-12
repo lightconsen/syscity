@@ -39,7 +39,7 @@ export function Statusbar({ transport, sidebarCollapsed }: StatusbarProps) {
 
   return (
     <div
-      className="h-7 shrink-0 flex items-center pr-3 bg-page border-t border-subtle text-xs text-secondary"
+      className="h-7 shrink-0 flex items-center pr-3 bg-page border-t border-subtle text-xs text-secondary select-none"
       style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
     >
       {/* Sidebar-width zone: status + theme on the sidebar surface.
