@@ -9,6 +9,97 @@ Release workflow integration: the `## [X.Y.Z]` section matching a pushed tag
 becomes the GitHub Release body. Write release notes here BEFORE tagging;
 if no section matches, the release falls back to auto-generated notes.
 
+## [Unreleased]
+
+### Changed
+
+- The first turn no longer pays for the embedding model. The GGUF weights are
+  ~600 MB and took 23.6 s to load, all of it inside the first message's memory
+  retrieval; the gateway now warms them at startup, and the first search finds
+  the model already loaded.
+- One query expansion per turn instead of two. Memory recall expands the query
+  with an LLM (~2 s) and the knowledge-base search ran its own expansion of the
+  same query; the expansion is now done once and shared. An empty knowledge-base
+  collection is skipped entirely instead of being embedded and searched.
+- Short first messages are titled from the message itself. The fallback title is
+  the first six words, so a message that already fits was paying a full
+  completion (~1.4 s) to have the model repeat it back.
+- The startup screen is a real screen: the product mark, a larger spinner and
+  "Starting Syscity / Connecting to the gateway…", with a second line after
+  six seconds explaining that the gateway is still bringing up agents and
+  tools. It used to be a bare 24px spinner with no way to tell starting from
+  stuck.
+
+### Fixed
+
+- A message is stored once per turn and reaches the model once. Every user and
+  assistant message was written twice — through `MemoryManager::remember_message`
+  and again through the chat-history store it already wraps — and the user
+  message was persisted *before* the history was re-read, so it came back as
+  replayed history and was then appended again as the live message. A single
+  "hello" reached the model three times and left four rows for one turn.
+- Eval runs no longer write into the real profile. The runner now uses a
+  throwaway `SYSCITY_HOME`, and the standalone harness points the personality
+  files and the agent workspace at a private temp directory. Before this, a
+  regression fixture's "我叫李四，今年28岁…" became the live `USER.md`, and an
+  adversarial task wrote its own prompt text into `workspace/memory/YYYY-MM-DD.md`,
+  which every later real session loaded as remembered context.
+- The desktop app opens links in the user's browser again. Under the Tauri
+  WebView `window.open` is a no-op — WKWebView refuses a new window unless the
+  host registered an `on_new_window` handler, and nothing navigates, silently.
+  That made "Sign in to Syscity Cloud" spin forever: the OAuth flow never
+  started, so no result could ever come back to end the poll. Cloud sign-in,
+  the console/recharge links, the re-login card and MCP authorization now hand
+  the URL to the host (`shell:open`, scoped to `http(s)`) instead, and a
+  capture-phase listener routes every other `target="_blank"` anchor — links
+  inside assistant messages included — the same way. A browser, where the
+  gateway serves the SPA itself, keeps `window.open`: the popup's
+  `postMessage` back to the opener is part of that login flow.
+- A failed hand-off now reports itself immediately instead of leaving the
+  button spinning for the three-minute timeout.
+- The desktop build embeds the web assets. The window loads the SPA over
+  `tauri://`, so nothing missed them — except the OAuth return the browser
+  visits at `/cloud/login/callback`, which the embedded gateway serves over
+  HTTP. Without the feature it looked for `dist/` next to the app, found
+  nothing, and answered "Build not found".
+- The macOS titlebar no longer overlaps the sidebar header: the logo moves
+  from `pl-[72px]` to `pl-[88px]`, clear of the third traffic light, and gains
+  a gap before the app name.
+- Double-clicking in the chat no longer selects the titlebar and sidebar
+  labels: both are `select-none` now, and the one editable field inside the
+  sidebar (the agent rename box) opts back in.
+- A cached turn is now persisted like any other. The response-cache hit path
+  had its own copy of the message-writing code and called `store_message`
+  directly, so a cached reply was never indexed for session search and never
+  invalidated the context cache. It now goes through `persist_user_message` /
+  `persist_assistant_message`, and `tests/message_persistence.rs` drives
+  `Agent::process_message` twice to assert one user row and one assistant row
+  per turn on both paths.
+
+### Added (gates)
+
+- `scripts/check-toolchain-parity.sh`, run by the pre-commit hook and CI. The
+  local CI mirror invoked `cargo +stable` while CI pins 1.97; on a developer
+  machine `+stable` is a newer release, so the mirror failed on ten lints CI
+  never reports. Every `cargo +<name>` in `scripts/` must now name the pinned
+  channel, and the pin must agree across `rust-toolchain.toml`, `Cargo.toml`
+  and every `toolchain:` line in `ci.yml`.
+- `scripts/check-disk-space.sh`, which the mirror runs before its first build
+  and the coverage job runs before instrumenting. A full filesystem kills the
+  linker, and cargo reports it as "could not compile" in unrelated modules —
+  five checks went red in one run for this before anyone read `errno=28`.
+- `tests/repo_gates.rs` holds the gates themselves to the same standard: the
+  parity and disk scripts must be able to fail *and* pass (a gate that only
+  ever passes is coverage that does not exist), the pre-commit hook must still
+  call `staged-checks.sh` / `gate-integrity.sh` / `audit.sh`, and every script
+  `ci.yml` invokes must exist.
+- Environment-dependent E2E tests now probe instead of assuming. The macOS
+  screenshot journeys skip with a stated reason when `screencapture` cannot
+  read the display (no Screen Recording permission), matching what
+  `browser_chat_tests` already did for Chrome; before this they failed as if
+  `macos_screenshot` had regressed. The probe itself is unit-tested so it
+  cannot silently answer `false` forever.
+
 ## [0.3.19] - 2026-11-11
 
 ### Changed
