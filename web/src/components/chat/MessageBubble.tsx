@@ -328,6 +328,56 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
     }, 150);
   }, [handleEditSubmit]);
 
+  // Every hook in this component is declared before the role branch below.
+  // The virtualizer recycles a mounted component for whatever message lands at
+  // that index, so the same instance renders a user bubble one moment and an
+  // assistant bubble the next. Declaring the assistant-only hooks after
+  // `if (isUser) return` made the hook count depend on the role, and React
+  // reports that as "rendered more hooks than during the previous render"
+  // (#310) — which unmounts the message list until the page is reloaded.
+  const replyText = assistantReplyText(message);
+  const internalCounts = countInternalParts(message);
+  const hasInternals = internalCounts.reasoning > 0 || internalCounts.toolCalls > 0;
+  const showInternals = useChatStore((s) => s.aiInternalsVisibility[message.id] ?? false);
+  const setAiInternalsVisibility = useChatStore((s) => s.setAiInternalsVisibility);
+  const toggleInternals = useCallback(() => {
+    setAiInternalsVisibility(message.id, !showInternals);
+  }, [message.id, showInternals, setAiInternalsVisibility]);
+
+  const handleRegenerate = useCallback(() => {
+    transport?.regenerateAssistantMessage(message.id);
+  }, [message.id, transport]);
+
+  const turnId = message.turnId;
+  const vote = useChatStore((s) => (turnId ? s.messageVotes[turnId] : undefined));
+
+  const handleVote = useCallback(
+    async (v: "up" | "down") => {
+      if (!turnId) return;
+      const state = useChatStore.getState();
+      const current = state.messageVotes[turnId];
+      const next = current === v ? undefined : v;
+      // Optimistic local mirror first for snappy UI.
+      state.setMessageVote(turnId, next);
+      if (!next || !transport) return; // toggle-off: no clear API on the DB
+      // Reconstruct the user input for this turn (for badcase dedup seeding).
+      let input: string | undefined;
+      const idx = state.messages.findIndex((m) => m.id === message.id);
+      for (let i = idx - 1; i >= 0; i--) {
+        if (state.messages[i].role === "user") {
+          input = state.messages[i].content;
+          break;
+        }
+      }
+      const ok = await transport.vote(turnId, next, { input, response: replyText });
+      if (!ok) {
+        // Revert on failure so the UI never diverges from the DB.
+        useChatStore.getState().setMessageVote(turnId, current);
+      }
+    },
+    [turnId, transport, message.id, replyText]
+  );
+
   if (isUser) {
     return (
       <div className="py-4 group">
@@ -382,48 +432,6 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
     (message.durationMs !== undefined ||
       message.toolCount !== undefined ||
       message.credits !== undefined);
-  const replyText = assistantReplyText(message);
-  const internalCounts = countInternalParts(message);
-  const hasInternals = internalCounts.reasoning > 0 || internalCounts.toolCalls > 0;
-  const showInternals = useChatStore((s) => s.aiInternalsVisibility[message.id] ?? false);
-  const setAiInternalsVisibility = useChatStore((s) => s.setAiInternalsVisibility);
-  const toggleInternals = useCallback(() => {
-    setAiInternalsVisibility(message.id, !showInternals);
-  }, [message.id, showInternals, setAiInternalsVisibility]);
-
-  const handleRegenerate = useCallback(() => {
-    transport?.regenerateAssistantMessage(message.id);
-  }, [message.id, transport]);
-
-  const turnId = message.turnId;
-  const vote = useChatStore((s) => (turnId ? s.messageVotes[turnId] : undefined));
-
-  const handleVote = useCallback(
-    async (v: "up" | "down") => {
-      if (!turnId) return;
-      const state = useChatStore.getState();
-      const current = state.messageVotes[turnId];
-      const next = current === v ? undefined : v;
-      // Optimistic local mirror first for snappy UI.
-      state.setMessageVote(turnId, next);
-      if (!next || !transport) return; // toggle-off: no clear API on the DB
-      // Reconstruct the user input for this turn (for badcase dedup seeding).
-      let input: string | undefined;
-      const idx = state.messages.findIndex((m) => m.id === message.id);
-      for (let i = idx - 1; i >= 0; i--) {
-        if (state.messages[i].role === "user") {
-          input = state.messages[i].content;
-          break;
-        }
-      }
-      const ok = await transport.vote(turnId, next, { input, response: replyText });
-      if (!ok) {
-        // Revert on failure so the UI never diverges from the DB.
-        useChatStore.getState().setMessageVote(turnId, current);
-      }
-    },
-    [turnId, transport, message.id, replyText]
-  );
 
   return (
     <div className="py-4 group">
@@ -500,11 +508,13 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
               <MarkdownMessage text={message.content} />
             </div>
           )}
-          {/* Live status or metadata footer */}
+          {/* Live status or metadata footer. `timestamp` is stamped once when
+              the live message is created; the fallback is resolved inside the
+              bar at mount, not re-derived here on every render. */}
           {message.liveStatus && (
             <LiveStatusBar
               liveStatus={message.liveStatus}
-              startTime={message.timestamp ?? Date.now() - 5000}
+              startTime={message.timestamp ?? 0}
             />
           )}
           {!message.liveStatus && hasMetadata && (

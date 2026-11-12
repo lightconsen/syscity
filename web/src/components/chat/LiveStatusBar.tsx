@@ -1,17 +1,35 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 interface LiveStatusBarProps {
   liveStatus: { status: "thinking" | "tool_calling"; toolName?: string };
+  /**
+   * When the turn started, in epoch ms. Must be stable for a given turn: the
+   * counter re-anchors when this value changes, so a caller that recomputes it
+   * on every render (e.g. `Date.now() - 5000`) makes the elapsed time climb
+   * and then snap backwards.
+   */
   startTime: number;
 }
 
 export function LiveStatusBar({ liveStatus, startTime }: LiveStatusBarProps) {
-  const [elapsed, setElapsed] = useState(0);
   const { t } = useTranslation("chat");
+  // A live message always carries a stamp; 0 means "unknown" (e.g. a message
+  // restored from a snapshot), and counting from the Unix epoch would print a
+  // nonsense number. Count from mount in that case.
+  const anchorRef = useRef(startTime > 0 ? startTime : Date.now());
+  const [elapsed, setElapsed] = useState(0);
+
+  // Re-anchor when a different turn lands in this slot (the message list
+  // recycles component instances by index).
+  if (startTime > 0 && anchorRef.current !== startTime) {
+    anchorRef.current = startTime;
+  }
 
   useEffect(() => {
-    const id = setInterval(() => setElapsed(Date.now() - startTime), 500);
+    const tick = () => setElapsed(Math.max(0, Date.now() - anchorRef.current));
+    tick();
+    const id = setInterval(tick, 500);
     return () => clearInterval(id);
   }, [startTime]);
 

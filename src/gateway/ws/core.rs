@@ -936,6 +936,7 @@ async fn dispatch_method(
         "sessions.set_pinned" => sessions::handle_sessions_set_pinned(req, conn, state).await,
         "sessions.set_model" => sessions::handle_sessions_set_model(req, conn, state).await,
         "sessions.set_mode" => sessions::handle_sessions_set_mode(req, conn, state).await,
+        "sessions.get_mode" => sessions::handle_sessions_get_mode(req, conn, state).await,
         "sessions.reset" => sessions::handle_sessions_reset(req, conn, state).await,
         "sessions.subscribe" => sessions::handle_sessions_subscribe(req, conn, cmd_tx).await,
         "sessions.unsubscribe" => sessions::handle_sessions_unsubscribe(req, conn, cmd_tx).await,

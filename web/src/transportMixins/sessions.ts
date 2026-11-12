@@ -32,6 +32,53 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
       return false;
     }
   };
+  /**
+   * `sessions.set_mode` — this session's permission mode override.
+   *
+   * The override is ephemeral: it lives on the gateway until the process
+   * restarts, then falls back to the configured `[permissions].mode`. The
+   * gateway is the authority — `bypass` without `[permissions].allow_bypass`
+   * comes back as `BYPASS_DISABLED`, which this reports as `false` so the
+   * caller can revert its optimistic UI.
+   */
+  proto.setSessionMode = async function (this: SyscityWebSocketTransport,
+    sessionId: string,
+    mode: "default" | "accept_edits" | "plan" | "bypass"
+  ): Promise<boolean> {
+    try {
+      await this.sendRequestAndWait("sessions.set_mode", {
+        session_id: sessionId,
+        mode,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * `sessions.get_mode` — the mode the session really runs in.
+   *
+   * Unlike reading `permission_mode` off `sessions.list`, this answers for a
+   * conversation the store has never seen: the composer's session has an
+   * override before its first message creates a row.
+   */
+  proto.getSessionMode = async function (this: SyscityWebSocketTransport,
+    sessionId: string
+  ): Promise<{ mode: "default" | "accept_edits" | "plan" | "bypass"; allowBypass: boolean } | null> {
+    try {
+      const res = (await this.sendRequestAndWait("sessions.get_mode", {
+        session_id: sessionId,
+      })) as { mode?: string; allow_bypass?: boolean } | undefined;
+      const mode = res?.mode;
+      if (!mode) return null;
+      return {
+        mode: mode as "default" | "accept_edits" | "plan" | "bypass",
+        allowBypass: res?.allow_bypass === true,
+      };
+    } catch {
+      return null;
+    }
+  };
   proto.renameSession = async function (this: SyscityWebSocketTransport,sessionId: string, name: string): Promise<boolean> {
     try {
       await this.sendRequestAndWait("sessions.rename", { session_id: sessionId, name });

@@ -350,6 +350,40 @@ impl ApprovalQueue {
         count
     }
 
+    /// Deny every pending approval raised by one conversation.
+    ///
+    /// An aborted turn takes with it the tool calls waiting on those approvals;
+    /// leaving them queued kept them in the UI — and in the sidebar badge — for
+    /// the queue's whole timeout, and left the call suspended behind them. The
+    /// explanation reaches the tool as a denial, so the agent's turn ends
+    /// instead of hanging.
+    pub async fn cancel_for_session(&self, session_id: &str) -> usize {
+        let ids: Vec<String> = {
+            let pending = self.pending.read().await;
+            pending
+                .values()
+                .filter(|pa| pa.session_id.as_deref() == Some(session_id))
+                .map(|pa| pa.id.clone())
+                .collect()
+        };
+
+        let mut count = 0;
+        for id in ids {
+            if self
+                .resolve(
+                    &id,
+                    ApprovalDecision::Deny {
+                        reason: "Cancelled: the turn was aborted".into(),
+                    },
+                )
+                .await
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Clean up stale approvals that have exceeded timeout
     pub async fn cleanup_stale(&self) -> usize {
         let timeout = self.default_timeout;

@@ -9,6 +9,7 @@ import { MessageBubble } from "./MessageBubble";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { CommandPalette } from "./CommandPalette";
 import { ModelSelector } from "./ModelSelector";
+import { ModeSelector } from "./ModeSelector";
 import { EntityPicker } from "./EntityPicker";
 import { ComposerChips } from "./ComposerChips";
 import { getCommandCompletions, type CommandDef } from "@/slash-commands";
@@ -410,6 +411,7 @@ export function ChatContent({ transport }: ChatContentProps) {
             <EntityPicker transport={transport} />
           </div>
           <div className="flex items-center gap-1">
+            <ModeSelector transport={transport} />
             <ModelSelector transport={transport} />
             {isRunning ? (
               <button

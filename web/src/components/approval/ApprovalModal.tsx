@@ -16,8 +16,17 @@ export interface ApprovalPrompt {
 
 interface ApprovalModalProps {
   prompt: ApprovalPrompt;
-  /** Approve or deny; the agent's turn resumes with the decision. */
-  onDecide: (decision: "approve" | "deny", reason?: string) => void;
+  /**
+   * Approve or deny; the agent's turn resumes with the decision.
+   *
+   * `remember` records the call as a `[permissions].allow` rule, so the same
+   * command is not asked about again ("always allow").
+   */
+  onDecide: (
+    decision: "approve" | "deny",
+    reason?: string,
+    remember?: boolean
+  ) => void;
   /** Dismiss without deciding (the approval stays pending server-side). */
   onDismiss: () => void;
 }
@@ -33,13 +42,13 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
   const { t } = useTranslation("approval");
   const [reason, setReason] = useState("");
   const [showReason, setShowReason] = useState(false);
-  const [busy, setBusy] = useState<"approve" | "deny" | null>(null);
+  const [busy, setBusy] = useState<"approve" | "approve_always" | "deny" | null>(null);
 
   const badge = RISK_BADGE[prompt.risk_level] ?? RISK_BADGE.Medium;
 
-  const decide = (decision: "approve" | "deny") => {
-    setBusy(decision);
-    onDecide(decision, reason.trim() || undefined);
+  const decide = (decision: "approve" | "deny", remember = false) => {
+    setBusy(decision === "approve" && remember ? "approve_always" : decision);
+    onDecide(decision, reason.trim() || undefined, remember || undefined);
   };
 
   return (
@@ -77,13 +86,25 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
         </div>
       )}
 
-      <div className="flex gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Button
           variant="primary-md"
           disabled={busy !== null}
           onClick={() => decide("approve")}
         >
           {busy === "approve" ? t("ApprovalModal.approving") : t("ApprovalModal.approve")}
+        </Button>
+        {/* Same decision, plus a persisted `[permissions].allow` rule for this
+            exact call — the "don't ask me about this again" escape hatch. */}
+        <Button
+          variant="ghost"
+          disabled={busy !== null}
+          onClick={() => decide("approve", true)}
+          title={t("ApprovalModal.alwaysTitle")}
+        >
+          {busy === "approve_always"
+            ? t("ApprovalModal.approving")
+            : t("ApprovalModal.always")}
         </Button>
         {showReason ? (
           <Button
@@ -99,10 +120,17 @@ export function ApprovalModal({ prompt, onDecide, onDismiss }: ApprovalModalProp
             {t("ApprovalModal.denyDots")}
           </Button>
         )}
-        <Button variant="ghost" onClick={onDismiss}>
+        <Button variant="ghost" onClick={onDismiss} title={t("ApprovalModal.laterTitle")}>
           {t("ApprovalModal.later")}
         </Button>
       </div>
+
+      {/* "Later" is not a decision. Saying so is the difference between a
+          button that looks like it answers and one that is understood to
+          leave the agent waiting. */}
+      <p className="mt-3 text-[11px] text-secondary/80">
+        {t("ApprovalModal.laterHelp")}
+      </p>
     </Modal>
   );
 }

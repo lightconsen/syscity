@@ -4,6 +4,19 @@ use chrono::Utc;
 
 use super::*;
 pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+    // The mode a session actually runs in: a per-session override when one was
+    // set (see `sessions.set_mode`), otherwise the configured default. The
+    // composer's mode picker reads it from here so a client that just
+    // connected shows the truth rather than guessing "default".
+    let mode_of = |session_id: &str| {
+        state
+            .tools
+            .registry
+            .permissions()
+            .effective_mode(session_id)
+            .as_str()
+            .to_string()
+    };
     let sessions: Vec<serde_json::Value> = if let Some(ref store) = state.agents.store {
         match store.find_sessions(None, None, None, false).await {
             Ok(rows) => rows
@@ -16,6 +29,7 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
                             meta.last_activity.format("%b %d %H:%M").to_string()
                         }
                     });
+                    let permission_mode = mode_of(&meta.session_id);
                     serde_json::json!({
                         "session_id": meta.session_id,
                         "name": name,
@@ -26,6 +40,7 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
                         "is_active": meta.is_active,
                         "pinned": meta.pinned,
                         "model": meta.model,
+                        "permission_mode": permission_mode,
                         "created_at": meta.created_at.to_rfc3339(),
                     })
                 })
@@ -40,7 +55,14 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
         mgr.list_sessions()
             .await
             .into_iter()
-            .map(|id| serde_json::json!({ "session_id": id, "name": id }))
+            .map(|id| {
+                let permission_mode = mode_of(&id);
+                serde_json::json!({
+                    "session_id": id,
+                    "name": id,
+                    "permission_mode": permission_mode,
+                })
+            })
             .collect()
     };
 
@@ -1037,6 +1059,44 @@ pub(super) async fn handle_sessions_set_model(
     WsResponse::ok(&req.id, serde_json::json!({ "status": "ok" }))
 }
 
+/// `sessions.get_mode {session_id}` — the mode this conversation actually runs
+/// in: its override if one was set, else the configured default.
+///
+/// `sessions.list` carries the same field, but only for sessions the store
+/// knows about. A conversation that exists client-side and in the override map
+/// but not yet in the store (the composer's session, before its first message)
+/// is exactly the case a client needs to restore after a reload, so it gets a
+/// read of its own rather than a scan of the list.
+pub(super) async fn handle_sessions_get_mode(
+    req: &WsRequest,
+    _conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct GetModeParams {
+        session_id: String,
+    }
+
+    let params: GetModeParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+
+    let permissions = state.tools.registry.permissions();
+    let mode = permissions.effective_mode(&params.session_id);
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "session_id": params.session_id,
+            "mode": mode.as_str(),
+            // Lets the picker grey out what the gateway would refuse rather
+            // than offering a mode that comes back as an error.
+            "allow_bypass": permissions.allow_bypass(),
+        }),
+    )
+}
+
 /// `sessions.set_mode {session_id, mode}` — set this conversation's
 /// permission-mode override. The override is deliberately ephemeral: it dies
 /// with the daemon, and the gateway falls back to the configured
@@ -1652,6 +1712,120 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// The composer's mode picker reads the mode off `sessions.list`, so a
+    /// client that just connected shows the mode the session really runs in
+    /// rather than assuming the default.
+    #[tokio::test]
+    async fn sessions_list_reports_the_effective_permission_mode() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+        // Materialise the session row (an upsert) so `sessions.list` has it.
+        state
+            .agents
+            .store
+            .as_ref()
+            .expect("store")
+            .set_session_model("s1", None)
+            .await
+            .expect("create session row");
+
+        // Set the override through the WS method, as the picker does.
+        let res = handle_sessions_set_mode(
+            &req(
+                "m",
+                "sessions.set_mode",
+                serde_json::json!({ "session_id": "s1", "mode": "plan" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(res.ok, "set_mode must succeed: {:?}", res.error);
+
+        let res =
+            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let sessions = res
+            .payload
+            .and_then(|p| p.get("sessions").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default();
+        let s1 = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some("s1"))
+            .expect("s1 should be listed");
+        assert_eq!(
+            s1.get("permission_mode").and_then(|v| v.as_str()),
+            Some("plan"),
+            "the override is reported, not the configured default"
+        );
+    }
+
+    /// A session the store has never seen still has a real mode, and the picker
+    /// needs it after a reload: the conversation exists client-side (and in the
+    /// override map) long before its first message creates a store row.
+    #[tokio::test]
+    async fn get_mode_reads_the_override_for_a_session_the_store_lacks() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+
+        let res = handle_sessions_get_mode(
+            &req("g", "sessions.get_mode", serde_json::json!({ "session_id": "web:dev_abc" })),
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(res.ok, "get_mode must succeed: {:?}", res.error);
+        assert_eq!(res.payload.as_ref().unwrap()["mode"].as_str(), Some("default"));
+        assert_eq!(res.payload.as_ref().unwrap()["allow_bypass"], false);
+
+        handle_sessions_set_mode(
+            &req(
+                "m",
+                "sessions.set_mode",
+                serde_json::json!({ "session_id": "web:dev_abc", "mode": "plan" }),
+            ),
+            &conn,
+            &state,
+        )
+        .await;
+
+        let res = handle_sessions_get_mode(
+            &req("g", "sessions.get_mode", serde_json::json!({ "session_id": "web:dev_abc" })),
+            &conn,
+            &state,
+        )
+        .await;
+        assert_eq!(res.payload.as_ref().unwrap()["mode"].as_str(), Some("plan"));
+
+        // Another conversation is unaffected.
+        let res = handle_sessions_get_mode(
+            &req("g", "sessions.get_mode", serde_json::json!({ "session_id": "web:dev_other" })),
+            &conn,
+            &state,
+        )
+        .await;
+        assert_eq!(res.payload.as_ref().unwrap()["mode"].as_str(), Some("default"));
+    }
+
+    #[tokio::test]
+    async fn get_mode_missing_params_errors() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+        let res = handle_sessions_get_mode(
+            &WsRequest {
+                frame_type: "req".to_string(),
+                id: "g".to_string(),
+                method: "sessions.get_mode".to_string(),
+                params: None,
+            },
+            &conn,
+            &state,
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
     }
 
     #[tokio::test]

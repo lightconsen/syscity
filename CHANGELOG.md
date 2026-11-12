@@ -88,6 +88,44 @@ if no section matches, the release falls back to auto-generated notes.
 - The macOS titlebar no longer overlaps the sidebar header: the logo moves
   from `pl-[72px]` to `pl-[88px]`, clear of the third traffic light, and gains
   a gap before the app name.
+- The composer has a permission-mode picker. `sessions.set_mode` already
+  existed (and the TUI's `/mode` used it) but the web UI never called it, so the
+  four modes — ask-when-needed, auto-approve edits, plan (read-only) and bypass
+  — were unreachable from the app. The picker sits next to the model selector,
+  reads the session's real mode from `sessions.get_mode`, and follows
+  `session.mode_changed` when another client switches it. (`sessions.list`
+  carries the same field, but only for sessions the store knows about; the
+  composer's own conversation has an override long before its first message
+  creates a row, so the picker would have reset to "default" after a reload
+  while the gateway still ran it in plan.) The read also reports
+  `allow_bypass`, so a mode the gateway would refuse is shown greyed out with
+  the reason instead of failing when clicked. It is deliberately ephemeral,
+  matching the gateway: the override lasts until the daemon restarts.
+- The approval dialog offers "Always allow". The gateway already accepted
+  `remember: true` on `approvals.approve`, writing a `[permissions].allow` rule
+  so the same call is not asked about again; the UI had no way to send it.
+  "Later" is now explained rather than guessed at: it dismisses the dialog but
+  leaves the request pending — the agent stays paused until you answer, it
+  times out after five minutes, or you act from the sidebar badge, which now
+  actually reopens it. The badge also no longer counts completed approvals: the
+  queue is reconciled against `approvals.list`, and a re-announced approval is
+  no longer queued twice.
+- Aborting a turn releases the approvals it was waiting on. A tool call
+  suspended on a human approval belongs to that turn; the abort cancelled the
+  session but left the approval queued, so it stayed in the UI for the whole
+  timeout and the call behind it waited out the same five minutes.
+- A message list that recycled a component no longer unmounts. `MessageBubble`
+  declared six hooks *after* `if (isUser) return`, so a user bubble rendered
+  seven hooks and an assistant bubble twelve. The message list reuses instances
+  by index, and when a different role landed in a recycled slot React counted
+  the change as "rendered more hooks than during the previous render" (#310) —
+  the "This part of the page could not be displayed" card, with every tool call
+  in the turn stuck at "Running". All hooks are now declared before the branch.
+- The live "Thinking… (N s)" counter counts up instead of oscillating. Its
+  start time was `message.timestamp ?? Date.now() - 5000`, re-derived on every
+  render, so each re-render re-based the epoch: the counter climbed past ten
+  seconds and snapped back to about five, over and over. The live message now
+  carries a timestamp stamped once at creation, and the bar anchors to it.
 - Double-clicking in the chat no longer selects the titlebar and sidebar
   labels: both are `select-none` now, and the one editable field inside the
   sidebar (the agent rename box) opts back in.

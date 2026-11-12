@@ -330,11 +330,23 @@ pub(super) async fn handle_chat_abort(
     if let Err(e) = state.agents.acp.cancel(params.session_id.clone()).await {
         warn!("Failed to cancel session {} during abort: {}", params.session_id, e);
     }
+    // A tool call suspended on a human approval belongs to this turn. Aborting
+    // the turn must release it, or it stays queued (and shown as pending) until
+    // the approval times out.
+    let cancelled = state
+        .tools
+        .approval_queue
+        .cancel_for_session(&params.session_id)
+        .await;
+    if cancelled > 0 {
+        debug!("Abort released {} pending approval(s)", cancelled);
+    }
     WsResponse::ok(
         &req.id,
         serde_json::json!({
             "status": "aborted",
             "session_id": params.session_id,
+            "cancelled_approvals": cancelled,
         }),
     )
 }
@@ -479,5 +491,35 @@ mod tests {
         let payload = resp.payload.as_ref().unwrap();
         assert_eq!(payload["status"], "aborted");
         assert_eq!(payload["session_id"], "ghost");
+    }
+
+    /// Aborting a turn releases the approvals it was waiting on: they were
+    /// queued for that conversation, the call behind them is cancelled, and
+    /// leaving them pending kept them in the UI for the whole timeout.
+    #[tokio::test]
+    async fn chat_abort_cancels_this_sessions_pending_approvals() {
+        let state = state().await;
+        let conn = make_test_conn(&[]);
+        for (id, session) in [("a1", "s1"), ("a2", "s1"), ("a3", "other")] {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let pa = crate::tools::approval::PendingApproval::new(
+                id,
+                "shell",
+                serde_json::json!({ "command": "ls" }),
+                "system",
+            )
+            .with_session(Some(session.to_string()))
+            .with_response_tx(tx);
+            state.tools.approval_queue.submit(pa).await;
+        }
+
+        let params = Some(serde_json::json!({ "session_id": "s1" }));
+        let resp = handle_chat_abort(&req("r1", params), &conn, &state).await;
+        assert!(resp.ok);
+        assert_eq!(resp.payload.as_ref().unwrap()["cancelled_approvals"], 2);
+
+        // The other conversation's approval is untouched.
+        let left = state.tools.approval_queue.list_ids().await;
+        assert_eq!(left, vec!["a3".to_string()]);
     }
 }

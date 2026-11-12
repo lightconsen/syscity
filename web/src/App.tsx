@@ -316,7 +316,15 @@ function ChatApp() {
   // A pending ask_user question awaiting a human answer.
   const [askPrompt, setAskPrompt] = useState<AskPrompt | null>(null);
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalPrompt[]>([]);
-  const approvalPrompt = pendingApprovals[0] ?? null;
+  // Approvals the user answered "Later" to. They stay pending on the gateway
+  // and keep counting in the sidebar badge — "Later" defers the question, it
+  // does not answer it — but they stop opening the modal until the user asks
+  // for them back from the badge.
+  const [deferredApprovals, setDeferredApprovals] = useState<Set<string>>(
+    () => new Set()
+  );
+  const approvalPrompt =
+    pendingApprovals.find((a) => !deferredApprovals.has(a.approval_id)) ?? null;
   const workspacePanelOpen = useChatStore((s) => s.workspacePanelOpen);
   const setWorkspacePanelOpen = useChatStore((s) => s.setWorkspacePanelOpen);
   const currentAgent = useChatStore((s) => s.currentAgent);
@@ -458,16 +466,24 @@ function ChatApp() {
       if (evt.event === "approval.required") {
         const p = evt.payload;
         if (!p) return;
-        setPendingApprovals((prev) => [
-          ...prev,
-          {
-            approval_id: String(p.approval_id ?? ""),
-            tool_name: String(p.tool_name ?? ""),
-            requested_by: String(p.requested_by ?? ""),
-            risk_level: String(p.risk_level ?? "Medium"),
-            message: String(p.message ?? ""),
-          },
-        ]);
+        const id = String(p.approval_id ?? "");
+        setPendingApprovals((prev) =>
+          // The gateway re-announces a still-pending approval (a reconnect, a
+          // resumed turn); queueing it twice would leave a modal behind for a
+          // request that no longer exists.
+          prev.some((a) => a.approval_id === id)
+            ? prev
+            : [
+                ...prev,
+                {
+                  approval_id: id,
+                  tool_name: String(p.tool_name ?? ""),
+                  requested_by: String(p.requested_by ?? ""),
+                  risk_level: String(p.risk_level ?? "Medium"),
+                  message: String(p.message ?? ""),
+                },
+              ]
+        );
       }
       if (evt.event === "session.created") {
         refreshSessions();
@@ -631,19 +647,63 @@ function ChatApp() {
   }, []);
 
   const handleApprovalDecide = useCallback(
-    async (decision: "approve" | "deny", reason?: string) => {
+    async (decision: "approve" | "deny", reason?: string, remember?: boolean) => {
       if (!approvalPrompt) return;
-      await transport.respondToApproval(approvalPrompt.approval_id, decision, reason);
-      setPendingApprovals((prev) => prev.slice(1));
+      const id = approvalPrompt.approval_id;
+      await transport.respondToApproval(id, decision, reason, remember);
+      setPendingApprovals((prev) => prev.filter((a) => a.approval_id !== id));
+      setDeferredApprovals((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     },
     [approvalPrompt, transport]
   );
 
   const handleApprovalDismiss = useCallback(() => {
-    // The approval stays pending server-side; the next turn that needs it
-    // will re-emit approval.required, or the user acts via the badge.
-    setPendingApprovals((prev) => prev.slice(1));
+    // "Later" defers the question instead of answering it. The approval stays
+    // pending on the gateway — the agent is still suspended — so it keeps
+    // counting in the sidebar badge and this modal stops reopening for it.
+    if (!approvalPrompt) return;
+    const id = approvalPrompt.approval_id;
+    setDeferredApprovals((prev) => new Set(prev).add(id));
+  }, [approvalPrompt]);
+
+  // The sidebar badge: bring the deferred approvals back into view.
+  const openApprovals = useCallback(() => {
+    setDeferredApprovals(new Set());
   }, []);
+
+  // Reconcile the queue with the gateway: an approval can be answered from
+  // another client (the TUI, a second window) or time out, and a stale entry
+  // leaves a modal for a request the gateway no longer has — pressing
+  // Approve on it then fails. Only entries the gateway has dropped are
+  // removed, so a fresher local entry is never discarded.
+  useEffect(() => {
+    if (pendingApprovals.length === 0) return;
+    let cancelled = false;
+    const reconcile = () => {
+      transport
+        .listApprovals()
+        .then((list) => {
+          if (cancelled) return;
+          const live = new Set(list.map((a) => a.approval_id));
+          setPendingApprovals((prev) => {
+            const kept = prev.filter((a) => live.has(a.approval_id));
+            return kept.length === prev.length ? prev : kept;
+          });
+        })
+        .catch(() => {});
+    };
+    reconcile();
+    const id = setInterval(reconcile, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [transport, pendingApprovals.length]);
 
   const handleNewSession = useCallback(() => {
     setSettingsOpen(false);
@@ -931,7 +991,7 @@ function ChatApp() {
             activeView={kbOpen ? "kb" : marketplaceOpen ? "extensions" : "chat"}
             chatWelcome={messageCount === 0}
             pendingApprovals={pendingApprovals.length}
-            onShowApprovals={() => {}}
+            onShowApprovals={openApprovals}
             onRenameSession={handleRenameSession}
             onDeleteSession={handleDeleteSession}
             onPinSession={handlePinSession}

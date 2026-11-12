@@ -424,6 +424,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("sessions.set_pinned", Some(SCOPE_WRITE)),
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),
+    ("sessions.get_mode", Some(SCOPE_READ)),
     ("sessions.reset", Some(SCOPE_WRITE)),
     ("sessions.subscribe", Some(SCOPE_WRITE)),
     ("sessions.unsubscribe", Some(SCOPE_WRITE)),
@@ -1286,6 +1287,7 @@ mod tests {
         // SCOPE_READ
         assert_eq!(method_scope("chat.history"), Some(SCOPE_READ));
         assert_eq!(method_scope("sessions.list"), Some(SCOPE_READ));
+        assert_eq!(method_scope("sessions.get_mode"), Some(SCOPE_READ));
         assert_eq!(method_scope("agents.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("agents.get"), Some(SCOPE_READ));
         assert_eq!(method_scope("agents.registry"), Some(SCOPE_READ));

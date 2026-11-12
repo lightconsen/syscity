@@ -613,6 +613,8 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       agent_id?: string;
       pinned?: boolean;
       model?: string | null;
+      /** The permission mode the session runs in (`default` unless overridden). */
+      permission_mode?: string;
       last_activity?: number;
     }>
   > {
@@ -629,6 +631,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
               agent_id?: string;
               pinned?: boolean;
               model?: string | null;
+              permission_mode?: string;
               last_activity?: string;
             }>;
           }
@@ -641,6 +644,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
           agent_id?: string;
           pinned?: boolean;
           model?: string | null;
+          permission_mode?: string;
           last_activity?: number;
         }
       >();
@@ -650,6 +654,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
           agent_id: s.agent_id,
           pinned: s.pinned,
           model: s.model ?? null,
+          permission_mode: s.permission_mode,
           last_activity: s.last_activity
             ? new Date(s.last_activity).getTime()
             : undefined,
@@ -666,6 +671,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
         agent_id: data.agent_id,
         pinned: data.pinned,
         model: data.model ?? null,
+        permission_mode: data.permission_mode,
         last_activity: data.last_activity,
       }));
     } catch {
@@ -1507,6 +1513,10 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       role: "assistant",
       content: "",
       parts: [],
+      // The live status bar counts from here. Stamped once, at creation: a
+      // timestamp derived at render time re-anchors on every re-render, which
+      // made the elapsed counter climb and then snap backwards.
+      timestamp: Date.now(),
     };
     this.messages = [...this.messages, aiMsg];
     this.messagesListeners.forEach((cb) => cb(this.messages));
@@ -1811,6 +1821,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       content: "",
       parts: [],
       liveStatus: { status: "thinking" },
+      timestamp: Date.now(),
     };
     let currentText = partialAi?.content || "";
     let currentReasoning = "";
@@ -2091,7 +2102,31 @@ export interface SyscityWebSocketTransport {
   setDefaultModel(modelId: string): Promise<boolean>;
   setSessionModel( sessionId: string, model: string | null ): Promise<boolean>;
   setSessionPinned( sessionId: string, pinned: boolean ): Promise<boolean>;
-  respondToApproval(approvalId: string, decision: "approve" | "deny", reason?: string): Promise<boolean>;
+  /** `sessions.set_mode` — this session's permission-mode override. */
+  setSessionMode(
+    sessionId: string,
+    mode: "default" | "accept_edits" | "plan" | "bypass",
+  ): Promise<boolean>;
+  /** `sessions.get_mode` — the mode the session really runs in. */
+  getSessionMode(
+    sessionId: string,
+  ): Promise<{ mode: "default" | "accept_edits" | "plan" | "bypass"; allowBypass: boolean } | null>;
+  respondToApproval(
+    approvalId: string,
+    decision: "approve" | "deny",
+    reason?: string,
+    remember?: boolean,
+  ): Promise<boolean>;
+  /** `approvals.list` — what is still waiting for a human. */
+  listApprovals(): Promise<
+    Array<{
+      approval_id: string;
+      tool_name: string;
+      requested_by: string;
+      risk_level: string;
+      message: string;
+    }>
+  >;
   renameSession(sessionId: string, name: string): Promise<boolean>;
   respondToAsk(askId: string, response: string): Promise<boolean>;
   vote( turnId: string, vote: "up" | "down", opts?: { input?: string; response?: string; comment?: string } ): Promise<boolean>;
