@@ -2,10 +2,11 @@
 //!
 //! Embeds the Syscity Gateway and serves it to the Tauri WebView.
 
-// The crate is safe code apart from one place: the JNI callback in `events.rs`,
-// which is `#[no_mangle] extern "system"` by definition. Nothing else in this
-// crate uses `unsafe`, and `#[no_mangle]` cannot be written inside a `safe`
-// wrapper.
+// The crate is safe code apart from two places: the JNI callback in
+// `events.rs`, which is `#[no_mangle] extern "system"` by definition, and one
+// `set_var` in `run()` that must run before any worker thread exists (see the
+// comment there). Nothing else in this crate uses `unsafe`, and `#[no_mangle]`
+// cannot be written inside a `safe` wrapper.
 #![cfg_attr(not(target_os = "android"), deny(unsafe_code))]
 
 use std::sync::Arc;
@@ -373,6 +374,31 @@ async fn run_update_check(app: tauri::AppHandle) -> Result<String, String> {
 /// Entry point used by `src/main.rs`.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Keep llama.cpp's Metal teardown from aborting the process on exit.
+    //
+    // When the local GGUF embedding model is configured, the gateway loads it
+    // through llama.cpp, which registers every Metal buffer it allocates in a
+    // residency set. Those registrations live in process-static state, so the
+    // sets are still populated when `exit` runs the static destructors
+    // (`__cxa_finalize_ranges` → `~vector<unique_ptr<ggml_metal_device>>` →
+    // `ggml_metal_device_free` → `ggml_metal_rsets_free`), whose
+    // `GGML_ASSERT([rsets->data count] == 0)` fails and turns a normal quit
+    // into `Abort trap: 6`. llama.cpp ships this exact escape hatch: with
+    // `GGML_METAL_NO_RESIDENCY` set it never creates the sets (`dev->rsets =
+    // nil`), so the destructor has nothing left to assert about. The cost is
+    // the residency hint that keeps recently used buffers wired to the GPU —
+    // not a factor for a model loaded once at startup. Must be set before the
+    // first model load creates any Metal device.
+    //
+    // `unsafe` only because Rust 2024 marks `set_var` unsafe (a concurrent
+    // `getenv` could observe a torn value); nothing else in the process is
+    // running yet.
+    #[cfg(not(mobile))]
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+    }
+
     // Initialize syscity global setup (panic handler, and the process-wide path
     // root — see `syscity::init`). This must precede the log path below, which
     // resolves through `dirs::`.
@@ -479,140 +505,178 @@ pub fn run() {
         test_remote_gateway
     ]);
 
-    builder
-        .setup(move |app| {
-            let handle = app.handle().clone();
-            let state = app_state_for_setup.clone();
+    let builder = builder.setup(move |app| {
+        let handle = app.handle().clone();
+        let state = app_state_for_setup.clone();
 
-            // Spawn the Syscity Gateway in a background task. The connection
-            // mode (from ~/.syscity/client.toml) decides: remote mode connects
-            // to a gateway on another host; local mode runs the embedded
-            // gateway (mobile, or desktop with nothing running) or reuses an
-            // already-running local gateway (desktop, e.g. the CLI daemon).
-            tauri::async_runtime::spawn(async move {
-                #[cfg(mobile)]
-                let device_bridge: Option<
-                    std::sync::Arc<dyn syscity::device::DeviceBridge>,
-                > = mobile_device::bridge_from_app(&handle);
-                #[cfg(not(mobile))]
-                let device_bridge: Option<
-                    std::sync::Arc<dyn syscity::device::DeviceBridge>,
-                > = None;
+        // Spawn the Syscity Gateway in a background task. The connection
+        // mode (from ~/.syscity/client.toml) decides: remote mode connects
+        // to a gateway on another host; local mode runs the embedded
+        // gateway (mobile, or desktop with nothing running) or reuses an
+        // already-running local gateway (desktop, e.g. the CLI daemon).
+        tauri::async_runtime::spawn(async move {
+            #[cfg(mobile)]
+            let device_bridge: Option<
+                std::sync::Arc<dyn syscity::device::DeviceBridge>,
+            > = mobile_device::bridge_from_app(&handle);
+            #[cfg(not(mobile))]
+            let device_bridge: Option<
+                std::sync::Arc<dyn syscity::device::DeviceBridge>,
+            > = None;
 
-                let conn = connection::load_connection();
-                match conn.mode {
-                    ConnectionMode::Remote => {
-                        // Remote mode: connect to the configured gateway.
-                        let base = connection::remote_base(&conn);
-                        eprintln!("Connecting to remote Syscity Gateway at {}", base);
-                        if !gateway_healthy(&conn.host, conn.port).await {
-                            eprintln!("Remote gateway {} is not reachable (is it running?)", base);
-                        }
-                        let mut s = state.lock().await;
-                        s.gateway_port = conn.port;
-                        s.gateway_base = base.clone();
-                        // The remote gateway requires its shared token at the WS
-                        // handshake and as an HTTP Bearer — expose it to the
-                        // frontend (get_gateway_token).
-                        s.gateway_token = conn.token.clone();
-                        drop(s);
-                        announce_gateway_ready(&handle, &conn.host, conn.port).await;
-                        watch_remote_gateway(handle, conn).await;
+            let conn = connection::load_connection();
+            match conn.mode {
+                ConnectionMode::Remote => {
+                    // Remote mode: connect to the configured gateway.
+                    let base = connection::remote_base(&conn);
+                    eprintln!("Connecting to remote Syscity Gateway at {}", base);
+                    if !gateway_healthy(&conn.host, conn.port).await {
+                        eprintln!("Remote gateway {} is not reachable (is it running?)", base);
                     }
-                    ConnectionMode::Local => {
-                        #[cfg(mobile)]
-                        {
-                            // Mobile local: the embedded gateway with the
-                            // per-install token (loopback is shared between apps).
-                            let port = match find_available_port("127.0.0.1", 18080, 100).await {
-                                Some(p) => p,
-                                None => {
-                                    eprintln!("No available port found in range 18080-18179");
-                                    return;
-                                }
-                            };
-                            let mut s = state.lock().await;
-                            s.gateway_port = port;
-                            s.gateway_base = format!("http://127.0.0.1:{}", port);
-                            drop(s);
-                            let h2 = handle.clone();
-                            tauri::async_runtime::spawn(async move {
-                                monitor_owned_gateway(h2, port).await;
-                            });
-                            if let Err(e) = start_gateway(handle.clone(), port, device_bridge).await
-                            {
-                                eprintln!("Gateway failed: {}", e);
+                    let mut s = state.lock().await;
+                    s.gateway_port = conn.port;
+                    s.gateway_base = base.clone();
+                    // The remote gateway requires its shared token at the WS
+                    // handshake and as an HTTP Bearer — expose it to the
+                    // frontend (get_gateway_token).
+                    s.gateway_token = conn.token.clone();
+                    drop(s);
+                    announce_gateway_ready(&handle, &conn.host, conn.port).await;
+                    watch_remote_gateway(handle, conn).await;
+                }
+                ConnectionMode::Local => {
+                    #[cfg(mobile)]
+                    {
+                        // Mobile local: the embedded gateway with the
+                        // per-install token (loopback is shared between apps).
+                        let port = match find_available_port("127.0.0.1", 18080, 100).await {
+                            Some(p) => p,
+                            None => {
+                                eprintln!("No available port found in range 18080-18179");
+                                return;
                             }
+                        };
+                        let mut s = state.lock().await;
+                        s.gateway_port = port;
+                        s.gateway_base = format!("http://127.0.0.1:{}", port);
+                        drop(s);
+                        let h2 = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            monitor_owned_gateway(h2, port).await;
+                        });
+                        if let Err(e) = start_gateway(handle.clone(), port, device_bridge).await {
+                            eprintln!("Gateway failed: {}", e);
                         }
-                        #[cfg(not(mobile))]
-                        {
-                            // Desktop local: reuse an existing local gateway
-                            // (e.g. the CLI daemon) or start the embedded one.
-                            //
-                            // "Answers `/live`" is not the same as "usable by
-                            // this app": anything can sit on the port. An `adb
-                            // forward tcp:18080` from the Android emulator is
-                            // the real case — it answers `/live` with a healthy
-                            // gateway that requires the emulator's per-install
-                            // token, so every WebSocket upgrade from here is
-                            // refused and the window shows a permanent spinner.
-                            // Probe the upgrade itself before adopting it.
-                            let configured = configured_gateway_port().await;
-                            let reusable = gateway_healthy("127.0.0.1", configured).await
-                                && ws_upgrade_probe("127.0.0.1", configured, None).await == "ok";
-                            if reusable {
-                                eprintln!(
-                                    "Reusing existing Syscity Gateway on http://127.0.0.1:{}",
-                                    configured
-                                );
-                                let mut s = state.lock().await;
-                                s.gateway_port = configured;
-                                s.gateway_base = format!("http://127.0.0.1:{}", configured);
-                                drop(s);
-                                announce_gateway_ready(&handle, "127.0.0.1", configured).await;
-                                watch_reused_gateway(handle, state, configured, device_bridge)
-                                    .await;
-                            } else {
-                                match find_available_port("127.0.0.1", configured, 100).await {
-                                    Some(port) => {
-                                        let mut s = state.lock().await;
-                                        s.gateway_port = port;
-                                        s.gateway_base = format!("http://127.0.0.1:{}", port);
-                                        drop(s);
-                                        let h2 = handle.clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            monitor_owned_gateway(h2, port).await;
-                                        });
-                                        if let Err(e) =
-                                            start_gateway(handle.clone(), port, device_bridge).await
-                                        {
-                                            eprintln!("Gateway failed: {}", e);
-                                        }
+                    }
+                    #[cfg(not(mobile))]
+                    {
+                        // Desktop local: reuse an existing local gateway
+                        // (e.g. the CLI daemon) or start the embedded one.
+                        //
+                        // "Answers `/live`" is not the same as "usable by
+                        // this app": anything can sit on the port. An `adb
+                        // forward tcp:18080` from the Android emulator is
+                        // the real case — it answers `/live` with a healthy
+                        // gateway that requires the emulator's per-install
+                        // token, so every WebSocket upgrade from here is
+                        // refused and the window shows a permanent spinner.
+                        // Probe the upgrade itself before adopting it.
+                        let configured = configured_gateway_port().await;
+                        let reusable = gateway_healthy("127.0.0.1", configured).await
+                            && ws_upgrade_probe("127.0.0.1", configured, None).await == "ok";
+                        if reusable {
+                            eprintln!(
+                                "Reusing existing Syscity Gateway on http://127.0.0.1:{}",
+                                configured
+                            );
+                            let mut s = state.lock().await;
+                            s.gateway_port = configured;
+                            s.gateway_base = format!("http://127.0.0.1:{}", configured);
+                            drop(s);
+                            announce_gateway_ready(&handle, "127.0.0.1", configured).await;
+                            watch_reused_gateway(handle, state, configured, device_bridge).await;
+                        } else {
+                            match find_available_port("127.0.0.1", configured, 100).await {
+                                Some(port) => {
+                                    let mut s = state.lock().await;
+                                    s.gateway_port = port;
+                                    s.gateway_base = format!("http://127.0.0.1:{}", port);
+                                    drop(s);
+                                    let h2 = handle.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        monitor_owned_gateway(h2, port).await;
+                                    });
+                                    if let Err(e) =
+                                        start_gateway(handle.clone(), port, device_bridge).await
+                                    {
+                                        eprintln!("Gateway failed: {}", e);
                                     }
-                                    None => {
-                                        eprintln!(
-                                            "No available port found in range {}-{}",
-                                            configured,
-                                            configured + 99
-                                        );
-                                    }
+                                }
+                                None => {
+                                    eprintln!(
+                                        "No available port found in range {}-{}",
+                                        configured,
+                                        configured + 99
+                                    );
                                 }
                             }
                         }
                     }
                 }
-            });
-
-            // Set up system tray and menu (desktop only — no tray on mobile).
-            #[cfg(not(mobile))]
-            if let Err(e) = setup_tray_and_menu(app) {
-                eprintln!("Tray/menu setup failed: {}", e);
             }
+        });
 
-            Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // Set up system tray and menu (desktop only — no tray on mobile).
+        #[cfg(not(mobile))]
+        if let Err(e) = setup_tray_and_menu(app) {
+            eprintln!("Tray/menu setup failed: {}", e);
+        }
+
+        Ok(())
+    });
+
+    // Closing the window must not destroy the WebView (macOS).
+    //
+    // tao answers `windowShouldClose:` with `NO` unconditionally and only
+    // emits `CloseRequested`. Tauri then tears the *page* down
+    // (`WebPageProxy::close:`) while AppKit keeps the NSWindow — nothing is
+    // left to paint into it, so the window goes white and cannot be dismissed
+    // without Force Quit. Intercepting the request and hiding the window
+    // instead keeps the WebView (and the embedded gateway UI) intact; the dock
+    // icon (see `RunEvent::Reopen` below) and the tray's "Show Window" bring it
+    // back, and "Quit" is the way out.
+    //
+    // Other desktop targets keep the platform default: there the close really
+    // does destroy the window, and tao ends the event loop with it.
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_window_event(|window, event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Err(e) = window.hide() {
+                eprintln!("Failed to hide window on close: {}", e);
+            }
+        }
+    });
+
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // Clicking the dock icon with every window hidden must show the
+        // window again — that is the only way back once close hides it.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if !has_visible_windows {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app_handle, event);
+    });
 }
 
 /// Probe for an available TCP port starting at `start`.

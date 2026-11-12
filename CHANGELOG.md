@@ -30,16 +30,31 @@ if no section matches, the release falls back to auto-generated notes.
   tools. It used to be a bare 24px spinner with no way to tell starting from
   stuck.
 
-- The cron shared-session target is named `shared` instead of `main`
-  (`cron:shared`). `"main"` is still accepted when reading job files, so
-  existing schedules load unchanged.
-
 ### Fixed
 
-- The quality gate measures the suites it runs. The pass-rate criterion named a
-  hard-coded suite id (`main`) that is never in `config.suites`, so it always
-  evaluated "not executed" and the gate could not pass however well the real
-  suites did; there is now one criterion per configured suite.
+- A render error no longer blanks the window. React had no error boundary, so
+  any throw during render — a malformed tool result, a document that fails to
+  parse — unmounted the whole tree and left an empty `#root`, indistinguishable
+  from the app having died and recoverable only by restarting. There is now an
+  outermost boundary plus per-area ones (chat, message list, document preview)
+  that show what failed and re-render on "Try again".
+- `ToolCallPart` no longer renders a conditional hook. `showContent` was
+  declared inside `if (nonCollapsible)`, so a tool part that switched shape —
+  or a reused component instance showing a different tool — changed the hook
+  count mid-life, which React reports as "rendered more hooks than during the
+  previous render" and answers by unmounting the subtree; that was one route
+  to the blank window. It is now declared unconditionally.
+- Closing the window hides it instead of destroying the WebView (macOS). tao
+  answers `windowShouldClose:` with `NO` and Tauri reacts by tearing the page
+  down while AppKit keeps the window, leaving a white frame that cannot be
+  dismissed without Force Quit. The close request is now intercepted and the
+  window hidden; the dock icon and the tray's "Show Window" bring it back,
+  "Quit" still exits. Other desktop platforms keep the platform default.
+- Quitting no longer aborts with `Abort trap: 6` when the local GGUF embedding
+  model is configured. llama.cpp leaves its Metal residency sets populated in
+  process-static state, and their destructor asserts when it runs at `exit`.
+  The desktop shell sets `GGML_METAL_NO_RESIDENCY` before the first model load,
+  which is the upstream escape hatch for exactly this teardown.
 - A message is stored once per turn and reaches the model once. Every user and
   assistant message was written twice — through `MemoryManager::remember_message`
   and again through the chat-history store it already wraps — and the user

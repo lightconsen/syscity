@@ -53,6 +53,12 @@ export function ToolCallPart({ toolName, args, result, data, isError: isErrorPro
   const [expanded, setExpanded] = useState(true);
   const [requesting, setRequesting] = useState(false);
   const [requestDone, setRequestDone] = useState(false);
+  // Declared unconditionally: this component renders both the collapsible and
+  // the non-collapsible shape, and a hook inside `if (nonCollapsible)` changes
+  // the hook count when a part switches between them (or when the same
+  // component instance is reused for a different tool), which React reports as
+  // "rendered more hooks than during the previous render" and unmounts the tree.
+  const [showContent, setShowContent] = useState(false);
 
   const isError = isErrorProp || isErrorResult(result);
 
@@ -172,8 +178,6 @@ export function ToolCallPart({ toolName, args, result, data, isError: isErrorPro
   );
 
   if (nonCollapsible) {
-    const [showContent, setShowContent] = useState(false);
-
     return (
       <div className="my-3">
         <button

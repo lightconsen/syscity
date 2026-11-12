@@ -6,6 +6,7 @@ import {
 } from "@assistant-ui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { MessageBubble } from "./MessageBubble";
+import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { CommandPalette } from "./CommandPalette";
 import { ModelSelector } from "./ModelSelector";
 import { EntityPicker } from "./EntityPicker";
@@ -469,11 +470,17 @@ export function ChatContent({ transport }: ChatContentProps) {
                       transform: `translateY(${virtualItem.start}px)`,
                     }}
                   >
-                    <MessageBubble
-                      message={messages[virtualItem.index]}
-                      transport={transport}
-                      onEdit={(id, text) => transport.editUserMessage(id, text)}
-                    />
+                    {/* One message is model output rendered outside our control.
+                        A malformed part throws in render; without a boundary
+                        that unmounts the whole list (and, at the top level,
+                        the whole app). */}
+                    <ErrorBoundary area="message">
+                      <MessageBubble
+                        message={messages[virtualItem.index]}
+                        transport={transport}
+                        onEdit={(id, text) => transport.editUserMessage(id, text)}
+                      />
+                    </ErrorBoundary>
                   </div>
                 ))}
               </div>

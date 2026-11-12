@@ -22,6 +22,7 @@ import { ChatContent } from "@/components/chat/ChatContent";
 import { useGoalStore } from "@/stores/goalStore";
 import { GoalPanel } from "@/components/chat/GoalPanel";
 import { DocumentPreviewPanel } from "@/components/shared/DocumentPreviewPanel";
+import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { WorkspacePanel } from "@/components/workspace/WorkspacePanel";
 import { UpdateBanner } from "@/components/update/UpdateBanner";
 import { CloudEnabledBanner } from "@/components/update/CloudEnabledBanner";
@@ -1036,7 +1037,11 @@ function ChatApp() {
               className="min-w-0 overflow-hidden flex flex-col"
               style={{ flex: `${1 - previewRatio} 1 0%` }}
             >
-              <ChatAppInner key={sessionKey} transport={transport} />
+              {/* The message list renders arbitrary model output; a single bad
+                  part must not take the app down with it. */}
+              <ErrorBoundary area="chat">
+                <ChatAppInner key={sessionKey} transport={transport} />
+              </ErrorBoundary>
               <GoalPanel />
             </div>
             {/* Resizable divider */}
@@ -1083,16 +1088,25 @@ function ChatApp() {
                   onClose={() => setWorkspacePanelOpen(false)}
                 />
               ) : previewDocument ? (
-                <DocumentPreviewPanel
-                  document={previewDocument}
-                  onClose={() => setPreviewDocument(null)}
-                />
+                <ErrorBoundary
+                  area="document preview"
+                  /* A document that throws would pin the boundary's error state
+                     forever; clearing the preview lets the user pick another. */
+                  onReset={() => setPreviewDocument(null)}
+                >
+                  <DocumentPreviewPanel
+                    document={previewDocument}
+                    onClose={() => setPreviewDocument(null)}
+                  />
+                </ErrorBoundary>
               ) : null}
             </div>
           </div>
         ) : (
           <>
-            <ChatAppInner key={sessionKey} transport={transport} />
+            <ErrorBoundary area="chat">
+              <ChatAppInner key={sessionKey} transport={transport} />
+            </ErrorBoundary>
             <GoalPanel />
           </>
         )}
@@ -1111,10 +1125,15 @@ function ChatApp() {
             paddingBottom: "env(safe-area-inset-bottom)",
           }}
         >
-          <DocumentPreviewPanel
-            document={previewDocument}
-            onClose={() => setPreviewDocument(null)}
-          />
+          <ErrorBoundary
+            area="document preview"
+            onReset={() => setPreviewDocument(null)}
+          >
+            <DocumentPreviewPanel
+              document={previewDocument}
+              onClose={() => setPreviewDocument(null)}
+            />
+          </ErrorBoundary>
         </div>
       )}
 

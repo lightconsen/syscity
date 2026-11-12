@@ -3,15 +3,21 @@ import ReactDOM from 'react-dom/client'
 import './index.css'
 import './i18n'
 import App from './App'
+import { ErrorBoundary } from './components/shared/ErrorBoundary'
 import { installExternalLinkHandler } from './lib/external'
 
 // The desktop shell's WebView cannot open a new window, so every outbound link
 // has to go through the host instead (see lib/external.ts).
 installExternalLinkHandler()
 
+// The outermost boundary: without it a throw anywhere in render unmounts the
+// tree and leaves a blank white window. The inner boundaries in App.tsx keep
+// the damage narrower than this one can.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <ErrorBoundary area="app">
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>,
 )
 
