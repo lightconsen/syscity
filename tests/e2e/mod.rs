@@ -143,6 +143,72 @@ pub fn skip_if_no_provider() -> Option<LocalProviderConfig> {
     provider
 }
 
+// ── Capability Probes
+// ─────────────────────────────────────────────────────────
+
+/// Whether this process can actually capture the screen on macOS.
+///
+/// A Mac does not grant Screen Recording by default: the *binary* that calls
+/// `screencapture` needs the permission, so `cargo test` from a fresh terminal
+/// (or over SSH, or a CI runner) gets
+///
+///   screencapture: could not create image from display
+///
+/// and `macos_screenshot` dutifully reports the tool error. The screenshot E2E
+/// tests then fail on a missing `data` object — which reads exactly like a
+/// product regression, and cost a debugging session before anyone ran
+/// `screencapture` by hand.
+///
+/// Probed, not assumed: one `screencapture` into a temp file is the only
+/// reliable signal (the TCC database is not readable without Full Disk Access,
+/// and `CGPreflightScreenCaptureAccess` is not exposed here).
+pub fn macos_screen_capture_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        let probe =
+            std::env::temp_dir().join(format!("syscity_screen_probe_{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&probe);
+        // stderr is captured, not inherited: `screencapture` prints
+        // "could not create image from display" on every non-permitted run,
+        // which would otherwise appear interleaved with the test output and
+        // look like a tool failure rather than a probe result.
+        let ok = std::process::Command::new("/usr/sbin/screencapture")
+            .arg("-x")
+            .arg(&probe)
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let produced = std::fs::metadata(&probe)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(&probe);
+        ok && produced
+    })
+}
+
+/// Skip the calling test unless the platform can really screenshot.
+///
+/// Every screenshot E2E asserts on the tool's result payload; without Screen
+/// Recording that payload cannot exist, so running them would report a product
+/// bug that is really a permission the test runner does not have. The skip is
+/// loud, and returning `false` lets the caller `return` before building a
+/// gateway at all.
+pub fn skip_if_no_screen_capture() -> bool {
+    if macos_screen_capture_available() {
+        return true;
+    }
+    eprintln!(
+        "Skipping screenshot E2E test: `screencapture` cannot read the display. Grant Screen \
+         Recording to the terminal/runner, or run on a host with a real session."
+    );
+    false
+}
+
 // ── Gateway Setup
 // ─────────────────────────────────────────────────────────────
 
@@ -1039,3 +1105,53 @@ mod tool_chat_tests;
 mod vision_tests;
 mod workspace_tests;
 mod write_guard_tests;
+
+#[cfg(test)]
+mod capability_probe_tests {
+    /// The probe must be able to answer both ways.
+    ///
+    /// A capability probe that always returns `false` silently disables every
+    /// test behind it — the same "passed by not running" failure the skip
+    /// comment on the CI step warns about. This pins the shape: on macOS the
+    /// probe runs `screencapture` for real, so its verdict must equal whether
+    /// that command succeeds, and on other platforms it is unconditionally
+    /// unavailable (those tests are `ignore`d there anyway).
+    #[test]
+    fn screen_capture_probe_matches_the_platform() {
+        let available = super::macos_screen_capture_available();
+        if cfg!(target_os = "macos") {
+            // Compare against an independent invocation rather than asserting a
+            // fixed value: a machine WITH permission must probe true, one
+            // without must probe false. Both are correct; a constant is not.
+            let probe = std::env::temp_dir()
+                .join(format!("syscity_probe_check_{}.png", std::process::id()));
+            let _ = std::fs::remove_file(&probe);
+            let exit_ok = std::process::Command::new("/usr/sbin/screencapture")
+                .arg("-x")
+                .arg(&probe)
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let produced = std::fs::metadata(&probe)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            let _ = std::fs::remove_file(&probe);
+            assert_eq!(
+                available,
+                exit_ok && produced,
+                "the probe disagreed with a direct screencapture run"
+            );
+        } else {
+            assert!(!available, "non-macOS platforms cannot capture the screen");
+        }
+    }
+
+    /// The skip helper returns the probe's verdict — the callers rely on
+    /// `false` meaning "do not run", never "run anyway".
+    #[test]
+    fn skip_helper_follows_the_probe() {
+        assert_eq!(super::skip_if_no_screen_capture(), super::macos_screen_capture_available());
+    }
+}

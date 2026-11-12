@@ -99,6 +99,17 @@ skip_with_hint() {
     echo ""
 }
 
+# ── Preflight: disk ────────────────────────────────────────────────────────
+# A full filesystem kills the linker, and the failure is reported as a compile
+# error in unrelated modules — five checks went red in one run for this and the
+# real cause was one `errno=28`. Stop here rather than spend twenty minutes
+# producing misleading failures.
+if ! ./scripts/check-disk-space.sh --min-gb 15; then
+    echo -e "${RED}Not enough free disk to run the build checks. Aborting.${RESET}"
+    exit 1
+fi
+echo ""
+
 # ── Job: frontend (ci.yml `frontend`) ───────────────────────────────────────
 if $RUN_FRONTEND; then
     check "frontend: install" in_dir web pnpm install --frozen-lockfile
@@ -108,16 +119,24 @@ fi
 
 # ── Job: check (ci.yml `check`) ─────────────────────────────────────────────
 check "fmt" cargo fmt -- --check
-check "clippy" cargo +stable clippy --all-features -- -D warnings
+# Bare `cargo`: rust-toolchain.toml pins the channel, so this is whichever
+# toolchain CI declares. It said `+stable` once, which on a developer machine
+# resolved to a newer release than CI's 1.97 and failed the mirror on lints CI
+# never reports (scripts/check-toolchain-parity.sh now rejects that drift).
+check "clippy" cargo clippy --all-features -- -D warnings
+check "toolchain-parity" ./scripts/check-toolchain-parity.sh
 check "static-analysis" ./scripts/static-analysis.sh
 check "cargo check (all-features)" cargo check --all-features
 check "cargo doc" cargo doc --no-deps --all-features
 
 # ── Job: msrv (ci.yml `msrv`) ───────────────────────────────────────────────
-if cargo +1.97 --version >/dev/null 2>&1; then
-    check "msrv (1.97)" cargo +1.97 check --all-features
+# The pinned channel, read from the declaration itself rather than hardcoded —
+# a hardcoded copy is the drift check-toolchain-parity.sh exists to catch.
+PINNED_TOOLCHAIN=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml | head -1)
+if cargo +"$PINNED_TOOLCHAIN" --version >/dev/null 2>&1; then
+    check "msrv ($PINNED_TOOLCHAIN)" cargo +"$PINNED_TOOLCHAIN" check --all-features
 else
-    skip_with_hint "msrv (1.97)" "rustup toolchain install 1.97 --profile minimal"
+    skip_with_hint "msrv ($PINNED_TOOLCHAIN)" "rustup toolchain install $PINNED_TOOLCHAIN --profile minimal"
 fi
 
 # ── Job: build (ci.yml `build`: default + all-features) ─────────────────────

@@ -140,9 +140,17 @@ syscity/
    - Or run individual steps: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`
    - Run `./scripts/static-analysis.sh --full` for cross-module anti-patterns
    - Run `cargo doc` to check docs build
+   - Environment-dependent tests must *probe*, not assume: `tests/e2e` skips
+     screenshot journeys when `screencapture` cannot read the display
+     (`skip_if_no_screen_capture`) and browser journeys without Chrome
+     (`skip_if_no_chrome`). A skip must be loud — a silently-green test that
+     never ran is worse than a red one.
    - Security gate: a versioned pre-commit hook (`.githooks/pre-commit`) runs
      fast staged-content checks (`scripts/staged-checks.sh`: conflict markers,
-     oversized files, rustfmt, secret patterns) and then `./scripts/audit.sh`
+     oversized files, rustfmt, secret patterns), `scripts/gate-integrity.sh
+     --staged` (the eval gate's meaning must not be lowered), and
+     `scripts/check-toolchain-parity.sh` (no script may run a toolchain other
+     than the one `rust-toolchain.toml` pins), then `./scripts/audit.sh`
      (`cargo audit` + `pnpm audit` over the JS workspaces + `cargo deny`),
      rejecting the commit on failure. Enable it once per clone with
      `git config core.hooksPath .githooks`; bypass a single commit with
@@ -156,6 +164,13 @@ syscity/
    - Security audit: `./scripts/audit.sh` (`cargo audit`, `pnpm audit`,
      `cargo deny` — the CI job splits the first two across steps)
    - Static analysis: `./scripts/static-analysis.sh`
+   - Toolchain parity: `./scripts/check-toolchain-parity.sh` (the mirror and
+     template CI must never run a toolchain other than the pinned one — a
+     `cargo +stable` in a script resolves to whatever the machine has, and
+     then the local mirror fails on lints CI accepts)
+   - Disk headroom: `./scripts/check-disk-space.sh` (a full filesystem fails
+     in the *linker*, reported as a compile error in unrelated modules; the
+     runner and `scripts/ci-check.sh` check this before building)
 
 3. **Self-review checklist (review every change against these):**
    - **Error handling**: No `let _ =` or `.ok()` silently drops errors? (static-analysis.sh checks this)

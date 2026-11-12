@@ -122,6 +122,16 @@ jobs:
           chmod +x scripts/gate-integrity.sh
           ./scripts/gate-integrity.sh --tree
 
+      - name: Toolchain parity checks
+        # Every declaration of "the toolchain" must agree: rust-toolchain.toml,
+        # Cargo.toml's rust-version, every `toolchain:` line here, and every
+        # `cargo +<name>` in scripts/. This is what the `msrv` job below checks
+        # for the first three; the fourth is why it exists — the local mirror
+        # had drifted to `cargo +stable` and failed on lints 1.97 accepts.
+        run: |
+          chmod +x scripts/check-toolchain-parity.sh
+          ./scripts/check-toolchain-parity.sh
+
       - name: Check build
         run: cargo check --all-features
 
@@ -963,6 +973,16 @@ jobs:
 
       - name: Report free disk
         run: df -h /
+
+      - name: Check disk headroom
+        # A full filesystem fails in the *linker* — "No space left on device",
+        # reported as a compile error in unrelated modules — and cost a whole
+        # debugging session before anyone read the errno. Fail here instead,
+        # with the cause named. This job builds two instrumented copies of the
+        # dependency tree, so it needs the most room.
+        run: |
+          chmod +x scripts/check-disk-space.sh
+          ./scripts/check-disk-space.sh --min-gb 25
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@c3076e6fa5aeb9a93daf1bd8eff73345250a8a9c # cargo-llvm-cov

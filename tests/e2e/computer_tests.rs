@@ -179,6 +179,9 @@ fn assert_process_output(result: &serde_json::Value) {
 #[serial]
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_screenshot_basic() {
+    if !skip_if_no_screen_capture() {
+        return;
+    }
     let results = run_tool_chat_test(
         free_port(),
         "Use the macos_screenshot tool to take a screenshot and describe what you see on my \
@@ -196,6 +199,9 @@ async fn tool_macos_screenshot_basic() {
 #[serial]
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_screenshot_front_window() {
+    if !skip_if_no_screen_capture() {
+        return;
+    }
     let results = run_tool_chat_test(
         free_port(),
         "Capture the frontmost window using macos_screenshot. Set the window parameter to capture \
@@ -213,6 +219,9 @@ async fn tool_macos_screenshot_front_window() {
 #[serial]
 #[ignore = "Opens browser on the desktop"]
 async fn tool_macos_screenshot_after_open_browser() {
+    if !skip_if_no_screen_capture() {
+        return;
+    }
     let results = run_multi_tool_chat_test(
         free_port(),
         "Use applescript to open Google Chrome or Safari. Then use macos_screenshot to take a \
@@ -292,6 +301,9 @@ async fn tool_macos_desktop_control_open_settings() {
 #[serial]
 #[ignore = "Requires Chrome + display server; performs real web search"]
 async fn tool_macos_desktop_control_chrome_search() {
+    if !skip_if_no_screen_capture() {
+        return;
+    }
     let results = run_multi_tool_chat_test(
         free_port(),
         "Use applescript to open Google Chrome and navigate to a search for 'syscity'. Then use \
@@ -529,6 +541,9 @@ async fn tool_combo_full_desktop_report() {
 #[serial]
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS-only test")]
 async fn tool_macos_screenshot_via_chat() {
+    if !skip_if_no_screen_capture() {
+        return;
+    }
     let results = run_tool_chat_test(
         free_port(),
         "Use the macos_screenshot tool to take a screenshot and tell me what you see. Call ONLY \

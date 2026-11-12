@@ -42,6 +42,17 @@ if ! ./scripts/gate-integrity.sh --staged; then
     exit 1
 fi
 
+# Toolchain parity: no script may run a toolchain other than the one
+# rust-toolchain.toml pins and CI declares. `scripts/ci-check.sh` said
+# `cargo +stable`, which on a developer machine resolved to a newer release
+# than CI's pin, so the local mirror failed on lints CI never reports.
+if ! ./scripts/check-toolchain-parity.sh; then
+    echo ""
+    echo "❌  Toolchain parity failed — commit rejected."
+    echo "    Emergency bypass: git commit --no-verify"
+    exit 1
+fi
+
 if ./scripts/audit.sh; then
     exit 0
 fi
