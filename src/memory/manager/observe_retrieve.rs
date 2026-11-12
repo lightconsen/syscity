@@ -211,9 +211,22 @@ impl MemoryManager {
             let mut cfg = self.config.hybrid_config.clone();
             cfg.max_results = limit;
 
-            let hybrid_results =
-                hybrid_search(&query_text, user_id, conversation_id.unwrap_or(""), vs, ss, &cfg)
-                    .await;
+            // Expand once per retrieval, not once per search: the global
+            // hybrid search and the knowledge-base search below both use these
+            // sub-queries. Two LLM expansion calls per turn was ~4 s of the
+            // latency on a first message.
+            let sub_queries = vs.expand(&query_text).await;
+
+            let hybrid_results = hybrid_search_expanded(
+                &query_text,
+                &sub_queries,
+                user_id,
+                conversation_id.unwrap_or(""),
+                vs,
+                ss,
+                &cfg,
+            )
+            .await;
 
             memories = hybrid_results
                 .into_iter()
@@ -227,27 +240,21 @@ impl MemoryManager {
                         }))
                 })
                 .collect();
-        } else {
-            // ── Fallback: keyword search via the primary store ────────────────────
-            // DatabaseStore no longer handles embedding-based search; semantic
-            // recall requires the hybrid vector+FTS path configured above.
-            let mut mq = MemoryQuery::new()
-                .for_user(user_id)
-                .with_content(&query_text)
-                .limit(limit);
 
-            if let Some(conv_id) = conversation_id {
-                mq = mq.for_conversation(conv_id);
-            }
-
-            memories = self.store.search(mq).await?;
-        }
-
-        // ── KB collection search (additive — merged with global memory results) ─
-        if let (Some(ref vs), Some(ref _ss)) = (&self.vector_service, &self.session_search) {
-            if let Some(kb_coll) = kb_collection {
-                if !kb_coll.is_empty() {
-                    match vs.search_collection(&query_text, limit, kb_coll, 0.0).await {
+            // ── KB collection search (additive, shares the expansion) ───────
+            if let Some(kb_coll) = kb_collection.filter(|c| !c.is_empty()) {
+                // An empty (or absent) knowledge base cannot contribute; skip
+                // the embedding and the RRF merge rather than pay for them.
+                let populated = vs
+                    .collection_len(kb_coll)
+                    .await
+                    .map(|len| len > 0)
+                    .unwrap_or(true);
+                if populated {
+                    match vs
+                        .search_collection_expanded(&sub_queries, limit, kb_coll, 0.0)
+                        .await
+                    {
                         Ok(kb_results) => {
                             for r in kb_results {
                                 // Skip duplicates against main results
@@ -276,6 +283,20 @@ impl MemoryManager {
                     }
                 }
             }
+        } else {
+            // ── Fallback: keyword search via the primary store ────────────────────
+            // DatabaseStore no longer handles embedding-based search; semantic
+            // recall requires the hybrid vector+FTS path configured above.
+            let mut mq = MemoryQuery::new()
+                .for_user(user_id)
+                .with_content(&query_text)
+                .limit(limit);
+
+            if let Some(conv_id) = conversation_id {
+                mq = mq.for_conversation(conv_id);
+            }
+
+            memories = self.store.search(mq).await?;
         }
 
         // ── QMD search path ───────────────────────────────────────────────────

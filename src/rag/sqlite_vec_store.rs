@@ -463,6 +463,19 @@ impl VectorStore for SqliteVecStore {
         })
     }
 
+    async fn collection_len(&self, collection: &str) -> crate::Result<usize> {
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM vec_chunk_collections WHERE collection = ?")
+                .bind(collection)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| crate::error::SyscityError::Storage {
+                    context: "Failed to count chunks in collection".to_string(),
+                    details: e.to_string(),
+                })?;
+        Ok(count.0 as usize)
+    }
+
     async fn clear(&self) -> crate::Result<()> {
         sqlx::query("DELETE FROM vec_chunk_collections")
             .execute(&self.pool)

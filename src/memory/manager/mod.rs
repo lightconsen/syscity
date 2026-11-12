@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use super::{
     effectiveness::{EffectivenessConfig, EffectivenessTracker},
     events::{MemoryEventBuilder, MemoryEventLog},
-    hybrid::hybrid_search,
+    hybrid::hybrid_search_expanded,
     multimodal::{MemoryMultimodalConfig, MultimodalStore},
     personality::PersonalityMemory,
     qmd::{QmdExecutor, QmdScope},
@@ -327,6 +327,123 @@ mod tests {
             .unwrap();
 
         assert_eq!(ctx.messages.len(), 2);
+    }
+
+    /// One turn used to run two LLM query expansions of the same text — one
+    /// for the global memory search, one for the knowledge-base collection —
+    /// at ~2 s each. The expansion is now computed once and handed to both
+    /// searches, so a retrieval with a KB collection must still be exactly
+    /// one provider call.
+    #[tokio::test]
+    async fn test_retrieve_expands_the_query_once_for_memory_and_kb() {
+        use crate::providers::mock::MockProvider;
+        use crate::providers::Provider;
+        use crate::rag::config::EmbeddingConfig;
+        use crate::rag::embedding::EmbeddingProvider;
+        use crate::rag::vector_store::MemoryVectorStore;
+
+        struct FixedEmbeddingProvider;
+        #[async_trait]
+        impl EmbeddingProvider for FixedEmbeddingProvider {
+            fn model_name(&self) -> &str {
+                "fixed"
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+            async fn embed_batch(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        let n = t.len() as f32;
+                        vec![n, 0.0, 0.0, 0.0]
+                    })
+                    .collect())
+            }
+        }
+
+        let provider = Arc::new(MockProvider::new().with_callback(|_| {
+            crate::providers::Message::assistant("alternative one\nalternative two")
+        }));
+        let embedding = Arc::new(FixedEmbeddingProvider) as Arc<dyn EmbeddingProvider>;
+        let vectors = Arc::new(MemoryVectorStore::new(4));
+        let service =
+            VectorMemoryService::new(embedding, vectors.clone(), &EmbeddingConfig::default())
+                .with_multi_query(
+                    provider.clone() as Arc<dyn Provider>,
+                    None,
+                    crate::rag::multi_query::MultiQueryConfig {
+                        enabled: true,
+                        num_variations: 2,
+                        ..Default::default()
+                    },
+                );
+        // A populated collection, so the KB branch actually runs.
+        service
+            .add_to_collection("doc body", None, "kb-default")
+            .await
+            .unwrap();
+
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        let session_search = Arc::new(SessionSearch::new(pool));
+        session_search.initialize().await.unwrap();
+
+        let store = Arc::new(UnifiedStore::new_in_memory().await.unwrap());
+        let mm = MemoryManager::new(store.clone(), store, MemoryManagerConfig::default())
+            .with_vector_service(Arc::new(service))
+            .with_session_search(session_search);
+
+        let _ = mm
+            .retrieve("user1", None::<&str>, "what did we decide", Some(5), Some("kb-default"))
+            .await
+            .unwrap();
+
+        assert_eq!(provider.call_count(), 1, "memory and KB search must share one expansion");
+    }
+
+    /// A collection that holds nothing cannot contribute, so the search is
+    /// skipped — embedding the query for an empty KB was pure cost.
+    #[tokio::test]
+    async fn test_retrieve_skips_an_empty_kb_collection() {
+        use crate::rag::config::EmbeddingConfig;
+        use crate::rag::embedding::EmbeddingProvider;
+        use crate::rag::vector_store::MemoryVectorStore;
+
+        struct FixedEmbeddingProvider;
+        #[async_trait]
+        impl EmbeddingProvider for FixedEmbeddingProvider {
+            fn model_name(&self) -> &str {
+                "fixed"
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+            async fn embed_batch(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|t| vec![t.len() as f32, 0.0]).collect())
+            }
+        }
+
+        let embedding = Arc::new(FixedEmbeddingProvider) as Arc<dyn EmbeddingProvider>;
+        let vectors = Arc::new(MemoryVectorStore::new(2));
+        let service = VectorMemoryService::new(embedding, vectors, &EmbeddingConfig::default());
+
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        let session_search = Arc::new(SessionSearch::new(pool));
+        session_search.initialize().await.unwrap();
+
+        let store = Arc::new(UnifiedStore::new_in_memory().await.unwrap());
+        let mm = MemoryManager::new(store.clone(), store, MemoryManagerConfig::default())
+            .with_vector_service(Arc::new(service))
+            .with_session_search(session_search);
+
+        let results = mm
+            .retrieve("user1", None::<&str>, "anything", Some(5), Some("kb-empty"))
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|m| m.source != "knowledge_base"),
+            "nothing should come from a collection that does not exist"
+        );
     }
 
     #[tokio::test]

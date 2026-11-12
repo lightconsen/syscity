@@ -26,6 +26,34 @@ pub async fn hybrid_search(
     session_search: &SessionSearch,
     config: &HybridSearchConfig,
 ) -> Vec<HybridSearchResult> {
+    let sub_queries = vector_service.expand(query).await;
+    hybrid_search_expanded(
+        query,
+        &sub_queries,
+        user_id,
+        conversation_id,
+        vector_service,
+        session_search,
+        config,
+    )
+    .await
+}
+
+/// [`hybrid_search`] with the multi-query expansion already done.
+///
+/// A single turn searches twice — global memory here and a knowledge-base
+/// collection in [`crate::memory::MemoryManager::retrieve`] — and each search
+/// used to run its own LLM expansion (~2 s each). Expanding once and handing
+/// the same sub-queries to both searches removes the duplicate call.
+pub async fn hybrid_search_expanded(
+    query: &str,
+    sub_queries: &[String],
+    user_id: &str,
+    conversation_id: &str,
+    vector_service: &VectorMemoryService,
+    session_search: &SessionSearch,
+    config: &HybridSearchConfig,
+) -> Vec<HybridSearchResult> {
     let fetch_limit = config.max_results * 2;
     let threshold = 0.0; // we apply min_score ourselves after merging
 
@@ -36,7 +64,7 @@ pub async fn hybrid_search(
         .limit(fetch_limit);
 
     let (vector_res, fts_res) = tokio::join!(
-        vector_service.search(query, fetch_limit, threshold),
+        vector_service.search_expanded(sub_queries, fetch_limit, threshold, None),
         session_search.search(fts_query),
     );
 

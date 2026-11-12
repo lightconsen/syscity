@@ -69,7 +69,7 @@ pub use flush::{
     check_memory_flush, increment_compaction_count, record_flush_in_state,
     resolve_flush_target_path, FlushReason, MemoryFlushDecision,
 };
-pub use hybrid::hybrid_search;
+pub use hybrid::{hybrid_search, hybrid_search_expanded};
 pub use manager::{MemoryManager, MemoryManagerBuilder, MemoryManagerConfig, SessionContext};
 pub use multimodal::{
     build_multimodal_glob, classify_multimodal_file, FileClassification, MemoryMultimodalConfig,

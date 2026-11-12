@@ -135,19 +135,85 @@ impl VectorMemoryService {
         limit: usize,
         threshold: f32,
     ) -> crate::Result<Vec<(EmbeddedChunk, f32)>> {
-        // ── Multi-Query path ─────────────────────────────────────────────────
-        if let Some(ref mq_config) = self.multi_query_config {
-            if mq_config.enabled && mq_config.num_variations > 0 {
-                return self.search_multi_query(query, limit, threshold, None).await;
+        let sub_queries = self.expand(query).await;
+        self.search_expanded(&sub_queries, limit, threshold, None)
+            .await
+    }
+
+    /// Expand `query` into the sub-queries to search, original first.
+    ///
+    /// Split out of [`Self::search`] so a caller that queries several scopes
+    /// in one turn (global memory *and* a knowledge-base collection) pays for
+    /// the LLM expansion once instead of once per scope. Expansion is an
+    /// enhancement: a failed or disabled call degrades to the original query
+    /// rather than failing the search.
+    pub async fn expand(&self, query: &str) -> Vec<String> {
+        let Some(ref mq_config) = self.multi_query_config else {
+            return vec![query.to_string()];
+        };
+        if !mq_config.enabled || mq_config.num_variations == 0 {
+            return vec![query.to_string()];
+        }
+        let Some(ref provider) = self.multi_query_provider else {
+            return vec![query.to_string()];
+        };
+
+        match expand_query_with_llm(
+            query,
+            mq_config.num_variations,
+            provider.as_ref(),
+            self.multi_query_model.as_deref(),
+        )
+        .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("Multi-Query expansion failed, falling back to the original query: {}", e);
+                vec![query.to_string()]
             }
         }
+    }
 
-        // ── Original single-query path ──────────────────────────────────────
-        let rewritten = self.query_transformer.transform(query).await?;
-        let query_embedding = self.embedding_provider.embed(&rewritten).await?;
-        self.vector_store
-            .search_similar(&query_embedding, limit, threshold, None)
-            .await
+    /// Run the searches for already-expanded sub-queries and RRF-merge them.
+    ///
+    /// `collection` scopes every sub-query to one collection; `None` searches
+    /// the global memory scope.
+    pub async fn search_expanded(
+        &self,
+        sub_queries: &[String],
+        limit: usize,
+        threshold: f32,
+        collection: Option<&str>,
+    ) -> crate::Result<Vec<(EmbeddedChunk, f32)>> {
+        // Each sub-query goes through QueryTransformer (HyDE) → Embed → Search
+        let mut per_query = Vec::with_capacity(sub_queries.len());
+        for sub_q in sub_queries {
+            let rewritten = self.query_transformer.transform(sub_q).await?;
+            let query_embedding = self.embedding_provider.embed(&rewritten).await?;
+            let results = self
+                .vector_store
+                .search_similar(&query_embedding, limit, threshold, collection)
+                .await?;
+            per_query.push(results);
+        }
+
+        if per_query.len() == 1 {
+            // Single-query path (multi-query disabled, or expansion degraded):
+            // RRF over one list would only renumber it.
+            return Ok(per_query.pop().unwrap_or_default());
+        }
+
+        let Some(ref mq_config) = self.multi_query_config else {
+            return Ok(per_query.into_iter().next().unwrap_or_default());
+        };
+        let crate::rag::multi_query::MergeStrategy::Rrf(rrf_config) = &mq_config.merge_strategy;
+
+        Ok(crate::rag::multi_query::merge_results(
+            per_query,
+            rrf_config,
+            limit,
+            |chunk: &EmbeddedChunk| chunk.id.clone(),
+        ))
     }
 
     /// Delete memory embeddings
@@ -162,6 +228,11 @@ impl VectorMemoryService {
         self.vector_store.stats().await
     }
 
+    /// How many chunks `collection` holds; see [`VectorStore::collection_len`].
+    pub async fn collection_len(&self, collection: &str) -> crate::Result<usize> {
+        self.vector_store.collection_len(collection).await
+    }
+
     /// Search memories in a specific collection (simplified API for gateway)
     pub async fn search_collection(
         &self,
@@ -170,32 +241,23 @@ impl VectorMemoryService {
         collection: &str,
         threshold: f32,
     ) -> crate::Result<Vec<SearchResult>> {
-        // ── Multi-Query path ─────────────────────────────────────────────────
-        if let Some(ref mq_config) = self.multi_query_config {
-            if mq_config.enabled && mq_config.num_variations > 0 {
-                let results = self
-                    .search_multi_query(query, limit, threshold, Some(collection))
-                    .await?;
-                return Ok(results
-                    .into_iter()
-                    .map(|(chunk, score)| SearchResult {
-                        id: chunk.id,
-                        content: chunk.text,
-                        score,
-                        metadata: chunk.metadata,
-                    })
-                    .collect());
-            }
-        }
+        let sub_queries = self.expand(query).await;
+        self.search_collection_expanded(&sub_queries, limit, collection, threshold)
+            .await
+    }
 
-        // ── Original single-query path ──────────────────────────────────────
-        let rewritten = self.query_transformer.transform(query).await?;
-        let query_embedding = self.embedding_provider.embed(&rewritten).await?;
+    /// [`Self::search_collection`] with the expansion already done — see
+    /// [`Self::search_expanded`].
+    pub async fn search_collection_expanded(
+        &self,
+        sub_queries: &[String],
+        limit: usize,
+        collection: &str,
+        threshold: f32,
+    ) -> crate::Result<Vec<SearchResult>> {
         let results = self
-            .vector_store
-            .search_similar(&query_embedding, limit, threshold, Some(collection))
+            .search_expanded(sub_queries, limit, threshold, Some(collection))
             .await?;
-
         Ok(results
             .into_iter()
             .map(|(chunk, score)| SearchResult {
@@ -205,65 +267,6 @@ impl VectorMemoryService {
                 metadata: chunk.metadata,
             })
             .collect())
-    }
-
-    /// Multi-Query core logic: expand → N parallel searches → RRF merge.
-    async fn search_multi_query(
-        &self,
-        query: &str,
-        limit: usize,
-        threshold: f32,
-        collection: Option<&str>,
-    ) -> crate::Result<Vec<(EmbeddedChunk, f32)>> {
-        let mq_config = self.multi_query_config.as_ref().ok_or_else(|| {
-            crate::error::SyscityError::Internal("Multi-Query config not set".into())
-        })?;
-        let provider = self.multi_query_provider.as_ref().ok_or_else(|| {
-            crate::error::SyscityError::Internal("Multi-Query provider not set".into())
-        })?;
-
-        // 1. Expand query into sub-queries (includes original query first).
-        //    Expansion is an enhancement — when the LLM call fails, degrade
-        //    to the original query only instead of failing the whole search.
-        let sub_queries = match expand_query_with_llm(
-            query,
-            mq_config.num_variations,
-            provider.as_ref(),
-            self.multi_query_model.as_deref(),
-        )
-        .await
-        {
-            Ok(q) => q,
-            Err(e) => {
-                warn!("Multi-Query expansion failed, falling back to the original query: {}", e);
-                vec![query.to_string()]
-            }
-        };
-
-        // 2. Search each sub-query in parallel
-        //    Each sub-query goes through QueryTransformer (HyDE) → Embed → Search
-        let mut handles = Vec::with_capacity(sub_queries.len());
-        for sub_q in &sub_queries {
-            let rewritten = self.query_transformer.transform(sub_q).await?;
-            let query_embedding = self.embedding_provider.embed(&rewritten).await?;
-            let results = self
-                .vector_store
-                .search_similar(&query_embedding, limit, threshold, collection)
-                .await?;
-            handles.push(results);
-        }
-
-        // 3. RRF merge
-        let crate::rag::multi_query::MergeStrategy::Rrf(rrf_config) = &mq_config.merge_strategy;
-
-        let merged = crate::rag::multi_query::merge_results(
-            handles,
-            rrf_config,
-            limit,
-            |chunk: &EmbeddedChunk| chunk.id.clone(),
-        );
-
-        Ok(merged)
     }
 
     /// Add content to a collection (simplified API for gateway)
@@ -411,5 +414,24 @@ mod tests {
         };
         assert_eq!(result.id, "r1");
         assert!((result.score - 0.95).abs() < 0.001);
+    }
+
+    /// A service with no multi-query provider must pass the query through
+    /// unchanged, and an empty collection must report itself as empty so a
+    /// caller can skip the search.
+    #[tokio::test]
+    async fn test_expand_without_multi_query_is_identity_and_empty_collection_len(
+    ) -> crate::Result<()> {
+        let provider = Arc::new(FixedEmbeddingProvider) as Arc<dyn EmbeddingProvider>;
+        let store = Arc::new(MemoryVectorStore::new(2)) as Arc<dyn VectorStore>;
+        let config = EmbeddingConfig::default();
+        let service = VectorMemoryService::new(provider, store, &config);
+
+        assert_eq!(service.expand("hello").await, vec!["hello".to_string()]);
+
+        assert_eq!(service.collection_len("never-written").await?, 0);
+        service.add_to_collection("x", None, "col-a").await?;
+        assert!(service.collection_len("col-a").await? > 0);
+        Ok(())
     }
 }

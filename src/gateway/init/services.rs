@@ -60,24 +60,41 @@ pub async fn init_memory_services(
                             info!("Using local GGUF embedding provider");
                             use crate::rag::local_embeddings::ModelSource;
                             let source = ModelSource::parse(model_path);
-                            let provider = LocalGgufEmbeddingProvider::create(
-                                source,
-                                config.vector_memory.embedding_dimension,
-                            )
-                            .await;
+                            let provider = Arc::new(
+                                LocalGgufEmbeddingProvider::create(
+                                    source,
+                                    config.vector_memory.embedding_dimension,
+                                )
+                                .await,
+                            );
                             if provider.is_fts_only() {
                                 if let Some(reason) = provider.fts_reason() {
                                     warn!("Local GGUF provider in FTS-only mode: {}", reason);
-                                } else {
-                                    info!(
-                                        "Local GGUF provider initialized, will load model on \
-                                         first use"
-                                    );
                                 }
                             } else {
                                 info!("GGUF model configured from {}", model_path);
+                                // Loading the weights is ~600 MB of disk and
+                                // 23 s on a cold first turn — and that turn
+                                // used to pay for it inside its own memory
+                                // retrieval. Warm it here, off the request
+                                // path; the first search then finds the model
+                                // already loaded (it awaits the same OnceCell).
+                                let warm = provider.clone();
+                                let handle = tokio::spawn(async move {
+                                    if let Err(e) = warm.warm_up().await {
+                                        warn!(
+                                            "Failed to warm the embedding model; the first \
+                                             search will retry and may fail: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                                state
+                                    .task_registry
+                                    .insert_join("rag:embedding-warmup", handle)
+                                    .await;
                             }
-                            Some(Arc::new(provider))
+                            Some(provider)
                         } else {
                             warn!("Local GGUF provider requires 'local_model_path' configuration");
                             None

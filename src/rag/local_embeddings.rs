@@ -371,6 +371,29 @@ impl LocalEmbeddingProvider {
         }
     }
 
+    /// Load the GGUF weights now instead of on the first search.
+    ///
+    /// The model is ~600 MB and loading it took 23.6 s on a cold first turn,
+    /// all of it inside the first user request's memory retrieval. Callers
+    /// that own a background task (the gateway at startup) warm it there so
+    /// the cost lands before the first turn rather than during it.
+    ///
+    /// Returns `true` when a real model is loaded, `false` in FTS-only mode.
+    /// An error means the file is configured but could not be loaded; the
+    /// caller should log it and carry on, because the first search will
+    /// report the same failure to the user.
+    pub async fn warm_up(&self) -> crate::Result<bool> {
+        match self {
+            LocalEmbeddingProvider::Gguf(model) => {
+                let started = std::time::Instant::now();
+                model.get_model().await?;
+                info!("Embedding model warmed in {:.1}s", started.elapsed().as_secs_f32());
+                Ok(true)
+            }
+            LocalEmbeddingProvider::FtsOnly { .. } => Ok(false),
+        }
+    }
+
     /// Generate embeddings (or return error if FTS-only)
     pub async fn embed_batch(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
         match self {

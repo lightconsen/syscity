@@ -278,6 +278,15 @@ pub(super) fn handle_methods_list(req: &WsRequest) -> WsResponse {
 /// Prompt for generating session titles via LLM.
 const SESSION_TITLE_PROMPT: &str = "Summarize the following user message into a very short session title (at most 6 words, no punctuation, no explanation).\n\nMessage: {message}\n\nTitle:";
 
+/// A first message short enough that the LLM round can only reword it.
+///
+/// The fallback title is the message's first six words, so for a message that
+/// already fits that budget the model was asked to repeat its input — at the
+/// cost of a full completion (~1.4 s) before the first reply could start.
+/// Below both limits the fallback is strictly as good and free.
+const TITLE_GENERATION_MIN_CHARS: usize = 32;
+const TITLE_GENERATION_MIN_WORDS: usize = 7;
+
 /// Generate a concise session title by asking an LLM to summarize the user's
 /// first message.
 pub(super) async fn generate_session_title(
@@ -287,6 +296,11 @@ pub(super) async fn generate_session_title(
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Ok("New Session".to_string());
+    }
+    if trimmed.chars().count() < TITLE_GENERATION_MIN_CHARS
+        || trimmed.split_whitespace().count() < TITLE_GENERATION_MIN_WORDS
+    {
+        return Ok(fallback_session_name(trimmed));
     }
 
     let prompt = SESSION_TITLE_PROMPT.replace("{message}", trimmed);
@@ -731,6 +745,25 @@ mod tests {
         );
         let title = generate_session_title(&router, "   ").await.unwrap();
         assert_eq!(title, "New Session");
+    }
+
+    /// A short first message must be titled without an LLM round. An
+    /// unconfigured router cannot complete anything, so the assertion is also
+    /// what proves no call was attempted: routing it would return an error.
+    #[tokio::test]
+    async fn generate_title_short_message_skips_the_llm() {
+        let router = crate::model_router::ModelRouter::new(
+            crate::model_router::ModelRouterConfig::default(),
+        );
+        let title = generate_session_title(&router, "hello there")
+            .await
+            .unwrap();
+        assert_eq!(title, "hello there");
+
+        // Long enough to be worth summarizing → the LLM path is taken, which
+        // this router cannot serve.
+        let long = "please summarize the deployment notes from yesterday for me";
+        assert!(generate_session_title(&router, long).await.is_err());
     }
 
     #[tokio::test]

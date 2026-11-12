@@ -53,6 +53,16 @@ pub trait VectorStore: Send + Sync {
     /// Delete all chunks in a collection.
     async fn delete_by_collection(&self, collection: &str) -> crate::Result<usize>;
 
+    /// How many chunks the collection holds.
+    ///
+    /// Used to skip a search that cannot return anything: an empty knowledge
+    /// base still cost a query expansion and an embedding on every turn.
+    /// The default is "unknown, do not skip" — a backend that cannot answer
+    /// cheaply must lose nothing but the optimisation.
+    async fn collection_len(&self, _collection: &str) -> crate::Result<usize> {
+        Ok(usize::MAX)
+    }
+
     /// Get stats about the store
     async fn stats(&self) -> crate::Result<VectorStoreStats>;
 
@@ -239,6 +249,14 @@ impl VectorStore for MemoryVectorStore {
             total_sources: sources.len(),
             dimension: self.dimension,
         })
+    }
+
+    async fn collection_len(&self, collection: &str) -> crate::Result<usize> {
+        let chunks = self.chunks.read().await;
+        Ok(chunks
+            .values()
+            .filter(|c| c.collection.as_deref() == Some(collection))
+            .count())
     }
 
     async fn clear(&self) -> crate::Result<()> {
