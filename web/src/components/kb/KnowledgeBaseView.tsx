@@ -4,6 +4,7 @@ import type { TFunction } from "i18next";
 import { Cloud, CloudUpload, FileText, Loader2, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { getActiveTransport } from "@/SyscityWebSocketTransport";
 import { cloudLoginUrl, cloudStatus, type CloudStatus } from "@/lib/cloud";
+import { openExternal } from "@/lib/external";
 import { useChatStore } from "@/stores/chatStore";
 import { MarkdownMessage } from "@/components/shared/MarkdownMessage";
 
@@ -508,7 +509,7 @@ export function KnowledgeBaseView({ agents }: { agents: KbAgent[] }) {
   };
 
   const signIn = () => {
-    window.open(cloudLoginUrl("github"), "_blank");
+    void openExternal(cloudLoginUrl("github"));
     if (pollTimer.current) window.clearInterval(pollTimer.current);
     const started = Date.now();
     pollTimer.current = window.setInterval(async () => {

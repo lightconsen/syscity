@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { formatDuration } from "@/lib/utils";
 import { cloudLoginUrl, cloudStatus } from "@/lib/cloud";
+import { openExternal } from "@/lib/external";
 import type { ChatMessage, SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
@@ -101,7 +102,7 @@ function CloudLoginRequiredCard() {
       </p>
       <button
         type="button"
-        onClick={() => window.open(cloudLoginUrl("github"), "_blank")}
+        onClick={() => void openExternal(cloudLoginUrl("github"))}
         className="mt-2 inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-primary-500 hover:bg-primary-600 text-white text-xs font-medium transition"
       >
         <LogIn className="w-3 h-3" />

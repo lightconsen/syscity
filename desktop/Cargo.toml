@@ -48,11 +48,18 @@ rand = "0.10"
 # The desktop table must explicitly exclude x86_64-apple-darwin: features
 # unify across *all* matching target tables, so if it matched there too, the
 # default set (incl. `vision`) would be added back alongside `intel-macos`.
+#
+# `embedded-assets` is not optional for the desktop: the window loads the SPA
+# over `tauri://`, but the embedded gateway also serves it over HTTP, and the
+# cloud OAuth callback (`/cloud/login/callback`) is the one page a browser —
+# the system browser the login hands off to — really visits. Without the
+# feature the gateway looks for `dist/` relative to the app's working
+# directory, finds nothing, and answers the callback with "Build not found".
 [target.'cfg(not(any(target_os = "android", target_os = "ios", all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
-syscity = { path = "..", features = ["cloud"] }
+syscity = { path = "..", features = ["cloud", "embedded-assets"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
-syscity = { path = "..", default-features = false, features = ["intel-macos"] }
+syscity = { path = "..", default-features = false, features = ["intel-macos", "embedded-assets"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 syscity = { path = "..", default-features = false, features = ["mobile"] }

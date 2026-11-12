@@ -3,6 +3,11 @@ import ReactDOM from 'react-dom/client'
 import './index.css'
 import './i18n'
 import App from './App'
+import { installExternalLinkHandler } from './lib/external'
+
+// The desktop shell's WebView cannot open a new window, so every outbound link
+// has to go through the host instead (see lib/external.ts).
+installExternalLinkHandler()
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

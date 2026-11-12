@@ -37,6 +37,7 @@ import {
   type CloudStatus,
   type CloudSubscription,
 } from "@/lib/cloud";
+import { openExternal } from "@/lib/external";
 
 const LOGIN_TIMEOUT_MS = 180_000;
 const POLL_MS = 1_500;
@@ -174,11 +175,22 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
     if (pendingRef.current) return;
     setPending(true);
     pendingSince.current = Date.now();
-    window.open(cloudLoginUrl("github"), "_blank");
     stopPolling();
     pollTimer.current = window.setInterval(() => {
       void checkAndMaybeStop();
     }, POLL_MS);
+    // The desktop shell cannot open a new WebView window, so this goes
+    // through the host instead. If it fails, say so now rather than spinning
+    // for three minutes: nothing was ever started, so nothing can come back.
+    void openExternal(cloudLoginUrl("github")).then((opened) => {
+      if (opened) return;
+      stopPolling();
+      setPending(false);
+      pushToast(
+        "error",
+        i18n.t("AccountButton.loginFailed", { ns: "chat" }),
+      );
+    });
   }, [checkAndMaybeStop, setPending, stopPolling]);
 
   // Close the menu on outside click.
@@ -528,7 +540,7 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
                       </span>
                       <button
                         type="button"
-                        onClick={() => consoleUrl && window.open(consoleUrl, "_blank")}
+                        onClick={() => consoleUrl && void openExternal(consoleUrl)}
                         className="shrink-0 px-2 py-0.5 rounded bg-primary-500 hover:bg-primary-600 text-white font-medium transition"
                       >
                         {t("AccountButton.buy")}

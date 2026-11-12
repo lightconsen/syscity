@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { openExternal } from "@/lib/external";
 
 interface McpAuthModalProps {
   authModal: { serverId: string; authUrl: string } | null;
@@ -17,7 +18,7 @@ export function McpAuthModal({ authModal, onCancel }: McpAuthModalProps) {
         </p>
         <div className="flex gap-2">
           <button
-            onClick={() => window.open(authModal.authUrl, "_blank")}
+            onClick={() => void openExternal(authModal.authUrl)}
             className="px-3 py-1.5 text-xs font-medium rounded-lg bg-primary-600 text-white hover:opacity-90 transition-opacity"
           >
             {t("McpAuthModal.authorize")}

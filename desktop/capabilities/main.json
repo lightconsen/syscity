@@ -1,10 +1,11 @@
 {
   "identifier": "main",
-  "description": "Core permissions for the main window: window drag region (overlay titlebar) + Tauri event listen (gateway-ready / update-status).",
+  "description": "Core permissions for the main window: window drag region (overlay titlebar), Tauri event listen (gateway-ready / update-status), and handing a URL to the system browser (cloud/OAuth sign-in — see web/src/lib/external.ts).",
   "windows": ["main"],
   "permissions": [
     "core:window:default",
     "core:window:allow-start-dragging",
-    "core:event:default"
+    "core:event:default",
+    "shell:allow-open"
   ]
 }
