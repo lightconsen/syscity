@@ -30,6 +30,17 @@
 `run.sh` 封装了所有常见评测场景，自动执行 `cargo build --release` 并检查 API key。
 所有命令等价于直接调用 `syscity eval` CLI，详见下方说明。
 
+### 隔离：评测不碰真实 profile
+
+每次 `run.sh` 执行都会建一个一次性的 `SYSCITY_HOME`（`mktemp -d`），只把
+`config.toml`、`models/`、`secrets/` 带过去（后两者是只读软链），退出时删除。
+`syscity eval run --full` 本身也会把 personality 目录和 agent workspace 指到
+一个私有的临时目录。这两层保证评测 fixture 不会写进真实的
+`~/.syscity/workspace`——曾经发生过：回归用例里的「我叫李四…」被写成了真实
+`USER.md`，对抗用例把自己的 prompt 文本写进了 `workspace/memory/YYYY-MM-DD.md`。
+
+调试时想复用同一个目录：`SYSCITY_EVAL_HOME=/tmp/my-eval ./evals/run.sh quick`。
+
 ---
 
 ## 一、基本使用流程

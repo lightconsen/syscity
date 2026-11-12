@@ -51,6 +51,55 @@ ensure_built() {
     fi
 }
 
+# ── Eval home isolation ────────────────────────────────────────────────────
+# `SYSCITY_HOME` is read exactly once, at process start, and every later path
+# (config, database, workspace, secrets, models) hangs off it. Pointing it at a
+# throwaway directory is what keeps an eval run out of the operator's real
+# `~/.syscity` — before this, an eval fixture's "我叫李四…" became the live
+# user profile and an adversarial task wrote its own prompt text into the real
+# `workspace/memory/`.
+#
+# The pieces a run genuinely needs are carried over: the config (provider,
+# model, API key refs) and read-only links to the downloaded models and the
+# secret store. Everything the run writes lands in the temp root.
+setup_eval_home() {
+    if [ -n "${SYSCITY_EVAL_HOME:-}" ]; then
+        # Reuse a directory across invocations (debugging a suite).
+        mkdir -p "$SYSCITY_EVAL_HOME"
+        export SYSCITY_HOME="$SYSCITY_EVAL_HOME"
+        info "Eval home: $SYSCITY_HOME"
+        return
+    fi
+
+    local real_home="${SYSCITY_HOME:-$HOME/.syscity}"
+    # Not `local`: the trap runs after this function has returned, and a local
+    # would be unbound under `set -u` — which both leaks the directory and
+    # turns a passing run into a failure at exit.
+    EVAL_HOME="$(mktemp -d "${TMPDIR:-/tmp}/syscity-eval-home.XXXXXX")"
+    local eval_home="$EVAL_HOME"
+    trap 'rm -rf "$EVAL_HOME"' EXIT
+
+    if [ -f "$real_home/config.toml" ]; then
+        cp "$real_home/config.toml" "$eval_home/config.toml"
+    fi
+    # Read-only access to things the run must not re-download or duplicate.
+    # `config.toml` holds absolute paths for the embedding model, so the model
+    # link is belt-and-braces for any config that uses a relative one.
+    #
+    # `secrets` is linked because provider keys can live in the file store.
+    # `agents` and `skills` deliberately are *not*: they are writable
+    # configuration, and linking them would hand an eval run the real ones.
+    local entry
+    for entry in models secrets; do
+        if [ -e "$real_home/$entry" ] && [ ! -e "$eval_home/$entry" ]; then
+            ln -s "$real_home/$entry" "$eval_home/$entry"
+        fi
+    done
+
+    export SYSCITY_HOME="$eval_home"
+    info "Eval home isolated at $SYSCITY_HOME"
+}
+
 # ── Commands ───────────────────────────────────────────────────────────────
 
 cmd_quick() {
@@ -235,6 +284,7 @@ main() {
         exit 1
     fi
 
+    setup_eval_home
     ensure_built
 
     if declare -F "cmd_$cmd" > /dev/null; then

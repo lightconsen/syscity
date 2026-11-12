@@ -209,9 +209,22 @@ impl PersonalityMemory {
     /// Create a new personality memory manager
     ///
     /// Uses tiered lookup:
-    /// 1. Workspace level: <workspace>/.syscity/memory/ (if in a workspace)
-    /// 2. User level: ~/.syscity/memory-files/ (fallback)
+    /// 1. `SYSCITY_PERSONALITY_DIR`, when set — an explicit, unconditional
+    ///    override (see [`Self::resolve_base_dir`])
+    /// 2. Workspace level: <workspace>/.syscity/memory/ (if in a workspace)
+    /// 3. User level: ~/.syscity/memory-files/ (fallback)
     pub async fn new() -> crate::Result<Self> {
+        Self::new_with_override(std::env::var("SYSCITY_PERSONALITY_DIR").ok()).await
+    }
+
+    /// [`Self::new`] with the override passed in rather than read from the
+    /// process environment, so tests stay pure.
+    async fn new_with_override(override_value: Option<String>) -> crate::Result<Self> {
+        if let Some(dir) = Self::resolve_base_dir(override_value.as_deref()) {
+            tracing::info!("Using personality memory override: {:?}", dir);
+            return Self::with_dir(dir).await;
+        }
+
         // Try workspace level first
         if let Some(workspace_dir) = Self::find_workspace_memory_dir() {
             if workspace_dir.exists() {
@@ -224,6 +237,18 @@ impl PersonalityMemory {
         let base_dir = crate::dirs::workspace_memory_dir();
         tracing::info!("Using user-level personality memory: {:?}", base_dir);
         Self::with_dir(base_dir).await
+    }
+
+    /// The directory named by `SYSCITY_PERSONALITY_DIR`, if one was given.
+    ///
+    /// An empty value means "not set" rather than "the current directory":
+    /// a shell that exports `SYSCITY_PERSONALITY_DIR=` by accident must not
+    /// turn `personality_memory` writes loose in the process CWD.
+    fn resolve_base_dir(override_value: Option<&str>) -> Option<PathBuf> {
+        override_value
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
     }
 
     /// Find workspace-level memory directory
@@ -1344,6 +1369,24 @@ fn is_cjk(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The override is what keeps an eval run's persona out of the real
+    /// profile; an empty value must not be treated as "the current directory".
+    #[tokio::test]
+    async fn personality_dir_override_wins_and_blank_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("syscity_override_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dir_str = dir.to_string_lossy().to_string();
+
+        let memory = PersonalityMemory::new_with_override(Some(dir_str.clone()))
+            .await
+            .unwrap();
+        assert_eq!(memory.base_dir, dir);
+        tokio::fs::remove_dir_all(&dir).await.ok();
+
+        assert!(PersonalityMemory::resolve_base_dir(Some("  ")).is_none());
+        assert!(PersonalityMemory::resolve_base_dir(None).is_none());
+    }
 
     #[tokio::test]
     async fn test_personality_memory_read_write() {

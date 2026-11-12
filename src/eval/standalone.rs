@@ -171,6 +171,22 @@ pub async fn run_suite(
         std::env::set_var("SYSCITY_MAX_TOOL_ITERATIONS", "60");
     }
 
+    // ── Eval profile isolation ──────────────────────────────────────────────
+    // An eval run is a fixture, not a user. Its agent reads `USER.md` /
+    // `SOUL.md` into the system prompt, may write dated memory fragments, and
+    // resolves relative file paths against its workspace — all of which used
+    // to be the operator's real `~/.syscity/workspace`. The consequences were
+    // not hypothetical: the `multiple_turns` fixture ("我叫李四，今年28岁…")
+    // became the live user profile, and an `edge_irrelevant_context` task
+    // wrote its own prompt text into `memory/YYYY-MM-DD.md`, which every later
+    // real session then loaded as remembered context.
+    //
+    // Both levers move for the life of the run: the personality directory
+    // (`SYSCITY_PERSONALITY_DIR`) and the agent workspace, so neither the
+    // prompt layer nor the file tools can reach the real profile. The temp
+    // root is kept alive until `run_suite` returns.
+    let eval_home = isolate_eval_profile()?;
+
     println!("\n═══ Eval Suite: {} ═══", suite.name);
     println!("  Tasks:    {}", suite.tasks.len());
     println!("  Min pass: {:.0}%", suite.min_pass_rate * 100.0);
@@ -275,9 +291,11 @@ pub async fn run_suite(
     {
         let tools_for_builder = tool_registry.clone();
         let provider_for_builder = provider.clone();
+        let subagent_workspace = eval_home.path().join("workspace");
         acp.set_agent_builder(move |subagent_id| {
             let mut cfg = crate::agent::AgentConfig {
                 agent_id: Some(subagent_id.to_string()),
+                workspace_dir: Some(subagent_workspace.clone()),
                 ..crate::agent::AgentConfig::default()
             };
             cfg.max_tokens = 8192;
@@ -291,6 +309,10 @@ pub async fn run_suite(
         .as_ref()
         .map(|g| g.default_agent.clone())
         .unwrap_or_default();
+    // Keep the eval agent's files in the throwaway root created above. This
+    // also resolves relative paths in eval tasks (`fibonacci.py`, `AGENTS.md`)
+    // inside that root instead of the operator's real workspace.
+    agent_config.workspace_dir = Some(eval_home.path().join("workspace"));
     // 改动1 (eval-only): raise the eval agent's output cap so long analyses and
     // multi-step summaries aren't truncated mid-sentence (judge measures
     // capability, not the 2048-token default). Production default unchanged.
@@ -842,6 +864,30 @@ fn append_eval_ledger(
     }
 }
 
+/// Give an eval run its own throwaway profile directory.
+///
+/// The agent of an eval run reads `USER.md` / `SOUL.md` into its system prompt,
+/// writes dated memory fragments, and resolves relative file paths against its
+/// workspace. Without this, all three landed in the operator's real
+/// `~/.syscity/workspace`: a regression fixture's "我叫李四…" became the live
+/// user profile, and an adversarial task wrote its own prompt text into
+/// `memory/YYYY-MM-DD.md`, which every later real session then loaded as
+/// remembered context.
+///
+/// Returns the run's root; the [`tempfile::TempDir`] guard inside keeps it
+/// alive, so the caller must hold it until the run finishes.
+fn isolate_eval_profile() -> Result<tempfile::TempDir> {
+    let root = tempfile::Builder::new().prefix("syscity-eval-").tempdir()?;
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    // In production the personality files live in the workspace directory
+    // (`dirs::workspace_memory_dir()`), so pointing both at the same throwaway
+    // directory keeps the eval layout faithful while changing only its root.
+    std::env::set_var("SYSCITY_PERSONALITY_DIR", &workspace);
+    info!("Eval profile isolated at {:?}", root.path());
+    Ok(root)
+}
+
 /// Find and parse the config file as `GatewayConfig`.
 ///
 /// Searches the same locations as the daemon:
@@ -1084,6 +1130,32 @@ mod tests {
             prompt.contains("that format wins over this guidance"),
             "the task's own format must win"
         );
+    }
+
+    /// The isolation helper is what stops an eval fixture from becoming the
+    /// operator's real profile: the personality files and the agent workspace
+    /// must both land under one throwaway root, and that root must not be a
+    /// path the live profile also uses.
+    #[test]
+    fn eval_profile_isolation_points_everything_at_one_throwaway_root() {
+        let home = isolate_eval_profile().expect("temp eval home");
+        let workspace = home.path().join("workspace");
+
+        assert!(workspace.is_dir(), "the eval workspace must exist");
+        assert_eq!(
+            std::env::var("SYSCITY_PERSONALITY_DIR").as_deref(),
+            Ok(workspace.to_string_lossy().as_ref()),
+            "the personality layer must read the throwaway workspace"
+        );
+        assert!(
+            !workspace.starts_with(crate::dirs::workspace_memory_dir()),
+            "the eval workspace must not be the live one"
+        );
+
+        // Dropping the guard removes the root, so nothing outlives the run.
+        let root = home.path().to_path_buf();
+        drop(home);
+        assert!(!root.exists(), "the eval home must be cleaned up");
     }
 
     /// An eval run on DeepSeek must be able to search even when `[search]`
