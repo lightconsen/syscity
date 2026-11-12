@@ -118,24 +118,15 @@ impl Agent {
             {
                 info!("Cache hit for user {} - returning cached response", user_id);
 
-                // Store user message in chat history
-                if let Some(store) = self.chat_history() {
-                    use crate::memory::ChatMessage;
-                    let chat_msg = ChatMessage::new(&conversation_id, &user_id, "user", &content);
-                    if let Err(e) = store.store_message(chat_msg).await {
-                        error!("Failed to store user message: {}", e);
-                    }
-                }
-
-                // Store cached assistant response in chat history
-                if let Some(store) = self.chat_history() {
-                    use crate::memory::ChatMessage;
-                    let chat_msg =
-                        ChatMessage::new(&conversation_id, &user_id, "assistant", &cached.response);
-                    if let Err(e) = store.store_message(chat_msg).await {
-                        error!("Failed to store assistant message: {}", e);
-                    }
-                }
+                // Persist through the shared path, not a bare `store_message`:
+                // a cache hit is still a turn, and the direct write skipped
+                // session-search indexing and the context-cache invalidation —
+                // so a cached reply could never be recalled, and the next
+                // session context was built from a stale snapshot.
+                self.persist_user_message(&conversation_id, &user_id, &content)
+                    .await;
+                self.persist_assistant_message(&conversation_id, &user_id, &cached.response)
+                    .await;
 
                 // Return cached response
                 return Ok(OutgoingMessage::new(
@@ -506,24 +497,11 @@ impl Agent {
                 })
                 .await;
 
-                // Store user message in chat history
-                if let Some(store) = self.chat_history() {
-                    use crate::memory::ChatMessage;
-                    let chat_msg = ChatMessage::new(&conversation_id, &user_id, "user", &content);
-                    if let Err(e) = store.store_message(chat_msg).await {
-                        error!("Failed to store user message: {}", e);
-                    }
-                }
-
-                // Store cached assistant response in chat history
-                if let Some(store) = self.chat_history() {
-                    use crate::memory::ChatMessage;
-                    let chat_msg =
-                        ChatMessage::new(&conversation_id, &user_id, "assistant", &cached.response);
-                    if let Err(e) = store.store_message(chat_msg).await {
-                        error!("Failed to store assistant message: {}", e);
-                    }
-                }
+                // Same shared path as the non-streaming turn — see above.
+                self.persist_user_message(&conversation_id, &user_id, &content)
+                    .await;
+                self.persist_assistant_message(&conversation_id, &user_id, &cached.response)
+                    .await;
 
                 // Record the cache hit as a completed turn with no LLM rounds so
                 // cache-hit rate / cost statistics stay accurate. The collector
@@ -969,7 +947,13 @@ impl Agent {
     /// chat history, session-search index, transcript/disk budget) best-effort.
     /// Shared by `process_message` and `process_message_with_progress`.
     async fn persist_user_message(&self, conversation_id: &str, user_id: &str, content: &str) {
-        // Persist user message via MemoryManager (episodic memory)
+        // One write, one store. `MemoryManager::remember_message` already puts
+        // the row in the manager's chat-history store (the same object
+        // `chat_history()` returns) and indexes it for session search, so
+        // writing through both paths stored every message twice. Rehydrated
+        // history then showed the model several copies of a single user turn —
+        // one "hello" arrived as three.
+        let message_id = uuid::Uuid::new_v4().to_string();
         if let Some(ref mm) = self.memory_manager {
             if let Err(e) = mm
                 .remember_message(user_id, conversation_id, "user", content)
@@ -977,14 +961,9 @@ impl Agent {
             {
                 warn!("MemoryManager: failed to store user message: {}", e);
             }
-        }
-
-        // Store user message in chat history and index for search
-        let message_id = uuid::Uuid::new_v4().to_string();
-        if let Some(store) = self.chat_history() {
+        } else if let Some(store) = self.chat_history() {
             use crate::memory::ChatMessage;
             let chat_msg = ChatMessage::new(conversation_id, user_id, "user", content);
-            // Clone message_id before moving chat_msg
             let msg_id = chat_msg.id.clone();
             if let Err(e) = store.store_message(chat_msg).await {
                 error!("Failed to store user message: {}", e);
@@ -1057,7 +1036,7 @@ impl Agent {
             }
         }
 
-        // Persist assistant response via MemoryManager (episodic memory)
+        // One write, one store — see `persist_user_message`.
         if let Some(ref mm) = self.memory_manager {
             if let Err(e) = mm
                 .remember_message(user_id, conversation_id, "assistant", content)
@@ -1065,9 +1044,7 @@ impl Agent {
             {
                 warn!("MemoryManager: failed to store assistant message: {}", e);
             }
-        }
-
-        if let Some(store) = self.chat_history() {
+        } else if let Some(store) = self.chat_history() {
             use crate::memory::ChatMessage;
             let chat_msg = ChatMessage::new(conversation_id, user_id, "assistant", content);
             let msg_id = chat_msg.id.clone();

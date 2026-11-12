@@ -1478,3 +1478,124 @@ async fn an_identical_call_to_a_pure_tool_is_still_skipped() {
         "the skipped rounds still close with a real answer"
     );
 }
+
+/// A turn persists each message once, and the request the model sees carries
+/// the current user message once.
+///
+/// Both halves used to fail together: `persist_user_message` wrote through
+/// `MemoryManager::remember_message` *and* `chat_history().store_message`,
+/// which are the same store, so every message landed twice; and the fresh
+/// context rehydrated that just-written row before the engine appended the
+/// live message, so one "hello" reached the model three times.
+#[tokio::test]
+async fn a_turn_is_persisted_once_and_sent_once() {
+    use std::sync::Mutex;
+
+    use crate::channels::IncomingMessage;
+    use crate::memory::{ChatHistoryStore, MemoryManager};
+    use crate::providers::Role;
+
+    struct CaptureRequests(Arc<Mutex<Vec<Vec<(Role, String)>>>>);
+
+    #[async_trait::async_trait]
+    impl Provider for CaptureRequests {
+        fn name(&self) -> &str {
+            "capture-requests-test"
+        }
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+        fn max_context(&self) -> usize {
+            128_000
+        }
+        async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+            self.0.lock().unwrap().push(
+                request
+                    .messages
+                    .iter()
+                    .map(|m| (m.role, m.content.clone()))
+                    .collect(),
+            );
+            Ok(CompletionResponse {
+                message: Message::assistant("ok"),
+                model: self.default_model().to_string(),
+                usage: Some(Usage::default()),
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+        async fn stream(&self, _request: CompletionRequest) -> crate::Result<CompletionStream> {
+            unimplemented!("non-streaming test");
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn set_credential(
+            &self,
+            _credential: crate::model_router::Credential,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(crate::memory::DatabaseStore::new_in_memory().await.unwrap());
+    let seen: Arc<Mutex<Vec<Vec<(Role, String)>>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        AgentConfig::default(),
+        Arc::new(CaptureRequests(seen.clone())),
+        Arc::new(crate::tools::ToolRegistry::new()),
+    )
+    .with_memory_manager(Arc::new(MemoryManager::new(
+        store.clone(),
+        store.clone(),
+        crate::memory::MemoryManagerConfig::default(),
+    )));
+
+    let conversation = "conv-single-write";
+    agent
+        .process_message(IncomingMessage::new("anonymous", conversation, "hello"))
+        .await
+        .unwrap();
+
+    let history = store
+        .get_conversation_history(conversation, 50)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2, "one user row + one assistant row, got {history:?}");
+
+    {
+        let seen = seen.lock().unwrap();
+        let first = &seen[0];
+        let hellos = first
+            .iter()
+            .filter(|(role, content)| *role == Role::User && content == "hello")
+            .count();
+        assert_eq!(hellos, 1, "the model must see one hello, got {first:?}");
+    }
+
+    // A second turn rehydrates the first turn and still sends its own user
+    // message exactly once.
+    agent
+        .process_message(IncomingMessage::new("anonymous", conversation, "again"))
+        .await
+        .unwrap();
+
+    let history = store
+        .get_conversation_history(conversation, 50)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 4, "no message is stored twice, got {history:?}");
+
+    let seen = seen.lock().unwrap();
+    let second = &seen[1];
+    let count = |text: &str| {
+        second
+            .iter()
+            .filter(|(role, content)| *role == Role::User && content == text)
+            .count()
+    };
+    assert_eq!(count("hello"), 1, "earlier turn replayed once, got {second:?}");
+    assert_eq!(count("again"), 1, "current turn sent once, got {second:?}");
+}

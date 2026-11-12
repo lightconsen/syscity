@@ -753,7 +753,18 @@ impl Agent {
             };
 
             match history {
-                Ok(history) => {
+                Ok(mut history) => {
+                    // The caller persists the message being processed before
+                    // building this context, so it is the newest row in
+                    // history. Keeping it here would hand the model the same
+                    // turn twice — once replayed from history, once as the
+                    // live message the engine appends right after this call.
+                    if matches!(
+                        history.last(),
+                        Some(msg) if msg.role == "user" && msg.content == user_message
+                    ) {
+                        history.pop();
+                    }
                     if let Some(ref summary) = summary {
                         let mut summary_msg = crate::providers::Message::system(summary.clone());
                         summary_msg.name = Some("compaction_summary".to_string());
