@@ -1144,7 +1144,7 @@ mod tests {
     /// Persist a session row with the given pinned model (if any) for `session_id`.
     async fn seed_session(state: &GatewayState, session_id: &str, model: Option<&str>) {
         let store = state.agents.store.as_ref().expect("store wired in");
-        let mut meta = SessionMetadata::new(session_id, "main", "web", "u1");
+        let mut meta = SessionMetadata::new(session_id, "default", "web", "u1");
         meta.model = model.map(String::from);
         store
             .save_session(session_id, &meta, "{}")
@@ -1159,9 +1159,10 @@ mod tests {
         {
             let mut config = state.config.write().await;
             let cfg = Arc::make_mut(&mut config);
-            cfg.agent_models.insert("main".into(), "agent-model".into());
+            cfg.agent_models
+                .insert("default".into(), "agent-model".into());
         }
-        let resolved = resolve_session_model(&state, "s1", "main").await;
+        let resolved = resolve_session_model(&state, "s1", "default").await;
         assert_eq!(resolved.as_deref(), Some("alt"));
     }
 
@@ -1172,9 +1173,10 @@ mod tests {
         {
             let mut config = state.config.write().await;
             let cfg = Arc::make_mut(&mut config);
-            cfg.agent_models.insert("main".into(), "agent-model".into());
+            cfg.agent_models
+                .insert("default".into(), "agent-model".into());
         }
-        let resolved = resolve_session_model(&state, "s1", "main").await;
+        let resolved = resolve_session_model(&state, "s1", "default").await;
         assert_eq!(resolved.as_deref(), Some("agent-model"));
     }
 
@@ -1185,9 +1187,10 @@ mod tests {
         {
             let mut config = state.config.write().await;
             let cfg = Arc::make_mut(&mut config);
-            cfg.agent_models.insert("main".into(), "agent-model".into());
+            cfg.agent_models
+                .insert("default".into(), "agent-model".into());
         }
-        let resolved = resolve_session_model(&state, "s1", "main").await;
+        let resolved = resolve_session_model(&state, "s1", "default").await;
         assert_eq!(resolved.as_deref(), Some("agent-model"));
     }
 
@@ -1195,7 +1198,7 @@ mod tests {
     async fn resolve_returns_none_when_neither_bound() {
         let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
         seed_session(&state, "s1", None).await;
-        let resolved = resolve_session_model(&state, "s1", "main").await;
+        let resolved = resolve_session_model(&state, "s1", "default").await;
         assert_eq!(resolved, None);
     }
 
@@ -1205,9 +1208,10 @@ mod tests {
         {
             let mut config = state.config.write().await;
             let cfg = Arc::make_mut(&mut config);
-            cfg.agent_models.insert("main".into(), "agent-model".into());
+            cfg.agent_models
+                .insert("default".into(), "agent-model".into());
         }
-        let resolved = resolve_session_model(&state, "s1", "main").await;
+        let resolved = resolve_session_model(&state, "s1", "default").await;
         assert_eq!(resolved.as_deref(), Some("agent-model"));
     }
 
@@ -1339,7 +1343,7 @@ mod tests {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
         dispatch_routed_message(
             &state,
-            routed_msg("main", "s1", crate::inbound::QueueMode::Normal, true),
+            routed_msg("default", "s1", crate::inbound::QueueMode::Normal, true),
         )
         .await;
         let buffers = state.agents.message_buffer.read().await;
@@ -1400,7 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn flush_session_buffer_empty_is_noop() {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
-        flush_session_buffer(&state, "main", "s1", None, None).await;
+        flush_session_buffer(&state, "default", "s1", None, None).await;
         let buffers = state.agents.message_buffer.read().await;
         assert!(buffers.is_empty());
     }

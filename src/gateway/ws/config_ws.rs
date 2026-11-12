@@ -802,26 +802,42 @@ mod tests {
     async fn config_set_agent_models_binds_and_clears() {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
         register_provider(&state, "openai", &["gpt-4o"]).await;
-        let res = set_and_ok(&state, "agent_models.main", serde_json::json!("gpt-4o")).await;
+        let res = set_and_ok(&state, "agent_models.default", serde_json::json!("gpt-4o")).await;
         assert!(res.ok);
         assert_eq!(
-            state.config.read().await.agent_models.get("main").cloned(),
+            state
+                .config
+                .read()
+                .await
+                .agent_models
+                .get("default")
+                .cloned(),
             Some("gpt-4o".into())
         );
 
         // Null clears the binding.
-        let res = set_and_ok(&state, "agent_models.main", serde_json::Value::Null).await;
+        let res = set_and_ok(&state, "agent_models.default", serde_json::Value::Null).await;
         assert!(res.ok);
-        assert!(!state.config.read().await.agent_models.contains_key("main"));
+        assert!(!state
+            .config
+            .read()
+            .await
+            .agent_models
+            .contains_key("default"));
     }
 
     #[tokio::test]
     async fn config_set_agent_models_rejects_unknown_model() {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
-        let res = set_and_ok(&state, "agent_models.main", serde_json::json!("nope")).await;
+        let res = set_and_ok(&state, "agent_models.default", serde_json::json!("nope")).await;
         assert!(!res.ok);
         assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("MODEL_NOT_FOUND"));
-        assert!(!state.config.read().await.agent_models.contains_key("main"));
+        assert!(!state
+            .config
+            .read()
+            .await
+            .agent_models
+            .contains_key("default"));
     }
 
     /// A provider-qualified cloud ref is a valid agent binding; a `cloud/` ref
@@ -832,11 +848,17 @@ mod tests {
         register_provider(&state, "cloud", &["deepseek-v4-pro"]).await;
 
         let res =
-            set_and_ok(&state, "agent_models.main", serde_json::json!("cloud/deepseek-v4-pro"))
+            set_and_ok(&state, "agent_models.default", serde_json::json!("cloud/deepseek-v4-pro"))
                 .await;
         assert!(res.ok, "qualified cloud ref should bind: {:?}", res.error);
         assert_eq!(
-            state.config.read().await.agent_models.get("main").cloned(),
+            state
+                .config
+                .read()
+                .await
+                .agent_models
+                .get("default")
+                .cloned(),
             Some("cloud/deepseek-v4-pro".into())
         );
 

@@ -146,7 +146,7 @@ pub(crate) async fn init_plugin_channels(
                         warn!("WASM channel plugin '{}' failed: {}", plugin_name, e);
                     }
                 });
-                register_channel_task(&state, name, "main", start_handle).await;
+                register_channel_task(&state, name, "start", start_handle).await;
 
                 // Wire health monitoring
                 if let Some(ref monitor) = state.channels.health_monitor {
@@ -532,7 +532,7 @@ pub(crate) async fn init_discord_channel(
                 error!("Discord channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -588,7 +588,7 @@ pub(crate) async fn init_slack_channel(
                 error!("Slack channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -628,7 +628,7 @@ pub(crate) async fn init_whatsapp_channel(
                 error!("WhatsApp channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -671,7 +671,7 @@ pub(crate) async fn init_feishu_channel(
                 error!("Feishu channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -723,7 +723,7 @@ pub(crate) async fn init_wechatmp_channel(
                 error!("WeChat MP channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -771,7 +771,7 @@ pub(crate) async fn init_line_channel(
                 error!("LINE channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -825,7 +825,7 @@ pub(crate) async fn init_twilio_channel(
                 error!("Twilio channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher
@@ -935,7 +935,7 @@ pub(crate) async fn init_googlechat_channel(
             error!("Google Chat channel {} failed: {}", channel_name, e);
         }
     });
-    register_channel_task(&state, name, "main", main_handle).await;
+    register_channel_task(&state, name, "start", main_handle).await;
     state
         .channels
         .reply_dispatcher
@@ -1022,7 +1022,7 @@ pub(crate) async fn init_teams_channel(
             error!("Teams channel {} failed: {}", channel_name, e);
         }
     });
-    register_channel_task(&state, name, "main", main_handle).await;
+    register_channel_task(&state, name, "start", main_handle).await;
     state
         .channels
         .reply_dispatcher
@@ -1115,7 +1115,7 @@ pub(crate) async fn init_wecom_channel(
             error!("WeCom channel {} failed: {}", name_for_task, e);
         }
     });
-    register_channel_task(&state, name, "main", main_handle).await;
+    register_channel_task(&state, name, "start", main_handle).await;
 
     state
         .channels
@@ -1198,7 +1198,7 @@ pub(crate) async fn init_dingtalk_channel(
             error!("DingTalk channel {} failed: {}", name_for_task, e);
         }
     });
-    register_channel_task(&state, name, "main", main_handle).await;
+    register_channel_task(&state, name, "start", main_handle).await;
 
     state
         .channels
@@ -1291,7 +1291,7 @@ pub(crate) async fn init_irc_channel(
             error!("IRC channel {} failed: {}", name_for_task, e);
         }
     });
-    register_channel_task(&state, name, "main", main_handle).await;
+    register_channel_task(&state, name, "start", main_handle).await;
 
     state
         .channels
@@ -1364,7 +1364,7 @@ pub(crate) async fn init_simplex_channel(
             error!("SimpleX channel {} failed: {}", name_for_task, e);
         }
     });
-    register_channel_task(&state, name, "main", main_handle).await;
+    register_channel_task(&state, name, "start", main_handle).await;
 
     state
         .channels
@@ -1420,7 +1420,7 @@ pub(crate) async fn init_qq_channel(
                 error!("QQ channel {} failed: {}", channel_name, e);
             }
         });
-        register_channel_task(&state, name, "main", main_handle).await;
+        register_channel_task(&state, name, "start", main_handle).await;
         state
             .channels
             .reply_dispatcher

@@ -130,7 +130,7 @@ mod tests {
             session_id: Some("s".into()),
             conversation_id: "c".into(),
             agent_id: "worker".into(),
-            thread_id: "main".into(),
+            thread_id: "thread-1".into(),
             turn_index: 0,
             state: TurnEndState::Complete,
             started_at: "2026-08-14T10:00:00+08:00".into(),

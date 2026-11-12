@@ -1013,7 +1013,7 @@ mod tests {
             session_id: Some("s1".into()),
             conversation_id: "c1".into(),
             agent_id: "worker".into(),
-            thread_id: "main".into(),
+            thread_id: "thread-1".into(),
             turn_index,
             state: TurnEndState::Complete,
             started_at: "2026-08-14T10:00:00+08:00".into(),
@@ -1047,7 +1047,7 @@ mod tests {
             created_at: chrono::DateTime::parse_from_rfc3339("2026-08-14T09:00:00+08:00")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
-            thread_id: Some("main".into()),
+            thread_id: Some("thread-1".into()),
             turn_index: Some(turn_index),
         }
     }
@@ -1093,7 +1093,7 @@ mod tests {
                 },
                 TurnOutcomeRow {
                     turn_id: "t2".into(),
-                    agent_id: "main".into(),
+                    agent_id: "reviewer".into(),
                     state: "complete".into(),
                     duration_ms: 500,
                     ttft_ms: None,

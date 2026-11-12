@@ -30,8 +30,16 @@ if no section matches, the release falls back to auto-generated notes.
   tools. It used to be a bare 24px spinner with no way to tell starting from
   stuck.
 
+- The cron shared-session target is named `shared` instead of `main`
+  (`cron:shared`). `"main"` is still accepted when reading job files, so
+  existing schedules load unchanged.
+
 ### Fixed
 
+- The quality gate measures the suites it runs. The pass-rate criterion named a
+  hard-coded suite id (`main`) that is never in `config.suites`, so it always
+  evaluated "not executed" and the gate could not pass however well the real
+  suites did; there is now one criterion per configured suite.
 - A message is stored once per turn and reaches the model once. Every user and
   assistant message was written twice — through `MemoryManager::remember_message`
   and again through the chat-history store it already wraps — and the user

@@ -629,12 +629,12 @@ mod tests {
     async fn agents_default_switches_resolver() {
         let state = state().await;
         let resp = handle_agents_default(
-            &req("r1", Some(serde_json::json!({ "agent_id": "main" }))),
+            &req("r1", Some(serde_json::json!({ "agent_id": "default" }))),
             &state,
         )
         .await;
         assert!(resp.ok, "default failed: {:?}", resp.error);
-        assert_eq!(state.agents.route_resolver.default_agent().await, "main");
+        assert_eq!(state.agents.route_resolver.default_agent().await, "default");
     }
 
     #[tokio::test]

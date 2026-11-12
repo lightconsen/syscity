@@ -415,7 +415,7 @@ impl CronScheduler {
         agent_id: Option<&str>,
     ) -> Result<String> {
         let session_id = match job.session {
-            SessionTarget::Main => "cron:main".to_string(),
+            SessionTarget::Shared => "cron:shared".to_string(),
             SessionTarget::Isolated => format!("cron:{}", job.id),
         };
 

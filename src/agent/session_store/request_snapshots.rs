@@ -203,7 +203,11 @@ mod tests {
     async fn save_and_load_request_snapshot_roundtrip() {
         let store = create_test_store().await;
         store
-            .save_session("snap-sess", &SessionMetadata::new("snap-sess", "main", "cli", "u"), "{}")
+            .save_session(
+                "snap-sess",
+                &SessionMetadata::new("snap-sess", "default", "cli", "u"),
+                "{}",
+            )
             .await
             .unwrap();
 
@@ -215,7 +219,7 @@ mod tests {
         let snapshot = RequestSnapshot {
             session_id: Some("snap-sess"),
             conversation_id: Some("conv-1"),
-            agent_id: Some("main"),
+            agent_id: Some("default"),
             model: "claude-haiku",
             system_prompt: "You are syscity.",
             tools_json: &tools,
@@ -229,7 +233,7 @@ mod tests {
         assert_eq!(rows[0].id, id);
         assert_eq!(rows[0].model, "claude-haiku");
         assert_eq!(rows[0].system_prompt, "You are syscity.");
-        assert_eq!(rows[0].agent_id.as_deref(), Some("main"));
+        assert_eq!(rows[0].agent_id.as_deref(), Some("default"));
         assert_eq!(rows[0].conversation_id.as_deref(), Some("conv-1"));
         assert!(rows[0].tools_json.contains("\"time\""));
         assert!(rows[0].created_at_ms > 0);
@@ -241,7 +245,7 @@ mod tests {
         store
             .save_session(
                 "order-sess",
-                &SessionMetadata::new("order-sess", "main", "cli", "u"),
+                &SessionMetadata::new("order-sess", "default", "cli", "u"),
                 "{}",
             )
             .await
@@ -251,7 +255,7 @@ mod tests {
             let snapshot = RequestSnapshot {
                 session_id: Some("order-sess"),
                 conversation_id: Some("c"),
-                agent_id: Some("main"),
+                agent_id: Some("default"),
                 model: "m",
                 system_prompt: prompt,
                 tools_json: "[]",

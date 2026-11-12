@@ -342,6 +342,15 @@ mod tests {
         assert_eq!(SessionTarget::default(), SessionTarget::Isolated);
     }
 
+    /// Job files written before the shared-session rename store `"main"`;
+    /// they must keep loading rather than fail the whole jobs file.
+    #[test]
+    fn test_session_target_reads_retired_main_spelling() {
+        let parsed: SessionTarget = serde_json::from_str("\"main\"").unwrap();
+        assert_eq!(parsed, SessionTarget::Shared);
+        assert_eq!(serde_json::to_string(&SessionTarget::Shared).unwrap(), "\"shared\"");
+    }
+
     #[test]
     fn test_retry_config_default() {
         let config = RetryConfig::default();
@@ -390,7 +399,7 @@ mod tests {
             channel: "discord".to_string(),
             to: "#general".to_string(),
         })
-        .with_session(SessionTarget::Main)
+        .with_session(SessionTarget::Shared)
         .with_retry(RetryConfig {
             max_retries: 5,
             backoff: BackoffStrategy::Fixed,
@@ -400,7 +409,7 @@ mod tests {
             job.delivery,
             DeliveryMode::Announce { channel, to } if channel == "discord" && to == "#general"
         ));
-        assert_eq!(job.session, SessionTarget::Main);
+        assert_eq!(job.session, SessionTarget::Shared);
         assert_eq!(job.retry.max_retries, 5);
         assert_eq!(job.retry.backoff, BackoffStrategy::Fixed);
     }

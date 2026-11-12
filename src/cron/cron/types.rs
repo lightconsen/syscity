@@ -69,8 +69,11 @@ impl ExecutionTarget {
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum SessionTarget {
-    /// Run in main session (has conversation context)
-    Main,
+    /// Run in the scheduler's shared cron session (`cron:shared`), which keeps
+    /// conversation context across runs. Accepts the retired `"main"` spelling
+    /// so job files written before the rename still load.
+    #[serde(alias = "main")]
+    Shared,
     /// Run in isolated session (clean state: cron:{job_id})
     #[default]
     Isolated,

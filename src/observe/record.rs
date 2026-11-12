@@ -492,8 +492,8 @@ mod tests {
             turn_id: "t1".into(),
             session_id: Some("s1".into()),
             conversation_id: "c1".into(),
-            agent_id: "main".into(),
-            thread_id: "main".into(),
+            agent_id: "worker".into(),
+            thread_id: "thread-1".into(),
             turn_index: 0,
             state: TurnEndState::Complete,
             started_at: "2026-08-14T10:00:00+08:00".into(),
@@ -545,7 +545,7 @@ mod tests {
             channel: Some(ChannelObservation {
                 debounced: true,
                 enriched: false,
-                route: Some("main".into()),
+                route: Some("worker".into()),
             }),
         };
         let json = serde_json::to_string(&rec).unwrap();
@@ -568,8 +568,8 @@ mod tests {
             "turn_id": "old",
             "session_id": null,
             "conversation_id": "c",
-            "agent_id": "main",
-            "thread_id": "main",
+            "agent_id": "worker",
+            "thread_id": "thread-1",
             "turn_index": 0,
             "state": "complete",
             "started_at": "2026-08-14T10:00:00+08:00",

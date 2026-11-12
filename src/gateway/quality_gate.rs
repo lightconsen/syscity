@@ -347,24 +347,23 @@ impl QualityGate {
         self
     }
 
-    /// Create from configuration.
-    pub fn from_config(
-        config: &QualityGateConfig,
-        harness: EvalHarness,
-        evals_dir: PathBuf,
-        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
-    ) -> Option<Self> {
-        if !config.enabled {
-            return None;
-        }
-
+    /// The criteria implied by a gate configuration.
+    ///
+    /// Split out of [`Self::from_config`] so it can be asserted without
+    /// building a harness and a paths root.
+    pub fn criteria_from_config(config: &QualityGateConfig) -> Vec<GateCriterion> {
         let mut criteria = Vec::new();
 
-        // Pass rate criterion
-        criteria.push(GateCriterion::PassRate {
-            suite_id: "main".into(),
-            min_rate: config.min_pass_rate,
-        });
+        // Pass-rate criterion, one per configured suite. The criterion names
+        // the suite it measures, so it has to come from `config.suites` — a
+        // hard-coded id would evaluate a suite the gate never runs and fail
+        // with "not executed" no matter how well the real suites did.
+        for suite_id in &config.suites {
+            criteria.push(GateCriterion::PassRate {
+                suite_id: suite_id.clone(),
+                min_rate: config.min_pass_rate,
+            });
+        }
 
         // Zero P0 criterion
         if config.require_zero_p0 {
@@ -381,6 +380,22 @@ impl QualityGate {
                 max_degradation,
             });
         }
+
+        criteria
+    }
+
+    /// Create from configuration.
+    pub fn from_config(
+        config: &QualityGateConfig,
+        harness: EvalHarness,
+        evals_dir: PathBuf,
+        paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+    ) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+
+        let criteria = Self::criteria_from_config(config);
 
         Some(Self {
             name: config.name.clone(),
@@ -1286,6 +1301,47 @@ mod tests {
         let s = SuiteSummary::from_tasks("test".into(), summaries);
         assert!((s.overall_pass_rate - 0.8).abs() < 0.01);
         assert!(!s.continuous_success);
+    }
+
+    /// The pass-rate criterion must name a suite the gate actually runs;
+    /// naming anything else makes it evaluate "not executed" forever.
+    #[test]
+    fn test_criteria_name_the_configured_suites() {
+        let config = QualityGateConfig {
+            enabled: true,
+            suites: vec!["smoke".into(), "gaia".into()],
+            min_pass_rate: 0.75,
+            ..QualityGateConfig::default()
+        };
+
+        let criteria = QualityGate::criteria_from_config(&config);
+
+        let pass_rate: Vec<(String, f64)> = criteria
+            .iter()
+            .filter_map(|c| match c {
+                GateCriterion::PassRate { suite_id, min_rate } => {
+                    Some((suite_id.clone(), *min_rate))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pass_rate, vec![("smoke".to_string(), 0.75), ("gaia".to_string(), 0.75)]);
+    }
+
+    #[test]
+    fn test_criteria_omit_disabled_checks() {
+        let config = QualityGateConfig {
+            enabled: true,
+            suites: vec!["smoke".into()],
+            require_zero_p0: false,
+            baseline_tag: None,
+            max_degradation: None,
+            ..QualityGateConfig::default()
+        };
+
+        let criteria = QualityGate::criteria_from_config(&config);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(criteria[0], GateCriterion::PassRate { .. }));
     }
 
     #[test]

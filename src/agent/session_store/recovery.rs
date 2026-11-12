@@ -299,7 +299,7 @@ mod tests {
         store
             .save_session(
                 session_id,
-                &SessionMetadata::new(session_id, "main", "cli", "local"),
+                &SessionMetadata::new(session_id, "default", "cli", "local"),
                 "{}",
             )
             .await

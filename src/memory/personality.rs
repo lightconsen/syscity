@@ -64,7 +64,7 @@ static RE_EXFILTRATION: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Controls which memory files are included in the system prompt.
 ///
-/// `Primary` produces the full prompt including MEMORY.md (for main session
+/// `Primary` produces the full prompt including MEMORY.md (for a direct chat
 /// with user). `Subagent` omits MEMORY.md (contains personal context that
 /// shouldn't leak to strangers) and BOOTSTRAP.md (startup-only instructions
 /// irrelevant to subagents).
@@ -833,7 +833,7 @@ Before doing anything else:
 1. Read `SOUL.md` — this is who you are
 2. Read `USER.md` — this is who you're helping
 3. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
-4. **If in MAIN SESSION** (direct chat with your human): Also read `MEMORY.md`
+4. **If this is a direct chat with your human**: Also read `MEMORY.md`
 
 Don't ask permission. Just do it.
 
@@ -848,10 +848,10 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 
 ### 🧠 MEMORY.md - Your Long-Term Memory
 
-- **ONLY load in main session** (direct chats with your human)
+- **ONLY load in a direct chat with your human**
 - **DO NOT load in shared contexts** (group chats, sessions with other people)
 - This is for **security** — contains personal context that shouldn't leak to strangers
-- You can **read, edit, and update** MEMORY.md freely in main sessions
+- You can **read, edit, and update** MEMORY.md freely in direct chats
 - Write significant events, thoughts, decisions, opinions, lessons learned
 - This is your curated memory — the distilled essence, not raw logs
 - Over time, review your daily files and update MEMORY.md with what's worth keeping
@@ -934,7 +934,7 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 **Use cron when:**
 
 - Exact timing matters ("9:00 AM sharp every Monday")
-- Task needs isolation from main session history
+- Task needs isolation from the conversation's history
 - You want a different model or thinking level for the task
 
 **Tip:** Batch similar periodic checks into `HEARTBEAT.md` instead of creating multiple cron jobs. Use cron for precise schedules and standalone tasks.
@@ -1180,7 +1180,7 @@ Think of this as your "second brain" - the distilled essence of your experiences
 
 ## Security Note
 
-This file contains personal context. Only load in main session (direct chats with your human).
+This file contains personal context. Only load in a direct chat with your human.
 DO NOT load in shared contexts, group chats, or sessions with other people.
 
 ---

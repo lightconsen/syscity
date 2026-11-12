@@ -502,9 +502,9 @@ impl Tool for SessionStatusTool {
     }
 
     fn description(&self) -> &str {
-        "Get the status of a session. Use session_key to target a specific session ('current', \
-         'main', or a session ID). Use model to override the session's model (e.g. \
-         'anthropic/claude-opus' or 'default' to reset)."
+        "Get the status of a session. Use session_key to target a specific session ('current' \
+         for the session you are in, or a session ID from sessions_list). Use model to override \
+         the session's model (e.g. 'anthropic/claude-opus' or 'default' to reset)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -513,7 +513,7 @@ impl Tool for SessionStatusTool {
             "properties": {
                 "session_key": {
                     "type": "string",
-                    "description": "Session key: 'current', 'main', or a specific session ID"
+                    "description": "Session key: 'current' or a specific session ID"
                 },
                 "model": {
                     "type": "string",
@@ -580,19 +580,6 @@ impl Tool for SessionStatusTool {
                 });
             }
             context.conversation_id.clone()
-        } else if key_raw == "main" {
-            match store.find_sessions(None, None, None, true).await {
-                Ok(sessions) if !sessions.is_empty() => sessions[0].session_id.clone(),
-                _ => {
-                    return Ok(ToolExecutionResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some("No main session found".to_string()),
-                        data: None,
-                        execution_time: start.elapsed(),
-                    });
-                }
-            }
         } else {
             key_raw.to_string()
         };

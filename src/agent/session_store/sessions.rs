@@ -573,7 +573,7 @@ mod tests {
     async fn test_save_and_load_session() {
         let store = create_test_store().await;
 
-        let metadata = SessionMetadata::new("test-session", "main", "discord", "user123");
+        let metadata = SessionMetadata::new("test-session", "default", "discord", "user123");
 
         // Save session
         store
@@ -589,7 +589,7 @@ mod tests {
             .expect("Session not found");
 
         assert_eq!(loaded.id, "test-session");
-        assert_eq!(loaded.metadata.agent_id, "main");
+        assert_eq!(loaded.metadata.agent_id, "default");
         assert_eq!(loaded.metadata.channel, "discord");
     }
 
@@ -598,7 +598,7 @@ mod tests {
         let store = create_test_store().await;
 
         // Save a session with a pinned model.
-        let mut metadata = SessionMetadata::new("m-session", "main", "web", "user1");
+        let mut metadata = SessionMetadata::new("m-session", "default", "web", "user1");
         metadata.model = Some("smart".to_string());
         store
             .save_session("m-session", &metadata, "{}")
@@ -725,7 +725,7 @@ mod tests {
         for i in 0..3 {
             let metadata = SessionMetadata::new(
                 format!("session-{}", i),
-                if i == 0 { "main" } else { "coder" },
+                if i == 0 { "default" } else { "coder" },
                 "discord",
                 format!("user{}", i),
             );
@@ -736,12 +736,12 @@ mod tests {
         }
 
         // Find by agent
-        let main_sessions = store
-            .find_sessions(Some("main"), None, None, false)
+        let default_sessions = store
+            .find_sessions(Some("default"), None, None, false)
             .await
             .expect("Failed to find sessions");
-        assert_eq!(main_sessions.len(), 1);
-        assert_eq!(main_sessions[0].agent_id, "main");
+        assert_eq!(default_sessions.len(), 1);
+        assert_eq!(default_sessions[0].agent_id, "default");
 
         // Find by channel
         let discord_sessions = store
@@ -756,7 +756,7 @@ mod tests {
         let store = create_test_store().await;
 
         // Create session
-        let metadata = SessionMetadata::new("msg-test", "main", "cli", "local");
+        let metadata = SessionMetadata::new("msg-test", "default", "cli", "local");
         store
             .save_session("msg-test", &metadata, "{}")
             .await
@@ -799,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_session_active() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("active-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("active-test", "default", "cli", "local");
         store
             .save_session("active-test", &meta, "{}")
             .await
@@ -820,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("del-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("del-test", "default", "cli", "local");
         store.save_session("del-test", &meta, "{}").await.unwrap();
 
         store.delete_session("del-test").await.unwrap();
@@ -831,10 +831,10 @@ mod tests {
     #[tokio::test]
     async fn test_find_sessions_active_only() {
         let store = create_test_store().await;
-        let meta1 = SessionMetadata::new("active-1", "main", "cli", "local");
+        let meta1 = SessionMetadata::new("active-1", "default", "cli", "local");
         store.save_session("active-1", &meta1, "{}").await.unwrap();
 
-        let mut meta2 = SessionMetadata::new("inactive-1", "main", "cli", "local");
+        let mut meta2 = SessionMetadata::new("inactive-1", "default", "cli", "local");
         meta2.is_active = false;
         store
             .save_session("inactive-1", &meta2, "{}")
@@ -854,7 +854,7 @@ mod tests {
         let store = create_test_store().await;
         // save_session always sets last_activity to now, so recent sessions won't be
         // cleaned up
-        let mut meta = SessionMetadata::new("old", "main", "cli", "local");
+        let mut meta = SessionMetadata::new("old", "default", "cli", "local");
         meta.is_active = false;
         store.save_session("old", &meta, "{}").await.unwrap();
 
@@ -873,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_messages_with_limit() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("limit-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("limit-test", "default", "cli", "local");
         store.save_session("limit-test", &meta, "{}").await.unwrap();
 
         for i in 0..5 {
@@ -897,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn test_persisted_session_fields() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("persist-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("persist-test", "default", "cli", "local");
         store
             .save_session("persist-test", &meta, r#"{"key":"val"}"#)
             .await
@@ -913,7 +913,7 @@ mod tests {
     async fn test_set_session_pinned_and_find_order() {
         let store = create_test_store().await;
 
-        let mut meta1 = SessionMetadata::new("pinned-test", "main", "cli", "local");
+        let mut meta1 = SessionMetadata::new("pinned-test", "default", "cli", "local");
         meta1.pinned = true;
         store
             .save_session("pinned-test", &meta1, "{}")
@@ -922,7 +922,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let meta2 = SessionMetadata::new("recent-test", "main", "cli", "local");
+        let meta2 = SessionMetadata::new("recent-test", "default", "cli", "local");
         store
             .save_session("recent-test", &meta2, "{}")
             .await
@@ -948,7 +948,7 @@ mod tests {
     async fn test_concurrent_session_access_no_deadlock() {
         let store = create_test_store().await;
         let session_id = "concurrent-session";
-        let meta = SessionMetadata::new(session_id, "main", "cli", "local");
+        let meta = SessionMetadata::new(session_id, "default", "cli", "local");
         store.save_session(session_id, &meta, "{}").await.unwrap();
 
         let mut tasks = Vec::new();
@@ -1008,7 +1008,7 @@ mod tests {
             let store = store.clone();
             tasks.push(tokio::spawn(async move {
                 let sid = format!("throughput-session-{}", i);
-                let meta = SessionMetadata::new(&sid, "main", "cli", "local");
+                let meta = SessionMetadata::new(&sid, "default", "cli", "local");
                 store.save_session(&sid, &meta, "{}").await.unwrap();
 
                 // Append a few messages

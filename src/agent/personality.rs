@@ -460,7 +460,7 @@ impl AgentPersonality {
 
         // Explicitly excluded: bootstrap, heartbeat, memory
         // - Bootstrap: startup-only instructions irrelevant to subagents
-        // - Heartbeat: periodic task checklist for main session only
+        // - Heartbeat: periodic task checklist for direct chats only
         // - Memory: contains personal context that shouldn't leak to strangers
 
         if sections.is_empty() {

@@ -670,7 +670,7 @@ mod tests {
                 session_id: Some("s1".into()),
                 conversation_id: "c1".into(),
                 agent_id: "worker".into(),
-                thread_id: "main".into(),
+                thread_id: "thread-1".into(),
                 turn_index: 0,
                 user_message: "hello".into(),
                 enqueued_at: None,
@@ -890,7 +890,7 @@ mod tests {
         c.record_channel(ChannelObservation {
             debounced: true,
             enriched: false,
-            route: Some("main".into()),
+            route: Some("worker".into()),
         });
         let id = c.turn_id().to_string();
         c.finish("done").await;
@@ -904,7 +904,7 @@ mod tests {
         assert!(rec.compressions[0].triggered_at_ms < 60_000);
         assert_eq!(rec.plan_snapshot.as_ref().unwrap().steps[0].id, "task_1");
         assert!(rec.channel.as_ref().unwrap().debounced);
-        assert_eq!(rec.channel.as_ref().unwrap().route.as_deref(), Some("main"));
+        assert_eq!(rec.channel.as_ref().unwrap().route.as_deref(), Some("worker"));
     }
 
     #[test]

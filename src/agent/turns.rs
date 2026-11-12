@@ -140,7 +140,7 @@ impl Turn {
 /// until a new turn is pushed (which clears the redo history).
 #[derive(Debug)]
 pub struct Thread {
-    /// Thread identifier (e.g. `"main"` or `uuid`).
+    /// Thread identifier (e.g. `thread-<conversation id>`).
     pub id: String,
     /// Human-readable label.
     pub label: String,

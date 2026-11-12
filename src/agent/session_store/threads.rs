@@ -346,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_and_load_thread() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("thread-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("thread-test", "default", "cli", "local");
         store
             .save_session("thread-test", &meta, "{}")
             .await
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_turn_and_load() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("turn-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("turn-test", "default", "cli", "local");
         store.save_session("turn-test", &meta, "{}").await.unwrap();
         store.save_thread("turn-test", "t1", "", 0).await.unwrap();
 
@@ -389,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_turn() {
         let store = create_test_store().await;
-        let meta = SessionMetadata::new("del-turn-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("del-turn-test", "default", "cli", "local");
         store
             .save_session("del-turn-test", &meta, "{}")
             .await
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(stats.total_messages, 0);
         assert_eq!(stats.total_subagent_runs, 0);
 
-        let meta = SessionMetadata::new("stats-test", "main", "cli", "local");
+        let meta = SessionMetadata::new("stats-test", "default", "cli", "local");
         store.save_session("stats-test", &meta, "{}").await.unwrap();
         store
             .append_message(&AppendMessageParams {

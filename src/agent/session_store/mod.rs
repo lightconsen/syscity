@@ -31,7 +31,7 @@ pub use self::threads::StoredMessage;
 pub struct SessionMetadata {
     /// Session ID (UUID)
     pub session_id: String,
-    /// Agent ID ("main", "coder", etc.)
+    /// Agent ID (e.g. "default", "coder").
     pub agent_id: String,
     /// Channel ("discord", "telegram", etc.)
     pub channel: String,

@@ -397,12 +397,12 @@ mod tests {
         config.model = "deepseek-chat".to_string();
         config
             .agent_models
-            .insert("main".to_string(), "default".to_string());
+            .insert("default".to_string(), "default".to_string());
 
         let changed = migrate_model_router_config(&mut config).await;
 
         assert!(changed);
-        assert_eq!(config.agent_models.get("main").cloned(), Some("deepseek-chat".to_string()));
+        assert_eq!(config.agent_models.get("default").cloned(), Some("deepseek-chat".to_string()));
     }
 
     #[tokio::test]
@@ -430,12 +430,12 @@ mod tests {
         config.model_provider = "deepseek".to_string();
         config
             .agent_models
-            .insert("main".to_string(), "deepseek-chat".to_string());
+            .insert("default".to_string(), "deepseek-chat".to_string());
 
         let changed = migrate_model_router_config(&mut config).await;
 
         assert!(!changed);
         assert_eq!(config.model, "deepseek-chat");
-        assert_eq!(config.agent_models.get("main").cloned(), Some("deepseek-chat".to_string()));
+        assert_eq!(config.agent_models.get("default").cloned(), Some("deepseek-chat".to_string()));
     }
 }
