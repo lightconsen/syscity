@@ -42,7 +42,15 @@ function looksLikeMarkdown(text: string): boolean {
 /** Detect tool result that reports an error by shape or string prefix. */
 function isErrorResult(result: unknown): boolean {
   if (typeof result === "string") {
-    return result.startsWith("Error:") || result.toLowerCase().startsWith("error");
+    // "Tool execution failed: …" is the agent loop's wrapper for a tool error
+    // (a denied approval, a policy refusal, a crash). Without it a refused
+    // call rendered as a green "done" card — the one case where the screen
+    // said the opposite of what happened.
+    return (
+      result.startsWith("Error:") ||
+      result.toLowerCase().startsWith("error") ||
+      result.startsWith("Tool execution failed")
+    );
   }
   if (typeof result !== "object" || result === null) return false;
   return "error" in result;
@@ -179,7 +187,12 @@ export function ToolCallPart({ toolName, args, result, data, isError: isErrorPro
 
   if (nonCollapsible) {
     return (
-      <div className="my-3">
+      <div
+        className="my-3"
+        data-testid="tool-call"
+        data-tool-name={toolName}
+        data-status={isError ? "error" : result !== undefined ? "done" : "running"}
+      >
         <button
           type="button"
           onClick={() => setShowContent(!showContent)}
