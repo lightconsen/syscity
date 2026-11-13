@@ -57,10 +57,13 @@ export const test = base.extend({
     const apps = [];
 
     const launch = async (script = plainText(), gatewayOpts = {}) => {
-      const provider = await startFakeProvider({ script });
+      // `cloudUser` answers the cloud identity probe a submitted token
+      // triggers; it is not a gateway option, so it is split out here.
+      const { cloudUser, ...gwOpts } = gatewayOpts;
+      const provider = await startFakeProvider({ script, user: cloudUser ?? null });
       const gateway = await startGateway({
         providerBaseUrl: provider.url,
-        ...gatewayOpts,
+        ...gwOpts,
       });
       apps.push({ provider, gateway });
       await page.goto(gateway.url);

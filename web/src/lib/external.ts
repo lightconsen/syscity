@@ -16,7 +16,7 @@
 // part of the login flow there.
 
 /** True when running inside the desktop/mobile Tauri shell. */
-function inTauri(): boolean {
+export function inDesktopShell(): boolean {
   return typeof window !== "undefined" && "__TAURI__" in window;
 }
 
@@ -27,7 +27,7 @@ function inTauri(): boolean {
  * the caller is usually waiting for something to happen as a result.
  */
 export async function openExternal(url: string): Promise<boolean> {
-  if (!inTauri()) {
+  if (!inDesktopShell()) {
     window.open(url, "_blank");
     return true;
   }
@@ -56,7 +56,7 @@ export async function openExternal(url: string): Promise<boolean> {
  * Does nothing in a browser, where the anchor already works.
  */
 export function installExternalLinkHandler(): void {
-  if (!inTauri() || typeof document === "undefined") return;
+  if (!inDesktopShell() || typeof document === "undefined") return;
   document.addEventListener(
     "click",
     (event) => {

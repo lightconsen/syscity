@@ -149,7 +149,7 @@ impl Default for CspConfig {
         Self {
             enabled: true,
             policy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-                     img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; \
+                     img-src 'self' data: https:; font-src 'self'; connect-src 'self' ws: wss:; \
                      frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
                 .to_string(),
             use_nonce: true,

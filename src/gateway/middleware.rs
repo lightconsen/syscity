@@ -836,15 +836,20 @@ impl CspPolicy {
     /// Build the CSP string
     pub fn to_header_value(&self) -> String {
         match self {
+            // `img-src ... https:` is for the cloud avatar (and any future
+            // remote image): the gateway refuses to load a broken image, and
+            // a CSP that blocks the avatar host makes the signed-in profile
+            // button render as a browser "missing image" glyph. Images only —
+            // scripts, styles and connections stay same-origin.
             CspPolicy::Strict => "default-src 'self'; script-src 'self'; style-src 'self' \
-                                  'unsafe-inline'; img-src 'self' data:; font-src 'self'; \
-                                  connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri \
-                                  'self'; form-action 'self';"
+                                  'unsafe-inline'; img-src 'self' data: https:; font-src \
+                                  'self'; connect-src 'self' ws: wss:; frame-ancestors 'none'; \
+                                  base-uri 'self'; form-action 'self';"
                 .to_string(),
             CspPolicy::Api => "default-src 'none'; frame-ancestors 'none';".to_string(),
             CspPolicy::Admin { nonce } => format!(
                 "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' \
-                 'nonce-{nonce}' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; \
+                 'nonce-{nonce}' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self'; \
                  connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; \
                  form-action 'self';",
                 nonce = nonce
@@ -1120,7 +1125,7 @@ mod tests {
         let header = policy.to_header_value();
         assert!(header.contains("script-src 'self' 'nonce-abc123'"));
         assert!(header.contains("style-src 'self' 'nonce-abc123'"));
-        assert!(header.contains("img-src 'self' data: blob:"));
+        assert!(header.contains("img-src 'self' data: blob: https:"));
     }
 
     #[test]

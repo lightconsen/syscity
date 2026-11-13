@@ -156,5 +156,13 @@
   "AgentRenameDialog.cancel": "取消",
   "AgentRenameDialog.save": "保存",
   "AccountButton.loginFailed": "云端登录失败：",
-  "AccountButton.loginTimedOut": "云端登录未完成。如果网络需要代理，请带 HTTPS_PROXY 启动网关——网关无法连接云端 API。"
+  "AccountButton.loginTimedOut": "云端登录未完成。如果网络需要代理，请带 HTTPS_PROXY 启动网关——网关无法连接云端 API。",
+  "CloudLogin.working": "正在完成登录…",
+  "CloudLogin.workingHint": "正在保存 Syscity Cloud 会话。",
+  "CloudLogin.done": "登录成功",
+  "CloudLogin.doneHint": "可以关闭此窗口，回到 Syscity。",
+  "CloudLogin.failed": "登录未完成",
+  "CloudLogin.failedHint": "没有保存任何内容。请回到 Syscity 重试。",
+  "CloudLogin.close": "关闭此窗口",
+  "CloudLogin.closeHint": "浏览器没有允许本页自行关闭，请手动关闭此标签页。"
 }

@@ -9,8 +9,7 @@ import {
   type ChatMessage,
 } from "@/SyscityWebSocketTransport";
 import { useTranslation } from "react-i18next";
-import i18n from "@/i18n";
-import { cloudSubmitToken } from "@/lib/cloud";
+import { CloudLoginCallback } from "@/components/cloud/CloudLoginCallback";
 import { useChatStore } from "@/stores/chatStore";
 import { Titlebar } from "@/components/chrome/Titlebar";
 import { Statusbar } from "@/components/chrome/Statusbar";
@@ -181,6 +180,20 @@ function StartingScreen({ t }: { t: (key: string) => string }) {
 
 /* ── ChatApp ── */
 function ChatApp() {
+  // The cloud OAuth return is its own page, not the app: the browser lands
+  // here from the console with the session in the fragment, and what happens
+  // next depends on where the sign-in was started (close the popup, stay on
+  // a "you can close this window" screen, or return to `/`). Mounting the
+  // full chat app here would connect, list sessions and flash the home view
+  // for a tab that is about to go away.
+  if (window.location.pathname === "/cloud/login/callback") {
+    return <CloudLoginCallback />;
+  }
+  return <ChatShell />;
+}
+
+/** The app itself: transport, titlebar, sidebar, chat. */
+function ChatShell() {
   const { t } = useTranslation("app");
   const transport = useMemo(() => new SyscityWebSocketTransport(), []);
   useEffect(() => {
@@ -247,70 +260,9 @@ function ChatApp() {
     setKbOpen(true);
   };
 
-  // Handle the cloud OAuth callback: /cloud/login/callback#token=... — persist
-  // the session token, then return to the home view.
-  useEffect(() => {
-    if (window.location.pathname === "/cloud/login/callback") {
-      const token = new URLSearchParams(window.location.hash.slice(1)).get(
-        "token",
-      );
-      // In the sidebar popup flow this page runs inside the OAuth popup
-      // (window.opener present): persist the token, notify the opener, then
-      // self-close. Otherwise (direct navigation, e.g. from the welcome page)
-      // fall back to returning to the home view.
-      const isPopup = Boolean(window.opener);
-      const finish = () => {
-        if (isPopup) {
-          try {
-            window.close();
-          } catch {
-            /* ignore */
-          }
-        } else {
-          window.location.replace("/");
-        }
-      };
-      if (token) {
-        cloudSubmitToken(token).then(({ ok, message }) => {
-          // First-login guidance: surface the newly-enabled cloud
-          // capabilities banner on the home view after a successful login.
-          if (ok) {
-            try {
-              localStorage.setItem("syscity_cloud_enabled_hint", "1");
-            } catch {
-              /* ignore */
-            }
-          }
-          if (isPopup) {
-            // Tell the opener the flow finished (it polls /api/v1/status as
-            // the reliable fallback). targetOrigin "*": the opener may be on
-            // 127.0.0.1 while this callback is on localhost — the receiver
-            // validates the origin.
-            try {
-              window.opener.postMessage(
-                { type: "syscity:login", ok, message },
-                "*",
-              );
-            } catch {
-              /* ignore */
-            }
-          }
-          if (ok) {
-            finish();
-            return;
-          }
-          // The failure used to be swallowed here: the popup closed and the
-          // user was simply still signed out. Keep the page, say why, and let
-          // the toast carry the gateway's own message (a network error reads
-          // very differently from an expired token).
-          const lead = i18n.t("AccountButton.loginFailed", { ns: "chat" });
-          pushToast("error", message ? `${lead} ${message}` : lead);
-        });
-      } else {
-        finish();
-      }
-    }
-  }, []);
+  // Handle the cloud OAuth callback: /cloud/login/callback#token=... — that
+  // page brings its own component (it has three endings: close, stay, or
+  // return to the app), rendered below.
 
   const isMobile = useIsMobile();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -997,10 +949,7 @@ function ChatApp() {
             activeView={kbOpen ? "kb" : marketplaceOpen ? "extensions" : "chat"}
             chatWelcome={messageCount === 0}
             pendingApprovals={pendingApprovals.length}
-            onShowApprovals={() => {
-              openApprovals();
-              setMobileNavOpen(false);
-            }}
+            onShowApprovals={openApprovals}
             onRenameSession={handleRenameSession}
             onDeleteSession={handleDeleteSession}
             onPinSession={handlePinSession}
@@ -1065,6 +1014,11 @@ function ChatApp() {
                   setDeleteTarget(agent);
                 }}
                 onOpenAgentSettings={handleOpenAgentSettings}
+                pendingApprovals={pendingApprovals.length}
+                onShowApprovals={() => {
+                  openApprovals();
+                  setMobileNavOpen(false);
+                }}
               />
             </div>
           </div>

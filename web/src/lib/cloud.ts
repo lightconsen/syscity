@@ -130,14 +130,24 @@ export async function cloudUsage(days = 30): Promise<CloudUsage> {
   return (await transport.getCloudUsage(days)) as CloudUsage;
 }
 
+/**
+ * How the sign-in was started — the callback page branches on it.
+ *
+ * - `popup`   a window the app opened and can close again (browser UI).
+ * - `desktop` the desktop shell handed the URL to the system browser, so the
+ *             callback tab has no opener and no app behind it.
+ * - `tab`     the app navigated the current tab, so `/` really is "back".
+ */
+export type LoginFlow = "popup" | "desktop" | "tab";
+
 /** The cloud OAuth login URL (engine route that 302s to the cloud). */
-export function cloudLoginUrl(provider = "github"): string {
-  return `${getGatewayBase()}/api/v1/login?provider=${provider}`;
+export function cloudLoginUrl(provider = "github", flow: LoginFlow = "popup"): string {
+  return `${getGatewayBase()}/api/v1/login?provider=${provider}&flow=${flow}`;
 }
 
 /** Redirect the current tab to the cloud OAuth login (welcome-page flow). */
 export function cloudLogin(provider = "github") {
-  window.location.href = cloudLoginUrl(provider);
+  window.location.href = cloudLoginUrl(provider, "tab");
 }
 
 /** Outcome of persisting the token from the OAuth callback.
@@ -150,11 +160,15 @@ export interface SubmitTokenResult {
   message?: string;
 }
 
-/** Persist a session token returned by the cloud OAuth callback. */
+/** Persist a session token returned by the cloud OAuth callback.
+ *
+ *  `transport` overrides the active one. The callback page is rendered
+ *  instead of the app, so it has no app to register a transport with — it
+ *  passes its own. */
 export async function cloudSubmitToken(
   token: string,
+  transport = getActiveTransport(),
 ): Promise<SubmitTokenResult> {
-  const transport = getActiveTransport();
   if (!transport) {
     return { ok: false, message: "No gateway connection" };
   }

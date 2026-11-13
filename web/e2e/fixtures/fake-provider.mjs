@@ -34,10 +34,14 @@ const DEFAULT_CHUNK_DELAY_MS = 30;
 /**
  * Start the fake provider.
  *
- * @param {{script: ScriptStep[], port?: number, onRequest?: (body: any) => void}} opts
+ * @param {{script: ScriptStep[], port?: number, onRequest?: (body: any) => void,
+ *          user?: object | null}} opts
+ *   `user` answers the cloud API's `GET /auth/me` (the gateway's own call when
+ *   a cloud token is submitted); `null` leaves that route 404ing, which is
+ *   what a non-cloud test wants.
  * @returns {Promise<{url: string, port: number, requests: any[], close: () => Promise<void>}>}
  */
-export async function startFakeProvider({ script, port = 0, onRequest } = {}) {
+export async function startFakeProvider({ script, port = 0, onRequest, user = null } = {}) {
   if (!Array.isArray(script) || script.length === 0) {
     throw new Error("startFakeProvider needs a non-empty script");
   }
@@ -57,6 +61,14 @@ export async function startFakeProvider({ script, port = 0, onRequest } = {}) {
             data: [{ id: "fake-ui-model", object: "model", owned_by: "test" }],
           }),
         );
+        return;
+      }
+      // Cloud identity: `cloud.token` calls this with the submitted token to
+      // verify it before storing it. A 401 here is a rejected token, so only
+      // answer when the test asked for a signed-in user.
+      if (req.method === "GET" && req.url?.startsWith("/auth/me") && user) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ user }));
         return;
       }
       res.writeHead(404).end();

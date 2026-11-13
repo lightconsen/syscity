@@ -37,7 +37,7 @@ import {
   type CloudStatus,
   type CloudSubscription,
 } from "@/lib/cloud";
-import { openExternal } from "@/lib/external";
+import { inDesktopShell, openExternal } from "@/lib/external";
 
 const LOGIN_TIMEOUT_MS = 180_000;
 const POLL_MS = 1_500;
@@ -78,6 +78,10 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
   const [redeemBusy, setRedeemBusy] = useState(false);
   const [claimBusy, setClaimBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  /** The cloud avatar failed to load — fall back to the initial, not a
+   *  browser broken-image glyph (see `avatarEl`). Reset when the URL changes
+   *  so a later sign-in with a working avatar still shows it. */
+  const [avatarFailed, setAvatarFailed] = useState(false);
   const [loginPending, setLoginPending] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
@@ -111,6 +115,13 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
   useEffect(() => {
     refreshStatus();
   }, [refreshStatus]);
+
+  // A different account (or a re-login that refreshed the URL) gets a fresh
+  // chance to load its avatar.
+  const avatarUrl = status?.user?.avatar_url ?? null;
+  useEffect(() => {
+    setAvatarFailed(false);
+  }, [avatarUrl]);
 
   /** Fetch status; stop waiting once logged in (or on timeout). */
   const checkAndMaybeStop = useCallback(async () => {
@@ -180,9 +191,11 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
       void checkAndMaybeStop();
     }, POLL_MS);
     // The desktop shell cannot open a new WebView window, so this goes
-    // through the host instead. If it fails, say so now rather than spinning
-    // for three minutes: nothing was ever started, so nothing can come back.
-    void openExternal(cloudLoginUrl("github")).then((opened) => {
+    // through the host instead — into the system browser, where the callback
+    // page has no opener and must not try to "return" to the app (`flow`).
+    void openExternal(
+      cloudLoginUrl("github", inDesktopShell() ? "desktop" : "popup"),
+    ).then((opened) => {
       if (opened) return;
       stopPolling();
       setPending(false);
@@ -288,15 +301,26 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
 
   // Avatar: cloud avatar_url when present, else the initial, else the
   // Profile icon. `extra` layers variant-specific classes (e.g. shrink-0).
-  const avatarEl = (extra = "") =>
-    user?.avatar_url ? (
-      <img
-        src={user.avatar_url}
-        alt=""
-        referrerPolicy="no-referrer"
-        className={`w-6 h-6 rounded-full object-cover ${extra}`}
-      />
-    ) : initial ? (
+  //
+  // The image is only a convenience — an avatar host that is unreachable
+  // (a proxy-less network, the desktop WebView's `img-src 'self' data: blob:`
+  // CSP refusing a remote origin) must not leave a broken-image glyph sitting
+  // in the titlebar. That is what made the signed-in profile button look
+  // like nothing at all: the browser's own "missing image" icon on a 24px
+  // button. A failed load falls back to the same initial the image replaced.
+  const avatarEl = (extra = "") => {
+    if (user?.avatar_url && !avatarFailed) {
+      return (
+        <img
+          src={user.avatar_url}
+          alt=""
+          referrerPolicy="no-referrer"
+          onError={() => setAvatarFailed(true)}
+          className={`w-6 h-6 rounded-full object-cover ${extra}`}
+        />
+      );
+    }
+    return initial ? (
       <span
         className={`w-6 h-6 rounded-full bg-primary-500 text-white text-xs font-semibold flex items-center justify-center ${extra}`}
       >
@@ -305,6 +329,7 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
     ) : (
       <User className={`w-4 h-4 ${extra}`} />
     );
+  };
 
   const toggleMenu = () => {
     if (menuOpen) {
@@ -369,18 +394,7 @@ export function AccountButton({ variant = "row" }: { variant?: "row" | "icon" })
     >
       <div className="max-h-[70vh] overflow-y-auto">
         <div className="px-2 py-1.5 flex items-center gap-2">
-          {user?.avatar_url ? (
-            <img
-              src={user.avatar_url}
-              alt=""
-              referrerPolicy="no-referrer"
-              className="w-8 h-8 rounded-full object-cover shrink-0"
-            />
-          ) : initial ? (
-            <span className="w-8 h-8 rounded-full bg-primary-500 text-white text-xs font-semibold flex items-center justify-center shrink-0">
-              {initial}
-            </span>
-          ) : null}
+          {avatarEl("shrink-0")}
           <div className="text-primary font-medium truncate">
             {display || t("AccountButton.signedIn")}
           </div>

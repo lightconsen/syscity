@@ -156,5 +156,13 @@
   "AgentRenameDialog.cancel": "Cancel",
   "AgentRenameDialog.save": "Save",
   "AccountButton.loginFailed": "Cloud sign-in failed:",
-  "AccountButton.loginTimedOut": "Cloud sign-in did not complete. If the network needs a proxy, start the gateway with HTTPS_PROXY set — it could not reach the cloud API."
+  "AccountButton.loginTimedOut": "Cloud sign-in did not complete. If the network needs a proxy, start the gateway with HTTPS_PROXY set — it could not reach the cloud API.",
+  "CloudLogin.working": "Finishing sign-in…",
+  "CloudLogin.workingHint": "Saving your Syscity Cloud session.",
+  "CloudLogin.done": "You're signed in",
+  "CloudLogin.doneHint": "You can close this window and go back to Syscity.",
+  "CloudLogin.failed": "Sign-in did not complete",
+  "CloudLogin.failedHint": "Nothing was saved. Go back to Syscity and try again.",
+  "CloudLogin.close": "Close this window",
+  "CloudLogin.closeHint": "Your browser did not let this page close itself — close the tab yourself."
 }

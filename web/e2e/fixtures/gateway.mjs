@@ -54,6 +54,10 @@ const PLACEHOLDER_KEY = ["sk", "placeholder", "local", "fake", "key"].join("-");
  * @param {boolean} [opts.skipOnboarding]
  *        Write the identity files up front; the UI then goes straight to the
  *        chat instead of the first-launch wizard.
+ * @param {string} [opts.cloudApiBase]
+ *        Point the gateway's `[cloud] api_base` here (typically the fake
+ *        provider), so `cloud.token` verifies against it instead of the real
+ *        Syscity Cloud. Defaults to "fake", i.e. the provider's own URL.
  * @returns {Promise<{home: string, port: number, url: string, stop: () => Promise<void>, log: () => string}>}
  */
 export async function startGateway({
@@ -62,6 +66,7 @@ export async function startGateway({
   binary = path.join(REPO_ROOT, "target/debug/syscity"),
   skipOnboarding = true,
   extraConfig = "",
+  cloudApiBase = null,
 } = {}) {
   if (!providerBaseUrl) throw new Error("startGateway needs providerBaseUrl");
   if (!existsSync(binary)) {
@@ -93,6 +98,16 @@ retry_delay_ms = 100
 [providers.fakeui.timeout]
 secs = 30
 nanos = 0
+${
+  cloudApiBase
+    ? `
+[cloud]
+enabled = true
+api_base = "${cloudApiBase === "fake" ? providerBaseUrl.replace(/\/v1$/, "") : cloudApiBase}"
+redirect_base = "http://127.0.0.1:${port}/cloud/login/callback"
+`
+    : ""
+}
 ${extraConfig}
 `;
   await writeFile(path.join(home, "config.toml"), config);
