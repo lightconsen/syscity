@@ -974,6 +974,8 @@ function ChatApp() {
             : sessionItems.find((s) => s.id === transport.getSessionId())
                 ?.label ?? ""
         }
+        pendingApprovals={pendingApprovals.length}
+        onShowApprovals={openApprovals}
       />
 
       {/* Row 2: sidebar + main content. */}
@@ -995,7 +997,10 @@ function ChatApp() {
             activeView={kbOpen ? "kb" : marketplaceOpen ? "extensions" : "chat"}
             chatWelcome={messageCount === 0}
             pendingApprovals={pendingApprovals.length}
-            onShowApprovals={openApprovals}
+            onShowApprovals={() => {
+              openApprovals();
+              setMobileNavOpen(false);
+            }}
             onRenameSession={handleRenameSession}
             onDeleteSession={handleDeleteSession}
             onPinSession={handlePinSession}

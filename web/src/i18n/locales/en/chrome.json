@@ -7,6 +7,9 @@
   "Titlebar.collapseSidebar": "Collapse sidebar",
   "Titlebar.openNavigation": "Open navigation",
   "Titlebar.settings": "Settings",
+  "Titlebar.pendingApprovals_one": "{{count}} pending approval",
+  "Titlebar.pendingApprovals_other": "{{count}} pending approvals",
+  "Titlebar.pendingApprovalsHint": "Review the pending approval",
   "Titlebar.toggleDocPanel": "Toggle document panel",
   "Titlebar.browseFiles": "Browse workspace files"
 }

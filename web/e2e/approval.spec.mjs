@@ -34,9 +34,11 @@ test.describe("approval dialog", () => {
 
     await app.page.getByTestId("approval-approve").click();
 
-    // The dialog goes away and the queued approval stops counting.
+    // The dialog goes away and the queued approval stops counting — in both
+    // places it is counted.
     await expect(app.page.getByTestId("approval-dialog")).toHaveCount(0);
     await expect(app.page.getByTestId("approval-badge")).toHaveCount(0);
+    await expect(app.page.getByTestId("titlebar-approval-badge")).toHaveCount(0);
 
     // The tool ran and the turn concluded with the model's follow-up.
     await expect(app.lastAssistant).toContainText("the command was decided");
@@ -93,6 +95,12 @@ test.describe("approval dialog", () => {
       // The gateway still has the request: the badge counts it, and the turn
       // is still parked on it rather than finished or hung.
       await expect(app.page.getByTestId("approval-badge")).toHaveAttribute("data-count", "1");
+      // The toolbar one is the copy that survives a collapsed sidebar, a
+      // closed phone drawer and the full-screen pages.
+      await expect(app.page.getByTestId("titlebar-approval-badge")).toHaveAttribute(
+        "data-count",
+        "1",
+      );
       await expect(app.page.getByTestId("live-status")).toHaveAttribute(
         "data-status",
         "awaiting_approval",
@@ -100,8 +108,8 @@ test.describe("approval dialog", () => {
       await expect(app.page.getByTestId("composer-stop")).toBeVisible();
       await expect(app.page.getByTestId("turn-duration")).toHaveCount(0);
 
-      // The badge brings the question back.
-      await app.page.getByTestId("approval-badge").click();
+      // The badge brings the question back — the toolbar one, from anywhere.
+      await app.page.getByTestId("titlebar-approval-badge").click();
       await expect(app.page.getByTestId("approval-dialog")).toBeVisible();
 
       // Answering it now still works, which proves the deferred request was

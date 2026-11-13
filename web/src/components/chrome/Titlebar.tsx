@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Menu,
   Settings,
   PanelRight,
@@ -27,6 +28,12 @@ interface TitlebarProps {
   /** Open session's title, shown left-aligned like page titles. Empty
    *  while no session is open (welcome page, full-screen pages). */
   sessionTitle?: string;
+  /** Approvals waiting for a human, across all sessions. */
+  pendingApprovals?: number;
+  /** Bring the pending approvals back into view (same as the sidebar badge,
+   *  reachable from anywhere — including a collapsed sidebar and the
+   *  full-screen pages, where the sidebar one is hidden). */
+  onShowApprovals?: () => void;
 }
 
 const iconBtnCls =
@@ -66,6 +73,8 @@ export function Titlebar({
   onToggleSidebar,
   page,
   sessionTitle,
+  pendingApprovals = 0,
+  onShowApprovals,
 }: TitlebarProps) {
   const { t } = useTranslation("chrome");
   const platform = usePlatform();
@@ -215,6 +224,30 @@ export function Titlebar({
       {/* Right cluster (network dot + theme toggle live in the Statusbar) */}
       <div className="flex items-center gap-1 shrink-0">
         <AccountButton variant="icon" />
+        {/* Pending approvals, right after the profile button: the toolbar is
+            the one place that is on screen in every layout — the sidebar
+            badge disappears with the sidebar, and a collapsed sidebar, a
+            phone drawer left closed or a full-screen page would otherwise
+            leave a blocked agent with no visible signal at all. */}
+        {pendingApprovals > 0 && (
+          <button
+            type="button"
+            onClick={onShowApprovals}
+            title={t("Titlebar.pendingApprovalsHint")}
+            aria-label={t("Titlebar.pendingApprovals", { count: pendingApprovals })}
+            data-testid="titlebar-approval-badge"
+            data-count={pendingApprovals}
+            className="relative p-1.5 rounded-md text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 transition"
+          >
+            <AlertTriangle className="w-4 h-4" />
+            <span
+              aria-hidden="true"
+              className="absolute -top-0.5 -right-0.5 min-w-[0.95rem] h-[0.95rem] px-1 rounded-full bg-amber-500 text-white text-[9px] font-semibold leading-[0.95rem] text-center"
+            >
+              {pendingApprovals > 9 ? "9+" : pendingApprovals}
+            </span>
+          </button>
+        )}
         <button onClick={onOpenSettings} className={iconBtnCls} title={t("Titlebar.settings")} aria-label={t("Titlebar.settings")}>
           <Settings className="w-4 h-4" />
         </button>
