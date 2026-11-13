@@ -52,7 +52,10 @@ likely to change. The ids currently in use: `composer-input`, `composer-send`,
 `data-status`), `approval-dialog`, `approval-risk`, `approval-approve`,
 `approval-always`, `approval-deny`, `approval-deny-dots`, `approval-close`,
 `approval-badge` (+ `data-count`), `session-row` (+ `data-session-id`,
-`data-active`), `session-running`.
+`data-active`), `session-running`, `sidebar-nav` (the fixed New Session /
+Extensions / Knowledge Base block), `cloud-login-result` (+ `data-state`),
+`cloud-login-title`, `cloud-login-close`, `mode-option-*`,
+`titlebar-approval-badge`.
 
 When a test needs the gateway's own view of a turn (rather than what the page
 happens to have rendered), assert on the live bar's `data-status` or the

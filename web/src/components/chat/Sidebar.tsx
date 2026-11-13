@@ -298,62 +298,67 @@ export function Sidebar({
         </button>
       )}
 
+      {/* Fixed nav — New Session, Extensions, Knowledge Base. Outside the
+          scrolling session list so a long history never scrolls them away. */}
+      <div className="shrink-0 px-1 pt-2 pb-1" data-testid="sidebar-nav">
+        <button
+          onClick={onNewSession}
+          className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
+            activeView === "chat" && chatWelcome
+              ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
+              : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+          } ${collapsed ? "justify-center" : ""}`}
+          title={t("Sidebar.newSession")}
+          aria-label={t("Sidebar.newSession")}
+          aria-current={activeView === "chat" && chatWelcome ? "page" : undefined}
+        >
+          <Plus className="w-4 h-4 shrink-0" />
+          {!collapsed && <span>{t("Sidebar.newSessionLabel")}</span>}
+        </button>
+        {/* Extensions (marketplace): connectors, skills, experts. */}
+        <button
+          onClick={() => onOpenMarketplace()}
+          className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
+            activeView === "extensions"
+              ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
+              : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+          } ${collapsed ? "justify-center" : ""}`}
+          title={t("Sidebar.browseExtensions")}
+          aria-label={t("Sidebar.extensions")}
+          aria-current={activeView === "extensions" ? "page" : undefined}
+        >
+          <Puzzle className="w-4 h-4 shrink-0" />
+          {!collapsed && <span>{t("Sidebar.extensions")}</span>}
+        </button>
+        {/* Knowledge Base: local per-agent collections + cloud KBs. */}
+        {onOpenKnowledgeBase && (
+          <button
+            onClick={onOpenKnowledgeBase}
+            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
+              activeView === "kb"
+                ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
+                : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+            } ${collapsed ? "justify-center" : ""}`}
+            title={t("Sidebar.manageKnowledgeBases")}
+            aria-label={t("Sidebar.knowledgeBase")}
+            aria-current={activeView === "kb" ? "page" : undefined}
+          >
+            <Library className="w-4 h-4 shrink-0" />
+            {!collapsed && <span>{t("Sidebar.knowledgeBase")}</span>}
+          </button>
+        )}
+      </div>
+
       <div
         ref={listContainerRef}
         className="flex-1 flex flex-col min-h-0 overflow-hidden"
       >
         {/* Sessions */}
         <div
-          className="scrollbar-hover overflow-y-auto overflow-x-hidden px-1 py-2"
+          className="scrollbar-hover overflow-y-auto overflow-x-hidden px-1 pb-2"
           style={{ flexBasis: `${sessionRatio * 100}%`, flexShrink: 0, flexGrow: 0 }}
           role="list"
         >
-          <button
-            onClick={onNewSession}
-            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
-              activeView === "chat" && chatWelcome
-                ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
-                : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
-            } ${collapsed ? "justify-center" : ""}`}
-            title={t("Sidebar.newSession")}
-            aria-label={t("Sidebar.newSession")}
-            aria-current={activeView === "chat" && chatWelcome ? "page" : undefined}
-          >
-            <Plus className="w-4 h-4 shrink-0" />
-            {!collapsed && <span>{t("Sidebar.newSessionLabel")}</span>}
-          </button>
-          {/* Extensions (marketplace): connectors, skills, experts. */}
-          <button
-            onClick={() => onOpenMarketplace()}
-            className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
-              activeView === "extensions"
-                ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
-                : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
-            } ${collapsed ? "justify-center" : ""}`}
-            title={t("Sidebar.browseExtensions")}
-            aria-label={t("Sidebar.extensions")}
-            aria-current={activeView === "extensions" ? "page" : undefined}
-          >
-            <Puzzle className="w-4 h-4 shrink-0" />
-            {!collapsed && <span>{t("Sidebar.extensions")}</span>}
-          </button>
-          {/* Knowledge Base: local per-agent collections + cloud KBs. */}
-          {onOpenKnowledgeBase && (
-            <button
-              onClick={onOpenKnowledgeBase}
-              className={`w-full text-left px-3 py-1.5 mb-0.5 rounded-lg text-sm transition flex items-center gap-2 ${
-                activeView === "kb"
-                  ? "bg-primary-100 dark:bg-primary-900/20 text-primary"
-                  : "text-secondary hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
-              } ${collapsed ? "justify-center" : ""}`}
-              title={t("Sidebar.manageKnowledgeBases")}
-              aria-label={t("Sidebar.knowledgeBase")}
-              aria-current={activeView === "kb" ? "page" : undefined}
-            >
-              <Library className="w-4 h-4 shrink-0" />
-              {!collapsed && <span>{t("Sidebar.knowledgeBase")}</span>}
-            </button>
-          )}
           {!collapsed &&
             groups.map((group) => (
               <div key={group.label} className="mb-2">
