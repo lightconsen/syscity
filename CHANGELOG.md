@@ -13,6 +13,10 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Changed
 
+- The sidebar's three fixed entries — New Session, Extensions, Knowledge Base —
+  no longer scroll away. They sat inside the session list, so a long history
+  pushed the three always-relevant entries off the top; they are now a fixed
+  block and only the sessions scroll.
 - The first turn no longer pays for the embedding model. The GGUF weights are
   ~600 MB and took 23.6 s to load, all of it inside the first message's memory
   retrieval; the gateway now warms them at startup, and the first search finds
@@ -104,12 +108,49 @@ if no section matches, the release falls back to auto-generated notes.
 - The approval dialog offers "Always allow". The gateway already accepted
   `remember: true` on `approvals.approve`, writing a `[permissions].allow` rule
   so the same call is not asked about again; the UI had no way to send it.
-  "Later" is now explained rather than guessed at: it dismisses the dialog but
-  leaves the request pending — the agent stays paused until you answer, it
-  times out after five minutes, or you act from the sidebar badge, which now
-  actually reopens it. The badge also no longer counts completed approvals: the
-  queue is reconciled against `approvals.list`, and a re-announced approval is
-  no longer queued twice.
+  Deferring is no longer offered as a third answer: the "Later" button read as
+  a decision next to Approve and Deny, but it only hides the modal and the
+  agent stays paused. It is now a top-right × (and Escape), with a tooltip and
+  a help line that say it is not a decision — the request stays pending until
+  you answer, it times out after five minutes, or you act from the sidebar
+  badge, which now actually reopens it. The badge also no longer counts
+  completed approvals: the queue is reconciled against `approvals.list`, and a
+  re-announced approval is no longer queued twice.
+- Pending approvals are counted in the titlebar too. The sidebar badge
+  disappeared with the sidebar — a collapsed rail, a closed phone drawer or a
+  full-screen page all hide it — leaving an agent that looks idle. The same
+  count now sits in the titlebar's right cluster after the profile button, and
+  both open the same queue.
+- Bypass can be switched on from the permission picker. The gateway already
+  accepted `permissions.allow_bypass`, but the only way to set it was to edit
+  the config file; the greyed-out bypass row now offers to turn it on and
+  switch the session to it in one step (needs the admin scope).
+- A turn that is still running after a reload is still shown as running. A
+  reload or reconnect mid-turn left the page with no spinner, no Stop and no
+  sign the agent was working: the client had lost its local run state and
+  assumed an idle conversation. The gateway now records active turns
+  (`AgentState::active_turns`, marked where a turn begins and ends rather than
+  inferred from a trailing event) and reports them through
+  `sessions.status {session_id}` and a `running` field on every `sessions.list`
+  row; the page asks on history load, on session switch and on connect, and
+  re-opens a live bubble for a turn it did not start.
+- A denied tool call no longer renders as a success. A call refused at the
+  approval dialog, blocked by a policy rule, or failed outright showed a green
+  "done" card: the agent loop wraps every tool error as "Tool execution
+  failed: …", and the check only recognised "Error:" and "error" prefixes.
+- A desktop sign-in ends on a page that says so, instead of navigating to the
+  gateway. The desktop shell opens the OAuth flow in the system browser, where
+  there is no `window.opener`, and the callback page fell back to
+  `location.replace("/")` — landing on the gateway SPA, which showed a failed
+  sign-in. The UI now says which flow started it (`desktop` / `popup` / `tab`),
+  the gateway whitelists that value before splicing it into the console's
+  redirect, and the callback either stays on a "you're signed in, you can close
+  this window" screen, closes itself, or returns to `/` as before.
+- A signed-in profile button no longer renders as a broken image. A remote
+  avatar that failed to load (no network, or a CSP that blocked it) showed the
+  browser's missing-image glyph on a 24px button. It now falls back to the
+  account initial, and the CSPs permit `https:` images so a real avatar loads
+  at all.
 - Aborting a turn releases the approvals it was waiting on. A tool call
   suspended on a human approval belongs to that turn; the abort cancelled the
   session but left the approval queued, so it stayed in the UI for the whole
@@ -160,6 +201,14 @@ if no section matches, the release falls back to auto-generated notes.
   `browser_chat_tests` already did for Chrome; before this they failed as if
   `macos_screenshot` had regressed. The probe itself is unit-tested so it
   cannot silently answer `false` forever.
+- The UI now has a browser test suite. The Rust e2e suite proves the event
+  sequence but not the screen, and the two worst bugs in this UI had a
+  perfectly correct event stream behind them (a hook-order error that blanked
+  the message list, a reloaded page showing a running turn as stopped).
+  Playwright specs now drive the real gateway with a scripted
+  OpenAI-compatible provider, each test on its own private home and port, and
+  the elements they assert on carry stable `data-testid`s (`pnpm test:ui` in
+  `web/`).
 
 ## [0.3.19] - 2026-11-11
 
