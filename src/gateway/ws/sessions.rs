@@ -17,6 +17,9 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
             .as_str()
             .to_string()
     };
+    // Which conversations have a turn in flight, from the gateway's own
+    // record. A client that reloaded mid-turn has nothing local to go on.
+    let running = state.agents.running_sessions().await;
     let sessions: Vec<serde_json::Value> = if let Some(ref store) = state.agents.store {
         match store.find_sessions(None, None, None, false).await {
             Ok(rows) => rows
@@ -41,6 +44,7 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
                         "pinned": meta.pinned,
                         "model": meta.model,
                         "permission_mode": permission_mode,
+                        "running": running.contains(&meta.session_id),
                         "created_at": meta.created_at.to_rfc3339(),
                     })
                 })
@@ -61,12 +65,65 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
                     "session_id": id,
                     "name": id,
                     "permission_mode": permission_mode,
+                    "running": running.contains(&id),
                 })
             })
             .collect()
     };
 
     WsResponse::ok(&req.id, serde_json::json!({ "sessions": sessions }))
+}
+
+/// `sessions.status { session_id }` — is this conversation's turn still
+/// running? (`{ session_id, running, awaiting_approval }`)
+///
+/// The gateway's own answer, not the client's memory of it. A reloaded page,
+/// a reconnected socket, a turn started from the CLI or a channel, and a turn
+/// that survived the client going away all leave a client with no local run
+/// state — and a live view that shows no sign of work is indistinguishable
+/// from one that stopped. This is what lets it say the truth instead.
+///
+/// `awaiting_approval` is part of the same question: a turn parked on a human
+/// is running (nothing has ended), and the client can say so rather than
+/// showing a bare spinner for an answer it is the one who must give.
+pub(super) async fn handle_sessions_status(
+    req: &WsRequest,
+    _conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct StatusParams {
+        session_id: String,
+    }
+
+    let params: StatusParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+
+    let running = state.agents.is_turn_running(&params.session_id).await;
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "session_id": params.session_id,
+            "running": running,
+            // Whether a pending approval names this conversation — the client
+            // has the full request from `approval.required` / `approvals.list`;
+            // this only says whether the running turn is waiting on one.
+            "awaiting_approval": if running {
+                state
+                    .tools
+                    .approval_queue
+                    .list_pending(crate::tools::approval::ApprovalFilter::default())
+                    .await
+                    .iter()
+                    .any(|pa| pa.session_id.as_deref() == Some(params.session_id.as_str()))
+            } else {
+                false
+            },
+        }),
+    )
 }
 
 pub(super) async fn handle_sessions_create(
@@ -1826,6 +1883,93 @@ mod tests {
         .await;
         assert!(!res.ok);
         assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+    }
+
+    /// A turn must be visible to a client that did not start it — a reload
+    /// mid-turn, a reconnect, or a turn started from the CLI or a channel.
+    /// `sessions.status` answers from the gateway's own record, and says when
+    /// the turn is parked on a human rather than working.
+    #[tokio::test]
+    async fn status_reports_a_turn_in_flight_and_a_pending_approval() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        async fn status(state: &Arc<GatewayState>, session_id: &str) -> serde_json::Value {
+            let res = handle_sessions_status(
+                &req("s", "sessions.status", serde_json::json!({ "session_id": session_id })),
+                &make_test_conn(&["read"]),
+                state,
+            )
+            .await;
+            assert!(res.ok, "sessions.status must succeed: {:?}", res.error);
+            res.payload.expect("payload")
+        }
+
+        let payload = status(&state, "s1").await;
+        assert_eq!(payload["running"], false);
+        assert_eq!(payload["awaiting_approval"], false);
+
+        state.agents.mark_turn_started("s1").await;
+        let payload = status(&state, "s1").await;
+        assert_eq!(payload["running"], true);
+        assert_eq!(payload["awaiting_approval"], false);
+
+        // A pending approval naming the conversation means the turn is not
+        // stalled — it is waiting for an answer only the human can give.
+        let pa = crate::tools::approval::PendingApproval::new(
+            "a1",
+            "shell",
+            serde_json::json!({ "command": "ls" }),
+            "agent",
+        )
+        .with_session(Some("s1".to_string()));
+        state.tools.approval_queue.submit(pa).await;
+        assert_eq!(status(&state, "s1").await["awaiting_approval"], true);
+        // Another conversation is neither running nor waiting.
+        let other = status(&state, "s2").await;
+        assert_eq!(other["running"], false);
+        assert_eq!(other["awaiting_approval"], false);
+
+        // Once the turn ends the answer reverts, even with the approval row
+        // still present: a stale row must not claim a live turn.
+        state.agents.mark_turn_finished("s1").await;
+        let payload = status(&state, "s1").await;
+        assert_eq!(payload["running"], false);
+        assert_eq!(payload["awaiting_approval"], false);
+    }
+
+    /// The sidebar reads `running` straight off `sessions.list`; a session
+    /// whose turn is in flight must say so there too.
+    #[tokio::test]
+    async fn list_marks_the_session_whose_turn_is_running() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+        for sid in ["s1", "s2"] {
+            handle_sessions_create(
+                &req("c", "sessions.create", serde_json::json!({ "session_id": sid })),
+                &conn,
+                &state,
+                &make_test_ctx(),
+            )
+            .await;
+        }
+        state.agents.mark_turn_started("s1").await;
+
+        let res =
+            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let sessions = res
+            .payload
+            .and_then(|p| p.get("sessions").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default();
+        let running_of = |sid: &str| {
+            sessions
+                .iter()
+                .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(sid))
+                .and_then(|s| s.get("running"))
+                .and_then(|v| v.as_bool())
+        };
+        assert_eq!(running_of("s1"), Some(true));
+        assert_eq!(running_of("s2"), Some(false));
     }
 
     #[tokio::test]

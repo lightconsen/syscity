@@ -88,6 +88,9 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
         transport.setMessages(history);
         useChatStore.getState().setMessages(history);
         useChatStore.getState().setHasMoreHistory(hasMore);
+        // A reload mid-turn leaves nothing local saying the turn is running;
+        // ask the gateway before concluding the conversation is idle.
+        void transport.refreshSessionRunState(transport.getSessionId());
       } catch {
         /* ignore — will retry when connected */
       }
@@ -794,12 +797,9 @@ function ChatApp() {
         if (currentMessages.length > 0) {
           transport.saveHistory(currentId, currentMessages);
         }
-        // Store current messages in messagesMap for background processing
-        transport.saveSessionMessages(currentId, currentMessages);
-        // Stop local processing but keep backend running
-        transport.abortLocal(currentId);
-        // Continue processing events in background
-        transport.processSessionInBackground(currentId).catch(() => {});
+        // Hand a running turn to a background drainer: the gateway keeps
+        // working on it, and it must still read as running when we come back.
+        transport.detachSession(currentId);
       }
       // Switch to new session
       transport.switchSession(id);
@@ -811,6 +811,10 @@ function ChatApp() {
         const { messages: history, hasMore } = await transport.loadHistory(id);
         transport.setMessages(history);
         useChatStore.getState().setHasMoreHistory(hasMore);
+        // History can land on top of a live turn that `switchSession` had
+        // already resumed. Ask again now that the list is final, so a turn
+        // running in another surface still shows as running.
+        void transport.refreshSessionRunState(id);
       }
       setSessionKey((k) => k + 1);
     },

@@ -28,6 +28,7 @@
   "GoalPanel.activeCount": "({{count}} active)",
   "LiveStatusBar.runningTool": "Running {{tool}}...",
   "LiveStatusBar.thinking": "Thinking...",
+  "LiveStatusBar.awaitingApproval": "Waiting for your approval...",
   "ModelSelector.modelTitle": "Model: {{model}}",
   "ModelSelector.default": "default",
   "ModelSelector.defaultSuffix": " (default)",

@@ -425,6 +425,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("sessions.set_model", Some(SCOPE_WRITE)),
     ("sessions.set_mode", Some(SCOPE_WRITE)),
     ("sessions.get_mode", Some(SCOPE_READ)),
+    ("sessions.status", Some(SCOPE_READ)),
     ("sessions.reset", Some(SCOPE_WRITE)),
     ("sessions.subscribe", Some(SCOPE_WRITE)),
     ("sessions.unsubscribe", Some(SCOPE_WRITE)),

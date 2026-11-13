@@ -79,6 +79,32 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
       return null;
     }
   };
+  /**
+   * `sessions.status` — is this conversation's turn still running?
+   *
+   * The gateway answers from its own record of turns in flight, which is the
+   * only thing a client that did not start the turn can rely on: after a
+   * reload, a reconnect, or a turn started from the CLI or a channel, nothing
+   * local says the conversation is busy — and the view then looks stopped.
+   * `awaiting_approval` separates "working" from "parked on a human", so the
+   * UI can point at the approval instead of spinning.
+   */
+  proto.getSessionStatus = async function (
+    this: SyscityWebSocketTransport,
+    sessionId: string
+  ): Promise<{ running: boolean; awaitingApproval: boolean } | null> {
+    try {
+      const res = (await this.sendRequestAndWait("sessions.status", {
+        session_id: sessionId,
+      })) as { running?: boolean; awaiting_approval?: boolean } | undefined;
+      return {
+        running: res?.running === true,
+        awaitingApproval: res?.awaiting_approval === true,
+      };
+    } catch {
+      return null;
+    }
+  };
   proto.renameSession = async function (this: SyscityWebSocketTransport,sessionId: string, name: string): Promise<boolean> {
     try {
       await this.sendRequestAndWait("sessions.rename", { session_id: sessionId, name });

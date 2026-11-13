@@ -38,7 +38,9 @@ export interface ChatMessage {
   durationMs?: number;
   /** Live streaming status — set during response, cleared on complete */
   liveStatus?: {
-    status: "thinking" | "tool_calling";
+    /** `awaiting_approval`: the turn is parked on a human answer, so the UI
+     *  points at the approval instead of spinning as if it were working. */
+    status: "thinking" | "tool_calling" | "awaiting_approval";
     toolName?: string;
   };
   /** Stable per-turn id from the `chat.final` event; the key for feedback.vote. */

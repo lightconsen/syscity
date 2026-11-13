@@ -782,6 +782,12 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
         debug!("No receivers for AgentStatus event: {}", e);
     }
 
+    // The gateway's own record that this conversation has a turn in flight.
+    // A client cannot know this on its own — a reload mid-turn leaves it with
+    // no local run state — so `sessions.status`/`sessions.list` answer from
+    // here and the live view can say "running" instead of looking stopped.
+    state.agents.mark_turn_started(session_id).await;
+
     // Build progress callback that forwards events to gateway subscribers
     let event_tx = state.events.tx.clone();
     let progress_session = session_id.to_string();
@@ -1085,6 +1091,10 @@ pub(crate) async fn send_to_agent(state: &Arc<GatewayState>, dispatch: AgentDisp
     }) {
         debug!("No receivers for AgentStatus event: {}", e);
     }
+
+    // The turn is over, whichever way it ended: no client should go on
+    // showing a Stop button (or waiting for a live status) for it.
+    state.agents.mark_turn_finished(session_id).await;
 
     // Stop hook: fire-and-forget shell commands for the turn that just ended.
     state

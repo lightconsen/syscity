@@ -380,6 +380,7 @@ pub(crate) async fn run_agent_loop(
                                 session_id: session_id.clone(),
                             },
                         });
+                        state.agents.mark_turn_started(&session_id).await;
 
                         if use_acp {
                             process_message_acp(
@@ -413,13 +414,20 @@ pub(crate) async fn run_agent_loop(
                             status: super::AgentStatus::Idle,
                         });
                         busy.store(false, Ordering::Release);
+                        // Released before the finished mark: a queued prompt
+                        // that goes straight back to this loop is the same
+                        // conversation continuing, and should not flicker to
+                        // "idle" in between.
+                        let released =
+                            super::prompt_queue::release_next(&state.pipelines, &session_id).await;
+                        if released.is_none() {
+                            state.agents.mark_turn_finished(&session_id).await;
+                        }
 
                         // A prompt queued for this session was queued *behind
                         // the turn that has just finished, so this is its
                         // moment.
-                        if let Some(Err(e)) =
-                            super::prompt_queue::release_next(&state.pipelines, &session_id).await
-                        {
+                        if let Some(Err(e)) = released {
                             // It has already left the queue: saying so is the
                             // only alternative to losing it quietly.
                             warn!(

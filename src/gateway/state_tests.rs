@@ -156,6 +156,7 @@ pub async fn make_test_state_parts(
             repair_state: Arc::new(RepairState::new()),
             acp: Arc::new(AcpControlPlane::new(50)),
             goal_cancellers: Arc::new(RwLock::new(HashMap::new())),
+            active_turns: Arc::new(RwLock::new(HashSet::new())),
         },
         channels: ChannelState {
             channels: Arc::new(RwLock::new(HashMap::new())),

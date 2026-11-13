@@ -92,6 +92,47 @@ pub struct AgentState {
     pub acp: Arc<AcpControlPlane>,
     /// Active goal runners mapped by goal_id for cancellation support.
     pub goal_cancellers: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    /// Sessions whose turn is executing right now.
+    ///
+    /// This is the gateway's own answer to "is this conversation still
+    /// working?", which no client can derive for itself: a page reload, a
+    /// reconnect, or a turn started from another surface (CLI, channel,
+    /// cron) all leave a client with no local record of a turn that is
+    /// nonetheless running. `sessions.status` and `sessions.list` report it,
+    /// and the web client adopts it so the live view does not sit there
+    /// looking stopped while the agent is in the middle of a tool call.
+    ///
+    /// Marked where a turn actually begins and ends — `dispatch::send_to_agent`
+    /// for the WS path and `agent_spawn::run_agent_loop` for the direct one —
+    /// rather than inferred from a trailing event, which a client that missed
+    /// the start would also miss.
+    pub active_turns: Arc<RwLock<HashSet<String>>>,
+}
+
+impl AgentState {
+    /// Record that `session_id`'s turn has started.
+    pub async fn mark_turn_started(&self, session_id: &str) {
+        self.active_turns
+            .write()
+            .await
+            .insert(session_id.to_string());
+    }
+
+    /// Record that `session_id`'s turn has ended (completed, failed or was
+    /// cancelled). Idempotent: two execution paths may both have marked it.
+    pub async fn mark_turn_finished(&self, session_id: &str) {
+        self.active_turns.write().await.remove(session_id);
+    }
+
+    /// Whether a turn is executing for `session_id`.
+    pub async fn is_turn_running(&self, session_id: &str) -> bool {
+        self.active_turns.read().await.contains(session_id)
+    }
+
+    /// A snapshot of every session with a turn in flight.
+    pub async fn running_sessions(&self) -> HashSet<String> {
+        self.active_turns.read().await.clone()
+    }
 }
 
 /// Channel adapters, extensions, and response dispatch state.

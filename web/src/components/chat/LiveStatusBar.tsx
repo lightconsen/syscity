@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 interface LiveStatusBarProps {
-  liveStatus: { status: "thinking" | "tool_calling"; toolName?: string };
+  liveStatus: { status: "thinking" | "tool_calling" | "awaiting_approval"; toolName?: string };
   /**
    * When the turn started, in epoch ms. Must be stable for a given turn: the
    * counter re-anchors when this value changes, so a caller that recomputes it
@@ -36,10 +36,16 @@ export function LiveStatusBar({ liveStatus, startTime }: LiveStatusBarProps) {
   const label =
     liveStatus.status === "tool_calling"
       ? t("LiveStatusBar.runningTool", { tool: liveStatus.toolName || "tool" })
-      : t("LiveStatusBar.thinking");
+      : liveStatus.status === "awaiting_approval"
+        ? t("LiveStatusBar.awaitingApproval")
+        : t("LiveStatusBar.thinking");
 
   return (
-    <div className="mt-2 flex items-center gap-2 text-xs text-secondary animate-pulse">
+    <div
+      className={`mt-2 flex items-center gap-2 text-xs text-secondary${liveStatus.status === "awaiting_approval" ? "" : " animate-pulse"}`}
+      data-testid="live-status"
+      data-status={liveStatus.status}
+    >
       <div className="w-1.5 h-1.5 rounded-full bg-primary-500" />
       <span>{label}</span>
       <span className="font-mono">({(elapsed / 1000).toFixed(1)}s)</span>

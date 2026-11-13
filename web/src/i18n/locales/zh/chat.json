@@ -28,6 +28,7 @@
   "GoalPanel.activeCount": "（{{count}} 个进行中）",
   "LiveStatusBar.runningTool": "正在运行 {{tool}}…",
   "LiveStatusBar.thinking": "思考中…",
+  "LiveStatusBar.awaitingApproval": "等待你的批准…",
   "ModelSelector.modelTitle": "模型：{{model}}",
   "ModelSelector.default": "默认",
   "ModelSelector.defaultSuffix": "（默认）",

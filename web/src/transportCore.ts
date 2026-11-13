@@ -69,6 +69,26 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
   private runningSessions: Set<string> = new Set();
   /** Per-session AbortControllers for local cancellation. */
   private abortControllers: Map<string, AbortController> = new Map();
+  /** Sessions a background drainer is currently processing, and which one. */
+  private backgroundSessions: Map<string, number> = new Map();
+  private nextBackgroundToken = 0;
+  /**
+   * Sessions whose `run()` was aborted to hand the turn to a background
+   * drainer (the user switched away). The turn is still running, so `run()`
+   * must not clear its live status or its run mark on the way out — the
+   * drainer owns both now, and a cleared bubble is one a switch-back shows as
+   * a finished turn with a bogus duration.
+   */
+  private handoffSessions: Set<string> = new Set();
+  /**
+   * When a turn this client ran ended (epoch ms). The gateway clears its own
+   * mark a moment *after* sending the final event, so a snapshot taken in that
+   * window still says "running" — adopting it would resurrect a turn the user
+   * just watched finish.
+   */
+  private settledTurns: Map<string, number> = new Map();
+  /** How long after a turn ends the gateway's "running" is not trusted. */
+  private static readonly SETTLE_WINDOW_MS = 15000;
   /** Sessions whose background processing has completed. */
   private runningSessionListeners: Set<(ids: string[]) => void> = new Set();
   private reconnectDelay = 800;
@@ -226,7 +246,14 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     this.sendRequest("chat.abort", {
       session_id: sid,
     });
+    // A turn this client adopted from the gateway is drained in the
+    // background — Stop must stop that too, or the bubble keeps waiting.
+    this.stopBackgroundProcessing(sid);
+    this.clearStaleLiveBubbles(sid);
     this.runningSessions.delete(sid);
+    // The user ended it: a snapshot that still says "running" (the gateway
+    // clears its mark a moment after the cancel lands) must not revive it.
+    this.settledTurns.set(sid, Date.now());
     this.notifyRunningSessionsChanged();
   }
 
@@ -240,6 +267,185 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     }
     this.runningSessions.delete(sid);
     this.notifyRunningSessionsChanged();
+  }
+
+  /**
+   * Hand a running turn to a background drainer while the user switches away.
+   *
+   * Not `abortLocal`: the turn has not ended, so the run mark and the live
+   * bubble stay — the drainer continues them, and `run()`'s cleanup is told to
+   * leave them alone.
+   */
+  private handOffToBackground(sessionId: string): void {
+    this.handoffSessions.add(sessionId);
+    const controller = this.abortControllers.get(sessionId);
+    if (controller) {
+      controller.abort();
+      this.abortControllers.delete(sessionId);
+    }
+  }
+
+  /**
+   * Leave a session the user switched away from, without ending its turn.
+   *
+   * A running turn keeps going on the gateway; the background drainer picks up
+   * its events so the answer is complete when the user comes back. Merely
+   * calling `abortLocal` dropped the run mark and the live bubble, so the
+   * conversation looked stopped while it was still working.
+   *
+   * A session with nothing running is left alone.
+   */
+  detachSession(sessionId: string): void {
+    this.saveSessionMessages(sessionId, this.getMessages(sessionId));
+    if (!this.runningSessions.has(sessionId)) return;
+    this.handOffToBackground(sessionId);
+    this.startBackgroundDrain(sessionId);
+  }
+
+  /** Run a background drainer, reporting failures through message state. */
+  private startBackgroundDrain(sessionId: string): void {
+    void this.processSessionInBackground(sessionId).catch(() => {
+      /* the turn's own error event is the user-visible signal */
+    });
+  }
+
+  /**
+   * Fold the gateway's own answer — "this conversation has a turn in flight" —
+   * into the client's run state.
+   *
+   * `runningSessions` is otherwise built only from turns this client started
+   * and is lost on reload, so a turn running after a reload, on a reconnect,
+   * or started from the CLI drew no live view and no Stop button: the
+   * conversation simply looked stopped while the gateway kept working.
+   *
+   * A session this client owns locally is left alone. The gateway's mark lands
+   * a moment after `chat.send`, so a snapshot taken in that window would
+   * report "not running" and blink the Stop button off mid-send.
+   */
+  private adoptGatewayRunState(runningOnGateway: Map<string, boolean>): void {
+    let changed = false;
+    for (const [sid, running] of runningOnGateway) {
+      if (this.abortControllers.has(sid) || this.backgroundSessions.has(sid)) {
+        continue;
+      }
+      if (!running) {
+        if (this.runningSessions.delete(sid)) changed = true;
+        continue;
+      }
+      // A turn that just finished on this client is not made live again by a
+      // stale snapshot: the gateway clears its mark slightly after emitting
+      // the final event.
+      const settledAt = this.settledTurns.get(sid);
+      if (
+        settledAt !== undefined &&
+        Date.now() - settledAt < SyscityWebSocketTransport.SETTLE_WINDOW_MS
+      ) {
+        continue;
+      }
+      this.settledTurns.delete(sid);
+      if (!this.runningSessions.has(sid)) {
+        this.runningSessions.add(sid);
+        changed = true;
+      }
+      // Only the session on screen gets a live bubble: for any other session
+      // the client has not loaded the history the turn is appending to, and a
+      // placeholder written into `messagesMap` would replace it on the next
+      // save. The sidebar's spinner is enough there.
+      if (sid === this.sessionId) {
+        this.resumeLiveTurn(sid);
+      }
+    }
+    if (changed) this.notifyRunningSessionsChanged();
+  }
+
+  /** Re-open a live assistant bubble for a turn this client did not start. */
+  private resumeLiveTurn(sessionId: string): void {
+    if (this.backgroundSessions.has(sessionId)) return;
+    if (this.abortControllers.has(sessionId)) return;
+    const messages = this.getMessages(sessionId);
+    if (!messages.some((m) => m.role === "assistant" && m.liveStatus)) {
+      const live: ChatMessage = {
+        id: `a_resume_${Date.now()}`,
+        role: "assistant",
+        content: "",
+        parts: [{ type: "reasoning", text: "" }],
+        liveStatus: { status: "thinking" },
+        // Counts from when this client noticed, not from the turn's start:
+        // the turn began before the reload and its start is not knowable here.
+        timestamp: Date.now(),
+      };
+      // Written through whichever view the session is using right now: the
+      // live one when it is on screen, the cached one otherwise.
+      this.setMessages([...messages, live], sessionId);
+    }
+    // Deliberately not awaited: the caller is a request handler.
+    this.startBackgroundDrain(sessionId);
+  }
+
+  /** Ask the gateway about one session and adopt the answer. */
+  private async refreshRunStateFor(sessionId: string): Promise<void> {
+    const status = await this.getSessionStatus(sessionId);
+    if (!status) return;
+    this.adoptGatewayRunState(new Map([[sessionId, status.running]]));
+    // "Running" covers both working and parked on a human; the live view should
+    // not spin as if the agent were busy while it waits for an approval.
+    if (status.running && status.awaitingApproval) {
+      this.noteAwaitingApproval(sessionId);
+    }
+  }
+
+  /** Turn the live bubble's label into "waiting for your approval". */
+  private noteAwaitingApproval(sessionId: string): void {
+    const live = this.getMessages(sessionId).find(
+      (m) => m.role === "assistant" && m.liveStatus,
+    );
+    if (!live?.liveStatus || live.liveStatus.status === "awaiting_approval") return;
+    live.liveStatus = { status: "awaiting_approval" };
+    if (sessionId === this.sessionId) this.notifyLiveMessages();
+  }
+
+  /**
+   * Re-ask the gateway whether `sessionId` has a turn in flight and adopt it.
+   *
+   * Call this after history has replaced the message list: loading history
+   * can land on top of the live bubble a resumed turn had inserted, and the
+   * conversation would then look stopped again.
+   */
+  async refreshSessionRunState(sessionId?: string): Promise<void> {
+    await this.refreshRunStateFor(sessionId ?? this.sessionId);
+  }
+
+  /**
+   * Stop a background drainer that is parked on `nextEvent`, so an abort does
+   * not leave a phantom live bubble waiting for events that will never come.
+   */
+  private stopBackgroundProcessing(sessionId: string): void {
+    if (!this.backgroundSessions.has(sessionId)) return;
+    this.backgroundSessions.delete(sessionId);
+    // Wake the parked wait — with `null`, so nothing is pushed into the queue
+    // for the next drainer to trip over.
+    const waiters = this.eventWaiters.get(sessionId);
+    const waiter = waiters?.shift();
+    if (waiter) waiter(null);
+  }
+
+  /**
+   * Drop a live bubble a drainer left behind. Its turn had already ended, but
+   * the bubble never saw a `chat.final`, so it would otherwise sit under the
+   * new message counting up a stall that is not happening.
+   */
+  private clearStaleLiveBubbles(sessionId: string): void {
+    const msgs = this.getMessages(sessionId);
+    if (!msgs.some((m) => m.liveStatus)) return;
+    this.setMessages(
+      msgs.filter((m) => !m.liveStatus),
+      sessionId,
+    );
+  }
+
+  /** Push the current session's messages to the UI. */
+  private notifyLiveMessages(): void {
+    this.messagesListeners.forEach((cb) => cb(this.messages));
   }
 
   private notifyRunningSessionsChanged(): void {
@@ -413,6 +619,10 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
                 session_ids: this.subscribedSessions,
               });
             }
+            // A turn may have been running while this client was away: the
+            // gateway's record is the only way to know, and without it the
+            // conversation renders as stopped until the next message.
+            void this.refreshRunStateFor(this.sessionId);
           }
         }
         if (msg.type === "event") {
@@ -616,6 +826,8 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       /** The permission mode the session runs in (`default` unless overridden). */
       permission_mode?: string;
       last_activity?: number;
+      /** The gateway says this conversation has a turn in flight. */
+      running?: boolean;
     }>
   > {
     const local = this.getLocalSessions();
@@ -633,6 +845,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
               model?: string | null;
               permission_mode?: string;
               last_activity?: string;
+              running?: boolean;
             }>;
           }
         | undefined;
@@ -646,6 +859,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
           model?: string | null;
           permission_mode?: string;
           last_activity?: number;
+          running?: boolean;
         }
       >();
       for (const s of remote) {
@@ -658,8 +872,20 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
           last_activity: s.last_activity
             ? new Date(s.last_activity).getTime()
             : undefined,
+          running: s.running === true,
         });
       }
+      // The gateway is the only source for "this turn is still running": a
+      // reload, a reconnect or a turn started from the CLI leaves the client
+      // with no local record. Fold it in before returning, so the sidebar and
+      // the chat view agree without a separate poll.
+      this.adoptGatewayRunState(
+        new Map(
+          Array.from(merged.entries())
+            .filter(([, data]) => data.running !== undefined)
+            .map(([id, data]) => [id, data.running === true]),
+        ),
+      );
       for (const id of local) {
         if (!merged.has(id)) {
           merged.set(id, { label: this.sessionLabel(id) });
@@ -673,6 +899,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
         model: data.model ?? null,
         permission_mode: data.permission_mode,
         last_activity: data.last_activity,
+        running: data.running,
       }));
     } catch {
       return local.map((id) => ({ id, label: this.sessionLabel(id) }));
@@ -775,6 +1002,10 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
         session_ids: [sessionId],
       });
     }
+    // Switching to a conversation another surface is working in must show it
+    // working, not stopped — ask the gateway rather than trusting the empty
+    // local run state.
+    void this.refreshRunStateFor(sessionId);
     this.notifySessionChange();
   }
 
@@ -785,6 +1016,10 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     'agent.thinking', 'tool.calling', 'tool.result',
     'cron.completed', 'goal.progress',
     'session.created', 'session.renamed', 'session.pinned',
+    // A turn parked on a human is still that conversation's turn: without this
+    // a resumed live view showed an inert "thinking" while the agent waited on
+    // an approval it had already asked for.
+    'approval.required',
   ]);
 
   /** Extract session_id from event payload. Returns '' for non-session events. */
@@ -1461,6 +1696,11 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     }
 
     const sessionId = this.sessionId;
+    // A turn resumed from the gateway (`resumeLiveTurn`) is draining this
+    // session's event queue; leaving it running would split the same turn's
+    // events between two consumers, each seeing half.
+    this.stopBackgroundProcessing(sessionId);
+    this.clearStaleLiveBubbles(sessionId);
     this.runningSessions.add(sessionId);
     this.abortControllers.set(sessionId, new AbortController());
     this.notifyRunningSessionsChanged();
@@ -1729,6 +1969,17 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
               (evt.payload?.message as string) || "Chat error"
             );
           }
+          case "approval.required": {
+            // The turn is not stalled — it is waiting for a human. Say so, so
+            // the live view does not read as a hung agent.
+            aiMsg.liveStatus = {
+              status: "awaiting_approval",
+              toolName: (evt.payload?.tool_name as string) || undefined,
+            };
+            this.messagesListeners.forEach((cb) => cb(this.messages));
+            yield { content: [...parts] };
+            break;
+          }
         }
       }
     } catch (err) {
@@ -1740,6 +1991,12 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       this.messagesListeners.forEach((cb) => cb(this.messages));
       throw err;
     } finally {
+      // The turn was handed to a background drainer: it owns the live bubble
+      // and the run mark from here, and clearing either would make a working
+      // conversation look finished.
+      if (this.handoffSessions.delete(sessionId)) {
+        return;
+      }
       // Safety net: always clear live status
       if (aiMsg.durationMs === undefined) {
         aiMsg.durationMs = Date.now() - startTime;
@@ -1748,12 +2005,17 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       aiMsg.liveStatus = undefined;
       this.runningSessions.delete(sessionId);
       this.abortControllers.delete(sessionId);
+      this.settledTurns.set(sessionId, Date.now());
       this.runListeners.forEach((cb) => cb(false));
       this.notifyRunningSessionsChanged();
     }
   }
 
-  private nextEvent(sessionId: string, abortSignal?: AbortSignal): Promise<WsEvent | null> {
+  private nextEvent(
+    sessionId: string,
+    abortSignal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<WsEvent | null> {
     return new Promise((resolve) => {
       if (!this.eventQueues.has(sessionId)) {
         this.eventQueues.set(sessionId, []);
@@ -1764,6 +2026,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
         return;
       }
 
+      let timer: ReturnType<typeof setTimeout> | null = null;
       const waiter = (evt: WsEvent | null) => {
         cleanup();
         resolve(evt);
@@ -1779,6 +2042,10 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       };
 
       const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
         if (abortSignal) {
           abortSignal.removeEventListener("abort", onAbort);
         }
@@ -1796,6 +2063,14 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       if (abortSignal) {
         abortSignal.addEventListener("abort", onAbort);
       }
+      // A timed wait that leaves its waiter behind would swallow the next
+      // event into a promise nobody reads; `cleanup` removes it.
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          cleanup();
+          resolve(null);
+        }, timeoutMs);
+      }
     });
   }
 
@@ -1806,6 +2081,11 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
    * Does NOT send chat.abort.
    */
   async processSessionInBackground(sessionId: string): Promise<void> {
+    // One drainer per session: two would split the event stream between them
+    // and each would see half a turn.
+    if (this.backgroundSessions.has(sessionId)) return;
+    const token = ++this.nextBackgroundToken;
+    this.backgroundSessions.set(sessionId, token);
     // Seed messagesMap with current state if empty
     let sessionMessages = this.messagesMap.get(sessionId);
     if (!sessionMessages) {
@@ -1825,6 +2105,8 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
     };
     let currentText = partialAi?.content || "";
     let currentReasoning = "";
+    /** The stream said this turn ended — no need to ask the gateway. */
+    let terminal = false;
     const toolCalls = new Map<string, ChatMessagePart>();
     const extraParts: ChatMessagePart[] = [];
     if (!partialAi) {
@@ -1834,8 +2116,26 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
 
     try {
       while (true) {
-        const evt = await this.nextEvent(sessionId);
-        if (!evt) break;
+        // A background processor may be draining a turn this client did not
+        // start (it adopted the gateway's run state), so it has no natural end:
+        // wait in slices and confirm the turn is still alive between them.
+        // Otherwise a missed `chat.final` — a reconnect, a dropped event —
+        // leaves a phantom live bubble counting up forever.
+        const evt = await this.nextEvent(
+          sessionId,
+          undefined,
+          this.backgroundSessions.get(sessionId) === token ? 20000 : undefined,
+        );
+        if (!evt) {
+          if (this.backgroundSessions.get(sessionId) !== token) break;
+          const status = await this.getSessionStatus(sessionId);
+          if (!status || !status.running) {
+            terminal = true;
+            break;
+          }
+          aiMsg.liveStatus = aiMsg.liveStatus ?? { status: "thinking" };
+          continue;
+        }
 
         switch (evt.event) {
           case "chat.delta": {
@@ -1912,10 +2212,13 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
 
             aiMsg.content = currentText;
             aiMsg.parts = finalParts;
-            aiMsg.durationMs = Date.now();
+            // Elapsed, not the wall clock: this used to store `Date.now()`,
+            // so a finished turn rendered a 56-year duration.
+            aiMsg.durationMs = Date.now() - (aiMsg.timestamp ?? Date.now());
             aiMsg.toolCount = toolCalls.size;
             aiMsg.turnId = (evt.payload?.turn_id as string) || undefined;
             aiMsg.liveStatus = undefined;
+            terminal = true;
 
             this.messagesMap.set(sessionId, [...sessionMessages]);
             this.saveHistory(sessionId, this.messagesMap.get(sessionId)!);
@@ -1927,11 +2230,19 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
             }
             return;
           }
+          case "approval.required": {
+            aiMsg.liveStatus = {
+              status: "awaiting_approval",
+              toolName: (evt.payload?.tool_name as string) || undefined,
+            };
+            break;
+          }
           case "chat.error": {
             aiMsg.content = currentText || ((evt.payload?.message as string) || "Chat error");
             const code = evt.payload?.code as string | undefined;
-            if (code) aiMsg.errorCode = code;
+            aiMsg.errorCode = code;
             aiMsg.liveStatus = undefined;
+            terminal = true;
             this.messagesMap.set(sessionId, [...sessionMessages]);
             return;
           }
@@ -1946,19 +2257,46 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
 
         aiMsg.content = currentText;
         aiMsg.parts = parts;
+        // Live status follows the stream: a turn running a tool says so rather
+        // than looking like it is still thinking.
+        if (evt.event === "tool.calling") {
+          const name = (evt.payload?.tool_name as string) || undefined;
+          aiMsg.liveStatus = { status: "tool_calling", toolName: name };
+        } else if (evt.event === "tool.result" && aiMsg.liveStatus) {
+          aiMsg.liveStatus = { status: "thinking" };
+        }
         this.messagesMap.set(sessionId, sessionMessages);
 
         // If this is now the current session, notify live
         if (sessionId === this.sessionId) {
           this.messages = sessionMessages;
-          this.messagesListeners.forEach((cb) => cb(this.messages));
+          this.notifyLiveMessages();
         }
       }
     } catch {
       // Background processor silently handles errors
     } finally {
-      this.runningSessions.delete(sessionId);
-      this.notifyRunningSessionsChanged();
+      // A newer drainer may have taken over this session; it owns the state now.
+      if (this.backgroundSessions.get(sessionId) !== token) return;
+      this.backgroundSessions.delete(sessionId);
+      // The stream said the turn ended (`chat.final` / `chat.error`) — settling
+      // local state is enough. Otherwise ask the gateway: a turn still running
+      // after this drainer stops (the user switched away and back mid-turn)
+      // keeps its mark, and clearing it would blink the Stop button off under
+      // a working turn.
+      const stillRunning = terminal
+        ? false
+        : ((await this.getSessionStatus(sessionId).catch(() => null))?.running ?? false);
+      if (!stillRunning) {
+        aiMsg.liveStatus = undefined;
+        this.runningSessions.delete(sessionId);
+        this.settledTurns.set(sessionId, Date.now());
+        if (sessionId === this.sessionId) {
+          this.messages = this.messagesMap.get(sessionId) ?? this.messages;
+          this.notifyLiveMessages();
+        }
+        this.notifyRunningSessionsChanged();
+      }
     }
   }
 }
@@ -2111,6 +2449,18 @@ export interface SyscityWebSocketTransport {
   getSessionMode(
     sessionId: string,
   ): Promise<{ mode: "default" | "accept_edits" | "plan" | "bypass"; allowBypass: boolean } | null>;
+  /**
+   * `sessions.status` — whether this conversation's turn is still running.
+   *
+   * The only source of that fact a client that did not start the turn has:
+   * after a reload, a reconnect, or a turn started from the CLI, channel or
+   * cron, `runningSessions` holds nothing and the chat view would look stopped
+   * while the gateway is in the middle of a tool call.
+   */
+  getSessionStatus(sessionId: string): Promise<{
+    running: boolean;
+    awaitingApproval: boolean;
+  } | null>;
   respondToApproval(
     approvalId: string,
     decision: "approve" | "deny",
