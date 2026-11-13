@@ -361,7 +361,10 @@ export function ChatContent({ transport }: ChatContentProps) {
   // The composer is the chat area's own component; on the New Session welcome
   // page it renders centered below the greeting (same instance, one branch).
   const composerEl = (
-    <ComposerPrimitive.Root className="max-w-[var(--message-list-max-width)] mx-auto w-full">
+    <ComposerPrimitive.Root
+      className="max-w-[var(--message-list-max-width)] mx-auto w-full"
+      data-testid="composer"
+    >
       <div className="relative flex flex-col rounded-2xl bg-card shadow-sm focus-within:ring-2 focus-within:ring-primary-500/20 transition">
         {/* Command palette */}
         {paletteOpen && (
@@ -381,6 +384,7 @@ export function ChatContent({ transport }: ChatContentProps) {
           placeholder={t("ChatContent.placeholder")}
           rows={1}
           aria-label={t("ChatContent.messageInput")}
+          data-testid="composer-input"
         />
 
         {/* Entity chips attached via the "+" picker (cleared on send) */}
@@ -419,12 +423,16 @@ export function ChatContent({ transport }: ChatContentProps) {
                 onClick={() => transport.abort(transport.getSessionId())}
                 title={t("ChatContent.stopGenerating")}
                 aria-label={t("ChatContent.stopGenerating")}
+                data-testid="composer-stop"
                 className="shrink-0 p-2 rounded-lg bg-red-500 hover:bg-red-600 text-white transition shadow-sm"
               >
                 <Square className="w-4 h-4 fill-current" />
               </button>
             ) : (
-              <ComposerPrimitive.Send className="shrink-0 p-2 rounded-lg bg-gradient-to-r from-primary-500 to-primary-700 hover:from-primary-600 hover:to-primary-800 disabled:opacity-40 text-white transition shadow-sm">
+              <ComposerPrimitive.Send
+                className="shrink-0 p-2 rounded-lg bg-gradient-to-r from-primary-500 to-primary-700 hover:from-primary-600 hover:to-primary-800 disabled:opacity-40 text-white transition shadow-sm"
+                data-testid="composer-send"
+              >
                 <Send className="w-4 h-4" />
               </ComposerPrimitive.Send>
             )}
@@ -451,6 +459,7 @@ export function ChatContent({ transport }: ChatContentProps) {
             className="flex-1 overflow-y-auto relative"
             role="log"
             aria-live="polite"
+            data-testid="message-list"
           >
             {messages.length > 0 && (
               <div style={{ height: `${totalHeight}px`, position: "relative" }}>
@@ -487,7 +496,11 @@ export function ChatContent({ transport }: ChatContentProps) {
                 ))}
               </div>
             )}
-            {isRunning && <MessageSkeleton />}
+            {isRunning && (
+              <div data-testid="message-skeleton">
+                <MessageSkeleton />
+              </div>
+            )}
           </div>
 
           {showScrollButton && (

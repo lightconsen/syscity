@@ -279,6 +279,7 @@ function InternalsToggle({
       onClick={onToggle}
       className="flex items-center gap-1.5 text-[11px] text-secondary hover:text-primary transition mb-1.5"
       aria-expanded={expanded}
+      data-testid="internals-toggle"
     >
       <BrainCircuit className="w-3.5 h-3.5" />
       <span>{parts.join(" · ")}</span>
@@ -380,7 +381,7 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
 
   if (isUser) {
     return (
-      <div className="py-4 group">
+      <div className="py-4 group" data-testid="message-user">
         <div className="flex gap-3 flex-row-reverse" style={centerStyle}>
           <Avatar role="user" />
           <div className="flex-1 min-w-0 text-right">
@@ -434,7 +435,7 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
       message.credits !== undefined);
 
   return (
-    <div className="py-4 group">
+    <div className="py-4 group" data-testid="message-assistant">
       <div className="flex gap-3 flex-row" style={centerStyle}>
         <Avatar role="assistant" />
         <div className="flex-1 min-w-0">
@@ -457,7 +458,11 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
             <div className="space-y-1">
               {/* Internals panel: reasoning + tool-calls with Collapse button */}
               {hasInternals && (
-                <div className={showInternals ? "" : "hidden"}>
+                <div
+                  className={showInternals ? "" : "hidden"}
+                  data-testid="internals-panel"
+                  data-expanded={showInternals}
+                >
                   <div className="space-y-1">
                     {message.parts!.map((part, i) => {
                       if (part.type === "reasoning") {
@@ -518,9 +523,12 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
             />
           )}
           {!message.liveStatus && hasMetadata && (
-            <div className="mt-1.5 flex items-center gap-3 text-[10px] text-secondary">
+            <div
+              className="mt-1.5 flex items-center gap-3 text-[10px] text-secondary"
+              data-testid="message-footer"
+            >
               {message.durationMs !== undefined && (
-                <span className="flex items-center gap-1">
+                <span className="flex items-center gap-1" data-testid="turn-duration">
                   <Clock className="w-3 h-3" />
                   {formatDuration(message.durationMs)}
                 </span>

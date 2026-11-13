@@ -1,2 +1,7 @@
 node_modules/
 ../chat/
+
+# Playwright output: traces, screenshots and videos of failed runs. They are
+# large, machine-specific, and regenerated on every run.
+test-results/
+playwright-report/

@@ -291,6 +291,8 @@ export function Sidebar({
           onClick={onShowApprovals}
           className="mx-1 mb-2 px-3 py-2 rounded-lg text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-900/40 transition text-left shrink-0"
           title={t("Sidebar.showPendingApprovals")}
+          data-testid="approval-badge"
+          data-count={pendingApprovals}
         >
           ⚠️ {t("Sidebar.pendingApprovals", { count: pendingApprovals })}
         </button>
@@ -677,6 +679,9 @@ function SessionRow({
           : "hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
       }`}
       role="listitem"
+      data-testid="session-row"
+      data-session-id={session.id}
+      data-active={isActive ? "true" : "false"}
     >
       <button
         onClick={onSwitch}
@@ -738,7 +743,10 @@ function SessionRow({
           </div>
           {/* Loading overlay — covers same area as buttons, hidden on hover */}
           {runningSessionIds.includes(session.id) && (
-            <div className="absolute inset-0 flex items-center justify-end pr-0.5 opacity-100 group-hover:opacity-0 transition-opacity pointer-events-none">
+            <div
+              className="absolute inset-0 flex items-center justify-end pr-0.5 opacity-100 group-hover:opacity-0 transition-opacity pointer-events-none"
+              data-testid="session-running"
+            >
               <Loader2 className="w-4 h-4 animate-spin text-blue-400 shrink-0" />
             </div>
           )}
