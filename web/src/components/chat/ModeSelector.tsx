@@ -44,6 +44,7 @@ export function ModeSelector({ transport }: ModeSelectorProps) {
   const [allowBypass, setAllowBypass] = useState(false);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [busyBypass, setBusyBypass] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(
@@ -111,6 +112,24 @@ export function ModeSelector({ transport }: ModeSelectorProps) {
     }
   };
 
+  // Turning `bypass` on from here: the flag is a gateway-wide config knob
+  // (`[permissions].allow_bypass`), not a per-session setting, so this is a
+  // deliberate two-step — unlock, then select — and the menu says what it
+  // unlocks. `config.set` is admin-tier; a client without it gets `false`
+  // and keeps the greyed-out row plus the config pointer.
+  const enableBypass = async () => {
+    setError(null);
+    setBusyBypass(true);
+    const ok = await transport.setConfig("permissions.allow_bypass", true);
+    setBusyBypass(false);
+    if (!ok) {
+      setError(t("ModeSelector.bypassEnableFailed"));
+      return;
+    }
+    setAllowBypass(true);
+    await choose("bypass");
+  };
+
   const label = t(`ModeSelector.mode.${mode}`);
   const nonDefault = mode !== "default";
 
@@ -144,25 +163,28 @@ export function ModeSelector({ transport }: ModeSelectorProps) {
         >
           <div className="py-1">
             {MODES.map((m) => {
-              // `bypass` needs `[permissions].allow_bypass`. Showing it as a
-              // live choice and then failing on click teaches the user nothing;
-              // the gateway told us it is off, so say so here.
-              const unavailable = m === "bypass" && !allowBypass;
+              // `bypass` needs `[permissions].allow_bypass`. Offering it as a
+              // live choice and then failing on click teaches the user nothing,
+              // so the gateway's own answer decides what the row does: with the
+              // flag off it is an "enable and use" action, not a dead option.
+              const locked = m === "bypass" && !allowBypass;
               return (
                 <button
                   key={m}
                   type="button"
                   role="option"
                   aria-selected={m === mode}
-                  aria-disabled={unavailable}
-                  disabled={unavailable}
-                  onClick={() => void choose(m)}
-                  title={unavailable ? t("ModeSelector.bypassDisabled") : undefined}
+                  aria-disabled={busyBypass && locked}
+                  disabled={busyBypass && locked}
+                  onClick={() => (locked ? void enableBypass() : void choose(m))}
+                  title={locked ? t("ModeSelector.bypassDisabled") : undefined}
+                  data-testid={`mode-option-${m}`}
+                  data-locked={locked ? "true" : "false"}
                   className={`w-full flex items-start gap-2 px-3 py-2 text-left transition ${
                     m === mode
                       ? "bg-primary-50 dark:bg-primary-900/20"
-                      : unavailable
-                        ? "opacity-50 cursor-not-allowed"
+                      : locked
+                        ? "opacity-70 hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
                         : "hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
                   }`}
                 >
@@ -170,7 +192,11 @@ export function ModeSelector({ transport }: ModeSelectorProps) {
                   <span className="flex-1 min-w-0">
                     <span className="block text-sm text-primary">{t(`ModeSelector.mode.${m}`)}</span>
                     <span className="block text-xs text-secondary">
-                      {unavailable ? t("ModeSelector.bypassDisabled") : t(`ModeSelector.help.${m}`)}
+                      {locked
+                        ? busyBypass
+                          ? t("ModeSelector.bypassEnabling")
+                          : t("ModeSelector.bypassEnable")
+                        : t(`ModeSelector.help.${m}`)}
                     </span>
                   </span>
                   {m === mode && <Check className="w-4 h-4 text-primary shrink-0 mt-0.5" />}
