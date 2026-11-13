@@ -7,9 +7,9 @@
   "ApprovalModal.denying": "Denying…",
   "ApprovalModal.deny": "Deny",
   "ApprovalModal.denyDots": "Deny…",
-  "ApprovalModal.later": "Later",
-  "ApprovalModal.laterTitle": "Leave the request pending",
-  "ApprovalModal.laterHelp": "Later does not answer the request: the agent stays paused until you approve or deny it, it times out after 5 minutes, or you act on it from the pending-approval badge in the sidebar.",
+  "ApprovalModal.dismiss": "Close",
+  "ApprovalModal.dismissTitle": "Leave the request pending (Esc)",
+  "ApprovalModal.dismissHelp": "Closing does not answer the request: the agent stays paused until you approve or deny it, it times out after 5 minutes, or you act on it from the pending-approval badge in the sidebar.",
   "ApprovalModal.always": "Always allow",
   "ApprovalModal.alwaysTitle": "Approve and never ask for this exact call again (adds a [permissions].allow rule)"
 }

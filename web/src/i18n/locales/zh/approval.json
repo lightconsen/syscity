@@ -7,9 +7,9 @@
   "ApprovalModal.denying": "拒绝中…",
   "ApprovalModal.deny": "拒绝",
   "ApprovalModal.denyDots": "拒绝…",
-  "ApprovalModal.later": "稍后",
-  "ApprovalModal.laterTitle": "先不决定，保持挂起",
-  "ApprovalModal.laterHelp": "「稍后」并不等于做了决定：助手会一直暂停，直到你批准或拒绝、5 分钟后超时，或者你在侧边栏的待审批提示里处理它。",
+  "ApprovalModal.dismiss": "关闭",
+  "ApprovalModal.dismissTitle": "先不决定，保持挂起（Esc）",
+  "ApprovalModal.dismissHelp": "关闭并不等于做了决定：助手会一直暂停，直到你批准或拒绝、5 分钟后超时，或者你在侧边栏的待审批提示里处理它。",
   "ApprovalModal.always": "总是允许",
   "ApprovalModal.alwaysTitle": "批准，并且对这条完全相同的调用以后不再询问（会写入 [permissions].allow 规则）"
 }
