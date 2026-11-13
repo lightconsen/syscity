@@ -11,6 +11,8 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-11-13
+
 ### Changed
 
 - The sidebar's three fixed entries — New Session, Extensions, Knowledge Base —
