@@ -35,13 +35,19 @@ export function UpdateSection() {
   const phase = progress?.phase || "idle";
   const active = busy || (phase !== "idle" && phase !== "error");
   const enabled = status?.enabled ?? false;
+  // A background release check is running, so `latest` is about to change.
+  const checking = status?.checking === true;
 
   return (
     <Section title={t("UpdateSection.title")}>
       <div className="space-y-2">
         <Row label={t("UpdateSection.currentVersion")}>v{status?.current || "—"}</Row>
         <Row label={t("UpdateSection.latestVersion")}>
-          {status?.update_available ? `v${status.latest || "?"}` : t("UpdateBanner.upToDate")}
+          {checking
+            ? t("UpdateBanner.checking")
+            : status?.update_available
+              ? `v${status.latest || "?"}`
+              : t("UpdateBanner.upToDate")}
         </Row>
 
         <div className="flex flex-wrap items-center gap-2 px-3 py-2">
@@ -58,8 +64,19 @@ export function UpdateSection() {
             )}
           </Button>
           {!isTauri() && (
-            <Button variant="ghost" onClick={() => checkNow()} disabled={!enabled || active}>
-              {t("UpdateSection.checkForUpdates")}
+            <Button
+              variant="ghost"
+              onClick={() => checkNow()}
+              disabled={!enabled || active || checking}
+            >
+              {checking ? (
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  {t("UpdateBanner.checking")}
+                </span>
+              ) : (
+                t("UpdateSection.checkForUpdates")
+              )}
             </Button>
           )}
         </div>

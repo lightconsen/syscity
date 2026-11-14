@@ -8,6 +8,13 @@ export interface UpdateStatus {
   latest?: string;
   update_available: boolean;
   embedded: boolean;
+  /**
+   * A background release check is running. `update.status` never waits on
+   * GitHub — the WS dispatcher is serial per connection, so awaiting it would
+   * stall chat traffic — so a refresh answers with the previous result plus
+   * this flag, and the answer is re-read once it clears.
+   */
+  checking?: boolean;
 }
 
 /** Phase/percent (WS `update.progress`). */
@@ -31,10 +38,10 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI__" in window;
 }
 
-async function fetchStatus(): Promise<UpdateStatus> {
+async function fetchStatus(refresh = false): Promise<UpdateStatus> {
   const transport = getActiveTransport();
   if (!transport) throw new Error("gateway transport not ready");
-  return (await transport.getUpdateStatus()) as UpdateStatus;
+  return (await transport.getUpdateStatus(refresh)) as UpdateStatus;
 }
 
 async function fetchProgress(): Promise<UpdateProgress> {
@@ -104,6 +111,15 @@ export function useUpdate() {
     return () => window.clearInterval(interval);
   }, [busy, refreshProgress]);
 
+  // A background release check answers with the previous result; poll until
+  // it settles instead of leaving a stale "up to date" up for six minutes.
+  const checking = status?.checking === true;
+  useEffect(() => {
+    if (!checking) return;
+    const interval = window.setInterval(refreshStatus, 1000);
+    return () => window.clearInterval(interval);
+  }, [checking, refreshStatus]);
+
   const runUpdate = useCallback(async () => {
     setError(null);
     setMessage(null);
@@ -118,6 +134,10 @@ export function useUpdate() {
         const result = (await invoke("check_for_updates")) as string;
         setBusy(false);
         setMessage(result === "up-to-date" ? "已是最新" : result);
+        // The Tauri updater and the gateway's cached status are separate:
+        // a check that found nothing still deserves a fresh "current" row,
+        // and one that installed an update restarts the app before this runs.
+        refreshStatus();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
         setBusy(false);
@@ -135,7 +155,7 @@ export function useUpdate() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [refreshProgress]);
+  }, [refreshProgress, refreshStatus]);
 
   const checkNow = useCallback(async () => {
     setError(null);
@@ -145,7 +165,13 @@ export function useUpdate() {
       return;
     }
     try {
-      setStatus(await fetchStatus());
+      // `refresh` bypasses the gateway's status cache: "check for updates"
+      // after a release was just published must not answer with the cached
+      // "up to date" for the next six hours. The check itself runs in the
+      // background (the WS dispatcher is serial per connection, so awaiting
+      // GitHub would stall chat traffic), so this reply carries the previous
+      // result plus `checking`; the effect below polls until it clears.
+      setStatus((await fetchStatus(true)) as UpdateStatus);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }

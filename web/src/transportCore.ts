@@ -2492,7 +2492,7 @@ export interface SyscityWebSocketTransport {
   kbDocContent(collection: string, docId: string): Promise<{ doc_id: string; size: number; truncated: boolean; binary: boolean; content?: string }>;
   ingestKbDoc(agentId: string, filename: string, contentBase64: string): Promise<Record<string, unknown>>;
   deleteKbDoc(collection: string, docId: string): Promise<{ collection: string; doc_id: string; chunks_deleted: number }>;
-  getUpdateStatus(): Promise<unknown>;
+  getUpdateStatus(refresh?: boolean): Promise<unknown>;
   getUpdateProgress(): Promise<unknown>;
   triggerUpdate(): Promise<unknown>;
   workspaceList( agentId: string | undefined, path: string ): Promise<{ root: string; path: string; entries: Array<{ name: string; path: string; kind: "dir" | "file"; size: number; modified?: number; }>; }>;

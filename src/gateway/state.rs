@@ -273,6 +273,9 @@ pub struct UpdateState {
     pub status_cache: RwLock<Option<UpdateStatusCache>>,
     /// In-flight or last update run progress.
     pub progress: RwLock<UpdateProgress>,
+    /// A release check is running right now. Guards against a second one
+    /// being started while the first is still in flight.
+    pub checking: std::sync::atomic::AtomicBool,
     /// Total update checks performed (Prometheus counter).
     pub checks_total: std::sync::atomic::AtomicU64,
     /// Total update failures (Prometheus counter).
@@ -285,6 +288,7 @@ impl UpdateState {
         Self {
             status_cache: RwLock::new(None),
             progress: RwLock::new(UpdateProgress::default()),
+            checking: std::sync::atomic::AtomicBool::new(false),
             checks_total: std::sync::atomic::AtomicU64::new(0),
             failures_total: std::sync::atomic::AtomicU64::new(0),
         }
@@ -301,6 +305,10 @@ impl Default for UpdateState {
 pub struct UpdateStatusCache {
     pub info: crate::update::UpdateInfo,
     pub checked_at: Instant,
+    /// How long this entry stays fresh. A successful check is reused for
+    /// hours; a failed one only briefly, so a network blip does not hide a
+    /// release for the rest of the day (nor make every poll retry GitHub).
+    pub ttl: std::time::Duration,
 }
 
 /// Phase of the self-update run surfaced to the web UI.
