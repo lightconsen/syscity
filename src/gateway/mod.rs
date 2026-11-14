@@ -537,6 +537,7 @@ impl Gateway {
                 computer_adapter: Arc::new(tokio::sync::RwLock::new(
                     tools_init.computer_adapter.clone(),
                 )),
+                computer_runs: Arc::new(crate::computer::run_registry::ComputerRunRegistry::new()),
                 planner_handle: tools_init.planner_handle.clone(),
             },
             pipelines: PipelineState {

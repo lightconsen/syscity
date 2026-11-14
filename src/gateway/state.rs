@@ -181,6 +181,13 @@ pub struct ToolState {
     pub skills_manager: Arc<RwLock<SkillManager>>,
     pub canvas_manager: Arc<CanvasManager>,
     pub computer_adapter: Arc<RwLock<Option<Arc<dyn crate::computer::ComputerAdapter>>>>,
+    /// Live computer-use runs (`computer.run` / `.status` / `.control`).
+    ///
+    /// On the tool state rather than in a per-connection map: a run started
+    /// from one client is observable and controllable from another, which is
+    /// the point of handing a run over. Finished runs are kept (bounded) so
+    /// "start, then ask what happened" is not a race.
+    pub computer_runs: Arc<crate::computer::run_registry::ComputerRunRegistry>,
     /// Shared handle for the PlannerTool — set during agent spawn.
     pub planner_handle: Arc<std::sync::RwLock<Option<Arc<crate::planner::GoalPlanner>>>>,
 }

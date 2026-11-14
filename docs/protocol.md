@@ -402,6 +402,35 @@ Python 风格的 `type` 名（`dict` → `object`、`list`/`tuple` → `array`�
 
 `workspace.read` 参数：`{ agent_id?, path }`（`path` 必填）；响应含 `path`、`size`、`truncated`、`binary`、`content`（仅文本）。路径越界返回 `PATH_FORBIDDEN`，不存在返回 `NOT_FOUND`。
 
+#### Computer use（桌面自动化 run）
+
+一个 run 是"目标进、结果出"的一次本机操作。`computer.run` 在把 loop 挂到后台后**立即返回**
+`run_id`，此后的每一步都通过 `computer.step` 事件推送，`computer.status` 回答"它现在在做什么"。
+run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户端可以看、可以暂停、可以接管。
+
+| 方法 | 作用域 | 说明 |
+|--------|-------|-------------|
+| `computer.run` | `write` | 启动一个 run；返回 `run_id`、实际使用的 `model`、`model_supports_vision`、`max_steps` 与预算上限 |
+| `computer.status` | `read` | `{run_id}` 查单个 run，`{}` 列出全部（含已结束的，上限 20 条） |
+| `computer.control` | `write` | `{run_id, action}`，`action` ∈ `pause` / `resume` / `step` / `cancel` / `steer`（`steer` 必带非空 `message`） |
+
+`computer.run` 参数：`{ goal, session_id? }`。`goal` 为空返回 `INVALID_PARAMS`；`[computer] enabled = false`
+返回 `COMPUTER_DISABLED`；本机没有适配器返回 `COMPUTER_UNAVAILABLE`；没有可用模型返回
+`NO_MODEL` / `NO_PROVIDER`。这些都在**创建 run 之前**拒绝，避免调用方拿到一个永远不会动的 `run_id`。
+
+`computer.status` 响应含 `phase`（`running` / `paused` / `stepping` / `cancelled` / `done` / `failed`）、
+`runtime_state`、`step`、`last_action`、`last_verified`、`consecutive_failures`、`completed_steps`、
+`model_calls`、`images_attached`、`summary`（含 `stop_reason`）、`message`、`finished`，以及 `vision`：
+上一步视觉扫描的结论（`"api: 3 controls"` / `"local: …"` / `"unavailable: …"` / `"failed: …"`）。
+**`vision` 存在的原因**：一个因为"没人能看图"而停下的 run，不能和一个是"步数用完"的 run 长得一样。
+
+`stop_reason` 区分 `done` / `max_steps` / `budget` / `need_help` / `cancelled`：前两者"多给点就能做完"，
+后三者是结论。未知的 `action` 一律拒绝（`INVALID_PARAMS`）——"我说停它却继续跑"是这条路径最坏的失败，
+一个拼写错误不能静默变成为空操作。
+
+run 结束时若没有达成目标，会向审批队列投一张**交接单**（`tool_name: computer_run`）：完成了什么、
+卡在哪一步、试过什么、下一步该做什么，四段都是给接手的人看的，不是给状态机看的。
+
 #### 状态与在线
 
 | 方法 | 作用域 | 说明 |
@@ -425,6 +454,7 @@ Python 风格的 `type` 名（`dict` → `object`、`list`/`tuple` → `array`�
 | `ask.resolved` | 问题已被回答或取消（payload: `ask_id`, `cancelled`） |
 | `agent.usage` | 一轮 LLM 调用结束时的 token 用量（payload: `session_id`, `agent_id`, `usage: {prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens}`）；每轮推一次，客户端据此在运行中显示实时 token 计数（credits 计量在 `chat.final` 上） |
 | `delegation.updated` | 委派任务行变更（创建/状态/用量/共享状态/artifact）（payload: `session_id`（树的**根用户会话**，非子任务的 `delegation:<run_id>`）、`task_id`, `root_id`, `parent_id`, `depth`, `agent_id`, `title`, `status`, `created_at`, `updated_at`, `completed_at`, `usage_tokens`, `duration_ms`；终态行带 `duration_ms`，运行中为 `null`）。payload 自足，客户端无需按事件回查 |
+| `computer.step` | computer run 的一步或结束（payload: `session_id`（发起 run 的会话，裸 `computer.run` 为 `null`，此时广播给所有运维客户端）、`run_id`、`event`；`event.kind` 为 `step` 或 `finished`，字段与 run 自身的 `RunEvent` 一致——不在这里重塑，避免同一事件出现两份会漂移的描述） |
 
 ### 6.2 管理命令（CLI 前端）
 

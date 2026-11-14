@@ -381,6 +381,12 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         | E::AcpRecovered { session_id, .. }
         | E::AgentUsage { session_id, .. }
         | E::DelegationTaskUpdated { session_id, .. } => session(session_id),
+        E::ComputerStep { session_id: Some(sid), .. } => session(sid),
+        // A run started from a bare `computer.run` has no conversation. Like an
+        // approval with no session, it broadcasts: the run is driving the
+        // shared desktop, and every operator client watching it should see the
+        // same steps.
+        E::ComputerStep { session_id: None, .. } => Audience::All,
         E::AskRequired(e) => session(&e.session_id),
         E::AskResolved(e) => session(&e.session_id),
 
@@ -1134,6 +1140,9 @@ async fn dispatch_method(
         "approvals.get" => admin_ws::handle_approvals_get(req, state).await,
         "approvals.approve" => admin_ws::handle_approvals_approve(req, state).await,
         "approvals.deny" => admin_ws::handle_approvals_deny(req, state).await,
+        "computer.run" => admin_ws::handle_computer_run(req, state).await,
+        "computer.status" => admin_ws::handle_computer_status(req, state).await,
+        "computer.control" => admin_ws::handle_computer_control(req, state).await,
         "memory.search" => admin_ws::handle_memory_search(req, state).await,
         "memory.add" => admin_ws::handle_memory_add(req, state).await,
         "memory.collections" => admin_ws::handle_memory_collections(req, state).await,

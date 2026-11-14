@@ -525,6 +525,134 @@ pub struct ComputerConfig {
     /// Settle delay after actions (milliseconds)
     #[serde(default = "default_settle_delay_ms")]
     pub settle_delay_ms: u64,
+    /// How a loop decides who looks at the screen when it needs an image.
+    #[serde(default)]
+    pub vision: VisionConfig,
+    /// Per-run cost ceilings. A run is one goal, start to finish.
+    #[serde(default)]
+    pub budget: RunBudgetConfig,
+    /// Largest image width sent to the model, in pixels.
+    ///
+    /// Deliberately separate from [`crate::computer::screenshot_encoder`]'s
+    /// `NetworkCondition`: that one shrinks for *bandwidth*, and on a local
+    /// machine it picks the most expensive setting (1920 px, PNG, quality 90)
+    /// because there is no link to save. The cost this knob limits is the
+    /// model's context, and a local run is exactly where that cost matters
+    /// most — so reusing the network axis would give the right answer in the
+    /// one case that does not need it and the wrong answer in the one that
+    /// does.
+    #[serde(default = "default_screenshot_max_width")]
+    pub screenshot_max_width: u32,
+    /// `"jpeg"` (default) or `"png"` for images sent to the model.
+    #[serde(default = "default_screenshot_format")]
+    pub screenshot_format: String,
+    /// JPEG quality for images sent to the model.
+    #[serde(default = "default_screenshot_jpeg_quality")]
+    pub screenshot_jpeg_quality: u8,
+}
+
+/// Which vision backend answers "where is this element".
+///
+/// The ladder is local first: an ONNX model costs no tokens, needs no network,
+/// and its answer arrives as an element box rather than as prose. The API
+/// rung exists because the local models are optional downloads and a machine
+/// that has none must still be able to see; the third rung is admitting that
+/// neither is available, which callers must handle rather than discover as a
+/// timeout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionConfig {
+    /// `"auto"` (default), `"local"`, `"api"`, or `"off"`.
+    ///
+    /// - `auto` — local if a model is present, else API if configured, else
+    ///   unavailable.
+    /// - `local` — local only. Never calls the API, even on failure: this is
+    ///   the offline / privacy setting, and falling back would break the
+    ///   promise that chose it.
+    /// - `api` — API only. For a machine with no local models.
+    /// - `off` — no vision at all; the accessibility tree is the only input.
+    #[serde(default = "default_vision_mode")]
+    pub mode: String,
+    /// Provider for the API rung, when that rung is reachable.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model for the API rung.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Where local model files live. Empty means `<layout root>/models/vision`
+    /// (`~/.syscity/models/vision` by default).
+    #[serde(default)]
+    pub model_dir: String,
+    /// How long one visual lookup may take before it is abandoned.
+    #[serde(default = "default_vision_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// Ceilings for a single computer-use run.
+///
+/// These exist because the default shape of a loop — 30 steps, one model call
+/// and one full-screen image each — is expensive enough that an ungoverned run
+/// can spend a day's budget in minutes without anyone being able to say
+/// afterwards where it went. The counters are per *run*, not per request: the
+/// existing eight-image cap limits one request, so a thirty-step run satisfies
+/// it every single step and still attaches thirty images.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunBudgetConfig {
+    /// Maximum model calls in one run. Slightly above `max_steps` so a retry
+    /// has room.
+    #[serde(default = "default_max_calls_per_run")]
+    pub max_calls_per_run: usize,
+    /// Maximum images attached across the whole run.
+    #[serde(default = "default_max_images_per_run")]
+    pub max_images_per_run: usize,
+}
+
+fn default_screenshot_max_width() -> u32 {
+    1024
+}
+
+fn default_screenshot_format() -> String {
+    "jpeg".to_string()
+}
+
+fn default_screenshot_jpeg_quality() -> u8 {
+    75
+}
+
+fn default_vision_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_vision_timeout_secs() -> u64 {
+    10
+}
+
+fn default_max_calls_per_run() -> usize {
+    40
+}
+
+fn default_max_images_per_run() -> usize {
+    15
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_vision_mode(),
+            provider: None,
+            model: None,
+            model_dir: String::new(),
+            timeout_secs: default_vision_timeout_secs(),
+        }
+    }
+}
+
+impl Default for RunBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_calls_per_run: default_max_calls_per_run(),
+            max_images_per_run: default_max_images_per_run(),
+        }
+    }
 }
 
 /// What an Android tap may do without a human saying yes.
@@ -682,6 +810,11 @@ impl Default for ComputerConfig {
             enabled: true,
             max_steps: default_max_computer_steps(),
             settle_delay_ms: default_settle_delay_ms(),
+            vision: VisionConfig::default(),
+            budget: RunBudgetConfig::default(),
+            screenshot_max_width: default_screenshot_max_width(),
+            screenshot_format: default_screenshot_format(),
+            screenshot_jpeg_quality: default_screenshot_jpeg_quality(),
         }
     }
 }

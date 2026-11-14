@@ -159,6 +159,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             repair_state: Arc::new(syscity::gateway::RepairState::new()),
             acp: Arc::new(syscity::acp::AcpControlPlane::new(10)),
             goal_cancellers: Arc::new(RwLock::new(HashMap::new())),
+            active_turns: Arc::new(RwLock::new(HashSet::new())),
         },
         channels: syscity::gateway::state::ChannelState {
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -204,6 +205,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             skills_manager,
             canvas_manager: Arc::new(syscity::canvas::CanvasManager::new()),
             computer_adapter: Arc::new(tokio::sync::RwLock::new(None)),
+            computer_runs: Arc::new(syscity::computer::run_registry::ComputerRunRegistry::new()),
             planner_handle: Arc::new(std::sync::RwLock::new(None)),
         },
         pipelines: syscity::gateway::state::PipelineState {

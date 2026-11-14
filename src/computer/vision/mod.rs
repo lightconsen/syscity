@@ -30,12 +30,13 @@ pub struct DetectedElement {
     pub confidence: f32,
 }
 
-#[cfg(feature = "vision")]
+pub mod look;
 pub mod model_download;
 #[cfg(feature = "vision")]
 pub mod ocr_file;
 #[cfg(feature = "vision")]
 pub mod ocr_rapid;
+pub mod resolver;
 pub mod screen_state;
 #[cfg(feature = "vision")]
 pub mod ui_onnx;

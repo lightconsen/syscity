@@ -15,6 +15,33 @@ struct OpenedStream {
 impl ModelRouter {
     // ==================== COMPLETION (non-streaming) ====================
 
+    /// Whether `model_id` on `provider` is known to accept images.
+    ///
+    /// Answers `false` for a model the catalog has never heard of. That is the
+    /// conservative direction: a caller uses this to decide whether attaching
+    /// an image is worth the tokens, and an unknown model that does happen to
+    /// accept images loses an optimisation, while an unknown one that does not
+    /// lose the whole request.
+    pub async fn supports_vision(&self, provider: &str, model_id: &str) -> bool {
+        self.model_catalog
+            .get(provider, model_id)
+            .await
+            .is_some_and(|entry| entry.supports_vision)
+    }
+
+    /// Whether *some* model the catalog knows accepts images.
+    ///
+    /// Distinct from [`Self::supports_vision`]: a caller deciding whether the
+    /// vision *rung* exists at all does not yet know which model it would be
+    /// routed to.
+    pub async fn any_model_supports_vision(&self) -> bool {
+        self.model_catalog
+            .list()
+            .await
+            .iter()
+            .any(|entry| entry.supports_vision)
+    }
+
     /// Complete a request using the model router.
     pub async fn complete(
         &self,

@@ -371,6 +371,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("channels.list", Some(SCOPE_READ)),
     ("approvals.list", Some(SCOPE_READ)),
     ("approvals.get", Some(SCOPE_READ)),
+    ("computer.status", Some(SCOPE_READ)),
     ("audit.recent", Some(SCOPE_READ)),
     ("audit.all", Some(SCOPE_READ)),
     ("memory.search", Some(SCOPE_READ)),
@@ -399,6 +400,11 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     // archive, and `mcp.call_tool` invokes an arbitrary tool.
     ("sessions.create", Some(SCOPE_WRITE)),
     ("sessions.delete", Some(SCOPE_WRITE)),
+    // Both drive the shared desktop: `run` acts on the machine, `control`
+    // changes what a live run will do next. A read client must be able to do
+    // neither.
+    ("computer.run", Some(SCOPE_WRITE)),
+    ("computer.control", Some(SCOPE_WRITE)),
     ("agents.create", Some(SCOPE_WRITE)),
     ("agents.delete", Some(SCOPE_WRITE)),
     ("agents.purge", Some(SCOPE_WRITE)),
@@ -1071,6 +1077,18 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
                 "completed_at": task.completed_at,
                 "usage_tokens": task.usage_tokens,
                 "duration_ms": task.duration_ms,
+            }),
+        )),
+        // The run's own event vocabulary travels as-is: `event.kind` is
+        // `step` or `finished`, and a client switches on it the same way the
+        // run executor does. Reshaping it here would make two descriptions of
+        // one event that could drift.
+        GatewayEvent::ComputerStep { session_id, run_id, event } => Some((
+            "computer.step".to_string(),
+            serde_json::json!({
+                "session_id": session_id,
+                "run_id": run_id,
+                "event": event,
             }),
         )),
     }

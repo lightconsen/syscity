@@ -32,6 +32,48 @@ ToolRegistry ──→ CapabilitySet ──→ xdotool / SendKeys / AXUIElement
 - **`reflection.rs`** — Self-reflection and state introspection
 - **`vision/`** — Visual perception layer (behind the `vision` feature): RapidOCR (`ocr_rapid.rs`) for text and OmniParser (`ui_onnx.rs`) for UI element detection from screenshots, plus `screen_state.rs` capture, `model_download.rs`, and `preprocess.rs`
 
+### Runs (`computer.run`)
+
+A *run* is one goal driven from the gateway: `computer.run` spawns it and returns at once, and
+everything after that is `computer.step` events plus `computer.status`. The modules below are that
+path, and each one exists because the naive version of it had a specific failure:
+
+- **`driver.rs`** — the decision closure: renders a `LoopState` as a prompt and parses the answer back
+  into a `LoopDecision`. Text first: the accessibility outline, not a screenshot. A parse failure is a
+  request to re-observe, never a completion.
+- **`run_executor.rs`** — the production closure and everything a gateway run needs around it: the
+  per-run budget enforced *before* each model call, live state, one event per step, and the handoff.
+- **`run_budget.rs`** — per-run cost ceilings (`max_calls_per_run`, `max_images_per_run`) and
+  `plan_perception`: an image is attached only when the text cannot carry the question (truncated
+  tree, unverified last step, two failures in a row). The eight-image cap on a *request* does not
+  bound a thirty-step run.
+- **`run_registry.rs`** — the runs themselves, kept on the gateway rather than a connection so one
+  client can watch or steer another's run. Finished runs are retained (bounded) so "run, then ask what
+  happened" is not a race.
+- **`handoff.rs`** — the four-part note posted to the approval queue when a run stops short: done,
+  where, tried, next. Advice keyed on *why*, not "please check".
+- **`tree_render.rs` / `tree_budget.rs`** — the outline's line budget, spent on windows a person can
+  actually see: an off-screen tool window with more children than the whole budget (OpenShot's emoji
+  panel, 119) used to consume it before the window under test was reached.
+- **`image_budget.rs`** — the size and encoding of the one image a step may attach, kept separate from
+  `screenshot_encoder`'s *bandwidth* heuristic (which picks the most expensive setting on a local
+  machine — the opposite of what a context budget wants).
+- **`vision/look.rs` + `vision/resolver.rs`** — who looks, when the tree cannot answer. The ladder is
+  local ONNX → API vision model → nobody, configured by `[computer.vision].mode`:
+  `auto` (default) / `local` / `api` / `off`. `local` is a privacy promise and never falls through to
+  the network; `off` never looks. A scan's output is converted to `UiElement`s with snapshot ids, so
+  the visual path and the tree path are isomorphic — and since the adapter never held those ids, the
+  run rewrites a target naming one into the point the scan established before dispatch.
+
+```toml
+[computer.vision]
+mode = "auto"          # auto | local | api | off
+provider = "openai"    # the API rung, when it exists
+model = "gpt-4o"
+model_dir = ""         # empty → ~/.syscity/models/vision
+timeout_secs = 10      # one lookup, then degrade — never block the loop
+```
+
 ### Platform Adapters
 
 | Platform | Module | Backend |

@@ -38,8 +38,36 @@ pub struct OcrModelPaths {
 
 /// Data directory for ONNX models: `~/.syscity/models/vision/`.
 fn model_data_dir() -> PathBuf {
-    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join(".syscity").join("models").join("vision")
+    vision_model_dir("")
+}
+
+/// Where vision models live.
+///
+/// `[computer.vision].model_dir` when it is set, else
+/// `<layout root>/models/vision` (`~/.syscity/models/vision` by default).
+/// Resolved through [`crate::dirs::paths`] rather than `home_dir()`, so
+/// `SYSCITY_HOME`, a named profile, or a test's hermetic root all move the
+/// models with everything else — a run must not probe the developer's real
+/// home from inside a gateway that was deliberately rooted elsewhere.
+/// Downloads always write here, so a caller that wants to know whether a model
+/// is *present* uses the same answer rather than probing a directory the
+/// loader would not read.
+pub fn vision_model_dir(configured: &str) -> PathBuf {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
+    }
+    // `installed_paths` and not `paths`: a library caller that never installed
+    // a layout root (a bare tool invocation, a unit test) must not be turned
+    // into a panic just for asking where the models are. With no root, the
+    // historical `~/.syscity` answer stands.
+    match crate::dirs::installed_paths() {
+        Some(paths) => paths.models_dir().join("vision"),
+        None => {
+            let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+            base.join(".syscity").join("models").join("vision")
+        }
+    }
 }
 
 /// RapidOCR text detection (DBNet) model.
@@ -243,11 +271,18 @@ mod tests {
     fn test_model_data_dir_is_absolute() {
         let dir = model_data_dir();
         assert!(dir.is_absolute(), "data dir should be absolute: {:?}", dir);
-        assert!(
-            dir.ends_with(".syscity/models/vision"),
-            "should end with .syscity/models/vision: {:?}",
-            dir
-        );
+        // Under a layout root it is `<root>/models/vision`; with none installed
+        // it is the historical `~/.syscity/models/vision`. Both end the same
+        // way, which is the part that must not drift.
+        assert!(dir.ends_with("models/vision"), "should end with models/vision: {:?}", dir);
+    }
+
+    /// A configured directory wins, verbatim — the probe and the loader must
+    /// agree on the one path a caller asked for.
+    #[test]
+    fn a_configured_dir_is_used_as_given() {
+        assert_eq!(vision_model_dir("  /tmp/models  "), PathBuf::from("/tmp/models"));
+        assert_eq!(vision_model_dir(""), model_data_dir());
     }
 
     #[test]

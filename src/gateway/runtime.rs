@@ -322,6 +322,20 @@ pub enum GatewayEvent {
         session_id: String,
         task: crate::delegation::DelegationTaskSnapshot,
     },
+    /// A computer-use run reported something: one step, or its end.
+    ///
+    /// `session_id` is the conversation that started the run, when there was
+    /// one. A run started from a bare `computer.run` call has none, and the
+    /// event then reaches every operator client — which is right, because the
+    /// run is controlling the shared desktop and everyone watching it should
+    /// see the same thing.
+    ComputerStep {
+        session_id: Option<String>,
+        run_id: String,
+        /// The event as the run's own vocabulary describes it
+        /// (`run_executor::RunEvent`, tagged by `kind`).
+        event: serde_json::Value,
+    },
 }
 
 /// Agent status
