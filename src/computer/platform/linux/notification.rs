@@ -200,6 +200,10 @@ impl Tool for NotificationTool {
          for sending and dbus-monitor for listening. Works on both X11 and Wayland."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::notice(&["linux", "admin", "notification"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Send or monitor desktop notifications",

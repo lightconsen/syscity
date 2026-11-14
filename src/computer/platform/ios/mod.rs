@@ -108,6 +108,10 @@ impl Tool for IdeviceIdTool {
         "List connected iOS devices with their UDIDs."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        super::capabilities::observe(&["computer", "ios", "device"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema("List iOS devices", serde_json::json!({}), Vec::<String>::new())
     }
@@ -171,6 +175,10 @@ impl Tool for IdeviceScreenshotTool {
 
     fn description(&self) -> &str {
         "Capture a screenshot of a connected iOS device."
+    }
+
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        super::capabilities::observe(&["computer", "ios", "screenshot"])
     }
 
     fn parameters_schema(&self) -> Value {
@@ -287,6 +295,13 @@ impl Tool for IdeviceInstallerTool {
 
     fn description(&self) -> &str {
         "Install, uninstall, or list apps on an iOS device via ideviceinstaller."
+    }
+
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        // Installing and uninstalling reach past the screen into the device's
+        // installed set; there is no per-action classification here the way
+        // Android has, so the whole tool asks.
+        super::capabilities::system_change(&["computer", "ios", "apps"])
     }
 
     fn parameters_schema(&self) -> Value {

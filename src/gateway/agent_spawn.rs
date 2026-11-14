@@ -1400,6 +1400,32 @@ pub(crate) async fn create_default_tool_registry(
     // results/inbox consumption stays unprivileged).
     registry.mark_privileged("ios_shortcut_run");
 
+    // Desktop control. A separate gate from approval: this one decides whether
+    // a community-trust skill may reach the tool at all, and it used to list
+    // only shell/file tools — so an untrusted skill could take over the
+    // pointer while `shell` was out of reach. The aggregate `computer` tool and
+    // every per-platform input tool belong here.
+    registry.mark_privileged("computer");
+    registry.mark_privileged("applescript");
+    registry.mark_privileged("windows_powershell");
+    registry.mark_privileged("macos_desktop_control");
+    registry.mark_privileged("windows_desktop_control");
+    registry.mark_privileged("linux_x11_desktop_control");
+    registry.mark_privileged("linux_wayland_desktop_control");
+    registry.mark_privileged("windows_clipboard");
+    registry.mark_privileged("linux_x11_clipboard");
+    registry.mark_privileged("linux_wayland_clipboard");
+    // Android has its own in-tool risk gate (`computer/platform/android/gate.rs`)
+    // that asks before send/pay/delete; this gate is orthogonal — it decides
+    // whether an untrusted skill may reach the input path at all.
+    registry.mark_privileged("android_input");
+    registry.mark_privileged("android_system_action");
+    registry.mark_privileged("android_app_manager");
+    // Reading the screen is not privileged on its own — but `macos_accessibility`
+    // exposes the full UI tree of every window, which is the map an attacker
+    // needs to direct the input tools. It stays unprivileged because the
+    // perception tools need it; the input tools above are the fence.
+
     Ok(registry)
 }
 

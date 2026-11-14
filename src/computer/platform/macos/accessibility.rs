@@ -556,6 +556,10 @@ impl Tool for AccessibilityTool {
          taking screenshots whenever possible."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "macos", "accessibility"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Query UI tree via Accessibility API",

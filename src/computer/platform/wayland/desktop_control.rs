@@ -71,6 +71,10 @@ impl Tool for DesktopControlTool {
          and ask before acting."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::desktop_input(&["computer", "desktop", "wayland"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Perform a desktop control action",

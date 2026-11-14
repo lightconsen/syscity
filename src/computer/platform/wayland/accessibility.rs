@@ -98,6 +98,10 @@ impl Tool for WaylandAccessibilityTool {
          nested X11 session."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "wayland", "accessibility"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Query Wayland UI tree",

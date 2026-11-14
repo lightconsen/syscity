@@ -224,6 +224,10 @@ impl Tool for ServiceManagerTool {
          a service is not running."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::system_change(&["linux", "admin", "services"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Manage a systemd service",

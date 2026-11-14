@@ -102,6 +102,10 @@ impl Tool for NotificationTool {
          message. Listening to notifications is not available on Windows."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::notice(&["computer", "windows", "notification"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Send a desktop notification",

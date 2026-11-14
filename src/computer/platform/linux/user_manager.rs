@@ -150,6 +150,10 @@ impl Tool for UserManagerTool {
          for write operations."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::system_change(&["linux", "admin", "users"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Manage system users",

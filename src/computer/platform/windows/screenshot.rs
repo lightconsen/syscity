@@ -39,6 +39,10 @@ impl Tool for ScreenshotTool {
          System.Drawing, or nircmd if available."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "windows", "screenshot"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Take a screenshot",

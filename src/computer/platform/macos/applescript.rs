@@ -122,6 +122,12 @@ impl Tool for AppleScriptTool {
          UI state, control system settings, or interact with app-specific APIs."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        // Any AppleScript is arbitrary code in the user's session: it can drive
+        // apps, change settings, read files and send the result somewhere.
+        crate::computer::platform::capabilities::arbitrary_code(&["computer", "macos", "script"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Execute AppleScript",

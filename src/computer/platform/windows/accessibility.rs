@@ -371,6 +371,10 @@ impl Tool for WindowsAccessibilityTool {
          taking screenshots whenever possible for structured desktop perception."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "windows", "accessibility"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Query UI tree via UIAutomation",

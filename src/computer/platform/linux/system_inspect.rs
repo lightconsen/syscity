@@ -245,6 +245,10 @@ impl Tool for SystemInspectTool {
          the user asks about system status, performance, or to diagnose server issues."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["linux", "admin", "inspect"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Collect system snapshot",

@@ -35,6 +35,14 @@ impl Tool for ClipboardTool {
          Use 'get' to read, 'set' to write."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::clipboard_write(&[
+            "computer",
+            "wayland",
+            "clipboard",
+        ])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Read or write clipboard content",

@@ -78,6 +78,10 @@ impl Tool for ScreenshotTool {
          when you need to visually verify the current screen state."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "macos", "screenshot"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Take a screenshot",

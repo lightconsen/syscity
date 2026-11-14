@@ -228,6 +228,10 @@ impl Tool for CronManagerTool {
          adding/removing jobs, and listing systemd timers."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::system_change(&["linux", "admin", "cron"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Manage cron jobs and timers",

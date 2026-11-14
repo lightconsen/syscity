@@ -157,6 +157,10 @@ impl Tool for NetworkDiagTool {
          (dig), and HTTP check (curl). Use to diagnose connectivity, DNS, routing, and port issues."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["linux", "admin", "network"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Run a network diagnostic command",

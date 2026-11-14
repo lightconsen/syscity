@@ -222,6 +222,10 @@ impl Tool for FirewallManagerTool {
          Supports listing rules, checking status, and basic add/remove (where safe)."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::system_change(&["linux", "admin", "firewall"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Manage firewall",

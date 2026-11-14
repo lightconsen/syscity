@@ -327,6 +327,10 @@ impl Tool for PackageManagerTool {
          Supports listing installed packages, searching, installing, removing, and updating."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::system_change(&["linux", "admin", "packages"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Manage packages",

@@ -251,6 +251,15 @@ impl Tool for DesktopControlTool {
          holds focus, so on a desktop someone is using, say what you intend and ask before acting."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        // `inspect` only reads, but a tool declares one set of capabilities for
+        // all of its actions, so this is the worst case: click/type/key_shortcut
+        // move the real pointer and inject keystrokes. Declaring `inspect`'s
+        // risk here would let the other four actions through unapproved, which
+        // is exactly the hole this override closes.
+        crate::computer::platform::capabilities::desktop_input(&["computer", "desktop", "macos"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Control macOS desktop",

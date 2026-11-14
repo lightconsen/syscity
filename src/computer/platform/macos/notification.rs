@@ -94,6 +94,10 @@ impl Tool for NotificationTool {
          optional alert sound. Listening to notifications is not available on macOS."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::notice(&["computer", "notification"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Send a desktop notification",

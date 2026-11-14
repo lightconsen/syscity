@@ -55,6 +55,10 @@ impl Tool for ScreenshotTool {
          (ImageMagick), gnome-screenshot, or flameshot."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "x11", "screenshot"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Take a screenshot",

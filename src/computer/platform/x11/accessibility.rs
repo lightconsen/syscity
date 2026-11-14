@@ -281,6 +281,10 @@ impl Tool for X11AccessibilityTool {
          info if AT-SPI2 is unavailable."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::observe(&["computer", "x11", "accessibility"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Query X11 UI tree via AT-SPI2",

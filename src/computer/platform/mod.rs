@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::Tool;
 
+pub mod capabilities;
+
 /// OS control permission scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

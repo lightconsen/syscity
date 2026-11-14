@@ -38,6 +38,10 @@ impl Tool for PowerShellTool {
          objects, and Windows management cmdlets."
     }
 
+    fn capabilities(&self) -> crate::tools::sdk::ToolCapabilities {
+        crate::computer::platform::capabilities::arbitrary_code(&["computer", "windows", "script"])
+    }
+
     fn parameters_schema(&self) -> Value {
         create_schema(
             "Execute a PowerShell script",
