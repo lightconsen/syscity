@@ -251,7 +251,7 @@ A badcase is the concrete form of "quality definition". The pipeline is:
 
 ```
 failure (online or in eval)
-   → pending badcase pool        (sources: online:risk, human:dislike)
+   → pending badcase pool        (sources: online:risk, human:dislike, computer:run)
    → confirmation                (human_review, or mechanical corroboration)
    → RCA root-cause diagnosis    (rca.rs)
    → action items                (generate_action_items)
@@ -263,10 +263,22 @@ Key design points:
 
 - **Pool, not verdict**: online flags are *candidates*. `PendingBadcaseStore`
   holds rows keyed by `source` (`online:risk` from the rule hook,
-  `human:dislike` from the buttons) with `status` (`pending` / `confirmed`).
+  `human:dislike` from the buttons, and `computer:run` from a desktop run that
+  stopped `need_help` / `budget` / `max_steps`) with `status` (`pending` /
+  `confirmed`).
+- **A desktop run's failure is evidence, not a verdict.** Its row carries the
+  goal, the first failed step, the last capture's digest, the rung distribution
+  and the handoff note; the dedup signature is what the run did (stop reason,
+  step, action, verification), so repeats collapse. It is deliberately *not*
+  counted by the optimizer's online-anomaly gate: a desktop run is driven by its
+  own provider and loop configuration, so its failure says nothing about the
+  default-agent scalar that was just applied.
 - **Quality threshold on entry**: a pending case only enters the regression
   suite after human review **or** mechanical corroboration (multiple risk
-  signals / repeated trips), so garbage samples cannot pollute verdicts.
+  signals / repeated trips), so garbage samples cannot pollute verdicts. The
+  review is `ExpectedEndState`: a blank confirmant or an empty condition list is
+  refused, because a task with no checkable condition passes every trial
+  vacuously.
 - **Governance** (`BadcaseGovernance`): the governed suite feeds the release
   gate — stale badcases expire, duplicate inputs are de-duplicated,
   high-frequency cases are demoted, and difficulty weights bias trial counts.
@@ -442,7 +454,7 @@ Key sections in `EvalConfig` / `QualityGateConfig`:
 | Badcase recycle → regression suite | `eval/recycle.rs` | |
 | Human review routing | `eval/human_review.rs` | low-confidence / conflicting cases |
 | Skill-specific scoring | `eval/skill_scorer.rs` | trigger / execution / quality / resilience |
-| Pending badcase pool | `eval/pending_badcase.rs` | sources: `online:risk`, `human:dislike` |
+| Pending badcase pool | `eval/pending_badcase.rs` | sources: `online:risk`, `human:dislike`, `computer:run` |
 | Like/Dislike feedback | `gateway/feedback.rs`, `gateway/ws/feedback.rs` (`feedback.vote`) | |
 | Rule-based feedback aggregation | `eval/feedback_ops.rs`, WS `feedback.ops` | read-only, no LLM |
 | Production turn sampling | `eval/sample_store.rs` (`turn_samples`), `agent_engine.rs` `sample_turn` | default off |
@@ -579,7 +591,7 @@ src/eval/comparison.rs              version comparison (bootstrap significance)
 src/eval/rca.rs                     badcase root-cause diagnosis
 src/eval/recycle.rs                 badcase recycle → regression suite
 src/eval/human_review.rs            human review
-src/eval/pending_badcase.rs         pending badcase pool (online:risk / human:dislike)
+src/eval/pending_badcase.rs         pending badcase pool (online:risk / human:dislike / computer:run)
 src/eval/sample_store.rs            production turn samples (turn_samples)
 src/eval/compression_gate.rs        compression low-retention gate
 src/eval/feedback_ops.rs            rule-based feedback aggregation

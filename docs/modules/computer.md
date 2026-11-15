@@ -95,7 +95,8 @@ not silently re-arm it. Both halves of that are the checkpoint file.
 
 **What is written.** After every step the run appends one `CompletedStep` — the action, the
 three-state verification, the result line, the CAS digests of the captures *before* and *after* the
-action (`screenshot_before_ref` / `screenshot_ref`), and whether the action aimed at a sensitive
+action (`screenshot_before_ref` / `screenshot_ref`), which rung of the action ladder finally delivered
+it (`rung`, absent when the adapter reported no evidence), and whether the action aimed at a sensitive
 control — plus the running `model_calls` / `images_attached`. The order is deliberate: the step goes
 into the run's own view, then the file, then the `computer.step` event, so a crash between them loses
 at most the report, never the record of an action that already happened. The pre-action frame matters
@@ -108,6 +109,16 @@ what it was *looking at*. `computer.runs` therefore exposes a per-step `steps` a
 is nothing to continue, and keeping every finished run's steps would grow the layout forever for no
 reader. `max_steps`, `budget` and `need_help` keep it, with the reason recorded — a ceiling means
 "more room would help", and a person decides.
+
+**What a failure becomes.** Keeping the file is also what makes the run collectable: the same three
+stopping reasons put one row into the pending badcase pool (`eval/pending_badcase.rs`, source
+`computer:run`), carrying the goal, the first failed step, the last capture's digest, the rung
+distribution, and the handoff note the person was shown. The dedup key is what the run *did* — stop
+reason, step number, action, verification — never the run id or a capture digest, so the fifth
+repetition of one dead end collapses onto the first row instead of flooding the pool. The conversion
+lives in `computer/failure.rs` and the producer in `ws/admin_ws/computer.rs::record_run_badcase`; a
+row is only a *candidate* until somebody confirms an end state (`eval.badcase.confirm`), because an
+expected end state is a person's judgement, not the model's. See `docs/harness.md` §6.
 
 **What a resume does.** `computer.resume` starts a *new* loop with the checkpoint's history as memory:
 it continues at step N+1, keeps the original `max_steps`, and seeds the budget counters

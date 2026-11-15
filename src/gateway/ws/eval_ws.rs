@@ -201,6 +201,277 @@ pub(super) async fn handle_eval_trace_list(
     WsResponse::ok(&req.id, serde_json::json!({ "traces": items, "count": items.len() }))
 }
 
+/// `eval.badcase.list` — the pending badcase pool, newest first.
+///
+/// This is what a person reviews after a run stopped short: every failure the
+/// gateway collected on its own (online risk, a 👎, a desktop run that hit a
+/// ceiling) with the evidence it was collected with. Read-only.
+pub(super) async fn handle_eval_badcase_list(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct ListParams {
+        status: Option<String>,
+        source: Option<String>,
+        limit: Option<u32>,
+    }
+    let params: ListParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+
+    let Some(store) = state.infra.pending_badcase_store.as_ref() else {
+        return WsResponse::err(
+            &req.id,
+            "BADCASE_UNAVAILABLE",
+            "pending badcase store is not initialized (SQLite storage required)",
+        );
+    };
+
+    let status = match params.status.as_deref() {
+        None | Some("pending") => PendingStatus::Pending,
+        Some("confirmed") => PendingStatus::Confirmed,
+        Some("converted") => PendingStatus::Converted,
+        Some("dismissed") => PendingStatus::Dismissed,
+        Some(other) => {
+            return error_invalid_request(
+                &req.id,
+                format!(
+                    "unknown status '{other}'; expected pending | confirmed | converted | dismissed"
+                ),
+            );
+        }
+    };
+    let limit = params.limit.unwrap_or(50).min(500);
+
+    let rows = match store.list_pending(status, limit).await {
+        Ok(rows) => rows,
+        Err(e) => return error_internal(&req.id, format!("failed to list badcases: {e}")),
+    };
+    // The source filter runs after the read because the store's only query is
+    // by status. Applying it here rather than in SQL keeps one projection: a
+    // filtered row looks exactly like an unfiltered one.
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|b| {
+            params
+                .source
+                .as_deref()
+                .is_none_or(|want| b.source.as_str() == want)
+        })
+        .map(badcase_json)
+        .collect();
+
+    WsResponse::ok(&req.id, serde_json::json!({ "badcases": items, "count": items.len() }))
+}
+
+/// `eval.badcase.confirm` — commit a badcase into the regression suite.
+///
+/// The confirmation is the human half of the loop: the *expected end state*
+/// must come from the caller, never from a model's opinion of whether the goal
+/// was met. A row confirmed without a checkable condition would pass every
+/// trial vacuously, which is why `ExpectedEndState` refuses one (and why this
+/// handler turns that refusal into a `400`-style reason instead of an empty
+/// task).
+pub(super) async fn handle_eval_badcase_confirm(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct ConfirmParams {
+        id: String,
+        /// Who accepted the end state. Required: an unattributed regression case
+        /// cannot be revisited when it starts failing.
+        confirmed_by: String,
+        /// What "the goal was met" means, checkable against the environment.
+        conditions: Vec<ConditionParam>,
+        /// Human-readable statement of the end state, carried into the YAML.
+        description: String,
+    }
+    let params: ConfirmParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+
+    let Some(store) = state.infra.pending_badcase_store.as_ref() else {
+        return WsResponse::err(
+            &req.id,
+            "BADCASE_UNAVAILABLE",
+            "pending badcase store is not initialized (SQLite storage required)",
+        );
+    };
+
+    let mut conditions = Vec::with_capacity(params.conditions.len());
+    for (i, c) in params.conditions.iter().enumerate() {
+        let condition = match goal_condition_from(c) {
+            Ok(condition) => condition,
+            Err(reason) => {
+                return error_invalid_request(
+                    &req.id,
+                    format!("condition {i} ({}) is unusable: {reason}", c.kind),
+                );
+            }
+        };
+        conditions.push(condition);
+    }
+
+    let expected = match crate::eval::ExpectedEndState::new(
+        &params.confirmed_by,
+        conditions,
+        &params.description,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            // `ExpectedEndState::new` is the vacuous-green guard: it refuses a
+            // blank confirmant and an empty condition list. Both are the
+            // caller's mistake, not a server failure.
+            return error_invalid_request(&req.id, e.to_string());
+        }
+    };
+
+    match store.confirm_and_commit(&params.id, &expected).await {
+        Ok(path) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "id": params.id,
+                "status": PendingStatus::Converted.as_str(),
+                "path": path,
+                "confirmed_by": expected.confirmed_by,
+                "conditions": expected.conditions.len(),
+            }),
+        ),
+        Err(e) => error_internal(&req.id, format!("failed to commit badcase: {e}")),
+    }
+}
+
+/// `eval.badcase.dismiss` — drop a row that is not a real badcase.
+pub(super) async fn handle_eval_badcase_dismiss(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    #[derive(Debug, Deserialize)]
+    struct DismissParams {
+        id: String,
+    }
+    let params: DismissParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(res) => return res,
+    };
+    let Some(store) = state.infra.pending_badcase_store.as_ref() else {
+        return WsResponse::err(
+            &req.id,
+            "BADCASE_UNAVAILABLE",
+            "pending badcase store is not initialized (SQLite storage required)",
+        );
+    };
+    match store.dismiss(&params.id).await {
+        Ok(()) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({ "id": params.id, "status": PendingStatus::Dismissed.as_str() }),
+        ),
+        Err(e) => error_internal(&req.id, format!("failed to dismiss badcase: {e}")),
+    }
+}
+
+/// The JSON shape one pending badcase is reported in, shared by list and
+/// confirm so a client sees the same fields either way.
+fn badcase_json(b: &PendingBadcase) -> serde_json::Value {
+    serde_json::json!({
+        "id": b.id,
+        "source": b.source.as_str(),
+        "status": b.status.as_str(),
+        "turn_id": b.turn_id,
+        "session_id": b.session_id,
+        "agent_id": b.agent_id,
+        "input": b.input,
+        "response": b.response,
+        "risk_signals": b.risk_signals,
+        // The attempt's evidence (a failed desktop run: step, capture ref,
+        // ladder distribution, handoff). Absent for the chat-signal sources.
+        "detail": b.detail,
+        "created_at": b.created_at,
+    })
+}
+
+/// One condition as a client sends it, and [`goal_condition_from`] reads it.
+///
+/// A named struct (rather than a private type inside the handler) so the
+/// translation is unit-testable on its own: the rules a client's end state must
+/// satisfy are the same rules a test asserts, and a private type would make
+/// them reachable only through a whole WS request.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ConditionParam {
+    /// One of `file_exists` | `exit_code` | `pattern` | `must_not_contain` |
+    /// `numeric` — the same wire names the goal layer uses.
+    kind: String,
+    /// File path for `file_exists`; command for the others.
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    must_contain: Option<String>,
+    #[serde(default)]
+    must_not_contain: Option<String>,
+    #[serde(default)]
+    expected: Option<i32>,
+    /// `gt` | `ge` | `lt` | `le` | `eq` (the human spellings; the YAML layer's
+    /// symbols are accepted too).
+    #[serde(default)]
+    operator: Option<String>,
+    #[serde(default)]
+    threshold: Option<f64>,
+}
+
+/// Translate one wire condition into a [`crate::goal::GoalCondition`].
+///
+/// Kept explicit rather than `#[serde(tag = "kind")]` so the error message can
+/// name the missing field: a client sending `{"kind":"file_exists"}` deserves
+/// "path is required", not a serde field list.
+pub(super) fn goal_condition_from(
+    c: &ConditionParam,
+) -> Result<crate::goal::GoalCondition, &'static str> {
+    use crate::goal::condition::Comparison;
+    use crate::goal::GoalCondition;
+    match c.kind.as_str() {
+        "file_exists" => Ok(GoalCondition::FileExists {
+            path: c.path.clone().ok_or("path is required")?,
+        }),
+        "exit_code" => Ok(GoalCondition::ExitCode {
+            command: c.command.clone().ok_or("command is required")?,
+            expected: c.expected,
+        }),
+        "pattern" => Ok(GoalCondition::Pattern {
+            command: c.command.clone().ok_or("command is required")?,
+            must_contain: c.must_contain.clone().ok_or("must_contain is required")?,
+        }),
+        "must_not_contain" => Ok(GoalCondition::MustNotContain {
+            command: c.command.clone().ok_or("command is required")?,
+            must_not_contain: c
+                .must_not_contain
+                .clone()
+                .ok_or("must_not_contain is required")?,
+        }),
+        "numeric" => {
+            let operator = match c.operator.as_deref().unwrap_or(">=") {
+                ">" | "gt" => Comparison::Gt,
+                ">=" | "ge" | "gte" => Comparison::Ge,
+                "<" | "lt" => Comparison::Lt,
+                "<=" | "le" | "lte" => Comparison::Le,
+                "==" | "eq" => Comparison::Eq,
+                _ => return Err("operator must be > | >= | < | <= | == (or gt/ge/lt/le/eq)"),
+            };
+            Ok(GoalCondition::Numeric {
+                command: c.command.clone().ok_or("command is required")?,
+                operator,
+                threshold: c.threshold.ok_or("threshold is required")?,
+            })
+        }
+        _ => Err("kind must be file_exists | exit_code | pattern | must_not_contain | numeric"),
+    }
+}
+
 /// How many rows to pull per store when aggregating dashboard counts. The
 /// stores only expose `list`-style queries (no count endpoints), so counts are
 /// aggregated client-side over a bounded, newest-first window.
@@ -288,7 +559,7 @@ pub(super) async fn handle_eval_dashboard(
     }
 
     // ── pending badcases: per-source + per-status counts ─────────────────────
-    let mut badcases_by_source = zero_counts(&["online:risk", "human:dislike"]);
+    let mut badcases_by_source = zero_counts(&["online:risk", "human:dislike", "computer:run"]);
     let mut badcases_by_status = zero_counts(&["pending", "confirmed", "converted", "dismissed"]);
     let mut badcase_total: usize = 0;
     let mut all_badcases: Vec<PendingBadcase> = Vec::new();
@@ -831,5 +1102,242 @@ mod tests {
             false,
             "pause must be cleared"
         );
+    }
+
+    // ── badcase review (Stage D′ step 2: raw signal → regressable case) ─────
+
+    fn a_desktop_failure() -> crate::eval::RunFailureRecord {
+        let mut ladder = std::collections::BTreeMap::new();
+        ladder.insert("ax_action".to_string(), 2);
+        ladder.insert("pixel".to_string(), 1);
+        crate::eval::RunFailureRecord {
+            run_id: "run-42".to_string(),
+            goal: "export the report as CSV".to_string(),
+            stop_reason: "need_help".to_string(),
+            steps_completed: 3,
+            model_calls: 4,
+            images_attached: 1,
+            failed_step: Some(crate::eval::RunStepRecord {
+                step: 2,
+                action: "click [s1:0.4]".to_string(),
+                result: "the element did not respond".to_string(),
+                verification: "failed".to_string(),
+                rung: Some("pixel".to_string()),
+            }),
+            last_screenshot_ref: Some("sha256:deadbeef".to_string()),
+            rung_distribution: ladder,
+            handoff: Some(serde_json::json!({ "run_id": "run-42" })),
+            step_lines: vec!["1. click [s1:0.2] → ok".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn badcase_list_reports_the_attempt_evidence() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        state
+            .infra
+            .pending_badcase_store
+            .as_ref()
+            .unwrap()
+            .insert_run_failure(&a_desktop_failure(), None)
+            .await
+            .unwrap();
+
+        let res = handle_eval_badcase_list(
+            &req("r1", "eval.badcase.list", serde_json::json!({})),
+            &state,
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        let p = res.payload.as_ref().unwrap();
+        assert_eq!(p["count"], 1, "{p}");
+        let row = &p["badcases"][0];
+        assert_eq!(row["source"], "computer:run");
+        assert_eq!(row["status"], "pending");
+        // The evidence a person needs to triage it travels with the row.
+        assert_eq!(row["detail"]["failed_step"]["rung"], "pixel");
+        assert_eq!(row["detail"]["last_screenshot_ref"], "sha256:deadbeef");
+        assert_eq!(row["detail"]["rung_distribution"]["pixel"], 1);
+    }
+
+    #[tokio::test]
+    async fn badcase_list_filters_by_source() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.infra.pending_badcase_store.as_ref().unwrap();
+        store
+            .insert_run_failure(&a_desktop_failure(), None)
+            .await
+            .unwrap();
+        store
+            .insert_pending(&crate::eval::InsertPendingParams {
+                source: PendingSource::OnlineRisk,
+                turn_id: Some("t1".into()),
+                session_id: None,
+                agent_id: None,
+                input: "in".to_string(),
+                response: "out".to_string(),
+                risk_signals: vec!["unhelpful".to_string()],
+            })
+            .await
+            .unwrap();
+
+        let res = handle_eval_badcase_list(
+            &req("r1", "eval.badcase.list", serde_json::json!({ "source": "computer:run" })),
+            &state,
+        )
+        .await;
+        assert!(res.ok);
+        let p = res.payload.as_ref().unwrap();
+        assert_eq!(p["count"], 1, "{p}");
+        assert_eq!(p["badcases"][0]["source"], "computer:run");
+    }
+
+    /// The loop's credibility rests on this refusal: a case with no checkable
+    /// end state would pass every trial and measure nothing.
+    #[tokio::test]
+    async fn confirming_without_an_end_state_is_refused() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.infra.pending_badcase_store.as_ref().unwrap();
+        store
+            .insert_run_failure(&a_desktop_failure(), None)
+            .await
+            .unwrap();
+        let id = store
+            .list_pending(crate::eval::PendingStatus::Pending, 10)
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+
+        let res = handle_eval_badcase_confirm(
+            &req(
+                "r1",
+                "eval.badcase.confirm",
+                serde_json::json!({
+                    "id": id,
+                    "confirmed_by": "ops-jane",
+                    "conditions": [],
+                    "description": "the report was exported",
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!res.ok, "an empty end state must not become a case");
+        assert_eq!(res.error.as_ref().unwrap().code, "INVALID_PARAMS");
+        assert_eq!(
+            store
+                .list_pending(crate::eval::PendingStatus::Pending, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a refused confirmation leaves the row pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_condition_missing_its_field_is_named_in_the_error() {
+        let res = goal_condition_from(
+            &serde_json::from_value(serde_json::json!({
+                "kind": "file_exists"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(res.unwrap_err(), "path is required");
+    }
+
+    #[tokio::test]
+    async fn the_wire_condition_names_map_onto_goal_conditions() {
+        use crate::goal::condition::Comparison;
+        let c: ConditionParam =
+            serde_json::from_value(serde_json::json!({ "kind": "exit_code", "command": "true" }))
+                .unwrap();
+        assert!(matches!(
+            goal_condition_from(&c).unwrap(),
+            crate::goal::GoalCondition::ExitCode { expected: None, .. }
+        ));
+
+        let c: ConditionParam = serde_json::from_value(serde_json::json!({
+            "kind": "numeric",
+            "command": "wc -l < out.txt",
+            "operator": ">=",
+            "threshold": 3.0,
+        }))
+        .unwrap();
+        match goal_condition_from(&c).unwrap() {
+            crate::goal::GoalCondition::Numeric { operator, threshold, .. } => {
+                assert_eq!(operator, Comparison::Ge);
+                assert_eq!(threshold, 3.0);
+            }
+            other => panic!("expected a numeric condition, got {other:?}"),
+        }
+
+        let c: ConditionParam = serde_json::from_value(serde_json::json!({
+            "kind": "numeric", "command": "x", "operator": "≈"
+        }))
+        .unwrap();
+        assert!(goal_condition_from(&c).is_err());
+    }
+
+    #[tokio::test]
+    async fn dismiss_marks_the_row_and_leaves_the_queue() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.infra.pending_badcase_store.as_ref().unwrap();
+        store
+            .insert_run_failure(&a_desktop_failure(), None)
+            .await
+            .unwrap();
+        let id = store
+            .list_pending(crate::eval::PendingStatus::Pending, 10)
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+
+        let res = handle_eval_badcase_dismiss(
+            &req("r1", "eval.badcase.dismiss", serde_json::json!({ "id": id })),
+            &state,
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert!(store
+            .list_pending(crate::eval::PendingStatus::Pending, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_pending(crate::eval::PendingStatus::Dismissed, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn badcase_methods_degrade_without_a_store() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        for (method, params) in [
+            ("eval.badcase.list", serde_json::json!({})),
+            (
+                "eval.badcase.confirm",
+                serde_json::json!({ "id": "x", "confirmed_by": "y", "conditions": [], "description": "z" }),
+            ),
+            ("eval.badcase.dismiss", serde_json::json!({ "id": "x" })),
+        ] {
+            let res = match method {
+                "eval.badcase.list" => {
+                    handle_eval_badcase_list(&req("r1", method, params), &state).await
+                }
+                "eval.badcase.confirm" => {
+                    handle_eval_badcase_confirm(&req("r1", method, params), &state).await
+                }
+                _ => handle_eval_badcase_dismiss(&req("r1", method, params), &state).await,
+            };
+            assert!(!res.ok, "{method} must fail closed without a store");
+            assert_eq!(res.error.as_ref().unwrap().code, "BADCASE_UNAVAILABLE", "{method}");
+        }
     }
 }

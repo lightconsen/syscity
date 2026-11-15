@@ -84,6 +84,11 @@ impl ModelRouter {
     }
 
     /// [`Self::complete_with_route`] with caller-supplied sampling parameters.
+    ///
+    /// `params` are applied after `build_request`, because the request the
+    /// router builds carries no sampling knobs of its own — a caller's
+    /// `temperature` / `max_tokens` (the agent reads both from `AgentConfig`,
+    /// and the scalar optimizer tunes them) would otherwise be dropped silently.
     pub async fn complete_with_route_and_params(
         &self,
         model_id: &str,
@@ -97,6 +102,7 @@ impl ModelRouter {
         // Applied after `build_request` because capability resolution there
         // looks at the model, not the sampling knobs.
         request.temperature = params.temperature;
+        request.max_tokens = params.max_tokens;
         let providers_to_try = self
             .get_providers_to_try(&provider, &model_id, &request)
             .await;
@@ -137,9 +143,28 @@ impl ModelRouter {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> crate::Result<(CompletionStream, RouteRecord)> {
+        self.stream_with_route_and_params(model_id, messages, tools, CompletionParams::default())
+            .await
+    }
+
+    /// [`Self::stream_with_route`] with caller-supplied sampling parameters.
+    ///
+    /// Same reason as [`Self::complete_with_route_and_params`]: the streaming
+    /// path is the one the agent actually uses, so dropping the caller's
+    /// `temperature` / `max_tokens` here would leave the scalar optimizer with
+    /// nothing observable to tune.
+    pub async fn stream_with_route_and_params(
+        &self,
+        model_id: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        params: CompletionParams,
+    ) -> crate::Result<(CompletionStream, RouteRecord)> {
         let requested = model_id.to_string();
-        let (provider, model_id, request) =
+        let (provider, model_id, mut request) =
             self.build_request(model_id, messages, tools, true).await?;
+        request.temperature = params.temperature;
+        request.max_tokens = params.max_tokens;
         let providers_to_try = self
             .get_providers_to_try(&provider, &model_id, &request)
             .await;
@@ -789,6 +814,108 @@ mod tests {
             max_retries: 3,
             retry_delay_ms: 1000,
         }
+    }
+
+    /// A provider that records the request it was handed, so a test can assert
+    /// what actually reached it rather than what the router meant to send.
+    #[derive(Clone, Default)]
+    struct RecordingProvider {
+        seen: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl RecordingProvider {
+        fn last(&self) -> CompletionRequest {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
+                .expect("the provider was called")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn default_model(&self) -> &str {
+            "m1"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
+        fn max_context(&self) -> usize {
+            4096
+        }
+        async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(request);
+            Ok(CompletionResponse {
+                message: Message::assistant("ok"),
+                model: "m1".to_string(),
+                usage: Some(Usage::default()),
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+        async fn stream(&self, _request: CompletionRequest) -> crate::Result<CompletionStream> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+        async fn set_credential(
+            &self,
+            _credential: crate::model_router::Credential,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The caller's sampling parameters must survive the router boundary.
+    ///
+    /// The router builds its own `CompletionRequest` from the messages and the
+    /// route, so anything not explicitly pinned is dropped. `temperature` and
+    /// `max_tokens` are what `config.set` and the scalar optimizer change, so a
+    /// drop here makes both silently inert — the request would go out at the
+    /// provider's defaults no matter what the config says.
+    #[tokio::test]
+    async fn caller_sampling_parameters_reach_the_provider() {
+        let provider = Arc::new(RecordingProvider::default());
+        let router = ModelRouter::new(crate::model_router::config::ModelRouterConfig::default());
+        router
+            .add_provider_instance("recording", provider.clone())
+            .await
+            .unwrap();
+        router
+            .model_catalog
+            .register(ModelCatalogEntry::new("m1", "m1", "recording"))
+            .await;
+
+        let params = CompletionParams {
+            temperature: Some(0.25),
+            max_tokens: Some(1234),
+        };
+        router
+            .complete_with_route_and_params("m1", vec![Message::user("hi")], None, params)
+            .await
+            .expect("the recording provider answers");
+
+        let seen = provider.last();
+        assert_eq!(seen.temperature, Some(0.25), "temperature must reach the provider");
+        assert_eq!(seen.max_tokens, Some(1234), "max_tokens must reach the provider");
+
+        // Unset knobs stay unset: the provider applies its own default, which is
+        // what a caller that does not care asked for.
+        router
+            .complete_with_route("m1", vec![Message::user("hi")], None)
+            .await
+            .expect("the recording provider answers again");
+        let seen = provider.last();
+        assert_eq!(seen.temperature, None);
+        assert_eq!(seen.max_tokens, None);
     }
 
     /// `cloud/<bare>` selects the cloud proxy, and the model that reaches the

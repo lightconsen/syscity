@@ -699,6 +699,10 @@ async fn announce_new_steps(
                 screenshot_before_ref: screenshot_before_ref.clone(),
                 screenshot_ref: screenshot_ref.clone(),
                 sensitive: record.sensitive,
+                // The rung is already read for the event; the checkpoint gets
+                // the same value rather than a second derivation that could
+                // disagree with what the client was told.
+                rung,
             };
             checkpointer.step(&completed, calls, images).await;
         }

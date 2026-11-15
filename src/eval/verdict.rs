@@ -21,6 +21,7 @@
 //!   / harness failure degrades to `Ok(None)` — a missing provider must never
 //!   fail the optimizer run.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -97,6 +98,10 @@ pub struct HarnessCandidateVerifier {
     /// judge-backed suite.
     #[allow(dead_code)]
     judge_model: Option<String>,
+    /// `evals/` root to read the suite from. `None` = the project's own
+    /// `evals/`, which is what the gateway wants; a test pins a temp corpus so
+    /// measuring a candidate never reads (or writes) the checked-in tree.
+    evals_dir: Option<PathBuf>,
 }
 
 impl HarnessCandidateVerifier {
@@ -117,7 +122,14 @@ impl HarnessCandidateVerifier {
             iterations: iterations.max(1),
             confidence,
             judge_model,
+            evals_dir: None,
         }
+    }
+
+    /// Read the suite from `dir` instead of the project's `evals/`.
+    pub fn with_evals_dir(mut self, dir: PathBuf) -> Self {
+        self.evals_dir = Some(dir);
+        self
     }
 }
 
@@ -176,19 +188,54 @@ impl CandidateVerifier for HarnessCandidateVerifier {
         };
 
         // 4. Load the regression suite.
-        let suite_path = crate::eval::loader::default_evals_dir()
-            .join("suites")
-            .join(format!("{}.yaml", self.suite_id));
-        let suite = match crate::eval::loader::load_suite(&suite_path, &self.suite_id) {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(
-                    "verdict: failed to load suite '{}': {}; no harness evidence",
-                    self.suite_id, e
-                );
-                return Ok(None);
+        //
+        // `badcases` is the collected corpus, not a manifest: its
+        // `suites/badcases.yaml` intentionally carries `tasks: []` because the
+        // tasks are the YAML files under `badcases/`, written when a person
+        // confirms a pending row. Reading the manifest for it would hand the
+        // gate an empty suite, which passes vacuously and makes every
+        // candidate look "not improved" — the opposite of measuring a
+        // regression. So that one suite id is resolved through the collector.
+        let evals_dir = self
+            .evals_dir
+            .clone()
+            .unwrap_or_else(crate::eval::loader::default_evals_dir);
+        let suite = match self.suite_id.as_str() {
+            crate::eval::recycle::BADCASE_SUITE_ID => {
+                match crate::eval::recycle::load_badcase_suite(&evals_dir) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!(
+                            "verdict: failed to load the badcase corpus: {}; no harness evidence",
+                            e
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            _ => {
+                let suite_path = evals_dir
+                    .join("suites")
+                    .join(format!("{}.yaml", self.suite_id));
+                match crate::eval::loader::load_suite(&suite_path, &self.suite_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!(
+                            "verdict: failed to load suite '{}': {}; no harness evidence",
+                            self.suite_id, e
+                        );
+                        return Ok(None);
+                    }
+                }
             }
         };
+        // An empty suite has nothing to compare: every task list is empty, so
+        // the bootstrap would receive zero observations. Say so instead of
+        // letting the gate report a non-improvement it never measured.
+        if suite.tasks.is_empty() {
+            debug!("verdict: suite '{}' has no tasks; no harness evidence", self.suite_id);
+            return Ok(None);
+        }
 
         // 5. Run every task for the baseline and the candidate, recording
         //    per-task pass/fail (pass_rate > 0.0).

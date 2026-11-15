@@ -137,6 +137,8 @@ pub enum BadcaseEntry {
     OnlineRisk,
     /// Auto-collected online: a user disliked (👎) this turn.
     HumanVote,
+    /// Auto-collected online: a desktop run stopped short of its goal.
+    ComputerRun,
     /// Manually submitted by operator/QA/engineer.
     ManualSubmit {
         reporter: String,

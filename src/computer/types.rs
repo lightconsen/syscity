@@ -804,6 +804,14 @@ pub enum Rung {
     Page,
 }
 
+impl Rung {
+    /// The rung's stable wire name (`ax_action` / `pixel` / `keyboard` /
+    /// `page`), as the evidence object and the run timeline spell it.
+    pub fn rung_name(self) -> &'static str {
+        rung_name(self)
+    }
+}
+
 /// A native accessibility action to perform on an element.
 ///
 /// These map onto the platform's own action vocabulary: `AXPress` /

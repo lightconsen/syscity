@@ -120,6 +120,15 @@ pub struct CompletedStep {
     /// path say "step 3 touched a password field; it will be asked again".
     #[serde(default)]
     pub sensitive: bool,
+    /// Which rung of the action ladder finally delivered the action.
+    ///
+    /// Absent for a step the adapter reported no evidence for, and for a
+    /// checkpoint written before this field existed. Kept because the
+    /// distribution over a failed run is the difference between "it could not
+    /// find the control" (all `ax_action`, never escalated) and "it found it and
+    /// the rung did not work" (escalated through `pixel` / `keyboard`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rung: Option<crate::computer::types::Rung>,
 }
 
 /// What a checkpoint needs to rebuild a run.
@@ -233,6 +242,7 @@ impl Checkpoint {
                         "before_ref": s.screenshot_before_ref,
                         "after_ref": s.screenshot_ref,
                         "sensitive": s.sensitive,
+                        "rung": s.rung.map(|r| r.rung_name()),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -252,6 +262,39 @@ impl Checkpoint {
     /// again before the resume continues.
     pub fn sensitive_steps(&self) -> usize {
         self.completed.iter().filter(|s| s.sensitive).count()
+    }
+
+    /// How many steps were delivered at each rung of the action ladder.
+    ///
+    /// Steps with no reported evidence are counted under `"unknown"` rather than
+    /// dropped: a run whose every step is `unknown` is telling you the adapter
+    /// cannot say, which is a different fact from a run that clicked and had
+    /// nothing happen. The map always carries every rung key, so a reader
+    /// comparing two runs does not have to tell "zero" from "key missing".
+    pub fn rung_distribution(&self) -> std::collections::BTreeMap<&'static str, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for rung in ["ax_action", "pixel", "keyboard", "page", "unknown"] {
+            out.insert(rung, 0);
+        }
+        for step in &self.completed {
+            let key = step.rung.map(|r| r.rung_name()).unwrap_or("unknown");
+            *out.entry(key).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// The failed step, when the run recorded one.
+    ///
+    /// A "failure" here is the last step the verification could not confirm:
+    /// the handoff's `stuck_at` is about where the *run* stopped, while this is
+    /// about which action is the evidence of the obstacle. `None` when every
+    /// step verified — a run that hit its ceiling while still working has no
+    /// failed step to point at, and inventing one would be worse than saying so.
+    pub fn first_failed_step(&self) -> Option<&CompletedStep> {
+        self.completed
+            .iter()
+            .rev()
+            .find(|s| s.verification == StepVerification::Failed)
     }
 
     /// The history a resumed loop starts from.
@@ -537,6 +580,7 @@ mod tests {
             screenshot_before_ref: Some("sha256:before".to_string()),
             screenshot_ref: Some("sha256:abc".to_string()),
             sensitive: false,
+            rung: Some(crate::computer::types::Rung::AxAction),
         });
         cp.model_calls = 1;
         cp
@@ -620,6 +664,7 @@ mod tests {
             screenshot_before_ref: None,
             screenshot_ref: None,
             sensitive: false,
+            rung: None,
         });
         assert_eq!(cp.next_step(), 2);
     }

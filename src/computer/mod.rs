@@ -26,6 +26,7 @@ pub mod budget;
 pub mod display;
 pub mod driver;
 pub mod element_index;
+pub mod failure;
 pub mod fs_watch;
 pub mod handoff;
 pub mod headless;

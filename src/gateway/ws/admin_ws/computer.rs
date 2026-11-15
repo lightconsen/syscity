@@ -391,6 +391,7 @@ async fn launch(
         match outcome {
             Some(Ok(outcome)) => {
                 tracing::info!("computer run {} finished: {}", outcome.run_id, outcome.describe());
+                record_run_badcase(&task_state, &outcome).await;
                 if let Some(handoff) = outcome.handoff {
                     post_handoff(&task_state, &handoff).await;
                 }
@@ -550,6 +551,70 @@ async fn post_handoff(state: &Arc<GatewayState>, note: &crate::computer::handoff
     .with_session(None);
     let id = state.tools.approval_queue.submit(approval).await;
     tracing::info!("computer run {} posted a handoff note ({id})", note.run_id);
+}
+
+/// Put a run that stopped short into the pending badcase pool.
+///
+/// Stage D′'s producer, and the whole of it: the pool, the dedup and the
+/// conversion already existed, so a failure needs only to reach them. The
+/// checkpoint is the source of truth for what the run did — it is on disk
+/// precisely because the run stopped short — and the outcome is the source of
+/// truth for why it stopped.
+///
+/// Failure here is logged and swallowed. A badcase is a byproduct of the run,
+/// not a part of it: the person taking over has the handoff note either way, and
+/// failing the task would not put the row back.
+async fn record_run_badcase(
+    state: &Arc<GatewayState>,
+    outcome: &crate::computer::run_executor::RunOutcome,
+) {
+    if !crate::computer::failure::is_a_failure(outcome.stop_reason) {
+        return;
+    }
+    let Some(store) = state.infra.pending_badcase_store.as_ref() else {
+        // No pool wired is a configuration, not an error: a headless CLI run
+        // has nowhere to put a badcase and does not need one.
+        tracing::debug!(
+            "computer run {} stopped short; no pending badcase store is wired",
+            outcome.run_id
+        );
+        return;
+    };
+
+    // The checkpoint concludes before the outcome is returned, so a failure
+    // always has one: `conclude` deletes only `done` / `cancelled`.
+    let run_store = crate::computer::run_store::RunStore::for_paths(&state.paths);
+    let Some(checkpoint) = run_store.load(&outcome.run_id).await else {
+        tracing::warn!(
+            "computer run {} stopped short but left no checkpoint to collect",
+            outcome.run_id
+        );
+        return;
+    };
+    let Some(failure) = crate::computer::failure::failure_of(&checkpoint, outcome.handoff.as_ref())
+    else {
+        return;
+    };
+
+    match store
+        .insert_run_failure(&failure, checkpoint.session_id.clone())
+        .await
+    {
+        Ok(true) => tracing::info!(
+            "computer run {} became a pending badcase ({})",
+            outcome.run_id,
+            failure.stop_reason
+        ),
+        // A repeat of a failure already in the pool. Not noise: the pool is a
+        // set of distinct dead ends, and the run log has the rest.
+        Ok(false) => tracing::debug!(
+            "computer run {} repeated a failure already in the badcase pool",
+            outcome.run_id
+        ),
+        Err(e) => {
+            tracing::warn!("could not record computer run {} as a badcase: {e}", outcome.run_id)
+        }
+    }
 }
 
 /// The visual scan for a run, built from `[computer.vision]`.
@@ -955,6 +1020,7 @@ mod tests {
             screenshot_before_ref: None,
             screenshot_ref: None,
             sensitive,
+            rung: None,
         });
         cp.model_calls = 1;
         RunStore::for_paths(&state.paths)

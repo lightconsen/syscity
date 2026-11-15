@@ -487,6 +487,34 @@ payload 里，客户端不必猜路径。**不是像素回放**：坐标系在�
 `condition_results`、`critique_passed`、`response`、`tool_calls`；`failed` 时是 `error` 而不是这些字段。
 事件广播给所有运维客户端：被重放的那一轮不是一个活着的会话，问它的人也不一定订阅了那个会话。
 
+#### 评测闭环（badcase → 回归用例 → 判定 → 回滚）
+
+| 方法 | 作用域 | 说明 |
+|--------|-------|-------------|
+| `eval.trace.list` | `read` | 调参决策审计（apply / reject / rollback / gate） |
+| `eval.badcase.list` | `read` | `{ status?, source?, limit? }` 待处理 badcase 池，最新在前 |
+| `eval.badcase.confirm` | `write` | `{ id, confirmed_by, conditions[], description }` 把一行变成回归用例 |
+| `eval.badcase.dismiss` | `write` | `{ id }` 丢弃一行（它不是真 badcase） |
+| `eval.dashboard` | `read` | trace / badcase / feedback 的只读聚合 |
+| `eval.optimizer.status` | `read` | 最近一次调参的结论、熔断器状态 |
+| `eval.optimizer.run` | `write` | 手动跑一次标量调参（creates 候选 → 三闸 → apply/rollback） |
+| `eval.optimizer.resume` | `write` | 清除熔断器并恢复自动 apply |
+| `eval.optimizer.rollback` | `write` | `{ subject, reason? }` 手动回滚某个已 apply 的标量 |
+| `eval.propose` | `write` | 结构提议器：工具描述 / prompt 候选 |
+
+`eval.badcase.list` 的 `source` 可为 `online:risk`（在线风险规则命中）、`human:dislike`（一轮被 👎）、
+`computer:run`（一次桌面 run 以 `need_help` / `budget` / `max_steps` 结束）。`computer:run` 行的
+`detail` 带的是可复核的证据：`{ run_id, goal, stop_reason, steps_completed, model_calls,
+images_attached, failed_step{step,action,result,verification,rung}, last_screenshot_ref,
+rung_distribution, handoff, steps[] }`。去重按"做了什么"（停因 + 步号 + 动作 + 验证），不是按 run id，
+所以同一个死胡同重复五次只有一行。
+
+`eval.badcase.confirm` 的 `conditions` 是**人给的**终态，不是模型自评：`ExpectedEndState` 拒绝空
+`confirmed_by` 和空条件表（没有条件的用例每次都绿，正是这个闭环最不能给的答案），拒绝以
+`INVALID_PARAMS` 返回。提交成功后写一份 YAML 进 `evals/badcases/`（`{ id, status: "converted", path,
+confirmed_by, conditions }`），并自动成为 `badcases` 回归套件的任务——`eval.optimizer.run` 的
+verdict 判定默认就量它。
+
 #### 状态与在线
 
 | 方法 | 作用域 | 说明 |

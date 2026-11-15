@@ -102,8 +102,8 @@ pub use optimizer::{
     ScalarOptimizer,
 };
 pub use pending_badcase::{
-    dedup_hash, InsertPendingParams, PendingBadcase, PendingBadcaseStore, PendingSource,
-    PendingStatus,
+    dedup_hash, ExpectedEndState, InsertPendingParams, PendingBadcase, PendingBadcaseStore,
+    PendingSource, PendingStatus, RunFailureRecord, RunStepRecord,
 };
 pub use proposer::{
     fence_path, AdoptionReport, StructuralCandidate, StructuralObjectKind, StructuralProposer,

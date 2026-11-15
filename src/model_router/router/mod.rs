@@ -63,11 +63,20 @@ use crate::providers::{
 /// router's own configuration. `None` means "let the provider apply its
 /// default", which is what every in-tree caller other than the OpenAI-compatible
 /// route does.
+///
+/// Both fields exist because `build_request` cannot see a caller's request: it
+/// builds its own from the messages and the route, so a caller that carries
+/// `temperature` / `max_tokens` on its `CompletionRequest` (the agent, which
+/// reads them from `AgentConfig`) loses them at the router boundary unless it
+/// pins them here. That is not cosmetic — the scalar optimizer tunes exactly
+/// these two, and a tuning that never reaches a provider measures nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CompletionParams {
     /// Sampling temperature. Validated by the caller against the wire
     /// contract's range; the router passes it through untouched.
     pub temperature: Option<f32>,
+    /// Upper bound on generated tokens, as the caller configured it.
+    pub max_tokens: Option<u32>,
 }
 
 // ------------------------------------------------------------------

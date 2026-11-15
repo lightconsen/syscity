@@ -134,7 +134,10 @@ async fn raw_completion(
 
     // Same bound as the agent path: a provider that never answers must not hold
     // the HTTP request open forever.
-    let params = CompletionParams { temperature: req.temperature };
+    let params = CompletionParams {
+        temperature: req.temperature,
+        ..Default::default()
+    };
     let completion = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         state

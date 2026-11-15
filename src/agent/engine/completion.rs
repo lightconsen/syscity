@@ -284,12 +284,27 @@ impl Agent {
         // Get completion — use model router when available for key rotation /
         // fallback. If the provider rejects the request as over its context
         // window, compact the context and retry once instead of failing.
+        //
+        // Sampling knobs are pinned on the router call rather than left on
+        // `request`: the router builds its own request, so anything it is not
+        // told explicitly is dropped. `temperature` / `max_tokens` come from the
+        // agent config, which is what `config.set` and the scalar optimizer
+        // change — a drop here would make both silently inert.
+        let sampling = crate::model_router::CompletionParams {
+            temperature: Some(cfg.temperature),
+            max_tokens: Some(cfg.max_tokens),
+        };
         let mut retried = false;
         let response = loop {
             let outcome = if let Some(ref router) = self.model_router {
                 let req_tools = request.tools.take();
                 match router
-                    .complete_with_route(&model_id, request.messages, req_tools)
+                    .complete_with_route_and_params(
+                        &model_id,
+                        request.messages,
+                        req_tools,
+                        sampling,
+                    )
                     .await
                 {
                     Ok((resp, rec)) => {
@@ -700,12 +715,21 @@ impl Agent {
         // Get streaming completion — use model router when available. If the
         // provider rejects the request as over its context window at stream
         // setup (before any bytes are emitted), compact and retry once.
+        //
+        // The sampling knobs are pinned on the router call: this is the path
+        // the agent normally takes, and the router builds its own request, so
+        // `temperature` / `max_tokens` from the agent config would not survive
+        // the boundary otherwise.
+        let sampling = crate::model_router::CompletionParams {
+            temperature: Some(cfg.temperature),
+            max_tokens: Some(cfg.max_tokens),
+        };
         let mut retried = false;
         let (raw_stream, family, round_model, round_provider, route_record) = loop {
             let setup = if let Some(ref router) = self.model_router {
                 let req_tools = request.tools.take();
                 let stream = router
-                    .stream_with_route(&model_id, request.messages, req_tools)
+                    .stream_with_route_and_params(&model_id, request.messages, req_tools, sampling)
                     .await;
                 let provider = router
                     .provider_for_model(&model_id)

@@ -338,6 +338,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("device.shortcut.results", Some(SCOPE_READ)),
     ("device.shortcut.inbox", Some(SCOPE_READ)),
     ("eval.trace.list", Some(SCOPE_READ)),
+    ("eval.badcase.list", Some(SCOPE_READ)),
     ("eval.dashboard", Some(SCOPE_READ)),
     ("eval.optimizer.status", Some(SCOPE_READ)),
     ("feedback.ops", Some(SCOPE_READ)),
@@ -510,6 +511,11 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("mention.blocklist.remove", Some(SCOPE_WRITE)),
     ("auth_profiles.rotate", Some(SCOPE_WRITE)),
     ("eval.optimizer.run", Some(SCOPE_WRITE)),
+    // Committing a badcase writes a regression case into `evals/badcases/`;
+    // dismissing one decides what the suite will never cover again. Both are
+    // writes to the eval corpus, not to a chat surface.
+    ("eval.badcase.confirm", Some(SCOPE_WRITE)),
+    ("eval.badcase.dismiss", Some(SCOPE_WRITE)),
     ("eval.optimizer.resume", Some(SCOPE_WRITE)),
     ("eval.optimizer.rollback", Some(SCOPE_WRITE)),
     ("eval.propose", Some(SCOPE_WRITE)),
@@ -1358,9 +1364,12 @@ mod tests {
         assert_eq!(method_scope("device.shortcut.results"), Some(SCOPE_READ));
         assert_eq!(method_scope("device.shortcut.inbox"), Some(SCOPE_READ));
         assert_eq!(method_scope("eval.trace.list"), Some(SCOPE_READ));
+        assert_eq!(method_scope("eval.badcase.list"), Some(SCOPE_READ));
         assert_eq!(method_scope("eval.dashboard"), Some(SCOPE_READ));
         assert_eq!(method_scope("eval.optimizer.status"), Some(SCOPE_READ));
         assert_eq!(method_scope("eval.optimizer.run"), Some(SCOPE_WRITE));
+        assert_eq!(method_scope("eval.badcase.confirm"), Some(SCOPE_WRITE));
+        assert_eq!(method_scope("eval.badcase.dismiss"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("eval.optimizer.resume"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("eval.optimizer.rollback"), Some(SCOPE_WRITE));
         assert_eq!(method_scope("eval.propose"), Some(SCOPE_WRITE));

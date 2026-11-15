@@ -711,6 +711,14 @@ fn goal_condition_to_yaml(cond: &GoalCondition) -> serde_norway::Value {
 
 // ── Re-loading ──────────────────────────────────────────────────────────
 
+/// The id the dynamically-collected badcase corpus is loaded under.
+///
+/// It is also a valid value for `eval.optimizer.verdict.suite` — the one
+/// suite whose tasks are not declared in a manifest but written one by one as
+/// people confirm pending rows (Stage D′). Callers that need "the collected
+/// badcases" rather than "the manifest named `badcases`" must key on this.
+pub(crate) const BADCASE_SUITE_ID: &str = "badcases";
+
 /// Load all badcase YAML files from `evals/badcases/` as a regression suite.
 ///
 /// Returns an empty suite (all rates = 1.0) when the directory doesn't exist
@@ -720,7 +728,7 @@ pub fn load_badcase_suite(evals_dir: &Path) -> Result<EvalSuite> {
 
     if !badcases_dir.is_dir() {
         return Ok(EvalSuite {
-            id: "badcases".into(),
+            id: BADCASE_SUITE_ID.into(),
             name: "Badcase Regression Suite".into(),
             category: SuiteCategory::Regression,
             tasks: Vec::new(),
@@ -757,7 +765,7 @@ pub fn load_badcase_suite(evals_dir: &Path) -> Result<EvalSuite> {
     info!("Loaded {} badcase tasks from {:?}", tasks.len(), badcases_dir);
 
     Ok(EvalSuite {
-        id: "badcases".into(),
+        id: BADCASE_SUITE_ID.into(),
         name: "Badcase Regression Suite".into(),
         category: SuiteCategory::Regression,
         tasks,
