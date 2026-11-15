@@ -208,6 +208,15 @@ impl SyscityPaths {
         self.root.join("computer-runs")
     }
 
+    /// Recorded desktop workflows (`<root>/workflows`).
+    ///
+    /// One JSON file per workflow, named after it. A workflow is something a
+    /// person keeps and edits, not something a run leaves behind: it outlives
+    /// the conversation that recorded it and is replayable from any client.
+    pub fn workflows_dir(&self) -> PathBuf {
+        self.root.join("workflows")
+    }
+
     /// Plugin data directory (`<root>/plugins/data`).
     pub fn plugins_data_dir(&self) -> PathBuf {
         self.root.join("plugins").join("data")
@@ -738,6 +747,7 @@ pub async fn init() -> crate::Result<PathBuf> {
         paths.budget_dir(),
         paths.groups_dir(),
         paths.plugins_data_dir(),
+        paths.workflows_dir(),
     ];
 
     for dir in &dirs {
@@ -794,6 +804,7 @@ pub fn init_sync() -> crate::Result<PathBuf> {
         paths.budget_dir(),
         paths.groups_dir(),
         paths.plugins_data_dir(),
+        paths.workflows_dir(),
     ];
 
     for dir in &dirs {

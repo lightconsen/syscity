@@ -415,6 +415,9 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 | `computer.control` | `write` | `{run_id, action}`，`action` ∈ `pause` / `resume` / `step` / `cancel` / `steer`（`steer` 必带非空 `message`） |
 | `computer.runs` | `read` | `{ include_finished? }` 列出**磁盘上被中断、可续跑**的 run（默认只列可续跑的） |
 | `computer.resume` | `write` | `{ run_id, confirm_sensitive? }` 从持久化状态里继续一个被中断的 run，从第 N+1 步接着跑 |
+| `computer.record_start` | `write` | `{ name? }` 开始录制：`computer` 工具的每一次成功动作都会被记下来 |
+| `computer.record_stop` | `write` | `{ name, description? }` 结束录制，存成 `workflows/<name>.json`，返回抽出的 `parameters` |
+| `computer.play` | `write` | `{ name, parameters?, strategy?, confirm_sensitive?, session_id? }` 回放一个工作流（同样先返回 `run_id`） |
 
 `computer.run` 参数：`{ goal, session_id? }`。`goal` 为空返回 `INVALID_PARAMS`；`[computer] enabled = false`
 返回 `COMPUTER_DISABLED`；本机没有适配器返回 `COMPUTER_UNAVAILABLE`；没有可用模型返回
@@ -453,6 +456,42 @@ run 会在别人正在用的机器上真实动手，重启不是同意。重启�
 `CONFIRMATION_REQUIRED`——续跑批准的是目标，不是上一次模型凑巧瞄准的那个密码框。其它拒绝：
 `COMPUTER_DISABLED`、`RUN_ALREADY_LIVE`（同一 run 在本进程还活着）、`RUN_NOT_FOUND`（磁盘上没有这个
 检查点）、`RUN_NOT_RESUMABLE`（已有结论）。
+
+#### 录制与回放
+
+录一次，之后带参数重放。录制期间 `computer` 工具的每一次**成功且可重放**的动作都会被记进一个
+`Recording`（观察类动作不算：`screenshot` / `read_ui_tree` 是决策的依据，不是做过的事）。这个
+`Recording` 挂在 gateway 的工具状态上，不在连接上——录制是从 WS 发起的，而动作来自另一条 agent 轮次的
+工具注册表，两者是不同对象、共享同一个句柄。因此**全 gateway 同时只能有一个录制**，第二次
+`record_start` 返回 `ALREADY_RECORDING` 而不是默默丢掉前一个。
+
+`computer.record_start` 参数：`{ name? }`；`[computer] enabled = false` 返回 `COMPUTER_DISABLED`。
+
+`computer.record_stop` 参数：`{ name, description? }`。录到的步骤会先经 `Workflow::parameterize`
+把类型输入的内容抽成 `{{参数名}}`（参数名取自输入目标控件的 label，没有则 `text`），再存到
+`~/.syscity/workflows/<name>.json`。响应含 `name`、`path`、`steps`、`parameters`——`parameters`
+直接列出来，调用方不必打开文件就知道回放时要绑什么。没有录制在跑返回 `NOT_RECORDING`；录制是空的
+返回 `RECORD_STOP_FAILED`；存盘失败返回 `WORKFLOW_SAVE_FAILED`。后两种情况下录制都已经从录制器里
+取走——报告失败却让它保持"正在录制"才是说谎，重新存一次是调用方的事。
+
+步骤里元素 id 会在录制当下被解析成 `role + label`（`stabilize`）：快照 id 在下一次读树后就什么也
+指不到了，只有名字能活到另一次运行。描述文字同步改写，所以回放的运行日志不会一边显示 `{{name}}`
+一边在屏幕上打着绑定的值。
+
+`computer.play` 参数：`{ name, parameters?, strategy?, confirm_sensitive?, session_id? }`，和
+`computer.run` 一样**先返回 `run_id`**、在后台跑，进度看 `computer.status`、`computer.step`。
+
+三条**动手之前**的拒绝：
+
+- 工作流不存在 → `WORKFLOW_NOT_FOUND`；
+- 参数没绑全 → `PARAMETERS_MISSING`（空字符串不算绑定：对 `Type` 步骤就是把占位符换成"什么也不打"）；
+- 有敏感步骤（命中密码/支付/破坏性确认，或是 `close_window` / `kill_process` / `restart_process` /
+  shell）而未给 `confirm_sensitive: true` → `CONFIRMATION_REQUIRED`，报错里列出从 1 开始的步骤号。
+  录制时的那次批准不会延续到回放：填过一次密码框，不等于允许再填一次。
+
+`strategy` ∈ `skip`（默认）/ `abort` / `retry`，决定某一步失败之后是跳过、中止还是重试（`retry` 的次数与
+间隔在玩家内部默认，`computer.play` 目前只传策略名）。失败判定用与 run 同一套：动作发出了但屏幕没变化
+算失败；"无法验证"（`unverifiable`）算成功——把它当失败，会把一个做对了的步骤反复重做成它已经做过的事。
 
 #### 回放与审计时间线
 

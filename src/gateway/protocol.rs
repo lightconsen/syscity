@@ -422,6 +422,12 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("computer.control", Some(SCOPE_WRITE)),
     // Resuming is running: it starts a loop that acts on the shared desktop.
     ("computer.resume", Some(SCOPE_WRITE)),
+    // Both act on the shared desktop: a recording captures every action the
+    // computer tool takes, and a replay takes actions. A read client must be
+    // able to do neither.
+    ("computer.record_start", Some(SCOPE_WRITE)),
+    ("computer.record_stop", Some(SCOPE_WRITE)),
+    ("computer.play", Some(SCOPE_WRITE)),
     ("agents.create", Some(SCOPE_WRITE)),
     ("agents.delete", Some(SCOPE_WRITE)),
     ("agents.purge", Some(SCOPE_WRITE)),

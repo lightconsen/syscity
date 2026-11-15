@@ -188,6 +188,14 @@ pub struct ToolState {
     /// the point of handing a run over. Finished runs are kept (bounded) so
     /// "start, then ask what happened" is not a race.
     pub computer_runs: Arc<crate::computer::run_registry::ComputerRunRegistry>,
+    /// The recording in progress, if any (`computer.record_start` / `.stop`).
+    ///
+    /// On the tool state rather than in a connection: there is one screen, so a
+    /// recording started from a client or the UI must see the actions the
+    /// `computer` tool takes in an agent turn — which is a different task, and
+    /// has no way to reach a per-connection handle. One recording at a time,
+    /// refused rather than overlapped.
+    pub computer_recording: Arc<crate::planner::workflow::Recording>,
     /// Shared handle for the PlannerTool — set during agent spawn.
     pub planner_handle: Arc<std::sync::RwLock<Option<Arc<crate::planner::GoalPlanner>>>>,
 }

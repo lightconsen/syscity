@@ -136,7 +136,52 @@ the count, writes a line into each run's originating session naming the run and 
 from, and `computer.runs` is the list behind it. Both live in `ws/admin_ws/computer.rs::launch`, which
 owns every pre-spawn refusal so `computer.run` and `computer.resume` cannot diverge.
 
-## Key Types
+### Recording and replay
+
+A run answers "do this goal". A workflow answers "do what I just did, with a different input" — the
+second time is not a fresh decision, it is the same actions with a value substituted.
+
+**What gets recorded.** `computer.record_start` opens one `Recording` on the gateway's tool state
+(`Recording` in `planner/workflow.rs`), and the `computer` tool feeds it from
+`tools/computer.rs::record_step_if_recording`. Three questions decide whether a call is a step:
+
+- a recording is running, and the action is replayable (`screenshot` / `read_ui_tree` are how a
+  decision was made, not what it did);
+- the action landed: `result.success`, verification not `Failed`, effect not `Refused`;
+- the action can be named later — `stabilize` resolves each element id into `role + label` *at record
+  time*, through the same adapter resolution the step itself used. A snapshot id names nothing after
+  the next read; a role and a label survive into a run that will never see this process's tree again.
+
+The handle lives on the gateway, not on the tool or the connection, because the actions arrive from an
+agent turn's registry (a different `ComputerTool`) while the recording was started over WS. Sharing
+the handle is what makes "record a task by asking the agent to do it" work; one recording at a time
+follows from there, since there is one screen.
+
+**What is saved.** `computer.record_stop` calls `Workflow::parameterize` first: every `Type` step's
+literal (trimmed, ≤200 chars, single-line) becomes `{{name}}`, named after the target control's label
+(`text` when there is none), and both the action *and* the step description are rewritten. The
+description is what the replay's run log prints, so leaving the literal in it would show a reader the
+recorded value while the field holds the bound one. The parameterised `Workflow` is then written to
+`~/.syscity/workflows/<stem>.json` (tmp + rename), and the response names the parameters so a caller
+can bind them without opening the file.
+
+**What a replay does.** `computer.play` refuses before anything moves when the workflow is missing,
+when a parameter is unbound (blank counts as unbound — it would type nothing), or when a step needs a
+person and `confirm_sensitive` was not given. `needs_confirmation` is true for a step that aimed at a
+sensitive control and for one that is destructive by shape (`close_window`, `kill_process`,
+`restart_process`, shell); the approval that let the recording happen is not a standing permission to
+do it again. The replay then runs like a run: a `run_id` back immediately, one `ComputerSession` for
+the whole workflow, `controller.check_and_wait()` between steps, each step's line pushed into the
+run's `completed` and broadcast as `computer.step`.
+
+A step's failure escalates the same way it does in a run, and the verdict is read the same way:
+`Failed` verification means the action ran and the screen did not change, which is a failed step;
+`Unverifiable` is a success carrying `None`, because counting "nothing could check it" as a failure
+retries a step into doing what it already did. `FailureStrategy` (`skip` default, `abort`, `retry`)
+decides whether the replay goes on; a `Refused` step is terminal for that step whatever the strategy,
+since the same request meets the same refusal.
+
+
 
 ```rust
 #[async_trait]

@@ -37,6 +37,12 @@ pub struct ToolsInit {
     pub memory_manager_holder: Arc<RwLock<Option<Arc<MemoryManager>>>>,
     pub tool_registry: Arc<ToolRegistry>,
     pub computer_adapter: Option<Arc<dyn ComputerAdapter>>,
+    /// The recording handle given to the registered `computer` tool.
+    ///
+    /// Returned rather than built twice: the gateway's WS handlers start and
+    /// stop a recording on this exact handle, and the tool feeds it. Two
+    /// handles would be two recorders and no recording.
+    pub computer_recording: Arc<crate::planner::workflow::Recording>,
     pub planner_handle: Arc<std::sync::RwLock<Option<Arc<crate::planner::GoalPlanner>>>>,
     pub plugin_manager: Arc<PluginManager>,
     pub canvas_manager: Arc<CanvasManager>,
@@ -411,18 +417,27 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         init_computer_adapter(config, tool_registry.clone(), paths.clone()).await;
 
     // Register ComputerTool with the adapter (or None if unavailable).
+    //
+    // The recording handle is the gateway's, so a `computer.record_start` can
+    // capture the actions an agent turn's copy of this tool takes; the two are
+    // different objects sharing one recording.
+    let recording = Arc::new(crate::planner::workflow::Recording::new());
     if let Some(ref adapter) = computer_adapter {
         #[cfg(feature = "browser")]
         let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
             .with_page_actor(Arc::new(crate::browser::BrowserPageActor::new(
                 browser_pool.clone(),
                 config.browser.pool.default_profile.clone(),
-            )));
+            )))
+            .with_recording(recording.clone());
         #[cfg(not(feature = "browser"))]
-        let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()));
+        let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
+            .with_recording(recording.clone());
         tool_registry.register_dynamic(Arc::new(computer));
     } else {
-        tool_registry.register_dynamic(Arc::new(crate::tools::computer::ComputerTool::new(None)));
+        tool_registry.register_dynamic(Arc::new(
+            crate::tools::computer::ComputerTool::new(None).with_recording(recording.clone()),
+        ));
     }
 
     // Register screen-state tools (screenshot + UI tree + optional OCR).
@@ -475,6 +490,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         memory_manager_holder,
         tool_registry,
         computer_adapter,
+        computer_recording: recording,
         planner_handle,
         plugin_manager,
         canvas_manager,

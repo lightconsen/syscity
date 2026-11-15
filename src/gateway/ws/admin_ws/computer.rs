@@ -14,6 +14,11 @@
 //!   loop uses. Nothing about pausing is reimplemented here.
 //!
 //! Progress arrives as `computer.step` events, not as status polls.
+//!
+//! Three more methods record and replay a task (`computer.record_start`,
+//! `computer.record_stop`, `computer.play`). They are a different lifecycle —
+//! a recording is not a run — but they share this module because a replay is
+//! the same loop with a fixed script, and both act on the one shared desktop.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +26,9 @@ use std::time::Duration;
 use super::super::{parse_params, WsRequest, WsResponse};
 use crate::gateway::protocol::error_invalid_request;
 use crate::gateway::{GatewayEvent, GatewayState};
+use crate::planner::workflow::{
+    self, FailureStrategy, RecordedStep, StepResult, Workflow, WorkflowPlayer, WorkflowStore,
+};
 
 /// How long a run gets to unwind after shutdown cancels it.
 ///
@@ -809,6 +817,489 @@ async fn provider_for_model(
     Some((provider, name))
 }
 
+// ── Recording and replay ─────────────────────────────────────────────────────
+
+/// `computer.record_start` — begin capturing the actions the `computer` tool
+/// takes.
+///
+/// Params: `{ "name": "..."? }`.
+///
+/// One recording at a time across the whole gateway. There is one screen, so two
+/// recordings cannot usefully be different — and a second `start` that silently
+/// discarded the first would lose a capture the caller believed it had.
+pub(crate) async fn handle_computer_record_start(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let config = state.config.read().await.clone();
+    if !config.computer.enabled {
+        return WsResponse::err(
+            &req.id,
+            "COMPUTER_DISABLED",
+            "Computer use is disabled (`[computer] enabled = false`)",
+        );
+    }
+    let params = match parse_params::<serde_json::Value>(req) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+
+    match state.tools.computer_recording.start(name.clone()) {
+        Ok(()) => WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "recording": true,
+                "name": name,
+                "steps": 0,
+            }),
+        ),
+        Err(workflow::RecordingError::AlreadyRecording) => WsResponse::err(
+            &req.id,
+            "ALREADY_RECORDING",
+            "A recording is already in progress; stop it with `computer.record_stop` first",
+        ),
+        Err(e) => WsResponse::err(&req.id, "RECORD_START_FAILED", e.to_string()),
+    }
+}
+
+/// `computer.record_stop` — finish the recording and save it as a workflow.
+///
+/// Params: `{ "name": "...", "description": "..."? }`.
+///
+/// The saved workflow has its typed values already turned into `{{parameters}}`
+/// ([`Workflow::parameterize`]); the response names them so the caller can bind
+/// them on replay without opening the file.
+pub(crate) async fn handle_computer_record_stop(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let params = match parse_params::<serde_json::Value>(req) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let name = match params.get("name").and_then(|v| v.as_str()).map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            return error_invalid_request(&req.id, "Missing required parameter `name`");
+        }
+    };
+
+    let mut workflow = match state.tools.computer_recording.stop(Some(name.clone())) {
+        Ok(workflow) => workflow,
+        Err(workflow::RecordingError::NotRecording) => {
+            return WsResponse::err(
+                &req.id,
+                "NOT_RECORDING",
+                "No recording is in progress; start one with `computer.record_start`",
+            );
+        }
+        Err(e) => return WsResponse::err(&req.id, "RECORD_STOP_FAILED", e.to_string()),
+    };
+    if let Some(description) = params
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        workflow = workflow.with_description(description);
+    }
+
+    let store = WorkflowStore::for_paths(&state.paths);
+    let path = match store.save(&workflow).await {
+        Ok(path) => path,
+        Err(e) => {
+            // The recording is gone from the recorder either way: reporting the
+            // failure and leaving it "recording" would be a lie, and re-saving
+            // is the caller's retry, not something to invent here.
+            tracing::warn!("could not save workflow {name:?}: {e}");
+            return WsResponse::err(&req.id, "WORKFLOW_SAVE_FAILED", e.to_string());
+        }
+    };
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "recording": false,
+            "name": workflow.name,
+            "path": path.display().to_string(),
+            "steps": workflow.steps.len(),
+            "parameters": workflow.parameters,
+        }),
+    )
+}
+
+/// `computer.play` — replay a saved workflow.
+///
+/// Params:
+/// `{ "name": "...", "parameters": {...}?, "strategy": "skip|abort|retry"?,
+///    "confirm_sensitive": false?, "session_id": "..."? }`.
+///
+/// Three refusals before anything moves:
+///
+/// - the workflow must exist;
+/// - its parameters must all be bound — a missing value would otherwise replay
+///   the literal `{{name}}`, which types a placeholder into somebody's field;
+/// - a workflow with a sensitive step needs `confirm_sensitive: true`. The
+///   approval given to whatever recorded it does not survive to this run: a
+///   password field that was filled once is not a field to fill again unasked.
+///
+/// The replay is spawned like `computer.run` rather than awaited — a workflow
+/// has as many steps as a task, and WS dispatch is serial per connection.
+pub(crate) async fn handle_computer_play(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+    let params = match parse_params::<PlayParams>(req) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let config = state.config.read().await.clone();
+    if !config.computer.enabled {
+        return WsResponse::err(
+            &req.id,
+            "COMPUTER_DISABLED",
+            "Computer use is disabled (`[computer] enabled = false`)",
+        );
+    }
+
+    let store = WorkflowStore::for_paths(&state.paths);
+    let Some(workflow) = store.load(params.name.trim()).await else {
+        return WsResponse::err(
+            &req.id,
+            "WORKFLOW_NOT_FOUND",
+            format!("No saved workflow named {:?}", params.name),
+        );
+    };
+
+    let strategy = match params.strategy.as_deref() {
+        None => FailureStrategy::Skip,
+        Some(name) => match FailureStrategy::parse(name) {
+            Some(strategy) => strategy,
+            None => {
+                return error_invalid_request(
+                    &req.id,
+                    format!("Unknown strategy {name:?}; expected skip, abort or retry"),
+                );
+            }
+        },
+    };
+
+    if let Some(missing) = unbound_parameters(&workflow, &params.parameters) {
+        return WsResponse::err(
+            &req.id,
+            "PARAMETERS_MISSING",
+            format!(
+                "Workflow {} needs values for: {}; pass them in `parameters`",
+                workflow.name,
+                missing.join(", ")
+            ),
+        );
+    }
+
+    let sensitive: Vec<usize> = workflow
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| workflow::needs_confirmation(step))
+        .map(|(index, _)| index + 1)
+        .collect();
+    if !sensitive.is_empty() && !params.confirm_sensitive {
+        return WsResponse::err(
+            &req.id,
+            "CONFIRMATION_REQUIRED",
+            format!(
+                "Workflow {} has {} step(s) that need a person (sensitive control, close, \
+                 kill, or shell) at {}; resend with `confirm_sensitive: true` to replay it",
+                workflow.name,
+                sensitive.len(),
+                sensitive
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run = state
+        .tools
+        .computer_runs
+        .create(run_id.clone(), format!("replay workflow {}", workflow.name))
+        .await;
+
+    let session_id = params.session_id.clone().filter(|s| !s.is_empty());
+    let player = WorkflowPlayer::new().with_failure_strategy(strategy);
+    let steps = workflow.bind_parameters(params.parameters.clone());
+    let total = steps.len();
+    let plan = PlayPlan {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        workflow_name: workflow.name.clone(),
+        steps,
+        player,
+    };
+
+    let spawned = spawn_play(state, run, plan).await;
+    if let Err(resp) = spawned {
+        state.tools.computer_runs.remove(&run_id).await;
+        let mut resp = resp;
+        resp.id = req.id.clone();
+        return resp;
+    }
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "run_id": run_id,
+            "workflow": workflow.name,
+            "steps": total,
+            "sensitive_steps": sensitive,
+            "strategy": strategy.as_str(),
+        }),
+    )
+}
+
+/// Everything the spawned replay needs, assembled before the spawn.
+struct PlayPlan {
+    run_id: String,
+    session_id: Option<String>,
+    workflow_name: String,
+    steps: Vec<RecordedStep>,
+    player: WorkflowPlayer,
+}
+
+/// Build a session for this replay and spawn it.
+///
+/// Every refusal happens here, before the spawn, for the same reason `launch`
+/// does it: a caller that got a `run_id` back must be able to rely on the replay
+/// moving.
+async fn spawn_play(
+    state: &Arc<GatewayState>,
+    run: Arc<crate::computer::run_registry::ComputerRun>,
+    plan: PlayPlan,
+) -> Result<(), WsResponse> {
+    let adapter = {
+        let guard = state.tools.computer_adapter.read().await;
+        guard.clone()
+    };
+    let Some(adapter) = adapter else {
+        return Err(WsResponse::err(
+            "",
+            "COMPUTER_UNAVAILABLE",
+            "No desktop adapter is available on this host",
+        ));
+    };
+
+    let task_state = state.clone();
+    let total = plan.steps.len();
+    let plan_run_id = plan.run_id.clone();
+    let task = tokio::spawn(async move {
+        // One session for the whole replay, so the ladder's step history and
+        // the verification engine see the task, not N unrelated actions.
+        let session = crate::computer::session::ComputerSession::new(adapter);
+        let mut outcomes = Vec::with_capacity(total);
+        let mut last: Option<StepResult> = None;
+        let mut cancelled = false;
+
+        for (index, step) in plan.steps.iter().enumerate() {
+            // The same pause / cancel gate a run between steps, on this run's
+            // controller: a replay is steerable the way a run is.
+            if let Err(why) = run.controller.check_and_wait().await {
+                cancelled = true;
+                last = Some(StepResult::Failed { error: why.to_string() });
+                break;
+            }
+
+            let delay = plan.player.delay_for(step);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+
+            let result = plan.player.play_step(step, &session).await;
+            let verified = match &result {
+                StepResult::Success { verified, .. } => *verified,
+                _ => None,
+            };
+            let verdict = match verified {
+                Some(true) => crate::computer::use_loop::StepVerification::Verified,
+                Some(false) => crate::computer::use_loop::StepVerification::Failed,
+                None => crate::computer::use_loop::StepVerification::Unverifiable,
+            };
+            run.update(|s| {
+                s.step = index + 1;
+                s.last_action = Some(step.description.clone());
+                s.last_verified = verified;
+                s.completed.push(crate::computer::run_store::step_line(
+                    index,
+                    &step.description,
+                    &describe_step_result(&result),
+                    crate::computer::run_store::verdict_word(verdict),
+                ));
+            })
+            .await;
+
+            broadcast_step(
+                &task_state,
+                &plan.session_id,
+                &plan.run_id,
+                &crate::computer::run_executor::RunEvent::Step {
+                    run_id: plan.run_id.clone(),
+                    step: index + 1,
+                    action: step.description.clone(),
+                    rung: None,
+                    effect: None,
+                    screenshot_before_ref: None,
+                    screenshot_ref: None,
+                    verified,
+                    model_calls: 0,
+                    images_attached: 0,
+                },
+            );
+
+            let go_on = result.should_continue(plan.player.failure_strategy());
+            outcomes.push(result.clone());
+            last = Some(result);
+            if !go_on {
+                break;
+            }
+        }
+
+        let succeeded = outcomes.len() == total && outcomes.iter().all(StepResult::succeeded);
+        let message = match (&last, succeeded) {
+            (_, true) => format!("Replayed {total} step(s) of {:?}", plan.workflow_name),
+            (Some(result), false) => format!(
+                "Replay of {:?} stopped at step {} of {total}: {}",
+                plan.workflow_name,
+                outcomes.len(),
+                describe_step_result(result)
+            ),
+            (None, false) => format!("Replay of {:?} had nothing to do", plan.workflow_name),
+        };
+
+        // A cancelled replay is `Cancelled` even if the last step succeeded:
+        // the phase says why it stopped, and "done" would be a false answer.
+        let phase = if cancelled {
+            crate::computer::run_registry::RunPhase::Cancelled
+        } else if succeeded {
+            crate::computer::run_registry::RunPhase::Done
+        } else {
+            crate::computer::run_registry::RunPhase::Failed
+        };
+        let stop_reason = if cancelled {
+            crate::computer::run_budget::StopReason::Cancelled
+        } else if succeeded {
+            crate::computer::run_budget::StopReason::Done
+        } else {
+            crate::computer::run_budget::StopReason::NeedHelp
+        };
+
+        run.update(|s| {
+            s.phase = phase;
+            s.message = Some(message.clone());
+        })
+        .await;
+
+        broadcast_step(
+            &task_state,
+            &plan.session_id,
+            &plan.run_id,
+            &crate::computer::run_executor::RunEvent::Finished {
+                run_id: plan.run_id.clone(),
+                phase,
+                steps: outcomes.len(),
+                message,
+                stop_reason,
+            },
+        );
+        task_state.tools.computer_runs.sweep_finished().await;
+    });
+
+    let key = format!("computer:play:{}", plan_run_id);
+    state.task_registry.insert_join(key, task).await;
+
+    Ok(())
+}
+
+/// Broadcast one replay event on the same channel a run's steps use.
+fn broadcast_step(
+    state: &Arc<GatewayState>,
+    session_id: &Option<String>,
+    run_id: &str,
+    event: &crate::computer::run_executor::RunEvent,
+) {
+    let payload = match serde_json::to_value(event) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!("replay event did not serialize: {e}");
+            return;
+        }
+    };
+    let gateway_event = GatewayEvent::ComputerStep {
+        session_id: session_id.clone(),
+        run_id: run_id.to_string(),
+        event: payload,
+    };
+    if let Err(e) = state.events.tx.send(gateway_event) {
+        tracing::debug!("no subscribers for replay step event: {e}");
+    }
+}
+
+/// One line for a step's result, as the run log renders it.
+fn describe_step_result(result: &StepResult) -> String {
+    match result {
+        StepResult::Success { message, .. } => message.clone(),
+        StepResult::Skipped { reason } => format!("skipped: {reason}"),
+        StepResult::Failed { error } => format!("failed: {error}"),
+        StepResult::Refused { reason } => format!("refused: {reason}"),
+    }
+}
+
+/// The workflow's parameters this call did not bind, if any.
+///
+/// Checked before the spawn, deliberately: a `{{name}}` left in a `Type` step
+/// would type the braces into somebody's field, and a replay that half-ran
+/// before failing on step 4 is worse than one that never started.
+fn unbound_parameters(
+    workflow: &Workflow,
+    supplied: &std::collections::HashMap<String, String>,
+) -> Option<Vec<String>> {
+    // An empty value is not a binding: it would replace the placeholder with
+    // nothing, which for a `Type` step means typing nothing at all.
+    let missing: Vec<String> = workflow
+        .parameters
+        .iter()
+        .filter(|name| {
+            supplied
+                .get(*name)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PlayParams {
+    name: String,
+    #[serde(default)]
+    parameters: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    confirm_sensitive: bool,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct RunParams {
     goal: String,
@@ -1193,5 +1684,247 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, "COMPUTER_UNAVAILABLE");
         // And the half-built run did not linger.
         assert_eq!(state.tools.computer_runs.live_count().await, 0);
+    }
+
+    // ── Recording and replay ────────────────────────────────────────────────
+
+    /// Start, note a step, stop: the saved file is the workflow, and its
+    /// parameters are already placeholders.
+    #[tokio::test]
+    async fn a_recording_round_trips_to_a_saved_workflow() {
+        use crate::computer::types::{ClickTarget, DesktopAction, MouseButton};
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let started = handle_computer_record_start(
+            &req("computer.record_start", serde_json::json!({"name": "new folder"})),
+            &state,
+        )
+        .await;
+        assert!(started.ok, "{started:?}");
+
+        state.tools.computer_recording.note(
+            DesktopAction::Type {
+                text: "Reports".to_string(),
+                target: Some(ClickTarget::ElementLabel("Save As".to_string())),
+            },
+            "type Reports",
+            false,
+        );
+
+        let stopped = handle_computer_record_stop(
+            &req("computer.record_stop", serde_json::json!({"name": "new folder"})),
+            &state,
+        )
+        .await;
+        assert!(stopped.ok, "{stopped:?}");
+
+        let store = WorkflowStore::for_paths(&state.paths);
+        let saved = store
+            .load("new folder")
+            .await
+            .expect("the workflow was saved");
+        assert_eq!(saved.name, "new folder");
+        assert_eq!(saved.steps.len(), 1);
+        assert_eq!(saved.parameters, vec!["save_as".to_string()]);
+        match &saved.steps[0].action {
+            workflow::WorkflowAction::Desktop(DesktopAction::Type { text, .. }) => {
+                assert_eq!(text, "{{save_as}}");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+        let _ = MouseButton::Left;
+    }
+
+    /// Starting a second recording is refused, and the first keeps its steps.
+    #[tokio::test]
+    async fn a_second_recording_is_refused_and_the_first_survives() {
+        use crate::computer::types::{ClickTarget, DesktopAction, MouseButton, Point};
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        handle_computer_record_start(&req("computer.record_start", serde_json::json!({})), &state)
+            .await;
+        state.tools.computer_recording.note(
+            DesktopAction::Click {
+                target: ClickTarget::Coordinate(Point::new(10, 20)),
+                button: MouseButton::Left,
+            },
+            "click",
+            false,
+        );
+
+        let second = handle_computer_record_start(
+            &req("computer.record_start", serde_json::json!({"name": "other"})),
+            &state,
+        )
+        .await;
+        assert!(!second.ok);
+        assert_eq!(second.error.unwrap().code, "ALREADY_RECORDING");
+
+        let stopped = handle_computer_record_stop(
+            &req("computer.record_stop", serde_json::json!({"name": "first"})),
+            &state,
+        )
+        .await;
+        assert!(stopped.ok, "{stopped:?}");
+        assert_eq!(stopped.payload.unwrap()["steps"], 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_without_a_recording_is_refused() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let resp = handle_computer_record_stop(
+            &req("computer.record_stop", serde_json::json!({"name": "nothing"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "NOT_RECORDING");
+    }
+
+    #[tokio::test]
+    async fn record_stop_needs_a_name() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        handle_computer_record_start(&req("computer.record_start", serde_json::json!({})), &state)
+            .await;
+        let resp = handle_computer_record_stop(
+            &req("computer.record_stop", serde_json::json!({})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "INVALID_PARAMS");
+    }
+
+    /// A workflow that is not on disk is refused by name, not silently
+    /// replayed as an empty one.
+    #[tokio::test]
+    async fn playing_a_missing_workflow_is_refused() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let resp = handle_computer_play(
+            &req("computer.play", serde_json::json!({"name": "does-not-exist"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "WORKFLOW_NOT_FOUND");
+    }
+
+    /// A parameter left unbound would type `{{name}}` into somebody's field.
+    #[tokio::test]
+    async fn playing_without_a_parameter_is_refused_and_names_it() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_workflow(&state, "needs-param", false).await;
+
+        let resp = handle_computer_play(
+            &req("computer.play", serde_json::json!({"name": "needs-param"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, "PARAMETERS_MISSING");
+        assert!(error.message.contains("save_as"), "{}", error.message);
+    }
+
+    /// An empty value is not a binding.
+    #[tokio::test]
+    async fn playing_with_an_empty_parameter_is_refused() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_workflow(&state, "empty-param", false).await;
+
+        let resp = handle_computer_play(
+            &req(
+                "computer.play",
+                serde_json::json!({"name": "empty-param", "parameters": {"save_as": "  "}}),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "PARAMETERS_MISSING");
+    }
+
+    /// A sensitive step is asked about once, up front — and the refusal happens
+    /// before any run is registered.
+    #[tokio::test]
+    async fn playing_a_sensitive_workflow_requires_confirmation() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_workflow(&state, "sensitive", true).await;
+
+        let resp = handle_computer_play(
+            &req(
+                "computer.play",
+                serde_json::json!({"name": "sensitive", "parameters": {"save_as": "x"}}),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "CONFIRMATION_REQUIRED");
+        assert_eq!(state.tools.computer_runs.live_count().await, 0);
+    }
+
+    /// An unknown strategy is refused rather than defaulted: "I said abort" is
+    /// not a thing to get wrong silently.
+    #[tokio::test]
+    async fn an_unknown_strategy_is_refused() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_workflow(&state, "strategy", false).await;
+
+        let resp = handle_computer_play(
+            &req(
+                "computer.play",
+                serde_json::json!({
+                    "name": "strategy",
+                    "parameters": {"save_as": "x"},
+                    "strategy": "explode",
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "INVALID_PARAMS");
+    }
+
+    /// With no adapter, the replay is refused *before* a run is registered —
+    /// the caller must not be handed a `run_id` for a replay that cannot move.
+    #[tokio::test]
+    async fn playing_without_an_adapter_refuses_and_leaves_no_run() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_workflow(&state, "no-adapter", false).await;
+
+        let resp = handle_computer_play(
+            &req(
+                "computer.play",
+                serde_json::json!({"name": "no-adapter", "parameters": {"save_as": "x"}}),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "COMPUTER_UNAVAILABLE");
+        assert_eq!(state.tools.computer_runs.live_count().await, 0);
+    }
+
+    /// Write a workflow with one bound `Type` step to the state's store.
+    async fn save_workflow(state: &Arc<GatewayState>, name: &str, sensitive: bool) {
+        use crate::computer::types::{ClickTarget, DesktopAction};
+
+        let mut wf = Workflow::new(name);
+        wf.steps.push(RecordedStep {
+            delay_before: Duration::ZERO,
+            action: workflow::WorkflowAction::Desktop(DesktopAction::Type {
+                text: "{{save_as}}".to_string(),
+                target: Some(ClickTarget::ElementLabel("Save As".to_string())),
+            }),
+            description: "type the folder name".to_string(),
+            sensitive,
+        });
+        wf.parameters = vec!["save_as".to_string()];
+        WorkflowStore::for_paths(&state.paths)
+            .save(&wf)
+            .await
+            .expect("workflow saved");
     }
 }

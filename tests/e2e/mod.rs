@@ -1080,6 +1080,7 @@ mod browser_chat_tests;
 mod channel_roundtrip_tests;
 mod command_tests;
 mod compaction_tests;
+mod computer_play_tests;
 mod computer_resume_tests;
 mod computer_run_tests;
 mod computer_tests;

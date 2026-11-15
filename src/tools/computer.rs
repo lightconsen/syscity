@@ -32,6 +32,14 @@ pub struct ComputerTool {
     /// One session per conversation: step counters, pinned notes and the
     /// rollback bookkeeping belong to the task, not to the process.
     sessions: tokio::sync::Mutex<std::collections::HashMap<String, Arc<ComputerSession>>>,
+    /// Where a running `computer.record_start` collects the actions this tool
+    /// takes.
+    ///
+    /// The gateway's handle, not a per-tool one: a recording is started over
+    /// WS and the actions arrive from an agent turn's tool registry, which is
+    /// a different object. `None` outside a gateway (a test, a library caller),
+    /// where nothing can start a recording.
+    recording: Option<Arc<crate::planner::workflow::Recording>>,
 }
 
 impl ComputerTool {
@@ -40,7 +48,15 @@ impl ComputerTool {
             adapter,
             page: None,
             sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            recording: None,
         }
+    }
+
+    /// Attach the gateway's recording handle, so a recording started over WS
+    /// captures the actions this tool takes.
+    pub fn with_recording(mut self, recording: Arc<crate::planner::workflow::Recording>) -> Self {
+        self.recording = Some(recording);
+        self
     }
 
     /// Attach the browser, so a click the screen cannot deliver can still be
@@ -343,6 +359,7 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
         // is safe. Returning it as `Ok(failed result)` — rather than as a
         // flattened `Err` — is what lets that evidence reach the model.
         let step_budget = step_budget_for(context.timeout());
+        let executed_action = desktop_action.clone();
         let outcome = match session
             .execute_with_budget(
                 desktop_action,
@@ -364,6 +381,12 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
             adapter_start.elapsed(),
             _t_start.elapsed()
         );
+
+        // A recording in progress takes the action — resolved to a name that
+        // survives this tree, while the tree still exists. Doing it later would
+        // be too late: a snapshot id names nothing after the next read.
+        record_step_if_recording(self.recording.as_ref(), &session, &executed_action, &outcome)
+            .await;
 
         let mut tool_result = build_tool_result(outcome, &action).await;
         record_action_trace(context, &action, tool_result.data.as_ref());
@@ -406,6 +429,50 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Feed one executed step to a recording in progress.
+///
+/// Four conditions, each of which is a decision:
+///
+/// - **No recording, no work.** The common case must not cost a resolve.
+/// - **Only replayable actions.** A `screenshot` or `read_ui_tree` is how a
+///   decision was made, not what it did; recording the observation schedule
+///   would fill the workflow with steps that change nothing.
+/// - **Only steps that landed.** A refused or failed action is not part of a
+///   task that worked. `Unverifiable` counts as landed: nothing contradicted it.
+/// - **The action as a later run can name it.** An element id is resolved to its
+///   role and label *now*, through the session's own resolution, so a replay can
+///   find it in a tree this process will never see again.
+async fn record_step_if_recording(
+    recording: Option<&Arc<crate::planner::workflow::Recording>>,
+    session: &ComputerSession,
+    action: &DesktopAction,
+    outcome: &StepOutcome,
+) {
+    use crate::planner::workflow::is_replayable;
+
+    let Some(recording) = recording else {
+        return;
+    };
+    if !recording.is_recording() || !is_replayable(action) {
+        return;
+    }
+    let landed = outcome.result.success
+        && outcome.verification != crate::computer::use_loop::StepVerification::Failed
+        && !matches!(
+            outcome.evidence.as_ref().map(|e| e.effect),
+            Some(crate::computer::ActionEffect::Refused)
+        );
+    if !landed {
+        return;
+    }
+
+    // Resolve through the session's adapter: it is the only thing that can turn
+    // an id into a name, and it is the same resolution the step itself used.
+    let stable = crate::planner::workflow::stabilize(action, session.adapter().as_ref()).await;
+    let description = crate::computer::driver::describe_action(&stable);
+    recording.note(stable, description, outcome.sensitive_target);
+}
 
 fn action_to_desktop_action(action: &str, args: &Value) -> crate::Result<DesktopAction> {
     match action {

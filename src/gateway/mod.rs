@@ -538,6 +538,7 @@ impl Gateway {
                     tools_init.computer_adapter.clone(),
                 )),
                 computer_runs: Arc::new(crate::computer::run_registry::ComputerRunRegistry::new()),
+                computer_recording: tools_init.computer_recording.clone(),
                 planner_handle: tools_init.planner_handle.clone(),
             },
             pipelines: PipelineState {
