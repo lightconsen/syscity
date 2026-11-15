@@ -919,6 +919,30 @@ pub(crate) async fn start_gateway(
         }
     }
 
+    // Computer runs are held to the same rule, for the same reason — a desktop
+    // run takes real actions on a machine somebody is using, and a restart is
+    // not consent. The difference is that an interrupted run is *nearly done*,
+    // so the person is told rather than left to discover it: their session
+    // gets a line naming the run and the step to continue from, and
+    // `computer.runs` is the list behind it.
+    {
+        let store = crate::computer::run_store::RunStore::for_paths(&state.paths);
+        let interrupted: Vec<_> = store
+            .load_all()
+            .await
+            .into_iter()
+            .filter(|c| c.is_interrupted())
+            .collect();
+        if !interrupted.is_empty() {
+            info!(
+                "{} computer run(s) were interrupted (not auto-resumed); list them with \
+                 `computer.runs` and continue with `computer.resume`",
+                interrupted.len()
+            );
+            announce_interrupted_runs(&state, &interrupted).await;
+        }
+    }
+
     // Run the server until the shutdown token is cancelled.  Axum's
     // graceful-shutdown mechanism drains existing connections after the
     // token fires.  Stuck handles are aborted later by `stop_gateway`
@@ -937,8 +961,55 @@ pub(crate) async fn start_gateway(
     Ok(())
 }
 
+/// Tell the conversations behind interrupted runs that they were cut off.
+///
+/// A line in the session rather than only a log line: the log is read by
+/// whoever runs the daemon, and the person who asked for the run is the one
+/// who has to decide whether to continue it. The message names the run id and
+/// the step to continue from, so "续跑" has something to point at.
+///
+/// Runs started with no session (`computer.run` without `session_id`) have
+/// nowhere to put the notice; `computer.runs` is their list, and the startup
+/// log names the count.
+async fn announce_interrupted_runs(
+    state: &Arc<GatewayState>,
+    interrupted: &[crate::computer::run_store::Checkpoint],
+) {
+    let Some(store) = state.agents.store.as_ref() else {
+        return;
+    };
+    for checkpoint in interrupted {
+        let Some(session_id) = checkpoint.session_id.as_deref() else {
+            continue;
+        };
+        let text = format!(
+            "⏸️ 上次有 1 个桌面任务被中断：「{}」。已完成 {} 步，可从第 {} 步续跑（`computer.resume` \
+             run_id = `{}`）。",
+            checkpoint.goal,
+            checkpoint.completed.len(),
+            checkpoint.next_step() + 1,
+            checkpoint.run_id
+        );
+        if let Err(e) = store
+            .append_message(&crate::agent::session_store::AppendMessageParams {
+                session_id,
+                role: "assistant",
+                content: &text,
+                ..Default::default()
+            })
+            .await
+        {
+            warn!(
+                "could not tell session {} about interrupted run {}: {}",
+                session_id, checkpoint.run_id, e
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::gateway::state_tests::make_test_state;
 

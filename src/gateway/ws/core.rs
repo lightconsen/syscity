@@ -421,6 +421,7 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         | E::McpTokenRefreshed { .. }
         | E::ProviderAuthComplete { .. }
         | E::ProviderAuthFailed { .. }
+        | E::TurnRerunFinished { .. }
         | E::AcpThreadSwitched { .. } => Audience::All,
 
         // ── One channel's traffic ───────────────────────────────────────────
@@ -1131,6 +1132,10 @@ async fn dispatch_method(
         "providers.auth_cancel" => admin_ws::handle_providers_auth_cancel(req, state).await,
         "models.default" => admin_ws::handle_models_default(req, state).await,
         "traces.get" => admin_ws::handle_traces_get(req, state).await,
+        "turns.replay" => admin_ws::handle_turns_replay(req, state).await,
+        "turns.rerun" => admin_ws::handle_turns_rerun(req, state).await,
+        "turns.rerun_result" => admin_ws::handle_turns_rerun_result(req, state).await,
+        "attachment.get" => admin_ws::handle_attachment_get(req, state).await,
         "cost.get" => admin_ws::handle_cost_get(req, state).await,
         "cost.reset" => admin_ws::handle_cost_reset(req, state).await,
         "status.get" => admin_ws::handle_status_get(req, state).await,
@@ -1143,6 +1148,8 @@ async fn dispatch_method(
         "computer.run" => admin_ws::handle_computer_run(req, state).await,
         "computer.status" => admin_ws::handle_computer_status(req, state).await,
         "computer.control" => admin_ws::handle_computer_control(req, state).await,
+        "computer.runs" => admin_ws::handle_computer_runs(req, state).await,
+        "computer.resume" => admin_ws::handle_computer_resume(req, state).await,
         "memory.search" => admin_ws::handle_memory_search(req, state).await,
         "memory.add" => admin_ws::handle_memory_add(req, state).await,
         "memory.collections" => admin_ws::handle_memory_collections(req, state).await,

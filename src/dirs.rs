@@ -197,6 +197,17 @@ impl SyscityPaths {
         self.root.join("goals")
     }
 
+    /// Computer-run checkpoints (`<root>/computer-runs`).
+    ///
+    /// One JSON file per run, written after every step, so a run that was cut
+    /// off by a restart can be listed and resumed with the steps it already
+    /// completed. Separate from `goals/` because the two have different
+    /// lifetimes: a goal is a long-lived plan a person re-arms, while a run is
+    /// one desktop session whose checkpoint is worthless once it is done.
+    pub fn computer_runs_dir(&self) -> PathBuf {
+        self.root.join("computer-runs")
+    }
+
     /// Plugin data directory (`<root>/plugins/data`).
     pub fn plugins_data_dir(&self) -> PathBuf {
         self.root.join("plugins").join("data")
@@ -226,6 +237,15 @@ impl SyscityPaths {
     /// Content-addressed artifacts directory (`<root>/artifacts`).
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
+    }
+
+    /// Turn-rerun results directory (`<root>/reruns/<turn_id>/<rerun_id>.json`).
+    ///
+    /// A rerun answers "with today's prompt, would this turn still pass?" — a
+    /// question about a *past* turn, so the answer belongs next to the trace
+    /// it is about rather than in the eval suite's tree.
+    pub fn reruns_dir(&self) -> PathBuf {
+        self.root.join("reruns")
     }
 
     /// Delegation tree workspace (`<root>/delegations/{root_id}`).

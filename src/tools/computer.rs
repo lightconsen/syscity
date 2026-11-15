@@ -769,6 +769,7 @@ async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionR
         result,
         diff,
         evidence,
+        screenshot_before,
         sensitive_after,
         sensitive_target,
         reflection,
@@ -779,6 +780,19 @@ async fn build_tool_result(outcome: StepOutcome, action: &str) -> ToolExecutionR
     } = outcome;
 
     let mut tool_result = action_result_to_tool_result(result).await;
+
+    // The frame the decision was made against, stored next to the post-action
+    // one so the turn's trace can pair them. Kept out of the model's text: the
+    // model already saw the screen when it decided, and re-naming the image in
+    // the result would invite it to treat its own past frame as news.
+    if let Some(before) = screenshot_before.as_ref() {
+        if let Ok(Some(aref)) = store_screenshot(before).await {
+            let data = tool_result.data.get_or_insert_with(|| json!({}));
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("screenshot_before_ref".to_string(), aref.to_json());
+            }
+        }
+    }
 
     if let Some(diff) = &diff {
         // A bounds change is the expected effect for a window move/resize, and

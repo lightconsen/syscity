@@ -938,7 +938,7 @@ pub(crate) async fn try_load_gateway_config() -> Option<GatewayConfig> {
 /// registers is pre-approved by name (see [`eval_permissions`]). Anything not
 /// registered here is simply absent — that, not the approval gate, is what
 /// keeps an eval run inside its tool set.
-fn create_eval_tool_registry(
+pub(crate) fn create_eval_tool_registry(
     acp: Option<Arc<AcpControlPlane>>,
     search_cfg: Option<&crate::gateway::config::SearchConfig>,
     deepseek_search_key: Option<&str>,
@@ -985,7 +985,7 @@ fn create_eval_tool_registry(
 /// are derived from the registry itself rather than hard-coded, so a tool
 /// added to (or removed from) the eval set cannot silently drift out of
 /// sync with its permissions.
-fn eval_permissions(allow: Vec<String>) -> Arc<PermissionsRuntime> {
+pub(crate) fn eval_permissions(allow: Vec<String>) -> Arc<PermissionsRuntime> {
     Arc::new(PermissionsRuntime::from_config(&PermissionsConfig {
         allow,
         ..Default::default()

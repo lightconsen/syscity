@@ -4,7 +4,7 @@ Per-turn observability: records, collection, persistence, aggregation, and reten
 
 ## Design
 
-Every agent turn produces a full-fidelity **`TurnRecord`**, written as one JSON file per turn under `~/.syscity/turns/YYYY-MM-DD/<turn_id>.json` (local-time date partition, atomic tmp-file + rename). In parallel, the aggregateable numbers land as SQLite rows in `~/.syscity/data/syscity.db` (see `agent::session_store::metrics`):
+Every agent turn produces a full-fidelity **`TurnRecord`**, written as one JSON file per turn under `~/.syscity/turns/YYYY-MM-DD/<turn_id>/` (local-time date partition, atomic tmp-file + rename). The directory holds two views of the same turn: `summary.json` (the record, free text truncated) and `full.json` (an append-only JSONL of the untruncated events — one line per LLM round, per tool call, and per computer-use step). In parallel, the aggregateable numbers land as SQLite rows in `~/.syscity/data/syscity.db` (see `agent::session_store::metrics`):
 
 - **`llm_calls`** — one row per LLM call (provider, model, duration, TTFT, token usage incl. cache read/creation, finish reason, error)
 - **`tool_call_metrics`** — one row per tool call (name, duration, success, error)
@@ -16,6 +16,14 @@ Every agent turn produces a full-fidelity **`TurnRecord`**, written as one JSON 
 - **`TurnMetricsSink`** (`mod.rs`) — Optional numeric sink; when attached, the collector additionally persists the SQLite metric rows. The JSON writer always runs.
 - **`aggregate`** (`aggregate.rs`) — Pure aggregation functions over persisted records (percentiles, Duration / Turns / Calls stats blocks) used by the CLI.
 - **`prune`** (`prune.rs`) — Retention sweeps shared by `syscity observe prune` and the daemon-startup auto-cleanup.
+
+### Action & Screenshot Timeline
+
+A computer-use step is recorded as its own `FullTraceEvent::Action` line, built from the same evidence object the model was shown (`ActionTraceEvent::from_detail`, masked before it is written). It carries the rung, effect, delivery, retry classification, tried/escalated rungs, recovery hint, occluder, settle time, the three-state `verification` (`verified` / `failed` / `unverifiable`), and the CAS digests of the frame **before** and **after** the action (`before_ref` / `after_ref`). Only screen-mutating actions take a pre-action capture, so a read-only step leaves `before_ref` empty.
+
+`turns.replay` reads those lines back as one ordered timeline (`{step, action, effect, verified, before_ref, after_ref}`); `attachment.get` turns a digest into the picture a client renders. The same `before_ref` / `after_ref` pair is carried through the live run path (`RunEvent::Step.screenshot_before_ref`, `CompletedStep`, and `computer.runs`'s per-step `steps`), so a timeline drawn from a trace and one drawn from a run agree on the shape.
+
+`turns.rerun` uses the turn's recorded input (the first `user` message in `full.json` — not the truncated preview) as an `EvalTask` and runs it through `EvalHarness` at N=1, pre-approving the eval tool set and the desktop family so the desktop gate does not smuggle an approval prompt into the measurement. It refuses without an assertion that can fail. Results land under `~/.syscity/reruns/<turn_id>/<rerun_id>.json`.
 
 ### Agent Attribution
 
@@ -85,6 +93,8 @@ pub trait TurnMetricsSink: Send + Sync {
 - `Drop`-fallback `aborted` record for turns killed mid-flight
 - Per-record agent attribution (incl. subagent ids)
 - 4096-byte truncation of free-text fields at persistence time
+- `full.json` append-only untruncated event log per turn (rounds, tool calls, computer-use actions with before/after frame digests)
+- `turns.replay` / `attachment.get` action+frame timeline over WS, and `turns.rerun` / `turns.rerun_result` for "would this turn still pass?"
 - `syscity observe {stats,list,show,export,prune}` CLI with `--agent` filtering
 - Daemon-startup retention sweep (`observe.retention_days`) plus manual prune
 - `syscity_observe_write_failures_total` counter at `/metrics`

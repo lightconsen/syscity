@@ -904,6 +904,7 @@ mod tests {
                 screenshot_before: None,
                 screenshot_after: None,
                 snapshots_taken: 0,
+                sensitive: false,
             },
             StepRecord {
                 step: 1,
@@ -916,6 +917,7 @@ mod tests {
                 screenshot_before: None,
                 screenshot_after: None,
                 snapshots_taken: 0,
+                sensitive: false,
             },
         ];
         let (_system, user) = driver().render_prompt(&s, &ctx(true));
@@ -936,6 +938,7 @@ mod tests {
                 screenshot_before: None,
                 screenshot_after: None,
                 snapshots_taken: 0,
+                sensitive: false,
             })
             .collect();
         s.step = 20;

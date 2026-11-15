@@ -52,6 +52,12 @@ path, and each one exists because the naive version of it had a specific failure
   happened" is not a race.
 - **`handoff.rs`** — the four-part note posted to the approval queue when a run stops short: done,
   where, tried, next. Advice keyed on *why*, not "please check".
+- **`run_store.rs`** — survives a restart. One JSON file per run under
+  `<layout root>/computer-runs/<run_id>.json`, written after every step with tmp+rename (a crash
+  mid-write leaves the previous checkpoint, not a truncated one). A resume reads it back and continues
+  at step N+1 with the same `max_steps` and the same spent budget; a run that reaches an answer
+  (`done` / `cancelled`) deletes its file, because a checkpoint is only worth keeping while someone
+  might continue it. See [`### Checkpoints and resume`](#checkpoints-and-resume).
 - **`tree_render.rs` / `tree_budget.rs`** — the outline's line budget, spent on windows a person can
   actually see: an off-screen tool window with more children than the whole budget (OpenShot's emoji
   panel, 119) used to consume it before the window under test was reached.
@@ -81,6 +87,43 @@ timeout_secs = 10      # one lookup, then degrade — never block the loop
 | macOS | `platform_macos.rs` | AXUIElement, AppleScript |
 | Windows | `platform_windows.rs` | UIAutomation, SendKeys |
 | Linux | `platform_linux.rs` | xdotool, AT-SPI |
+
+### Checkpoints and resume
+
+A run takes real actions on somebody's screen, so a gateway restart mid-run must not erase it and must
+not silently re-arm it. Both halves of that are the checkpoint file.
+
+**What is written.** After every step the run appends one `CompletedStep` — the action, the
+three-state verification, the result line, the CAS digests of the captures *before* and *after* the
+action (`screenshot_before_ref` / `screenshot_ref`), and whether the action aimed at a sensitive
+control — plus the running `model_calls` / `images_attached`. The order is deliberate: the step goes
+into the run's own view, then the file, then the `computer.step` event, so a crash between them loses
+at most the report, never the record of an action that already happened. The pre-action frame matters
+because it is what the decision was made against: a replay can show what a step *did* without it, never
+what it was *looking at*. `computer.runs` therefore exposes a per-step `steps` array
+(`{step, action, result, verified, before_ref, after_ref, sensitive}`) whose shape matches the
+`turns.replay` timeline, so a run's timeline and a trace's timeline draw the same way.
+
+**When it is deleted.** A run that reaches a conclusion (`done` / `cancelled`) removes its file: there
+is nothing to continue, and keeping every finished run's steps would grow the layout forever for no
+reader. `max_steps`, `budget` and `need_help` keep it, with the reason recorded — a ceiling means
+"more room would help", and a person decides.
+
+**What a resume does.** `computer.resume` starts a *new* loop with the checkpoint's history as memory:
+it continues at step N+1, keeps the original `max_steps`, and seeds the budget counters
+(`RunBudget::restore`) so a restart cannot double the caller's allowance. Completed actions are never
+replayed — the history is memory, not a script. The recorded post-action captures are *not* re-attached;
+the digests stay in `screenshot_before_ref` / `screenshot_ref` for the replay path instead of spending
+the resumed turn's context on frames the decision maker already acted on.
+
+**Sensitive steps.** A checkpoint that recorded a step aimed at a password / payment / destructive
+confirmation requires `confirm_sensitive: true` on the resume. The person approving the resume is
+approving the goal, not the password field a previous model call happened to aim at.
+
+**Startup.** Nothing is auto-resumed (`lifecycle.rs`, same rule as persisted goals). The gateway logs
+the count, writes a line into each run's originating session naming the run and the step to continue
+from, and `computer.runs` is the list behind it. Both live in `ws/admin_ws/computer.rs::launch`, which
+owns every pre-spawn refusal so `computer.run` and `computer.resume` cannot diverge.
 
 ## Key Types
 

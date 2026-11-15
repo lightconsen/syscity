@@ -1,0 +1,679 @@
+//! Checkpoints for computer-use runs, so a restart does not erase them.
+//!
+//! A run is minutes long and takes real actions on somebody's screen. When the
+//! gateway goes down mid-run, the naive outcome is that the run simply ceases
+//! to exist: the registry was in memory, the steps are gone, and the next
+//! person to look at the desktop cannot tell what it was doing. This module
+//! keeps one JSON file per run under `<layout root>/computer-runs/`, written
+//! after every completed step with the same tmp+rename that makes a crash
+//! mid-write leave the previous checkpoint intact.
+//!
+//! Two deliberate choices, both following the existing goal-store decision
+//! (`lifecycle.rs`: "a restart must not re-arm autonomous loops without
+//! explicit human consent"):
+//!
+//! - **Nothing resumes on startup.** The files are read to build a list, and a
+//!   person resumes one with `computer.resume`.
+//! - **A finished run deletes its checkpoint.** Only runs that were cut off are
+//!   interesting to resume; keeping every completed run's steps as files would
+//!   grow the layout forever for no reader.
+//!
+//! The checkpoint is not a transcript. It carries what a resume needs — the
+//! goal, the loop's configuration, the actions already taken with their
+//! verification and screenshot refs, the step counter and the budget counters —
+//! and nothing that would let it *skip* a dangerous action: a sensitive-UI
+//! action is not replayed from the file, it is asked again (see
+//! [`Checkpoint::resumes_from`] and the executor).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::computer::run_budget::StopReason;
+use crate::computer::types::DesktopAction;
+use crate::computer::use_loop::{LoopConfig, StepVerification};
+
+/// Directory name for run checkpoints under the layout root.
+const RUNS_DIR_NAME: &str = "computer-runs";
+
+/// Where run checkpoints live when the caller does not pin a directory.
+///
+/// `installed_paths` rather than `paths`: a store built before a layout root is
+/// installed (a library caller, a unit test) must be able to answer this
+/// question without the answer being a panic.
+pub fn computer_runs_dir() -> PathBuf {
+    match crate::dirs::installed_paths() {
+        Some(paths) => paths.computer_runs_dir(),
+        None => crate::dirs::syscity_dir().join(RUNS_DIR_NAME),
+    }
+}
+
+/// One line per completed step, shared by the run's live view and by a resumed
+/// run rebuilding that view from its checkpoint.
+///
+/// One function rather than two formats: a resumed run's `completed_steps` must
+/// read exactly like a run that never stopped, or a person comparing the two
+/// before and after a restart would think a step changed.
+pub fn step_line(step: usize, action: &str, result: &str, verdict: &str) -> String {
+    let flat = result.replace(['\n', '\r'], " ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(100).collect();
+    let shown = if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    };
+    format!("{}. {action} → {shown} ({verdict})", step + 1)
+}
+
+/// The verdict word for a step, as the handoff note uses it.
+pub fn verdict_word(verification: StepVerification) -> &'static str {
+    match verification {
+        StepVerification::Verified => "ok",
+        StepVerification::Failed => "failed",
+        StepVerification::Unverifiable => "unchecked",
+    }
+}
+
+/// The step's verification as the three-state boolean the run events carry.
+///
+/// `None` is not "false": an unverifiable step is one nothing could confirm
+/// *or* deny, and a timeline that drew it as a failure would be claiming a
+/// verdict the adapter never reached.
+pub fn verified_word(verification: StepVerification) -> Option<bool> {
+    match verification {
+        StepVerification::Verified => Some(true),
+        StepVerification::Failed => Some(false),
+        StepVerification::Unverifiable => None,
+    }
+}
+
+/// One completed step, as the checkpoint records it.
+///
+/// `DesktopAction` and `StepVerification` are the loop's own types rather than
+/// strings: a resumed run hands the history back to the decision closure, and
+/// it must be the same shape the driver already renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletedStep {
+    pub step: usize,
+    pub action: DesktopAction,
+    pub verification: StepVerification,
+    /// What the adapter said happened, in one line.
+    pub result: String,
+    /// CAS digest of the pre-action capture, when one was stored.
+    ///
+    /// A checkpoint written before this field existed has none, and a resumed
+    /// run's replayed history is the post-action line alone — which is why it
+    /// is optional rather than defaulted to a placeholder digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_before_ref: Option<String>,
+    /// CAS digest of the post-action capture, when one was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_ref: Option<String>,
+    /// Whether the action aimed at an element the sensitive-UI detector
+    /// flagged.
+    ///
+    /// A resumed run does *not* skip these: the person who approves a resume is
+    /// approving the goal, not the individual password change that a previous
+    /// model call happened to aim at. Recording it here is what lets the resume
+    /// path say "step 3 touched a password field; it will be asked again".
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+/// What a checkpoint needs to rebuild a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub run_id: String,
+    pub goal: String,
+    /// The conversation that started the run, when there was one. A resumed run
+    /// keeps reporting to the same session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The loop configuration the run started with.
+    pub max_steps: usize,
+    pub settle_delay_ms: u64,
+    pub verify_after_each: bool,
+    /// Steps that already ran, in order.
+    pub completed: Vec<CompletedStep>,
+    /// Model calls already spent. Carried so a resume does not hand the run a
+    /// fresh budget and quietly double what the caller allowed.
+    pub model_calls: usize,
+    pub images_attached: usize,
+    /// Set once the run reaches a conclusion. A checkpoint with this set is not
+    /// resumable — it exists only until the file is swept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
+    /// When the checkpoint was last written (RFC 3339).
+    pub updated_at: String,
+}
+
+impl Checkpoint {
+    pub fn new(run_id: impl Into<String>, goal: impl Into<String>, config: &LoopConfig) -> Self {
+        Self {
+            run_id: run_id.into(),
+            goal: goal.into(),
+            session_id: None,
+            max_steps: config.max_steps,
+            settle_delay_ms: config.settle_delay_ms,
+            verify_after_each: config.verify_after_each,
+            completed: Vec::new(),
+            model_calls: 0,
+            images_attached: 0,
+            stop_reason: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// The loop configuration to resume with.
+    pub fn loop_config(&self) -> LoopConfig {
+        LoopConfig {
+            max_steps: self.max_steps,
+            settle_delay_ms: self.settle_delay_ms,
+            verify_after_each: self.verify_after_each,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this run was cut off rather than concluded.
+    ///
+    /// Only an interrupted run is worth offering to resume: a finished one has
+    /// an answer, and a cancelled one had a person say stop.
+    pub fn is_interrupted(&self) -> bool {
+        self.stop_reason.is_none()
+    }
+
+    /// Whether [`crate::computer::run_executor`] can continue this run.
+    ///
+    /// Everything on disk qualifies. `done` and `cancelled` delete their file,
+    /// so a file that exists and is not one of those was cut off, ran out of
+    /// room, or stopped to ask a person — and in all three cases continuing from
+    /// step N+1 is a meaningful offer.
+    pub fn is_resumable(&self) -> bool {
+        !matches!(self.stop_reason, Some(StopReason::Done | StopReason::Cancelled))
+    }
+
+    /// The listing `computer.runs` returns for one file.
+    pub fn view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": self.run_id,
+            "goal": self.goal,
+            "steps_completed": self.completed.len(),
+            "next_step": self.next_step(),
+            "model_calls": self.model_calls,
+            "images_attached": self.images_attached,
+            "interrupted": self.is_interrupted(),
+            "stop_reason": self.stop_reason,
+            "sensitive_steps": self.sensitive_steps(),
+            "updated_at": self.updated_at,
+            "completed_steps": self
+                .completed
+                .iter()
+                .map(|s| {
+                    crate::computer::run_store::step_line(
+                        s.step,
+                        &crate::computer::driver::describe_action(&s.action),
+                        &s.result,
+                        verdict_word(s.verification),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            // The same steps with their frame refs, so a listing can draw the
+            // action/screenshot timeline without a second call per step.
+            "steps": self
+                .completed
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "step": s.step,
+                        "action": crate::computer::driver::describe_action(&s.action),
+                        "result": s.result,
+                        "verified": verified_word(s.verification),
+                        "before_ref": s.screenshot_before_ref,
+                        "after_ref": s.screenshot_ref,
+                        "sensitive": s.sensitive,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The first step number a resumed run should execute.
+    ///
+    /// Steps are 0-indexed, so a run with three completed steps resumes at 3.
+    /// A dangerous step is *not* subtracted here: it is re-asked, and counting
+    /// it would mean skipping it.
+    pub fn next_step(&self) -> usize {
+        self.completed.len()
+    }
+
+    /// How many of the recorded steps touched something a person should see
+    /// again before the resume continues.
+    pub fn sensitive_steps(&self) -> usize {
+        self.completed.iter().filter(|s| s.sensitive).count()
+    }
+
+    /// The history a resumed loop starts from.
+    ///
+    /// The result messages are carried as the adapter reported them; the
+    /// post-action captures are not, because a checkpoint stores a CAS digest
+    /// and re-reading a frame into every prompt after a restart would spend the
+    /// resumed turn's context on images the decision maker has already acted
+    /// on. The digest stays in [`CompletedStep::screenshot_ref`] for the
+    /// replay path.
+    pub fn resume_history(&self) -> Vec<crate::computer::use_loop::StepRecord> {
+        self.completed
+            .iter()
+            .map(|step| crate::computer::use_loop::StepRecord {
+                step: step.step,
+                action: step.action.clone(),
+                result: if step.verification == StepVerification::Failed {
+                    crate::computer::ActionResult::error(step.result.clone())
+                } else {
+                    crate::computer::ActionResult::success(step.result.clone())
+                },
+                verification: step.verification,
+                screenshot_before: None,
+                screenshot_after: None,
+                snapshots_taken: 0,
+                sensitive: step.sensitive,
+            })
+            .collect()
+    }
+
+    /// The state a resumed loop continues from.
+    pub fn resume_state(&self) -> crate::computer::use_loop::LoopResume {
+        crate::computer::use_loop::LoopResume {
+            history: self.resume_history(),
+            start_step: self.next_step(),
+            last_verified: match self.completed.last().map(|s| s.verification) {
+                Some(StepVerification::Verified) => Some(true),
+                Some(StepVerification::Failed) => Some(false),
+                Some(StepVerification::Unverifiable) | None => None,
+            },
+            consecutive_failures: self
+                .completed
+                .iter()
+                .rev()
+                .take_while(|s| s.verification != StepVerification::Verified)
+                .count(),
+        }
+    }
+
+    /// A one-line description for a listing.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} — {} step(s) done, {} model call(s), updated {}",
+            self.goal,
+            self.completed.len(),
+            self.model_calls,
+            self.updated_at
+        )
+    }
+}
+
+/// File-based checkpoint store.
+///
+/// One file per run at `<dir>/<run_id>.json`, written atomically.
+pub struct RunStore {
+    /// `None` means the process-default directory, resolved on first use:
+    /// constructing a store must not require an installed layout root.
+    dir: Option<PathBuf>,
+}
+
+impl Default for RunStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RunStore {
+    pub fn new() -> Self {
+        Self { dir: None }
+    }
+
+    /// A store writing into an explicit directory (tests, or a gateway that
+    /// wants its runs somewhere other than the layout root).
+    pub fn with_dir(dir: PathBuf) -> Self {
+        Self { dir: Some(dir) }
+    }
+
+    /// A store for the layout root a gateway was built with.
+    pub fn for_paths(paths: &crate::dirs::SyscityPaths) -> Self {
+        Self::with_dir(paths.computer_runs_dir())
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.dir.clone().unwrap_or_else(computer_runs_dir)
+    }
+
+    async fn ensure_dir(&self) -> crate::Result<()> {
+        let dir = self.dir();
+        if !dir.exists() {
+            tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                crate::error::SyscityError::Storage {
+                    context: format!("Failed to create computer-runs directory: {dir:?}"),
+                    details: e.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn state_path(&self, run_id: &str) -> PathBuf {
+        self.dir().join(format!("{run_id}.json"))
+    }
+
+    /// Write the checkpoint, atomically.
+    ///
+    /// Serialise to `<file>.tmp`, then rename over the real file: a crash
+    /// mid-write leaves the previous checkpoint intact instead of a truncated
+    /// one, which is the difference between "resume from one step earlier" and
+    /// "this run's history is unreadable".
+    pub async fn save(&self, checkpoint: &Checkpoint) -> crate::Result<()> {
+        self.ensure_dir().await?;
+        let path = self.state_path(&checkpoint.run_id);
+        let json = serde_json::to_string_pretty(checkpoint).map_err(|e| {
+            crate::error::SyscityError::Internal(format!(
+                "Failed to serialize computer run checkpoint: {e}"
+            ))
+        })?;
+
+        let mut tmp_path = path.clone();
+        let mut tmp_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(".tmp");
+        tmp_path.set_file_name(tmp_name);
+
+        tokio::fs::write(&tmp_path, &json).await.map_err(|e| {
+            crate::error::SyscityError::Storage {
+                context: format!("Failed to write computer run checkpoint tmp: {tmp_path:?}"),
+                details: e.to_string(),
+            }
+        })?;
+
+        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
+            // Best-effort cleanup of the stale tmp file; a failure here is not
+            // the reason this call is failing.
+            let _ = std::fs::remove_file(&tmp_path);
+            crate::error::SyscityError::Storage {
+                context: format!("Failed to finalize computer run checkpoint: {path:?}"),
+                details: e.to_string(),
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Load every checkpoint. Unreadable or unparseable files are skipped with
+    /// a warning: one corrupt checkpoint must not hide the others.
+    pub async fn load_all(&self) -> Vec<Checkpoint> {
+        let mut out = Vec::new();
+        let mut entries = match tokio::fs::read_dir(self.dir()).await {
+            Ok(entries) => entries,
+            Err(_) => return out,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => match serde_json::from_str::<Checkpoint>(&content) {
+                    Ok(checkpoint) => out.push(checkpoint),
+                    Err(e) => {
+                        tracing::warn!("[computer] unreadable run checkpoint {path:?}: {e}");
+                    }
+                },
+                Err(e) => tracing::warn!("[computer] could not read run checkpoint {path:?}: {e}"),
+            }
+        }
+        out.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        out
+    }
+
+    /// Load one checkpoint, if it exists.
+    pub async fn load(&self, run_id: &str) -> Option<Checkpoint> {
+        let path = self.state_path(run_id);
+        let content = tokio::fs::read_to_string(&path).await.ok()?;
+        match serde_json::from_str::<Checkpoint>(&content) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(e) => {
+                tracing::warn!("[computer] unreadable run checkpoint {path:?}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Remove a run's checkpoint. Used when the run reaches a conclusion.
+    pub async fn delete(&self, run_id: &str) {
+        let path = self.state_path(run_id);
+        if path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                tracing::warn!("[computer] could not delete run checkpoint {path:?}: {e}");
+            }
+        }
+    }
+}
+
+/// Appends steps to a checkpoint as a run progresses, and settles it at the end.
+///
+/// A run's steps arrive through the observer path, which is also where the
+/// screenshot digest is computed; this writer takes the same facts rather than
+/// re-deriving them, so the checkpoint and the event stream cannot disagree
+/// about what step 3 did.
+pub struct RunCheckpointer {
+    store: Arc<RunStore>,
+    checkpoint: tokio::sync::Mutex<Checkpoint>,
+}
+
+impl RunCheckpointer {
+    pub fn new(store: Arc<RunStore>, checkpoint: Checkpoint) -> Self {
+        Self {
+            store,
+            checkpoint: tokio::sync::Mutex::new(checkpoint),
+        }
+    }
+
+    /// Record one completed step and write the file.
+    ///
+    /// A write failure is logged, never propagated: losing a checkpoint costs a
+    /// resume, but failing the step that just succeeded would be a worse deal.
+    pub async fn step(&self, step: &CompletedStep, model_calls: usize, images_attached: usize) {
+        let snapshot = {
+            let mut checkpoint = self.checkpoint.lock().await;
+            checkpoint.completed.push(step.clone());
+            checkpoint.model_calls = model_calls;
+            checkpoint.images_attached = images_attached;
+            checkpoint.updated_at = chrono::Utc::now().to_rfc3339();
+            checkpoint.clone()
+        };
+        if let Err(e) = self.store.save(&snapshot).await {
+            tracing::warn!("[computer] could not checkpoint run {}: {e}", snapshot.run_id);
+        }
+    }
+
+    /// Settle the checkpoint when the run ends.
+    ///
+    /// A run that reached a conclusion (`done`, `cancelled`) deletes its file —
+    /// there is nothing to resume, and keeping it would list every completed run
+    /// forever. The others keep it, with the reason recorded, so
+    /// `computer.runs` can say *why* it stopped and a person can decide whether
+    /// more room would help.
+    pub async fn conclude(&self, reason: StopReason) {
+        let snapshot = {
+            let mut checkpoint = self.checkpoint.lock().await;
+            checkpoint.stop_reason = Some(reason);
+            checkpoint.updated_at = chrono::Utc::now().to_rfc3339();
+            checkpoint.clone()
+        };
+        if matches!(reason, StopReason::Done | StopReason::Cancelled) {
+            self.store.delete(&snapshot.run_id).await;
+            return;
+        }
+        if let Err(e) = self.store.save(&snapshot).await {
+            tracing::warn!("[computer] could not finalize run {}: {e}", snapshot.run_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::computer::types::{ClickTarget, MouseButton};
+
+    fn checkpoint(run_id: &str) -> Checkpoint {
+        let mut cp = Checkpoint::new(run_id, "open the calculator", &LoopConfig::default());
+        cp.completed.push(CompletedStep {
+            step: 0,
+            action: DesktopAction::Click {
+                target: ClickTarget::ElementId("s1:0.2".to_string()),
+                button: MouseButton::Left,
+            },
+            verification: StepVerification::Verified,
+            result: "clicked".to_string(),
+            screenshot_before_ref: Some("sha256:before".to_string()),
+            screenshot_ref: Some("sha256:abc".to_string()),
+            sensitive: false,
+        });
+        cp.model_calls = 1;
+        cp
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_round_trips_through_disk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RunStore::with_dir(dir.path().to_path_buf());
+        let cp = checkpoint("r1");
+        store.save(&cp).await.expect("save");
+
+        let loaded = store.load("r1").await.expect("load");
+        assert_eq!(loaded.goal, "open the calculator");
+        assert_eq!(loaded.completed.len(), 1);
+        assert_eq!(loaded.completed[0].screenshot_ref.as_deref(), Some("sha256:abc"));
+        assert_eq!(loaded.model_calls, 1);
+        assert!(loaded.is_resumable());
+    }
+
+    /// The write is atomic, so a crash between the tmp write and the rename
+    /// leaves the previous checkpoint readable.
+    #[tokio::test]
+    async fn a_stale_tmp_file_does_not_replace_a_good_checkpoint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RunStore::with_dir(dir.path().to_path_buf());
+        store.save(&checkpoint("r1")).await.expect("save");
+
+        // Simulate the crash: a tmp file with garbage next to the real one.
+        std::fs::write(dir.path().join("r1.json.tmp"), b"{ this is not json").expect("write tmp");
+
+        let loaded = store.load("r1").await.expect("the real file is intact");
+        assert_eq!(loaded.completed.len(), 1);
+    }
+
+    /// A run the gateway was cut off in the middle of is resumable, and says
+    /// so as "interrupted" rather than as a stop reason it never reached.
+    #[tokio::test]
+    async fn a_finished_run_is_not_resumable() {
+        let mut cp = checkpoint("r1");
+        cp.stop_reason = Some(StopReason::Done);
+        assert!(!cp.is_resumable());
+        assert!(!cp.is_interrupted());
+
+        // `cancelled` had a person say stop; continuing it is not an offer to
+        // make.
+        cp.stop_reason = Some(StopReason::Cancelled);
+        assert!(!cp.is_resumable());
+    }
+
+    /// Running out of room is a reason to offer a resume, not a conclusion:
+    /// the plan's whole distinction between a ceiling and an answer.
+    #[tokio::test]
+    async fn a_ceiling_stop_is_resumable() {
+        let mut cp = checkpoint("r1");
+        cp.stop_reason = Some(StopReason::MaxSteps);
+        assert!(cp.is_resumable());
+        assert!(!cp.is_interrupted());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_checkpoint_is_resumable() {
+        let cp = checkpoint("r1");
+        assert!(cp.is_interrupted());
+        assert!(cp.is_resumable());
+    }
+
+    /// A run interrupted at step 3 resumes at step 3, not 4: the sensitive
+    /// step is executed again rather than skipped, and skipping it would be
+    /// exactly the bug this counter guards.
+    #[test]
+    fn the_next_step_counts_what_was_done() {
+        let mut cp = checkpoint("r1");
+        cp.completed.push(CompletedStep {
+            step: 1,
+            action: DesktopAction::KeyPress {
+                keys: vec!["return".to_string()],
+            },
+            verification: StepVerification::Failed,
+            result: "no effect".to_string(),
+            screenshot_before_ref: None,
+            screenshot_ref: None,
+            sensitive: false,
+        });
+        assert_eq!(cp.next_step(), 2);
+    }
+
+    #[test]
+    fn sensitive_steps_are_counted_for_the_resume_notice() {
+        let mut cp = checkpoint("r1");
+        cp.completed[0].sensitive = true;
+        assert_eq!(cp.sensitive_steps(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_all_skips_a_corrupt_file_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RunStore::with_dir(dir.path().to_path_buf());
+        store.save(&checkpoint("good")).await.expect("save");
+        std::fs::write(dir.path().join("bad.json"), b"not json").expect("write bad");
+
+        let all = store.load_all().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].run_id, "good");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_checkpoint_removes_it_from_the_listing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RunStore::with_dir(dir.path().to_path_buf());
+        store.save(&checkpoint("r1")).await.expect("save");
+        store.delete("r1").await;
+        assert!(store.load_all().await.is_empty());
+        assert!(store.load("r1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn loading_from_a_missing_directory_is_empty_not_an_error() {
+        let store = RunStore::with_dir(PathBuf::from("/nonexistent/syscity-runs"));
+        assert!(store.load_all().await.is_empty());
+        assert!(store.load("nothing").await.is_none());
+    }
+
+    /// The store carries the loop's settings across the restart: a resumed run
+    /// must not silently switch to the default step ceiling.
+    #[test]
+    fn the_loop_config_survives_in_the_checkpoint() {
+        let config = LoopConfig {
+            max_steps: 7,
+            settle_delay_ms: 3,
+            verify_after_each: false,
+            ..Default::default()
+        };
+        let cp = Checkpoint::new("r1", "g", &config);
+        let back = cp.loop_config();
+        assert_eq!(back.max_steps, 7);
+        assert_eq!(back.settle_delay_ms, 3);
+        assert!(!back.verify_after_each);
+    }
+}

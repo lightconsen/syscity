@@ -413,6 +413,8 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 | `computer.run` | `write` | 启动一个 run；返回 `run_id`、实际使用的 `model`、`model_supports_vision`、`max_steps` 与预算上限 |
 | `computer.status` | `read` | `{run_id}` 查单个 run，`{}` 列出全部（含已结束的，上限 20 条） |
 | `computer.control` | `write` | `{run_id, action}`，`action` ∈ `pause` / `resume` / `step` / `cancel` / `steer`（`steer` 必带非空 `message`） |
+| `computer.runs` | `read` | `{ include_finished? }` 列出**磁盘上被中断、可续跑**的 run（默认只列可续跑的） |
+| `computer.resume` | `write` | `{ run_id, confirm_sensitive? }` 从持久化状态里继续一个被中断的 run，从第 N+1 步接着跑 |
 
 `computer.run` 参数：`{ goal, session_id? }`。`goal` 为空返回 `INVALID_PARAMS`；`[computer] enabled = false`
 返回 `COMPUTER_DISABLED`；本机没有适配器返回 `COMPUTER_UNAVAILABLE`；没有可用模型返回
@@ -430,6 +432,60 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 
 run 结束时若没有达成目标，会向审批队列投一张**交接单**（`tool_name: computer_run`）：完成了什么、
 卡在哪一步、试过什么、下一步该做什么，四段都是给接手的人看的，不是给状态机看的。
+
+**跨重启存活。** 每完成一步，gateway 会把 run 的检查点原子写入
+`~/.syscity/computer-runs/<run_id>.json`（tmp + rename）：目标、loop 配置、已完成的步骤（动作、验证结论、
+result、截图 CAS digest、是否命中敏感界面）、已用的模型调用/图片数和中断时间。重启**不会自动续跑**——桌面
+run 会在别人正在用的机器上真实动手，重启不是同意。重启时 gateway 会：把仍处于"被中断"状态的 run 写一行
+通知进发起它的会话（"上一次有 N 个桌面任务被中断，从第几步续跑"），并把它们列进 `computer.runs`。
+
+`computer.runs` 响应：`{ runs, interrupted }`，每条 run 含 `run_id`、`goal`、`steps_completed`、
+`next_step`、`completed_steps`、`model_calls`、`images_attached`、`sensitive_steps`、`interrupted`、
+`stop_reason`、`updated_at`。默认只列**可续跑**的（`budget` / `max_steps` / `need_help` 与被中断的），
+`done` 和 `cancelled` 的检查点当场删除、不会出现在任何列表里；`include_finished: true` 只是额外带上
+"已有结论但仍留着"的（目前只有被中断后又被手写结论的极端情况）。`interrupted`
+是"进程死掉、没有结论"的条数，与"还能续跑"不是一回事：前者是意外，后者是"还有余地"。
+
+`computer.resume` 参数：`{ run_id, confirm_sensitive? }`。响应含 `run_id`、`model`、
+`model_supports_vision`、`max_steps`、`resumed_from_step`、`sensitive_steps`。续跑**不复放**已完成动作，
+只把它们作为历史交给决策者；步数、预算计数器、`max_steps` 都从检查点接着算（重启不会悄悄把额度翻倍）。
+检查点里记录过命中敏感控件的步骤时，必须带 `confirm_sensitive: true`，否则返回
+`CONFIRMATION_REQUIRED`——续跑批准的是目标，不是上一次模型凑巧瞄准的那个密码框。其它拒绝：
+`COMPUTER_DISABLED`、`RUN_ALREADY_LIVE`（同一 run 在本进程还活着）、`RUN_NOT_FOUND`（磁盘上没有这个
+检查点）、`RUN_NOT_RESUMABLE`（已有结论）。
+
+#### 回放与审计时间线
+
+| 方法 | 作用域 | 说明 |
+|--------|-------|-------------|
+| `traces.get` | `read` | 一轮的 `summary` + 完整事件列表（`full.json`） |
+| `turns.replay` | `read` | `{ turn_id }` → 按时间排序的动作+截图时间线 |
+| `attachment.get` | `read` | `{ digest }` → 一个 CAS 对象的 base64（时间线上的 digest 变图片） |
+| `turns.rerun` | `write` | `{ turn_id, assertions?, criteria?, model? }` 把该轮输入重放给 harness |
+| `turns.rerun_result` | `read` | `{ turn_id, rerun_id }` 读一次已完成的重放结论 |
+
+`turns.replay` 响应：`{ turn_id, input, steps, step_count, image_count, image_method }`。每个 step 是
+`{ step, round, action, rung, effect, delivery, verified, before_ref, after_ref, recovery, settle_ms }`。
+`step` 只数**动作事件**（`type: "action"`），编号与 run 自身 `computer.step` 的步数一致，所以时间线不
+会因为两次读取而错位。`verified` 是**三态**：`true` / `false` / `null`——`null` 是 `unverifiable`，
+意思是"没有任何东西确认或否认它"，把它画成失败就是在替适配器下它没下的结论。`before_ref` / `after_ref`
+是截图在附件库里的 CAS digest（`sha256:<64 hex>`），用 `attachment.get` 换成图片；`image_method` 直接写在
+payload 里，客户端不必猜路径。**不是像素回放**：坐标系在不同 DPI/窗口大小下不稳定，动作以语义描述为准。
+
+`turns.rerun` 回答的是"改了提示词，这轮还会不会做对"。它把该轮**真实的用户消息**（`full.json` 里第一条
+`user` 消息，不是被截断到 4 KiB 的 preview）交给 `EvalHarness`（N=1），通过一个只预批了 eval 工具集 +
+桌面族的 registry 跑一遍，因此桌面动作不会因为"没有人类批准"而被拒。**必须给 `assertions`
+（`GoalCondition[]`）或 `criteria`**，否则返回 `NO_ASSERTIONS`：harness 的 `conditions_passed` 与
+`critique_passed` 在为空时都默认为 `true`，一次没有断言的 rerun 永远绿——这是这个工具最不能给的答案。
+调用立即返回 `{ rerun_id, turn_id, status: "started", model, input, assertions, has_criteria }`；结论以
+`turn.rerun_finished` 事件推送，并同时原子写入 `~/.syscity/reruns/<turn_id>/<rerun_id>.json`，
+断线/晚到的客户端用 `turns.rerun_result` 回读。拒绝：`INVALID_PARAMS`（turn_id 非法）、`NOT_FOUND`
+（没有这一轮）、`NO_INPUT`（该轮没有记录用户消息）、`NO_MODEL` / `NO_PROVIDER`（与 `computer.run` 同一套）。
+
+`turn.rerun_finished` 事件 payload：`{ turn_id, rerun }`，`rerun` 含 `rerun_id`、`status`
+（`finished` / `failed`）、`passed`、`pass_rate`、`assertions`、`model`、`duration_ms`、
+`condition_results`、`critique_passed`、`response`、`tool_calls`；`failed` 时是 `error` 而不是这些字段。
+事件广播给所有运维客户端：被重放的那一轮不是一个活着的会话，问它的人也不一定订阅了那个会话。
 
 #### 状态与在线
 
@@ -455,6 +511,7 @@ run 结束时若没有达成目标，会向审批队列投一张**交接单**（
 | `agent.usage` | 一轮 LLM 调用结束时的 token 用量（payload: `session_id`, `agent_id`, `usage: {prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens}`）；每轮推一次，客户端据此在运行中显示实时 token 计数（credits 计量在 `chat.final` 上） |
 | `delegation.updated` | 委派任务行变更（创建/状态/用量/共享状态/artifact）（payload: `session_id`（树的**根用户会话**，非子任务的 `delegation:<run_id>`）、`task_id`, `root_id`, `parent_id`, `depth`, `agent_id`, `title`, `status`, `created_at`, `updated_at`, `completed_at`, `usage_tokens`, `duration_ms`；终态行带 `duration_ms`，运行中为 `null`）。payload 自足，客户端无需按事件回查 |
 | `computer.step` | computer run 的一步或结束（payload: `session_id`（发起 run 的会话，裸 `computer.run` 为 `null`，此时广播给所有运维客户端）、`run_id`、`event`；`event.kind` 为 `step` 或 `finished`，字段与 run 自身的 `RunEvent` 一致——不在这里重塑，避免同一事件出现两份会漂移的描述） |
+| `turn.rerun_finished` | 一次 `turns.rerun` 的结论（payload: `turn_id`、`rerun`，后者与结果文件的 body 相同；广播，因为被重放的是历史中的一轮而不是活着的会话） |
 
 ### 6.2 管理命令（CLI 前端）
 

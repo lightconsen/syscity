@@ -126,6 +126,21 @@ impl RunBudget {
         })
     }
 
+    /// Seed the counters from a checkpoint a previous process wrote.
+    ///
+    /// A resumed run continues the same spend, not a fresh allowance: handing it
+    /// an empty budget would let one restart double what the caller permitted.
+    pub fn restore(limits: RunBudgetConfig, model_calls: usize, images_attached: usize) -> Self {
+        Self {
+            limits,
+            model_calls,
+            images_attached,
+            tokens_in: 0,
+            tokens_out: 0,
+            exhausted: None,
+        }
+    }
+
     pub fn limits(&self) -> &RunBudgetConfig {
         &self.limits
     }

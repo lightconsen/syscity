@@ -70,6 +70,13 @@ pub struct StepRecord {
     pub screenshot_after: Option<Screenshot>,
     /// Number of snapshots taken before this step (for undo / rollback).
     pub snapshots_taken: usize,
+    /// Whether the step aimed at an element the sensitive-UI detector flagged.
+    ///
+    /// Carried on the record rather than only inside the session because a
+    /// resumed run rebuilds its history from the checkpoint, and a person
+    /// approving that resume is entitled to know which steps touched a
+    /// password field or a payment form.
+    pub sensitive: bool,
 }
 
 /// Current state exposed to the decision maker.
@@ -98,7 +105,8 @@ pub struct LoopState {
 /// `verify_by_diff` used to fold it into a pass — it answered `true` when it had
 /// no screenshots to compare, so "could not tell" and "it worked" were the same
 /// answer downstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepVerification {
     /// The action's effect was observed.
     Verified,
@@ -140,6 +148,26 @@ pub struct LoopResult {
     pub message: String,
 }
 
+/// The state a resumed loop starts from.
+///
+/// A run cut off by a restart has already taken real actions; the loop must
+/// not forget them, or the decision maker would be shown an empty history and
+/// asked to do the same things again. `start_step` is absolute — the step
+/// numbering continues where the previous process left it, and so does the
+/// `max_steps` ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct LoopResume {
+    /// Steps the previous process completed, oldest first.
+    pub history: Vec<StepRecord>,
+    /// The step number to execute next.
+    pub start_step: usize,
+    /// Whether the step before the restart verified. Carried so the vision and
+    /// image triggers keep the same view of the run.
+    pub last_verified: Option<bool>,
+    /// Consecutive failures at the checkpoint.
+    pub consecutive_failures: usize,
+}
+
 /// The canonical Computer Use orchestrator.
 pub struct ComputerUseLoop {
     adapter: Arc<dyn ComputerAdapter>,
@@ -153,6 +181,8 @@ pub struct ComputerUseLoop {
     /// The step engine. Shared with the `computer` tool's code path, so the
     /// loop and the tool cannot drift apart in what "verified" means.
     session: Arc<ComputerSession>,
+    /// Where a resumed run starts, when it is one.
+    resume: Option<LoopResume>,
 }
 
 impl ComputerUseLoop {
@@ -167,6 +197,7 @@ impl ComputerUseLoop {
             rollback_manager: None,
             execution_controller: None,
             session,
+            resume: None,
         }
     }
 
@@ -215,6 +246,17 @@ impl ComputerUseLoop {
         self
     }
 
+    /// Continue a run from where a previous process left it.
+    ///
+    /// The history is carried so the decision maker sees what was already
+    /// done, and the step counter continues from the checkpoint — a resumed
+    /// run does not get a fresh `max_steps`. Nothing already executed is
+    /// replayed: the history is *memory*, not a script.
+    pub fn with_resume(mut self, resume: LoopResume) -> Self {
+        self.resume = Some(resume);
+        self
+    }
+
     /// Set the consecutive-failure threshold for auto-rollback.
     /// Default is 3.
     pub fn with_auto_rollback_threshold(mut self, threshold: usize) -> Self {
@@ -244,15 +286,23 @@ impl ComputerUseLoop {
         F: FnMut(LoopState) -> Fut,
         Fut: std::future::Future<Output = Result<LoopDecision>>,
     {
-        let mut history = Vec::new();
-        let mut last_verified: Option<bool> = None;
+        let resume = self.resume.clone().unwrap_or_default();
+        let mut history = resume.history;
+        let mut last_verified: Option<bool> = resume.last_verified;
         let mut last_error: Option<String> = None;
-        let mut consecutive_failures: usize = 0;
+        let mut consecutive_failures: usize = resume.consecutive_failures;
 
-        // A run is a task: failure counters and memory start clean.
+        // A run is a task: failure counters and memory start clean — unless
+        // this *is* a continued task, in which case the counters are the
+        // previous process's.
+        //
+        // The session itself always starts clean: it holds per-step scratch
+        // state (screenshots, snapshots, the failure streak), none of which
+        // survives a process, and rebuilding it from a checkpoint would be
+        // inventing facts about a screen that may have changed.
         self.session.reset().await;
 
-        for step in 0..self.config.max_steps {
+        for step in resume.start_step..self.config.max_steps {
             // Check execution controller for pause / resume / step / cancel.
             if let Some(ref ctrl) = self.execution_controller {
                 if let Err(reason) = ctrl.check_and_wait().await {
@@ -326,6 +376,7 @@ impl ComputerUseLoop {
                     match self.session.execute(action.clone()).await {
                         Ok(outcome) => {
                             let verification = outcome.verification;
+                            let sensitive = outcome.sensitive_target;
                             consecutive_failures = self.session.consecutive_failures().await;
                             last_error = self.session.last_error().await;
                             last_verified = match verification {
@@ -342,12 +393,15 @@ impl ComputerUseLoop {
                                 action,
                                 result: outcome.result,
                                 verification,
-                                // The session keeps the pre-action capture for
-                                // its own diff; the record carries what the
-                                // caller may want to look at afterwards.
-                                screenshot_before: None,
+                                // The frame the decision was made against. Kept
+                                // on the record because the replay timeline
+                                // pairs it with the post-action one; a run that
+                                // dropped it could show what a step changed but
+                                // never what it was looking at.
+                                screenshot_before: outcome.screenshot_before,
                                 screenshot_after: outcome.state_after.map(|state| state.screenshot),
                                 snapshots_taken: outcome.snapshots_taken,
+                                sensitive,
                             });
                         }
                         Err(e) => {
@@ -365,6 +419,7 @@ impl ComputerUseLoop {
                                 screenshot_before: None,
                                 screenshot_after: None,
                                 snapshots_taken: 0,
+                                sensitive: false,
                             });
                         }
                     }

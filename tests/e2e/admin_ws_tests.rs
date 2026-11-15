@@ -101,6 +101,10 @@ async fn parameterized_admin_methods_refuse_a_bare_call() {
         ("memory.search", "query"),
         ("providers.fallback", "model_id"),
         ("traces.get", "turn_id"),
+        ("turns.replay", "turn_id"),
+        ("turns.rerun", "turn_id"),
+        ("turns.rerun_result", "turn_id"),
+        ("attachment.get", "digest"),
     ] {
         let frame = client.request(method, json!({})).await;
         assert_eq!(

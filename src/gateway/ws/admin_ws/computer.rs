@@ -57,18 +57,215 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
         );
     }
 
-    let adapter = state.tools.computer_adapter.read().await.clone();
-    let Some(adapter) = adapter else {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run = state
+        .tools
+        .computer_runs
+        .create(run_id.clone(), goal.clone())
+        .await;
+
+    let session_id = params.session_id.clone().filter(|s| !s.is_empty());
+    let started = match launch(state, &config, run, session_id, None).await {
+        Ok(started) => started,
+        Err(mut resp) => {
+            // Nothing was started, so the half-built run must not linger in the
+            // registry looking like something that is about to move.
+            state.tools.computer_runs.remove(&run_id).await;
+            resp.id = req.id.clone();
+            return resp;
+        }
+    };
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "run_id": run_id,
+            "goal": goal,
+            "model": started.model,
+            "model_supports_vision": started.model_supports_vision,
+            "max_steps": started.max_steps,
+            "budget": {
+                "max_calls_per_run": config.computer.budget.max_calls_per_run,
+                "max_images_per_run": config.computer.budget.max_images_per_run,
+            },
+        }),
+    )
+}
+
+/// `computer.runs` — runs a restart interrupted, or that stopped short.
+///
+/// Params: `{}`; optional `{ "include_finished": true }` to also list runs that
+/// stopped for a reason (`max_steps`, `budget`, `need_help`) rather than being
+/// cut off mid-step.
+///
+/// Read from disk rather than from memory: the point of the method is the runs
+/// this process never saw. It is also why it is separate from
+/// `computer.status` — status answers "what is running", and an interrupted run
+/// is precisely not running.
+pub(crate) async fn handle_computer_runs(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+    let params = match parse_params::<serde_json::Value>(req) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let include_finished = params
+        .get("include_finished")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let store = crate::computer::run_store::RunStore::for_paths(&state.paths);
+    let all = store.load_all().await;
+    let runs: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|c| include_finished || c.is_resumable())
+        .map(|c| c.view())
+        .collect();
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "runs": runs,
+            "interrupted": all.iter().filter(|c| c.is_interrupted()).count(),
+        }),
+    )
+}
+
+/// `computer.resume` — continue an interrupted run from step N+1.
+///
+/// Params: `{ "run_id": "...", "confirm_sensitive": false }`.
+///
+/// Resuming is a decision, not a repair: the file says what the run had done,
+/// and this method starts a *new* loop that carries that history, continues the
+/// step counter and the budget counters, and never auto-replays a completed
+/// action. A checkpoint that recorded a step aimed at a sensitive control
+/// requires `confirm_sensitive: true` — the person approving the resume is
+/// approving the goal, not the password field a previous model call happened to
+/// aim at.
+pub(crate) async fn handle_computer_resume(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let params = match parse_params::<ResumeParams>(req) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let run_id = params.run_id.trim().to_string();
+    if run_id.is_empty() {
+        return error_invalid_request(&req.id, "Missing required parameter `run_id`");
+    }
+
+    let config = state.config.read().await.clone();
+    if !config.computer.enabled {
         return WsResponse::err(
             &req.id,
+            "COMPUTER_DISABLED",
+            "Computer use is disabled (`[computer] enabled = false`)",
+        );
+    }
+
+    // A run already in this process cannot be resumed: two loops on one desktop
+    // is not a continuation, it is a race.
+    if let Some(live) = state.tools.computer_runs.get(&run_id).await {
+        if !live.snapshot().await.phase.is_finished() {
+            return WsResponse::err(
+                &req.id,
+                "RUN_ALREADY_LIVE",
+                format!("Run {run_id} is already running in this gateway"),
+            );
+        }
+    }
+
+    let store = crate::computer::run_store::RunStore::for_paths(&state.paths);
+    let Some(checkpoint) = store.load(&run_id).await else {
+        return WsResponse::err(
+            &req.id,
+            "RUN_NOT_FOUND",
+            format!("No interrupted computer run with id {run_id}"),
+        );
+    };
+    if !checkpoint.is_resumable() {
+        return WsResponse::err(
+            &req.id,
+            "RUN_NOT_RESUMABLE",
+            format!("Run {run_id} already reached a conclusion ({:?})", checkpoint.stop_reason),
+        );
+    }
+
+    let sensitive = checkpoint.sensitive_steps();
+    if sensitive > 0 && !params.confirm_sensitive {
+        return WsResponse::err(
+            &req.id,
+            "CONFIRMATION_REQUIRED",
+            format!(
+                "Run {run_id} recorded {sensitive} step(s) aimed at a sensitive control \
+                 (password / payment / destructive confirmation); resend with \
+                 `confirm_sensitive: true` to continue it"
+            ),
+        );
+    }
+
+    let started_from = checkpoint.next_step();
+    let run = state
+        .tools
+        .computer_runs
+        .create(run_id.clone(), checkpoint.goal.clone())
+        .await;
+
+    let session_id = checkpoint.session_id.clone();
+    let started = match launch(state, &config, run, session_id, Some(checkpoint)).await {
+        Ok(started) => started,
+        Err(mut resp) => {
+            state.tools.computer_runs.remove(&run_id).await;
+            resp.id = req.id.clone();
+            return resp;
+        }
+    };
+
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "run_id": run_id,
+            "goal": serde_json::Value::Null,
+            "model": started.model,
+            "model_supports_vision": started.model_supports_vision,
+            "max_steps": started.max_steps,
+            "resumed_from_step": started_from,
+            "sensitive_steps": sensitive,
+        }),
+    )
+}
+
+/// What `launch` established, for the response of the method that called it.
+struct StartedRun {
+    model: String,
+    model_supports_vision: bool,
+    max_steps: usize,
+}
+
+/// Attach a loop to `run` and spawn it.
+///
+/// Everything that can refuse the run happens here, before the spawn: no
+/// adapter, no provider, no model. All three are refusals *of the request*, and
+/// a caller that gets a `run_id` back must be able to rely on the run actually
+/// moving.
+async fn launch(
+    state: &Arc<GatewayState>,
+    config: &crate::gateway::GatewayConfig,
+    run: Arc<crate::computer::run_registry::ComputerRun>,
+    session_id: Option<String>,
+    checkpoint: Option<crate::computer::run_store::Checkpoint>,
+) -> Result<StartedRun, WsResponse> {
+    let adapter = state.tools.computer_adapter.read().await.clone();
+    let Some(adapter) = adapter else {
+        return Err(WsResponse::err(
+            "",
             "COMPUTER_UNAVAILABLE",
             "No desktop adapter is available on this host",
-        );
+        ));
     };
 
     let (provider, model) = match driver_provider(state).await {
         Ok(pair) => pair,
-        Err(resp) => return resp.with_id(&req.id),
+        Err(resp) => return Err(resp.with_id("")),
     };
     let provider_name = provider.name().to_string();
 
@@ -91,20 +288,18 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
             .with_image_limit(image_limit.clone()),
     );
 
-    let loop_config = crate::computer::LoopConfig {
-        max_steps: config.computer.max_steps,
-        settle_delay_ms: config.computer.settle_delay_ms,
-        ..Default::default()
+    // A resumed run keeps the ceiling it was started with: raising it silently
+    // would make the resume a different run than the one the file describes.
+    let loop_config = match checkpoint.as_ref() {
+        Some(checkpoint) => checkpoint.loop_config(),
+        None => crate::computer::LoopConfig {
+            max_steps: config.computer.max_steps,
+            settle_delay_ms: config.computer.settle_delay_ms,
+            ..Default::default()
+        },
     };
 
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let run = state
-        .tools
-        .computer_runs
-        .create(run_id.clone(), goal.clone())
-        .await;
-
-    let session_id = params.session_id.clone().filter(|s| !s.is_empty());
+    let run_id = run.run_id.clone();
     let observer: crate::computer::run_executor::RunObserver = {
         let tx = state.events.tx.clone();
         let session_id = session_id.clone();
@@ -130,14 +325,37 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
         })
     };
 
+    // The checkpoint the executor writes into: the one passed in (a resume), or
+    // a fresh one. Either way it is stamped with the session, so a later
+    // restart's notice reaches the conversation that asked for the run — a
+    // checkpoint written without one can only be found by `computer.runs`, and
+    // the person who started the run is never told.
+    let checkpoint = Some(match checkpoint {
+        Some(mut checkpoint) => {
+            checkpoint.session_id = session_id.clone();
+            checkpoint
+        }
+        None => {
+            let mut fresh = crate::computer::run_store::Checkpoint::new(
+                run.run_id.clone(),
+                run.goal.clone(),
+                &loop_config,
+            );
+            fresh.session_id = session_id.clone();
+            fresh
+        }
+    });
+
     let plan = crate::computer::run_executor::RunPlan {
         adapter,
         driver,
         loop_config,
         model_supports_vision,
-        vision: vision_look(state, &config, image_limit).await,
+        vision: vision_look(state, config, image_limit).await,
         budget: config.computer.budget.clone(),
         observer: Some(observer),
+        store: Some(Arc::new(crate::computer::run_store::RunStore::for_paths(&state.paths))),
+        checkpoint,
     };
 
     let task_state = state.clone();
@@ -190,20 +408,11 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
         .insert_join(format!("computer:{run_id}"), task)
         .await;
 
-    WsResponse::ok(
-        &req.id,
-        serde_json::json!({
-            "run_id": run_id,
-            "goal": goal,
-            "model": model,
-            "model_supports_vision": model_supports_vision,
-            "max_steps": loop_config.max_steps,
-            "budget": {
-                "max_calls_per_run": config.computer.budget.max_calls_per_run,
-                "max_images_per_run": config.computer.budget.max_images_per_run,
-            },
-        }),
-    )
+    Ok(StartedRun {
+        model,
+        model_supports_vision,
+        max_steps: loop_config.max_steps,
+    })
 }
 
 /// `computer.status` — one run, or all of them.
@@ -444,13 +653,13 @@ async fn api_vision(
 }
 
 /// A driver construction failure, before any run exists.
-struct DriverRefusal {
-    code: &'static str,
-    message: String,
+pub(crate) struct DriverRefusal {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl DriverRefusal {
-    fn with_id(self, id: &str) -> WsResponse {
+    pub(crate) fn with_id(self, id: &str) -> WsResponse {
         WsResponse::err(id, self.code, self.message)
     }
 }
@@ -460,7 +669,11 @@ impl DriverRefusal {
 /// Pinned to the concrete provider rather than routed per call: a run's steps
 /// are one task, and switching providers midway would change the answer's
 /// format (and its vision capability) halfway through a decision sequence.
-async fn driver_provider(
+///
+/// Also used by `turns.rerun`: a rerun asks the same question a run would
+/// ("what would this model do, given this screen?"), so it must resolve the
+/// provider the same way.
+pub(crate) async fn driver_provider(
     state: &Arc<GatewayState>,
 ) -> Result<(Arc<dyn crate::providers::Provider>, String), DriverRefusal> {
     let model = {
@@ -536,6 +749,15 @@ struct RunParams {
     goal: String,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ResumeParams {
+    run_id: String,
+    /// Required when the checkpoint records a step aimed at a sensitive
+    /// control: the resume is a second consent for those steps.
+    #[serde(default)]
+    confirm_sensitive: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -705,5 +927,205 @@ mod tests {
         .await;
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, "RUN_NOT_FOUND");
+    }
+
+    // ── Stage C: runs that survive a restart ────────────────────────────
+
+    /// Write a checkpoint into the state's own layout root, the way a previous
+    /// process would have.
+    async fn save_checkpoint(
+        state: &Arc<GatewayState>,
+        run_id: &str,
+        sensitive: bool,
+    ) -> crate::computer::run_store::Checkpoint {
+        use crate::computer::run_store::{Checkpoint, CompletedStep, RunStore};
+        use crate::computer::types::{ClickTarget, DesktopAction, MouseButton};
+        use crate::computer::use_loop::{LoopConfig, StepVerification};
+
+        let mut cp = Checkpoint::new(run_id, "click Save in Preferences", &LoopConfig::default());
+        cp.session_id = Some("s1".to_string());
+        cp.completed.push(CompletedStep {
+            step: 0,
+            action: DesktopAction::Click {
+                target: ClickTarget::ElementId("s1:0.2".to_string()),
+                button: MouseButton::Left,
+            },
+            verification: StepVerification::Verified,
+            result: "clicked".to_string(),
+            screenshot_before_ref: None,
+            screenshot_ref: None,
+            sensitive,
+        });
+        cp.model_calls = 1;
+        RunStore::for_paths(&state.paths)
+            .save(&cp)
+            .await
+            .expect("save checkpoint");
+        cp
+    }
+
+    /// The point of the method: a run this process never saw is listed, with
+    /// enough in the row for a person to decide whether to continue it.
+    #[tokio::test]
+    async fn an_interrupted_run_is_listed_from_disk() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_checkpoint(&state, "r-interrupted", false).await;
+
+        let resp = handle_computer_runs(&req("computer.runs", serde_json::json!({})), &state).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        let payload = resp.payload.expect("payload");
+        assert_eq!(payload["interrupted"], 1);
+        let runs = payload["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["run_id"], "r-interrupted");
+        assert_eq!(runs[0]["goal"], "click Save in Preferences");
+        assert_eq!(runs[0]["steps_completed"], 1);
+        // The list is what a person resumes from, so the step it would continue
+        // at is the number the resume must be asked for.
+        assert_eq!(runs[0]["next_step"], 1);
+        assert_eq!(runs[0]["interrupted"], true);
+    }
+
+    /// The default listing is "what can be continued": an interrupted run and
+    /// a run that stopped at a ceiling both qualify, which is the plan's
+    /// distinction between a limit and an answer. A file left behind by an
+    /// older release carrying `done` is excluded until asked for.
+    #[tokio::test]
+    async fn the_default_listing_offers_only_continuable_runs() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        // Stopped at the budget ceiling: more room would have helped, so it is
+        // offered — but it is not "interrupted", and the count says so.
+        let mut ceiling = save_checkpoint(&state, "r-budget", false).await;
+        ceiling.stop_reason = Some(crate::computer::run_budget::StopReason::Budget);
+        crate::computer::run_store::RunStore::for_paths(&state.paths)
+            .save(&ceiling)
+            .await
+            .expect("save");
+
+        // A concluded run: nothing to continue.
+        let mut concluded = save_checkpoint(&state, "r-done", false).await;
+        concluded.stop_reason = Some(crate::computer::run_budget::StopReason::Done);
+        crate::computer::run_store::RunStore::for_paths(&state.paths)
+            .save(&concluded)
+            .await
+            .expect("save");
+
+        let resp = handle_computer_runs(&req("computer.runs", serde_json::json!({})), &state).await;
+        let payload = resp.payload.expect("payload");
+        assert_eq!(payload["interrupted"], 0, "{payload}");
+        let ids: Vec<&str> = payload["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["run_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["r-budget"], "only the ceiling stop is continuable: {payload}");
+
+        // Asking for everything finds the concluded one too, with the reason.
+        let all = handle_computer_runs(
+            &req("computer.runs", serde_json::json!({"include_finished": true})),
+            &state,
+        )
+        .await;
+        let payload = all.payload.expect("payload");
+        assert_eq!(payload["runs"].as_array().unwrap().len(), 2);
+        assert!(
+            payload["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["run_id"] == "r-done" && r["stop_reason"] == "done"),
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_an_unknown_run_is_not_found() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let resp = handle_computer_resume(
+            &req("computer.resume", serde_json::json!({"run_id": "ghost"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "RUN_NOT_FOUND");
+    }
+
+    /// A checkpoint that recorded a step aimed at a sensitive control cannot be
+    /// continued by a bare resume: the person approving the resume is approving
+    /// the goal, not the password field a previous model call aimed at.
+    #[tokio::test]
+    async fn resuming_a_sensitive_run_needs_a_second_consent() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_checkpoint(&state, "r-sensitive", true).await;
+
+        let resp = handle_computer_resume(
+            &req("computer.resume", serde_json::json!({"run_id": "r-sensitive"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "CONFIRMATION_REQUIRED");
+        assert!(err.message.contains("sensitive"), "{}", err.message);
+        // Nothing started.
+        assert_eq!(state.tools.computer_runs.live_count().await, 0);
+    }
+
+    /// A concluded run is not resumable, and says so rather than silently
+    /// starting a fresh loop at step N.
+    #[tokio::test]
+    async fn resuming_a_concluded_run_is_refused() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let mut cp = save_checkpoint(&state, "r-done", false).await;
+        cp.stop_reason = Some(crate::computer::run_budget::StopReason::Done);
+        crate::computer::run_store::RunStore::for_paths(&state.paths)
+            .save(&cp)
+            .await
+            .expect("save");
+
+        let resp = handle_computer_resume(
+            &req("computer.resume", serde_json::json!({"run_id": "r-done"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "RUN_NOT_RESUMABLE");
+    }
+
+    /// Two loops on one desktop is a race, not a continuation.
+    #[tokio::test]
+    async fn resuming_a_live_run_is_refused() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_checkpoint(&state, "r-live", false).await;
+        state.tools.computer_runs.create("r-live", "g").await;
+
+        let resp = handle_computer_resume(
+            &req("computer.resume", serde_json::json!({"run_id": "r-live"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "RUN_ALREADY_LIVE");
+    }
+
+    /// The resume builds the loop from the checkpoint: a test with no desktop
+    /// adapter cannot start it, but the checkpoint is loaded before that
+    /// refusal, which is the order that matters — the method refuses for the
+    /// reason that is true, not "that file is unreadable".
+    #[tokio::test]
+    async fn resuming_without_an_adapter_refuses_for_that_reason() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        save_checkpoint(&state, "r-noadapter", false).await;
+        let resp = handle_computer_resume(
+            &req("computer.resume", serde_json::json!({"run_id": "r-noadapter"})),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, "COMPUTER_UNAVAILABLE");
+        // And the half-built run did not linger.
+        assert_eq!(state.tools.computer_runs.live_count().await, 0);
     }
 }

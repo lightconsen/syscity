@@ -176,6 +176,21 @@ pub struct ActionTraceEvent {
     /// The element the hit test found in the way, when one was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit_test: Option<crate::computer::Occluder>,
+    /// The three-state verification of the step: `verified` / `failed` /
+    /// `unverifiable`, or absent when the step was never verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
+    /// CAS digest of the frame captured *before* the action landed.
+    ///
+    /// The pre-action frame is what the decision was made against; without it
+    /// a replay can show what a step did, never what it was looking at. Only
+    /// screen-mutating actions take a baseline capture, so read-only steps
+    /// (a tree read, a screenshot) leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_ref: Option<String>,
+    /// CAS digest of the frame captured after the action settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_ref: Option<String>,
 }
 
 impl ActionTraceEvent {
@@ -199,6 +214,16 @@ impl ActionTraceEvent {
             .get("occluder")
             .filter(|v| !v.is_null())
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Attachment refs travel as `{digest, mime, size}` objects. Only the
+        // digest is kept here: the trace's job is to point at the frame, and
+        // the store is what says how big it is.
+        let digest = |key: &str| {
+            detail
+                .get(key)
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
         Self {
             action: action.to_string(),
             rung: text("rung").unwrap_or_else(|| "unknown".to_string()),
@@ -210,6 +235,9 @@ impl ActionTraceEvent {
             recovery: text("recovery"),
             settle_ms: detail.get("settle_ms").and_then(|v| v.as_u64()),
             hit_test,
+            verification: text("verification_state"),
+            before_ref: digest("screenshot_before_ref"),
+            after_ref: digest("screenshot_ref"),
         }
     }
 }

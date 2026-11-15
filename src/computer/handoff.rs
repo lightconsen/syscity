@@ -192,6 +192,7 @@ mod tests {
             screenshot_before: None,
             screenshot_after: None,
             snapshots_taken: 0,
+            sensitive: false,
         }
     }
 

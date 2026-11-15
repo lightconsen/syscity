@@ -719,6 +719,9 @@ mod tests {
             recovery: None,
             settle_ms: Some(140),
             hit_test: None,
+            verification: Some("unverifiable".into()),
+            before_ref: Some("sha256:aaaa".into()),
+            after_ref: None,
         });
 
         let lines = read_full_lines(&dir, &id);
@@ -753,6 +756,9 @@ mod tests {
             recovery: Some(format!("the field named {secret} did not take the text")),
             settle_ms: None,
             hit_test: None,
+            verification: None,
+            before_ref: None,
+            after_ref: None,
         });
 
         let raw = std::fs::read_to_string(turn_dir(&dir, &id).join("full.json")).unwrap();

@@ -58,6 +58,13 @@ pub enum RunEvent {
         rung: Option<Rung>,
         /// What the adapter established about the effect.
         effect: Option<ActionEffect>,
+        /// CAS digest of the frame captured *before* the action landed.
+        ///
+        /// Only screen-mutating actions take a baseline, so a read-only step
+        /// reports `None`. A client showing a step timeline pairs this with
+        /// [`Self::Step::screenshot_ref`]: the before frame is what the
+        /// decision was made against.
+        screenshot_before_ref: Option<String>,
         /// CAS digest of the post-action screenshot, when one was stored.
         screenshot_ref: Option<String>,
         /// `None` when nothing could confirm or deny the action.
@@ -98,6 +105,20 @@ pub struct RunPlan {
     /// The run's cost ceilings.
     pub budget: crate::config::RunBudgetConfig,
     pub observer: Option<RunObserver>,
+    /// Where per-step checkpoints go.
+    ///
+    /// `None` means "do not persist": a library caller running one goal
+    /// synchronously has nobody to resume it, and writing files for it would be
+    /// a side effect it did not ask for. The gateway always passes a store, so
+    /// a gateway run survives a restart.
+    pub store: Option<Arc<crate::computer::run_store::RunStore>>,
+    /// The checkpoint a run starts from.
+    ///
+    /// `None` starts a fresh one. A loaded checkpoint continues the run from
+    /// where it was cut off: the executor takes its history and step number as
+    /// the loop's starting state, and carries it forward so the next
+    /// interruption has the same information this one did.
+    pub checkpoint: Option<crate::computer::run_store::Checkpoint>,
 }
 
 /// The outcome of a run, as the caller reports it.
@@ -135,7 +156,15 @@ impl RunOutcome {
 /// machinery itself being broken (no adapter, no provider), which the caller
 /// reports as a failed request rather than as a failed goal.
 pub async fn execute(run: Arc<ComputerRun>, plan: RunPlan) -> crate::Result<RunOutcome> {
-    let budget = Arc::new(Mutex::new(RunBudget::new(plan.budget.clone())));
+    let budget = Arc::new(Mutex::new(match plan.checkpoint.as_ref() {
+        // A resume continues the spend, not a fresh allowance.
+        Some(checkpoint) => RunBudget::restore(
+            plan.budget.clone(),
+            checkpoint.model_calls,
+            checkpoint.images_attached,
+        ),
+        None => RunBudget::new(plan.budget.clone()),
+    }));
     let observer = plan.observer.clone();
     let outcome = match run_loop(run.clone(), plan, budget.clone()).await {
         Ok((outcome, spent)) => {
@@ -207,9 +236,55 @@ async fn run_loop(
     let controller = run.controller.clone();
     let run_for_closure = run.clone();
 
-    let computer_loop = ComputerUseLoop::new(plan.adapter.clone())
+    // The checkpoint writer, when the caller asked for persistence. It owns the
+    // checkpoint state so a resume can append to the file the previous process
+    // wrote rather than starting one from step zero.
+    let checkpointer = plan.store.as_ref().map(|store| {
+        let checkpoint = plan.checkpoint.clone().unwrap_or_else(|| {
+            crate::computer::run_store::Checkpoint::new(
+                run.run_id.clone(),
+                run.goal.clone(),
+                &plan.loop_config,
+            )
+        });
+        Arc::new(crate::computer::run_store::RunCheckpointer::new(store.clone(), checkpoint))
+    });
+
+    let resume = plan
+        .checkpoint
+        .as_ref()
+        .filter(|c| c.is_resumable())
+        .map(|c| c.resume_state())
+        .unwrap_or_default();
+    let mut computer_loop = ComputerUseLoop::new(plan.adapter.clone())
         .with_config(plan.loop_config)
         .with_execution_controller(controller.clone());
+    if resume.start_step > 0 {
+        // A resumed run's status must read like the run it continues, not like
+        // a new one that happens to start at step 4: seed the visible steps and
+        // step counter from the checkpoint before the first decision.
+        let seeded: Vec<String> = plan
+            .checkpoint
+            .as_ref()
+            .map(|c| {
+                c.completed
+                    .iter()
+                    .map(|s| {
+                        let action = crate::computer::driver::describe_action(&s.action);
+                        let verdict = crate::computer::run_store::verdict_word(s.verification);
+                        crate::computer::run_store::step_line(s.step, &action, &s.result, verdict)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let start = resume.start_step;
+        run.update(|s| {
+            s.completed = seeded;
+            s.step = start;
+        })
+        .await;
+        computer_loop = computer_loop.with_resume(resume);
+    }
 
     // Shared with the closure: the parse-failure streak, and why the loop
     // stopped when the reason is ours rather than the loop's.
@@ -222,6 +297,7 @@ async fn run_loop(
     let closure_run = run_for_closure.clone();
     let closure_vision = vision.clone();
     let closure_observer = observer.clone();
+    let closure_checkpointer = checkpointer.clone();
     let goal = run.goal.clone();
 
     let decided = computer_loop
@@ -231,6 +307,7 @@ async fn run_loop(
             let run = closure_run.clone();
             let budget = closure_budget.clone();
             let observer = closure_observer.clone();
+            let checkpointer = closure_checkpointer.clone();
             let parse_failures = closure_failures.clone();
             let our_stop = closure_stop.clone();
             let vision = closure_vision.clone();
@@ -238,7 +315,8 @@ async fn run_loop(
                 // Announce the step that just finished (the first iteration
                 // has none). Doing it here means the report carries the
                 // action's real result and verification.
-                announce_new_steps(&run, &state.history, observer.as_ref()).await;
+                announce_new_steps(&run, &state.history, observer.as_ref(), checkpointer.as_ref())
+                    .await;
                 let done = state.history.len();
                 run.update(|s| {
                     s.step = done;
@@ -290,7 +368,7 @@ async fn run_loop(
         .await?;
 
     // The loop is done; report any step it executed after the last decision.
-    announce_new_steps(&run, &decided.history, observer.as_ref()).await;
+    announce_new_steps(&run, &decided.history, observer.as_ref(), checkpointer.as_ref()).await;
 
     let runtime_state = controller.current_state().await;
     let stop_reason = {
@@ -298,6 +376,15 @@ async fn run_loop(
         ours.unwrap_or_else(|| classify(&decided, runtime_state))
     };
     let steps = decided.steps_taken.max(decided.history.len());
+
+    // Settle the checkpoint before the handoff is written: the file is what a
+    // resume reads, and a resume is only meaningful for a run that stopped
+    // *without* an answer. `conclude` deletes it for `done`/`cancelled` and
+    // keeps it, with the reason, for every other stop.
+    if let Some(checkpointer) = checkpointer.as_ref() {
+        checkpointer.conclude(stop_reason).await;
+    }
+
     let handoff = if decided.success {
         None
     } else {
@@ -574,6 +661,7 @@ async fn announce_new_steps(
     run: &Arc<ComputerRun>,
     history: &[StepRecord],
     observer: Option<&RunObserver>,
+    checkpointer: Option<&Arc<crate::computer::run_store::RunCheckpointer>>,
 ) {
     let already = run.snapshot().await.completed.len();
     if history.len() <= already {
@@ -581,6 +669,7 @@ async fn announce_new_steps(
     }
 
     for record in &history[already..] {
+        let screenshot_before_ref = store_screenshot(record.screenshot_before.as_ref()).await;
         let screenshot_ref = store_screenshot(record.screenshot_after.as_ref()).await;
         let rung = record.result.evidence.as_ref().map(|e| e.rung);
         let effect = record.result.evidence.as_ref().map(|e| e.effect);
@@ -598,6 +687,22 @@ async fn announce_new_steps(
         };
         run.update(|s| s.completed.push(line.clone())).await;
 
+        // The checkpoint is written after the step is in the run's own view, so
+        // a crash between the two loses at most the report, never the record of
+        // an action that already happened on the screen.
+        if let Some(checkpointer) = checkpointer {
+            let completed = crate::computer::run_store::CompletedStep {
+                step: record.step,
+                action: record.action.clone(),
+                verification: record.verification,
+                result: record.result.message.clone(),
+                screenshot_before_ref: screenshot_before_ref.clone(),
+                screenshot_ref: screenshot_ref.clone(),
+                sensitive: record.sensitive,
+            };
+            checkpointer.step(&completed, calls, images).await;
+        }
+
         if let Some(observer) = observer {
             observer(RunEvent::Step {
                 run_id: run.run_id.clone(),
@@ -605,6 +710,7 @@ async fn announce_new_steps(
                 action,
                 rung,
                 effect,
+                screenshot_before_ref,
                 screenshot_ref,
                 verified,
                 model_calls: calls,
@@ -616,28 +722,12 @@ async fn announce_new_steps(
 
 /// One line per step for the handoff note.
 fn describe_step(record: &StepRecord) -> String {
-    let verdict = match record.verification {
-        StepVerification::Verified => "ok",
-        StepVerification::Failed => "failed",
-        StepVerification::Unverifiable => "unchecked",
-    };
-    format!(
-        "{}. {} → {} ({verdict})",
-        record.step + 1,
-        crate::computer::driver::describe_action(&record.action),
-        truncate(&record.result.message, 100)
+    crate::computer::run_store::step_line(
+        record.step,
+        &crate::computer::driver::describe_action(&record.action),
+        &record.result.message,
+        crate::computer::run_store::verdict_word(record.verification),
     )
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    let flat = text.replace(['\n', '\r'], " ");
-    let mut chars = flat.chars();
-    let head: String = chars.by_ref().take(max).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    }
 }
 
 /// Store a post-action capture in the CAS and return its digest.
@@ -775,13 +865,17 @@ mod tests {
     }
 
     #[test]
-    fn truncate_keeps_the_line_short() {
-        assert_eq!(truncate("hello", 100), "hello");
-        assert_eq!(truncate("a\nb", 100), "a b");
-        let long = "x".repeat(200);
-        let cut = truncate(&long, 10);
-        assert_eq!(cut.chars().count(), 11);
-        assert!(cut.ends_with('…'));
+    fn a_step_line_is_one_short_line() {
+        assert_eq!(
+            crate::computer::run_store::step_line(0, "click [s1:0.4]", "clicked", "ok"),
+            "1. click [s1:0.4] → clicked (ok)"
+        );
+        // A multi-line adapter message is flattened: the handoff note is a list
+        // of steps, not a transcript.
+        assert_eq!(
+            crate::computer::run_store::step_line(1, "type", "a\nb", "failed"),
+            "2. type → a b (failed)"
+        );
     }
 
     // ── a real run, end to end ──────────────────────────────────────────
@@ -1057,6 +1151,10 @@ mod tests {
                 max_images_per_run: images,
             },
             observer: None,
+            // A unit-test run has nobody to resume it; persistence is the
+            // gateway's concern and is covered in `run_store` and the e2e test.
+            store: None,
+            checkpoint: None,
         }
     }
 

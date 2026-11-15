@@ -363,6 +363,19 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("providers.fallback", Some(SCOPE_READ)),
     ("providers.auth_status", Some(SCOPE_READ)),
     ("traces.get", Some(SCOPE_READ)),
+    // A turn's action/screenshot timeline: reads the same files `traces.get`
+    // does, in a shape a UI can walk step by step.
+    ("turns.replay", Some(SCOPE_READ)),
+    // One attachment-store object by digest. The timeline hands out digests,
+    // which a browser cannot render; this is the read that turns one into an
+    // image. `read` because a caller that may read the trace naming a frame may
+    // read the frame.
+    ("attachment.get", Some(SCOPE_READ)),
+    // Replaying a turn's input through the harness drives real tools, so it is
+    // a write even though it writes nothing the caller names. Its result read
+    // is a plain file read.
+    ("turns.rerun", Some(SCOPE_WRITE)),
+    ("turns.rerun_result", Some(SCOPE_READ)),
     ("cron.get", Some(SCOPE_READ)),
     ("cron.logs", Some(SCOPE_READ)),
     ("skills.get", Some(SCOPE_READ)),
@@ -372,6 +385,7 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("approvals.list", Some(SCOPE_READ)),
     ("approvals.get", Some(SCOPE_READ)),
     ("computer.status", Some(SCOPE_READ)),
+    ("computer.runs", Some(SCOPE_READ)),
     ("audit.recent", Some(SCOPE_READ)),
     ("audit.all", Some(SCOPE_READ)),
     ("memory.search", Some(SCOPE_READ)),
@@ -405,6 +419,8 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     // neither.
     ("computer.run", Some(SCOPE_WRITE)),
     ("computer.control", Some(SCOPE_WRITE)),
+    // Resuming is running: it starts a loop that acts on the shared desktop.
+    ("computer.resume", Some(SCOPE_WRITE)),
     ("agents.create", Some(SCOPE_WRITE)),
     ("agents.delete", Some(SCOPE_WRITE)),
     ("agents.purge", Some(SCOPE_WRITE)),
@@ -1089,6 +1105,16 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
                 "session_id": session_id,
                 "run_id": run_id,
                 "event": event,
+            }),
+        )),
+        // The replay's verdict travels whole: the caller asked about a turn,
+        // and reshaping the harness's own result (condition outcomes, critique,
+        // tool calls) here would create a second description that can drift.
+        GatewayEvent::TurnRerunFinished { turn_id, body } => Some((
+            "turn.rerun_finished".to_string(),
+            serde_json::json!({
+                "turn_id": turn_id,
+                "rerun": body,
             }),
         )),
     }

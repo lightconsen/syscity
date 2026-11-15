@@ -336,6 +336,16 @@ pub enum GatewayEvent {
         /// (`run_executor::RunEvent`, tagged by `kind`).
         event: serde_json::Value,
     },
+    /// A `turns.rerun` finished: the replay's verdict on a recorded turn.
+    ///
+    /// Carries the same body the rerun's result file holds, so a client can act
+    /// on the event without a follow-up read. Broadcast rather than keyed to a
+    /// session: the turn being replayed is not a live conversation, and whoever
+    /// asked about it may not be subscribed to whatever session it came from.
+    TurnRerunFinished {
+        turn_id: String,
+        body: serde_json::Value,
+    },
 }
 
 /// Agent status

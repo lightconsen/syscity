@@ -42,6 +42,7 @@ pub mod rollback;
 pub mod run_budget;
 pub mod run_executor;
 pub mod run_registry;
+pub mod run_store;
 pub mod screen_recorder;
 pub mod screenshot_encoder;
 pub mod sensitive_ui;

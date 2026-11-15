@@ -106,6 +106,12 @@ pub struct StepOutcome {
     pub evidence: Option<crate::computer::ActionEvidence>,
     /// Post-action screen state, when one was captured.
     pub state_after: Option<ScreenState>,
+    /// Pre-action capture, when the action mutates the screen.
+    ///
+    /// The session takes this baseline for its own diff; it is handed back
+    /// because a replayed timeline needs the frame the decision was made
+    /// against, and once the step is over only the caller can keep it.
+    pub screenshot_before: Option<crate::computer::Screenshot>,
     /// Pre/post comparison, when both sides were captured.
     pub diff: Option<ScreenDiff>,
     /// Sensitive UI found in the tree before the action.
@@ -534,6 +540,7 @@ impl ComputerSession {
                 verification,
                 evidence: Some(evidence),
                 state_after: None,
+                screenshot_before: None,
                 diff: None,
                 sensitive_before: Vec::new(),
                 sensitive_after: self.sensitive_findings().await,
@@ -612,6 +619,7 @@ impl ComputerSession {
                         verification: StepVerification::Unverifiable,
                         evidence: Some(refusal.evidence),
                         state_after: None,
+                        screenshot_before: None,
                         diff: None,
                         sensitive_before: Vec::new(),
                         sensitive_after: self.sensitive_findings().await,
@@ -737,6 +745,9 @@ impl ComputerSession {
                 verification,
                 evidence: Some(evidence),
                 state_after,
+                // The baseline this rung was verified against: the last rung
+                // that actually ran owns it.
+                screenshot_before,
                 diff,
                 sensitive_before,
                 sensitive_after,
@@ -781,6 +792,7 @@ impl ComputerSession {
                 verification,
                 evidence: Some(evidence),
                 state_after: None,
+                screenshot_before: None,
                 diff: None,
                 sensitive_before: Vec::new(),
                 sensitive_after: self.sensitive_findings().await,
