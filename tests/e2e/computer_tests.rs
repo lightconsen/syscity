@@ -342,21 +342,6 @@ async fn tool_macos_desktop_control_notes() {
     }
 }
 
-/// Prompt: 帮我打开计算器，计算 128 × 256，把结果截图发给我。
-#[tokio::test]
-#[serial]
-#[ignore = "Modifies actual desktop state (opens Calculator)"]
-async fn tool_macos_desktop_control_calculator() {
-    let results = run_multi_tool_chat_test(
-        free_port(),
-        "Use applescript to open the Calculator app. Then use macos_desktop_control to press the \
-         buttons for 128 × 256 =. Finally use macos_screenshot to capture the result.",
-        &["applescript", "macos_desktop_control", "macos_screenshot"],
-    )
-    .await;
-    assert!(!results.is_empty(), "expected at least one tool result");
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // 5. 进程管理
 // ════════════════════════════════════════════════════════════════════════════

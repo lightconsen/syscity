@@ -2736,6 +2736,34 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst), "the tool body must not run");
     }
 
+    /// The internal-caller shape: a desktop adapter calling another
+    /// `requires_approval` tool through `ToolContext::default()`.
+    ///
+    /// `platform_macos` drives the screen by calling `applescript` and
+    /// `macos_desktop_control` through the registry with a default context —
+    /// its own approval was already granted one level up, and the inner call is
+    /// the adapter's plumbing rather than a fresh request from a model. If that
+    /// default context is read as "a background context with nobody to ask",
+    /// every `computer.run` step on macOS is denied by the gate it just passed,
+    /// and the whole engine silently stops working.
+    ///
+    /// So the distinction this asserts is real and must not regress: a default
+    /// context is *not* a "nobody is present" context. It has no `system` user
+    /// and no `cron:`/`goal_` conversation, which is what marks the unattended
+    /// shapes.
+    #[tokio::test]
+    async fn an_internal_adapter_call_is_not_treated_as_unattended() {
+        let ctx = ToolContext::default();
+        assert!(
+            !crate::tools::ask_user::can_ask_a_human(&ctx),
+            "a default context has no ask queue — it cannot prompt"
+        );
+        assert!(
+            crate::tools::ask_user::background_context_reason(&ctx).is_none(),
+            "but it is not a background context either: nothing about it says nobody is present"
+        );
+    }
+
     /// The same tool, in a background context (cron/heartbeat/delegation),
     /// fails closed too — fast, not after the five-minute approval timeout —
     /// and submits nothing to the approval queue.
