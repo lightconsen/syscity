@@ -38,11 +38,15 @@ mod util;
 mod validators;
 
 pub use registrar::ToolRegistrar;
+// Only the gateway's platform sweep reads this, and only from a test, so the
+// re-export exists there and nowhere else.
+#[cfg(test)]
+pub(crate) use registry::DESKTOP_INNER_TOOLS;
 pub use registry::{ToolRegistry, WebSearchProviders};
 pub use types::{
-    execution_backend_error, BoxedTool, SharedTool, SkillTrust, SkillTrustCeiling, Tool,
-    ToolContext, ToolExecutionChunk, ToolExecutionResult, ToolId, ToolIdentity, ToolModel,
-    ToolSandbox, TurnTrace,
+    current_desktop_grant, execution_backend_error, with_desktop_grant, BoxedTool, DesktopGrant,
+    SharedTool, SkillTrust, SkillTrustCeiling, Tool, ToolContext, ToolExecutionChunk,
+    ToolExecutionResult, ToolId, ToolIdentity, ToolModel, ToolSandbox, TurnTrace,
 };
 pub use util::create_schema;
 pub use validators::{

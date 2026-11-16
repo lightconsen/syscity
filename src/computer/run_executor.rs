@@ -124,6 +124,16 @@ pub struct RunPlan {
     /// Shared rather than copied: a run outlives a config edit, and the edit
     /// has to reach the loop already executing. Empty is no boundary.
     pub allow_apps: crate::computer::app_scope::AppAllowlist,
+    /// The approval this run's desktop work inherits (see
+    /// [`crate::computer::session::SessionConfig::approved_by`]).
+    ///
+    /// A run started by `computer.run` runs because a request asked for it;
+    /// the adapter's inner calls still have to say so, or every step is refused
+    /// by the gate the request already passed.
+    pub approved_by: String,
+    /// The conversation the run belongs to, which an inherited grant is
+    /// checked against.
+    pub conversation_id: String,
 }
 
 /// The outcome of a run, as the caller reports it.
@@ -264,6 +274,7 @@ async fn run_loop(
     let mut computer_loop = ComputerUseLoop::new(plan.adapter.clone())
         .with_config(plan.loop_config)
         .with_allow_apps(plan.allow_apps.clone())
+        .with_approval_provenance(plan.approved_by.clone(), plan.conversation_id.clone())
         .with_execution_controller(controller.clone());
     if resume.start_step > 0 {
         // A resumed run's status must read like the run it continues, not like
@@ -1166,6 +1177,10 @@ mod tests {
             store: None,
             checkpoint: None,
             allow_apps: Default::default(),
+            // A unit-test plan is not an approved run; it drives a fake adapter
+            // that reaches no registry, so nothing inherits this.
+            approved_by: String::new(),
+            conversation_id: String::new(),
         }
     }
 

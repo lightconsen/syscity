@@ -189,6 +189,20 @@ pub struct SessionConfig {
     /// session that was built before it. An empty list is no boundary, which is
     /// the default.
     pub allow_apps: crate::computer::app_scope::AppAllowlist,
+    /// The tool whose approval covers this session's desktop work.
+    ///
+    /// A session is built by a caller that has already passed the gate — the
+    /// `computer` tool, or `computer.run`'s request. The adapter's inner calls
+    /// (AppleScript, the native desktop-control tool) require approval too, and
+    /// they run with a bare context that has no ask queue: without this, each
+    /// one would be refused by the gate the session was already granted.
+    ///
+    /// Empty means "no approval carries down", which is the honest default for
+    /// a session built outside an approved call.
+    pub approved_by: String,
+    /// The conversation this session acts for, which an inherited grant is
+    /// checked against. Empty outside a conversation.
+    pub conversation_id: String,
 }
 
 impl Default for SessionConfig {
@@ -202,6 +216,8 @@ impl Default for SessionConfig {
             delivery: DeliveryMode::Foreground,
             step_budget: None,
             allow_apps: crate::computer::app_scope::AppAllowlist::default(),
+            approved_by: String::new(),
+            conversation_id: String::new(),
         }
     }
 }
@@ -949,8 +965,35 @@ impl ComputerSession {
         Some(format!("{what} is disabled"))
     }
 
-    /// Perform the action at one rung.
+    /// Perform the action at one rung, under the session's approval.
+    ///
+    /// The desktop adapter drives the screen through the tool registry, and
+    /// those inner tools now require approval. The session is built by a
+    /// caller that already has it (the `computer` tool after its own gate, a
+    /// run after `computer.run`'s), so the approval is carried down here rather
+    /// than asked for again — and, on the inner call, asked for in a context
+    /// with no queue to put the question on, which is why an un-inherited gate
+    /// refused every step.
+    ///
+    /// Scoped to the task, not stored on the shared adapter: this adapter
+    /// serves every conversation, and a grant parked on it would be read by
+    /// whichever step ran next. Scoped around the *whole* dispatch rather than
+    /// only the foreground path, because the background path
+    /// (`perform_background`) reaches `applescript` just the same.
     async fn dispatch(
+        &self,
+        action: &DesktopAction,
+        rung: Rung,
+        budget: &StepBudget,
+    ) -> crate::computer::Result<ActionResult> {
+        let grant = crate::tools::DesktopGrant::new(
+            self.config.approved_by.as_str(),
+            self.config.conversation_id.as_str(),
+        );
+        crate::tools::with_desktop_grant(grant, self.dispatch_granted(action, rung, budget)).await
+    }
+
+    async fn dispatch_granted(
         &self,
         action: &DesktopAction,
         rung: Rung,
@@ -992,13 +1035,13 @@ impl ComputerSession {
         crate::computer::budget::within(
             budget,
             "the action dispatch",
-            self.dispatch_now(action, rung),
+            self.dispatch_inner(action, rung),
         )
         .await
         .unwrap_or_else(|_| Err(ComputerError::BudgetExhausted("dispatch".to_string())))
     }
 
-    async fn dispatch_now(
+    async fn dispatch_inner(
         &self,
         action: &DesktopAction,
         rung: Rung,

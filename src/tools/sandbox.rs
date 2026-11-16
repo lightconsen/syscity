@@ -338,6 +338,7 @@ mod tests {
             steers: None,
             trace: None,
             tiering: None,
+            desktop_grant: None,
         }
     }
 

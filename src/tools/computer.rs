@@ -124,6 +124,13 @@ impl ComputerTool {
                         crate::computer::session::SessionConfig {
                             delivery,
                             allow_apps: self.allow_apps.as_ref().clone(),
+                            // This tool passed the gate before any action was
+                            // dispatched, and the adapter drives the screen by
+                            // calling other approval-gated tools. Carrying the
+                            // approval down is what keeps one approval worth
+                            // something instead of asking for each keystroke.
+                            approved_by: "computer".to_string(),
+                            conversation_id: conversation.clone(),
                             ..Default::default()
                         },
                     );

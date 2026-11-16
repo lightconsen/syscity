@@ -298,6 +298,87 @@ pub struct ToolContext {
     /// outside an agent turn, where there is nothing tiered and asking would
     /// have no subject.
     pub tiering: Option<Arc<crate::tools::tiering::ToolTiering>>,
+    /// The desktop approval this call runs under, when it runs under one.
+    ///
+    /// The desktop adapter drives the screen by calling other tools
+    /// (`applescript`, `macos_desktop_control`) through the registry. Those now
+    /// advertise `requires_approval`, so an inner call that carried a bare
+    /// default context would be refused by the very gate the outer call just
+    /// passed — one approval would buy nothing on macOS.
+    ///
+    /// This is that approval, carried down. It is set by the layer a person
+    /// actually answered (`computer`, or `computer.run`'s own request) and read
+    /// by the inner call, which is why it names the tool and turn it came
+    /// from: an audit can tell "approved as part of `computer`" apart from "a
+    /// model called `applescript` directly", and the latter still asks.
+    ///
+    /// `None` everywhere else, including every entry point that has not
+    /// approved anything yet.
+    pub desktop_grant: Option<DesktopGrant>,
+}
+
+/// An approval to drive the desktop, inherited by the adapter's inner calls.
+///
+/// Deliberately not a boolean: the fields are what make the inherited approval
+/// auditable and bounded. A grant names the tool the person answered for, so a
+/// log line can say which decision covered the step, and the turn it belongs
+/// to, so a grant cannot be carried from one conversation into another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopGrant {
+    /// The tool whose approval this is — `computer`, `computer_run`, or a
+    /// desktop platform tool reached directly.
+    pub approved_tool: String,
+    /// The conversation that approval was given in.
+    ///
+    /// An inner call in a *different* conversation does not inherit it: the
+    /// person in that conversation never saw the question.
+    pub conversation_id: String,
+}
+
+tokio::task_local! {
+    /// The desktop approval the current task runs under.
+    ///
+    /// Task-local rather than a field on the adapter, which is one shared
+    /// object serving every conversation: a grant stored on it would be
+    /// readable by whichever task happened to run next. Scoping it to the task
+    /// is what makes "this step's inner call" mean one thing.
+    ///
+    /// Read by [`crate::tools::registry::ToolRegistry`] when an inner desktop
+    /// call would otherwise need its own approval — see
+    /// [`ToolContext::desktop_grant`].
+    static DESKTOP_GRANT: DesktopGrant;
+}
+
+/// Run `f` with `grant` in scope, so the desktop calls it makes inherit it.
+///
+/// Nesting keeps the innermost grant: a subtask that legitimately holds its own
+/// grant does not lose it to the caller's.
+pub async fn with_desktop_grant<F, T>(grant: DesktopGrant, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    DESKTOP_GRANT.scope(grant, f).await
+}
+
+/// The grant in scope for the current task, if any.
+pub fn current_desktop_grant() -> Option<DesktopGrant> {
+    DESKTOP_GRANT.try_with(|grant| grant.clone()).ok()
+}
+
+impl DesktopGrant {
+    /// A grant from the tool a person answered for, in the conversation it was
+    /// given in.
+    pub fn new(approved_tool: impl Into<String>, conversation_id: impl Into<String>) -> Self {
+        Self {
+            approved_tool: approved_tool.into(),
+            conversation_id: conversation_id.into(),
+        }
+    }
+
+    /// Whether this grant covers a call being made in `conversation_id`.
+    pub fn covers(&self, conversation_id: &str) -> bool {
+        self.conversation_id == conversation_id
+    }
 }
 
 /// The part of a turn an independently-invoked tool may write to.
@@ -430,6 +511,15 @@ impl ToolContext {
     /// Set workspace root
     pub fn with_workspace_root(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.sandbox.workspace_root = Some(path.into());
+        self
+    }
+
+    /// Carry down a desktop approval this call runs under.
+    ///
+    /// Set by the layer a person answered for, read by the desktop adapter's
+    /// inner calls. See [`DesktopGrant`].
+    pub fn with_desktop_grant(mut self, grant: DesktopGrant) -> Self {
+        self.desktop_grant = Some(grant);
         self
     }
 

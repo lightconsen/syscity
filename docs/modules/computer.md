@@ -319,6 +319,42 @@ Changing the list with `config.set` (`path: "computer.allow_apps"`, an array of
 names) or by editing `config.toml` reaches **sessions that are already
 running**: the handle is shared, not copied, and both paths `replace()` it.
 
+### Approvals
+
+Every platform tool an adapter uses to move the machine — `applescript`,
+`*_desktop_control`, `*_powershell`, the clipboard writers — advertises
+`requires_approval`. Observation tools (`*_accessibility`, `*_screenshot`) do
+not: a model that cannot look cannot find out what to ask about.
+
+The adapter does not ask. It is reached from the `computer` tool or from
+`computer.run`, and the caller already answered a gate — asking again for each
+of the seventeen inner calls a step makes would be several prompts a second and,
+in a run started over WS, no prompt at all. So a session carries the approval
+that produced it:
+
+- `SessionConfig.approved_by` names the tool that was approved
+  (`computer`, `computer.run`, `computer.play`), and `conversation_id` says
+  which conversation's turn it came from.
+- `ComputerSession::dispatch` puts that pair in a tokio task-local
+  (`DesktopGrant`) around the whole dispatch — foreground *and* background,
+  since `perform_background` reaches `applescript` too.
+- The registry's gate, before refusing a `requires_approval` call out of a
+  context that cannot ask, checks for a grant in scope. If it covers this
+  conversation and the tool is on `DESKTOP_INNER_TOOLS`, the call is allowed
+  and logged as `kind: "inherited_approval"` with both names, so a run that
+  clicked a hundred times is traceable to the one decision that allowed it.
+
+Task-local rather than a field on the adapter: the adapter instance serves every
+conversation, and a grant parked on it would be read by whichever task happened
+to run next. A tool *not* on `DESKTOP_INNER_TOOLS` never inherits — a `computer`
+approval is not a way for a model to reach `shell`. A grant whose conversation
+differs from the calling context's is likewise ignored.
+
+`DESKTOP_INNER_TOOLS` is the contract between the two halves, so a sweep in
+`agent_spawn` checks it both ways: every name the adapters really call must be
+listed (or a step is refused with no way to say yes), and every listed name must
+answer to a compiled tool (or a rename has quietly un-gated one).
+
 ## Regression baseline
 
 `tests/gui_baseline.rs` drives a real headless Chrome through the page rung —

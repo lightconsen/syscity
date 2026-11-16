@@ -1547,6 +1547,54 @@ mod tests {
             }
         }
 
+        // The other half of the contract: a tool an adapter must reach has to
+        // be able to inherit the approval the caller already gave, or every
+        // step is refused with no way to say yes. The names below are the ones
+        // `src/computer/platform_*.rs` really calls; a new call site added
+        // without a line in `DESKTOP_INNER_TOOLS` would fail here rather than
+        // on a user's screen.
+        const ADAPTER_CALLS: &[&str] = &[
+            "applescript",
+            "macos_desktop_control",
+            "macos_accessibility",
+            "macos_screenshot",
+            "windows_desktop_control",
+            "windows_powershell",
+            "windows_clipboard",
+            "windows_accessibility",
+            "windows_screenshot",
+            "linux_x11_desktop_control",
+            "linux_x11_accessibility",
+            "linux_x11_screenshot",
+            "linux_x11_clipboard",
+            "linux_wayland_desktop_control",
+            "linux_wayland_accessibility",
+            "linux_wayland_screenshot",
+            "linux_wayland_clipboard",
+        ];
+        use crate::tools::DESKTOP_INNER_TOOLS;
+        let known: std::collections::HashSet<String> = sets
+            .iter()
+            .flat_map(|s| s.tools())
+            .map(|t| t.name().to_string())
+            .collect();
+        let unlisted: Vec<&&str> = ADAPTER_CALLS
+            .iter()
+            .filter(|name| !crate::tools::DESKTOP_INNER_TOOLS.contains(name))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "these tools are driven by an adapter but cannot inherit its approval: {unlisted:?}"
+        );
+        let unknown: Vec<&&str> = DESKTOP_INNER_TOOLS
+            .iter()
+            .filter(|name| !known.contains(**name) && !ADAPTER_CALLS.contains(name))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "DESKTOP_INNER_TOOLS names tools no compiled set answers to: {unknown:?}"
+        );
+
         // A sweep whose naming heuristic stopped matching would pass silently.
         // Four is the honest floor off macOS (Windows, X11, Wayland); the
         // macOS-only sets add AppleScript and its desktop control tool.

@@ -249,6 +249,22 @@ impl ComputerUseLoop {
         self
     }
 
+    /// The approval this loop's desktop work runs under.
+    ///
+    /// The adapter's inner calls require approval and run with a bare context
+    /// that has no ask queue, so without this each step would be refused by the
+    /// gate the caller already passed. See [`SessionConfig::approved_by`].
+    pub fn with_approval_provenance(
+        mut self,
+        approved_by: impl Into<String>,
+        conversation_id: impl Into<String>,
+    ) -> Self {
+        self.session_config.approved_by = approved_by.into();
+        self.session_config.conversation_id = conversation_id.into();
+        self.rebuild_session();
+        self
+    }
+
     /// Paths to snapshot before each action (directories or files).
     pub fn with_snapshot_paths(mut self, paths: Vec<String>) -> Self {
         self.session_config.snapshot_paths = paths;

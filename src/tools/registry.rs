@@ -180,6 +180,36 @@ impl std::fmt::Debug for ToolRegistry {
     }
 }
 
+/// The tools a desktop adapter reaches to observe or drive a screen.
+///
+/// Only these may inherit an approval. A grant is about *where the call came
+/// from*, not a blanket permission for the turn: if it covered every tool, the
+/// `computer` tool's approval would be a way for a model to reach `shell`.
+///
+/// Kept as one list rather than inline in the gate so the platform sweep can
+/// assert it is complete — a new desktop tool added without a line here would
+/// otherwise be refused on every step, which reads as "the engine is broken"
+/// rather than "the list is stale".
+pub(crate) const DESKTOP_INNER_TOOLS: &[&str] = &[
+    "applescript",
+    "macos_desktop_control",
+    "macos_accessibility",
+    "macos_screenshot",
+    "windows_desktop_control",
+    "windows_powershell",
+    "windows_accessibility",
+    "windows_screenshot",
+    "windows_clipboard",
+    "linux_x11_desktop_control",
+    "linux_x11_accessibility",
+    "linux_x11_screenshot",
+    "linux_x11_clipboard",
+    "linux_wayland_desktop_control",
+    "linux_wayland_accessibility",
+    "linux_wayland_screenshot",
+    "linux_wayland_clipboard",
+];
+
 impl ToolRegistry {
     /// Number of consecutive failures before a tool is circuit-broken.
     pub const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
@@ -1055,6 +1085,41 @@ impl ToolRegistry {
         self.run_gate(name, args, ctx).await
     }
 
+    /// Whether this call is an inner desktop call covered by an approval the
+    /// caller already gave.
+    ///
+    /// Narrow on purpose. The grant must name a desktop tool, and the
+    /// conversation must be the one the approval was given in — a grant lifted
+    /// from one conversation's turn must not authorise another's. Everything
+    /// else is `false`, so a model calling `applescript` directly still gets
+    /// the ordinary question.
+    fn inherited_desktop_grant(
+        &self,
+        name: &str,
+        ctx: &ToolContext,
+    ) -> Option<crate::tools::DesktopGrant> {
+        // Two ways a grant reaches an inner call: on the context, when the
+        // caller built one for it, or in the task-local scope, when the call
+        // came through a shared adapter that has no context to thread. The
+        // adapter path is the common one — its inner calls construct a bare
+        // default context — so the task-local is what actually carries it.
+        let grant = ctx
+            .desktop_grant
+            .clone()
+            .or_else(crate::tools::types::current_desktop_grant);
+        let grant = grant?;
+        // The check has teeth only when the context says which conversation it
+        // is. The adapter's inner calls build a bare default context that names
+        // none — there the scope is the whole authority, and it is trustworthy
+        // because only this process put it there. A context that *does* name a
+        // conversation must match: a grant from one turn must not authorise a
+        // call made in another.
+        if !ctx.conversation_id.is_empty() && !grant.covers(&ctx.conversation_id) {
+            return None;
+        }
+        DESKTOP_INNER_TOOLS.contains(&name).then_some(grant)
+    }
+
     /// The approval a tool advertising `requires_approval` needs.
     ///
     /// One constructor for both policy paths, so what a caller sees cannot
@@ -1181,7 +1246,17 @@ impl ToolRegistry {
                         // pre-approval path is a `[permissions].allow` rule
                         // (name globs reach MCP tools).
                         if self.get_capabilities(name).requires_approval {
-                            if crate::tools::ask_user::can_ask_a_human(ctx) {
+                            if let Some(grant) = self.inherited_desktop_grant(name, ctx) {
+                                // The desktop adapter's inner call, covered by
+                                // the approval a person already gave for the
+                                // outer tool. Asking again would be asking the
+                                // same question twice and, worse, failing closed
+                                // the second time because the inner context has
+                                // no ask queue — which is how one approval
+                                // stopped buying anything on macOS.
+                                self.audit_inherited_approval(name, ctx, &grant).await;
+                                ToolPolicyDecision::Allow
+                            } else if crate::tools::ask_user::can_ask_a_human(ctx) {
                                 self.approval_fallback(name, args)
                             } else {
                                 ToolPolicyDecision::Deny {
@@ -1207,6 +1282,42 @@ impl ToolRegistry {
 
         self.audit_policy_decision(name, ctx, &decision).await;
         decision
+    }
+
+    /// Record that an inner desktop call ran under an approval someone else
+    /// already gave.
+    ///
+    /// The ordinary allow path writes nothing — an allow is unremarkable — but
+    /// this one is a permission being *reused* across calls, and the log should
+    /// let a reader reconstruct why the adapter could act on a screen nobody was
+    /// asked about a second time. Without this line, a run that clicked a
+    /// hundred times looks like a hundred ordinary invocations.
+    async fn audit_inherited_approval(
+        &self,
+        name: &str,
+        ctx: &ToolContext,
+        grant: &crate::tools::DesktopGrant,
+    ) {
+        let Some(ref audit) = self.audit_log else {
+            return;
+        };
+        audit
+            .log_entry(
+                crate::security::runtime_audit::AuditEventType::ToolInvocation,
+                ctx.user_id.clone(),
+                name.to_string(),
+                true,
+                format!(
+                    "Tool '{name}' ran under the approval given to '{}' in conversation '{}'",
+                    grant.approved_tool, grant.conversation_id
+                ),
+                Some(serde_json::json!({
+                    "kind": "inherited_approval",
+                    "approved_tool": grant.approved_tool,
+                    "conversation_id": grant.conversation_id,
+                })),
+            )
+            .await;
     }
 
     /// A second model's opinion on a call that is about to ask a human.
@@ -2762,6 +2873,176 @@ mod tests {
             crate::tools::ask_user::background_context_reason(&ctx).is_none(),
             "but it is not a background context either: nothing about it says nobody is present"
         );
+    }
+
+    /// The macOS adapter's own call path, exercised as it really runs.
+    ///
+    /// `platform_macos` drives the screen by calling `applescript` and
+    /// `macos_desktop_control` through the gateway's registry with
+    /// `ToolContext::default()`. Both now advertise `requires_approval`, so
+    /// whether `computer.run` works at all depends on what that default context
+    /// gets back from the gate.
+    ///
+    /// The answer is a `Deny` naming the pre-approval path — not a prompt, and
+    /// not a five-minute wait. `can_ask_a_human` needs an ask queue to put a
+    /// question on, and a default context has none, so the fallback fails
+    /// closed exactly as it does for cron. (An approval *queue* being present
+    /// is not the test: the question has no channel to reach a person.)
+    ///
+    /// This test exists to pin that shape, because it is the reason a
+    /// `computer.run` step cannot be left to inherit the gate: the adapter must
+    /// hand its inner calls a context that says where the permission came from,
+    /// or every step is refused by the gate the run just passed.
+    #[tokio::test]
+    async fn an_internal_adapter_call_with_a_default_context_is_denied_today() {
+        let ran = Arc::new(AtomicBool::new(false));
+        // The gateway's registry does carry an approval queue, so this is the
+        // production shape rather than the barest one.
+        let mut registry = ToolRegistry::new().with_approval_queue(Arc::new(ApprovalQueue::new()));
+        registry.register(approval_spy("applescript", ran.clone()));
+
+        let call = FunctionCall {
+            name: "applescript".to_string(),
+            arguments:
+                serde_json::json!({ "script": "tell application \"Calculator\" to activate" })
+                    .to_string(),
+        };
+
+        // A short cap: a deny returns at once, while a regression that submitted
+        // to the queue would sit on the five-minute timeout and read as a hang.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.execute_call(&call, &ToolContext::default()),
+        )
+        .await
+        .expect("a default context must not wait on an approval it cannot ask for");
+
+        let err = outcome.expect_err("today the adapter's inner call is refused");
+        assert!(err.to_string().contains("no human is present"), "err: {err}");
+        assert!(!ran.load(Ordering::SeqCst), "the tool body must not have run");
+    }
+
+    /// The fix for the adapter path: an inner desktop call inherits the
+    /// approval its caller already obtained, instead of being refused by the
+    /// gate that caller just passed.
+    ///
+    /// This is the shape `platform_macos` really uses — a bare
+    /// `ToolContext::default()` with no ask queue — so without inheritance
+    /// every `computer.run` step on macOS is denied and the engine cannot move
+    /// the mouse at all.
+    #[tokio::test]
+    async fn an_inner_desktop_call_inherits_the_callers_approval() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new().with_approval_queue(Arc::new(ApprovalQueue::new()));
+        registry.register(approval_spy("applescript", ran.clone()));
+
+        let call = FunctionCall {
+            name: "applescript".to_string(),
+            arguments: serde_json::json!({ "script": "return 6*7" }).to_string(),
+        };
+
+        // Exactly the adapter's context: default, no queue, no identity.
+        let ctx = ToolContext::default();
+        let grant = crate::tools::DesktopGrant::new("computer.run", "");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::tools::with_desktop_grant(grant, registry.execute_call(&call, &ctx)),
+        )
+        .await
+        .expect("inheriting an approval must not wait on anything");
+
+        let result = outcome.expect("the inner call must run under the inherited approval");
+        assert!(result.success, "the body ran: {:?}", result.output);
+        assert!(ran.load(Ordering::SeqCst), "the tool body must actually have run");
+    }
+
+    /// An inherited allow is a permission being reused, so it must leave a
+    /// trace. Without one, a run that clicked a hundred times reads in the log
+    /// as a hundred ordinary invocations and nobody can tell it acted on a
+    /// screen without asking.
+    #[tokio::test]
+    async fn an_inherited_approval_is_recorded_with_its_provenance() {
+        let audit = Arc::new(crate::security::runtime_audit::RuntimeAuditLog::with_capacity(100));
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new()
+            .with_approval_queue(Arc::new(ApprovalQueue::new()))
+            .with_audit_log(audit.clone());
+        registry.register(approval_spy("applescript", ran.clone()));
+
+        let call = FunctionCall {
+            name: "applescript".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let outcome = crate::tools::with_desktop_grant(
+            crate::tools::DesktopGrant::new("computer.run", "conv-a"),
+            registry.execute_call(&call, &ToolContext::default()),
+        )
+        .await;
+        assert!(outcome.is_ok(), "the inner call runs: {outcome:?}");
+
+        let entries = audit.recent(50).await;
+        let inherited = entries.iter().find(|e| {
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("kind"))
+                .and_then(|k| k.as_str())
+                == Some("inherited_approval")
+        });
+        let entry = inherited.expect("an inherited allow must be in the audit log");
+        assert!(
+            entry.description.contains("computer.run"),
+            "the entry names whose approval it was: {}",
+            entry.description
+        );
+        assert!(
+            entry.description.contains("conv-a"),
+            "the entry names the conversation it came from: {}",
+            entry.description
+        );
+    }
+
+    /// The grant is a permission for *desktop* calls in *that* conversation —
+    /// not a blanket bypass. A model calling a tool directly, or a grant lifted
+    /// into another conversation, still gets the ordinary refusal.
+    #[tokio::test]
+    async fn an_inherited_grant_does_not_cover_other_tools_or_conversations() {
+        let mut registry = ToolRegistry::new().with_approval_queue(Arc::new(ApprovalQueue::new()));
+
+        // A tool that is not one the adapter must reach for a screen.
+        let ran = Arc::new(AtomicBool::new(false));
+        registry.register(approval_spy("not_a_desktop_tool", ran.clone()));
+
+        let call = FunctionCall {
+            name: "not_a_desktop_tool".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let ctx = ToolContext::default();
+        let grant = crate::tools::DesktopGrant::new("computer.run", "");
+
+        let err =
+            crate::tools::with_desktop_grant(grant.clone(), registry.execute_call(&call, &ctx))
+                .await
+                .expect_err("a grant must not become a bypass for unrelated tools");
+        assert!(err.to_string().contains("no human is present"), "err: {err}");
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // And a desktop tool, but the grant belongs to another conversation.
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new().with_approval_queue(Arc::new(ApprovalQueue::new()));
+        registry.register(approval_spy("applescript", ran.clone()));
+        let call = FunctionCall {
+            name: "applescript".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let other_conversation = ToolContext::new("user", "conv-b");
+        let err = crate::tools::with_desktop_grant(
+            crate::tools::DesktopGrant::new("computer.run", "conv-a"),
+            registry.execute_call(&call, &other_conversation),
+        )
+        .await
+        .expect_err("a grant from one conversation must not authorise another");
+        assert!(err.to_string().contains("no human is present"), "err: {err}");
     }
 
     /// The same tool, in a background context (cron/heartbeat/delegation),

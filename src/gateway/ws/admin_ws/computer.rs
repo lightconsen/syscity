@@ -365,6 +365,12 @@ async fn launch(
         store: Some(Arc::new(crate::computer::run_store::RunStore::for_paths(&state.paths))),
         checkpoint,
         allow_apps: state.tools.computer_allow_apps.as_ref().clone(),
+        // This run exists because a `computer.run` request asked for it, and
+        // that request passed the gate. The adapter's inner calls inherit that
+        // approval rather than asking again — they run with a bare context that
+        // has no queue to put a second question on.
+        approved_by: "computer.run".to_string(),
+        conversation_id: session_id.clone().unwrap_or_default(),
     };
 
     let task_state = state.clone();
@@ -1099,12 +1105,18 @@ async fn spawn_play(
     let total = plan.steps.len();
     let plan_run_id = plan.run_id.clone();
     let allow_apps = state.tools.computer_allow_apps.as_ref().clone();
+    let conversation_id = plan.session_id.clone().unwrap_or_default();
     let task = tokio::spawn(async move {
         // One session for the whole replay, so the ladder's step history and
         // the verification engine see the task, not N unrelated actions.
         let session = crate::computer::session::ComputerSession::new(adapter).with_config(
             crate::computer::session::SessionConfig {
                 allow_apps,
+                // The replay was asked for by a `computer.play` request that
+                // already passed the gate; its inner desktop calls inherit
+                // that approval.
+                approved_by: "computer.play".to_string(),
+                conversation_id,
                 ..Default::default()
             },
         );
