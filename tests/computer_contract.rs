@@ -824,3 +824,25 @@ async fn launching_an_app_off_the_list_is_refused() {
     assert_eq!(evidence.effect, ActionEffect::Refused);
     assert!(outcome.result.message.contains("1Password"), "{}", outcome.result.message);
 }
+
+/// Scrolling an element is an action on that element's app, not evidence-less:
+/// asking the adapter which window the element is in is what keeps "scroll
+/// inside Safari is fine" from being refused while "click inside Safari" is.
+#[tokio::test]
+async fn scrolling_an_allowed_apps_element_passes_the_boundary() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(DesktopAction::Scroll {
+            target: ClickTarget::ElementId("live-save".to_string()),
+            direction: syscity::computer::ScrollDirection::Down,
+            amount: 3,
+        })
+        .await
+        .expect("an outcome");
+
+    assert!(
+        !outcome.result.message.contains("allow_apps"),
+        "a scroll inside a listed app must not be refused by the boundary: {}",
+        outcome.result.message
+    );
+}

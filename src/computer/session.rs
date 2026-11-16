@@ -1496,8 +1496,17 @@ impl ComputerSession {
         if self.config.allow_apps.is_empty() || !aims_at_an_app(action) {
             return None;
         }
-        let app = self.action_app(action).await;
-        self.config.allow_apps.refusal(app.as_deref())
+        // A drag has two endpoints, and the drop lands at the second: a drag
+        // that starts inside the list and ends outside it moves data across
+        // the boundary, so both have to be refused together.
+        let apps: Vec<Option<String>> = match action {
+            DesktopAction::Drag { from, to } => {
+                vec![self.app_of_target(from).await, self.app_of_target(to).await]
+            }
+            other => vec![self.action_app(other).await],
+        };
+        apps.iter()
+            .find_map(|app| self.config.allow_apps.refusal(app.as_deref()))
     }
 
     /// The application an action is aimed at, as well as this session can tell.
@@ -1527,11 +1536,31 @@ impl ComputerSession {
             DesktopAction::KillProcess { name, .. }
             | DesktopAction::RestartProcess { name, .. }
             | DesktopAction::SetProcessPriority { name, .. } => name.clone(),
+            // A scroll names its target the way a click does, but it is not
+            // one of the actions the ladder aims through `resolved_target`, so
+            // ask the adapter directly: a session that may act on Safari must
+            // not have scrolling its window refused while clicking the same
+            // element is allowed.
+            DesktopAction::Scroll { target, .. } => self.app_of_target(target).await,
             other => self
                 .resolved_target(other)
                 .await
                 .and_then(|resolved| resolved.app),
         }
+    }
+
+    /// The app an element target belongs to, resolved through the adapter's
+    /// snapshot. A bare point belongs to whatever draws under it, which is no
+    /// answer at all.
+    async fn app_of_target(&self, target: &ClickTarget) -> Option<String> {
+        if matches!(target, ClickTarget::Coordinate(_)) {
+            return None;
+        }
+        self.adapter
+            .resolve_target(target)
+            .await
+            .ok()
+            .and_then(|resolved| resolved.app)
     }
 
     /// Update failure counters, trigger auto-rollback, and reflect.
