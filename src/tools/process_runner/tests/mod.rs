@@ -107,11 +107,21 @@ async fn run_reports_signal_when_child_is_killed() {
 
 #[tokio::test]
 async fn run_collect_timeout_kills_backgrounded_descendants() {
-    // Unfenced spawn: `sleep 5` is backgrounded by sh. Without the
+    // Unfenced spawn: `sleep 30` is backgrounded by sh. Without the
     // process-group kill the orphan keeps the shared stdout pipe open
-    // and the pipe-drain below blocks ~5s past the 300ms timeout.
-    let mut req = argv(&["/bin/sh", "-c", "echo partial-out; sleep 5 & wait"]);
-    req.timeout = Some(Duration::from_millis(300));
+    // and the pipe-drain below blocks for the whole sleep past the timeout.
+    //
+    // The timeout is 3s, not the 300ms this test used to carry, because the
+    // assertion below is about *output surviving the kill* and a 300ms
+    // deadline was really measuring process start-up: on a runner busy with
+    // a few thousand other tests, forking sh and running `echo` takes longer
+    // than 300ms often enough to fail this test at random (observed tail
+    // ~2.3s), and the failure then reads as "partial output was dropped"
+    // when in fact the echo had not happened yet. The sleep is 30s so the
+    // deadline is still unambiguously before the child would finish, and
+    // the elapsed bound below still proves the kill did not wait for it.
+    let mut req = argv(&["/bin/sh", "-c", "echo partial-out; sleep 30 & wait"]);
+    req.timeout = Some(Duration::from_secs(3));
     let started = std::time::Instant::now();
     let out = StdProcessRunner.run_collect(&req).await.unwrap();
     assert!(out.timed_out, "run_collect should report the timeout");
@@ -123,7 +133,7 @@ async fn run_collect_timeout_kills_backgrounded_descendants() {
         out.stdout_string()
     );
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(10),
         "timeout must not wait for the orphaned sleep"
     );
 }

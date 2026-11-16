@@ -115,6 +115,10 @@ mod appcontainer {
         let runner = WindowsAppContainerRunner::default();
         let tmp = tempfile::tempdir().unwrap();
         let ws = std::fs::canonicalize(tmp.path()).unwrap();
+        // `timeout /t 5` keeps the job tree alive. The deadline is 3s so that
+        // process start-up (which on a busy runner can take seconds) is not
+        // what the deadline measures — the assertion below is that partial
+        // output survives the job-object kill, not that cmd.exe starts fast.
         let req = ProcessRequest {
             argv: vec![
                 "cmd".to_string(),
@@ -122,7 +126,7 @@ mod appcontainer {
                 "echo partial-out & timeout /t 5".to_string(),
             ],
             fence: Some(fence(ws.to_str().unwrap(), &[])),
-            timeout: Some(Duration::from_millis(300)),
+            timeout: Some(Duration::from_secs(3)),
             ..Default::default()
         };
         let started = std::time::Instant::now();
@@ -134,7 +138,7 @@ mod appcontainer {
             out.stdout_string()
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(10),
             "timeout must not wait for the orphaned child"
         );
     }

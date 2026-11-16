@@ -316,17 +316,21 @@ mod namespace_view {
         }
         let tmp = tempfile::tempdir().unwrap();
         let ws = std::fs::canonicalize(tmp.path()).unwrap();
-        // `sleep 5` is backgrounded by sh; without the group kill the
+        // `sleep 30` is backgrounded by sh; without the group kill the
         // orphan keeps the shared stdout pipe open and the drain below
-        // blocks ~5s past the 300ms timeout.
+        // blocks for the whole sleep past the timeout. The deadline is 3s
+        // for the same reason as the unfenced test: on a busy runner, the
+        // sandboxed fork+exec+`echo` does not reliably finish inside 300ms,
+        // and the assertion below would then fail as if partial output had
+        // been dropped when it had simply not been produced yet.
         let req = ProcessRequest {
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "echo partial-out; sleep 5 & wait".to_string(),
+                "echo partial-out; sleep 30 & wait".to_string(),
             ],
             fence: Some(fence_auto(ws.to_str().unwrap(), &[])),
-            timeout: Some(Duration::from_millis(300)),
+            timeout: Some(Duration::from_secs(3)),
             ..Default::default()
         };
         let started = std::time::Instant::now();
@@ -338,7 +342,7 @@ mod namespace_view {
             out.stdout_string()
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(10),
             "timeout must not wait for the orphaned sleep"
         );
     }
