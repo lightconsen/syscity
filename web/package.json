@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@assistant-ui/react": "0.15.30",
-    "@assistant-ui/react-markdown": "0.14.24",
+    "@assistant-ui/react-markdown": "0.14.26",
     "@tanstack/react-virtual": "^3.14.26",
     "@tauri-apps/api": "^2.12.4",
     "i18next": "^26.7.2",
