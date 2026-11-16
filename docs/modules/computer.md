@@ -203,6 +203,23 @@ retries a step into doing what it already did. `FailureStrategy` (`skip` default
 decides whether the replay goes on; a `Refused` step is terminal for that step whatever the strategy,
 since the same request meets the same refusal.
 
+**Watching without touching (stage G).** SSH already drives a remote machine; what was missing is a
+person being able to *see* it, which is the difference between approving a click and checking one.
+`computer.watch` captures on a timer and broadcasts each capture as `computer.frame`;
+`computer.unwatch` stops it. `computer/watch.rs` holds the frame contract and `computer/watch_registry.rs`
+the live set (on the gateway's tool state, like the recording — one screen, so a watcher started from
+one connection must be stoppable from another).
+
+"See, do not drive" is structural: that module has no path that dispatches a desktop action, so it is
+not a flag someone can flip. Frames are ordinary `Screenshot`s — the same capture path that already
+works locally and over SSH — published as ready-to-display data URLs, with the media type read from the
+payload's own first bytes (the capture path may have re-encoded it to JPEG, and a wrong type turns a
+good frame into a broken icon). A failed capture is broadcast as `computer.frame_failed` rather than
+skipped, because a viewer looking at a frozen last frame has to be able to tell "nothing changed" from
+"the capture broke"; three consecutive failures end the watcher, so a host that cannot capture at all
+does not log at the frame rate for five minutes. A watcher also ends itself after five minutes — "on"
+must not be a state that outlives the person who asked — and every loop `select!`s on shutdown.
+
 **The video half.** The actions are what a replay reproduces; the picture is what a person needs when
 the replay then does the wrong thing. `[computer] record_video = true` (off by default) makes
 `computer.record_start` also start a screen capture, and `record_stop` records the resulting file on

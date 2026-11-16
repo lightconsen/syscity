@@ -806,3 +806,103 @@ async fn a_replay_whose_targets_became_ambiguous_is_refused_before_it_moves() {
     assert_eq!(desktop.typed(), vec!["Reports".to_string()], "the replay dispatched no step");
     assert_eq!(desktop.field_value(), "Reports", "the recorded field is untouched");
 }
+
+// ── Stage G: see the screen without moving it ───────────────────────────────
+//
+// The remote story is SSH already drives the machine; what was missing is a
+// person being able to look at it. `computer.watch` captures on a timer and
+// publishes each capture as `computer.frame`, and has no input path at all.
+//
+// What this pins is the contract a viewer depends on: a frame arrives, it is a
+// ready-to-display data URL carrying the capture's real dimensions, `unwatch`
+// stops it, and a second `unwatch` (or one for a watch that already ended) is
+// still a success rather than an error that makes a reconnect noisy.
+
+#[tokio::test]
+#[serial]
+async fn watching_publishes_frames_and_unwatch_stops_them() {
+    let port = free_port();
+    let desktop = FinderDesktop::new();
+    let gateway = new_test_gateway(recording_config(port)).await;
+    register_mock_provider_with_model(&gateway.model_router(), recording_mock(), "mock-model")
+        .await;
+
+    let state = gateway.state();
+    let fake: Arc<dyn ComputerAdapter> = desktop.clone();
+    state
+        .tools
+        .computer_adapter
+        .write()
+        .await
+        .replace(fake.clone());
+    state.tools.registry.register_dynamic(Arc::new(
+        ComputerTool::new(Some(fake)).with_recording(state.tools.computer_recording.clone()),
+    ));
+
+    start_gateway_and_wait(port, gateway).await;
+
+    let mut client = FrontendSimulator::connect(port).await;
+    let sid = client.create_session().await;
+    client.subscribe(vec![sid.clone()]).await;
+
+    // 200ms is the floor, so the test does not spend a second per frame.
+    let started = client
+        .request("computer.watch", json!({ "interval_ms": 200 }))
+        .await;
+    assert_eq!(started["ok"], true, "{started}");
+    let watch_id = started["payload"]["watch_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the watch must be named: {started}"))
+        .to_string();
+    assert_eq!(started["payload"]["event"], "computer.frame", "{started}");
+    assert_eq!(
+        started["payload"]["interval_ms"], 200,
+        "a reasonable interval is honoured, and the reply says so: {started}"
+    );
+
+    let frame = client
+        .wait_for_event("computer.frame", 30)
+        .await
+        .expect("a frame must arrive");
+    assert_eq!(frame["watch_id"], watch_id.as_str(), "{frame}");
+    let inner = &frame["frame"];
+    assert_eq!(inner["watch_id"], watch_id.as_str(), "{frame}");
+    assert_eq!(inner["frame"], 1, "frames are counted from one: {frame}");
+    let image = inner["image"].as_str().unwrap_or_default();
+    assert!(
+        image.starts_with("data:image/"),
+        "a viewer puts this straight into an <img>: {}",
+        &image[..image.len().min(40)]
+    );
+    assert!(image.len() > 100, "the frame carries pixels, not a placeholder");
+    // The fake desktop reports 100x100; a frame that carried the wrong size
+    // would letterbox or stretch in the viewer.
+    assert_eq!(inner["width"], 100, "{frame}");
+    assert_eq!(inner["height"], 100, "{frame}");
+
+    let stopped = client
+        .request("computer.unwatch", json!({ "watch_id": watch_id }))
+        .await;
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["payload"]["was_running"], true, "{stopped}");
+
+    // Stopping what already stopped is success: the caller wanted "not
+    // running", and it is not running.
+    let again = client
+        .request("computer.unwatch", json!({ "watch_id": watch_id }))
+        .await;
+    assert_eq!(again["ok"], true, "{again}");
+    assert_eq!(
+        again["payload"]["was_running"], false,
+        "the second call reports the truth without failing: {again}"
+    );
+
+    // `computer.status` is the authority on "is something still capturing my
+    // screen", and the stop is recorded in the registry before the reply — so
+    // this is not a race with the task noticing the flag.
+    let listed = client.request("computer.status", json!({})).await;
+    let watches = listed["payload"]["watches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status reports the live watchers: {listed}"));
+    assert!(watches.is_empty(), "no watcher is left behind: {watches:?}");
+}

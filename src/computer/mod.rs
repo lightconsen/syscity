@@ -57,6 +57,8 @@ pub mod tree_render;
 pub mod types;
 pub mod use_loop;
 pub mod verification;
+pub mod watch;
+pub mod watch_registry;
 // The vision module itself is always compiled: its heavy ONNX/OCR
 // submodules are feature-gated internally, while `screen_state` (used by
 // `use_loop` and the computer/screen_state tools) is pure data structures.

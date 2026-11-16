@@ -346,6 +346,27 @@ pub enum GatewayEvent {
         turn_id: String,
         body: serde_json::Value,
     },
+    /// One frame of a screen being watched (`computer.watch`).
+    ///
+    /// Broadcast to every operator client, like a bare run's steps: the screen
+    /// being watched is the shared one, and a viewer should not have to guess
+    /// which connection asked first. `watch_id` separates two viewers' frames.
+    ComputerFrame {
+        watch_id: String,
+        /// The frame as `computer::watch::WatchedFrame` describes it
+        /// (`watch_id`, `frame`, `image`, `width`, `height`, `elapsed_ms`).
+        frame: serde_json::Value,
+    },
+    /// A watcher could not capture this frame.
+    ///
+    /// Carried rather than skipped: a viewer looking at a frozen last frame
+    /// needs to know the difference between "nothing changed" and "the capture
+    /// stopped working".
+    ComputerFrameFailed {
+        watch_id: String,
+        frame: u64,
+        error: String,
+    },
 }
 
 /// Agent status

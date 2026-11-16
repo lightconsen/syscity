@@ -418,10 +418,27 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 | `computer.record_start` | `write` | `{ name? }` 开始录制：`computer` 工具的每一次成功动作都会被记下来 |
 | `computer.record_stop` | `write` | `{ name, description? }` 结束录制，存成 `workflows/<name>.json`，返回抽出的 `parameters` |
 | `computer.play` | `write` | `{ name, parameters?, strategy?, confirm_sensitive?, session_id? }` 回放一个工作流（同样先返回 `run_id`） |
+| `computer.watch` | `read` | `{ interval_ms? }`（默认 1000，钳在 200–10000）开始**看**屏幕：每次截图作为 `computer.frame` 事件广播出去 |
+| `computer.unwatch` | `write` | `{ watch_id }` 停止一个 watch；本来就没在跑也算成功 |
 
 `computer.run` 参数：`{ goal, session_id? }`。`goal` 为空返回 `INVALID_PARAMS`；`[computer] enabled = false`
 返回 `COMPUTER_DISABLED`；本机没有适配器返回 `COMPUTER_UNAVAILABLE`；没有可用模型返回
 `NO_MODEL` / `NO_PROVIDER`。这些都在**创建 run 之前**拒绝，避免调用方拿到一个永远不会动的 `run_id`。
+
+`computer.watch` / `computer.unwatch`：**只看，不动**。G 阶段的"远程帮我干活"里 SSH 已经能驱动对方机器，
+缺的是人能看见它——一个看不见屏幕的人被要求批准他没法核对的点击。这个 watch 就是那一半，且**只有**那一半：
+它按间隔截图并广播，模块里没有任何派发动作的路径，"能看不能动"是结构上成立而不是靠一个可以翻的开关。
+
+返回 `{ watch_id, interval_ms, max_duration_ms, event: "computer.frame" }`。`interval_ms` 是**钳过之后**的值，
+不是请求值——调用方拿自己的计时器对齐时需要知道这一点。每帧的事件体是
+`{ watch_id, frame, image, width, height, elapsed_ms }`，`image` 是 `data:image/…;base64,…`，可以直接塞进 `<img>`；
+媒体类型从载荷头字节判断而不是猜扩展名（截图路径可能已经把它重编码成 JPEG，类型标错会让好帧显示成破图）。
+截图失败广播 `computer.frame_failed`（带 `error`），**不静默跳过**：盯着最后一帧卡住的查看者需要分清"画面没变"和"采集坏了"。
+连续 3 次失败 watcher 自行停止，否则一个根本没法截图的机器会按帧率刷日志五分钟。
+
+watcher 在 `MAX_DURATION`（5 分钟）后自行结束——"开着的"不能是一个比请求它的人活得更久的状态；
+它每个循环都 `select!` 挂 shutdown。`computer.status`（不带 `run_id`）的响应里多了 `watches` 数组，
+因为"是不是还有东西在截我的屏"必须能不靠等帧停下来就能回答。
 
 `computer.status` 响应含 `phase`（`running` / `paused` / `stepping` / `cancelled` / `done` / `failed`）、
 `runtime_state`、`step`、`last_action`、`last_verified`、`consecutive_failures`、`completed_steps`、

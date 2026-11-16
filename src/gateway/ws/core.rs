@@ -387,6 +387,10 @@ fn audience_of(event: &GatewayEvent) -> Audience {
         // shared desktop, and every operator client watching it should see the
         // same steps.
         E::ComputerStep { session_id: None, .. } => Audience::All,
+        // A watched screen is the shared one. Every operator client sees the
+        // frames, like a bare run's steps: hiding them per-session would make
+        // "who is looking at this machine" depend on which connection asked.
+        E::ComputerFrame { .. } | E::ComputerFrameFailed { .. } => Audience::All,
         E::AskRequired(e) => session(&e.session_id),
         E::AskResolved(e) => session(&e.session_id),
 
@@ -1156,6 +1160,8 @@ async fn dispatch_method(
         "computer.record_start" => admin_ws::handle_computer_record_start(req, state).await,
         "computer.record_stop" => admin_ws::handle_computer_record_stop(req, state).await,
         "computer.play" => admin_ws::handle_computer_play(req, state).await,
+        "computer.watch" => admin_ws::handle_computer_watch(req, state).await,
+        "computer.unwatch" => admin_ws::handle_computer_unwatch(req, state).await,
         "memory.search" => admin_ws::handle_memory_search(req, state).await,
         "memory.add" => admin_ws::handle_memory_add(req, state).await,
         "memory.collections" => admin_ws::handle_memory_collections(req, state).await,

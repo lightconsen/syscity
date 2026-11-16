@@ -203,6 +203,13 @@ pub struct ToolState {
     /// has to name the file. One optional path on the shared state is the
     /// smallest place for them to meet.
     pub computer_recording_video: Arc<RwLock<Option<std::path::PathBuf>>>,
+    /// Live screen watchers (`computer.watch`), by watch id.
+    ///
+    /// On the shared state rather than per connection: the screen being
+    /// watched is one screen, and `computer.unwatch` has to be able to stop a
+    /// watcher that another connection started — a viewer that reconnects, or
+    /// an operator closing a tab someone else opened.
+    pub computer_watches: Arc<crate::computer::watch_registry::WatchRegistry>,
     /// The apps desktop sessions may act on (`[computer] allow_apps`).
     ///
     /// On the tool state for the same reason the recording is: a run, a replay

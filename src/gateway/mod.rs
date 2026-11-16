@@ -540,6 +540,7 @@ impl Gateway {
                 computer_runs: Arc::new(crate::computer::run_registry::ComputerRunRegistry::new()),
                 computer_recording: tools_init.computer_recording.clone(),
                 computer_recording_video: Arc::new(RwLock::new(None)),
+                computer_watches: Arc::new(crate::computer::watch_registry::WatchRegistry::new()),
                 computer_allow_apps: tools_init.computer_allow_apps.clone(),
                 planner_handle: tools_init.planner_handle.clone(),
             },

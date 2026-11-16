@@ -428,6 +428,9 @@ pub const METHOD_SCOPES: &[(&str, Option<&str>)] = &[
     ("computer.record_start", Some(SCOPE_WRITE)),
     ("computer.record_stop", Some(SCOPE_WRITE)),
     ("computer.play", Some(SCOPE_WRITE)),
+    // Watching captures pixels and never dispatches: a read.
+    ("computer.watch", Some(SCOPE_READ)),
+    ("computer.unwatch", Some(SCOPE_WRITE)),
     ("agents.create", Some(SCOPE_WRITE)),
     ("agents.delete", Some(SCOPE_WRITE)),
     ("agents.purge", Some(SCOPE_WRITE)),
@@ -1118,6 +1121,18 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
                 "run_id": run_id,
                 "event": event,
             }),
+        )),
+        // One frame of a watched screen. The frame body travels whole for the
+        // same reason the run's events do: the viewer displays exactly what the
+        // capture produced, and a reshape here would be a second description
+        // that could drift from it.
+        GatewayEvent::ComputerFrame { watch_id, frame } => Some((
+            "computer.frame".to_string(),
+            serde_json::json!({ "watch_id": watch_id, "frame": frame }),
+        )),
+        GatewayEvent::ComputerFrameFailed { watch_id, frame, error } => Some((
+            "computer.frame_failed".to_string(),
+            serde_json::json!({ "watch_id": watch_id, "frame": frame, "error": error }),
         )),
         // The replay's verdict travels whole: the caller asked about a turn,
         // and reshaping the harness's own result (condition outcomes, critique,

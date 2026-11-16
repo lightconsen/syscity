@@ -205,6 +205,7 @@ pub async fn make_test_state_parts(
             computer_runs: Arc::new(crate::computer::run_registry::ComputerRunRegistry::new()),
             computer_recording: Arc::new(crate::planner::workflow::Recording::new()),
             computer_recording_video: Arc::new(tokio::sync::RwLock::new(None)),
+            computer_watches: Arc::new(crate::computer::watch_registry::WatchRegistry::new()),
             computer_allow_apps: Arc::new(crate::computer::app_scope::AppAllowlist::default()),
             planner_handle: Arc::new(std::sync::RwLock::new(None)),
         },

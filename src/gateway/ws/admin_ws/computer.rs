@@ -455,7 +455,19 @@ pub(crate) async fn handle_computer_status(
         },
         _ => WsResponse::ok(
             &req.id,
-            serde_json::json!({ "runs": state.tools.computer_runs.list().await }),
+            serde_json::json!({
+                "runs": state.tools.computer_runs.list().await,
+                // Watchers are host state, not run state, and "is something
+                // still capturing my screen" is a question an operator has to
+                // be able to answer without waiting for frames to stop.
+                "watches": state.tools.computer_watches.list().iter().map(|w| {
+                    serde_json::json!({
+                        "watch_id": w.id(),
+                        "interval_ms": w.interval_ms(),
+                        "stopping": w.stopping(),
+                    })
+                }).collect::<Vec<_>>(),
+            }),
         ),
     }
 }
@@ -1428,6 +1440,189 @@ fn unbound_parameters(
     } else {
         Some(missing)
     }
+}
+
+/// `computer.watch` — start publishing the screen to every operator client.
+///
+/// Params: `{ "interval_ms": 1000? }`.
+///
+/// The other half of stage G: SSH already drives a remote machine, and a person
+/// who cannot see it is being asked to approve clicks they cannot check. This
+/// captures and publishes; it dispatches nothing, and there is no input path in
+/// it to disable, which is how "see, do not drive" is enforced.
+///
+/// Returns the watch id and the interval actually used — the request is
+/// clamped, and a viewer comparing its timer against the reply needs to know.
+///
+/// The captures go out as `computer.frame` events, exactly like a run's steps:
+/// one screen, every operator client, no per-connection routing. A watcher ends
+/// itself after `computer::watch::MAX_DURATION`, so "on" is not a state that
+/// outlives the person who asked for it.
+pub(crate) async fn handle_computer_watch(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let params = match parse_params::<crate::computer::watch::WatchParams>(req) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let config = state.config.read().await.clone();
+    if !config.computer.enabled {
+        return WsResponse::err(
+            &req.id,
+            "COMPUTER_DISABLED",
+            "Computer use is disabled (`[computer] enabled = false`)",
+        );
+    }
+    let adapter = state.tools.computer_adapter.read().await.clone();
+    let Some(adapter) = adapter else {
+        return WsResponse::err(
+            &req.id,
+            "COMPUTER_UNAVAILABLE",
+            "No desktop adapter is available on this host",
+        );
+    };
+
+    let interval = params.interval();
+    let handle = state
+        .tools
+        .computer_watches
+        .start(interval.as_millis() as u64);
+    let watch_id = handle.id().to_string();
+    let reply_watch_id = watch_id.clone();
+
+    let task_state = state.clone();
+    let task_watch = handle.clone();
+    let shutdown = state.shutdown_token.clone();
+    let task = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut frame_number = 0u64;
+        let mut failures = 0u32;
+
+        loop {
+            if task_watch.stopping() {
+                tracing::info!("screen watch {watch_id} stopped by request");
+                break;
+            }
+            if started.elapsed() >= crate::computer::watch::MAX_DURATION {
+                tracing::info!(
+                    "screen watch {watch_id} reached its {:?} limit",
+                    crate::computer::watch::MAX_DURATION
+                );
+                break;
+            }
+
+            frame_number += 1;
+            // When this capture started, so the pause is measured from it
+            // rather than from the watcher's start.
+            let capture_started = started.elapsed();
+            match crate::computer::watch::capture_once(&adapter).await {
+                Ok(shot) => {
+                    failures = 0;
+                    let frame = crate::computer::watch::frame_from(
+                        &watch_id,
+                        frame_number,
+                        started.elapsed(),
+                        &shot,
+                    );
+                    let Ok(body) = serde_json::to_value(&frame) else {
+                        tracing::warn!("a watched frame did not serialize; dropping it");
+                        continue;
+                    };
+                    if let Err(e) = task_state.events.tx.send(GatewayEvent::ComputerFrame {
+                        watch_id: watch_id.clone(),
+                        frame: body,
+                    }) {
+                        tracing::debug!("nobody is watching screen {watch_id}: {e}");
+                    }
+                }
+                Err(error) => {
+                    // One failed capture is a dropped frame; a run of them is
+                    // the watcher telling the viewer why its picture froze, so
+                    // both are broadcast rather than swallowed.
+                    failures += 1;
+                    tracing::warn!("screen watch {watch_id} frame {frame_number}: {error}");
+                    let _ = task_state
+                        .events
+                        .tx
+                        .send(GatewayEvent::ComputerFrameFailed {
+                            watch_id: watch_id.clone(),
+                            frame: frame_number,
+                            error: error.clone(),
+                        });
+                    // A host that cannot capture at all would otherwise emit a
+                    // failure line at the frame rate for five minutes.
+                    if failures >= 3 {
+                        tracing::warn!(
+                            "screen watch {watch_id} stopping after {failures} consecutive \
+                             failed captures"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // The interval covers capture *and* pause: a capture that took
+            // longer than the interval must not be followed by a full pause, or
+            // a slow screen would fall further behind the clock every frame.
+            let pause = interval.saturating_sub(started.elapsed().saturating_sub(capture_started));
+            tokio::select! {
+                _ = tokio::time::sleep(pause) => {}
+                _ = shutdown.cancelled() => {
+                    tracing::info!("cancelling screen watch {watch_id} for shutdown");
+                    break;
+                }
+            }
+        }
+
+        task_state.tools.computer_watches.finish(&watch_id);
+    });
+
+    state
+        .task_registry
+        .insert_join(format!("computer:watch:{reply_watch_id}"), task)
+        .await;
+
+    let mut payload = params.describe();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("watch_id".to_string(), serde_json::json!(reply_watch_id));
+        obj.insert("event".to_string(), serde_json::json!("computer.frame"));
+    }
+    WsResponse::ok(&req.id, payload)
+}
+
+/// `computer.unwatch` — stop a watcher by id.
+///
+/// Params: `{ "watch_id": "..." }`. Idempotent: stopping a watcher that already
+/// ended (its own duration limit, or a client that disconnected) is a success,
+/// because the caller's intent — "this should not be running" — holds either
+/// way, and an error would make a reconnect loop noisy for no gain.
+pub(crate) async fn handle_computer_unwatch(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+) -> WsResponse {
+    let Ok(params) = parse_params::<serde_json::Value>(req) else {
+        return error_invalid_request(&req.id, "computer.unwatch takes an object of parameters");
+    };
+    let Some(watch_id) = params
+        .get("watch_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return error_invalid_request(&req.id, "computer.unwatch requires a non-empty `watch_id`");
+    };
+
+    let found = state.tools.computer_watches.stop(watch_id).is_some();
+    WsResponse::ok(
+        &req.id,
+        serde_json::json!({
+            "watch_id": watch_id,
+            // `false` is not an error: the watcher had already ended.
+            "was_running": found,
+            "stopping": true,
+        }),
+    )
 }
 
 #[derive(serde::Deserialize)]
