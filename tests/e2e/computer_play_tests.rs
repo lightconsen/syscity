@@ -388,6 +388,26 @@ async fn a_recorded_task_replays_with_a_different_name() {
     assert_eq!(view["phase"], "done", "{view}");
     assert_eq!(view["last_verified"], true, "{view}");
 
+    // The replay's event stream is numbered like a run's — zero-based
+    // positions — so a timeline drawn from a replay and one drawn from the run
+    // it came from do not sit one step apart. (`completed_steps` above is the
+    // human-facing 1-based rendering of the same three steps.)
+    for expected in 0..3u64 {
+        let event = client
+            .wait_for_event("computer.step", 30)
+            .await
+            .unwrap_or_else(|| panic!("no computer.step for replay step {expected}"));
+        let inner = &event["event"];
+        assert_eq!(inner["kind"], "step", "{event}");
+        assert_eq!(inner["step"], expected, "replay steps are zero-based: {event}");
+    }
+    let finished = client
+        .wait_for_event("computer.step", 30)
+        .await
+        .expect("the replay's conclusion is broadcast");
+    assert_eq!(finished["event"]["kind"], "finished", "{finished}");
+    assert_eq!(finished["event"]["steps"], 3, "{finished}");
+
     // ── The two runs are the same task ──
     let lines: Vec<String> = view["completed_steps"]
         .as_array()

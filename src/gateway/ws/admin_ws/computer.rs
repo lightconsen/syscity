@@ -1238,7 +1238,13 @@ async fn spawn_play(
                 &plan.run_id,
                 &crate::computer::run_executor::RunEvent::Step {
                     run_id: plan.run_id.clone(),
-                    step: index + 1,
+                    // Zero-based, like a run's own step events (they carry the
+                    // loop's `record.step`, which starts at 0) and like
+                    // `turns.replay`'s timeline. `run.step` below stays a
+                    // *count* of completed steps; the event is a position, and
+                    // one timeline drawn from a replay and from a live run must
+                    // not be off by one between them.
+                    step: index,
                     action: step.description.clone(),
                     rung: None,
                     effect: None,

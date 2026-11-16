@@ -51,6 +51,15 @@ pub enum RunEvent {
     /// One step finished.
     Step {
         run_id: String,
+        /// Position of the step, **zero-based**.
+        ///
+        /// Deliberately not the count: `finalize` reports `steps`, and a
+        /// client that wants "step 3 of 3" adds the one itself. Kept
+        /// zero-based because `turns.replay` numbers its timeline the same way
+        /// (`steps.len()`), and the two are drawn side by side — an off-by-one
+        /// between them misaligns every frame. Human-facing lines (the
+        /// `completed_steps` history, the handoff note) are 1-based via
+        /// [`crate::computer::run_store::step_line`].
         step: usize,
         /// What the action was, in words.
         action: String,
