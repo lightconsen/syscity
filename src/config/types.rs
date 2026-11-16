@@ -516,6 +516,18 @@ pub struct ComputerConfig {
     /// How the mobile control tools treat actions that cannot be taken back.
     #[serde(default)]
     pub mobile: MobileControlConfig,
+    /// Applications an action may be aimed at, by name (`"Safari"`, `"Google
+    /// Chrome*"`). Empty — the default — means no boundary.
+    ///
+    /// An allowlist rather than a denylist because the interesting set is
+    /// small ("the browser and the editor") and the screen also holds things
+    /// nobody thought to name. Once it is non-empty, an action that names no
+    /// app is refused as well: a coordinate click and a bare key press reach
+    /// whatever is in front, so they cannot be shown to stay inside the list.
+    /// See [`crate::computer::app_scope`] for why the boundary is here and not
+    /// in the operating system.
+    #[serde(default)]
+    pub allow_apps: Vec<String>,
     /// Enable computer use loop in agent responses
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -807,6 +819,7 @@ impl Default for ComputerConfig {
             remote_control: RemoteControlConfig::default(),
             headless: HeadlessConfig::default(),
             mobile: MobileControlConfig::default(),
+            allow_apps: Vec::new(),
             enabled: true,
             max_steps: default_max_computer_steps(),
             settle_delay_ms: default_settle_delay_ms(),

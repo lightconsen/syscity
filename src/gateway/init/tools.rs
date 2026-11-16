@@ -43,6 +43,12 @@ pub struct ToolsInit {
     /// stop a recording on this exact handle, and the tool feeds it. Two
     /// handles would be two recorders and no recording.
     pub computer_recording: Arc<crate::planner::workflow::Recording>,
+    /// The per-app boundary (`[computer] allow_apps`), shared by every session
+    /// this gateway starts — a chat turn's tool, a run, a replay.
+    ///
+    /// Returned for the same reason the recording is: the gateway's reload path
+    /// must be able to change the answer under sessions that already exist.
+    pub computer_allow_apps: Arc<crate::computer::app_scope::AppAllowlist>,
     pub planner_handle: Arc<std::sync::RwLock<Option<Arc<crate::planner::GoalPlanner>>>>,
     pub plugin_manager: Arc<PluginManager>,
     pub canvas_manager: Arc<CanvasManager>,
@@ -422,6 +428,12 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
     // capture the actions an agent turn's copy of this tool takes; the two are
     // different objects sharing one recording.
     let recording = Arc::new(crate::planner::workflow::Recording::new());
+    // And so is the per-app boundary: one list, handed to the tool here and to
+    // every session a run or a replay builds, so tightening it reaches all of
+    // them rather than only the next one to be constructed.
+    let allow_apps = Arc::new(crate::computer::app_scope::AppAllowlist::new(
+        config.computer.allow_apps.clone(),
+    ));
     if let Some(ref adapter) = computer_adapter {
         #[cfg(feature = "browser")]
         let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
@@ -429,14 +441,18 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 browser_pool.clone(),
                 config.browser.pool.default_profile.clone(),
             )))
-            .with_recording(recording.clone());
+            .with_recording(recording.clone())
+            .with_allow_apps(allow_apps.clone());
         #[cfg(not(feature = "browser"))]
         let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
-            .with_recording(recording.clone());
+            .with_recording(recording.clone())
+            .with_allow_apps(allow_apps.clone());
         tool_registry.register_dynamic(Arc::new(computer));
     } else {
         tool_registry.register_dynamic(Arc::new(
-            crate::tools::computer::ComputerTool::new(None).with_recording(recording.clone()),
+            crate::tools::computer::ComputerTool::new(None)
+                .with_recording(recording.clone())
+                .with_allow_apps(allow_apps.clone()),
         ));
     }
 
@@ -491,6 +507,7 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
         tool_registry,
         computer_adapter,
         computer_recording: recording,
+        computer_allow_apps: allow_apps,
         planner_handle,
         plugin_manager,
         canvas_manager,

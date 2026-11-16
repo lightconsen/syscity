@@ -364,6 +364,7 @@ async fn launch(
         observer: Some(observer),
         store: Some(Arc::new(crate::computer::run_store::RunStore::for_paths(&state.paths))),
         checkpoint,
+        allow_apps: state.tools.computer_allow_apps.as_ref().clone(),
     };
 
     let task_state = state.clone();
@@ -1097,10 +1098,16 @@ async fn spawn_play(
     let task_state = state.clone();
     let total = plan.steps.len();
     let plan_run_id = plan.run_id.clone();
+    let allow_apps = state.tools.computer_allow_apps.as_ref().clone();
     let task = tokio::spawn(async move {
         // One session for the whole replay, so the ladder's step history and
         // the verification engine see the task, not N unrelated actions.
-        let session = crate::computer::session::ComputerSession::new(adapter);
+        let session = crate::computer::session::ComputerSession::new(adapter).with_config(
+            crate::computer::session::SessionConfig {
+                allow_apps,
+                ..Default::default()
+            },
+        );
         let mut outcomes = Vec::with_capacity(total);
         let mut last: Option<StepResult> = None;
         let mut cancelled = false;

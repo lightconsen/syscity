@@ -183,6 +183,12 @@ pub struct SessionConfig {
     /// wait and settle inside the step is capped by what is left, so the step
     /// ends with a budget refusal instead of being cut off from outside.
     pub step_budget: Option<Duration>,
+    /// The apps this session may act on (`[computer] allow_apps`).
+    ///
+    /// Shared, not copied, so a `config.set` that tightens the list reaches a
+    /// session that was built before it. An empty list is no boundary, which is
+    /// the default.
+    pub allow_apps: crate::computer::app_scope::AppAllowlist,
 }
 
 impl Default for SessionConfig {
@@ -195,6 +201,7 @@ impl Default for SessionConfig {
             verify: true,
             delivery: DeliveryMode::Foreground,
             step_budget: None,
+            allow_apps: crate::computer::app_scope::AppAllowlist::default(),
         }
     }
 }
@@ -504,6 +511,23 @@ impl ComputerSession {
         };
         let mutating = is_screen_mutating_action(&action);
 
+        // The per-app boundary, checked before anything is captured or
+        // dispatched. It has to come first: a step that refuses because the app
+        // is not on the list must leave no trace of having started, and the
+        // filesystem snapshots below are a side effect.
+        if let Some(reason) = self.app_scope_refusal(&action).await {
+            return Ok(self
+                .refused_outcome(
+                    action,
+                    &reason,
+                    "act only on the apps on the [computer] allow_apps list, or ask the operator \
+                     to add this one — the action was not sent",
+                    0,
+                    &budget,
+                )
+                .await);
+        }
+
         // Filesystem snapshots, so a step that wrecks something can be undone.
         let snapshots_taken = self.snapshot_before().await;
         if snapshots_taken > 0 {
@@ -522,35 +546,9 @@ impl ComputerSession {
         if let Some(reason) = self.disabled_target(&action).await {
             let recovery = "wait for the control to become enabled, or ask the user how to \
                             proceed";
-            let mut evidence =
-                crate::computer::ActionEvidence::new(Rung::AxAction, ActionEffect::Refused)
-                    .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
-                    .with_recovery(recovery.to_string());
-            evidence.escalation = None;
-            let result = ActionResult::error(format!("refused: {reason} — {recovery}"));
-            // Nothing was delivered, so nothing failed either; a refusal must
-            // not count toward the auto-rollback threshold.
-            let verification = StepVerification::Unverifiable;
-            let (rolled_back, reflection) = self
-                .account(&action, &result, verification, ActionEffect::Refused)
-                .await;
-            return Ok(StepOutcome {
-                action,
-                result,
-                verification,
-                evidence: Some(evidence),
-                state_after: None,
-                screenshot_before: None,
-                diff: None,
-                sensitive_before: Vec::new(),
-                sensitive_after: self.sensitive_findings().await,
-                sensitive_target: false,
-                reflection,
-                snapshots_taken,
-                rolled_back,
-                settle_ms: None,
-                budget: Some(budget.summary()),
-            });
+            return Ok(self
+                .refused_outcome(action, &reason, recovery, snapshots_taken, &budget)
+                .await);
         }
 
         for (index, rung) in ladder.iter().copied().enumerate() {
@@ -1438,6 +1436,104 @@ impl ComputerSession {
         state.consecutive_failures
     }
 
+    /// A refusal, as a step: nothing delivered, nothing failed.
+    ///
+    /// One constructor for every pre-dispatch refusal, so "the boundary said
+    /// no" looks the same in the result, in the evidence and in the run
+    /// timeline whichever boundary it was — a disabled control, an app that is
+    /// not on the list. It counts through [`account`](Self::account) with
+    /// `Refused`, which is what keeps it out of the auto-rollback threshold.
+    async fn refused_outcome(
+        &self,
+        action: DesktopAction,
+        reason: &str,
+        recovery: &str,
+        snapshots_taken: usize,
+        budget: &StepBudget,
+    ) -> StepOutcome {
+        let mut evidence =
+            crate::computer::ActionEvidence::new(Rung::AxAction, ActionEffect::Refused)
+                .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
+                .with_recovery(recovery.to_string());
+        evidence.escalation = None;
+        let result = ActionResult::error(format!("refused: {reason} — {recovery}"));
+        // Nothing was delivered, so nothing failed either; a refusal must not
+        // count toward the auto-rollback threshold.
+        let verification = StepVerification::Unverifiable;
+        let (rolled_back, reflection) = self
+            .account(&action, &result, verification, ActionEffect::Refused)
+            .await;
+        StepOutcome {
+            action,
+            result,
+            verification,
+            evidence: Some(evidence),
+            state_after: None,
+            screenshot_before: None,
+            diff: None,
+            sensitive_before: Vec::new(),
+            sensitive_after: self.sensitive_findings().await,
+            sensitive_target: false,
+            reflection,
+            snapshots_taken,
+            rolled_back,
+            settle_ms: None,
+            budget: Some(budget.summary()),
+        }
+    }
+
+    /// Why the per-app boundary refuses this action, when it does.
+    ///
+    /// The app is whatever the adapter resolved the target to (the window's
+    /// owning process), or what the action names outright. `None` — no app
+    /// established — is a refusal too once a list is set: an action nobody can
+    /// place inside the list must not be assumed to be inside it.
+    ///
+    /// Actions that are not input at all (a screenshot, a tree read, a system
+    /// query) are not aimed at an app and are not what an allowlist exists to
+    /// stop, so they pass. Reading a window's content is not acting on it.
+    async fn app_scope_refusal(&self, action: &DesktopAction) -> Option<String> {
+        if self.config.allow_apps.is_empty() || !aims_at_an_app(action) {
+            return None;
+        }
+        let app = self.action_app(action).await;
+        self.config.allow_apps.refusal(app.as_deref())
+    }
+
+    /// The application an action is aimed at, as well as this session can tell.
+    ///
+    /// Two sources: the action names one (`launch_app`, or a window action's
+    /// title pattern), or the resolved target says which app the snapshot came
+    /// from. A resolved app is evidence rather than a claim; a name the caller
+    /// supplied is a claim, and is used because the alternative is refusing
+    /// every launch and every window move.
+    async fn action_app(&self, action: &DesktopAction) -> Option<String> {
+        match action {
+            DesktopAction::LaunchApp { name, .. } => Some(name.clone()),
+            // A window action names its window, not its app: use the pattern
+            // as the best available answer. `title_pattern` is a glob, so a
+            // strict list may not match it — the refusal says so, and the
+            // caller can target an element instead.
+            DesktopAction::ActivateWindow { title_pattern }
+            | DesktopAction::CloseWindow { title_pattern }
+            | DesktopAction::GetWindowGeometry { title_pattern }
+            | DesktopAction::MoveWindow { title_pattern, .. }
+            | DesktopAction::ResizeWindow { title_pattern, .. }
+            | DesktopAction::MinimizeWindow { title_pattern }
+            | DesktopAction::MaximizeWindow { title_pattern } => Some(title_pattern.clone()),
+            // A process action names its target only when the caller gave a
+            // name; a pid identifies a process, not an app, so the boundary
+            // cannot place it and refuses rather than guesses.
+            DesktopAction::KillProcess { name, .. }
+            | DesktopAction::RestartProcess { name, .. }
+            | DesktopAction::SetProcessPriority { name, .. } => name.clone(),
+            other => self
+                .resolved_target(other)
+                .await
+                .and_then(|resolved| resolved.app),
+        }
+    }
+
     /// Update failure counters, trigger auto-rollback, and reflect.
     async fn account(
         &self,
@@ -1664,6 +1760,29 @@ fn editable_values(tree: &[UiElement]) -> Vec<(String, String)> {
         walk(root, &mut out);
     }
     out
+}
+
+/// Whether an action is aimed at an application at all.
+///
+/// The distinction the per-app boundary turns on. A screenshot, a tree read, a
+/// clipboard read and a system query observe the machine; they are not what an
+/// allowlist exists to stop, and refusing them would make a locked-down session
+/// unable to see what it is allowed to work on. Everything the ladder can
+/// deliver — a click, a keystroke, a launch, a window move, a process kill — is,
+/// including the actions that name their target only by coordinate. That is
+/// deliberate: an action whose app cannot be established is not thereby inside
+/// the list.
+fn aims_at_an_app(action: &DesktopAction) -> bool {
+    !matches!(
+        action,
+        DesktopAction::Screenshot { .. }
+            | DesktopAction::ReadUiTree { .. }
+            | DesktopAction::ListWindows
+            | DesktopAction::Wait { .. }
+            | DesktopAction::ClipboardGet
+            | DesktopAction::GetSystemStatus
+            | DesktopAction::ListProcesses { .. }
+    )
 }
 
 /// What the caller must change when an action was refused before it ran.

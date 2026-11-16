@@ -20,7 +20,7 @@ Configuration is split into two layers:
 | Browser | `browser` (bridge, pool, profiles) | Hot-reloadable |
 | Memory | `memory` (multimodal, dreaming, tier, effectiveness) | Hot-reloadable |
 | Heartbeat | `heartbeat` | Hot-reloadable |
-| Computer | `computer` (remote_control, headless) | Hot-reloadable |
+| Computer | `computer` (remote_control, headless, allow_apps) | Hot-reloadable |
 | Standing Orders | `standing_orders` | Hot-reloadable |
 | Capabilities | `capabilities` (profile, scope, sets) | Hot-reloadable |
 
@@ -143,6 +143,9 @@ pub struct ConfigChangeEvent {
 - Secret resolution with `SecretRef` (env, file, exec providers)
 - Canonical secret masking (`secrets::mask_json_value`) on all config read surfaces
 - Config revision CAS (`REVISION_CONFLICT`) for safe concurrent writes
+- `computer.allow_apps` — the per-app desktop boundary — is pushed into a shared
+  handle on reload and on `config.set`, so it reaches desktop sessions that are
+  already running rather than only the ones built after the edit
 - `ReloadableConfig` with broadcast-based change notifications
 - Comprehensive unit tests for all config subsystems
 

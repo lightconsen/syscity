@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::tools::ToolRegistry;
 
+pub mod app_scope;
 pub mod audio;
 pub mod budget;
 pub mod display;

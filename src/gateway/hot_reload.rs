@@ -457,7 +457,20 @@ pub(crate) async fn register_hot_reload_handlers(
                     if permissions_changed {
                         config.permissions = new_config.permissions.clone();
                     }
+                    let allow_apps_changed =
+                        config.computer.allow_apps != new_config.computer.allow_apps;
+                    if allow_apps_changed {
+                        config.computer.allow_apps = new_config.computer.allow_apps.clone();
+                    }
                     drop(config_guard);
+                    // The apps a desktop session may act on are read through a
+                    // handle shared with every session already running, so the
+                    // edit has to be pushed into it. Assigning the config alone
+                    // would only change the answer for sessions built later.
+                    if allow_apps_changed {
+                        let apps = state.config.read().await.computer.allow_apps.clone();
+                        state.tools.computer_allow_apps.replace(apps);
+                    }
                     // The permission gate reads the shared runtime — reload it
                     // here so a file edit takes effect without a restart.
                     if permissions_changed {

@@ -239,6 +239,16 @@ impl ComputerUseLoop {
         self
     }
 
+    /// The apps this loop may act on (`[computer] allow_apps`).
+    ///
+    /// The list is shared, so a config edit reaches a loop that is already
+    /// running; this only has to install the handle.
+    pub fn with_allow_apps(mut self, allow_apps: crate::computer::app_scope::AppAllowlist) -> Self {
+        self.session_config.allow_apps = allow_apps;
+        self.rebuild_session();
+        self
+    }
+
     /// Paths to snapshot before each action (directories or files).
     pub fn with_snapshot_paths(mut self, paths: Vec<String>) -> Self {
         self.session_config.snapshot_paths = paths;
@@ -592,5 +602,29 @@ mod tests {
         assert_eq!(loop_.session_config.snapshot_paths.len(), 1);
         assert_eq!(loop_.session_config.auto_rollback_threshold, 5);
         assert!(loop_.rollback_manager.is_some());
+    }
+
+    /// The allowlist reaches the session the loop actually dispatches
+    /// through — installing the handle on the builder is not enough if the
+    /// rebuilt step engine kept the old one.
+    #[test]
+    fn a_loop_hands_its_allowlist_to_the_session_it_dispatches_through() {
+        let adapter = Arc::new(crate::computer::headless::HeadlessComputerAdapter::new());
+        let allow = crate::computer::app_scope::AppAllowlist::new(vec!["Safari".to_string()]);
+        let loop_ = ComputerUseLoop::new(adapter)
+            .with_allow_apps(allow.clone())
+            // A later rebuild (a setting changed) must carry it forward.
+            .with_auto_rollback_threshold(2);
+
+        assert!(loop_
+            .session
+            .config()
+            .allow_apps
+            .refusal(Some("1Password"))
+            .is_some());
+        assert_eq!(loop_.session.config().allow_apps.refusal(Some("Safari")), None);
+        // Same handle, so a config edit reaches a running loop.
+        allow.replace(vec!["Finder".to_string()]);
+        assert_eq!(loop_.session.config().allow_apps.refusal(Some("Finder")), None);
     }
 }

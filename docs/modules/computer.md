@@ -276,6 +276,49 @@ where input may land:
   Clicks at a bare screen point are refused in this mode: an accessibility hit
   test at a point lands in whatever window happens to be in front.
 
+### The app boundary (`[computer] allow_apps`)
+
+`[computer] allow_apps` is the list of applications a desktop action may be
+aimed at:
+
+```toml
+[computer]
+allow_apps = ["Safari", "Google Chrome*", "Code"]
+```
+
+Empty — the default — is no boundary. Once it is non-empty, every action that
+mutates the screen is checked against it **inside the session, before anything
+is captured or dispatched**, and an app that is not on the list is refused
+(`ActionEffect::Refused`, not delivered). Matching is case-insensitive and glob
+(`*` at either end), because the platform's spelling is not ours: macOS reports
+`Google Chrome`, a rule may say `Google Chrome*`.
+
+An action that names no app is refused too. A coordinate click, a bare key
+press and typing into whatever holds focus reach whatever is in front, so none
+of them can be shown to stay inside the list; a refusal that guessed would be
+theatre. Target an element in an allowed app instead. A process action that
+names a pid rather than a name is in the same position: a pid is not an app.
+
+Observation is not gated: screenshot, UI-tree reads, window listing, waits,
+clipboard reads and system status all work whatever the list says, because a
+model that cannot look cannot find out where it is allowed to go.
+
+The same list feeds `primary_invocation_arg`, so `[permissions].deny` can name
+an app (`computer:Safari`, `*_desktop_control:1Password`) and refuse the call
+before the tool runs at all. The two are complementary: a rule reaches calls
+that name the app, and the session boundary is the half that holds for the
+calls that do not.
+
+This is **not isolation**. The actions still run on the real desktop with the
+real user's permissions; the list narrows what the tool will do, not what the
+process could do. Isolation (a container or VM) is a deliberate non-goal — see
+the plan's §6.6.4 — because it turns "visible and takeover-able" into background
+batch work.
+
+Changing the list with `config.set` (`path: "computer.allow_apps"`, an array of
+names) or by editing `config.toml` reaches **sessions that are already
+running**: the handle is shared, not copied, and both paths `replace()` it.
+
 ## Regression baseline
 
 `tests/gui_baseline.rs` drives a real headless Chrome through the page rung —

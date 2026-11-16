@@ -196,6 +196,12 @@ pub struct ToolState {
     /// has no way to reach a per-connection handle. One recording at a time,
     /// refused rather than overlapped.
     pub computer_recording: Arc<crate::planner::workflow::Recording>,
+    /// The apps desktop sessions may act on (`[computer] allow_apps`).
+    ///
+    /// On the tool state for the same reason the recording is: a run, a replay
+    /// and a chat turn each build their own session, and one list has to reach
+    /// all of them — including the ones already running when it changes.
+    pub computer_allow_apps: Arc<crate::computer::app_scope::AppAllowlist>,
     /// Shared handle for the PlannerTool — set during agent spawn.
     pub planner_handle: Arc<std::sync::RwLock<Option<Arc<crate::planner::GoalPlanner>>>>,
 }

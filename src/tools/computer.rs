@@ -40,6 +40,11 @@ pub struct ComputerTool {
     /// a different object. `None` outside a gateway (a test, a library caller),
     /// where nothing can start a recording.
     recording: Option<Arc<crate::planner::workflow::Recording>>,
+    /// The apps this tool's sessions may act on (`[computer] allow_apps`).
+    ///
+    /// One handle for every session this tool makes, so a change reaches a
+    /// conversation that is already running rather than only the next one.
+    allow_apps: Arc<crate::computer::app_scope::AppAllowlist>,
 }
 
 impl ComputerTool {
@@ -49,7 +54,20 @@ impl ComputerTool {
             page: None,
             sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             recording: None,
+            allow_apps: Arc::new(crate::computer::app_scope::AppAllowlist::default()),
         }
+    }
+
+    /// Attach the per-app boundary (`[computer] allow_apps`).
+    ///
+    /// Without one the tool has no boundary, which is every install that never
+    /// set a list — and every test that does not care about one.
+    pub fn with_allow_apps(
+        mut self,
+        allow_apps: Arc<crate::computer::app_scope::AppAllowlist>,
+    ) -> Self {
+        self.allow_apps = allow_apps;
+        self
     }
 
     /// Attach the gateway's recording handle, so a recording started over WS
@@ -103,7 +121,11 @@ impl ComputerTool {
                     // whichever call happened to create it. The per-call
                     // budget is passed to `execute_with_budget` instead.
                     let session = ComputerSession::new(adapter).with_config(
-                        crate::computer::session::SessionConfig { delivery, ..Default::default() },
+                        crate::computer::session::SessionConfig {
+                            delivery,
+                            allow_apps: self.allow_apps.as_ref().clone(),
+                            ..Default::default()
+                        },
                     );
                     match page {
                         // The page belongs to the conversation, not to the

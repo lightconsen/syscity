@@ -112,18 +112,47 @@ pub enum EngineDecision {
 /// The argument that identifies what a call acts on, for rule matching.
 ///
 /// `shell`/`process`/`execute_code` → the command string; the file tools →
-/// the path; `web_fetch` → the URL. `None` for tools whose identity is the
-/// tool name alone, which is what bare `"tool"` rules match.
+/// the path; `web_fetch` → the URL; the desktop tools → the app they name.
+/// `None` for tools whose identity is the tool name alone, which is what bare
+/// `"tool"` rules match.
+///
+/// The desktop answer is the app when the call names one (`computer` with
+/// `app_name`, a `*_desktop_control` with `app`), then the window the call
+/// targets (`title_pattern` / `name` on a window action), then the element id.
+/// An id is not an app name, and this function cannot read the screen to find
+/// out which window owns it — so a rule that names an app only reaches the
+/// calls that name that app. That is why the rule is the cheap, legible half of
+/// the boundary and [`crate::computer::app_scope`] is the half that holds: the
+/// session resolves the real target before it dispatches, and refuses whatever
+/// the list does not cover.
 pub fn primary_invocation_arg(tool: &str, args: &Value) -> Option<String> {
+    if tool == "computer" {
+        return ["app_name", "title_pattern", "element_id"]
+            .iter()
+            .find_map(|field| non_empty(args.get(*field)));
+    }
+    if tool.ends_with("_desktop_control") {
+        return ["app", "name"]
+            .iter()
+            .find_map(|field| non_empty(args.get(*field)));
+    }
     let field = match tool {
         "shell" | "process" | "execute_code" => "command",
         "file_read" | "file_write" | "file_edit" | "apply_patch" => "path",
         "web_fetch" => "url",
         _ => return None,
     };
-    args.get(field)
+    non_empty(args.get(field))
+}
+
+/// The string in `value`, when it is one and is not blank. A blank field names
+/// nothing, and matching a rule against nothing would be matching everything.
+fn non_empty(value: Option<&Value>) -> Option<String> {
+    value
         .and_then(Value::as_str)
-        .map(|s| s.to_string())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Whether one rule matches `primary` under `quantifier`. The three command
@@ -493,6 +522,52 @@ mod tests {
             Some("https://x".to_string())
         );
         assert_eq!(primary_invocation_arg("grep", &json!({"pattern": "x"})), None);
+    }
+
+    #[test]
+    fn a_computer_call_is_identified_by_the_app_it_names() {
+        // A rule reads `computer:Safari`. The app name is what a person would
+        // write, so it is the first field consulted; a call that names an
+        // element instead still yields something a rule can match on.
+        assert_eq!(
+            primary_invocation_arg("computer", &json!({"action": "click", "app_name": "Safari"})),
+            Some("Safari".to_string())
+        );
+        assert_eq!(
+            primary_invocation_arg(
+                "computer",
+                &json!({"action": "focus_window", "title_pattern": "1Password"})
+            ),
+            Some("1Password".to_string())
+        );
+        assert_eq!(
+            primary_invocation_arg("computer", &json!({"action": "click", "element_id": "e12"})),
+            Some("e12".to_string()),
+            "a rule can still reach an id-addressed call, even though the id is not an app"
+        );
+        assert_eq!(primary_invocation_arg("computer", &json!({"action": "screenshot"})), None);
+        assert_eq!(
+            primary_invocation_arg("computer", &json!({"action": "click", "app_name": "  "})),
+            None,
+            "a blank field names nothing and must not look like a match"
+        );
+    }
+
+    #[test]
+    fn a_desktop_control_call_is_identified_by_its_app() {
+        assert_eq!(
+            primary_invocation_arg("macos_desktop_control", &json!({"app": "Terminal"})),
+            Some("Terminal".to_string())
+        );
+        assert_eq!(
+            primary_invocation_arg("x11_desktop_control", &json!({"name": "Firefox"})),
+            Some("Firefox".to_string()),
+            "the window name is the only app-shaped field some calls carry"
+        );
+        assert_eq!(
+            primary_invocation_arg("wayland_desktop_control", &json!({"window_id": 7})),
+            None
+        );
     }
 
     #[test]

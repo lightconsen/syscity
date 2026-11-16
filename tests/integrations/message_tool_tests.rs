@@ -207,6 +207,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             computer_adapter: Arc::new(tokio::sync::RwLock::new(None)),
             computer_runs: Arc::new(syscity::computer::run_registry::ComputerRunRegistry::new()),
             computer_recording: Arc::new(syscity::planner::workflow::Recording::new()),
+            computer_allow_apps: Arc::new(syscity::computer::app_scope::AppAllowlist::default()),
             planner_handle: Arc::new(std::sync::RwLock::new(None)),
         },
         pipelines: syscity::gateway::state::PipelineState {

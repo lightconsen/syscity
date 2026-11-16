@@ -119,6 +119,11 @@ pub struct RunPlan {
     /// the loop's starting state, and carries it forward so the next
     /// interruption has the same information this one did.
     pub checkpoint: Option<crate::computer::run_store::Checkpoint>,
+    /// The apps this run may act on (`[computer] allow_apps`).
+    ///
+    /// Shared rather than copied: a run outlives a config edit, and the edit
+    /// has to reach the loop already executing. Empty is no boundary.
+    pub allow_apps: crate::computer::app_scope::AppAllowlist,
 }
 
 /// The outcome of a run, as the caller reports it.
@@ -258,6 +263,7 @@ async fn run_loop(
         .unwrap_or_default();
     let mut computer_loop = ComputerUseLoop::new(plan.adapter.clone())
         .with_config(plan.loop_config)
+        .with_allow_apps(plan.allow_apps.clone())
         .with_execution_controller(controller.clone());
     if resume.start_step > 0 {
         // A resumed run's status must read like the run it continues, not like
@@ -1159,6 +1165,7 @@ mod tests {
             // gateway's concern and is covered in `run_store` and the e2e test.
             store: None,
             checkpoint: None,
+            allow_apps: Default::default(),
         }
     }
 

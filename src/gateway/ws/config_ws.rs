@@ -53,6 +53,13 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
                 "deny": config.permissions.deny,
                 "ask": config.permissions.ask,
             },
+            "computer": {
+                "enabled": config.computer.enabled,
+                // The per-app boundary as configured. Read from the config, not
+                // from the shared handle, so `config.get` and `config.set` are
+                // about the same value rather than about two lifetimes.
+                "allow_apps": config.computer.allow_apps,
+            },
             "search": {
                 "provider": config.search.provider,
                 "providers": config.search.providers,
@@ -172,6 +179,9 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // the write lock is dropped (the push re-reads state.config).
     let mut push_override_agent: Option<String> = None;
     let push_default_agent = params.path.starts_with("default_agent.");
+    // Set by the `computer.allow_apps` arm; the shared handle is refreshed
+    // after the write lock is dropped, so a session already running sees it.
+    let mut allow_apps_changed = false;
 
     match params.path.as_str() {
         // Scalar `default_agent.*` paths share the same pure application logic
@@ -195,6 +205,31 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
                     config.agent_models.insert(agent_id, v);
                 }
             }
+        }
+        "computer.allow_apps" => {
+            let Some(items) = params.value.as_array() else {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.allow_apps takes an array of app names",
+                );
+            };
+            let mut apps = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return WsResponse::err(
+                        &req.id,
+                        "INVALID_PARAMS",
+                        "computer.allow_apps takes an array of app names",
+                    );
+                };
+                apps.push(name.to_string());
+            }
+            // `AppAllowlist::replace` trims and drops blanks, so an entry that
+            // is only whitespace does not silently become a boundary nothing
+            // can match.
+            config.computer.allow_apps = apps;
+            allow_apps_changed = true;
         }
         "heartbeat.enabled" => {
             if let Some(v) = params.value.as_bool() {
@@ -489,6 +524,7 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     } else {
         None
     };
+    let updated_allow_apps = allow_apps_changed.then(|| config_guard.computer.allow_apps.clone());
     drop(config_guard);
 
     // Push the recomputed effective config to running agents so the change
@@ -503,6 +539,12 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // make the change effective on the very next tool call.
     if let Some(permissions) = updated_permissions {
         state.tools.registry.permissions().reload(&permissions);
+    }
+    // The per-app boundary is read through a handle shared with every desktop
+    // session — a run started before this write keeps running, so the change
+    // has to reach it rather than only the config snapshot.
+    if let Some(apps) = updated_allow_apps {
+        state.tools.computer_allow_apps.replace(apps);
     }
 
     WsResponse::ok(
@@ -668,6 +710,8 @@ mod tests {
         assert!(p["permissions"]["mode"].as_str().is_some());
         assert!(p["permissions"]["allow"].is_array());
         assert!(p["permissions"]["allow_bypass"].is_boolean());
+        assert!(p["computer"]["allow_apps"].is_array());
+        assert!(p["computer"]["enabled"].is_boolean());
     }
 
     #[tokio::test]
@@ -747,6 +791,46 @@ mod tests {
         assert!(!res.ok);
         assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
         assert!(state.config.read().await.permissions.allow_bypass);
+    }
+
+    #[tokio::test]
+    async fn config_set_computer_allow_apps_reaches_running_sessions() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res = set_and_ok(
+            &state,
+            "computer.allow_apps",
+            serde_json::json!(["Safari", " Google Chrome* "]),
+        )
+        .await;
+        assert!(res.ok, "the list must set: {:?}", res.error);
+        assert_eq!(
+            state.config.read().await.computer.allow_apps,
+            vec!["Safari".to_string(), " Google Chrome* ".to_string()],
+            "the config keeps what was written"
+        );
+        // A session built before the write holds the same handle, so the
+        // boundary must already read the new list — and trim the blanks.
+        assert_eq!(
+            state.tools.computer_allow_apps.entries(),
+            vec!["Safari".to_string(), "Google Chrome*".to_string()]
+        );
+        assert!(state
+            .tools
+            .computer_allow_apps
+            .refusal(Some("1Password"))
+            .is_some());
+        assert!(state
+            .tools
+            .computer_allow_apps
+            .refusal(Some("google chrome"))
+            .is_none());
+
+        // A string instead of a list is refused, and the previous list stands.
+        let res = set_and_ok(&state, "computer.allow_apps", serde_json::json!("Safari")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert_eq!(state.tools.computer_allow_apps.entries().len(), 2);
     }
 
     #[tokio::test]

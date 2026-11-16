@@ -204,6 +204,7 @@ pub async fn make_test_state_parts(
             computer_adapter: Arc::new(tokio::sync::RwLock::new(None)),
             computer_runs: Arc::new(crate::computer::run_registry::ComputerRunRegistry::new()),
             computer_recording: Arc::new(crate::planner::workflow::Recording::new()),
+            computer_allow_apps: Arc::new(crate::computer::app_scope::AppAllowlist::default()),
             planner_handle: Arc::new(std::sync::RwLock::new(None)),
         },
         pipelines: PipelineState {

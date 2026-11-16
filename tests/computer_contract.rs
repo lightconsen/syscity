@@ -715,3 +715,112 @@ async fn a_spent_budget_is_a_refusal_that_names_the_budget() {
     assert_eq!(budget["total_ms"], 20);
     assert_eq!(budget["remaining_ms"], 0);
 }
+
+// ── Contract: the per-app boundary ──────────────────────────────────────
+
+/// A session that may only act on the named apps builds with that list.
+fn scoped_session(adapter: Arc<ContractAdapter>, apps: &[&str]) -> ComputerSession {
+    ComputerSession::new(adapter).with_config(SessionConfig {
+        allow_apps: syscity::computer::app_scope::AppAllowlist::new(
+            apps.iter().map(|a| a.to_string()).collect(),
+        ),
+        settle: SettleConfig {
+            initial_delay_ms: 0,
+            poll_interval_ms: 0,
+            max_rounds: 1,
+            stable_threshold: 0.5,
+            min_window_ms: 0,
+        },
+        ..SessionConfig::default()
+    })
+}
+
+/// An app that is not on the list is refused before anything reaches the
+/// adapter — not after the click has already landed.
+#[tokio::test]
+async fn an_app_off_the_allowlist_is_refused_before_dispatch() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
+    let outcome = scoped_session(adapter.clone(), &["Safari"])
+        .execute(click(ClickTarget::ElementId("live-save".to_string())))
+        .await
+        .expect("a refusal is an outcome");
+
+    assert!(
+        adapter.delivered().is_empty(),
+        "a refused action must leave no trace: {:?}",
+        adapter.delivered()
+    );
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert_eq!(evidence.delivery, DeliveryDisposition::NotDelivered);
+    assert_eq!(evidence.retry, RetryDisposition::Safe);
+    // The refusal is not the session's fault-to-fix, so it must not push a
+    // run toward an automatic rollback.
+    assert!(outcome.result.message.contains("Contract"), "{}", outcome.result.message);
+    assert!(outcome.result.message.contains("allow_apps"), "{}", outcome.result.message);
+}
+
+/// The listed app passes the boundary: the same click is delivered.
+#[tokio::test]
+async fn a_listed_app_passes_the_boundary() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::ElementId("live-save".to_string())))
+        .await
+        .expect("an outcome");
+
+    assert!(outcome.result.success, "{}", outcome.result.message);
+    assert!(!adapter.delivered().is_empty(), "the click reached the adapter");
+}
+
+/// A coordinate click names no app, so once a list is set it cannot be shown
+/// to stay inside it and is refused. Assuming otherwise would make the
+/// boundary theatre: the click lands wherever the screen happens to be.
+#[tokio::test]
+async fn a_coordinate_action_is_refused_once_a_list_is_set() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::Coordinate(Point::new(20, 20))))
+        .await
+        .expect("a refusal is an outcome");
+
+    assert!(adapter.delivered().is_empty(), "{:?}", adapter.delivered());
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert!(outcome.result.message.contains("names no app"), "{}", outcome.result.message);
+    let recovery = evidence.recovery.expect("a refusal carries a hint");
+    assert!(recovery.contains("allow_apps"), "{recovery}");
+}
+
+/// Reading the screen is not acting on it. A screenshot must work whatever
+/// the list says, or the model cannot even look to find out where it may go.
+#[tokio::test]
+async fn observation_is_not_gated_by_the_boundary() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
+    let outcome = scoped_session(adapter.clone(), &["Safari"])
+        .execute(DesktopAction::Screenshot { region: None })
+        .await
+        .expect("an outcome");
+
+    assert!(outcome.result.success, "{}", outcome.result.message);
+}
+
+/// Launching an app that is not on the list is refused; the boundary covers
+/// the door as well as the room.
+#[tokio::test]
+async fn launching_an_app_off_the_list_is_refused() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
+    let outcome = scoped_session(adapter.clone(), &["Safari"])
+        .execute(DesktopAction::LaunchApp {
+            name: "1Password".to_string(),
+            args: vec![],
+            wait_for_ready: false,
+        })
+        .await
+        .expect("a refusal is an outcome");
+
+    assert!(adapter.delivered().is_empty(), "{:?}", adapter.delivered());
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert!(outcome.result.message.contains("1Password"), "{}", outcome.result.message);
+}
