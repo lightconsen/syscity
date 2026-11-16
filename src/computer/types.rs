@@ -772,6 +772,36 @@ pub enum DesktopAction {
     },
 }
 
+impl DesktopAction {
+    /// Whether acting on this needs the one input handle a display has.
+    ///
+    /// A machine has one pointer and one focus. Two tasks injecting input at
+    /// the same time interleave: one types into a field while the other
+    /// clicks elsewhere, and both report success. This is the classification
+    /// the planner's concurrent batch uses to decide which tasks may overlap
+    /// — observation may, input may not.
+    ///
+    /// The line is drawn wide on purpose. Scrolling moves the content under
+    /// the pointer and a window action moves the focus, so both are input even
+    /// though neither types a character: after either, an unaimed keystroke
+    /// lands somewhere it was not meant to. Callers that are unsure belong on
+    /// the input side, where the cost is waiting and the alternative is a
+    /// wrong action reported as a right one.
+    pub fn needs_input_lock(&self) -> bool {
+        !matches!(
+            self,
+            DesktopAction::Screenshot { .. }
+                | DesktopAction::ReadUiTree { .. }
+                | DesktopAction::ListWindows
+                | DesktopAction::GetWindowGeometry { .. }
+                | DesktopAction::ListProcesses { .. }
+                | DesktopAction::GetSystemStatus
+                | DesktopAction::ClipboardGet
+                | DesktopAction::Wait { .. }
+        )
+    }
+}
+
 /// A file entry returned by BrowseFiles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -1462,6 +1492,69 @@ pub struct WindowInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn click() -> DesktopAction {
+        DesktopAction::Click {
+            target: ClickTarget::Coordinate(Point::new(1, 2)),
+            button: MouseButton::Left,
+        }
+    }
+
+    /// Input actions take the one display's lock; observation must not, or a
+    /// batch of twenty window reads would run one at a time for no reason.
+    #[test]
+    fn input_needs_the_display_and_observation_does_not() {
+        for action in [
+            click(),
+            DesktopAction::DoubleClick {
+                target: ClickTarget::Coordinate(Point::new(1, 2)),
+                button: MouseButton::Left,
+            },
+            DesktopAction::Type {
+                text: "x".to_string(),
+                target: None,
+            },
+            DesktopAction::KeyPress {
+                keys: vec!["cmd".to_string(), "s".to_string()],
+            },
+            DesktopAction::Drag {
+                from: ClickTarget::Coordinate(Point::new(1, 2)),
+                to: ClickTarget::Coordinate(Point::new(3, 4)),
+            },
+            DesktopAction::Scroll {
+                target: ClickTarget::Coordinate(Point::new(1, 2)),
+                direction: ScrollDirection::Down,
+                amount: 1,
+            },
+            // Window actions move the focus, so an unaimed keystroke after one
+            // lands somewhere it was not meant to.
+            DesktopAction::ActivateWindow {
+                title_pattern: "Safari".to_string(),
+            },
+            DesktopAction::LaunchApp {
+                name: "Safari".to_string(),
+                args: vec![],
+                wait_for_ready: false,
+            },
+        ] {
+            assert!(action.needs_input_lock(), "{action:?} must take the display lock");
+        }
+
+        for action in [
+            DesktopAction::Screenshot { region: None },
+            DesktopAction::ReadUiTree { app: None },
+            DesktopAction::ListWindows,
+            DesktopAction::GetWindowGeometry {
+                title_pattern: "Safari".to_string(),
+            },
+            DesktopAction::ListProcesses { filter: None, limit: None },
+            DesktopAction::GetSystemStatus,
+            DesktopAction::ClipboardGet,
+            DesktopAction::Wait { milliseconds: 0 },
+        ] {
+            assert!(!action.needs_input_lock(), "{action:?} must not serialise the batch");
+        }
+    }
 
     #[test]
     fn a_missing_permission_is_not_a_timeout() {

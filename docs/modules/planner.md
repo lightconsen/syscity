@@ -93,6 +93,38 @@ DagScheduler::execute()
     └──▶ Rollback if needed
 ```
 
+## Concurrency: reads in parallel, writes in serial
+
+A batch of independent tasks really is spawned concurrently (`max_concurrency`,
+default 4). That is safe for perception and unsafe for input, because a machine
+has one pointer and one focus: two clicks landing at once do not become two
+clicks, they become one click at a place neither task asked for, reported to
+both as success.
+
+So the executor asks each action whether it needs the display
+(`DesktopAction::needs_input_lock`) and, if it does, holds the shared
+`target_lock::DESKTOP` lease for the length of that dispatch only. The
+classification is deliberately wide:
+
+| Category | Variants | Takes the display lock |
+|----------|----------|------------------------|
+| Input | `Click`, `DoubleClick`, `Type`, `KeyPress`, `Drag`, `Scroll` | **yes** |
+| Window state | `ActivateWindow`, `CloseWindow`, `MoveWindow`, `ResizeWindow`, `MinimizeWindow`, `MaximizeWindow`, `LaunchApp` | **yes** (they move the focus, so an unaimed keystroke after one lands elsewhere) |
+| Process / clipboard | `KillProcess`, `RestartProcess`, `SetProcessPriority`, `ClipboardSet` | **yes** |
+| Observation | `Screenshot`, `ReadUiTree`, `ListWindows`, `GetWindowGeometry`, `ListProcesses`, `GetSystemStatus`, `ClipboardGet` | no |
+| No effect | `Wait` | no |
+
+`Scroll` and the window actions are the ones most often mistaken for harmless.
+Neither types a character, but both change where the next unaimed action lands.
+Callers that are unsure belong on the locked side: the cost is waiting, and the
+alternative is a wrong action reported as a right one.
+
+Note the boundary with the loop: `ComputerUseLoop` stays a **single-target
+serial** loop and is not parallelised internally. Parallelism lives *above* it
+— `GoalPlanner` splits a DAG into sub-tasks, each sub-task is its own serial
+loop, and only the input steps queue on the display lock. Do not try to make
+the loop itself concurrent; it has no way to know what else is on the screen.
+
 ## Implemented Features
 
 - Goal decomposition into task DAGs
