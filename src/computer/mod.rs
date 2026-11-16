@@ -41,6 +41,7 @@ pub mod reflection;
 /// harnesses (OSWorld, Cua Bench) own the VM and this side drives it.
 pub mod remote;
 pub mod remote_control;
+pub mod replay_preflight;
 pub mod rollback;
 pub mod run_budget;
 pub mod run_executor;

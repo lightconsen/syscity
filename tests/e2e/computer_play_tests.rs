@@ -46,6 +46,9 @@ struct FakeState {
     /// Every `Type` action's text, in order — the evidence that the replay
     /// typed the value it was bound to.
     typed: Vec<String>,
+    /// A second window holding a second "New Folder" button — the screen that
+    /// makes a by-name replay have to guess.
+    duplicate_window: bool,
 }
 
 /// A desktop with one window, one button and one text field.
@@ -58,6 +61,20 @@ impl FinderDesktop {
         Arc::new(Self {
             state: Mutex::new(FakeState::default()),
         })
+    }
+
+    /// The same desktop with a second Finder window on it.
+    ///
+    /// Built after the recording rather than before, because the point is a
+    /// screen that *moved on*: the workflow was recorded against one window and
+    /// is replayed against two, which is how a by-name target stops naming one
+    /// element.
+    fn with_duplicate_window(self: Arc<Self>) -> Arc<Self> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .duplicate_window = true;
+        self
     }
 
     fn typed(&self) -> Vec<String> {
@@ -105,7 +122,12 @@ impl ComputerAdapter for FinderDesktop {
 
     async fn read_ui_tree(&self, _app: Option<&str>) -> syscity::computer::Result<Vec<UiElement>> {
         let value = self.field_value();
-        Ok(vec![UiElement {
+        let duplicate = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .duplicate_window;
+        let mut roots = vec![UiElement {
             id: "win-finder".to_string(),
             role: "window".to_string(),
             label: Some("Finder".to_string()),
@@ -144,7 +166,38 @@ impl ComputerAdapter for FinderDesktop {
             ],
             children_count: None,
             truncated: false,
-        }])
+        }];
+        if duplicate {
+            // A second window on the same screen, with its own "New Folder".
+            // Two elements now answer to that name, and nothing in the
+            // workflow says which one was recorded.
+            roots.push(UiElement {
+                id: "win-finder-2".to_string(),
+                role: "window".to_string(),
+                label: Some("Finder".to_string()),
+                value: None,
+                bounds: Some(Rect::new(820, 0, 800, 600)),
+                enabled: Tri::Known(true),
+                focused: Tri::Known(false),
+                actions: None,
+                children: vec![UiElement {
+                    id: "btn-new-folder-2".to_string(),
+                    role: "button".to_string(),
+                    label: Some("New Folder".to_string()),
+                    value: None,
+                    bounds: Some(Rect::new(1200, 40, 100, 30)),
+                    enabled: Tri::Known(true),
+                    focused: Tri::Known(false),
+                    actions: None,
+                    children: Vec::new(),
+                    children_count: None,
+                    truncated: false,
+                }],
+                children_count: None,
+                truncated: false,
+            });
+        }
+        Ok(roots)
     }
 
     async fn execute(&self, action: DesktopAction) -> syscity::computer::Result<ActionResult> {
@@ -646,4 +699,110 @@ async fn a_recording_without_video_still_saves_its_workflow() {
         .expect("the workflow was saved regardless");
     assert!(saved.video.is_none(), "the workflow names no video: {:?}", saved.video);
     assert_eq!(saved.steps.len(), 3, "the actions were recorded as usual");
+}
+
+// ── The preflight: a replay that would have to guess is refused ─────────────
+//
+// A workflow records its targets by *name* (`stabilize` rewrites the element id
+// into a label), because an id does not survive a restart. A name is not an
+// identity: the screen the replay runs on is not the screen it was recorded on,
+// and if it now holds two "New Folder" buttons then step 2 of this plan is a
+// coin flip the person never authorised.
+//
+// The plan's risk table says to check each target before replaying and stop if
+// one is not unique. That is what this asserts — and, equally, that the check
+// does *not* demand existence, because most workflows open their own window in
+// step 1 (the recording below literally starts with `launch Finder`).
+
+#[tokio::test]
+#[serial]
+async fn a_replay_whose_targets_became_ambiguous_is_refused_before_it_moves() {
+    let port = free_port();
+    let desktop = FinderDesktop::new();
+    let gateway = new_test_gateway(recording_config(port)).await;
+    register_mock_provider_with_model(&gateway.model_router(), recording_mock(), "mock-model")
+        .await;
+
+    let state = gateway.state();
+    let fake: Arc<dyn ComputerAdapter> = desktop.clone();
+    state
+        .tools
+        .computer_adapter
+        .write()
+        .await
+        .replace(fake.clone());
+    state.tools.registry.register_dynamic(Arc::new(
+        ComputerTool::new(Some(fake)).with_recording(state.tools.computer_recording.clone()),
+    ));
+
+    start_gateway_and_wait(port, gateway).await;
+
+    let mut client = FrontendSimulator::connect(port).await;
+    let sid = client.create_session().await;
+    client.subscribe(vec![sid.clone()]).await;
+
+    // Record against one window.
+    let started = client.request("computer.record_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started}");
+    client
+        .send_chat(&sid, "In Finder, create a new folder and name it Reports.")
+        .await;
+    client
+        .wait_for_event("chat.final", 120)
+        .await
+        .expect("the recording turn must finish");
+    let stopped = client
+        .request("computer.record_stop", json!({ "name": "ambiguous-replay" }))
+        .await;
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    // The recorded steps aim by name, which is the precondition for this test.
+    let store = WorkflowStore::for_paths(&test_paths_root());
+    let saved = store
+        .load("ambiguous-replay")
+        .await
+        .expect("the recording was saved");
+    let device_targets: Vec<String> = saved
+        .steps
+        .iter()
+        .filter_map(|step| match &step.action {
+            WorkflowAction::Desktop(action) => Some(format!("{action:?}")),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        device_targets
+            .iter()
+            .any(|t| t.contains("ElementLabel") || t.contains("ElementRoleLabel")),
+        "the recording must aim by name for ambiguity to be possible: {device_targets:?}"
+    );
+
+    // A second window appears — the screen has moved on.
+    desktop.clone().with_duplicate_window();
+
+    let played = client
+        .request(
+            "computer.play",
+            json!({ "name": "ambiguous-replay", "parameters": { "name": "Invoices" } }),
+        )
+        .await;
+    assert_eq!(played["ok"], false, "the replay must not start: {played}");
+    assert_eq!(played["error"]["code"].as_str(), Some("REPLAY_AMBIGUOUS"), "{played}");
+    let message = played["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("New Folder"), "the collision is named: {message}");
+    assert!(message.contains("Nothing was replayed"), "{message}");
+    assert!(
+        played["payload"].get("run_id").is_none(),
+        "a refused replay hands back no run to poll: {played}"
+    );
+
+    // Nothing moved: the refusal happened before the first step, so the screen
+    // still has the state the recording left it in and no action was dispatched.
+    // The screen is exactly as the recording left it: the recording typed
+    // "Reports" once, and a refused replay added nothing. Asserted as "no new
+    // typing" rather than "nothing typed" — the recording's own keystrokes are
+    // part of the history, and counting from zero would be asserting the
+    // recording never happened.
+    assert_eq!(desktop.typed(), vec!["Reports".to_string()], "the replay dispatched no step");
+    assert_eq!(desktop.field_value(), "Reports", "the recorded field is untouched");
 }

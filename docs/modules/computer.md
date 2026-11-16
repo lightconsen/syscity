@@ -165,6 +165,28 @@ recorded value while the field holds the bound one. The parameterised `Workflow`
 `~/.syscity/workflows/<stem>.json` (tmp + rename), and the response names the parameters so a caller
 can bind them without opening the file.
 
+**Before a replay moves: the ambiguity preflight.** A recorded workflow aims by *name*, because
+`stabilize` rewrites every element id into `role + label` at record time — an id does not survive a
+restart. A name is not an identity, and the screen a replay runs on is not the screen it was recorded
+on: if it now holds two "New Folder" buttons, the recorded step is a coin flip nobody authorised.
+
+`computer/replay_preflight.rs` resolves every target against the current tree at step 0 and refuses the
+whole replay with `REPLAY_AMBIGUOUS` if any of them has more than one match. The message names the
+step, the count and each candidate's id, so the way out (re-record aimed at an id, or make the targets
+distinguishable) is in the refusal rather than in a step log the person has to reconstruct.
+
+Two deliberate limits:
+
+- **Ambiguity, not existence.** Most workflows open their own window in step 1 (`launch Finder`, then
+  click inside it), so demanding that targets exist at replay start would refuse exactly the workflows
+  this protects. A target that is merely absent is left to the step that finds it missing.
+- **A tree that cannot be read is not a refusal.** The replay runs and each step resolves its own
+  target as before; losing the preflight costs the early warning, not the replay.
+
+This is not the same check the ladder already makes. `ComputerSession` refuses an ambiguous target at
+the moment it runs (nothing is dispatched, which is right and too late): it surfaces as step N failing
+for a reason the person reconstructs after N-1 steps have touched the screen.
+
 **What a replay does.** `computer.play` refuses before anything moves when the workflow is missing,
 when a parameter is unbound (blank counts as unbound — it would type nothing), or when a step needs a
 person and `confirm_sensitive` was not given. `needs_confirmation` is true for a step that aimed at a

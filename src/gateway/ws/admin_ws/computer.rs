@@ -1177,6 +1177,53 @@ async fn spawn_play(
     let plan_run_id = plan.run_id.clone();
     let allow_apps = state.tools.computer_allow_apps.as_ref().clone();
     let conversation_id = plan.session_id.clone().unwrap_or_default();
+
+    // Before the first step moves anything: would any step have to guess?
+    //
+    // Only ambiguity is checked, not existence — most workflows open their own
+    // window in step 1, so demanding the window now would refuse the very
+    // workflows this protects. See `replay_preflight` for why the distinction
+    // is the whole design.
+    //
+    // A tree that cannot be read is *not* a refusal: the replay still runs, and
+    // every step resolves its own target exactly as it did before. Losing the
+    // preflight costs the early warning, not the replay.
+    let described: Vec<(String, crate::computer::DesktopAction)> = plan
+        .steps
+        .iter()
+        .filter_map(|step| match &step.action {
+            crate::planner::workflow::WorkflowAction::Desktop(action) => {
+                Some((step.description.clone(), action.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if !described.is_empty() {
+        let check: Result<(), WsResponse> = async {
+            let Ok(roots) = adapter.read_ui_tree(None).await else {
+                tracing::debug!(
+                    "replay preflight skipped: the UI tree could not be read on this host"
+                );
+                return Ok(());
+            };
+            let mut roots = roots;
+            let id = crate::computer::element_index::next_snapshot_id();
+            crate::computer::element_index::assign_ids(&mut roots, id);
+            let snapshot = crate::computer::element_index::UiSnapshot { id, app: None, roots };
+            let found = crate::computer::replay_preflight::find_ambiguous(&described, &snapshot);
+            if found.is_empty() {
+                return Ok(());
+            }
+            Err(WsResponse::err(
+                "",
+                "REPLAY_AMBIGUOUS",
+                crate::computer::replay_preflight::refuse(&plan.workflow_name, &found),
+            ))
+        }
+        .await;
+        check?;
+    }
+
     let task = tokio::spawn(async move {
         // One session for the whole replay, so the ladder's step history and
         // the verification engine see the task, not N unrelated actions.
