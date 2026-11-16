@@ -457,18 +457,32 @@ async fn observe(
     vision: Option<&Arc<crate::computer::vision::look::VisionLook>>,
     run: &Arc<ComputerRun>,
 ) -> StepContext {
-    let raw_tree = match adapter.read_ui_tree(None).await {
-        Ok(tree) => tree,
+    // A read that failed is not a screen with nothing on it.
+    //
+    // This used to fall back to an empty `Vec`, and completeness is judged on
+    // what was read — `tree_is_complete(&[])` is `true` — so a host that
+    // cannot read its tree at all (a Wayland session without the AT-SPI
+    // bridge, a missing accessibility permission) was reported to the model
+    // as a complete tree with no elements. Two things then went wrong: the
+    // model decided against a "blank" screen instead of a screenshot, and the
+    // run loop's "attach an image because the tree is incomplete" rule never
+    // fired, because the tree did not look incomplete, it looked empty.
+    //
+    // The failure is now carried, so the step is honestly incomplete and the
+    // perception plan can reach for the picture.
+    let (raw_tree, tree_read_failed) = match adapter.read_ui_tree(None).await {
+        Ok(tree) => (tree, None),
         Err(e) => {
             debug!("read_ui_tree failed, deciding from the capture alone: {e}");
-            Vec::new()
+            (Vec::new(), Some(e.to_string()))
         }
     };
 
     // Completeness is judged on what was read, not on what survives pruning:
     // folding a window away is a decision this side made, while an incomplete
     // read is a fact about the screen that the model must be told.
-    let tree_complete = crate::computer::types::UiElement::tree_is_complete(&raw_tree);
+    let tree_complete = tree_read_failed.is_none()
+        && crate::computer::types::UiElement::tree_is_complete(&raw_tree);
     let geometry = adapter.display_geometry().await.unwrap_or_default();
     let (tree, _report) = prune(&raw_tree, &geometry);
 
@@ -487,6 +501,7 @@ async fn observe(
         model_supports_vision,
         image_budget_available,
         vision: found,
+        tree_read_failed,
     }
 }
 

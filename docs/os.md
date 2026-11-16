@@ -64,10 +64,22 @@ For systems with a display server, the agent uses a **hybrid perception** approa
 
 | Capability | Linux X11 | Linux Wayland | macOS | Windows |
 |------------|-----------|---------------|-------|---------|
-| UI tree | `at-spi2` | `xdg-desktop-portal` (limited) | `AXUIElement` | `UI Automation` |
+| UI tree | `at-spi2` | `at-spi2` (same bus) | `AXUIElement` | `UI Automation` |
 | Screenshot | `scrot`/`grim` | `grim`/`xdg-desktop-portal` | `screencapture` | `BitBlt` |
 | Click/type | `xdotool` | `ydotool`/`portal` | `AXUIElement` | `UIA InvokePattern` |
 | Window mgmt | `wmctrl`/`swaymsg` | compositor-specific | AppleScript/AX | `FindWindow` |
+
+AT-SPI2 is a D-Bus accessibility bus, not an X11 protocol: GNOME and KDE
+publish it under Wayland exactly as under X11, so both Linux tools read the
+tree with the same script (`computer/platform/atspi.rs`). What Wayland genuinely
+lacks is the X11-only `xdotool`/`xwininfo` fallback and any way to drive
+another application's windows.
+
+A read that cannot produce a tree is reported as a failure with its reason, not
+as a successful empty tree. The difference is load-bearing: an empty list is
+indistinguishable from "a desktop with no controls on it", so a caller that
+cannot tell them apart either acts on a screen it never read or never falls
+back to the screenshot it should have used.
 
 ### Key Types
 

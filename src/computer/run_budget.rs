@@ -263,6 +263,11 @@ pub enum ImageTrigger {
     /// The accessibility tree was cut by a depth or element limit, so the
     /// semantic path cannot name what is on screen.
     TreeIncomplete,
+    /// The accessibility tree could not be read at all: no tree, not a short
+    /// one. The distinction matters to the sentence the model is shown — a cut
+    /// tree means "look deeper", an unreadable one means "the picture is all
+    /// there is" — and it decides whether re-reading is worth a step.
+    TreeUnreadable,
     /// The last action did not verify — either it plainly did not land, or
     /// nothing could check it. Both mean the text says nothing trustworthy
     /// about what happened.
@@ -275,6 +280,7 @@ impl ImageTrigger {
     pub fn describe(self) -> &'static str {
         match self {
             ImageTrigger::TreeIncomplete => "the accessibility tree is incomplete",
+            ImageTrigger::TreeUnreadable => "the accessibility tree could not be read",
             ImageTrigger::LastStepNotVerified => "the last action was not verified",
             ImageTrigger::RepeatedFailures => "repeated failures",
         }
@@ -299,6 +305,11 @@ pub struct PerceptionPlan {
 pub struct PerceptionInputs {
     /// Whether the accessibility tree was read in full.
     pub tree_complete: bool,
+    /// Whether the read failed outright, producing no tree.
+    ///
+    /// Implies `!tree_complete`, and is carried separately because "the tree
+    /// was cut" and "there is no tree" call for different words in the prompt.
+    pub tree_read_failed: bool,
     /// The previous step's verification, if there was one.
     pub last_verified: Option<bool>,
     /// Consecutive failed steps so far.
@@ -344,7 +355,11 @@ pub fn plan_perception(inputs: PerceptionInputs) -> PerceptionPlan {
     if !inputs.tree_complete {
         return PerceptionPlan {
             attach_image: true,
-            trigger: Some(ImageTrigger::TreeIncomplete),
+            trigger: Some(if inputs.tree_read_failed {
+                ImageTrigger::TreeUnreadable
+            } else {
+                ImageTrigger::TreeIncomplete
+            }),
             tree_complete: false,
         };
     }
@@ -379,6 +394,7 @@ mod tests {
     fn inputs() -> PerceptionInputs {
         PerceptionInputs {
             tree_complete: true,
+            tree_read_failed: false,
             last_verified: Some(true),
             consecutive_failures: 0,
             model_supports_vision: true,
@@ -411,6 +427,25 @@ mod tests {
         assert!(plan.attach_image);
         assert_eq!(plan.trigger, Some(ImageTrigger::TreeIncomplete));
         assert!(!plan.tree_complete);
+    }
+
+    /// A tree that could not be read at all is not a truncated one. Both ask
+    /// for the picture, but the model is told a different thing — "look
+    /// deeper" is wrong advice when there was nothing to look at.
+    #[test]
+    fn an_unreadable_tree_is_named_as_unreadable_not_truncated() {
+        let plan = plan_perception(PerceptionInputs {
+            tree_complete: false,
+            tree_read_failed: true,
+            ..inputs()
+        });
+        assert!(plan.attach_image);
+        assert_eq!(plan.trigger, Some(ImageTrigger::TreeUnreadable));
+        assert_ne!(
+            ImageTrigger::TreeUnreadable.describe(),
+            ImageTrigger::TreeIncomplete.describe(),
+            "the two sentences must not be interchangeable"
+        );
     }
 
     #[test]
@@ -473,6 +508,7 @@ mod tests {
     fn a_model_without_vision_gets_no_image_however_bad_things_are() {
         let plan = plan_perception(PerceptionInputs {
             tree_complete: false,
+            tree_read_failed: false,
             last_verified: Some(false),
             consecutive_failures: 9,
             model_supports_vision: false,

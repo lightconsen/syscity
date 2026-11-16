@@ -1,16 +1,16 @@
 //! Linux X11 Accessibility tool — query UI trees via AT-SPI2.
 //!
-//! Tries `python3` + `pyatspi` first, then falls back to `atspi2` D-Bus
-//! introspection, then finally to `xdotool` + `xwininfo` for minimal
-//! window information.
+//! The AT-SPI2 script lives in [`crate::computer::platform::atspi`] because it
+//! is not X11-specific: the same bus serves Wayland sessions. What is X11's
+//! own is the last-resort fallback, `xdotool` + `xwininfo`, which reads window
+//! geometry and no controls.
 
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::process::Command;
-use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
+use super::super::atspi;
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
 
 /// Description of a UI element on Linux.
@@ -68,158 +68,9 @@ impl X11AccessibilityTool {
         Self
     }
 
-    /// Python script that traverses the active AT-SPI2 application.
-    ///
-    /// `max_depth` is substituted into the script rather than frozen at 3: a
-    /// caller asking for a deeper tree used to be silently given a shallow
-    /// one, which reads as "the element is not there".
-    fn build_python_script(max_depth: u32) -> String {
-        // The script is a template rather than a `format!` string: its Python
-        // bodies are full of `{}` dict literals, which would have to be
-        // doubled to survive formatting.
-        r#"
-import json, sys
-try:
-    import pyatspi
-except ImportError:
-    print(json.dumps({"error": "pyatspi not installed"}), file=sys.stderr)
-    sys.exit(1)
-
-def export_element(acc, depth=0):
-    try:
-        name = acc.name or ""
-        role = acc.getRoleName() or "unknown"
-        state_set = acc.getState()
-        enabled = state_set.contains(pyatspi.STATE_ENABLED)
-        focused = state_set.contains(pyatspi.STATE_FOCUSED)
-        x, y, w, h = acc.extents
-    except Exception:
-        return None
-    try:
-        child_count = int(acc.childCount)
-    except Exception:
-        child_count = None
-    obj = {
-        "role": role,
-        "name": name,
-        "enabled": enabled,
-        "focused": focused,
-        "x": x, "y": y,
-        "width": w, "height": h,
-        "children_count": child_count,
-        "truncated": False,
-        "children": []
-    }
-    if depth < __MAX_DEPTH__:
-        try:
-            for i in range(acc.childCount):
-                child = acc.getChildAtIndex(i)
-                child_dict = export_element(child, depth + 1)
-                if child_dict:
-                    obj["children"].append(child_dict)
-        except Exception:
-            pass
-    else:
-        # Stopped at the depth limit with children still unread. The count is
-        # what makes that visible: the caller can tell "no children" from
-        # "children nobody looked at".
-        obj["truncated"] = bool(child_count)
-    return obj
-
-desktop = pyatspi.Registry.getDesktop(0)
-active_app = None
-for i in range(desktop.childCount):
-    app = desktop.getChildAtIndex(i)
-    try:
-        if app.getState().contains(pyatspi.STATE_ACTIVE) or app.getState().contains(pyatspi.STATE_FOCUSED):
-            active_app = app
-            break
-    except Exception:
-        pass
-
-if not active_app and desktop.childCount > 0:
-    active_app = desktop.getChildAtIndex(0)
-
-if active_app:
-    tree = export_element(active_app)
-    print(json.dumps(tree))
-else:
-    print(json.dumps({"role": "desktop", "name": "", "children": []}))
-"#
-        .replace("__MAX_DEPTH__", &max_depth.to_string())
-    }
-
-    /// Fallback script using xdotool + xwininfo for minimal window data.
+    /// The X11-only fallback script.
     fn build_xwininfo_fallback() -> &'static str {
-        r#"
-import json, subprocess, sys
-
-def run(cmd):
-    try:
-        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
-        return out.stdout.strip()
-    except Exception:
-        return ""
-
-# Get active window id
-wid = run("xdotool getactivewindow 2>/dev/null || xdotool getwindowfocus 2>/dev/null")
-if not wid:
-    print(json.dumps({"role":"desktop","name":"","children":[]}))
-    sys.exit(0)
-
-# Get window info
-info = run(f"xwininfo -id {wid} 2>/dev/null")
-name = ""
-for line in info.splitlines():
-    if "Window id:" in line and '"' in line:
-        name = line.split('"')[1]
-        break
-
-# Get window geometry
-geo = run(f"xdotool getwindowgeometry {wid} 2>/dev/null")
-x, y, w, h = 0, 0, 0, 0
-for line in geo.splitlines():
-    if "Position:" in line:
-        parts = line.replace(",", "").split()
-        try:
-            x = int(parts[1])
-            y = int(parts[2])
-        except Exception:
-            pass
-    if "Geometry:" in line:
-        parts = line.replace("x", " ").split()
-        try:
-            w = int(parts[1])
-            h = int(parts[2])
-        except Exception:
-            pass
-
-print(json.dumps({
-    "role": "Window",
-    "name": name,
-    "enabled": True,
-    "x": x, "y": y,
-    "width": w, "height": h,
-    "children": []
-}))
-"#
-    }
-
-    async fn run_python(script: &str) -> crate::Result<(bool, String, String)> {
-        let output = timeout(
-            Duration::from_secs(10),
-            Command::new("python3").arg("-c").arg(script).output(),
-        )
-        .await;
-        match output {
-            Ok(Ok(out)) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                Ok((out.status.success() && !stdout.is_empty(), stdout, stderr))
-            }
-            Ok(Err(e)) => Ok((false, String::new(), format!("Python spawn error: {}", e))),
-            Err(_) => Ok((false, String::new(), "Python timed out".to_string())),
-        }
+        atspi::xwininfo_fallback_script()
     }
 
     /// Parse JSON tree into a tree of elements.
@@ -303,45 +154,38 @@ impl Tool for X11AccessibilityTool {
         _args: Value,
         _context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
+        // Strategy 1: the shared AT-SPI2 read (the same one the Wayland tool
+        // uses — the bus is not an X11 feature).
         info!("Querying X11 accessibility tree via AT-SPI2");
-
-        // Strategy 1: Python + pyatspi
         let max_depth = _args["max_depth"]
             .as_u64()
             .map(|d| d.clamp(1, 16) as u32)
             .unwrap_or(3);
-        let script = Self::build_python_script(max_depth);
-        let (success, stdout, stderr) = Self::run_python(&script).await?;
+        let read = atspi::read(max_depth).await;
 
-        if success {
-            match serde_json::from_str::<Value>(&stdout) {
-                Ok(json) => {
-                    let app = json.get("name").and_then(|v| v.as_str()).map(String::from);
-                    let elements = Self::parse_json_tree(&json);
-                    let result = AccessibilityResult {
-                        success: true,
-                        app,
-                        elements,
-                        raw_output: Some(stdout),
-                        error: None,
-                    };
-                    let json_str = serde_json::to_string_pretty(&result)
-                        .map_err(crate::error::SyscityError::Serialization)?;
-                    return Ok(ToolExecutionResult::success(json_str)
-                        .with_data(serde_json::to_value(result)?));
-                }
-                Err(e) => {
-                    warn!("AT-SPI2 JSON parse failed: {}", e);
-                }
-            }
-        } else {
-            warn!("AT-SPI2 (pyatspi) failed: {}", stderr);
+        if read.ok {
+            let json = read.tree.unwrap_or(Value::Null);
+            let elements = Self::parse_json_tree(&json);
+            let result = AccessibilityResult {
+                success: true,
+                app: read.app.clone(),
+                elements,
+                raw_output: read.raw.clone(),
+                error: None,
+            };
+            let json_str = serde_json::to_string_pretty(&result)
+                .map_err(crate::error::SyscityError::Serialization)?;
+            return Ok(
+                ToolExecutionResult::success(json_str).with_data(serde_json::to_value(result)?)
+            );
         }
+        let stderr = read.error.unwrap_or_default();
+        warn!("AT-SPI2 (pyatspi) failed: {}", stderr);
 
         // Strategy 2: xdotool + xwininfo fallback
         info!("Falling back to xdotool/xwininfo");
         let (fb_success, fb_stdout, fb_stderr) =
-            Self::run_python(Self::build_xwininfo_fallback()).await?;
+            atspi::run_python(Self::build_xwininfo_fallback()).await?;
 
         if fb_success {
             match serde_json::from_str::<Value>(&fb_stdout) {
@@ -395,17 +239,13 @@ mod tests {
     }
 
     /// The depth the caller asked for reaches the walker rather than being
-    /// frozen at 3.
+    /// frozen at 3. The script lives in `atspi` now, so this asserts the
+    /// delegation rather than re-testing the template (which `atspi`'s own
+    /// tests cover).
     #[test]
-    fn the_python_script_honours_the_requested_depth() {
-        let script = X11AccessibilityTool::build_python_script(7);
+    fn the_requested_depth_reaches_the_shared_reader() {
+        let script = atspi::python_script(7);
         assert!(script.contains("if depth < 7:"), "{script}");
-        assert!(!script.contains("__MAX_DEPTH__"), "placeholder left in script");
-        // The dict literals survive templating untouched.
-        assert!(script.contains(r#"{"error": "pyatspi not installed"}"#));
-        // Focus decides where a bare `type` / `key_press` lands.
-        assert!(script.contains("STATE_FOCUSED"), "{script}");
-        assert!(script.contains(r#""focused": focused,"#), "{script}");
     }
 
     #[test]

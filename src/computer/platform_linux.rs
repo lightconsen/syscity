@@ -655,7 +655,21 @@ impl ComputerAdapter for WaylandComputerAdapter {
             .ok_or_else(|| ComputerError::ToolFailed("accessibility tool not found".to_string()))?
             .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
 
-        // Wayland tool always returns success with explanation; parse whatever we got
+        // A failed read is a failure, not an empty tree. The tool now reports
+        // "could not read" rather than "nothing here", and collapsing that
+        // back to `Ok(vec![])` would restore the lie one layer down: every
+        // caller that reads an empty tree as "a desktop with no controls"
+        // would be misled again, including the run loop's decision to fall
+        // back to a screenshot.
+        if !result.success {
+            let message = result.error.clone().unwrap_or_default();
+            return Err(crate::computer::accessibility_read_error(
+                result.data.as_ref(),
+                &message,
+                false,
+            ));
+        }
+
         let elements = crate::computer::parse_accessibility_elements(result.data.as_ref());
         let app_name = result
             .data

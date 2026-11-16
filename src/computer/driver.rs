@@ -116,6 +116,14 @@ pub struct StepContext {
     pub tree: Vec<UiElement>,
     /// Whether that read was complete.
     pub tree_complete: bool,
+    /// Why the read produced no tree at all, when it failed.
+    ///
+    /// Distinct from `tree_complete`: an incomplete tree *is* a tree the model
+    /// can read part of, while this says there was nothing to read. The prompt
+    /// words them differently — "an element you cannot see may still exist" is
+    /// wrong advice for a screen nobody managed to read, and the honest line
+    /// there is that the tree is unavailable and the picture is all there is.
+    pub tree_read_failed: Option<String>,
     /// The screenshot, when one was taken. Always available because the loop
     /// captures before deciding; whether it is *sent* is the perception plan's
     /// call.
@@ -217,6 +225,7 @@ impl ModelDriver {
 
         let mut perception = plan_perception(PerceptionInputs {
             tree_complete: ctx.tree_complete,
+            tree_read_failed: ctx.tree_read_failed.is_some(),
             last_verified: state.last_verified,
             consecutive_failures: state.consecutive_failures,
             model_supports_vision: ctx.model_supports_vision,
@@ -282,7 +291,15 @@ impl ModelDriver {
             &std::collections::HashMap::new(),
         );
         wire.push_str(&outline.text);
-        if let Some(note) = outline.incomplete_note() {
+        if let Some(reason) = ctx.tree_read_failed.as_deref() {
+            // Not "an element you cannot see may still exist" — that is advice
+            // for a tree that was cut. Here nothing was read at all, and the
+            // ways forward are a screenshot or screen coordinates.
+            wire.push_str(&format!(
+                "(the accessibility tree could not be read: {reason}. Act from the \
+                 screenshot or by screen coordinates until it can be.)\n"
+            ));
+        } else if let Some(note) = outline.incomplete_note() {
             wire.push_str(note);
         }
 
@@ -802,6 +819,7 @@ mod tests {
         StepContext {
             tree: vec![],
             tree_complete,
+            tree_read_failed: None,
             screenshot: Some(screenshot()),
             model_supports_vision: true,
             image_budget_available: true,
@@ -885,6 +903,25 @@ mod tests {
         let (_system, user) = driver().render_prompt(&state(), &ctx(false));
         assert!(user.contains("image of the screen is attached"), "{user}");
         assert!(user.contains("accessibility tree is incomplete"), "{user}");
+    }
+
+    /// A tree that could not be read is not a tree that was cut. The old
+    /// wording — "an element you cannot see may still exist" — tells the model
+    /// to re-read a screen nobody managed to read in the first place.
+    #[test]
+    fn an_unreadable_tree_is_told_apart_from_a_truncated_one() {
+        let mut context = ctx(false);
+        context.tree_read_failed = Some("pyatspi is not installed".to_string());
+        let (_system, user) = driver().render_prompt(&state(), &context);
+        assert!(user.contains("could not be read"), "{user}");
+        assert!(user.contains("pyatspi is not installed"), "{user}");
+        assert!(
+            !user.contains("an element you cannot see may still exist"),
+            "that advice is for a tree that was cut, not one that is absent: {user}"
+        );
+        // It is still a reason to attach the picture — nothing else describes
+        // the screen.
+        assert!(user.contains("could not be read"), "{user}");
     }
 
     #[test]

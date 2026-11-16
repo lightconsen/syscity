@@ -241,6 +241,8 @@ fn is_service_available(name: &str) -> bool {
 }
 
 pub mod android;
+/// The AT-SPI2 UI-tree read, shared by the Linux desktop tools.
+pub mod atspi;
 pub mod common;
 pub mod ios;
 pub mod linux;
