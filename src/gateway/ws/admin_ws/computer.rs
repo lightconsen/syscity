@@ -858,20 +858,78 @@ pub(crate) async fn handle_computer_record_start(
         .map(str::to_string);
 
     match state.tools.computer_recording.start(name.clone()) {
-        Ok(()) => WsResponse::ok(
-            &req.id,
-            serde_json::json!({
-                "recording": true,
-                "name": name,
-                "steps": 0,
-            }),
-        ),
+        Ok(()) => {
+            // The picture is a second, optional half of the recording. It is
+            // started here — after the action recorder is running, so the two
+            // cover the same interval — and its failure never fails the
+            // recording: losing the video but keeping the replayable workflow
+            // is strictly better than losing both.
+            let video = if config.computer.record_video {
+                start_recording_video(state, &name).await
+            } else {
+                None
+            };
+            WsResponse::ok(
+                &req.id,
+                serde_json::json!({
+                    "recording": true,
+                    "name": name,
+                    "steps": 0,
+                    "video": video,
+                }),
+            )
+        }
         Err(workflow::RecordingError::AlreadyRecording) => WsResponse::err(
             &req.id,
             "ALREADY_RECORDING",
             "A recording is already in progress; stop it with `computer.record_stop` first",
         ),
         Err(e) => WsResponse::err(&req.id, "RECORD_START_FAILED", e.to_string()),
+    }
+}
+
+/// Start the video half of a recording, returning the file path when it began.
+///
+/// Failure here is reported, not raised: `computer.record_start` has already
+/// succeeded at the half that matters (the action recorder), and a missing
+/// screen-capture permission on this host must not make recording impossible.
+/// The reply's `video: null` is the caller's answer to "was there a picture",
+/// and the warning names the fix for whoever is reading the logs.
+async fn start_recording_video(
+    state: &Arc<GatewayState>,
+    name: &Option<String>,
+) -> Option<std::path::PathBuf> {
+    let Some(session) = state.tools.computer_recording.session_id() else {
+        // The action recorder stopped between `start` and here — a second
+        // `record_stop` raced this call. Nothing to capture.
+        return None;
+    };
+    let dir = crate::computer::recording::video_dir(&state.paths);
+    match crate::computer::recording::start_capture(
+        state.tools.computer_recording.clone(),
+        session,
+        name.clone(),
+        dir,
+    )
+    .await
+    {
+        Ok(capture) => {
+            // Registered so a gateway shutdown stops the capture rather than
+            // leaving an ffmpeg child holding the display.
+            state
+                .task_registry
+                .insert_join(format!("computer-recording-video-{session}"), capture.task)
+                .await;
+            *state.tools.computer_recording_video.write().await = Some(capture.path.clone());
+            Some(capture.path)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[computer.record_start] no video for this recording: {e}. The workflow will \
+                 still be recorded; enable Screen Recording for this process to capture a video."
+            );
+            None
+        }
     }
 }
 
@@ -897,6 +955,10 @@ pub(crate) async fn handle_computer_record_stop(
         }
     };
 
+    // Taken before the recording stops: the capture's own task notices the end
+    // of the session and closes the file, and reading this afterwards would be
+    // a race with a `record_start` that follows hard on this one.
+    let video_path = state.tools.computer_recording_video.write().await.take();
     let mut workflow = match state.tools.computer_recording.stop(Some(name.clone())) {
         Ok(workflow) => workflow,
         Err(workflow::RecordingError::NotRecording) => {
@@ -915,6 +977,11 @@ pub(crate) async fn handle_computer_record_stop(
         .filter(|d| !d.is_empty())
     {
         workflow = workflow.with_description(description);
+    }
+
+    if let Some(video) = &video_path {
+        let dir = crate::computer::recording::video_dir(&state.paths);
+        workflow.video = crate::computer::recording::relative_to(&dir, video);
     }
 
     let store = WorkflowStore::for_paths(&state.paths);
@@ -937,6 +1004,10 @@ pub(crate) async fn handle_computer_record_stop(
             "path": path.display().to_string(),
             "steps": workflow.steps.len(),
             "parameters": workflow.parameters,
+            // Named so a caller can open it; `null` when the capture was off
+            // or produced nothing, which is not an error.
+            "video": video_path.as_ref().map(|p| p.display().to_string()),
+            "video_ready": video_path.is_some(),
         }),
     )
 }

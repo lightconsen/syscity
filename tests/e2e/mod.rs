@@ -209,6 +209,27 @@ pub fn skip_if_no_screen_capture() -> bool {
     false
 }
 
+/// Whether `ffmpeg` is on this host, loudly skipped when it is not.
+///
+/// The screen-recording E2E spawns ffmpeg for real, so its absence is a
+/// capability this host does not have rather than a defect in the code. The
+/// message names the fix because the next reader will otherwise assume the
+/// test simply does not exist.
+pub fn skip_if_no_ffmpeg() -> Option<()> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let found = path
+        .split(':')
+        .any(|dir| !dir.is_empty() && std::path::Path::new(dir).join("ffmpeg").is_file());
+    if found {
+        return Some(());
+    }
+    eprintln!(
+        "Skipping screen-recording E2E test: `ffmpeg` is not on PATH. Install it \
+         (`brew install ffmpeg`) or run on a host that has it."
+    );
+    None
+}
+
 // ── Gateway Setup
 // ─────────────────────────────────────────────────────────────
 

@@ -181,6 +181,30 @@ retries a step into doing what it already did. `FailureStrategy` (`skip` default
 decides whether the replay goes on; a `Refused` step is terminal for that step whatever the strategy,
 since the same request meets the same refusal.
 
+**The video half.** The actions are what a replay reproduces; the picture is what a person needs when
+the replay then does the wrong thing. `[computer] record_video = true` (off by default) makes
+`computer.record_start` also start a screen capture, and `record_stop` records the resulting file on
+the workflow as `video` (relative to the artifacts directory, so a moved root still resolves).
+
+The capture lives in `computer/recording.rs` and is three parts, each for a reason:
+
+- `ScreenRecorder` already reads the display, but its buffer is a *window* (`max_buffer_secs`) for
+  asking "is the scene stable", not the whole recording. A recording may last minutes, so a
+  `StreamSink` (`with_stream_sink`) hands every frame onward as it arrives, before the buffer's own
+  trim can drop it.
+- `StreamingEncoder` is that frame's destination: one ffmpeg process, fed frame by frame, so what the
+  recording holds is a pipe rather than gigabytes (1920×1080 RGBA is ~8 MB a frame, 40 MB a second at
+  5 fps). The encoder cannot start until the first frame reports the dimensions.
+- The supervisor polls `Recording::session_id()` and closes the file when the recording ends. Polling
+  rather than hooking `record_stop` is deliberate: `record_stop` is one of several ways a recording
+  ends (the same handle is dropped at shutdown), and a video that stops only when someone rings a bell
+  is truncated whenever they forget.
+
+A capture that cannot start — no ffmpeg, no Screen Recording permission, no display — is a `null`
+`video` in the reply and a warning in the log, never a failed `record_start`. Losing the picture but
+keeping the replayable workflow is strictly better than losing both, and the two are independent
+permissions.
+
 
 
 ```rust

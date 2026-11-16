@@ -35,6 +35,7 @@ pub mod image_budget;
 pub mod log_aggregator;
 pub mod network;
 pub mod page;
+pub mod recording;
 pub mod reflection;
 /// Clients for a desktop that lives on another machine — the benchmark
 /// harnesses (OSWorld, Cua Bench) own the VM and this side drives it.
@@ -84,7 +85,8 @@ pub use page::{PageAction, PageActor, PageTarget};
 pub use remote_control::{RemoteControlAdapter, RemoteControlConfig, RemoteProtocol};
 pub use rollback::{RollbackManager, Snapshot};
 pub use screen_recorder::{
-    resolve_or_download_ffmpeg, RecorderConfig, Rect as RecorderRect, ScreenRecorder, VideoFrame,
+    resolve_or_download_ffmpeg, RecorderConfig, Rect as RecorderRect, ScreenRecorder, StreamSink,
+    StreamingEncoder, VideoFrame,
 };
 pub use types::*;
 pub use use_loop::{ComputerUseLoop, LoopConfig, LoopDecision, LoopResult, LoopState, StepRecord};

@@ -390,6 +390,17 @@ pub struct Rect {
     pub height: u32,
 }
 
+/// Where captured frames go besides the circular buffer.
+///
+/// The buffer is a *window* — `max_buffer_secs` of recent frames, for asking
+/// "is the scene stable". A recording wants the whole run, which is unbounded
+/// and must not be held in memory. So a sink is handed every frame as it
+/// arrives and writes it out; the buffer keeps its own window alongside.
+///
+/// `Send`-safe and called from the capture task, so an implementation must not
+/// block: pushing onto an mpsc is fine, awaiting ffmpeg is not.
+pub type StreamSink = Arc<dyn Fn(VideoFrame) + Send + Sync>;
+
 /// Screen recorder backed by FFmpeg.
 pub struct ScreenRecorder {
     config: RecorderConfig,
@@ -397,6 +408,7 @@ pub struct ScreenRecorder {
     running: Arc<AtomicBool>,
     capture_task: Option<tokio::task::JoinHandle<()>>,
     save_path: Option<PathBuf>,
+    stream_sink: Option<StreamSink>,
 }
 
 impl ScreenRecorder {
@@ -408,6 +420,7 @@ impl ScreenRecorder {
             running: Arc::new(AtomicBool::new(false)),
             capture_task: None,
             save_path: None,
+            stream_sink: None,
         })
     }
 
@@ -425,9 +438,10 @@ impl ScreenRecorder {
         let running = self.running.clone();
         let buffer = self.frame_buffer.clone();
         let config = self.config;
+        let sink = self.stream_sink.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_ffmpeg_capture(config, buffer, running, ffmpeg_bin).await {
+            if let Err(e) = run_ffmpeg_capture(config, buffer, running, ffmpeg_bin, sink).await {
                 warn!("Screen recorder capture loop exited: {}", e);
             }
         });
@@ -508,6 +522,15 @@ impl ScreenRecorder {
             return None;
         }
         Some(pixel_diff(frames[1], frames[0]))
+    }
+
+    /// Send every captured frame to `sink` as well as into the buffer.
+    ///
+    /// Set before [`Self::start`]: the sink is moved into the capture task, and
+    /// a sink installed after the task exists would never be called.
+    pub fn with_stream_sink(mut self, sink: StreamSink) -> Self {
+        self.stream_sink = Some(sink);
+        self
     }
 
     /// Inject a synthetic frame into the buffer (for testing).
@@ -606,6 +629,7 @@ async fn run_ffmpeg_capture(
     buffer: Arc<Mutex<VecDeque<VideoFrame>>>,
     running: Arc<AtomicBool>,
     ffmpeg_bin: PathBuf,
+    sink: Option<StreamSink>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = build_ffmpeg_command(config, &ffmpeg_bin)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -649,11 +673,7 @@ async fn run_ffmpeg_capture(
                     height,
                 };
 
-                let mut buf = buffer.lock().await;
-                buf.push_back(frame);
-                while buf.len() > max_frames {
-                    buf.pop_front();
-                }
+                accept_frame(frame, &sink, &buffer, max_frames).await;
             }
             Ok(Err(e)) => {
                 warn!("FFmpeg stdout read error: {}", e);
@@ -683,6 +703,30 @@ async fn run_ffmpeg_capture(
     }
 
     Ok(())
+}
+
+/// What one captured frame does: the recording sink first, then the buffer.
+///
+/// A named step rather than five lines inline because the *order* is the
+/// contract — a recording must not lose a frame to the buffer's window — and
+/// the only way to test an order inside a capture loop is to call the step
+/// that implements it.
+async fn accept_frame(
+    frame: VideoFrame,
+    sink: &Option<StreamSink>,
+    buffer: &Mutex<VecDeque<VideoFrame>>,
+    max_frames: usize,
+) {
+    // The sink sees the frame first: it is the recording, and a frame dropped
+    // to keep the buffer small must still be written.
+    if let Some(sink) = sink {
+        sink(frame.clone());
+    }
+    let mut buf = buffer.lock().await;
+    buf.push_back(frame);
+    while buf.len() > max_frames {
+        buf.pop_front();
+    }
 }
 
 fn build_ffmpeg_command(
@@ -831,6 +875,171 @@ async fn detect_screen_resolution() -> Option<(u32, u32)> {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming encoder
+// ---------------------------------------------------------------------------
+
+/// Writes frames to an MP4 as they arrive.
+///
+/// [`ScreenRecorder::set_save_path`] keeps the frames and encodes them all at
+/// [`ScreenRecorder::stop`], which is right for a short window but wrong for a
+/// recording: a person may record for minutes, and holding every RGBA frame
+/// would be gigabytes (1920×1080×4 is ~8 MB a frame; at 5 fps that is 40 MB a
+/// second). A recording therefore encodes continuously — one ffmpeg process,
+/// fed frame by frame — so what it holds is a pipe, not a buffer.
+///
+/// The encoder is a `tokio::process::Child` writing to stdin, not the blocking
+/// `std::process::Command` the buffer path uses: this one runs inside the
+/// capture task, where awaiting is allowed and blocking is not.
+pub struct StreamingEncoder {
+    child: tokio::process::Child,
+    /// `Some` until [`Self::finish`] closes it: closing the pipe is what tells
+    /// ffmpeg the recording ended, so it cannot simply be a field.
+    stdin: Option<tokio::process::ChildStdin>,
+    width: u32,
+    height: u32,
+    fps: u32,
+    path: PathBuf,
+    frames: u64,
+}
+
+impl StreamingEncoder {
+    /// Start an encoder that will write the recording to `path`.
+    ///
+    /// The dimensions are not known until ffmpeg's capture has read its first
+    /// frame, so ffmpeg is told to read `rgba` at the size the *frame*
+    /// reports — see [`Self::start_with_size`]. The size is fixed for the
+    /// duration: a display that changes resolution mid-recording is not a case
+    /// worth a second encoder.
+    pub async fn start(
+        path: impl Into<PathBuf>,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> crate::computer::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                crate::computer::ComputerError::Other(format!(
+                    "Cannot create {} for the recording: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let ffmpeg_bin = resolve_or_download_ffmpeg().await?;
+
+        let mut child = tokio::process::Command::new(&ffmpeg_bin)
+            .arg("-y")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("rgba")
+            .arg("-s")
+            .arg(format!("{width}x{height}"))
+            .arg("-r")
+            .arg(fps.to_string())
+            .arg("-i")
+            .arg("-")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-preset")
+            .arg("veryfast")
+            .arg(&path)
+            .stdin(Stdio::piped())
+            // Inherited rather than piped: a piped stderr that nobody drains
+            // fills its buffer and blocks ffmpeg mid-recording.
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                crate::computer::ComputerError::Other(format!(
+                    "Failed to start the recording encoder: {e}"
+                ))
+            })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            crate::computer::ComputerError::Other("the recording encoder has no stdin".to_string())
+        })?;
+
+        info!("Recording to {} ({width}x{height} @ {fps} fps)", path.display());
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            width,
+            height,
+            fps,
+            path,
+            frames: 0,
+        })
+    }
+
+    /// The path the recording is being written to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// How many frames have been written.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Write one frame. A frame whose size does not match is dropped, with a
+    /// warning: handing ffmpeg a short buffer would corrupt the whole file.
+    pub async fn write(&mut self, frame: &VideoFrame) -> crate::computer::Result<()> {
+        if frame.width != self.width || frame.height != self.height {
+            warn!(
+                "dropping a {}x{} frame; the recording is {}x{}",
+                frame.width, frame.height, self.width, self.height
+            );
+            return Ok(());
+        }
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(crate::computer::ComputerError::Other(
+                "the recording has already been closed".to_string(),
+            ));
+        };
+        stdin
+            .write_all(&frame.data)
+            .await
+            .map_err(|e| crate::computer::ComputerError::Other(format!("writing a frame: {e}")))?;
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Close the recording and report where it is.
+    ///
+    /// Closing stdin is the signal ffmpeg waits for, so the final file is only
+    /// complete after `wait()` returns. A non-zero exit is an error even so:
+    /// the file may exist and be truncated, and reporting a path to it as a
+    /// success would be a lie a player would discover.
+    pub async fn finish(mut self) -> crate::computer::Result<PathBuf> {
+        // Dropping the pipe is the signal ffmpeg waits for.
+        drop(self.stdin.take());
+
+        let status = self.child.wait().await.map_err(|e| {
+            crate::computer::ComputerError::Other(format!("waiting for the encoder: {e}"))
+        })?;
+        if !status.success() {
+            return Err(crate::computer::ComputerError::Other(format!(
+                "the recorder exited {status} after {} frames; {} is incomplete",
+                self.frames,
+                self.path.display()
+            )));
+        }
+        info!(
+            "Recording finished: {} frames ({}x{} @ {} fps) → {}",
+            self.frames,
+            self.width,
+            self.height,
+            self.fps,
+            self.path.display()
+        );
+        Ok(self.path)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frame analysis
 // ---------------------------------------------------------------------------
 
@@ -904,6 +1113,41 @@ mod tests {
         let a = make_test_frame(100, 100, 0);
         let b = make_test_frame(200, 100, 0);
         assert_eq!(pixel_diff(&a, &b), 100 * 100);
+    }
+
+    /// A frame must reach the sink even when the buffer would drop it.
+    ///
+    /// The buffer is a window (`max_buffer_secs`); a recording is the whole
+    /// run. Tying the two together would make a long recording silently lose
+    /// its beginning — exactly the part a person wants to review.
+    #[tokio::test]
+    async fn a_streamed_frame_reaches_the_sink_even_when_the_buffer_drops_it() {
+        use std::sync::Mutex as StdMutex;
+
+        let seen: Arc<StdMutex<Vec<u32>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_in_sink = seen.clone();
+        let sink: Option<StreamSink> = Some(Arc::new(move |frame: VideoFrame| {
+            seen_in_sink.lock().expect("not poisoned").push(frame.width);
+        }));
+        // A buffer one frame wide: of five frames, four are dropped from it.
+        let buffer = Mutex::new(VecDeque::new());
+
+        for i in 0..5u32 {
+            // Alternate widths so the sink's record says *which* frames came
+            // through, not only how many.
+            accept_frame(make_test_frame(64 + i, 48, 7), &sink, &buffer, 1).await;
+        }
+
+        let widths = seen.lock().expect("not poisoned").clone();
+        assert_eq!(
+            widths,
+            vec![64, 65, 66, 67, 68],
+            "every captured frame must reach the recording sink, in order"
+        );
+        // The window did its own job: it kept only the last frame.
+        let buf = buffer.lock().await;
+        assert_eq!(buf.len(), 1, "the buffer is still bounded");
+        assert_eq!(buf[0].width, 68, "and it holds the newest frame");
     }
 
     #[tokio::test]

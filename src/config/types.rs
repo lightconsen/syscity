@@ -561,6 +561,18 @@ pub struct ComputerConfig {
     /// JPEG quality for images sent to the model.
     #[serde(default = "default_screenshot_jpeg_quality")]
     pub screenshot_jpeg_quality: u8,
+    /// Capture a video alongside `computer.record_start`/`.record_stop`.
+    ///
+    /// Off by default, and not because it is expensive to run: it starts a
+    /// screen-capture process and needs a permission the rest of computer use
+    /// does not (macOS Screen Recording). A feature that spawns an encoder
+    /// should be asked for.
+    ///
+    /// The video goes to `<layout root>/artifacts/computer-recordings/` and its
+    /// path is stored on the workflow, so a later replay that goes wrong can be
+    /// read against the picture of what the recording originally did.
+    #[serde(default)]
+    pub record_video: bool,
 }
 
 /// Which vision backend answers "where is this element".
@@ -828,6 +840,7 @@ impl Default for ComputerConfig {
             screenshot_max_width: default_screenshot_max_width(),
             screenshot_format: default_screenshot_format(),
             screenshot_jpeg_quality: default_screenshot_jpeg_quality(),
+            record_video: false,
         }
     }
 }

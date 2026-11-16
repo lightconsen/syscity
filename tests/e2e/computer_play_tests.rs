@@ -411,3 +411,219 @@ async fn a_recorded_task_replays_with_a_different_name() {
     );
     assert_eq!(desktop.field_value(), "Invoices");
 }
+
+// ── The video half of a recording ───────────────────────────────────────────
+//
+// The plan's E-4: a recording can also keep the picture, so a replay that goes
+// wrong can be read against what the original did. The capture is a real
+// screen recording — ffmpeg reading the display — so this needs Screen
+// Recording permission on macOS and a display that can be read.
+//
+// Two halves, and both matter:
+//
+// 1. **The wiring, hermetically.** Turning the option on must make
+//    `record_start` report a video path, `record_stop` must store it on the
+//    workflow and write a playable file, and the capture must stop on its own
+//    when the recording does. This runs on any host, because the fake desktop
+//    above is the screen and no permission is needed to see it.
+// 2. **A real capture**, skipped loudly when the host cannot read its display.
+
+/// The file a video path names must exist, decode, and carry actual frames.
+///
+/// "The file is non-empty" would pass for a container whose video stream never
+/// got a frame (ffmpeg writes the header first). `ffprobe` is asked for the
+/// stream description instead, which is the difference between "a recording
+/// happened" and "a file appeared".
+fn assert_playable_video(path: &std::path::Path) {
+    assert!(path.exists(), "the recording video must exist at {}", path.display());
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,nb_frames",
+        ])
+        .arg("-of")
+        .arg("default=noprint_wrappers=1")
+        .arg(path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    assert!(
+        output.status.success(),
+        "ffprobe rejected {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("width=") && report.contains("height="),
+        "the video must have a picture stream: {report}"
+    );
+}
+
+/// Recording video must switch on with the option and end with the recording.
+///
+/// Asserts the whole seam: the path is reported at `start`, the workflow names
+/// it at `stop`, the file is a real video, and a second recording gets its own
+/// file rather than overwriting the first.
+#[tokio::test]
+#[serial]
+async fn a_recording_captures_a_video_when_the_option_is_on() {
+    let Some(_) = super::skip_if_no_ffmpeg() else {
+        return;
+    };
+    if !super::macos_screen_capture_available() {
+        eprintln!(
+            "Skipping the recorded-video E2E: this display cannot be captured (Screen Recording \
+             permission, or no session). The wiring below it is exercised on every host by \
+             `a_recording_without_video_still_saves_its_workflow`."
+        );
+        return;
+    }
+
+    let port = free_port();
+    let desktop = FinderDesktop::new();
+    let mut config = recording_config(port);
+    config.computer.record_video = true;
+    let gateway = new_test_gateway(config).await;
+    register_mock_provider_with_model(&gateway.model_router(), recording_mock(), "mock-model")
+        .await;
+
+    let state = gateway.state();
+    let fake: Arc<dyn ComputerAdapter> = desktop.clone();
+    state
+        .tools
+        .computer_adapter
+        .write()
+        .await
+        .replace(fake.clone());
+    state.tools.registry.register_dynamic(Arc::new(
+        ComputerTool::new(Some(fake)).with_recording(state.tools.computer_recording.clone()),
+    ));
+
+    start_gateway_and_wait(port, gateway).await;
+
+    let mut client = FrontendSimulator::connect(port).await;
+    let sid = client.create_session().await;
+    client.subscribe(vec![sid.clone()]).await;
+
+    let started = client.request("computer.record_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started}");
+    let video_path = started["payload"]["video"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the recording must name its video: {started}"))
+        .to_string();
+    assert!(video_path.ends_with(".mp4"), "the capture writes an mp4: {video_path}");
+
+    // Some steps, so the recording is not empty — a workflow with no steps is
+    // refused by `record_stop` and there would be nothing to attach a video to.
+    client
+        .send_chat(&sid, "In Finder, create a new folder and name it Reports.")
+        .await;
+    client
+        .wait_for_event("chat.final", 120)
+        .await
+        .expect("the recording turn must finish");
+
+    let stopped = client
+        .request("computer.record_stop", json!({ "name": "recorded-with-video" }))
+        .await;
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(
+        stopped["payload"]["video"].as_str(),
+        Some(video_path.as_str()),
+        "the stop reply names the same file: {stopped}"
+    );
+
+    // The saved workflow points at the video, relative to the artifacts dir, so
+    // moving `~/.syscity` does not break the reference.
+    let store = WorkflowStore::for_paths(&test_paths_root());
+    let saved = store
+        .load("recorded-with-video")
+        .await
+        .expect("the workflow was saved");
+    let stored = saved
+        .video
+        .as_deref()
+        .expect("the workflow names its video");
+    assert!(
+        !stored.starts_with('/'),
+        "the path is stored relative to the artifact directory: {stored}"
+    );
+
+    // The capture ends when the recording does — that is a poll plus the last
+    // frames still being written, so wait for the file rather than race it.
+    let path = std::path::PathBuf::from(&video_path);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_playable_video(&path);
+}
+
+/// With the option off, a recording saves its workflow and reports no video.
+///
+/// The other half of the seam, and the one that runs everywhere: the picture is
+/// optional, and its absence must not be reported as a failure or leave a stale
+/// path behind for the next recording to inherit.
+#[tokio::test]
+#[serial]
+async fn a_recording_without_video_still_saves_its_workflow() {
+    let port = free_port();
+    let desktop = FinderDesktop::new();
+    let gateway = new_test_gateway(recording_config(port)).await;
+    register_mock_provider_with_model(&gateway.model_router(), recording_mock(), "mock-model")
+        .await;
+
+    let state = gateway.state();
+    let fake: Arc<dyn ComputerAdapter> = desktop.clone();
+    state
+        .tools
+        .computer_adapter
+        .write()
+        .await
+        .replace(fake.clone());
+    state.tools.registry.register_dynamic(Arc::new(
+        ComputerTool::new(Some(fake)).with_recording(state.tools.computer_recording.clone()),
+    ));
+
+    start_gateway_and_wait(port, gateway).await;
+
+    let mut client = FrontendSimulator::connect(port).await;
+    let sid = client.create_session().await;
+    client.subscribe(vec![sid.clone()]).await;
+
+    let started = client.request("computer.record_start", json!({})).await;
+    assert_eq!(started["ok"], true, "{started}");
+    assert!(
+        started["payload"]["video"].is_null(),
+        "with the option off there is no capture, and the reply says so: {started}"
+    );
+
+    client
+        .send_chat(&sid, "In Finder, create a new folder and name it Reports.")
+        .await;
+    client
+        .wait_for_event("chat.final", 120)
+        .await
+        .expect("the recording turn must finish");
+
+    let stopped = client
+        .request("computer.record_stop", json!({ "name": "recorded-without-video" }))
+        .await;
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert!(
+        stopped["payload"]["video"].is_null(),
+        "no video means no path, not an empty one: {stopped}"
+    );
+
+    let store = WorkflowStore::for_paths(&test_paths_root());
+    let saved = store
+        .load("recorded-without-video")
+        .await
+        .expect("the workflow was saved regardless");
+    assert!(saved.video.is_none(), "the workflow names no video: {:?}", saved.video);
+    assert_eq!(saved.steps.len(), 3, "the actions were recorded as usual");
+}

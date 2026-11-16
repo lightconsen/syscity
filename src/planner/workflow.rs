@@ -97,6 +97,16 @@ pub struct Workflow {
     /// Parameter names inferred from the recording (e.g. `filename`).
     #[serde(default)]
     pub parameters: Vec<String>,
+    /// The screen recording taken while the workflow was recorded, relative to
+    /// the artifact directory.
+    ///
+    /// `None` unless `[computer] record_video` was on and the capture produced
+    /// frames. Kept on the workflow rather than in a side file because it is
+    /// part of what was recorded: a replay that goes wrong is best explained by
+    /// the picture of the original, and a reference nobody can find from the
+    /// workflow is a reference nobody uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<String>,
 }
 
 impl Workflow {
@@ -106,6 +116,7 @@ impl Workflow {
             description: None,
             steps: Vec::new(),
             parameters: Vec::new(),
+            video: None,
         }
     }
 
@@ -549,6 +560,7 @@ impl WorkflowRecorder {
             description: None,
             steps: std::mem::take(&mut self.steps),
             parameters: Vec::new(),
+            video: None,
         }
     }
 
@@ -653,10 +665,18 @@ pub enum RecordingError {
 #[derive(Debug, Default)]
 pub struct Recording {
     inner: Mutex<Option<RecordingSession>>,
+    /// Monotonic id for the current session.
+    ///
+    /// The video side needs to know whether the recording it is capturing is
+    /// still the one in progress: a `stop` then a fast `start` must not let the
+    /// first encoder write into the second recording's file. An id is enough —
+    /// the two sides never need to exchange anything else.
+    next_id: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug)]
 struct RecordingSession {
+    id: u64,
     name: Option<String>,
     started: Instant,
     recorder: WorkflowRecorder,
@@ -665,6 +685,12 @@ struct RecordingSession {
 impl Recording {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The id of the recording in progress, or `None` when there is none.
+    pub fn session_id(&self) -> Option<u64> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| s.id)
     }
 
     /// Begin recording, under the given name when one was chosen up front.
@@ -677,7 +703,12 @@ impl Recording {
         }
         let mut recorder = WorkflowRecorder::new();
         recorder.start_recording();
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         *guard = Some(RecordingSession {
+            id,
             name: name.filter(|n| !n.trim().is_empty()),
             started: Instant::now(),
             recorder,

@@ -196,6 +196,13 @@ pub struct ToolState {
     /// has no way to reach a per-connection handle. One recording at a time,
     /// refused rather than overlapped.
     pub computer_recording: Arc<crate::planner::workflow::Recording>,
+    /// The video being captured for the recording in progress, if any.
+    ///
+    /// The action recording and the screen capture start and stop together but
+    /// are owned by different code, and the workflow that `record_stop` saves
+    /// has to name the file. One optional path on the shared state is the
+    /// smallest place for them to meet.
+    pub computer_recording_video: Arc<RwLock<Option<std::path::PathBuf>>>,
     /// The apps desktop sessions may act on (`[computer] allow_apps`).
     ///
     /// On the tool state for the same reason the recording is: a run, a replay

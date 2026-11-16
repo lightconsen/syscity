@@ -146,6 +146,11 @@ pub struct ConfigChangeEvent {
 - `computer.allow_apps` — the per-app desktop boundary — is pushed into a shared
   handle on reload and on `config.set`, so it reaches desktop sessions that are
   already running rather than only the ones built after the edit
+- `computer.record_video` (default `false`) — capture a video alongside
+  `computer.record_start`/`.record_stop`. Read at the start of a recording, not
+  hot-reloaded into one already running: the file it writes is named and opened
+  up front. Off by default because it starts a screen-capture process and needs
+  a permission (macOS Screen Recording) the rest of computer use does not.
 - `ReloadableConfig` with broadcast-based change notifications
 - Comprehensive unit tests for all config subsystems
 
