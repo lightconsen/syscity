@@ -1480,6 +1480,84 @@ mod tests {
         }
     }
 
+    /// The Stage A gate: every tool that injects input on a real desktop must
+    /// advertise `requires_approval`.
+    ///
+    /// This is a *gate*, not a hint. The hole it closes is not "a tool forgot
+    /// a nice-to-have marker" — it is that the same click was approved when
+    /// reached through the aggregate `computer` tool and unapproved when
+    /// reached through `macos_desktop_control`. A hardcoded list would rot;
+    /// this sweeps the sets' own `tools()`, so a platform tool that drives the
+    /// pointer cannot land without saying so.
+    ///
+    /// Observation is out of scope on purpose: `*_accessibility`,
+    /// `*_screenshot` and the read half of `*_clipboard` become unusable if
+    /// they prompt, and a permission prompt for reading is how people learn to
+    /// click through the ones that matter.
+    #[test]
+    fn every_tool_that_drives_a_desktop_requires_approval() {
+        use crate::computer::platform::{
+            IosToolset, LinuxDesktopWaylandToolset, LinuxDesktopX11Toolset, LinuxToolset,
+            PlatformToolSet, WindowsToolset,
+        };
+
+        // Only the macOS module is `cfg`-gated; the rest compile everywhere,
+        // so one sweep can cover every OS whatever host runs the test.
+        #[allow(unused_mut)]
+        let mut sets: Vec<Box<dyn PlatformToolSet>> = vec![
+            Box::new(WindowsToolset::new()),
+            Box::new(LinuxToolset::new()),
+            Box::new(LinuxDesktopX11Toolset::new()),
+            Box::new(LinuxDesktopWaylandToolset::new()),
+            Box::new(IosToolset::new()),
+        ];
+        #[cfg(target_os = "macos")]
+        sets.push(Box::new(crate::computer::platform::MacosToolset::new()));
+
+        // Substrings that mean "this tool puts input into the machine".
+        const INPUT: &[&str] = &[
+            "desktop_control",
+            "applescript",
+            "powershell",
+            "input",
+            "click",
+            "type",
+            "key",
+        ];
+
+        let mut matched: Vec<String> = Vec::new();
+        for set in &sets {
+            for tool in set.tools() {
+                let name = tool.name();
+                if !INPUT.iter().any(|needle| name.contains(needle)) {
+                    continue;
+                }
+                let caps = tool.capabilities();
+                assert!(
+                    caps.requires_approval,
+                    "`{name}` (set `{}`) drives the desktop and must require approval",
+                    set.id()
+                );
+                assert!(
+                    !caps.read_only,
+                    "`{name}` (set `{}`) changes the desktop and must not claim read_only",
+                    set.id()
+                );
+                matched.push(name.to_string());
+            }
+        }
+
+        // A sweep whose naming heuristic stopped matching would pass silently.
+        // Four is the honest floor off macOS (Windows, X11, Wayland); the
+        // macOS-only sets add AppleScript and its desktop control tool.
+        let floor = if cfg!(target_os = "macos") { 6 } else { 4 };
+        assert!(
+            matched.len() >= floor,
+            "only {} input tools matched ({matched:?}) — the sweep is stale",
+            matched.len()
+        );
+    }
+
     /// `AgentCommand::UpdateConfig` must reach the running agent's runtime
     /// config, not just the display copy on the handle. Otherwise hot-reload /
     /// `config.set agent_overrides.*` would appear to succeed without taking
