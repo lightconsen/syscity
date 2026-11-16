@@ -186,3 +186,229 @@ async fn a_run_with_no_vision_ends_asking_for_a_person_and_names_the_reason() {
         "a handoff note is pending for a person: {approvals}"
     );
 }
+
+// ── The event sequence a client timeline is built from ──────────────────────
+//
+// The plan's second verification gap: a scripted desktop and a scripted model,
+// three steps and an answer, and the `computer.step` stream must be exactly
+// what a timeline needs — one ordered event per completed step, carrying the
+// step number the run's own status counts from, then one `finished`.
+//
+// Asserted through the public surface (`computer.run` → events →
+// `computer.status`) rather than against the executor directly, because the
+// event is what the UI actually renders and the status is what the next
+// client polls. A test of the loop alone would not catch a gateway that
+// numbered one and reported the other.
+
+/// A desktop whose screen changes on every click.
+///
+/// Verification compares the frame before a step with the frame after it. A
+/// desktop that never changes makes every click read as `Failed`, the failure
+/// streak ends the run early, and the test would be measuring the streak.
+struct ChangingDesktop {
+    clicks: std::sync::atomic::AtomicUsize,
+}
+
+impl ChangingDesktop {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            clicks: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl ComputerAdapter for ChangingDesktop {
+    async fn screenshot(&self, _region: Option<Rect>) -> syscity::computer::Result<Screenshot> {
+        let n = self.clicks.load(std::sync::atomic::Ordering::SeqCst);
+        // Two alternating byte patterns: different everywhere, so the diff is
+        // visible whether the build decodes pixels or samples them.
+        let fill = if n % 2 == 0 { b'A' } else { b'B' };
+        let data = vec![fill; 10_000];
+        Ok(Screenshot::new(String::from_utf8(data).unwrap_or_default(), 100, 100))
+    }
+
+    async fn read_ui_tree(&self, _app: Option<&str>) -> syscity::computer::Result<Vec<UiElement>> {
+        // Complete, so the loop decides from text and never reaches for a
+        // vision rung this test has switched off.
+        Ok(vec![UiElement {
+            id: "w1".to_string(),
+            role: "window".to_string(),
+            label: Some("Preferences".to_string()),
+            value: None,
+            bounds: Some(Rect::new(0, 0, 100, 100)),
+            enabled: syscity::computer::Tri::Known(true),
+            focused: syscity::computer::Tri::Known(true),
+            actions: None,
+            children: Vec::new(),
+            children_count: None,
+            truncated: false,
+        }])
+    }
+
+    async fn execute(&self, action: DesktopAction) -> syscity::computer::Result<ActionResult> {
+        if matches!(action, DesktopAction::Click { .. }) {
+            self.clicks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(ActionResult::success("clicked"))
+    }
+
+    async fn wait_for(
+        &self,
+        _condition: WaitCondition,
+        _timeout: Duration,
+    ) -> syscity::computer::Result<bool> {
+        Ok(true)
+    }
+
+    async fn display_geometry(&self) -> syscity::computer::Result<DisplayGeometry> {
+        Ok(DisplayGeometry::new(vec![
+            syscity::computer::DisplayInfo::new(0, 0, 100, 100).primary()
+        ]))
+    }
+}
+
+/// Click for the first `clicks` decisions, then declare the goal done.
+fn clicking_then_done(clicks: usize) -> MockProvider {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    MockProvider::new().with_callback(move |messages| {
+        let is_driver = messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("You drive a computer"));
+        if !is_driver {
+            return ProviderMessage::assistant("NOCACHE");
+        }
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n < clicks {
+            ProviderMessage::assistant(
+                r#"{"decision": "act", "action": {"type": "click", "x": 10, "y": 10}}"#,
+            )
+        } else {
+            ProviderMessage::assistant(r#"{"decision": "done", "message": "finished"}"#)
+        }
+    })
+}
+
+/// Three acted steps then an answer: the stream must be three ordered steps
+/// followed by one `finished`, and the status must agree about how many there
+/// were.
+#[tokio::test]
+#[serial]
+async fn a_three_step_run_streams_one_ordered_event_per_step_then_finished() {
+    let port = free_port();
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config.computer.enabled = true;
+    config.computer.settle_delay_ms = 1;
+    // Room for the three clicks and the decision that answers; one more would
+    // let the loop overshoot and the count assertion would be about the bound
+    // rather than about the run.
+    config.computer.max_steps = 4;
+    config.computer.vision.mode = "off".to_string();
+
+    let gateway = new_test_gateway(config).await;
+    register_mock_provider_with_model(&gateway.model_router(), clicking_then_done(3), "mock-model")
+        .await;
+    gateway
+        .state()
+        .tools
+        .computer_adapter
+        .write()
+        .await
+        .replace(ChangingDesktop::new());
+
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    let mut client = FrontendSimulator::connect(port).await;
+    let sid = client.create_session().await;
+    client.subscribe(vec![sid.clone()]).await;
+
+    let started = client
+        .request(
+            "computer.run",
+            json!({ "goal": "click through Preferences", "session_id": &sid }),
+        )
+        .await;
+    assert_eq!(started["ok"], true, "{started}");
+    let run_id = started["payload"]["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+
+    // Three steps, in order, each naming an action the adapter actually ran.
+    //
+    // `event.step` is zero-based, matching `turns.replay` and a run's own
+    // events; the human-facing `completed_steps` lines are 1-based. A stream
+    // that numbered from one here would draw every replay's timeline one step
+    // out of step with the run that recorded it.
+    let mut seen_steps = Vec::new();
+    for expected in 0..3usize {
+        let event = client
+            .wait_for_event("computer.step", 30)
+            .await
+            .unwrap_or_else(|| panic!("no computer.step for step {expected}"));
+        assert_eq!(event["run_id"], run_id.as_str(), "{event}");
+        assert_eq!(event["session_id"], sid.as_str(), "{event}");
+        let inner = &event["event"];
+        assert_eq!(inner["kind"], "step", "{event}");
+        assert_eq!(
+            inner["step"],
+            expected,
+            "steps must arrive in order, one event each, numbered from zero: {}",
+            serde_json::json!(seen_steps)
+        );
+        let action = inner["action"].as_str().unwrap_or_default();
+        assert!(
+            action.contains("click") || action.contains("Click"),
+            "the event says what was done, got {action:?} in {event}"
+        );
+        // The frame changed under the click, so the step is verified — an event
+        // stream that reported `null` here would leave a timeline unable to
+        // tell a step that landed from one that did not.
+        assert_eq!(inner["verified"], true, "{event}");
+        seen_steps.push(inner["step"].as_u64());
+    }
+
+    // Then exactly one conclusion, carrying the reason the run ended.
+    let finished = client
+        .wait_for_event("computer.step", 30)
+        .await
+        .expect("the run must report that it finished");
+    assert_eq!(finished["run_id"], run_id.as_str(), "{finished}");
+    let inner = &finished["event"];
+    assert_eq!(inner["kind"], "finished", "{finished}");
+    assert_eq!(inner["stop_reason"], "done", "{finished}");
+    assert_eq!(inner["phase"], "done", "{finished}");
+    assert_eq!(inner["steps"], 3, "the conclusion counts the same steps: {finished}");
+
+    // And the status a later client polls agrees with the stream it missed.
+    let mut view = serde_json::Value::Null;
+    for _ in 0..100 {
+        let status = client
+            .request("computer.status", json!({ "run_id": &run_id }))
+            .await;
+        assert_eq!(status["ok"], true, "{status}");
+        view = status["payload"].clone();
+        if view["finished"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(view["finished"], true, "the run never finished: {view}");
+    assert_eq!(view["phase"], "done", "{view}");
+    assert_eq!(
+        view["summary"]["steps"], 3,
+        "status and the event stream must count the same steps: {view}"
+    );
+    let completed = view["completed_steps"].as_array().expect("completed steps");
+    assert_eq!(completed.len(), 3, "{view}");
+    for (i, line) in completed.iter().enumerate() {
+        let line = line.as_str().unwrap_or_default();
+        assert!(
+            line.starts_with(&format!("{}. ", i + 1)),
+            "step {i} is numbered {i} in the visible history: {line}"
+        );
+    }
+}
