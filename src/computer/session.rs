@@ -651,6 +651,48 @@ impl ComputerSession {
                 }
             }
 
+            // The boundary, again, for the rungs that deliver to a point or a
+            // focus rather than to an element. An action that named an allowed
+            // app passed the pre-dispatch check, but the pixel and keyboard
+            // rungs are fallbacks that run *after* another rung had no effect
+            // — the moment a covering window or a different frontmost app
+            // decides who receives the event. Asking here is what keeps "may
+            // act on Safari" from typing into whatever happens to be in front
+            // when the accessibility rung answers "no effect".
+            if let Some(reason) = self.rung_border_refusal(&action, rung).await {
+                let (rolled_back, reflection) = self
+                    .account(
+                        &action,
+                        &ActionResult::error(format!("refused: {reason}")),
+                        StepVerification::Unverifiable,
+                        ActionEffect::Refused,
+                    )
+                    .await;
+                let mut evidence =
+                    crate::computer::ActionEvidence::new(rung, ActionEffect::Refused)
+                        .with_delivery(crate::computer::DeliveryDisposition::NotDelivered)
+                        .with_recovery(reason.clone())
+                        .with_tried(tried.clone());
+                evidence.escalation = None;
+                return Ok(StepOutcome {
+                    action,
+                    result: ActionResult::error(format!("refused: {reason}")),
+                    verification: StepVerification::Unverifiable,
+                    evidence: Some(evidence),
+                    state_after: None,
+                    screenshot_before: None,
+                    diff: None,
+                    sensitive_before: Vec::new(),
+                    sensitive_after: self.sensitive_findings().await,
+                    sensitive_target: false,
+                    reflection,
+                    snapshots_taken,
+                    rolled_back,
+                    settle_ms: None,
+                    budget: Some(budget.summary()),
+                });
+            }
+
             let result = match self.dispatch(&action, rung, &budget).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -1527,10 +1569,25 @@ impl ComputerSession {
 
     /// Why the per-app boundary refuses this action, when it does.
     ///
-    /// The app is whatever the adapter resolved the target to (the window's
-    /// owning process), or what the action names outright. `None` — no app
-    /// established — is a refusal too once a list is set: an action nobody can
-    /// place inside the list must not be assumed to be inside it.
+    /// Two questions, asked in one place because they must not be able to
+    /// disagree. First: does the app the action *names* pass the list — the
+    /// app it says outright, or the app the tree snapshot says its element
+    /// came from. Second, for an action that names no app at all: which app
+    /// would *receive* it, and is that one on the list?
+    ///
+    /// The second question is what turns "a coordinate click names nothing,
+    /// so it is always refused" into a check: a session that may act on
+    /// Safari can click a point while Safari is in front, because the platform
+    /// can say that Safari is what would get the event — and a session that
+    /// may not act on Finder still has its click refused when Finder is. When
+    /// the platform cannot say, the answer stays no: "nobody could check" has
+    /// never been clearance at this layer.
+    ///
+    /// An action that *names* an allowed app is judged on that name here. Its
+    /// delivered receiver is checked later, per rung, by
+    /// [`rung_border_refusal`](Self::rung_border_refusal) — the accessibility
+    /// rung acts on the element itself and may succeed whatever is in front,
+    /// so a receiver mismatch must not pre-empt it.
     ///
     /// Actions that are not input at all (a screenshot, a tree read, a system
     /// query) are not aimed at an app and are not what an allowlist exists to
@@ -1542,14 +1599,196 @@ impl ComputerSession {
         // A drag has two endpoints, and the drop lands at the second: a drag
         // that starts inside the list and ends outside it moves data across
         // the boundary, so both have to be refused together.
-        let apps: Vec<Option<String>> = match action {
-            DesktopAction::Drag { from, to } => {
-                vec![self.app_of_target(from).await, self.app_of_target(to).await]
+        for claim in self.claimed_apps(action).await {
+            match claim {
+                Claim::App(app) => {
+                    if let Some(reason) = self.config.allow_apps.refusal(Some(&app)) {
+                        return Some(reason);
+                    }
+                }
+                // The action names an element (or a process) but the app
+                // behind it could not be established. That is the older
+                // situation and keeps the older verdict: an action nobody can
+                // place inside the list is not assumed to be inside it.
+                Claim::Unresolved => {
+                    return Some(format_unresolved_app(self.config.allow_apps.entries()))
+                }
             }
-            other => vec![self.action_app(other).await],
+        }
+        // Every part that claims an app passed. What is left is the part that
+        // claims nothing — and that is answered by asking who would receive
+        // the event, not by refusing on the absence of a claim.
+        self.unattributed_receivers(action).await
+    }
+
+    /// The app each part of `action` claims, where it claims one.
+    ///
+    /// A part that names nothing (a coordinate, a bare key press) contributes
+    /// nothing here — it is [`unattributed_receivers`]'s question. A part that
+    /// names something the adapter cannot place contributes
+    /// [`Claim::Unresolved`], which is a refusal rather than a question: the
+    /// caller said where it meant to act, and nothing corroborated it.
+    async fn claimed_apps(&self, action: &DesktopAction) -> Vec<Claim> {
+        let targets: Vec<&ClickTarget> = match action {
+            DesktopAction::Drag { from, to } => vec![from, to],
+            DesktopAction::Click { target, .. }
+            | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Scroll { target, .. } => vec![target],
+            DesktopAction::Type { target: Some(target), .. } => vec![target],
+            _ => Vec::new(),
         };
-        apps.iter()
-            .find_map(|app| self.config.allow_apps.refusal(app.as_deref()))
+        // An element target is a claim about one app, and the adapter's
+        // snapshot is what corroborates it. A coordinate in the same position
+        // claims nothing, and is left to `unattributed_receivers`.
+        if !targets.is_empty() {
+            let mut claims = Vec::new();
+            for target in targets {
+                if matches!(target, ClickTarget::Coordinate(_)) {
+                    continue;
+                }
+                match self.app_of_target(target).await {
+                    Some(app) => claims.push(Claim::App(app)),
+                    None => claims.push(Claim::Unresolved),
+                }
+            }
+            return claims;
+        }
+        let mut claims = Vec::new();
+        match self.action_app(action).await {
+            Some(app) => claims.push(Claim::App(app)),
+            // The action names a target but only in terms the platform cannot
+            // turn into an app — a process id. Refusing is the older, safer
+            // answer, and it is the named side that has to produce it: no
+            // receiving app exists to ask about.
+            None if names_an_app(action) => claims.push(Claim::Unresolved),
+            None => {}
+        }
+        claims
+    }
+
+    /// The receiving app for every part of `action` that names none.
+    ///
+    /// The pre-dispatch half of the boundary. An action whose parts are all
+    /// named has nothing to ask here — its claimed app was already judged, and
+    /// its delivery is checked per rung.
+    async fn unattributed_receivers(&self, action: &DesktopAction) -> Option<String> {
+        let mut receivers: Vec<Option<String>> = Vec::new();
+        let mut unnamed_parts = 0usize;
+        match action {
+            // A click lands at a point, not in "the frontmost app": the window
+            // drawn there decides, and that may be a background window of a
+            // different app.
+            DesktopAction::Click { target, .. }
+            | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Scroll { target, .. } => {
+                if let ClickTarget::Coordinate(point) = target {
+                    unnamed_parts += 1;
+                    receivers.push(self.adapter.application_at(*point).await);
+                }
+            }
+            DesktopAction::Type { target, .. } => match target {
+                // Typing blind: the keystrokes go to whatever holds focus.
+                None => {
+                    unnamed_parts += 1;
+                    receivers.push(self.adapter.active_app().await);
+                }
+                Some(ClickTarget::Coordinate(point)) => {
+                    unnamed_parts += 1;
+                    receivers.push(self.adapter.application_at(*point).await);
+                }
+                Some(_) => {}
+            },
+            // Keys go to whatever holds focus. There is no point to hit test:
+            // the keyboard has one receiver, and it is the frontmost app.
+            DesktopAction::KeyPress { .. } => {
+                unnamed_parts += 1;
+                receivers.push(self.adapter.active_app().await);
+            }
+            DesktopAction::Drag { from, to } => {
+                for target in [from, to] {
+                    if let ClickTarget::Coordinate(point) = target {
+                        unnamed_parts += 1;
+                        receivers.push(self.adapter.application_at(*point).await);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if unnamed_parts == 0 {
+            // The clipboard is the one action with no receiver to ask about
+            // that the boundary still gates: it carries data out of the app
+            // that wrote it, and where it will be pasted is not knowable at
+            // the time it is set.
+            if matches!(action, DesktopAction::ClipboardSet { .. }) {
+                return self.config.allow_apps.refusal(None);
+            }
+            return None;
+        }
+        receivers
+            .iter()
+            .find_map(|app| self.config.allow_apps.refusal_reaching(app.as_deref()))
+    }
+
+    /// Why one rung must not deliver this action, for the per-app boundary.
+    ///
+    /// The pre-dispatch check judges what an action *names*. This judges where
+    /// a rung would actually deliver. The two input rungs reach a screen and a
+    /// focus, and on this ladder they are the fallbacks that run after another
+    /// rung failed — exactly the moment a covering window or a different
+    /// frontmost app decides who receives the event. An action that named an
+    /// allowed app must not then have its keystrokes typed into someone else's
+    /// window, which is the edge the name-level check cannot see.
+    ///
+    /// The accessibility and page rungs are deliberately not checked: they act
+    /// on an element, not on a point or a focus, so the app that holds the
+    /// foreground has nothing to do with where they land.
+    ///
+    /// Only a positive mismatch refuses. A platform that cannot say which app
+    /// is at the point or in front gets the benefit of the evidence that
+    /// already passed the name check: unlike the unnamed case, something *has*
+    /// established where this action is aimed.
+    async fn rung_border_refusal(&self, action: &DesktopAction, rung: Rung) -> Option<String> {
+        if self.config.allow_apps.is_empty() {
+            return None;
+        }
+        let receiving = match (rung, action) {
+            (Rung::Pixel, DesktopAction::Click { target, .. })
+            | (Rung::Pixel, DesktopAction::DoubleClick { target, .. })
+            | (Rung::Pixel, DesktopAction::Scroll { target, .. })
+            // The pixel rung of a typing step is a click into the field, and
+            // whatever it focuses is where the keystrokes go next — so the
+            // point belongs to this check just as much as a click does.
+            | (Rung::Pixel, DesktopAction::Type { target: Some(target), .. }) => {
+                // Only for a named target: a coordinate click was already
+                // placed by the pre-dispatch check, and asking again a few
+                // calls later would only be able to disagree with the answer
+                // the action was admitted on.
+                if matches!(target, ClickTarget::Coordinate(_)) {
+                    return None;
+                }
+                let resolved = self.adapter.resolve_target(target).await.ok()?;
+                let point = resolved.point?;
+                self.adapter.application_at(point).await
+            }
+            (Rung::Keyboard, _) => self.adapter.active_app().await,
+            _ => return None,
+        };
+        let receiving = receiving?;
+        // Same app as the action named: the fallback is delivering where the
+        // action was always aimed.
+        if let Some(named) = self.action_app(action).await {
+            if named.eq_ignore_ascii_case(&receiving) {
+                return None;
+            }
+        }
+        if self.config.allow_apps.allows(&receiving) {
+            return None;
+        }
+        Some(format!(
+            "the {rung:?} fallback would deliver this action to {receiving:?}, which is not on the \
+             [computer] allow_apps list — the action was not sent to that app. Bring the app the \
+             action names to the front (or ask the operator to add {receiving:?}) and retry"
+        ))
     }
 
     /// The application an action is aimed at, as well as this session can tell.
@@ -1855,6 +2094,55 @@ fn aims_at_an_app(action: &DesktopAction) -> bool {
             | DesktopAction::GetSystemStatus
             | DesktopAction::ListProcesses { .. }
     )
+}
+
+/// What an action says about which app it is aimed at.
+///
+/// Three states rather than two, because the two kinds of "no app" call for
+/// opposite answers: silence (a coordinate, a bare key press) is answered by
+/// asking who would receive the event, while a claim that cannot be
+/// corroborated (an element whose app the snapshot does not carry) has to be
+/// refused — something was asserted, and nothing bore it out.
+enum Claim {
+    /// The action names this app, or an element the adapter says belongs to it.
+    App(String),
+    /// The action names a target that cannot be placed in an app.
+    Unresolved,
+}
+
+/// The refusal for a named target whose app could not be established.
+fn format_unresolved_app(entries: Vec<String>) -> String {
+    format!(
+        "this action targets an element whose application could not be established, and \
+         [computer] allow_apps is set ({}) — it cannot be shown to stay inside the list. \
+         Re-read the UI tree so the app is recorded with the element, then target a fresh \
+         element id; the action was not sent",
+        entries.join(", ")
+    )
+}
+
+/// Whether the action's *defined* target is an app, as opposed to a coordinate
+/// or a focused window.
+///
+/// Different from [`aims_at_an_app`], which asks whether the action reaches an
+/// app at all. This asks whether the action itself carries a name that the
+/// boundary can match against the list; a process identified only by pid does
+/// not, which is why it is refused rather than asked about.
+fn names_an_app(action: &DesktopAction) -> bool {
+    match action {
+        DesktopAction::LaunchApp { .. }
+        | DesktopAction::ActivateWindow { .. }
+        | DesktopAction::CloseWindow { .. }
+        | DesktopAction::GetWindowGeometry { .. }
+        | DesktopAction::MoveWindow { .. }
+        | DesktopAction::ResizeWindow { .. }
+        | DesktopAction::MinimizeWindow { .. }
+        | DesktopAction::MaximizeWindow { .. } => true,
+        DesktopAction::KillProcess { name, .. }
+        | DesktopAction::RestartProcess { name, .. }
+        | DesktopAction::SetProcessPriority { name, .. } => name.is_some(),
+        _ => false,
+    }
 }
 
 /// What the caller must change when an action was refused before it ran.

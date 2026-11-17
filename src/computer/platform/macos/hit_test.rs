@@ -57,6 +57,10 @@ extern "C" {
     ) -> i32;
     /// `CFString` / `CFArray` release, from Core Foundation.
     fn CFRelease(value: *const c_void);
+    /// The process id of an application element.
+    fn AXUIElementGetPid(element: AxElementRef, pid: *mut i32) -> i32;
+    /// The process's short name, e.g. `"Safari"` for a bundle named `Safari`.
+    fn proc_name(pid: i32, buffer: *mut c_char, buffer_size: u32) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -132,6 +136,99 @@ impl HitElement {
         }
         occluder
     }
+}
+
+/// The application that would receive an event at `point`.
+///
+/// `AXUIElementCopyElementAtPosition` answers with an element; the owning
+/// application is one attribute away (`AXParent` until the application
+/// element, which is what publishes `AXTitle` as the app's name). Walking up
+/// natively keeps this on the same side of the permission fence as
+/// [`element_at`]: both need the Accessibility grant, and neither needs a
+/// second tool round trip.
+///
+/// `None` covers every failure — no grant, a point outside every window, a
+/// pid the system would not translate — for the same reason [`element_at`]
+/// reports `None`: an unanswered query is not an answer.
+pub fn application_at(point: Point) -> Option<String> {
+    // SAFETY: `element_at_point` hands back an owned element (Copy
+    // convention), which this function releases on every path; the parent
+    // walk does the same for each step.
+    unsafe {
+        let element = element_at_point(point)?;
+        let mut current: AxElementRef = element;
+        // A window is nested under the application element, and a tree is not
+        // deeper than the screen's own hierarchy, so a small bound is plenty:
+        // a cycle here would be a malformed tree, and looping forever on it
+        // would hang a step.
+        for _ in 0..16 {
+            let Some(parent) = copy_attribute(current, "AXParent") else {
+                CFRelease(current);
+                return None;
+            };
+            CFRelease(current);
+            current = parent as AxElementRef;
+            // The application element is the one whose own role says so, not
+            // the one with no parent: an element that only *looks* rootward
+            // must not be reported as the app.
+            if attribute_string(current, "AXRole").as_deref() == Some("AXApplication") {
+                let name = attribute_string(current, "AXTitle")
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| pid_name(current));
+                CFRelease(current);
+                return name;
+            }
+        }
+        CFRelease(current);
+        None
+    }
+}
+
+/// Fall back to the process name for an application element with no
+/// `AXTitle`.
+///
+/// Some apps publish no title on their own element, and the tree read names
+/// them by process name; using the same fallback here keeps the two sides
+/// agreeing on what the app is called.
+///
+/// # Safety
+///
+/// `element` must be a live `AXUIElementRef` that the caller owns.
+unsafe fn pid_name(element: AxElementRef) -> Option<String> {
+    let mut pid: i32 = 0;
+    let status = AXUIElementGetPid(element, &mut pid);
+    if status != AX_ERROR_SUCCESS || pid <= 0 {
+        return None;
+    }
+    let mut buffer = [0 as c_char; 256];
+    let written = proc_name(pid, buffer.as_mut_ptr(), buffer.len() as u32);
+    if written <= 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buffer
+        .iter()
+        .take_while(|b| **b != 0)
+        .map(|b| *b as u8)
+        .collect();
+    let name = String::from_utf8(bytes).ok()?.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The element at `point`, unreleased — the caller owns it.
+///
+/// # Safety
+///
+/// The returned element must be released with `CFRelease`.
+unsafe fn element_at_point(point: Point) -> Option<AxElementRef> {
+    let system = AXUIElementCreateSystemWide();
+    if system.is_null() {
+        return None;
+    }
+    let mut element: AxElementRef = std::ptr::null();
+    let status =
+        AXUIElementCopyElementAtPosition(system, point.x as f32, point.y as f32, &mut element);
+    CFRelease(system);
+    (status == AX_ERROR_SUCCESS && !element.is_null()).then_some(element)
 }
 
 /// The element at `point`, or `None` when the system could not say.

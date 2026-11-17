@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use syscity::computer::element_index::{assign_ids, ResolveError, SnapshotCache, UiSnapshot};
+use syscity::computer::element_index::{assign_ids, ResolveError, UiSnapshot};
 use syscity::computer::element_index::{parse_element_id, ActionTarget, ResolvedElement};
 use syscity::computer::session::{ComputerSession, SessionConfig, SettleConfig};
 use syscity::computer::{
@@ -46,12 +46,33 @@ const NO_AX: ElementState = ElementState {
     actions: Some(&[]),
 };
 
+/// One readable, never-changing 400x300 screen, as base64 PNG.
+///
+/// A `Screenshot` with an empty payload is "no observation", and verification
+/// answers `Unverifiable` for it — which never escalates. A no-op step has to
+/// be *measured*: two decodable captures that are genuinely identical.
+const STILL_FRAME: &str = concat!(
+    "iVBORw0KGgoAAAANSUhEUgAAAZAAAAEsCAAAAADI3LoeAAAAi0lEQVR42u3BMQEAAADCoPVPbQlP",
+    "oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAA4GPV+wAB2A4yPQAAAABJRU5ErkJggg==",
+);
+
 /// An adapter whose behaviour is fully described by its constructor.
 struct ContractAdapter {
     /// Whether the platform can deliver input without the foreground.
     supports_background: bool,
     /// What the platform's hit test says, when it has one.
     hit_test: Option<HitTestResult>,
+    /// The app drawing at any point — who would receive a click. `None`
+    /// models a platform that cannot say.
+    point_app: Option<String>,
+    /// The app holding focus — who would receive a key press.
+    focus_app: Option<String>,
+    /// Whether the input rungs have no observable effect. False models the
+    /// normal case — an empty capture, which verification cannot measure; true
+    /// makes every rung look like a measured no-op so the ladder escalates.
+    input_has_no_effect: bool,
     /// The elements a tree read returns, under one window root.
     elements: Vec<UiElement>,
     /// Whether the tree read stopped before the tree was whole.
@@ -76,6 +97,30 @@ impl ContractAdapter {
         self
     }
 
+    /// Say which app would receive input — a click and a key press alike. The
+    /// default is `None`, as on a platform with no query for either.
+    fn receiving_from(mut self, app: &str) -> Self {
+        self.point_app = Some(app.to_string());
+        self.focus_app = Some(app.to_string());
+        self
+    }
+
+    /// Say which app holds focus, leaving the app at a point as it was. The
+    /// two answers differ exactly when a window is covered or a background
+    /// window answers: that is the case the per-rung check exists for.
+    fn focused_in(mut self, app: &str) -> Self {
+        self.focus_app = Some(app.to_string());
+        self
+    }
+
+    /// Make the input rungs report no effect, so the ladder escalates to the
+    /// next one. The keyboard-fallback tests are the only callers: without
+    /// this the pixel rung succeeds and the fallback never runs.
+    fn failing_input(mut self) -> Self {
+        self.input_has_no_effect = true;
+        self
+    }
+
     async fn pause(&self) {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
@@ -90,6 +135,9 @@ impl ContractAdapter {
         Self {
             supports_background,
             hit_test,
+            point_app: None,
+            focus_app: None,
+            input_has_no_effect: false,
             tree_truncated: false,
             delivered: std::sync::Mutex::new(Vec::new()),
             delay: std::time::Duration::ZERO,
@@ -173,6 +221,14 @@ impl ContractAdapter {
 impl ComputerAdapter for ContractAdapter {
     async fn screenshot(&self, _region: Option<Rect>) -> CResult<Screenshot> {
         self.pause().await;
+        // An empty payload is "no observation available", and verification
+        // answers `Unverifiable` rather than `Failed` for it. The no-effect
+        // fixture needs the opposite: two captures that are both readable and
+        // identical, so the diff is a measured 0% and the step is a no-op —
+        // the only verdict that escalates to the fallback rungs.
+        if self.input_has_no_effect {
+            return Ok(Screenshot::new(STILL_FRAME.to_string(), 400, 300));
+        }
         Ok(Screenshot::new(String::new(), 400, 300))
     }
 
@@ -278,6 +334,14 @@ impl ComputerAdapter for ContractAdapter {
         // `None` is "this platform has no hit test", which must behave like
         // the trait default: unknown, and never a refusal.
         self.hit_test.clone().unwrap_or(HitTestResult::Unknown)
+    }
+
+    async fn active_app(&self) -> Option<String> {
+        self.focus_app.clone()
+    }
+
+    async fn application_at(&self, _point: Point) -> Option<String> {
+        self.point_app.clone()
     }
 
     async fn wait_for(
@@ -773,11 +837,50 @@ async fn a_listed_app_passes_the_boundary() {
     assert!(!adapter.delivered().is_empty(), "the click reached the adapter");
 }
 
-/// A coordinate click names no app, so once a list is set it cannot be shown
-/// to stay inside it and is refused. Assuming otherwise would make the
-/// boundary theatre: the click lands wherever the screen happens to be.
+/// A coordinate click names no app, so whether it may run is decided by the
+/// app that would *receive* it. A list naming that app allows it — the old
+/// blanket refusal made a locked-down session unable to click at all, which
+/// is not what "only these apps" means.
 #[tokio::test]
-async fn a_coordinate_action_is_refused_once_a_list_is_set() {
+async fn a_coordinate_action_reaches_an_allowed_app_that_is_in_front() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true).receiving_from("Contract"));
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::Coordinate(Point::new(20, 20))))
+        .await
+        .expect("an outcome");
+
+    assert!(outcome.result.success, "{}", outcome.result.message);
+    assert!(!adapter.delivered().is_empty(), "the click reached the adapter");
+}
+
+/// The same click with a different app in front is refused, and the refusal
+/// names the app that would have received it — not "this names nothing".
+#[tokio::test]
+async fn a_coordinate_action_is_refused_when_another_app_would_receive_it() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true).receiving_from("1Password"));
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::Coordinate(Point::new(20, 20))))
+        .await
+        .expect("a refusal is an outcome");
+
+    assert!(adapter.delivered().is_empty(), "{:?}", adapter.delivered());
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert_eq!(evidence.delivery, DeliveryDisposition::NotDelivered);
+    assert!(
+        outcome.result.message.contains("1Password"),
+        "the refusal names the receiving app: {}",
+        outcome.result.message
+    );
+    let recovery = evidence.recovery.expect("a refusal carries a hint");
+    assert!(recovery.contains("allow_apps"), "{recovery}");
+}
+
+/// A platform that cannot say which app is in front does not get the benefit
+/// of the doubt: the action cannot be shown to stay inside the list, so it is
+/// refused rather than delivered blind.
+#[tokio::test]
+async fn an_unattributable_coordinate_action_is_still_refused() {
     let adapter = Arc::new(ContractAdapter::new(ENABLED, true));
     let outcome = scoped_session(adapter.clone(), &["Contract"])
         .execute(click(ClickTarget::Coordinate(Point::new(20, 20))))
@@ -787,9 +890,35 @@ async fn a_coordinate_action_is_refused_once_a_list_is_set() {
     assert!(adapter.delivered().is_empty(), "{:?}", adapter.delivered());
     let evidence = outcome.evidence.expect("evidence");
     assert_eq!(evidence.effect, ActionEffect::Refused);
-    assert!(outcome.result.message.contains("names no app"), "{}", outcome.result.message);
-    let recovery = evidence.recovery.expect("a refusal carries a hint");
-    assert!(recovery.contains("allow_apps"), "{recovery}");
+    assert!(
+        outcome.result.message.contains("could not say"),
+        "the refusal explains that nothing established the receiver: {}",
+        outcome.result.message
+    );
+}
+
+/// A bare key press has one receiver — whatever holds focus — and the same
+/// rule applies: allowed when that app is listed, refused when it is not.
+#[tokio::test]
+async fn a_bare_key_press_is_judged_by_the_focused_app() {
+    let adapter = Arc::new(ContractAdapter::new(ENABLED, true).receiving_from("Contract"));
+    let allowed = scoped_session(adapter.clone(), &["Contract"])
+        .execute(DesktopAction::KeyPress {
+            keys: vec!["return".to_string()],
+        })
+        .await
+        .expect("an outcome");
+    assert!(allowed.result.success, "{}", allowed.result.message);
+
+    let other = Arc::new(ContractAdapter::new(ENABLED, true).receiving_from("1Password"));
+    let refused = scoped_session(other.clone(), &["Contract"])
+        .execute(DesktopAction::KeyPress {
+            keys: vec!["return".to_string()],
+        })
+        .await
+        .expect("a refusal is an outcome");
+    assert!(other.delivered().is_empty(), "{:?}", other.delivered());
+    assert!(refused.result.message.contains("1Password"), "{}", refused.result.message);
 }
 
 /// Reading the screen is not acting on it. A screenshot must work whatever
@@ -820,6 +949,125 @@ async fn launching_an_app_off_the_list_is_refused() {
         .expect("a refusal is an outcome");
 
     assert!(adapter.delivered().is_empty(), "{:?}", adapter.delivered());
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert!(outcome.result.message.contains("1Password"), "{}", outcome.result.message);
+}
+
+/// The keyboard fallback delivers to whatever holds focus, which is not
+/// necessarily the app the action named. When that app is off the list, the
+/// fallback is refused instead of typing into it — the edge the name-level
+/// check cannot see, because the action's own app was on the list.
+#[tokio::test]
+async fn an_allowed_apps_action_is_not_typed_into_another_app() {
+    // An element that declares no actions: the accessibility rung is not in
+    // the ladder, so the pixel rung runs, has no effect, and the keyboard rung
+    // is reached. The point itself belongs to the allowed app — only the focus
+    // has been taken by the other one, which is the exact moment the fallback
+    // becomes unsafe.
+    let adapter = Arc::new(
+        ContractAdapter::new(NO_AX, true)
+            .failing_input()
+            .receiving_from("Contract")
+            .focused_in("1Password"),
+    );
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::ElementId("live-save".to_string())))
+        .await
+        .expect("an outcome");
+
+    let delivered = adapter.delivered();
+    assert!(
+        delivered.iter().all(|d| !d.contains("KeyPress")),
+        "no key may be pressed into the app that holds focus: {delivered:?}"
+    );
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert_eq!(evidence.delivery, DeliveryDisposition::NotDelivered);
+    assert!(
+        outcome.result.message.contains("1Password"),
+        "the refusal names the app that would have received it: {}",
+        outcome.result.message
+    );
+}
+
+/// The other half of the same edge, one rung earlier: an action that names an
+/// allowed app, aimed at a point where another app's window is drawn, is
+/// refused before the click is sent — naming that app, not the one the action
+/// named.
+#[tokio::test]
+async fn an_allowed_apps_action_is_not_clicked_through_another_apps_window() {
+    let adapter = Arc::new(
+        ContractAdapter::new(NO_AX, true)
+            .receiving_from("1Password")
+            .focused_in("Contract"),
+    );
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::ElementId("live-save".to_string())))
+        .await
+        .expect("a refusal is an outcome");
+
+    let delivered = adapter.delivered();
+    assert!(
+        delivered.iter().all(|d| !d.contains("Click")),
+        "the click was not sent at all: {delivered:?}"
+    );
+    let evidence = outcome.evidence.expect("evidence");
+    assert_eq!(evidence.effect, ActionEffect::Refused);
+    assert!(
+        outcome.result.message.contains("1Password"),
+        "the refusal names the app the point belongs to: {}",
+        outcome.result.message
+    );
+}
+
+/// The same fallback is fine when the frontmost app *is* the one on the list:
+/// the check must not turn "another window of the same app" into a refusal.
+#[tokio::test]
+async fn the_keyboard_fallback_may_land_in_the_app_the_action_named() {
+    let adapter = Arc::new(
+        ContractAdapter::new(NO_AX, true)
+            .failing_input()
+            .receiving_from("Contract"),
+    );
+    scoped_session(adapter.clone(), &["Contract"])
+        .execute(click(ClickTarget::ElementId("live-save".to_string())))
+        .await
+        .expect("an outcome");
+
+    let delivered = adapter.delivered();
+    assert!(
+        delivered.iter().any(|d| d.contains("KeyPress")),
+        "the fallback ran inside the allowed app: {delivered:?}"
+    );
+}
+
+/// Typing into a named field is the same story one action further: the pixel
+/// rung focuses the field by clicking it, and the keystrokes go wherever that
+/// click landed. A point belonging to another app is refused before the click,
+/// so the text is never typed anywhere.
+#[tokio::test]
+async fn an_allowed_apps_typing_step_is_not_aimed_at_another_apps_window() {
+    let adapter = Arc::new(
+        ContractAdapter::new(NO_AX, true)
+            .receiving_from("1Password")
+            .focused_in("Contract"),
+    );
+    let outcome = scoped_session(adapter.clone(), &["Contract"])
+        .execute(DesktopAction::Type {
+            text: "hunter2".to_string(),
+            target: Some(ClickTarget::ElementId("live-save".to_string())),
+        })
+        .await
+        .expect("a refusal is an outcome");
+
+    let delivered = adapter.delivered();
+    assert!(
+        delivered
+            .iter()
+            .all(|d| !d.contains("Type") && !d.contains("Click")),
+        "neither the focusing click nor the text was sent: {delivered:?}"
+    );
     let evidence = outcome.evidence.expect("evidence");
     assert_eq!(evidence.effect, ActionEffect::Refused);
     assert!(outcome.result.message.contains("1Password"), "{}", outcome.result.message);

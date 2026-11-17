@@ -249,6 +249,38 @@ pub trait ComputerAdapter: Send + Sync {
         HitTestResult::Unknown
     }
 
+    /// The application that currently receives input — the one an action
+    /// naming no app would land in.
+    ///
+    /// This is the receiving half of [`hit_test`](Self::hit_test), and it is
+    /// what lets a coordinate click or a bare key press be placed inside an
+    /// allow-list instead of being refused for naming nothing. The answer must
+    /// be the platform's own notion of "in front" (the frontmost application,
+    /// the focused window's owning process), not an inference from window
+    /// order: a window can be on top without holding focus.
+    ///
+    /// `None` is "could not say" — no permission, no window server, a platform
+    /// without the query. A caller that needs the answer to decide an
+    /// allow-list must treat it as "not established", never as "nothing is
+    /// in front".
+    async fn active_app(&self) -> Option<String> {
+        None
+    }
+
+    /// The application that would receive an event at `point`.
+    ///
+    /// The positional counterpart of [`active_app`](Self::active_app): a click
+    /// is not delivered to "the frontmost app", it is delivered to whatever is
+    /// drawn at that point. The difference matters for a background window and
+    /// for a window of an allowed app that has another app's window on top of
+    /// the point the action would land on.
+    ///
+    /// The default is `None` — "cannot say", which a caller deciding an
+    /// allow-list must not read as clearance.
+    async fn application_at(&self, _point: Point) -> Option<String> {
+        None
+    }
+
     /// Whether this adapter can deliver input without taking the foreground.
     ///
     /// Accessibility actions and page actions are not input-layer delivery:

@@ -7,22 +7,34 @@
 //! hold against a model that never says the app's name is this one.
 //!
 //! The rule is deliberately one sentence long: **when the list is non-empty,
-//! only the named apps may be acted on.** Two consequences follow, and both are
-//! the point rather than a rough edge:
+//! only the named apps may be acted on.** Two consequences follow:
 //!
 //! - An action that names a *different* app is refused before anything is
 //!   dispatched — not after, so nothing was delivered and nothing has to be
 //!   undone.
-//! - An action that names *no* app is refused too. A coordinate click, a bare
-//!   key press and "type into whatever holds focus" reach whatever happens to
-//!   be in front, so they are exactly the actions an allowlist exists to stop.
-//!   "Unknown" is not a member of the list.
+//! - An action that names *no* app — a coordinate click, a bare key press,
+//!   "type into whatever holds focus" — is the case the boundary is really
+//!   for: the event reaches whatever is in front, which is not necessarily
+//!   anything the caller aimed at. Such an action is allowed only when the
+//!   platform can say *which app would receive it* and that app is on the
+//!   list; when the receiving app cannot be established, the answer is still
+//!   no. That is [`refusal_reaching`](AppAllowlist::refusal_reaching).
 //!
 //! This is enforced in our own code, before the adapter is asked to act. It is
 //! not a sandbox: the operating system still lets this process move the pointer
-//! anywhere, and an action that both names an allowed app and lands on top of
-//! another window is not caught here. Isolation is a different (and, for this
-//! product, rejected) design; see the plan's §6.6.4.
+//! anywhere. What it does cover now is an action that names an allowed app but
+//! would land in someone else's window: which app an action *names* is judged
+//! before dispatch, and which app would *receive* a point or a keystroke is
+//! judged per rung, before that rung delivers anything — a mismatch is refused
+//! with the receiving app named. What it still does not cover is a *window* of
+//! an allowed app hosting content from another app (a web view, an embedded
+//! browser) — that is app-level granularity, not window-level, and is noted in
+//! the plan's §6.6.4.
+//!
+//! The receiving answer is also a reading of a live screen, taken moments
+//! before the event: focus or stacking can change in between. It narrows the
+//! window in which an unintended receiver can be hit; it does not close it,
+//! which is what "not a sandbox" means here.
 
 use std::sync::{Arc, RwLock};
 
@@ -102,6 +114,52 @@ impl AppAllowlist {
             )),
         }
     }
+
+    /// Whether `app` may be acted on — the same question as [`refusal`], in
+    /// the shape a caller asks when it already knows the answer is a name.
+    pub fn allows(&self, app: &str) -> bool {
+        self.refusal(Some(app)).is_none()
+    }
+
+    /// Why an action that names no app may not run, given the app that would
+    /// receive it.
+    ///
+    /// This is the second half of the boundary. [`refusal`](Self::refusal)
+    /// judges a *claimed* target — what the caller said it meant. This judges
+    /// the *receiving* app — who would actually get the event — and it is what
+    /// turns "a coordinate click reaches whatever is in front, so it cannot be
+    /// shown to stay inside the list" from a constant refusal into a check:
+    /// when the screen says Safari is in front, a click at a point is an
+    /// action on Safari, and a list naming Safari may allow it.
+    ///
+    /// The asymmetry with [`refusal`](Self::refusal) is deliberate. There,
+    /// `None` (no app named) is a refusal because nothing establishes where
+    /// the action goes. Here the caller has already established where it goes;
+    /// passing `None` means the platform could not answer that question, and
+    /// the honest verdict for that is the old one — refuse, and say why.
+    pub fn refusal_reaching(&self, receiving: Option<&str>) -> Option<String> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if entries.is_empty() {
+            return None;
+        }
+        let listed = entries.join(", ");
+        match receiving {
+            Some(app) if entries.iter().any(|entry| matches(entry, app)) => None,
+            Some(app) => Some(format!(
+                "this action names no application, and the one that would receive it — {app:?} — \
+                 is not on the [computer] allow_apps list ({listed}); the action was not sent"
+            )),
+            None => Some(format!(
+                "this action names no application, and the platform could not say which one would \
+                 receive it, so it cannot be shown to stay inside [computer] allow_apps \
+                 ({listed}). Target an element in an allowed app instead; the action was not sent"
+            )),
+        }
+    }
 }
 
 fn clean(entries: Vec<String>) -> Vec<String> {
@@ -147,6 +205,47 @@ mod tests {
             refusal.contains("was not sent"),
             "the refusal says nothing was delivered: {refusal}"
         );
+    }
+
+    #[test]
+    fn a_receiving_app_on_the_list_passes() {
+        let allow = AppAllowlist::new(vec!["Safari".to_string()]);
+        assert_eq!(allow.refusal_reaching(Some("Safari")), None);
+        assert_eq!(allow.refusal_reaching(Some("safari")), None);
+        assert!(allow.allows("Safari"));
+    }
+
+    #[test]
+    fn a_receiving_app_off_the_list_is_named_in_the_refusal() {
+        let allow = AppAllowlist::new(vec!["Safari".to_string()]);
+        let refusal = allow
+            .refusal_reaching(Some("1Password"))
+            .expect("a refusal");
+        assert!(refusal.contains("1Password"), "the receiving app is named: {refusal}");
+        assert!(refusal.contains("Safari"), "the list is named: {refusal}");
+        assert!(refusal.contains("was not sent"), "{refusal}");
+        assert!(!allow.allows("1Password"));
+    }
+
+    /// The two questions differ in exactly one answer: the one the platform
+    /// could not give. A claim that names no app is refused; a receiver the
+    /// screen cannot establish is also refused, but says *that* is why.
+    #[test]
+    fn an_unknown_receiver_is_refused_for_its_own_reason() {
+        let allow = AppAllowlist::new(vec!["Safari".to_string()]);
+        let claim = allow.refusal(None).expect("a refusal");
+        let receiver = allow.refusal_reaching(None).expect("a refusal");
+        assert!(receiver.contains("could not say"), "{receiver}");
+        assert!(receiver.contains("Safari"), "the list is named: {receiver}");
+        assert_ne!(claim, receiver, "the two refusals explain different things");
+    }
+
+    #[test]
+    fn no_list_never_refuses_a_receiver() {
+        let allow = AppAllowlist::default();
+        assert_eq!(allow.refusal_reaching(Some("1Password")), None);
+        assert_eq!(allow.refusal_reaching(None), None);
+        assert!(allow.allows("anything"));
     }
 
     #[test]

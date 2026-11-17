@@ -790,6 +790,35 @@ end tell"#,
         crate::computer::platform::macos::hit_test::check(point, target)
     }
 
+    /// The application that would receive an event at `point`.
+    ///
+    /// Same native query as the hit test, one attribute further up: the point's
+    /// element, then its `AXApplication` ancestor. This is the answer for a
+    /// coordinate click — the event goes to the window drawn there, which is
+    /// not always the frontmost one — and for an element click that something
+    /// else is covering.
+    async fn application_at(&self, point: Point) -> Option<String> {
+        crate::computer::platform::macos::hit_test::application_at(point)
+    }
+
+    /// The frontmost application, named the way `read_ui_tree` names apps.
+    ///
+    /// The spelling matters more than it looks: an allow-list is written in
+    /// the names a person sees on screen, and those are the names System
+    /// Events reports. Asked through the same helper the permission probe
+    /// uses, so "is the grant there" and "who is in front" cannot disagree
+    /// about which query they ran. A blocked call answers `None` rather than
+    /// raising a dialog: this runs between steps, where a modal prompt would
+    /// be a hang.
+    async fn active_app(&self) -> Option<String> {
+        tokio::task::spawn_blocking(
+            crate::computer::platform::macos::permissions::frontmost_application,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// AppKit accessibility actions reach the app through System Events, which
     /// is the same path regardless of which window is in front.
     fn supports_background_input(&self) -> bool {

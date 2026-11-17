@@ -25,6 +25,29 @@ pub fn has_accessibility_permission() -> bool {
     }
 }
 
+/// The frontmost application's name, or `None` when the system could not say.
+///
+/// The same query [`has_accessibility_permission`] uses to probe the grant, so
+/// its answer is only as available as that permission is. Non-interactive: a
+/// refused call returns `None` instead of raising the permission dialog the
+/// way [`trigger_accessibility_prompt`] does.
+///
+/// `None` is reported for a failed script and for an empty answer alike — a
+/// caller deciding an allow-list needs "an app called nothing" and "no answer"
+/// to be the same thing, because both mean "could not place this".
+pub fn frontmost_application() -> Option<String> {
+    let out = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to return name of first application process whose frontmost is true"#)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Trigger the macOS accessibility permission dialog.
 ///
 /// Runs a short AppleScript that requires System Events access.

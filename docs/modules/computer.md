@@ -356,11 +356,25 @@ is captured or dispatched**, and an app that is not on the list is refused
 (`*` at either end), because the platform's spelling is not ours: macOS reports
 `Google Chrome`, a rule may say `Google Chrome*`.
 
-An action that names no app is refused too. A coordinate click, a bare key
-press and typing into whatever holds focus reach whatever is in front, so none
-of them can be shown to stay inside the list; a refusal that guessed would be
-theatre. Target an element in an allowed app instead. A process action that
-names a pid rather than a name is in the same position: a pid is not an app.
+An action that names no app is judged by the app that would **receive** it.
+A coordinate click, a bare key press and typing into whatever holds focus reach
+whatever is in front — so before dispatch the session asks the platform who
+that is (`ComputerAdapter::application_at` for a point,
+`ComputerAdapter::active_app` for the focus) and allows the action when that
+app is on the list. When the platform cannot say — no accessibility grant, no
+window server, an adapter that has not implemented the query — the answer is
+still no, and the refusal says *that* is why instead of pretending the action
+named nothing. A process action that names a pid rather than a name is in the
+same position: a pid is not an app.
+
+The second half is checked per rung. An action that names an allowed app may
+still fall back to the pixel or keyboard rung after the accessibility rung had
+no effect, and those two deliver to a point or a focus — the exact moment a
+covering window or a stolen focus decides who receives the event. Before either
+rung dispatches, the app that would receive it is compared with the app the
+action named; a mismatch is refused with the receiving app named. The
+accessibility and page rungs are not checked this way: they act on an element,
+so the foreground has nothing to do with where they land.
 
 Observation is not gated: screenshot, UI-tree reads, window listing, waits,
 clipboard reads and system status all work whatever the list says, because a

@@ -385,9 +385,30 @@ rung / 敏感 / verified·refused 判定、点开才加载的 before/after 截�
 禁止操作 1Password"，**不能**写"允许在这个 app 里点，但不允许把数据带出去"——
 剪贴板、输入法、截图通道在 OS 层共享。数据级隔离需要 VM/容器，而隔离明确不做。
 
-`app_scope.rs` 的两条也是自觉接受的粗糙边缘：一旦名单非空，**不点名 app 的动作
-（坐标点击、裸按键）也会被拒**——它们落到"恰好在前面的那个窗口"，无法证明在名单内；
-而一个既点名了允许的 app、又恰好画在别人窗口上的动作，这个边界抓不到。
+### 6.3 `app_scope` 的两条边缘 —— 已收口
+
+这条原本列在 §6.2 里作为第三条"接受的粗糙"，现在两条都关掉了，所以单独写。
+规则仍然是"名单非空时只能操作点名的 app"，但现在区分了两种"没点名"：
+
+- **坐标点击、裸按键、无目标输入**——不再一律拒绝。派发前问平台"这个点 / 当前焦点
+  归谁"（`ComputerAdapter::application_at` / `active_app`），拿到 app 名就在名单里
+  正常执行，不在名单里就拒绝并**点名那个会收到事件的 app**。平台答不出来（没有
+  AX 授权、窗口服务器不可用）仍然是拒绝，且拒绝理由说的是"无法确定谁会收到"，
+  不是"这个动作没点名"——"查不到"从来不是放行。
+- **点名了允许的 app、却画在别人窗口上**——逐个 rung 检查。pixel / keyboard 这两个
+  fallback 是在别的 rung 无效果之后才跑的，正是覆盖窗口或焦点被抢走的那一刻；在
+  它们派发之前比对"会收到事件的 app"和 action 点名的 app，不一致就拒绝。AX 与
+  page rung 不做此检查：它们作用在元素上，前台是谁与之无关，所以不会被提前拦掉。
+
+平台实现：macOS 用 `AXUIElementCopyElementAtPosition` + `AXParent` 走上到
+`AXApplication`（点），以及 System Events 的 frontmost process（焦点）。其他平台
+没有实现，`active_app` / `application_at` 返回 `None`，于是回落到"拒绝"——行为与
+改动前一致，不会因为平台答不出来而放宽。
+
+仍然抓不到的：**应用级之外的粒度**（一个允许的 app 的窗口里嵌着另一个 app 的内容——
+web view、内嵌浏览器），以及上面说的数据级隔离；还有**时间差**——接收方是在派发前
+一刻读的，焦点或叠放顺序在那之后仍可能变化。它把"打到不该打的 app"的窗口收窄，
+没有关死，这正是"不是沙箱"的意思。
 
 ---
 
@@ -465,6 +486,8 @@ Android 是例外：它在工具内部**按动作**门（`android/gate.rs`），
 
 | 层 | 位置 | 覆盖什么 |
 |---|---|---|
+| 单测 | `app_scope.rs` | 点名的 app 通过/拒绝、大小写与 glob、名单为空即无边界、`refusal_reaching` 的三种回答（允许 / 点名拒绝 / 无法确定拒绝） |
+| 契约 | `tests/computer_contract.rs` | 跨平台的 action 契约（假设没有产成品）：歧义标签拒绝、陈旧 id、禁用控件、occluder、未观测的 AX 不算确认、预算拒绝；以及 `allow_apps` 的两条边缘——坐标/裸按键按**接收方**判定、允许的 app 不会被 fallback 打进别人的窗口 |
 | 单测 | `run_executor.rs` | 感知触发、预算停、截图去重（`looking_twice_at_an_unchanged_screen_attaches_one_image`）、无 vision 时零图片 |
 | 单测 | `tree_budget.rs` | 屏外折叠、部分可见保留、focus 与面积排序、紧预算下主窗口仍在（含两个窗口都在屏上的用例） |
 | 单测 | `vision/resolver.rs` | 四模式；`local_mode_never_falls_back_to_the_api` |
