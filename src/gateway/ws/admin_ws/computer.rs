@@ -1359,6 +1359,9 @@ async fn spawn_play(
                     screenshot_before_ref: None,
                     screenshot_ref: None,
                     verified,
+                    // A replay runs a recorded script; it aims at nothing the
+                    // verifier could map back to a box.
+                    aim_missed: None,
                     model_calls: 0,
                     images_attached: 0,
                 },
@@ -1909,6 +1912,7 @@ mod tests {
             sensitive,
             rung: None,
             effect: None,
+            aim_missed: None,
         });
         cp.model_calls = 1;
         RunStore::for_paths(&state.paths)

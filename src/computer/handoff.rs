@@ -109,12 +109,22 @@ pub fn note_for(
 }
 
 fn describe(record: &StepRecord) -> String {
-    format!(
+    let mut line = format!(
         "{}. {} → {}",
         record.step + 1,
         crate::computer::driver::describe_action(&record.action),
         truncate(&record.result.message, 120)
-    )
+    );
+    // A person picking this up faces the same choice the model did, and has
+    // less context. "Unchecked" alone would let them repeat a click that
+    // visibly landed somewhere else.
+    if let Some(target) = record.aim_missed {
+        line.push_str(&format!(
+            " — nothing changed at its target {}x{} at ({},{})",
+            target.width, target.height, target.x, target.y
+        ));
+    }
+    line
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -193,6 +203,7 @@ mod tests {
             screenshot_after: None,
             snapshots_taken: 0,
             sensitive: false,
+            aim_missed: None,
         }
     }
 
@@ -221,6 +232,22 @@ mod tests {
         let note = note_for(&run, &history, "boom", StopReason::NeedHelp);
         assert!(note.stuck_at.contains("step 1"), "{}", note.stuck_at);
         assert!(note.stuck_at.contains("window not found"), "{}", note.stuck_at);
+    }
+
+    /// A step that visibly missed says where it aimed, so the person taking
+    /// over does not repeat it.
+    #[tokio::test]
+    async fn a_missed_click_says_where_it_aimed() {
+        let run = ComputerRun::new("r1", "g");
+        let mut missed = record(0, StepVerification::Unverifiable, "clicked");
+        missed.aim_missed = Some(crate::computer::Rect::new(12, 24, 64, 64));
+        let note = note_for(&run, &[missed], "stuck", StopReason::NeedHelp);
+
+        assert_eq!(note.tried.len(), 1);
+        assert!(note.tried[0].contains("64x64"), "{:?}", note.tried);
+        assert!(note.tried[0].contains("(12,24)"), "{:?}", note.tried);
+        // The rendered note carries it too: that is what a person reads.
+        assert!(note.render().contains("64x64"), "{}", note.render());
     }
 
     /// A run that never got a step says so, rather than claiming "step 1".

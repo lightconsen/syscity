@@ -216,10 +216,14 @@ export function TurnReplayPlayer({ transport, turnId, onClose }: TurnReplayPlaye
   );
 }
 
-/** Verification, as a row draws it: "yes" / "no" / "unknown". */
-function verdict(step: TurnReplayStep): "yes" | "no" | "unknown" {
+/** Verification, as a row draws it: "yes" / "no" / "elsewhere" / "unknown". */
+function verdict(step: TurnReplayStep): "yes" | "no" | "elsewhere" | "unknown" {
   if (step.verified === true) return "yes";
   if (step.verified === false) return "no";
+  // A null verdict has two meanings and only one of them is actionable: the
+  // screen changed, just not where the step aimed. Drawing both as
+  // "Unverified" hides the miss behind "nobody checked".
+  if (step.aim_missed) return "elsewhere";
   return "unknown";
 }
 
@@ -243,7 +247,9 @@ function ReplayStepRow({
       ? "text-green-600 dark:text-green-400"
       : status === "no"
         ? "text-red-600 dark:text-red-400"
-        : "text-secondary";
+        : status === "elsewhere"
+          ? "text-amber-600 dark:text-amber-400"
+          : "text-secondary";
 
   return (
     <button

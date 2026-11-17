@@ -147,6 +147,15 @@ pub struct CompletedStep {
     /// adapter reported no evidence at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<crate::computer::types::ActionEffect>,
+    /// The box the step aimed at when its visible change landed elsewhere.
+    ///
+    /// The one fact from the pre/post diff that outlives the step: a resumed
+    /// run's prompt renders one line per past step, and "unchecked" without
+    /// "it aimed at (x,y) and nothing there moved" invites the same click
+    /// again. Absent for every other step and for a checkpoint written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim_missed: Option<crate::computer::Rect>,
 }
 
 /// What a checkpoint needs to rebuild a run.
@@ -307,6 +316,10 @@ impl Checkpoint {
                         // opposite of what happened — the same reason the live
                         // event carries it.
                         "effect": s.effect.map(|e| e.as_str()),
+                        // Present only when the change was away from the
+                        // target, so the timeline can distinguish "nothing
+                        // could check this" from "it visibly missed".
+                        "aim_missed": s.aim_missed,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -385,6 +398,7 @@ impl Checkpoint {
                 screenshot_after: None,
                 snapshots_taken: 0,
                 sensitive: step.sensitive,
+                aim_missed: step.aim_missed,
             })
             .collect()
     }
@@ -756,6 +770,7 @@ mod tests {
             sensitive: false,
             rung: Some(crate::computer::types::Rung::AxAction),
             effect: Some(crate::computer::types::ActionEffect::Confirmed),
+            aim_missed: None,
         });
         cp.model_calls = 1;
         cp
@@ -841,6 +856,7 @@ mod tests {
             sensitive: false,
             rung: None,
             effect: None,
+            aim_missed: None,
         });
         assert_eq!(cp.next_step(), 2);
     }
@@ -850,6 +866,47 @@ mod tests {
         let mut cp = checkpoint("r1");
         cp.completed[0].sensitive = true;
         assert_eq!(cp.sensitive_steps(), 1);
+    }
+
+    /// Where a miss aimed survives the process that saw it.
+    ///
+    /// A resumed run's prompt is built from `resume_history`, which has no
+    /// diff — only what the checkpoint kept. If the box is dropped here, the
+    /// next process can say a click was "unchecked" and nothing more, and the
+    /// model restarts by retrying it.
+    #[tokio::test]
+    async fn a_miss_reaches_the_resumed_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RunStore::with_dir(dir.path().to_path_buf());
+        let mut cp = checkpoint("r1");
+        cp.completed[0].verification = StepVerification::Unverifiable;
+        cp.completed[0].aim_missed = Some(crate::computer::Rect::new(4, 8, 64, 64));
+        store.save(&cp).await.expect("save");
+
+        let loaded = store.load("r1").await.expect("load");
+        let history = loaded.resume_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].aim_missed,
+            Some(crate::computer::Rect::new(4, 8, 64, 64)),
+            "the box must survive the file, not just the struct"
+        );
+    }
+
+    /// A checkpoint written before this field existed still loads. The field
+    /// is a note, not a fact the run depends on, so an absent one is `None`
+    /// rather than a deserialisation error.
+    #[test]
+    fn an_old_checkpoint_without_an_aim_still_loads() {
+        let mut cp = checkpoint("r1");
+        let mut json = serde_json::to_value(&cp).expect("serialize");
+        let steps = json["completed"].as_array_mut().expect("steps");
+        steps[0]
+            .as_object_mut()
+            .expect("object")
+            .remove("aim_missed");
+        cp = serde_json::from_value(json).expect("an old checkpoint loads");
+        assert_eq!(cp.completed[0].aim_missed, None);
     }
 
     /// A panel reopened after a restart has only the file to go on, so the file

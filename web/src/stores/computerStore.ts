@@ -18,6 +18,8 @@ export interface ComputerStepView {
   beforeRef?: string | null;
   afterRef?: string | null;
   sensitive?: boolean;
+  /** Where the step aimed, when its visible change landed elsewhere. */
+  aimMissed?: { x: number; y: number; width: number; height: number } | null;
 }
 
 /** A run, merged from the live view and the file that outlives it. */
@@ -90,6 +92,7 @@ function stepFromRecord(s: ComputerRunStep): ComputerStepView {
     beforeRef: s.before_ref ?? null,
     afterRef: s.after_ref ?? null,
     sensitive: s.sensitive ?? false,
+    aimMissed: s.aim_missed ?? null,
   };
 }
 
@@ -253,6 +256,10 @@ export const useComputerStore = create<ComputerState>((set) => ({
         effect: (event.effect as string | null) ?? null,
         beforeRef: (event.screenshot_before_ref as string | null) ?? null,
         afterRef: (event.screenshot_ref as string | null) ?? null,
+        // Present only when the step's visible change landed away from where
+        // it aimed; `null` covers both "verified" and "nothing checked it".
+        aimMissed:
+          (event.aim_missed as ComputerStepView["aimMissed"]) ?? null,
       };
       const existing = prev ?? {
         runId,

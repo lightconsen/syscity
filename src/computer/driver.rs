@@ -303,6 +303,17 @@ impl ModelDriver {
             let start = state.history.len().saturating_sub(self.max_history);
             for record in &state.history[start..] {
                 wire.push_str(&render_step(record));
+                // The one-line history says "unchecked"; what it cannot say —
+                // and what decides whether retrying is worth a step — is that
+                // the screen changed somewhere other than where the action
+                // pointed. The same sentence the `computer` tool appends, so a
+                // model that reads both is not left to reconcile two wordings.
+                if let Some(target) = record.aim_missed {
+                    wire.push_str(&format!(
+                        "     {}\n",
+                        crate::computer::vision::off_target_note(&target)
+                    ));
+                }
             }
         }
 
@@ -1060,6 +1071,7 @@ mod tests {
                 screenshot_after: None,
                 snapshots_taken: 0,
                 sensitive: false,
+                aim_missed: None,
             },
             StepRecord {
                 step: 1,
@@ -1073,11 +1085,73 @@ mod tests {
                 screenshot_after: None,
                 snapshots_taken: 0,
                 sensitive: false,
+                aim_missed: None,
             },
         ];
         let (_system, user) = driver().render_prompt(&s, &ctx(true));
         assert!(user.contains("1. launch Calculator → verified"), "{user}");
         assert!(user.contains("2. click [s1:0.4] → FAILED"), "{user}");
+    }
+
+    /// A miss is named in the prompt, not just counted as "unchecked".
+    ///
+    /// The bug this pins: the aim verdict reached the run as a three-state
+    /// boolean and stopped there. "Last step: unchecked" is true of a click
+    /// that missed and of a step nothing could check, and the second reading
+    /// invites the model to repeat the click verbatim. Naming the box is what
+    /// lets it move instead.
+    #[test]
+    fn a_click_whose_change_landed_elsewhere_says_so_in_the_prompt() {
+        let mut s = state();
+        s.step = 1;
+        s.last_verified = None;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::Click {
+                target: ClickTarget::Coordinate(Point::new(10, 10)),
+                button: MouseButton::Left,
+            },
+            result: ActionResult::success("clicked".to_string()),
+            verification: StepVerification::Unverifiable,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: Some(crate::computer::Rect::new(0, 0, 64, 64)),
+        }];
+        let (_system, user) = driver().render_prompt(&s, &ctx(true));
+        assert!(user.contains("unchecked"), "{user}");
+        assert!(user.contains("the visible change is elsewhere"), "{user}");
+        assert!(user.contains("64x64"), "the box is named: {user}");
+        assert!(
+            user.contains(&crate::computer::vision::off_target_note(&crate::computer::Rect::new(
+                0, 0, 64, 64
+            ))),
+            "the tool and the run must word it the same way: {user}"
+        );
+    }
+
+    /// A step with nothing to say about its aim adds no line: an empty note
+    /// would train the model to skim the one that matters.
+    #[test]
+    fn a_verified_step_adds_no_aim_note() {
+        let mut s = state();
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::Click {
+                target: ClickTarget::Coordinate(Point::new(10, 10)),
+                button: MouseButton::Left,
+            },
+            result: ActionResult::success("clicked".to_string()),
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+        let (_system, user) = driver().render_prompt(&s, &ctx(true));
+        assert!(!user.contains("elsewhere"), "{user}");
     }
 
     /// The history is tail-limited: a long run must not grow every prompt.
@@ -1094,6 +1168,7 @@ mod tests {
                 screenshot_after: None,
                 snapshots_taken: 0,
                 sensitive: false,
+                aim_missed: None,
             })
             .collect();
         s.step = 20;

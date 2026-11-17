@@ -215,6 +215,9 @@ pub(crate) async fn handle_turns_replay(req: &WsRequest, state: &Arc<GatewayStat
             "after_ref": after_ref,
             "recovery": detail.get("recovery").and_then(|v| v.as_str()),
             "settle_ms": detail.get("settle_ms").and_then(|v| v.as_u64()),
+            // The same key the run half uses, so `verdict()` needs no branch
+            // on `source` to tell a missed click from an unchecked one.
+            "aim_missed": detail.get("aim_missed"),
             "source": "turn",
         }));
     }
@@ -296,6 +299,9 @@ fn run_timeline(runs: &[crate::computer::run_store::Checkpoint], offset: usize) 
                 "effect": step.effect.map(|e| e.as_str()),
                 "verified": crate::computer::run_store::verified_word(step.verification),
                 "sensitive": step.sensitive,
+                // The one reason a `verified: null` can be acted on: the
+                // screen changed, just not where this step aimed.
+                "aim_missed": step.aim_missed,
                 "before_ref": before_ref,
                 "after_ref": after_ref,
                 "round": serde_json::Value::Null,
@@ -949,6 +955,7 @@ mod tests {
                 sensitive: false,
                 rung: Some(Rung::AxAction),
                 effect: Some(ActionEffect::Confirmed),
+                aim_missed: None,
             });
         }
         cp.model_calls = 3;
@@ -1012,6 +1019,79 @@ mod tests {
         assert_eq!(runs[0]["tokens_in"], 1200);
         assert_eq!(runs[0]["tokens_out"], 40);
         assert_eq!(payload["image_count"], 2, "one turn frame, one run frame");
+    }
+
+    /// A step whose change landed away from its aim keeps the box, from
+    /// either half of the timeline.
+    ///
+    /// Both halves answer `verified: null` for a miss *and* for a step
+    /// nothing could check. The box is the only thing that separates them,
+    /// and the two halves reach it by different routes — a tool payload's
+    /// `verification.aim` on one side, the checkpoint's own field on the
+    /// other — so a change to either route can silently collapse them back
+    /// into one grey "Unverified" in the UI.
+    #[tokio::test]
+    async fn a_missed_step_keeps_its_box_in_both_halves() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let target = serde_json::json!({ "x": 4, "y": 8, "width": 64, "height": 64 });
+        let mut missed = action(0, "click", "unverifiable", "unverifiable");
+        missed["detail"]["aim_missed"] = target.clone();
+        write_turn(&state, "turn-miss", &[missed]);
+
+        // A run step in the same turn, aiming at a different box so the two
+        // halves cannot pass by accident.
+        let run_target = crate::computer::Rect::new(12, 24, 32, 32);
+        let mut cp = crate::computer::run_store::Checkpoint::new(
+            "r-miss",
+            "open the calculator",
+            &crate::computer::use_loop::LoopConfig::default(),
+        );
+        cp.turn_id = Some("turn-miss".to_string());
+        cp.completed
+            .push(crate::computer::run_store::CompletedStep {
+                step: 0,
+                action: crate::computer::types::DesktopAction::Click {
+                    target: crate::computer::types::ClickTarget::ElementId("s1:0.0".to_string()),
+                    button: crate::computer::types::MouseButton::Left,
+                },
+                verification: crate::computer::use_loop::StepVerification::Unverifiable,
+                result: "clicked".to_string(),
+                screenshot_before_ref: None,
+                screenshot_ref: None,
+                sensitive: false,
+                rung: None,
+                effect: None,
+                aim_missed: Some(run_target),
+            });
+        RunStoreForTest::for_paths(&state.paths)
+            .save(&cp)
+            .await
+            .expect("save run checkpoint");
+
+        let resp = handle_turns_replay(
+            &req("turns.replay", serde_json::json!({"turn_id": "turn-miss"})),
+            &state,
+        )
+        .await;
+        assert!(resp.ok, "{:?}", resp.error);
+        let payload = resp.payload.expect("payload");
+        let steps = payload["steps"].as_array().expect("steps");
+        assert_eq!(steps.len(), 2, "{payload}");
+
+        assert_eq!(steps[0]["source"], "turn");
+        assert_eq!(steps[0]["verified"], serde_json::Value::Null);
+        assert_eq!(
+            steps[0]["aim_missed"], target,
+            "the turn half reads the box out of the tool payload: {payload}"
+        );
+
+        assert_eq!(steps[1]["source"], "run");
+        assert_eq!(steps[1]["verified"], serde_json::Value::Null);
+        assert_eq!(
+            steps[1]["aim_missed"]["width"], 32,
+            "and the run half carries the checkpoint's own box: {payload}"
+        );
+        assert_eq!(steps[1]["aim_missed"]["x"], 12);
     }
 
     /// A run that names a turn with no turn trace of its own is still

@@ -172,6 +172,20 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
 "框里没变化"不算数）；没有 `vision` 特征时字节采样给不出区域，`aim` 记为
 `None`，裁决退回原来的"有没有变化"。**不知道 ≠ 在别处。**
 
+**这条事实要走到三个读者手里，缺一个就等于没接线**（这是初版的实际缺陷：
+session 判出了"在别处"，`StepRecord` 没接，run 的决策prompt 只能看到
+`unchecked`，模型于是反复重试同一次点击）：
+
+| 读者 | 载体 |
+|---|---|
+| `computer` 工具（单步） | `diff.summary_for_action()` 追加的整句 |
+| run 的下一步决策 prompt | `StepRecord::aim_missed` → `driver.rs` 在历史行下追加同一句 |
+| 断点续跑 / 时间线 / 交接单 | `CompletedStep::aim_missed` → `resume_history` 与 `turns.replay` 的 `aim_missed` |
+
+三处共用 `off_target_note(&Rect)`，措辞只有一份。Web 的 `verdict()` 因此有
+第四态 `elsewhere`（琥珀色）：把"变化在别处"画成和"没人验证"一样的灰字，
+等于把唯一可行动的那种 `null` 藏起来。
+
 ### L3 · 给图就给小的
 
 `image_budget.rs`：默认 **1024px / JPEG / quality 75**。**刻意不复用**

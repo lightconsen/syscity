@@ -305,13 +305,24 @@ function StepRow({
   const [open, setOpen] = useState(false);
 
   const hasFrame = Boolean(step.beforeRef || step.afterRef);
-  const status = step.verified === true ? "yes" : step.verified === false ? "no" : "unknown";
+  const status =
+    step.verified === true
+      ? "yes"
+      : step.verified === false
+        ? "no"
+        : // A null verdict with an aim box is a miss, not an unknown: the
+          // screen changed, just not where the step pointed.
+          step.aimMissed
+          ? "elsewhere"
+          : "unknown";
   const statusColor =
     status === "yes"
       ? "text-green-600 dark:text-green-400"
       : status === "no"
         ? "text-red-600 dark:text-red-400"
-        : "text-secondary";
+        : status === "elsewhere"
+          ? "text-amber-600 dark:text-amber-400"
+          : "text-secondary";
 
   return (
     <div className="border-b border-subtle last:border-b-0" data-testid="computer-step" data-step={step.step}>

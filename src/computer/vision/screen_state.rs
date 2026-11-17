@@ -362,14 +362,9 @@ impl ScreenDiff {
         // change is evidence something happened even if no pixel near the
         // target moved, and saying "not evidence" then would contradict the
         // `Verified` the same diff produces.
-        if self.changed_elsewhere() {
-            if let Some(aim) = self.aim.as_ref() {
-                summary.push_str(&format!(
-                    "\nNothing changed at or near ({},{}) {}x{}, where this action aimed — the \
-                     visible change is elsewhere. That is not evidence the action took effect.",
-                    aim.target.x, aim.target.y, aim.target.width, aim.target.height
-                ));
-            }
+        if let Some(note) = self.aim_note() {
+            summary.push('\n');
+            summary.push_str(&note);
         }
         if summary == "no visible change detected" || self.evidences_action(geometry_counts) {
             return summary;
@@ -380,6 +375,47 @@ impl ScreenDiff {
              taking effect."
         )
     }
+
+    /// One sentence naming where an action aimed when the change was elsewhere.
+    ///
+    /// Separate from [`summary_for_action`](Self::summary_for_action) because
+    /// the run's decision prompt has no room for the whole diff — it renders
+    /// one line per past step — but the fact that the change happened away
+    /// from the target is exactly what a model needs before it decides to
+    /// retry the same click. `None` when there is nothing to say: the change
+    /// was at the target, the tree corroborated it, or no aim was recorded.
+    pub fn aim_note(&self) -> Option<String> {
+        self.aim_missed().map(|target| off_target_note(&target))
+    }
+
+    /// The box the action aimed at, when the change landed somewhere else.
+    ///
+    /// The structured form of [`aim_note`](Self::aim_note), for callers that
+    /// cannot keep the whole diff — a [`StepRecord`] carries this one box so a
+    /// later prompt can still say where a step went wrong.
+    ///
+    /// [`StepRecord`]: crate::computer::use_loop::StepRecord
+    pub fn aim_missed(&self) -> Option<Rect> {
+        if !self.changed_elsewhere() {
+            return None;
+        }
+        self.aim.as_ref().map(|aim| aim.target)
+    }
+}
+
+/// The sentence that says a step's visible change happened away from its aim.
+///
+/// Free-standing because the fact has two carriers: the diff, while a step is
+/// still being reported, and the [`StepRecord`](crate::computer::use_loop::StepRecord),
+/// which outlives it and is all a later prompt has. Both must word it the same
+/// way — a run that said "elsewhere" in one place and something vaguer in the
+/// other would leave the model to work out which of its steps missed.
+pub fn off_target_note(target: &Rect) -> String {
+    format!(
+        "Nothing changed at or near ({},{}) {}x{}, where this action aimed — the visible change \
+         is elsewhere. That is not evidence the action took effect.",
+        target.x, target.y, target.width, target.height
+    )
 }
 
 /// Pixel-level comparison of two screenshots.
@@ -1215,6 +1251,49 @@ mod tests {
         let summary = diff.summary_for_action(false);
         assert!(summary.contains("elsewhere"), "{summary}");
         assert!(summary.contains("at or near (100,100) 80x24"), "{summary}");
+    }
+
+    /// The box a miss aimed at is what the caller keeps once the diff is gone.
+    ///
+    /// `aim_note` and `aim_missed` are the same fact in two shapes, and they
+    /// must agree: if one said "elsewhere" where the other said nothing, a run
+    /// and a tool would report the same step differently.
+    #[test]
+    fn the_missed_box_is_offered_separately_from_the_whole_diff() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 1.0,
+                changed_regions: vec![Rect::new(900, 0, 32, 32)],
+                regions_truncated: false,
+            },
+            tree: TreeDiffResult::default(),
+            aim: None,
+        };
+        let target = Rect::new(100, 100, 80, 24);
+        assert_eq!(diff.aim_missed(), None, "no aim was recorded yet");
+
+        let diff = diff.with_aim(target);
+        assert_eq!(diff.aim_missed(), Some(target));
+        assert_eq!(diff.aim_note(), Some(off_target_note(&target)));
+        assert!(off_target_note(&target).contains("(100,100) 80x24"));
+    }
+
+    /// A diff whose change was at the target has no note and no box: the
+    /// sentence exists to explain a suspicion, and there is none here.
+    #[test]
+    fn a_change_at_the_target_offers_no_miss() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 2.0,
+                changed_regions: vec![Rect::new(110, 104, 32, 32)],
+                regions_truncated: false,
+            },
+            tree: TreeDiffResult::default(),
+            aim: None,
+        }
+        .with_aim(Rect::new(100, 100, 80, 24));
+        assert_eq!(diff.aim_missed(), None);
+        assert_eq!(diff.aim_note(), None);
     }
 
     #[test]

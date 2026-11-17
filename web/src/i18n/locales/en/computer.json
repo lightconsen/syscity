@@ -22,6 +22,7 @@
   "ComputerPanel.verified.yes": "Verified",
   "ComputerPanel.verified.no": "Not the effect asked for",
   "ComputerPanel.verified.unknown": "Unverified",
+  "ComputerPanel.verified.elsewhere": "Changed elsewhere",
   "ComputerPanel.effect.confirmed": "Screen changed",
   "ComputerPanel.effect.unverifiable": "Nothing could be read back",
   "ComputerPanel.effect.suspected_noop": "Screen did not change",

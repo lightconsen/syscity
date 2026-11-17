@@ -191,6 +191,13 @@ pub struct ActionTraceEvent {
     /// CAS digest of the frame captured after the action settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_ref: Option<String>,
+    /// The box the step aimed at, when its visible change landed elsewhere.
+    ///
+    /// The run's own checkpoint keeps the same fact for its steps; without it
+    /// here, one timeline would draw a missed click from a tool as a plain
+    /// "unverified" and the same miss from a run as a miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim_missed: Option<crate::computer::Rect>,
 }
 
 impl ActionTraceEvent {
@@ -224,6 +231,14 @@ impl ActionTraceEvent {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         };
+        // The diff travels whole in the tool payload; the timeline keeps the
+        // one box that says a `null` verdict was a miss rather than a gap.
+        let aim_missed = detail
+            .get("verification")
+            .and_then(|v| v.get("aim"))
+            .filter(|aim| aim.get("at_target").and_then(|v| v.as_bool()) == Some(false))
+            .and_then(|aim| aim.get("target").cloned())
+            .and_then(|target| serde_json::from_value(target).ok());
         Self {
             action: action.to_string(),
             rung: text("rung").unwrap_or_else(|| "unknown".to_string()),
@@ -238,6 +253,7 @@ impl ActionTraceEvent {
             verification: text("verification_state"),
             before_ref: digest("screenshot_before_ref"),
             after_ref: digest("screenshot_ref"),
+            aim_missed,
         }
     }
 }
@@ -723,5 +739,35 @@ mod tests {
         let back: CompressionObservation = serde_json::from_str(&json).unwrap();
         assert_ratio(back.retention_ratio, 0.2);
         assert_eq!(back.quality_flag.as_deref(), Some("low_retention"));
+    }
+
+    /// The trace keeps the box a missed click aimed at, and only that case.
+    ///
+    /// The tool's payload carries the whole diff under `verification`; the
+    /// timeline keeps one fact from it. Taking `aim.target` unconditionally
+    /// would mark every verified click as a miss.
+    #[test]
+    fn a_missed_aim_is_read_out_of_the_tool_payload() {
+        let detail = serde_json::json!({
+            "verification": {
+                "aim": { "target": { "x": 4, "y": 8, "width": 64, "height": 64 }, "at_target": false }
+            }
+        });
+        let event = ActionTraceEvent::from_detail("click", &detail);
+        assert_eq!(event.aim_missed, Some(crate::computer::Rect::new(4, 8, 64, 64)));
+        // The round trip through `full.json` keeps it.
+        let line = serde_json::to_string(&event).unwrap();
+        let back: ActionTraceEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.aim_missed, Some(crate::computer::Rect::new(4, 8, 64, 64)));
+
+        let landed = serde_json::json!({
+            "verification": {
+                "aim": { "target": { "x": 4, "y": 8, "width": 64, "height": 64 }, "at_target": true }
+            }
+        });
+        assert_eq!(ActionTraceEvent::from_detail("click", &landed).aim_missed, None);
+
+        // No aim at all: a key press, or a build without pixel regions.
+        assert_eq!(ActionTraceEvent::from_detail("click", &serde_json::json!({})).aim_missed, None);
     }
 }

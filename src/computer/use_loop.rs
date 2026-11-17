@@ -77,6 +77,22 @@ pub struct StepRecord {
     /// approving that resume is entitled to know which steps touched a
     /// password field or a payment form.
     pub sensitive: bool,
+    /// The box a click-like action aimed at, when the visible change landed
+    /// somewhere else.
+    ///
+    /// `Some` only for the case the three-state verdict calls `Unverifiable`
+    /// for a reason worth repeating: the screen *did* change, just not where
+    /// the action pointed. The diff that established this is dropped when the
+    /// step ends, and the run's next decision prompt renders one line per past
+    /// step — so without this box, "unchecked" is all a later prompt can say
+    /// about a click that visibly missed. A model told only "unchecked" tends
+    /// to retry the same click; told where it aimed, it can move.
+    ///
+    /// `None` for every other step: a change at the target, a tree-corroborated
+    /// one, a step that could not be compared at all, or an action that aimed
+    /// nowhere (a key press, a launch). Carrying a box in those cases would
+    /// say "elsewhere" about a question nobody answered.
+    pub aim_missed: Option<crate::computer::Rect>,
 }
 
 /// Current state exposed to the decision maker.
@@ -423,6 +439,10 @@ impl ComputerUseLoop {
                         Ok(outcome) => {
                             let verification = outcome.verification;
                             let sensitive = outcome.sensitive_target;
+                            // Read before the outcome is taken apart: the diff
+                            // is the only thing that knows where the change
+                            // happened, and this record outlives it.
+                            let aim_missed = outcome.diff.as_ref().and_then(|d| d.aim_missed());
                             consecutive_failures = self.session.consecutive_failures().await;
                             last_error = self.session.last_error().await;
                             last_verified = match verification {
@@ -448,6 +468,7 @@ impl ComputerUseLoop {
                                 screenshot_after: outcome.state_after.map(|state| state.screenshot),
                                 snapshots_taken: outcome.snapshots_taken,
                                 sensitive,
+                                aim_missed,
                             });
                         }
                         Err(e) => {
@@ -466,6 +487,8 @@ impl ComputerUseLoop {
                                 screenshot_after: None,
                                 snapshots_taken: 0,
                                 sensitive: false,
+                                // Nothing was delivered, so nothing aimed.
+                                aim_missed: None,
                             });
                         }
                     }
@@ -706,6 +729,127 @@ mod tests {
         assert_eq!(loop_.session_config.snapshot_paths.len(), 1);
         assert_eq!(loop_.session_config.auto_rollback_threshold, 5);
         assert!(loop_.rollback_manager.is_some());
+    }
+
+    /// A miss reaches the record the next decision is built from.
+    ///
+    /// The session establishes "the change was not where the click pointed"
+    /// and returns it on the diff. The diff dies with the step; the record is
+    /// what the loop hands back. Losing the fact in between is invisible in
+    /// every unit test of either half — the session still reports
+    /// `Unverifiable` and the record still says `Unverifiable` — and only
+    /// shows up as a model that retries the same click forever.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_miss_lands_on_the_step_record() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Blanks until something is clicked, then paints a corner — a change
+        /// that is real and is not the click.
+        ///
+        /// Keyed on the click rather than on a capture count: the loop takes
+        /// one capture for perception and another as the step's baseline, so
+        /// "paint from the second capture" would paint the baseline too and
+        /// the diff would find nothing.
+        struct CornerPainter {
+            clicked: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::computer::ComputerAdapter for CornerPainter {
+            async fn screenshot(
+                &self,
+                _region: Option<crate::computer::Rect>,
+            ) -> crate::computer::Result<Screenshot> {
+                use base64::Engine as _;
+                let mut img = image::RgbImage::new(200, 200);
+                if self.clicked.load(Ordering::SeqCst) {
+                    for y in 150..182 {
+                        for x in 150..182 {
+                            img.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                        }
+                    }
+                }
+                let mut buf = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut buf, image::ImageFormat::Png)
+                    .expect("a PNG");
+                Ok(Screenshot::new(
+                    base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                    200,
+                    200,
+                ))
+            }
+
+            async fn read_ui_tree(
+                &self,
+                _app: Option<&str>,
+            ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+                Ok(Vec::new())
+            }
+
+            async fn execute(
+                &self,
+                _action: DesktopAction,
+            ) -> crate::computer::Result<ActionResult> {
+                self.clicked.store(true, Ordering::SeqCst);
+                Ok(ActionResult::success("clicked"))
+            }
+
+            async fn wait_for(
+                &self,
+                _condition: crate::computer::WaitCondition,
+                _timeout: std::time::Duration,
+            ) -> crate::computer::Result<bool> {
+                Ok(true)
+            }
+
+            async fn display_geometry(
+                &self,
+            ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+                Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                    0, 0, 200, 200,
+                )
+                .primary()]))
+            }
+        }
+
+        let loop_ = ComputerUseLoop::new(Arc::new(CornerPainter {
+            clicked: AtomicBool::new(false),
+        }))
+        .with_config(LoopConfig {
+            settle_delay_ms: 0,
+            max_steps: 2,
+            ..LoopConfig::default()
+        });
+
+        let result = loop_
+            .run("click the thing", move |state| async move {
+                if !state.history.is_empty() {
+                    return Ok(LoopDecision::Done { message: "stop".to_string() });
+                }
+                Ok(LoopDecision::Action(DesktopAction::Click {
+                    target: crate::computer::types::ClickTarget::Coordinate(
+                        crate::computer::types::Point::new(10, 10),
+                    ),
+                    button: crate::computer::types::MouseButton::Left,
+                }))
+            })
+            .await
+            .expect("a run");
+
+        assert_eq!(result.history.len(), 1, "one step ran");
+        let record = &result.history[0];
+        assert_eq!(record.verification, StepVerification::Unverifiable);
+        let target = record.aim_missed.expect("the miss survives to the record");
+        assert!(
+            target.overlaps(&crate::computer::Rect::new(10, 10, 1, 1)),
+            "the box is where the click aimed: {target:?}"
+        );
+        assert!(
+            !target.overlaps(&crate::computer::Rect::new(150, 150, 32, 32)),
+            "and not where the change was: {target:?}"
+        );
     }
 
     /// The allowlist reaches the session the loop actually dispatches

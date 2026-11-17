@@ -78,6 +78,15 @@ pub enum RunEvent {
         screenshot_ref: Option<String>,
         /// `None` when nothing could confirm or deny the action.
         verified: Option<bool>,
+        /// The box the step aimed at, when its visible change landed
+        /// elsewhere.
+        ///
+        /// Present only for the interesting `verified: None` — the one where
+        /// the screen *did* change, just not where the action pointed. A
+        /// timeline that draws both kinds of `None` identically hides the one
+        /// a person can act on ("it missed") behind the one they cannot
+        /// ("nothing checked it").
+        aim_missed: Option<crate::computer::Rect>,
         model_calls: usize,
         images_attached: usize,
     },
@@ -794,6 +803,11 @@ async fn announce_new_steps(
                 // checkpoint drawable as the identical timeline `turns.replay`
                 // draws for a turn.
                 effect,
+                // And for the aim: a resumed run's history is rebuilt from
+                // here, and without the box the next process can only say a
+                // click was "unchecked", never that its change landed away
+                // from where it pointed.
+                aim_missed: record.aim_missed,
             };
             let spent = { budget.lock().await.clone() };
             checkpointer.step(&completed, &spent).await;
@@ -809,6 +823,7 @@ async fn announce_new_steps(
                 screenshot_before_ref,
                 screenshot_ref,
                 verified,
+                aim_missed: record.aim_missed,
                 model_calls: calls,
                 images_attached: images,
             });

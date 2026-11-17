@@ -157,6 +157,13 @@ export interface ComputerRunStep {
   sensitive?: boolean;
   rung?: string | null;
   effect?: string | null;
+  /**
+   * Where the step aimed, when its visible change landed somewhere else.
+   *
+   * The actionable half of a `null` verdict: `null` alone cannot tell "nothing
+   * checked this" from "the screen moved, but not at the target".
+   */
+  aim_missed?: { x: number; y: number; width: number; height: number } | null;
 }
 
 /** The disk view (`computer.runs`) — the run's record after the process. */
@@ -218,6 +225,15 @@ export interface TurnReplayStep {
   result?: string | null;
   /** Whether the step touched a sensitive control (`run` steps only). */
   sensitive?: boolean;
+  /**
+   * Where a step aimed, when the screen changed somewhere else.
+   *
+   * `verified: null` covers two different facts: nothing could check the
+   * step, and the step visibly missed. This box is present only for the
+   * second, so a timeline can say "the change was elsewhere" instead of
+   * leaving a person to guess.
+   */
+  aim_missed?: { x: number; y: number; width: number; height: number } | null;
   /** The run's own step number, so a row can be found in `computer.status`. */
   run_step?: number;
   /** Which run contributed the step (`run` steps only). */

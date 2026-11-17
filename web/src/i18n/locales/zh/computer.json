@@ -22,6 +22,7 @@
   "ComputerPanel.verified.yes": "已验证",
   "ComputerPanel.verified.no": "未产生预期效果",
   "ComputerPanel.verified.unknown": "未能验证",
+  "ComputerPanel.verified.elsewhere": "变化在别处",
   "ComputerPanel.effect.confirmed": "屏幕已变化",
   "ComputerPanel.effect.unverifiable": "无法回读",
   "ComputerPanel.effect.suspected_noop": "屏幕未变化",

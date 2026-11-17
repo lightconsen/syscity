@@ -75,6 +75,6 @@ pub use model_download::{resolve_or_download_vision_models, VisionModelPaths};
 #[cfg(feature = "vision")]
 pub use preprocess::{decode_screenshot, image_to_nchw_tensor, normalize_image, resize_with_pad};
 pub use screen_state::{
-    action_changes_geometry, is_screen_mutating_action, pixel_diff, tree_diff, PixelDiffResult,
-    ScreenDiff, ScreenState, TextBlockSer, TreeDiffResult,
+    action_changes_geometry, is_screen_mutating_action, off_target_note, pixel_diff, tree_diff,
+    PixelDiffResult, ScreenDiff, ScreenState, TextBlockSer, TreeDiffResult,
 };

@@ -143,6 +143,7 @@ mod tests {
             sensitive: false,
             rung,
             effect: None,
+            aim_missed: None,
         }
     }
 
@@ -223,6 +224,7 @@ mod tests {
             screenshot_after: None,
             snapshots_taken: 0,
             sensitive: false,
+            aim_missed: None,
         }];
         let note =
             crate::computer::handoff::note_for(&run, &history, "stuck", StopReason::NeedHelp);
@@ -278,6 +280,7 @@ mod tests {
                 sensitive: r.sensitive,
                 rung: None,
                 effect: None,
+                aim_missed: None,
             })
             .collect()
     }
