@@ -1715,6 +1715,59 @@ mod tests {
         assert_eq!(view["vision"], "api: 1 controls");
     }
 
+    /// A tree-less screen that does not change is scanned once, not per step.
+    ///
+    /// This is the cost the cache exists to remove. A tree-less app makes
+    /// `tree_complete` false on every step, so the scan trigger fires every
+    /// step; the local detector plus OCR cost seconds apiece. Nothing about
+    /// the second look can differ from the first — same pixels, same goal,
+    /// same geometry — so paying for it again is pure waste, and on a long
+    /// run it is the difference between a minute and ten.
+    ///
+    /// The assertion is on the vision rung's own call count. "The run
+    /// finished" would pass with the cache removed entirely.
+    #[tokio::test]
+    async fn a_still_tree_less_screen_is_scanned_once_across_steps() {
+        let provider = ScriptedProvider::new(vec![
+            click_answer(),
+            click_answer(),
+            click_answer(),
+            r#"{"decision": "done", "message": "clicked it"}"#,
+        ]);
+        let adapter = FakeDesktop::tree_less();
+        let run = ComputerRun::new("r1", "click Save");
+
+        let (look, scans) = crate::computer::vision::look::test_support::counting_api_look(
+            r#"{"elements": [{"role": "button", "label": "Save", "x": 10, "y": 20, "width": 30, "height": 10}]}"#,
+        );
+        let mut plan = fast_plan(provider.clone(), adapter.clone(), 15, true);
+        plan.vision = Some(look);
+
+        let outcome = execute(run.clone(), plan)
+            .await
+            .expect("the run machinery works");
+
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(adapter.executions(), 3, "three steps acted");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unchanged screen was scanned once, not once per step"
+        );
+        // The scan still reached every step's prompt: the cache saves the
+        // inference, not the evidence.
+        assert!(
+            provider
+                .requests()
+                .last()
+                .expect("a decision")
+                .messages
+                .iter()
+                .any(|m| m.content.contains("\"Save\"")),
+            "the cached controls are still shown to the model"
+        );
+    }
+
     /// The same screen with nobody to look: the step says so and still acts.
     ///
     /// The other half of the change — the tree-less app is now understood as

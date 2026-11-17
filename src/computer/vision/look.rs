@@ -229,10 +229,66 @@ pub struct VisionLook {
     resolver: VisionResolver,
     api: Option<ApiVision>,
     image_limit: ImageLimit,
+    /// The last scan, so two steps that looked at the same pixels do not pay
+    /// for the same inference twice.
+    ///
+    /// A run in a tree-less app scans on *every* step — the tree is
+    /// permanently incomplete, so the trigger never stops firing — and the
+    /// local detector plus OCR costs seconds per scan. A screen that did not
+    /// change cannot produce a different answer, so the second scan is pure
+    /// cost: the model sees the same controls, and the run pays again.
+    ///
+    /// Only the *last* scan is kept, not a table. The step after a real
+    /// action is almost always the same screen, and a run that is moving
+    /// through a UI changes it every step — a one-entry cache catches the
+    /// repeat this exists for without holding every frame of a run in memory.
+    /// An `Option` rather than a one-element map, because there is only ever
+    /// one resident scan and a `VecDeque` would suggest a policy that does
+    /// not exist.
+    #[cfg(feature = "vision")]
+    cache: Mutex<Option<ScanCache>>,
     #[cfg(feature = "vision")]
     detector: SharedDetector,
     #[cfg(feature = "vision")]
     ocr: SharedOcr,
+}
+
+/// What a cached scan remembers, and what makes it still valid.
+///
+/// The digest alone is not enough. The same pixels can be asked a different
+/// question — an API scan is prompted with the goal, and a local answer is not
+/// an API answer — and the same pixels map to different screen points when the
+/// display geometry changed under the run. A cache keyed on pixels alone would
+/// answer the new question with the old answer.
+#[cfg(feature = "vision")]
+#[derive(Debug)]
+struct ScanCache {
+    digest: String,
+    rung: String,
+    goal: String,
+    geometry: crate::computer::display::DisplayGeometry,
+    found: VisionElements,
+}
+
+#[cfg(feature = "vision")]
+impl ScanCache {
+    /// Whether this scan still answers the question being asked.
+    ///
+    /// Every field is compared, not just the digest: a hit on stale geometry
+    /// would hand back boxes in the previous coordinate space, which is the
+    /// Retina mis-click this codebase already has an incident for.
+    fn answers(
+        &self,
+        digest: &str,
+        rung: &str,
+        goal: &str,
+        geometry: &crate::computer::display::DisplayGeometry,
+    ) -> bool {
+        self.digest == digest
+            && self.rung == rung
+            && self.goal == goal
+            && &self.geometry == geometry
+    }
 }
 
 #[cfg(feature = "vision")]
@@ -275,6 +331,8 @@ impl VisionLook {
             api,
             image_limit: ImageLimit::default(),
             #[cfg(feature = "vision")]
+            cache: Mutex::new(None),
+            #[cfg(feature = "vision")]
             detector: shared_detector(),
             #[cfg(feature = "vision")]
             ocr: shared_ocr(),
@@ -305,6 +363,12 @@ impl VisionLook {
     /// fallback if it fails. `budget` is charged for an API call *before* the
     /// request, because a vision call is a model call and the run's cost
     /// ceiling is the only thing that can refuse it.
+    ///
+    /// A screen that has not changed since the previous look is answered from
+    /// that look instead of being re-read. The local detector and OCR cost
+    /// seconds each, and a tree-less run asks on every step — without this the
+    /// same pixels are put through the same model over and over for one
+    /// screen. A cache hit charges nothing, because nothing was spent.
     pub async fn look(
         &self,
         shot: &Screenshot,
@@ -318,8 +382,22 @@ impl VisionLook {
             return LookOutcome::Unavailable(reason);
         }
 
+        // An unknown digest cannot be compared — the same rule the image
+        // allowance uses. A capture that was never measured is looked at.
+        let digest = shot.digest.clone();
+        if let Some(digest) = digest.as_deref() {
+            if let Some(cached) = self.cached(digest, &source, goal, geometry).await {
+                debug!("vision: the screen is unchanged, reusing the previous scan");
+                return LookOutcome::Found(cached);
+            }
+        }
+
         let why = match self.attempt(&source, shot, goal, geometry, budget).await {
-            Ok(found) => return LookOutcome::Found(found),
+            Ok(found) => {
+                self.remember(digest.as_deref(), &source, goal, geometry, &found)
+                    .await;
+                return LookOutcome::Found(found);
+            }
             Err(why) => why,
         };
 
@@ -331,6 +409,13 @@ impl VisionLook {
                         describe(&source),
                         describe(&fallback)
                     );
+                    // Keyed on the rung the ladder *started* from, not the one
+                    // that answered: the next step on these pixels will walk
+                    // the same ladder, so a hit must short-circuit the whole
+                    // of it. Keying on the fallback would replay a rung already
+                    // known to fail on exactly this screen.
+                    self.remember(digest.as_deref(), &source, goal, geometry, &found)
+                        .await;
                     LookOutcome::Found(found)
                 }
                 Err(fallback_why) => LookOutcome::Failed {
@@ -342,6 +427,66 @@ impl VisionLook {
                 },
             },
             None => LookOutcome::Failed { why },
+        }
+    }
+
+    /// The previous scan, when it still answers this question.
+    async fn cached(
+        &self,
+        digest: &str,
+        source: &VisionSource,
+        goal: &str,
+        geometry: &DisplayGeometry,
+    ) -> Option<VisionElements> {
+        #[cfg(feature = "vision")]
+        {
+            let rung = describe(source);
+            let cache = self.cache.lock().await;
+            let hit = cache
+                .as_ref()
+                .filter(|c| c.answers(digest, &rung, goal, geometry))?;
+            Some(hit.found.clone())
+        }
+        #[cfg(not(feature = "vision"))]
+        {
+            let _ = (digest, source, goal, geometry);
+            None
+        }
+    }
+
+    /// Keep a successful scan for the next step, if it can be reused at all.
+    ///
+    /// A failed look is never cached: a transient detector error would
+    /// otherwise be remembered as "this screen has no controls" for as long as
+    /// the pixels stay the same, which is exactly the failure the trigger
+    /// exists to retry.
+    async fn remember(
+        &self,
+        digest: Option<&str>,
+        source: &VisionSource,
+        goal: &str,
+        geometry: &DisplayGeometry,
+        found: &VisionElements,
+    ) {
+        // Without a digest nothing can be matched later, and the `api` rung
+        // costs a model call to reproduce: only a measured capture is worth
+        // holding, so an unmeasured one simply is not cached.
+        let Some(digest) = digest else {
+            return;
+        };
+        #[cfg(feature = "vision")]
+        {
+            *self.cache.lock().await = Some(ScanCache {
+                digest: digest.to_string(),
+                rung: describe(source),
+                goal: goal.to_string(),
+                geometry: geometry.clone(),
+                found: found.clone(),
+            });
+        }
+        #[cfg(not(feature = "vision"))]
+        {
+            let _ = (digest, source, goal, geometry, found);
         }
     }
 
@@ -892,9 +1037,22 @@ pub(crate) mod test_support {
     /// This is the same path a real API rung takes — parse, map, charge — so a
     /// run test exercises the code that ships rather than a stub of it.
     pub(crate) fn api_look(answer: &str) -> Arc<VisionLook> {
-        use crate::providers::{CompletionResponse, CompletionStream};
+        counting_api_look(answer).0
+    }
 
-        struct Scripted(String);
+    /// [`api_look`], plus a handle on how many times the rung was asked.
+    ///
+    /// A run-level test has to prove the scan was *skipped*, and "the run
+    /// finished" does not prove it: the cache could be broken and the run
+    /// would look identical from the outside, only slower and more expensive.
+    /// The counter is the observation.
+    pub(crate) fn counting_api_look(
+        answer: &str,
+    ) -> (Arc<VisionLook>, Arc<std::sync::atomic::AtomicUsize>) {
+        use crate::providers::{CompletionResponse, CompletionStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Scripted(String, Arc<AtomicUsize>);
 
         #[async_trait::async_trait]
         impl Provider for Scripted {
@@ -914,6 +1072,7 @@ pub(crate) mod test_support {
                 &self,
                 _request: CompletionRequest,
             ) -> crate::Result<CompletionResponse> {
+                self.1.fetch_add(1, Ordering::SeqCst);
                 Ok(CompletionResponse {
                     message: Message::assistant(self.0.clone()),
                     usage: None,
@@ -948,14 +1107,16 @@ pub(crate) mod test_support {
                 feature_enabled: true,
             },
         );
-        Arc::new(VisionLook::new(
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let look = Arc::new(VisionLook::new(
             resolver,
             Some(ApiVision {
-                provider: Arc::new(Scripted(answer.to_string())),
+                provider: Arc::new(Scripted(answer.to_string(), Arc::clone(&calls))),
                 provider_name: "scripted-vision".to_string(),
                 model: "scripted-vision-model".to_string(),
             }),
-        ))
+        ));
+        (look, calls)
     }
 
     /// A look that can see nothing: `mode = "off"`.
@@ -1010,8 +1171,20 @@ mod tests {
     /// empty payload would make every API assertion vacuous.
     const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
+    /// A different picture, with a different digest. The cache keys on the
+    /// digest, so "two screens" in a test has to mean two payloads.
+    const OTHER_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGNgZGIGIgYIBQAArgAZhy4cnQAAAABJRU5ErkJggg==";
+
     fn shot(width: u32, height: u32) -> Screenshot {
         Screenshot::new(ONE_PIXEL_PNG.to_string(), width, height)
+    }
+
+    /// A capture of different pixels, for proving two screens are not one.
+    ///
+    /// `Screenshot::new` digests its payload, so this differs from [`shot`] in
+    /// exactly the way the cache keys on.
+    fn other_shot(width: u32, height: u32) -> Screenshot {
+        Screenshot::new(OTHER_PIXEL_PNG.to_string(), width, height)
     }
 
     fn geometry() -> DisplayGeometry {
@@ -1255,12 +1428,164 @@ mod tests {
         assert!(matches!(outcome, LookOutcome::Found(_)));
         assert_eq!(budget.lock().await.model_calls(), 1);
 
-        // The same run cannot pay for a second one.
+        // A *different* screen cannot be answered from the first scan, so this
+        // is a second model call — and the run cannot pay for it.
         let again = look
-            .look(&shot(100, 100), "open the calculator", &geometry(), &budget)
+            .look(&other_shot(100, 100), "open the calculator", &geometry(), &budget)
             .await;
         assert!(matches!(again, LookOutcome::Failed { .. }), "{}", again.status());
         assert_eq!(provider.calls(), 1);
+    }
+
+    /// The same screen twice is one lookup.
+    ///
+    /// A tree-less run asks for a scan on every step, because the tree is
+    /// permanently incomplete. The detector and OCR cost seconds apiece, and
+    /// a screen that did not change produces the same answer — so the second
+    /// step must not pay for it. The assertion is on the provider's call count
+    /// rather than on wall-clock, because that is the cost being avoided.
+    #[tokio::test]
+    async fn an_unchanged_screen_is_not_looked_at_twice() {
+        let (api, provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+
+        let first = look
+            .look(&shot(100, 100), "open the calculator", &geometry(), &unlimited())
+            .await;
+        let second = look
+            .look(&shot(100, 100), "open the calculator", &geometry(), &unlimited())
+            .await;
+
+        assert!(matches!(first, LookOutcome::Found(_)));
+        assert!(matches!(second, LookOutcome::Found(_)));
+        assert_eq!(provider.calls(), 1, "the second look was answered from the first");
+        // A hit still reports the same controls: the model must not be told
+        // "nobody looked" just because the host remembered.
+        assert_eq!(second.status(), first.status());
+    }
+
+    /// A cache hit is free, so an exhausted budget does not refuse it.
+    ///
+    /// The ceiling counts model calls. Answering from memory is not one — and
+    /// refusing a free answer would stop a run from reading a screen it has
+    /// already paid to understand.
+    #[tokio::test]
+    async fn a_cached_scan_is_served_even_when_the_call_ceiling_is_reached() {
+        let (api, provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+        let budget = Arc::new(Mutex::new(RunBudget::new(crate::config::RunBudgetConfig {
+            max_calls_per_run: 1,
+            max_images_per_run: 5,
+        })));
+
+        assert!(matches!(
+            look.look(&shot(100, 100), "open the calculator", &geometry(), &budget)
+                .await,
+            LookOutcome::Found(_)
+        ));
+        // The ceiling is now exactly reached. The same pixels are still
+        // answerable, and answering costs nothing.
+        assert!(matches!(
+            look.look(&shot(100, 100), "open the calculator", &geometry(), &budget)
+                .await,
+            LookOutcome::Found(_)
+        ));
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(budget.lock().await.model_calls(), 1);
+    }
+
+    /// The same pixels asked a different question are not a cache hit.
+    ///
+    /// The API rung is prompted with the goal. Two goals over one screenshot
+    /// are two questions, and answering the second with the first's answer
+    /// would have the model reasoning about controls it never asked for.
+    #[tokio::test]
+    async fn a_new_goal_asks_the_screen_again() {
+        let (api, provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+
+        look.look(&shot(100, 100), "open the calculator", &geometry(), &unlimited())
+            .await;
+        look.look(&shot(100, 100), "close the dialog", &geometry(), &unlimited())
+            .await;
+
+        assert_eq!(provider.calls(), 2, "a different question is a different lookup");
+    }
+
+    /// A new display geometry invalidates the scan.
+    ///
+    /// Cached boxes are in screen points. If the geometry changed under the
+    /// run, the same pixels map somewhere else, and serving the old boxes
+    /// would aim a click at where the control used to be.
+    #[tokio::test]
+    async fn a_changed_display_asks_the_screen_again() {
+        let (api, provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+
+        look.look(&shot(100, 100), "open the calculator", &geometry(), &unlimited())
+            .await;
+        let moved = DisplayGeometry::new(vec![DisplayInfo::new(100, 0, 100, 100).primary()]);
+        look.look(&shot(100, 100), "open the calculator", &moved, &unlimited())
+            .await;
+
+        assert_eq!(provider.calls(), 2, "a moved display is a different mapping");
+    }
+
+    /// A failed look is never remembered.
+    ///
+    /// "The detector failed" is not "this screen has no controls". Caching the
+    /// first would make one transient error stick for as long as the pixels
+    /// stay put, which is precisely the state the per-step trigger exists to
+    /// retry out of.
+    #[tokio::test]
+    async fn a_failed_look_is_not_remembered() {
+        let (api, _) = api("openai", "gpt-4o", "not json at all");
+        let look = VisionLook::new(resolver("api", true, false), api);
+
+        let first = look
+            .look(&shot(100, 100), "open the calculator", &geometry(), &unlimited())
+            .await;
+        assert!(!matches!(first, LookOutcome::Found(_)), "{}", first.status());
+        // Nothing was cached, so the same screen is genuinely re-examined
+        // rather than answered with a remembered failure.
+        assert!(look
+            .cached(
+                &shot(100, 100).digest.clone().unwrap(),
+                &VisionSource::Unavailable(
+                    crate::computer::vision::resolver::UnavailableReason::ApiNotConfigured
+                ),
+                "open the calculator",
+                &geometry()
+            )
+            .await
+            .is_none());
+    }
+
+    /// A capture with no digest is looked at every time.
+    ///
+    /// An unmeasured capture cannot be compared to anything — the same rule
+    /// the image allowance follows — and pretending two unknowns match would
+    /// serve one screen's controls for another.
+    #[tokio::test]
+    async fn an_unmeasured_capture_is_never_a_hit() {
+        let (api, provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+        // A real payload with no measurement: the adapter built the struct and
+        // never digested it. The pixels are there to send; the key is not
+        // there to match.
+        let unmeasured = Screenshot { digest: None, ..shot(100, 100) };
+
+        let first = look
+            .look(&unmeasured, "open the calculator", &geometry(), &unlimited())
+            .await;
+        let second = look
+            .look(&unmeasured, "open the calculator", &geometry(), &unlimited())
+            .await;
+
+        // Both were real lookups, not one lookup and one hit.
+        assert!(matches!(first, LookOutcome::Found(_)), "{}", first.status());
+        assert!(matches!(second, LookOutcome::Found(_)), "{}", second.status());
+        assert_eq!(provider.calls(), 2, "an unknown digest is looked at, not matched");
     }
 
     /// The detector says *where*; OCR says *what*. A machine with both must
