@@ -13,6 +13,8 @@ import enMarketplace from "./locales/en/marketplace.json";
 import zhMarketplace from "./locales/zh/marketplace.json";
 import enWorkspace from "./locales/en/workspace.json";
 import zhWorkspace from "./locales/zh/workspace.json";
+import enComputer from "./locales/en/computer.json";
+import zhComputer from "./locales/zh/computer.json";
 import enOnboarding from "./locales/en/onboarding.json";
 import zhOnboarding from "./locales/zh/onboarding.json";
 import enAsk from "./locales/en/ask.json";
@@ -57,6 +59,7 @@ i18n.use(initReactI18next).init({
       update: enUpdate,
       chrome: enChrome,
       app: enApp,
+      computer: enComputer,
     },
     zh: {
       common: zhCommon,
@@ -71,6 +74,7 @@ i18n.use(initReactI18next).init({
       update: zhUpdate,
       chrome: zhChrome,
       app: zhApp,
+      computer: zhComputer,
     },
   },
   lng: detectLang(),

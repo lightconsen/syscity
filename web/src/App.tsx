@@ -20,6 +20,8 @@ import { IdentityWizard } from "@/components/onboarding/IdentityWizard";
 import { ChatContent } from "@/components/chat/ChatContent";
 import { useGoalStore } from "@/stores/goalStore";
 import { GoalPanel } from "@/components/chat/GoalPanel";
+import { ComputerPanel } from "@/components/computer/ComputerPanel";
+import { useComputerStore } from "@/stores/computerStore";
 import { DocumentPreviewPanel } from "@/components/shared/DocumentPreviewPanel";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { WorkspacePanel } from "@/components/workspace/WorkspacePanel";
@@ -282,6 +284,8 @@ function ChatShell() {
     pendingApprovals.find((a) => !deferredApprovals.has(a.approval_id)) ?? null;
   const workspacePanelOpen = useChatStore((s) => s.workspacePanelOpen);
   const setWorkspacePanelOpen = useChatStore((s) => s.setWorkspacePanelOpen);
+  const computerPanelOpen = useChatStore((s) => s.computerPanelOpen);
+  const setComputerPanelOpen = useChatStore((s) => s.setComputerPanelOpen);
   const currentAgent = useChatStore((s) => s.currentAgent);
   // Message count drives the "welcome page" state (empty chat = New Session
   // welcome), which the sidebar uses to highlight the right nav item.
@@ -497,6 +501,19 @@ function ChatShell() {
         transport.saveMessage(msg);
         const updated = [...transport.getMessages(), msg];
         transport.setMessages(updated);
+      }
+      // A desktop run's step, or its end. The run is not part of the message
+      // stream — it reports to the panel — so this handler is the only thing
+      // that keeps the panel live while it is open.
+      if (evt.event === "computer.step") {
+        const p = evt.payload as Record<string, unknown> | undefined;
+        if (!p) return;
+        const runId = (p.run_id as string) || "";
+        const runEvent = p.event as Record<string, unknown> | undefined;
+        if (!runId || !runEvent) return;
+        useComputerStore
+          .getState()
+          .applyStepEvent((p.session_id as string) || null, runId, runEvent);
       }
       if (evt.event === "goal.progress") {
         const p = evt.payload as Record<string, unknown> | undefined;
@@ -1050,7 +1067,7 @@ function ChatShell() {
             onSummonExpert={handleCreateSessionWithAgent}
             onNewSessionWithDraft={handleNewSessionWithDraft}
           />
-        ) : (previewDocument || workspacePanelOpen) && !isMobile ? (
+        ) : (previewDocument || workspacePanelOpen || computerPanelOpen) && !isMobile ? (
           <div
             ref={splitContainerRef}
             className="flex flex-row h-full overflow-hidden"
@@ -1104,7 +1121,20 @@ function ChatShell() {
               className="min-w-0 overflow-hidden flex flex-col"
               style={{ flex: `${previewRatio} 1 0%` }}
             >
-              {workspacePanelOpen ? (
+              {computerPanelOpen ? (
+                <ErrorBoundary
+                  area="computer panel"
+                  /* A run's step list renders data from the gateway; a bad
+                     frame must not take the chat down with it. */
+                  onReset={() => setComputerPanelOpen(false)}
+                >
+                  <ComputerPanel
+                    transport={transport}
+                    sessionId={transport.getSessionId() || null}
+                    onClose={() => setComputerPanelOpen(false)}
+                  />
+                </ErrorBoundary>
+              ) : workspacePanelOpen ? (
                 <WorkspacePanel
                   key={currentAgent?.id ?? "default"}
                   transport={transport}

@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Menu,
+  Monitor,
   Settings,
   PanelRight,
   PanelLeft,
@@ -77,10 +78,15 @@ export function Titlebar({
   onShowApprovals,
 }: TitlebarProps) {
   const { t } = useTranslation("chrome");
+  // The panel button's wording lives in the panel's own namespace, so the two
+  // cannot drift into saying "desktop run" and "computer use" in one screen.
+  const { t: tComputer } = useTranslation("computer");
   const platform = usePlatform();
   const currentAgent = useChatStore((s) => s.currentAgent);
   const workspacePanelOpen = useChatStore((s) => s.workspacePanelOpen);
   const setWorkspacePanelOpen = useChatStore((s) => s.setWorkspacePanelOpen);
+  const computerPanelOpen = useChatStore((s) => s.computerPanelOpen);
+  const setComputerPanelOpen = useChatStore((s) => s.setComputerPanelOpen);
   const kbPanelOpen = useChatStore((s) => s.kbPanelOpen);
   const setKbPanelOpen = useChatStore((s) => s.setKbPanelOpen);
 
@@ -251,6 +257,26 @@ export function Titlebar({
         <button onClick={onOpenSettings} className={iconBtnCls} title={t("Titlebar.settings")} aria-label={t("Titlebar.settings")}>
           <Settings className="w-4 h-4" />
         </button>
+        {/* The desktop-run panel, beside the right-pane toggle. Hidden on the
+            Knowledge Base page (no runs there) and on mobile (the pane does
+            not exist; the split layout starts at md). */}
+        {!isMobile && !inKbPage && (
+          <button
+            type="button"
+            title={tComputer("ComputerPanel.openPanel")}
+            aria-label={tComputer("ComputerPanel.openPanel")}
+            aria-pressed={computerPanelOpen}
+            data-testid="titlebar-computer-panel"
+            className={
+              computerPanelOpen
+                ? "p-1.5 rounded-md text-primary-600 dark:text-primary-400 bg-black/5 dark:bg-white/10 transition"
+                : iconBtnCls
+            }
+            onClick={() => setComputerPanelOpen(!computerPanelOpen)}
+          >
+            <Monitor className="w-4 h-4" />
+          </button>
+        )}
         {!isMobile && (
           <button
             type="button"

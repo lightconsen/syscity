@@ -87,6 +87,9 @@ interface ChatState {
   messageVotes: Record<string, "up" | "down" | undefined>;
   previewDocument: PreviewDocument | null;
   workspacePanelOpen: boolean;
+  /** The desktop-run panel. It shares the right pane with the workspace
+   *  browser and the document preview, so opening one closes the others. */
+  computerPanelOpen: boolean;
   /** KB page's right-side document panel — driven by the same Titlebar
    *  "show right sidebar" button, but scoped to the Knowledge Base view. */
   kbPanelOpen: boolean;
@@ -125,6 +128,7 @@ interface ChatState {
   setMessageVote: (turnId: string, vote: "up" | "down" | undefined) => void;
   setPreviewDocument: (doc: PreviewDocument | null) => void;
   setWorkspacePanelOpen: (open: boolean) => void;
+  setComputerPanelOpen: (open: boolean) => void;
   setKbPanelOpen: (open: boolean) => void;
   setPendingAgent: (agent: { id: string; display_name: string; emoji: string } | null) => void;
   setPendingDraft: (draft: string | null) => void;
@@ -149,6 +153,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messageVotes: loadMessageVotes(),
   previewDocument: null,
   workspacePanelOpen: false,
+  computerPanelOpen: false,
   kbPanelOpen: false,
   pendingAgent: null,
   pendingDraft: null,
@@ -193,9 +198,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // The workspace panel and document preview share the right-side pane;
   // opening one closes the other.
   setPreviewDocument: (doc) =>
-    set(doc ? { previewDocument: doc, workspacePanelOpen: false } : { previewDocument: doc }),
+    set(
+      doc
+        ? { previewDocument: doc, workspacePanelOpen: false, computerPanelOpen: false }
+        : { previewDocument: doc }
+    ),
   setWorkspacePanelOpen: (open) =>
-    set(open ? { workspacePanelOpen: true, previewDocument: null } : { workspacePanelOpen: false }),
+    set(
+      open
+        ? { workspacePanelOpen: true, previewDocument: null, computerPanelOpen: false }
+        : { workspacePanelOpen: false }
+    ),
+  setComputerPanelOpen: (open) =>
+    set(
+      open
+        ? { computerPanelOpen: true, previewDocument: null, workspacePanelOpen: false }
+        : { computerPanelOpen: false }
+    ),
   setKbPanelOpen: (open) => set({ kbPanelOpen: open }),
   setPendingAgent: (pendingAgent) => set({ pendingAgent }),
   setPendingDraft: (pendingDraft) => set({ pendingDraft }),

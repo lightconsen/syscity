@@ -300,6 +300,12 @@ async fn launch(
     turn_id: Option<String>,
     checkpoint: Option<crate::computer::run_store::Checkpoint>,
 ) -> Result<StartedRun, WsResponse> {
+    // Record who asked, before anything can report progress: `computer.status`
+    // is served from this state from the first step, and a panel must be able
+    // to tell its conversation's run from another one's before any checkpoint
+    // exists on disk.
+    run.update(|s| s.session_id = session_id.clone()).await;
+
     let adapter = state.tools.computer_adapter.read().await.clone();
     let Some(adapter) = adapter else {
         return Err(WsResponse::err(

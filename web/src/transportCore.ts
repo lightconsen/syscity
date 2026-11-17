@@ -39,6 +39,9 @@ import type {
   EvalDashboardPayload,
   FeedbackOpsPayload,
 } from "./transportTypes";
+// The computer-use mixin's own shapes live with it; the facade
+// (`SyscityWebSocketTransport.ts`) re-exports them for components.
+import type { ComputerStatusAnswer, ComputerRunRecord } from "./transportMixins/computer";
 
 export type * from "./transportTypes";
 export * from "./transportTypes";
@@ -2497,4 +2500,10 @@ export interface SyscityWebSocketTransport {
   triggerUpdate(): Promise<unknown>;
   workspaceList( agentId: string | undefined, path: string ): Promise<{ root: string; path: string; entries: Array<{ name: string; path: string; kind: "dir" | "file"; size: number; modified?: number; }>; }>;
   workspaceRead( agentId: string | undefined, path: string ): Promise<{ path: string; size: number; truncated: boolean; binary: boolean; content?: string; }>;
+  /** One run's live state, or the run list when no id is given. */
+  computerStatus(runId?: string): Promise<ComputerStatusAnswer | null>;
+  /** Runs recorded on disk (survives a gateway restart). */
+  computerRuns(includeFinished?: boolean): Promise<{ runs: ComputerRunRecord[]; interrupted: number; finished: number }>;
+  /** A stored frame as a `data:` URL, or null when the frame is gone. */
+  computerFrameUrl(digest: string): Promise<string | null>;
 }

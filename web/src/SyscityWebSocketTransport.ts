@@ -6,6 +6,7 @@ import { install as installAgents } from "./transportMixins/agents";
 import { install as installApprovals } from "./transportMixins/approvals";
 import { install as installChannels } from "./transportMixins/channels";
 import { install as installCloud } from "./transportMixins/cloud";
+import { install as installComputer } from "./transportMixins/computer";
 import { install as installConfig } from "./transportMixins/config";
 import { install as installConnectors } from "./transportMixins/connectors";
 import { install as installCron } from "./transportMixins/cron";
@@ -25,6 +26,7 @@ installAgents(SyscityWebSocketTransport.prototype);
 installApprovals(SyscityWebSocketTransport.prototype);
 installChannels(SyscityWebSocketTransport.prototype);
 installCloud(SyscityWebSocketTransport.prototype);
+installComputer(SyscityWebSocketTransport.prototype);
 installConfig(SyscityWebSocketTransport.prototype);
 installConnectors(SyscityWebSocketTransport.prototype);
 installCron(SyscityWebSocketTransport.prototype);
@@ -61,3 +63,13 @@ export function getActiveTransport(): SyscityWebSocketTransport | null {
 export { SyscityWebSocketTransport };
 export type * from "./transportTypes";
 export * from "./transportTypes";
+// The computer-use panel's shapes live with its mixin; re-exported here so a
+// component imports the transport and its types from one module.
+export type {
+  ComputerStatusAnswer,
+  ComputerRunRecord,
+  ComputerRunView,
+  ComputerRunStep,
+  ComputerRunSummary,
+  ComputerRunPhase,
+} from "./transportMixins/computer";

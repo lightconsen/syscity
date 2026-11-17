@@ -85,6 +85,13 @@ pub struct RunState {
     pub vision: Option<String>,
     /// The closing message: the goal's result, or why it stopped.
     pub message: Option<String>,
+    /// The conversation that started the run, when there was one.
+    ///
+    /// Set on the live run for the same reason the checkpoint carries it: a
+    /// client showing one conversation's desktop work must not show another's,
+    /// and `computer.status` is the only view that exists before a run writes
+    /// its first checkpoint.
+    pub session_id: Option<String>,
 }
 
 impl Default for RunState {
@@ -102,6 +109,7 @@ impl Default for RunState {
             summary: None,
             vision: None,
             message: None,
+            session_id: None,
         }
     }
 }
@@ -167,6 +175,7 @@ impl ComputerRun {
             "summary": state.summary,
             "vision": state.vision,
             "message": state.message,
+            "session_id": state.session_id,
             "finished": state.phase.is_finished(),
         })
     }
@@ -304,6 +313,20 @@ mod tests {
         assert_eq!(view["finished"], false);
         assert_eq!(view["goal"], "open the calculator");
         assert_eq!(registry.live_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_live_view_names_the_conversation_that_started_the_run() {
+        let registry = ComputerRunRegistry::new();
+        let run = registry.create("r1", "g").await;
+        run.update(|s| s.session_id = Some("s-42".to_string()))
+            .await;
+
+        // `computer.status` is the only view that exists before the first
+        // checkpoint, so a panel filtering live runs needs the same key the
+        // disk record already carries.
+        let view = run.view().await;
+        assert_eq!(view["session_id"], "s-42");
     }
 
     #[tokio::test]

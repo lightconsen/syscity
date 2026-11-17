@@ -255,6 +255,14 @@ impl Checkpoint {
         serde_json::json!({
             "run_id": self.run_id,
             "goal": self.goal,
+            // The conversation and turn this run belongs to, so a client can
+            // show a conversation its own runs after a reload. A run's live
+            // state is in memory and dies with the process; the file is what
+            // is left, and without these two keys a panel reopened tomorrow
+            // could only list every run on the machine — including other
+            // people's sessions on a shared gateway.
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
             "steps_completed": self.completed.len(),
             "next_step": self.next_step(),
             "model_calls": self.model_calls,
@@ -293,6 +301,12 @@ impl Checkpoint {
                         "after_ref": s.screenshot_ref,
                         "sensitive": s.sensitive,
                         "rung": s.rung.map(|r| r.rung_name()),
+                        // What the adapter established about the screen's
+                        // response. A client drawing a step as "done" when the
+                        // adapter reported `refused` would be showing the
+                        // opposite of what happened — the same reason the live
+                        // event carries it.
+                        "effect": s.effect.map(|e| e.as_str()),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -836,6 +850,46 @@ mod tests {
         let mut cp = checkpoint("r1");
         cp.completed[0].sensitive = true;
         assert_eq!(cp.sensitive_steps(), 1);
+    }
+
+    /// A panel reopened after a restart has only the file to go on, so the file
+    /// has to say which conversation the run belongs to. Without these keys the
+    /// listing can only answer "every run on this machine", which on a shared
+    /// gateway is other people's sessions too.
+    #[test]
+    fn a_saved_run_names_the_conversation_and_turn_it_belongs_to() {
+        let mut cp = checkpoint("r1");
+        cp.session_id = Some("s-42".to_string());
+        cp.turn_id = Some("t-7".to_string());
+
+        let view = cp.view();
+        assert_eq!(view["session_id"], "s-42");
+        assert_eq!(view["turn_id"], "t-7");
+    }
+
+    /// A run started outside a turn has neither, and the view must say so with
+    /// a missing value rather than an empty string — "" is a session id that
+    /// no conversation has, and a client filtering on it would silently match
+    /// nothing while looking like it matched something.
+    #[test]
+    fn a_run_outside_a_turn_has_no_conversation_to_name() {
+        let view = checkpoint("r1").view();
+        assert!(view["session_id"].is_null());
+        assert!(view["turn_id"].is_null());
+    }
+
+    /// The step list a listing draws carries what the adapter established, not
+    /// only whether a verification passed: `refused` and `suspected_noop` both
+    /// read as "not verified", and a panel that showed them the same way would
+    /// hide the one fact that says "change the request, don't retry".
+    #[test]
+    fn each_saved_step_carries_what_the_adapter_established() {
+        let mut cp = checkpoint("r1");
+        cp.completed[0].effect = Some(crate::computer::types::ActionEffect::Refused);
+
+        let step = &cp.view()["steps"][0];
+        assert_eq!(step["effect"], "refused");
+        assert_eq!(step["rung"], "ax_action", "the rung travels with it");
     }
 
     #[tokio::test]
