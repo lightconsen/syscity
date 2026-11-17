@@ -42,6 +42,9 @@ fn tool_context() -> ToolContext {
         steers: None,
         trace: None,
         tiering: None,
+        // The browser tools need no desktop approval, so there is nothing to
+        // inherit here; the field exists for tools that drive the desktop.
+        desktop_grant: None,
     }
 }
 

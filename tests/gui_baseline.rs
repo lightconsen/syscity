@@ -53,6 +53,9 @@ fn tool_context(conversation: &str) -> ToolContext {
         steers: None,
         trace: None,
         tiering: None,
+        // The page rung works through the browser tool, not the desktop
+        // adapter, so no desktop approval is carried.
+        desktop_grant: None,
     }
 }
 

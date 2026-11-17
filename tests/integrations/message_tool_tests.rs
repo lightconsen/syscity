@@ -207,6 +207,11 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             computer_adapter: Arc::new(tokio::sync::RwLock::new(None)),
             computer_runs: Arc::new(syscity::computer::run_registry::ComputerRunRegistry::new()),
             computer_recording: Arc::new(syscity::planner::workflow::Recording::new()),
+            // No recording is capturing video and nobody is watching the
+            // screen: this fixture exercises the message tool, not the
+            // desktop.
+            computer_recording_video: Arc::new(tokio::sync::RwLock::new(None)),
+            computer_watches: Arc::new(syscity::computer::watch_registry::WatchRegistry::default()),
             computer_allow_apps: Arc::new(syscity::computer::app_scope::AppAllowlist::default()),
             planner_handle: Arc::new(std::sync::RwLock::new(None)),
         },

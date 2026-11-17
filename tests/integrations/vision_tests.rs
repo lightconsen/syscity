@@ -55,6 +55,7 @@ fn make_test_screenshot(img: &DynamicImage) -> syscity::computer::types::Screens
         .expect("PNG encoding should succeed");
     let base64 = base64::engine::general_purpose::STANDARD.encode(&buf.into_inner());
     syscity::computer::types::Screenshot {
+        digest: syscity::computer::types::digest_of_base64(&base64),
         base64,
         width,
         height,
