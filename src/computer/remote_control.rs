@@ -173,6 +173,126 @@ pub fn ssh_option_args(port: u16, key_path: Option<&str>, extra_args: &[String])
     args
 }
 
+/// The remote `screencapture` argument list, with the region in it.
+///
+/// `screencapture -R x,y,w,h` takes logical screen coordinates and grabs that
+/// rectangle; without it the command captures every display. The two are not
+/// interchangeable: a caller that asked for a region and got the whole screen
+/// gets a picture of the wrong thing, and cannot tell from the result.
+fn macos_screenshot_args(region: Option<Rect>) -> Vec<String> {
+    let mut args: Vec<String> = ["-x", "-t", "png"].iter().map(|s| s.to_string()).collect();
+    if let Some(r) = region {
+        args.push("-R".to_string());
+        args.push(format!("{},{},{},{}", r.x, r.y, r.width, r.height));
+    }
+    // The trailing `-` is "write to stdout", which the SSH pipe reads.
+    args.push("-".to_string());
+    args
+}
+
+/// The PowerShell that captures the remote Windows screen, cropped to `region`.
+///
+/// `CopyFromScreen(sourceOrigin, destinationOrigin, blockRegionSize)` — the
+/// first argument is what makes a region possible. The uncropped form captured
+/// `PrimaryScreen.Bounds` from `Empty`, which is the same call with a fixed
+/// origin, so passing the region costs nothing but the two coordinates.
+///
+/// The origin is the region's own top-left, and the block is its size, so the
+/// bitmap is the requested rectangle and not the screen it was cut from.
+///
+/// `SetProcessDPIAware` is not decoration: the coordinates a region carries
+/// come from the UI Automation tree, which reports **physical** pixels, while a
+/// DPI-unaware PowerShell has `CopyFromScreen` and `PrimaryScreen.Bounds`
+/// virtualised for the session's scale factor. Without it, a region capture on
+/// a scaled display crops the wrong pixels and a full-screen capture returns a
+/// scaled-down bitmap.
+fn windows_screenshot_script(region: Option<Rect>) -> String {
+    let (origin, size) = match region {
+        Some(r) => (
+            format!("New-Object System.Drawing.Point({}, {})", r.x, r.y),
+            format!("New-Object System.Drawing.Size({}, {})", r.width, r.height),
+        ),
+        None => ("[System.Drawing.Point]::Empty".to_string(), "$screen.Size".to_string()),
+    };
+    // A full-screen capture keeps its existing shape: the screen's own bounds
+    // are the block. A region supplies both the origin and the size.
+    let bounds = if region.is_some() {
+        String::new()
+    } else {
+        "$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\n".to_string()
+    };
+    format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class SCDpi {{
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}}
+'@
+[SCDpi]::SetProcessDPIAware() | Out-Null
+{bounds}$origin = {origin}
+$size = {size}
+$bitmap = New-Object System.Drawing.Bitmap($size.Width, $size.Height)
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($origin, [System.Drawing.Point]::Empty, $size)
+$ms = New-Object System.IO.MemoryStream
+$bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+[System.Convert]::ToBase64String($ms.ToArray())
+"#
+    )
+}
+
+/// The remote Linux screenshot arguments for one tool, with the region in it.
+///
+/// The three tools are not interchangeable, and only one of them can be told a
+/// rectangle on the command line:
+///
+/// - `scrot -a X,Y,W,H FILE` — explicitly "non-interactively choose a
+///   rectangle" (scrot(1)), with `FILE` of `-` meaning stdout;
+/// - `gnome-screenshot -a` — the `-a` flag opens the *interactive* area
+///   selector. It takes no rectangle, so over SSH it waits for a mouse drag
+///   that never comes and the whole capture hangs. Its arguments therefore
+///   never carry the region, and [`screenshot_linux`] will not try it when one
+///   was asked for;
+/// - ImageMagick's `import` — selects the *window under the pointer* and waits
+///   for a click unless told otherwise, so it needs `-window root` to capture
+///   non-interactively. The rectangle then comes from `-crop WxH+X+Y`; the
+///   output file is the last argument.
+fn linux_screenshot_args(tool: &str, region: Option<Rect>) -> Vec<String> {
+    match tool {
+        "scrot" => {
+            let mut args = Vec::new();
+            if let Some(r) = region {
+                args.push("-a".to_string());
+                args.push(format!("{},{},{},{}", r.x, r.y, r.width, r.height));
+            }
+            args.push("-".to_string());
+            args
+        }
+        "gnome-screenshot" => vec!["-f".to_string(), "/dev/stdout".to_string()],
+        _ => {
+            let mut args = vec!["-window".to_string(), "root".to_string()];
+            if let Some(r) = region {
+                args.push("-crop".to_string());
+                args.push(format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y));
+            }
+            args.push("png:-".to_string());
+            args
+        }
+    }
+}
+
+/// Whether this tool can be told an exact rectangle without asking a person.
+///
+/// `gnome-screenshot -a` only opens a drag-select box, so a region capture must
+/// skip it rather than hang the SSH session waiting for a mouse.
+fn linux_tool_takes_a_region(tool: &str) -> bool {
+    tool != "gnome-screenshot"
+}
+
 impl RemoteControlAdapter {
     /// Create a new remote control adapter.
     ///
@@ -282,31 +402,23 @@ impl RemoteControlAdapter {
     // ── Screenshot helpers per OS ─────────────────────────────────────────
 
     async fn screenshot_linux(&self, region: Option<Rect>) -> Result<Screenshot> {
-        let _args: Vec<String> = Vec::new();
+        // Try gnome-screenshot first, then scrot, then import. Only scrot and
+        // import can be told a rectangle; `gnome-screenshot -a` opens a
+        // drag-select and would wait forever for a mouse that SSH cannot
+        // provide, so a region capture skips it — see [`linux_screenshot_args`]
+        // and [`linux_tool_takes_a_region`].
+        const TOOLS: [&str; 3] = ["gnome-screenshot", "scrot", "import"];
 
-        // Try gnome-screenshot first, then scrot, then import
-        let tools = [
-            ("gnome-screenshot", vec!["-f", "/dev/stdout"]),
-            ("scrot", vec!["-"]),
-            ("import", vec!["png:-"]),
-        ];
+        for tool in TOOLS {
+            if region.is_some() && !linux_tool_takes_a_region(tool) {
+                continue;
+            }
 
-        for (tool, tool_args) in &tools {
             let mut ssh = self.ssh_cmd();
             if let Some(ref display) = self.config.display {
                 ssh.env("DISPLAY", display);
             }
-
-            if tool == &"import" {
-                if let Some(r) = region {
-                    let crop = format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y);
-                    ssh.arg(tool).args(tool_args).arg(&crop);
-                } else {
-                    ssh.arg(tool).args(tool_args);
-                }
-            } else {
-                ssh.arg(tool).args(tool_args);
-            }
+            ssh.args(linux_screenshot_args(tool, region));
 
             ssh.stdout(Stdio::piped());
             ssh.stderr(Stdio::piped());
@@ -364,13 +476,10 @@ impl RemoteControlAdapter {
         ))
     }
 
-    async fn screenshot_macos(&self, _region: Option<Rect>) -> Result<Screenshot> {
+    async fn screenshot_macos(&self, region: Option<Rect>) -> Result<Screenshot> {
         let mut ssh = self.ssh_cmd();
         ssh.arg("screencapture")
-            .arg("-x") // no sound
-            .arg("-t")
-            .arg("png")
-            .arg("-")
+            .args(macos_screenshot_args(region))
             .stdout(Stdio::piped());
 
         let output = ssh.output().await.map_err(|e| {
@@ -420,22 +529,11 @@ impl RemoteControlAdapter {
         Ok(Screenshot::new(base64, width, height))
     }
 
-    async fn screenshot_windows(&self, _region: Option<Rect>) -> Result<Screenshot> {
-        // PowerShell + .NET for screenshot capture
-        let ps = r#"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-$bitmap = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
-$ms = New-Object System.IO.MemoryStream
-$bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-[System.Convert]::ToBase64String($ms.ToArray())
-"#;
+    async fn screenshot_windows(&self, region: Option<Rect>) -> Result<Screenshot> {
+        let ps = windows_screenshot_script(region);
 
         let output = self
-            .run_remote("powershell", &["-Command", ps])
+            .run_remote("powershell", &["-Command", &ps])
             .await
             .map_err(|e| {
                 ComputerError::ScreenshotFailed(format!(
@@ -1186,5 +1284,152 @@ mod tests {
         // We can't inspect the Command easily, but at least we verified it doesn't
         // panic
         let _ = cmd;
+    }
+
+    // ── Region handling ────────────────────────────────────────────────────
+    //
+    // A screenshot is the one thing a "remote help" feature is for, and a
+    // region that is silently dropped returns a picture of the whole screen
+    // that looks like a success. Each platform names its rectangle
+    // differently, so each gets its own assertion rather than one shared
+    // "contains the numbers" check.
+
+    const REGION: Rect = Rect {
+        x: 120,
+        y: 60,
+        width: 640,
+        height: 480,
+    };
+
+    #[test]
+    fn macos_screenshot_region_uses_screencapture_r() {
+        let argv = macos_screenshot_args(Some(REGION));
+        let args = argv.join(" ");
+        assert!(
+            args.contains("-R 120,60,640,480"),
+            "screencapture takes the rectangle after -R: {args}"
+        );
+        // Still writing to the pipe, and still silent. Checked as tokens: `-x`
+        // is the first flag, so a padded substring match would never see it.
+        assert!(argv.iter().any(|a| a == "-x"), "must not play a sound: {args}");
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-t" && w[1] == "png"),
+            "must ask for PNG: {args}"
+        );
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "must write to stdout: {args}");
+    }
+
+    #[test]
+    fn macos_screenshot_without_a_region_captures_everything() {
+        let args = macos_screenshot_args(None).join(" ");
+        assert!(!args.contains("-R"), "no region means every display, not a crop of one: {args}");
+    }
+
+    #[test]
+    fn windows_screenshot_region_moves_the_copy_origin() {
+        let script = windows_screenshot_script(Some(REGION));
+        assert!(
+            script.contains("New-Object System.Drawing.Point(120, 60)"),
+            "the region's top-left is the copy origin: {script}"
+        );
+        assert!(
+            script.contains("New-Object System.Drawing.Size(640, 480)"),
+            "the block is the region's size: {script}"
+        );
+        // A region is a small bitmap, so the full screen must not be measured
+        // and used instead — that is how the region got dropped before.
+        assert!(
+            !script.contains("$screen"),
+            "a region must not fall back to the primary screen's bounds: {script}"
+        );
+        // The origin must be a variable, not `::Empty`, or the crop starts at
+        // the top-left of the screen whichever rectangle was asked for.
+        assert!(
+            !script.contains("CopyFromScreen([System.Drawing.Point]::Empty"),
+            "the source origin must not be pinned to Empty: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_screenshot_without_a_region_keeps_the_whole_screen() {
+        let script = windows_screenshot_script(None);
+        assert!(script.contains("PrimaryScreen.Bounds"));
+        assert!(script.contains("[System.Drawing.Point]::Empty"));
+        assert!(script.contains("$screen.Size"));
+    }
+
+    /// A region's numbers come from the UI Automation tree, which is in physical
+    /// pixels; a DPI-unaware process sees a virtualised screen. Without the
+    /// call, the crop offsets by the scale factor on any scaled display.
+    #[test]
+    fn windows_screenshot_is_dpi_aware() {
+        for region in [Some(REGION), None] {
+            let script = windows_screenshot_script(region);
+            assert!(
+                script.contains("[SCDpi]::SetProcessDPIAware()"),
+                "the capture must not be virtualised by the display scale: {script}"
+            );
+        }
+    }
+
+    /// The two Linux tools that can be told a rectangle get it, each in its own
+    /// syntax. The bug this closes: only `import` was given the rectangle, and
+    /// it is the third choice, so a host with `scrot` answered with the whole
+    /// screen.
+    #[test]
+    fn the_linux_tools_that_can_take_a_region_are_told_it() {
+        // scrot's `-a` is documented as "non-interactively choose a rectangle".
+        let args = linux_screenshot_args("scrot", Some(REGION)).join(" ");
+        assert!(args.contains("-a 120,60,640,480"), "scrot: {args}");
+        assert!(args.ends_with(" -"), "scrot reads its file from the last argument: {args}");
+
+        // import names the rectangle with `-crop WxH+X+Y`, and must say
+        // `-window root` or it waits for a click on the window under the
+        // pointer — which over SSH is a hang, not a capture.
+        let args = linux_screenshot_args("import", Some(REGION)).join(" ");
+        assert!(args.contains("-crop 640x480+120+60"), "import: {args}");
+        assert!(args.contains("-window root"), "import must not wait for a click: {args}");
+        assert!(args.ends_with(" png:-"), "import writes to stdout: {args}");
+    }
+
+    /// `gnome-screenshot -a` is the interactive drag-select, so a region must
+    /// skip it. Handing it `-a` plus a rectangle would send a flag it cannot
+    /// parse, and handing it bare `-a` would hang the SSH session on a mouse
+    /// drag that no one is there to perform.
+    #[test]
+    fn gnome_screenshot_is_skipped_when_a_region_is_asked_for() {
+        assert!(!linux_tool_takes_a_region("gnome-screenshot"));
+        assert!(linux_tool_takes_a_region("scrot"));
+        assert!(linux_tool_takes_a_region("import"));
+
+        // Its argument list never carries the region, so it cannot be the
+        // accidental answer to a region request.
+        let args = linux_screenshot_args("gnome-screenshot", Some(REGION)).join(" ");
+        assert!(!args.contains("-a"), "no interactive selector: {args}");
+        assert!(!args.contains("120,60,640,480"), "it takes no rectangle: {args}");
+    }
+
+    /// Each tool still does its own job when no region was asked for: this is
+    /// the call the common case makes, and a stray crop would cut it.
+    #[test]
+    fn linux_screenshot_without_a_region_asks_for_none() {
+        for tool in ["gnome-screenshot", "scrot", "import"] {
+            let args = linux_screenshot_args(tool, None).join(" ");
+            assert!(!args.contains("-a "), "{tool} must not crop: {args}");
+            assert!(!args.contains("-crop"), "{tool} must not crop: {args}");
+        }
+        // Every tool still names a destination.
+        assert!(linux_screenshot_args("gnome-screenshot", None)
+            .join(" ")
+            .contains("/dev/stdout"));
+        assert_eq!(linux_screenshot_args("scrot", None), vec!["-".to_string()]);
+        assert_eq!(
+            linux_screenshot_args("import", None),
+            vec![
+                "-window".to_string(),
+                "root".to_string(),
+                "png:-".to_string()
+            ]
+        );
     }
 }
