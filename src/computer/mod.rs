@@ -102,6 +102,16 @@ pub enum ComputerError {
     UnsupportedPlatform(String),
     #[error("No GUI/display server available")]
     NoDisplay,
+    /// The capture worked and the screen holds nothing.
+    ///
+    /// Distinct from [`ComputerError::ScreenshotFailed`] — the tool ran — and
+    /// from [`ComputerError::NoDisplay`] — a display answered. What it said was
+    /// one flat colour, which on a remote host is what a machine that is up but
+    /// has nobody logged in looks like: the X server is running, the framebuffer
+    /// is black, and every action aimed at it lands on nothing. Returning that
+    /// frame as a success is how a run confidently clicks an empty screen.
+    #[error("The screen is blank: {0}")]
+    BlankScreen(String),
     #[error("Accessibility permission not granted")]
     AccessibilityDenied,
     #[error("Background input is not available: {0}")]

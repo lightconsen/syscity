@@ -315,7 +315,15 @@ impl ModelDriver {
             &std::collections::HashMap::new(),
         );
         wire.push_str(&outline.text);
-        if let Some(reason) = ctx.tree_read_failed.as_deref() {
+        if let Some(reason) = state.capture_error.as_deref() {
+            // Say exactly this, not "the screen is empty": the capture failed,
+            // so nothing here is a report about the desktop. A model that
+            // mistook a failed look for a blank screen would plan against it.
+            wire.push_str(&format!(
+                "(the screen could NOT be captured: {reason}. No screenshot from this step \
+                 describes the desktop. Answer `help` if the goal needs the screen.)\n"
+            ));
+        } else if let Some(reason) = ctx.tree_read_failed.as_deref() {
             // Not "an element you cannot see may still exist" — that is advice
             // for a tree that was cut. Here nothing was read at all, and the
             // ways forward are a screenshot or screen coordinates.
@@ -860,6 +868,7 @@ mod tests {
             step: 0,
             goal: "Open the calculator and compute 17 × 23".to_string(),
             screenshot: screenshot(),
+            capture_error: None,
             history: vec![],
             last_verified: None,
             last_error: None,
@@ -974,6 +983,34 @@ mod tests {
         // It is still a reason to attach the picture — nothing else describes
         // the screen.
         assert!(user.contains("could not be read"), "{user}");
+    }
+
+    /// A capture that failed is a fact about the look, not about the screen.
+    ///
+    /// Before this the loop answered a failed capture with an empty
+    /// placeholder, and the prompt showed an empty tree — which reads as "the
+    /// desktop has nothing on it". A model acting on that clicks into the
+    /// dark. The reason is what lets it say "I cannot look".
+    #[test]
+    fn a_failed_capture_is_reported_as_one() {
+        let mut s = state();
+        s.capture_error =
+            Some("The screen is blank: no desktop session is drawing on it".to_string());
+        let (_system, user) = driver().render_prompt(&s, &ctx(true));
+        assert!(user.contains("could NOT be captured"), "{user}");
+        assert!(user.contains("no desktop session is drawing"), "{user}");
+        assert!(
+            user.contains("Answer `help`"),
+            "an unseeable screen is a reason to hand back, not to guess: {user}"
+        );
+    }
+
+    /// With a capture in hand the note must not appear — a stale warning would
+    /// train the model to ignore it.
+    #[test]
+    fn a_successful_capture_says_nothing_about_failure() {
+        let (_system, user) = driver().render_prompt(&state(), &ctx(true));
+        assert!(!user.contains("could NOT be captured"), "{user}");
     }
 
     #[test]

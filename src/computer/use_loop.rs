@@ -88,6 +88,16 @@ pub struct LoopState {
     pub goal: String,
     /// The most recent screenshot.
     pub screenshot: Screenshot,
+    /// Why the capture is empty, when it is.
+    ///
+    /// A screen that could not be captured is not a screen with nothing on it.
+    /// The loop used to answer both with an empty placeholder `Screenshot`, so
+    /// a host whose display is blank — a remote machine with nobody logged in,
+    /// a locked session — was reported to the model as an empty screen, which
+    /// is a claim about the world rather than about the capture. The reason is
+    /// carried here so the decision can say "I could not look", and the run
+    /// stops as `NeedHelp` instead of clicking into the dark.
+    pub capture_error: Option<String>,
     /// All previously executed steps.
     pub history: Vec<StepRecord>,
     /// Whether the previous step verified successfully.
@@ -359,14 +369,24 @@ impl ComputerUseLoop {
                 });
             }
 
-            // 1. Perceive — capture screenshot (fallback on headless).
-            let screenshot = self.fallback_screenshot().await;
+            // 1. Perceive — capture screenshot. A capture that failed is not
+            //    an empty screen: carry the reason and let the decision maker
+            //    answer "I cannot look" instead of planning on a blank frame.
+            let (screenshot, capture_error) =
+                match self.adapter.screenshot(self.config.screenshot_region).await {
+                    Ok(shot) => (shot, None),
+                    Err(e) => {
+                        tracing::warn!("screen capture failed: {e}");
+                        (Screenshot::new(String::new(), 0, 0), Some(e.to_string()))
+                    }
+                };
 
             // 2. Plan — ask the decision maker what to do.
             let state = LoopState {
                 step,
                 goal: goal.to_string(),
                 screenshot: screenshot.clone(),
+                capture_error: capture_error.clone(),
                 history: history.clone(),
                 last_verified,
                 last_error: last_error.clone(),
@@ -510,6 +530,7 @@ mod tests {
             step: 0,
             goal: "test".to_string(),
             screenshot: Screenshot::new(String::new(), 100, 100),
+            capture_error: None,
             history: vec![],
             last_verified: None,
             last_error: None,
@@ -601,6 +622,73 @@ mod tests {
 
         let undone = loop_.undo_last_step().await.unwrap();
         assert!(!undone);
+    }
+
+    /// An adapter that cannot capture must not look like an adapter that
+    /// captured an empty screen. The decision maker is handed the reason, and
+    /// can stop the run instead of planning against a blank frame.
+    #[tokio::test]
+    async fn a_failed_capture_reaches_the_decision_maker() {
+        use crate::computer::ComputerError;
+
+        /// Every capture fails; nothing else is reachable.
+        struct BlindAdapter;
+
+        #[async_trait::async_trait]
+        impl crate::computer::ComputerAdapter for BlindAdapter {
+            async fn screenshot(
+                &self,
+                _region: Option<crate::computer::Rect>,
+            ) -> crate::computer::Result<Screenshot> {
+                Err(ComputerError::BlankScreen("no desktop session is drawing on it".to_string()))
+            }
+
+            async fn read_ui_tree(
+                &self,
+                _app: Option<&str>,
+            ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+                Ok(Vec::new())
+            }
+
+            async fn execute(
+                &self,
+                _action: crate::computer::DesktopAction,
+            ) -> crate::computer::Result<crate::computer::ActionResult> {
+                Err(ComputerError::NoDisplay)
+            }
+
+            async fn wait_for(
+                &self,
+                _condition: crate::computer::WaitCondition,
+                _timeout: std::time::Duration,
+            ) -> crate::computer::Result<bool> {
+                Ok(true)
+            }
+        }
+
+        let loop_ = ComputerUseLoop::new(Arc::new(BlindAdapter));
+        let mut seen = None;
+
+        let result = loop_
+            .run("open the calculator", |state| {
+                seen = state.capture_error.clone();
+                async {
+                    // The model says "I cannot look", which is what a real one
+                    // should be told to do.
+                    Ok(LoopDecision::NeedHelp {
+                        reason: "the screen could not be captured".to_string(),
+                    })
+                }
+            })
+            .await
+            .expect("the loop returns a result rather than panicking");
+
+        assert!(!result.success);
+        let reason = seen.expect("the decision maker was told why the capture is empty");
+        assert!(
+            reason.contains("no desktop session is drawing"),
+            "the reason must survive to the decision: {reason}"
+        );
     }
 
     #[test]

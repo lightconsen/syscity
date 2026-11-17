@@ -100,11 +100,18 @@ pub async fn init_computer_adapter(
                 return Some(Arc::new(adapter));
             }
             Err(e) => {
+                // No local fallback. The user named a host; acting on *this*
+                // machine instead would run every desktop action — clicks,
+                // typing, process kills — against the wrong computer while
+                // reporting the configured one. A remote target that cannot be
+                // reached leaves the gateway without a desktop adapter, which
+                // the computer tools refuse, and says why once here.
                 warn!(
-                    "Failed to connect remote control adapter to {}: {}. Falling back to local \
-                     adapter.",
-                    host, e
+                    "Remote control adapter for {host} could not connect: {e}. Desktop automation \
+                     is disabled — no local fallback is used when a remote host is configured, \
+                     because acting locally would be acting on the wrong machine."
                 );
+                return None;
             }
         }
     }

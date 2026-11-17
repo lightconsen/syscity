@@ -1892,6 +1892,10 @@ fn refusal_recovery(error: &ComputerError) -> Option<&'static str> {
         ComputerError::NoDisplay => {
             Some("no display is available; desktop actions cannot run until one is")
         }
+        ComputerError::BlankScreen(_) => Some(
+            "the screen is blank — nobody is logged in to the remote desktop, or the session is \
+             locked. A desktop has to be open for actions to land anywhere",
+        ),
         ComputerError::BackgroundInputUnavailable(_) => Some(
             "this action cannot be delivered without the foreground — target an element the \
              accessibility tree can act on, use the page rung, or ask for foreground input",

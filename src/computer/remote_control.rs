@@ -173,6 +173,52 @@ pub fn ssh_option_args(port: u16, key_path: Option<&str>, extra_args: &[String])
     args
 }
 
+/// How to name the remote display so the command on the *other* side sees it.
+///
+/// `Command::env` sets the local `ssh` client's environment, which reaches the
+/// remote shell only if the server's `sshd_config` has the name in
+/// `AcceptEnv` — Debian and Ubuntu ship `AcceptEnv LANG LC_*`, so `DISPLAY` is
+/// silently dropped and an X tool would talk to whatever display the server
+/// chose, or to none. Prefixing the remote command is unconditional: the
+/// remote shell sets `DISPLAY` itself, and no server configuration is involved.
+///
+/// Quoted because `display` comes from configuration and is interpolated into
+/// a shell string; a value containing a space or `;` must not become a second
+/// command.
+fn remote_display_prefix(display: Option<&str>) -> Option<String> {
+    let display = display?.trim();
+    if display.is_empty() {
+        return None;
+    }
+    Some(format!("DISPLAY={}", shell_word(display)))
+}
+
+/// Wrap a remote command line so the display is set on the far side.
+#[allow(dead_code)] // kept as the readable form; `run_remote` builds its line directly
+fn with_remote_display(command: &str, display: Option<&str>) -> String {
+    match remote_display_prefix(display) {
+        Some(prefix) => format!("{prefix} {command}"),
+        None => command.to_string(),
+    }
+}
+
+/// Quote one word for the remote shell.
+///
+/// ssh joins its arguments into a single string the remote shell parses, so an
+/// argument with a space (a PowerShell script, a path with spaces) would be
+/// split into several. Single quotes keep everything literal; an embedded
+/// quote is closed, escaped and reopened (`'` → `'\''`).
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+%^".contains(c))
+    {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
 /// The remote `screencapture` argument list, with the region in it.
 ///
 /// `screencapture -R x,y,w,h` takes logical screen coordinates and grabs that
@@ -293,6 +339,32 @@ fn linux_tool_takes_a_region(tool: &str) -> bool {
     tool != "gnome-screenshot"
 }
 
+/// Whether a decoded capture holds no content at all.
+///
+/// "Blank" is one flat colour across the whole frame — the shape a machine
+/// looks like when the X server or the desktop session is up but nobody is
+/// logged in. It is deliberately **not** "mostly dark": a video player, a dark
+/// theme, or a full-screen image can be nearly black and perfectly real, and
+/// refusing those would make this check a bug of its own. Only a single
+/// uniform colour, which no usable desktop ever is, counts.
+///
+/// Every pixel is read, not a sample. The alternative was measured first and
+/// is unsafe: a coarse grid misses thin content, so a real screen with one
+/// bright cursor-line would be reported blank and refused — a false refusal is
+/// worse than the cost of one pass over a decoded frame that was just decoded
+/// anyway.
+#[cfg(feature = "image")]
+fn is_blank_frame(img: &image::DynamicImage) -> bool {
+    let img = img.to_rgb8();
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return true;
+    }
+
+    let first = img.get_pixel(0, 0);
+    img.pixels().all(|pixel| pixel == first)
+}
+
 impl RemoteControlAdapter {
     /// Create a new remote control adapter.
     ///
@@ -373,13 +445,39 @@ impl RemoteControlAdapter {
     }
 
     /// Run a command on the remote host via SSH.
+    ///
+    /// The display is set with a prefix on the *remote* command, not with
+    /// `Command::env`: the latter sets this process's environment for the ssh
+    /// client, which forwards nothing unless the server's `AcceptEnv` names the
+    /// variable, and Debian/Ubuntu name only `LANG LC_*`. See
+    /// [`remote_display_prefix`].
+    ///
+    /// The whole call is bounded by `connect_timeout`, because the one failure
+    /// this adapter cannot otherwise survive is a remote tool that *waits* — a
+    /// selector dialog, a missing auth cookie prompting for a password — and
+    /// never returns. `ConnectTimeout` only bounds establishing the connection.
     async fn run_remote(&self, cmd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
         let mut ssh = self.ssh_cmd();
-        ssh.arg(cmd).args(args);
-        if let Some(ref display) = self.config.display {
-            ssh.env("DISPLAY", display);
+        let mut line = String::new();
+        if let Some(prefix) = remote_display_prefix(self.config.display.as_deref()) {
+            line.push_str(&prefix);
+            line.push(' ');
         }
-        ssh.output().await
+        line.push_str(&shell_word(cmd));
+        for arg in args {
+            line.push(' ');
+            line.push_str(&shell_word(arg));
+        }
+        ssh.arg(&line);
+
+        let timeout = self.config.connect_timeout;
+        match tokio::time::timeout(timeout, ssh.output()).await {
+            Ok(output) => output,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("remote command `{cmd}` did not finish within {timeout:?}"),
+            )),
+        }
     }
 
     /// Run a command and return stdout as string.
@@ -414,21 +512,16 @@ impl RemoteControlAdapter {
                 continue;
             }
 
-            let mut ssh = self.ssh_cmd();
-            if let Some(ref display) = self.config.display {
-                ssh.env("DISPLAY", display);
-            }
-            ssh.args(linux_screenshot_args(tool, region));
-
-            ssh.stdout(Stdio::piped());
-            ssh.stderr(Stdio::piped());
-
-            let output = ssh.output().await.map_err(|e| {
-                ComputerError::ScreenshotFailed(format!(
-                    "Failed to run remote screenshot tool {}: {}",
-                    tool, e
-                ))
-            })?;
+            let tool_args = linux_screenshot_args(tool, region);
+            let output = self
+                .run_remote(tool, &tool_args.iter().map(String::as_str).collect::<Vec<_>>())
+                .await
+                .map_err(|e| {
+                    ComputerError::ScreenshotFailed(format!(
+                        "Failed to run remote screenshot tool {}: {}",
+                        tool, e
+                    ))
+                })?;
 
             if output.status.success() && !output.stdout.is_empty() {
                 let raw_bytes = output.stdout;
@@ -455,36 +548,53 @@ impl RemoteControlAdapter {
                     }
                 }
 
+                #[cfg(feature = "image")]
+                let (width, height, blank) = if let Ok(img) = image::load_from_memory(&final_bytes)
+                {
+                    let blank = is_blank_frame(&img);
+                    (img.width(), img.height(), blank)
+                } else {
+                    (0, 0, false)
+                };
+                #[cfg(not(feature = "image"))]
+                let (width, height, blank) = (0, 0, false);
+
+                if blank {
+                    return Err(ComputerError::BlankScreen(format!(
+                        "{} on {} returned a single flat colour ({}x{}); the display is up but \
+                         no desktop session is drawing on it",
+                        tool, self.config.host, width, height
+                    )));
+                }
+
                 let base64 = base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
                     &final_bytes,
                 );
-                #[cfg(feature = "image")]
-                let (width, height) = if let Ok(img) = image::load_from_memory(&final_bytes) {
-                    (img.width(), img.height())
-                } else {
-                    (0, 0)
-                };
-                #[cfg(not(feature = "image"))]
-                let (width, height) = (0, 0);
                 return Ok(Screenshot::new(base64, width, height));
             }
         }
 
-        Err(ComputerError::ScreenshotFailed(
-            "All remote screenshot tools failed on Linux host".to_string(),
-        ))
+        Err(ComputerError::ScreenshotFailed(format!(
+            "All remote screenshot tools failed on Linux host {} (tried {}, and the region was \
+             requested: {})",
+            self.config.host,
+            TOOLS.join(", "),
+            region.is_some()
+        )))
     }
 
     async fn screenshot_macos(&self, region: Option<Rect>) -> Result<Screenshot> {
-        let mut ssh = self.ssh_cmd();
-        ssh.arg("screencapture")
-            .args(macos_screenshot_args(region))
-            .stdout(Stdio::piped());
-
-        let output = ssh.output().await.map_err(|e| {
-            ComputerError::ScreenshotFailed(format!("screencapture failed on remote macOS: {}", e))
-        })?;
+        let args = macos_screenshot_args(region);
+        let output = self
+            .run_remote("screencapture", &args.iter().map(String::as_str).collect::<Vec<_>>())
+            .await
+            .map_err(|e| {
+                ComputerError::ScreenshotFailed(format!(
+                    "screencapture failed on remote macOS: {}",
+                    e
+                ))
+            })?;
 
         if !output.status.success() || output.stdout.is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -518,10 +628,23 @@ impl RemoteControlAdapter {
         let base64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &final_bytes);
         #[cfg(feature = "image")]
-        let (width, height) = if let Ok(img) = image::load_from_memory(&final_bytes) {
-            (img.width(), img.height())
-        } else {
-            (0, 0)
+        let (width, height) = {
+            match image::load_from_memory(&final_bytes) {
+                Ok(img) => {
+                    if is_blank_frame(&img) {
+                        return Err(ComputerError::BlankScreen(format!(
+                            "screencapture on {} returned a single flat colour ({}x{}); the \
+                             display is up but no desktop session is drawing on it (locked, or \
+                             nobody logged in)",
+                            self.config.host,
+                            img.width(),
+                            img.height()
+                        )));
+                    }
+                    (img.width(), img.height())
+                }
+                Err(_) => (0, 0),
+            }
         };
         #[cfg(not(feature = "image"))]
         let (width, height) = (0, 0);
@@ -884,7 +1007,12 @@ except Exception as e:
         }
 
         warn!("No accessible UI tree tools found on remote Linux (try installing python3-pyatspi)");
-        Ok(Vec::new())
+        Err(ComputerError::UnsupportedPlatform(format!(
+            "cannot read the accessibility tree on remote Linux host {}: `python3` with pyatspi \
+             (install python3-pyatspi) and `wmctrl` both returned nothing. A missing tree is not \
+             an empty screen — actions that name an element cannot be aimed without one",
+            self.config.host
+        )))
     }
 
     /// Read the UI tree of the remote Windows host via PowerShell UIAutomation.
@@ -969,7 +1097,12 @@ Dump-Tree $desktop 0
         }
 
         warn!("PowerShell UIAutomation failed on remote Windows (may require .NET Framework)");
-        Ok(Vec::new())
+        Err(ComputerError::UnsupportedPlatform(format!(
+            "cannot read the accessibility tree on remote Windows host {}: the UIAutomation \
+             script returned no elements. Either .NET UIAutomation is unavailable, or the SSH \
+             session is in Windows' non-interactive session 0, where it sees no user desktop",
+            self.config.host
+        )))
     }
 }
 
@@ -1000,15 +1133,17 @@ impl ComputerAdapter for RemoteControlAdapter {
         match self.remote_os {
             RemoteOs::Linux => self.read_ui_tree_linux(app).await,
             RemoteOs::Windows => self.read_ui_tree_windows(app).await,
-            RemoteOs::Macos => {
-                // macOS AXUIElement accessibility via SSH is impractical.
-                warn!("read_ui_tree not supported for remote macOS");
-                Ok(Vec::new())
-            }
-            _ => {
-                warn!("read_ui_tree not supported for remote OS {:?}", self.remote_os);
-                Ok(Vec::new())
-            }
+            RemoteOs::Macos => Err(ComputerError::UnsupportedPlatform(format!(
+                "cannot read the accessibility tree on remote macOS host {}: AXUIElement is not \
+                 reachable over SSH. Usable only through the screenshot/vision path, and a \
+                 caller that needs element ids has none here",
+                self.config.host
+            ))),
+            RemoteOs::Unknown => Err(ComputerError::UnsupportedPlatform(format!(
+                "cannot read the accessibility tree on remote host {}: its OS could not be \
+                 identified during connection",
+                self.config.host
+            ))),
         }
     }
 
@@ -1431,5 +1566,93 @@ mod tests {
                 "png:-".to_string()
             ]
         );
+    }
+
+    // ── The display must be set on the far side ────────────────────────────
+
+    /// `Command::env("DISPLAY", …)` only ever reached the local ssh client.
+    /// A server's `AcceptEnv` decides whether it crosses, and Debian/Ubuntu
+    /// allow `LANG LC_*` and nothing else — so the remote command ran with no
+    /// display at all, and every X tool failed for a reason the caller could
+    /// not see. The prefix is what actually sets it.
+    #[test]
+    fn the_display_is_set_on_the_remote_command() {
+        assert_eq!(remote_display_prefix(Some(":0")).as_deref(), Some("DISPLAY=:0"));
+        assert_eq!(remote_display_prefix(Some(" :1 ")).as_deref(), Some("DISPLAY=:1"));
+        assert_eq!(remote_display_prefix(None), None);
+        assert_eq!(remote_display_prefix(Some("   ")), None);
+
+        assert_eq!(with_remote_display("scrot -", Some(":0")), "DISPLAY=:0 scrot -");
+        assert_eq!(with_remote_display("scrot -", None), "scrot -");
+    }
+
+    /// The display name comes from configuration and is interpolated into a
+    /// shell line, so it must not be able to become a second command.
+    #[test]
+    fn a_display_with_shell_syntax_is_quoted_not_executed() {
+        let prefix = remote_display_prefix(Some(":0; rm -rf /")).expect("a prefix");
+        assert!(
+            prefix.starts_with("DISPLAY='") && prefix.ends_with('\''),
+            "the value must be one quoted word: {prefix}"
+        );
+        assert_eq!(prefix, "DISPLAY=':0; rm -rf /'");
+    }
+
+    /// ssh joins its arguments into one string the remote shell parses, so an
+    /// argument with a space would silently split into several.
+    #[test]
+    fn an_argument_with_a_space_stays_one_word() {
+        assert_eq!(shell_word("xdotool"), "xdotool");
+        assert_eq!(shell_word("640x480+120+60"), "640x480+120+60");
+        assert_eq!(shell_word("/dev/stdout"), "/dev/stdout");
+        assert_eq!(shell_word("png:-"), "png:-");
+
+        let script = "Add-Type -AssemblyName System.Windows.Forms; 'x'";
+        let quoted = shell_word(script);
+        assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
+        // The embedded quote is closed, escaped and reopened.
+        assert!(quoted.contains(r"'\''"), "a quote must be escaped, not ended: {quoted}");
+        assert!(
+            !quoted[1..quoted.len() - 1].contains("'; "),
+            "must not leave the shell: {quoted}"
+        );
+    }
+
+    // ── A blank screen is not a success ────────────────────────────────────
+
+    /// A machine that is up with no session logged in answers every capture
+    /// with one flat colour. Returning it as a screenshot is how a run decides
+    /// against a screen that holds nothing and then clicks into it.
+    #[cfg(feature = "image")]
+    #[test]
+    fn a_flat_frame_is_blank_and_any_content_is_not() {
+        let flat = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            64,
+            48,
+            image::Rgb([0, 0, 0]),
+        ));
+        assert!(is_blank_frame(&flat), "one colour is blank");
+
+        // Not "dark": a real screen can be nearly black all over.
+        let dark_but_real = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            64,
+            48,
+            image::Rgb([3, 3, 4]),
+        ));
+        assert!(is_blank_frame(&dark_but_real), "uniform is uniform, dark or not");
+
+        // One pixel of content is content. A video player, a dark theme, a
+        // full-screen photo — all of these have something that is not the
+        // background.
+        let mut with_content = image::RgbImage::from_pixel(64, 48, image::Rgb([0, 0, 0]));
+        with_content.put_pixel(31, 24, image::Rgb([255, 255, 255]));
+        assert!(
+            !is_blank_frame(&image::DynamicImage::ImageRgb8(with_content)),
+            "a screen with anything on it is not blank"
+        );
+
+        // A zero-sized frame describes no screen at all.
+        let empty = image::DynamicImage::ImageRgb8(image::RgbImage::new(0, 0));
+        assert!(is_blank_frame(&empty));
     }
 }
