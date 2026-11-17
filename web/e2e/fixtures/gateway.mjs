@@ -9,7 +9,7 @@
 // `web/` first — the same artifact the app ships with, not a dev server.
 import { spawn } from "node:child_process";
 import { mkdtemp, writeFile, mkdir, readFile, rm } from "node:fs/promises";
-import { existsSync, statSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -63,6 +63,80 @@ function newestMtime(roots) {
   };
   for (const root of roots) walk(root);
   return newest;
+}
+
+/**
+ * The feature set this binary was built with, read from cargo's own record.
+ *
+ * `cargo` writes `.fingerprint/syscity-<hash>/bin-syscity.json` for every
+ * build, and its `features` field is the list that build actually compiled in.
+ * That is the only cheap evidence of the *feature set*: mtime says when the
+ * file was written, not what went into it, so a plain `cargo build` — or any
+ * `cargo test`, which builds the bin with the default features — leaves a
+ * newer binary that still cannot load `[cloud]` config.
+ *
+ * The fingerprint directory is keyed by the same hash cargo gives the
+ * `deps/syscity-<hash>` artifact it links to `target/debug/syscity`, so the
+ * hash links the two records. Several builds can share a size, so the newest
+ * deps artifact wins — it is the one the last build produced, which is the
+ * binary at the path being checked. Returns `null` when nothing matches, and
+ * the caller must treat that as "unknown", never as "fine": a wrong "no cloud"
+ * would fail honest builds, and a wrong "has cloud" would bring back the two
+ * red tests this check exists to explain.
+ *
+ * @param {string} binary  Path to the built `syscity` binary.
+ * @returns {{features: string[]}|null}
+ */
+function buildFeatures(binary) {
+  const fingerprintRoot = path.join(REPO_ROOT, "target/debug/.fingerprint");
+  const depsRoot = path.join(REPO_ROOT, "target/debug/deps");
+  let size;
+  try {
+    size = statSync(binary).size;
+  } catch {
+    return null;
+  }
+
+  /** Read one fingerprint file, or null when it is not ours. */
+  const read = (file) => {
+    try {
+      const record = JSON.parse(readFileSync(file, "utf8"));
+      const features = JSON.parse(record.features);
+      return Array.isArray(features) ? { features } : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Cargo names the fingerprint directory and the deps artifact with the same
+  // hash, so a candidate is "this hash has a deps binary of our size". More
+  // than one build can share a size, so the newest deps artifact wins: that is
+  // the one the last `cargo build`/`cargo test` produced, which is the build
+  // sitting at `target/debug/syscity`.
+  let entries = [];
+  try {
+    entries = readdirSync(fingerprintRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith("syscity-"))
+      .map((e) => e.name.slice("syscity-".length));
+  } catch {
+    return null;
+  }
+
+  let best = null;
+  for (const hash of entries) {
+    let dep;
+    try {
+      dep = statSync(path.join(depsRoot, `syscity-${hash}`));
+    } catch {
+      continue;
+    }
+    if (dep.size !== size) continue;
+    const found = read(path.join(fingerprintRoot, `syscity-${hash}`, "bin-syscity.json"));
+    if (found && (!best || dep.mtimeMs > best.mtimeMs)) {
+      best = { features: found.features, mtimeMs: dep.mtimeMs };
+    }
+  }
+  return best ? { features: best.features } : null;
 }
 
 /** "3 min" / "2.1 h" — enough to see a stale binary at a glance. */
@@ -216,6 +290,31 @@ export async function startGateway({
         `(a plain \`cargo build\` drops the \`cloud\` feature the cloud-login and ` +
         `account specs need).`,
     );
+  }
+
+  // mtime cannot say *which features* the file was built with, and every
+  // runner in this repo (`cargo test`, a plain `cargo build`) writes a newer
+  // binary with the default set. Ask cargo's own record before spawning
+  // anything: a build without `cloud` cannot load the `[cloud]` section about
+  // to be written, and the failure it produces is a startup timeout in an
+  // unrelated spec.
+  if (cloudApiBase || /^\s*\[cloud\]/m.test(extraConfig)) {
+    const build = buildFeatures(binary);
+    // `null` is "cargo left no record" (a binary copied in from elsewhere),
+    // not "no features". Refusing on it would fail honest builds, so the
+    // runtime probe below still has the last word.
+    if (build && !build.features.includes("cloud")) {
+      throw new Error(
+        `the gateway binary at ${binary} was built without the \`cloud\` feature, but this ` +
+          `spec configured [cloud]. cargo's own record for that build ` +
+          `(\`target/debug/.fingerprint/syscity-*/bin-syscity.json\`) lists ` +
+          `${build.features.length} features and \`cloud\` is not one of them.\n\n` +
+          `Rebuild with \`cargo build --features cloud\`. Any plain \`cargo build\` — including ` +
+          `the bin build inside \`cargo test\` — writes to the same target/debug/syscity and ` +
+          `replaces the cloud build, after which these specs fail on an assertion that names ` +
+          `nothing.`,
+      );
+    }
   }
 
   const home = await mkdtemp(path.join(os.tmpdir(), "syscity-ui-"));

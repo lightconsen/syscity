@@ -11,10 +11,19 @@ page showing a running turn as stopped.
 ## Running
 
 ```sh
-cargo build            # the tests spawn target/debug/syscity
+cargo build --features cloud   # the tests spawn target/debug/syscity
 pnpm build             # the gateway serves the UI out of dist/
 pnpm test:ui           # or: pnpm test:ui --headed, or --grep "approval"
 ```
+
+The `cloud` feature is not optional here: the `cloud-login` and `account` specs
+write a `[cloud]` config section, and a build without it cannot load that
+section. Any plain `cargo build` — including the bin build inside `cargo test`
+— writes to the same `target/debug/syscity` and silently replaces the cloud
+build with a newer one, which is why mtime alone cannot catch it. The fixture
+therefore reads cargo's own record (`target/debug/.fingerprint/syscity-*/
+bin-syscity.json`) before spawning anything and names the missing feature,
+instead of letting those specs fail on an assertion that says nothing.
 
 Only Chrome is needed (`channel: "chrome"` in `playwright.config.ts`), so there
 is no browser download. A run takes ~30 s; most of that is per-test gateway
