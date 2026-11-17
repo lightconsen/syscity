@@ -9,7 +9,7 @@
 // `web/` first — the same artifact the app ships with, not a dev server.
 import { spawn } from "node:child_process";
 import { mkdtemp, writeFile, mkdir, readFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, statSync, readdirSync } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +28,127 @@ export async function freePort() {
 
 /** Repo root, resolved from this file's location (`web/e2e/fixtures/`). */
 export const REPO_ROOT = path.resolve(new URL(".", import.meta.url).pathname, "../../..");
+
+/**
+ * Newest mtime under the given directories, skipping build output.
+ *
+ * Only `.rs`/`.toml` files matter: the binary is made of those, and walking
+ * `dist/` or `target/` would both dominate the stat and report something the
+ * binary does not depend on.
+ */
+function newestMtime(roots) {
+  let newest = 0;
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === "target" || entry.name === "node_modules" || entry.name === "dist") {
+        continue;
+      }
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (/\.(rs|toml)$/.test(entry.name)) {
+        try {
+          newest = Math.max(newest, statSync(full).mtimeMs);
+        } catch {
+          /* raced with a rebuild; the next file will do */
+        }
+      }
+    }
+  };
+  for (const root of roots) walk(root);
+  return newest;
+}
+
+/** "3 min" / "2.1 h" — enough to see a stale binary at a glance. */
+function formatAge(mtimeMs) {
+  const seconds = Math.max(0, (Date.now() - mtimeMs) / 1000);
+  if (seconds < 90) return `${Math.round(seconds)} s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
+}
+
+/**
+ * Whether this binary was compiled with the `cloud` feature.
+ *
+ * Asking the gateway itself beats inspecting the binary: what matters is not
+ * the file's name or mtime but whether *this process* has the feature, and
+ * `cloud.status` answers `null` exactly when it does not
+ * (`cloud_status_json` in `ws/admin_ws/mod.rs`). A build that is fresh but
+ * plain `cargo build` — which drops `cloud` — passes every mtime check and
+ * still cannot load `[cloud]` config, so mtime alone is not enough.
+ */
+async function hasCloudFeature(port) {
+  const answer = await websocketCall(port, "cloud.status", {}, 10_000);
+  // A payload of `null` is the no-feature build's answer; anything else
+  // (an object, even `{enabled: false}`) means the feature is compiled in.
+  return answer != null;
+}
+
+/**
+ * One request/response round trip over the same WS protocol the UI speaks.
+ *
+ * Deliberately minimal: `connect` (with the protocol version the gateway
+ * requires) then one method. Kept here rather than shelled out to the CLI so
+ * the fixture depends on nothing but the socket the product already uses.
+ */
+async function websocketCall(port, method, params, timeoutMs) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const pending = new Map();
+  let nextId = 0;
+
+  const open = new Promise((resolve, reject) => {
+    ws.addEventListener("open", () => resolve());
+    ws.addEventListener("error", () => reject(new Error("websocket refused")));
+  });
+  ws.addEventListener("message", (event) => {
+    let frame;
+    try {
+      frame = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    const waiter = pending.get(frame.id);
+    if (waiter) {
+      pending.delete(frame.id);
+      waiter.resolve(frame);
+    }
+  });
+
+  const call = (name, callParams) => {
+    const id = `probe-${nextId++}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${name} timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      pending.set(id, {
+        resolve: (frame) => {
+          clearTimeout(timer);
+          if (!frame.ok) {
+            reject(new Error(`${name} failed: ${frame.error?.message ?? "unknown"}`));
+          } else {
+            resolve(frame.payload ?? null);
+          }
+        },
+      });
+      ws.send(JSON.stringify({ type: "req", id, method: name, params: callParams }));
+    });
+  };
+
+  try {
+    await open;
+    await call("connect", { protocol_version: 1, client: { id: "e2e-probe", version: "0" } });
+    return await call(method, params);
+  } finally {
+    ws.close();
+  }
+}
 
 /**
  * The API key the fake provider is given.
@@ -70,8 +191,30 @@ export async function startGateway({
 } = {}) {
   if (!providerBaseUrl) throw new Error("startGateway needs providerBaseUrl");
   if (!existsSync(binary)) {
+    // `--features cloud`, not a plain build: the cloud-login and account specs
+    // need it, and suggesting the command that produces a binary without it
+    // is how the failure turns into a day of debugging.
     throw new Error(
-      `no syscity binary at ${binary} — run \`cargo build\` first (the UI tests drive the real gateway)`,
+      `no syscity binary at ${binary} — run \`cargo build --features cloud\` first ` +
+        `(the UI tests drive the real gateway)`,
+    );
+  }
+  // The binary is a *build artifact*, and a plain `cargo build` writes one
+  // without the `cloud` feature. The cloud specs then fail as "gateway never
+  // answered /live" — a startup timeout that names nothing, when the truth is
+  // "this binary cannot load the config you are about to write". Say which
+  // binary is stale and how to fix it while the evidence is still in hand.
+  const built = statSync(binary).mtimeMs;
+  const newestSource = newestMtime([
+    path.join(REPO_ROOT, "src"),
+    path.join(REPO_ROOT, "crates"),
+  ]);
+  if (newestSource && newestSource > built) {
+    throw new Error(
+      `stale gateway binary: ${binary} was built ${formatAge(built)} ago but sources ` +
+        `changed ${formatAge(newestSource)} ago. Rebuild with \`cargo build --features cloud\` ` +
+        `(a plain \`cargo build\` drops the \`cloud\` feature the cloud-login and ` +
+        `account specs need).`,
     );
   }
 
@@ -176,7 +319,43 @@ ${extraConfig}
   }
   if (Date.now() >= deadline) {
     proc.kill("SIGKILL");
-    throw new Error(`gateway never answered /live on ${url}:\n${output.slice(-4000)}`);
+    // An empty log is the common shape here: the process is alive but has not
+    // got as far as logging (an on-start migration, or a config it cannot
+    // parse). Saying "no output" beats a trailing blank line that reads like a
+    // bug in this message.
+    const tail = output.trim() ? output.slice(-4000) : "(the gateway printed nothing)";
+    throw new Error(
+      `gateway never answered /live on ${url} within 30 s:\n${tail}\n\n` +
+        `If the cloud-login or account spec failed here, check the binary has the ` +
+        `\`cloud\` feature: \`cargo build --features cloud\`.`,
+    );
+  }
+
+  // Only the specs that configure `[cloud]` care, so the probe runs only for
+  // them: asking every gateway would be one extra connection per test for an
+  // answer nothing reads. The failure it prevents is precise — those specs
+  // then fail on a `data-state="failed"` assertion that says nothing about
+  // the real cause.
+  if (cloudApiBase) {
+    let hasCloud = false;
+    try {
+      hasCloud = await hasCloudFeature(port);
+    } catch (e) {
+      hasCloud = false;
+      output += `\n[fixture] cloud.status probe failed: ${e.message}\n`;
+    }
+    if (!hasCloud) {
+      proc.kill("SIGTERM");
+      throw new Error(
+        `the gateway at ${url} was built without the \`cloud\` feature, but this spec ` +
+          `configured [cloud]. \`cloud.status\` answered null, which only a ` +
+          `\`#[cfg(not(feature = "cloud"))]\` build does.\n\n` +
+          `Rebuild with \`cargo build --features cloud\`. A plain \`cargo build\` writes ` +
+          `to the same target/debug/syscity and silently replaces the cloud build — the ` +
+          `cloud-login and account specs then fail on an assertion that names nothing.\n\n` +
+          `gateway log:\n${output.trim() ? output.slice(-4000) : "(the gateway printed nothing)"}`,
+      );
+    }
   }
 
   return {
