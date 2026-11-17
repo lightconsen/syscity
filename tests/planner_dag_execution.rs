@@ -19,7 +19,25 @@ use syscity::planner::dag::DagValidation;
 use syscity::planner::executor::ExecutorConfig;
 use syscity::planner::{DagScheduler, Plan, Task, TaskExecutor, TaskStatus};
 
+/// An isolated layout, installed as the process default.
+///
+/// An input action takes the cross-process display lock, which resolves the
+/// data directory; without a layout installed that is a panic, and with the
+/// real one it would be the developer's own `~/.syscity`.
+fn install_test_paths() {
+    static PATHS: std::sync::OnceLock<Arc<syscity::dirs::SyscityPaths>> =
+        std::sync::OnceLock::new();
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| {
+        let root = ROOT.get_or_init(|| tempfile::tempdir().expect("temp layout root"));
+        let paths = Arc::new(syscity::dirs::SyscityPaths::from_root(root.path()));
+        let _ = syscity::dirs::set_default_paths(paths.clone());
+        paths
+    });
+}
+
 fn executor(concurrency: usize, rollback: bool) -> TaskExecutor {
+    install_test_paths();
     let adapter = Arc::new(HeadlessComputerAdapter::new());
     let verifier = VerificationEngine::new(adapter.clone());
     TaskExecutor::new(adapter, verifier).with_config(ExecutorConfig {

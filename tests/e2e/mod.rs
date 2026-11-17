@@ -1117,6 +1117,7 @@ mod learning_loop_tests;
 mod llm_chat_tests;
 mod mcp_chat_tests;
 mod mock_chat_tests;
+mod planner_dag_tests;
 mod planner_tests;
 mod post_execute_tests;
 mod protocol_tests;
