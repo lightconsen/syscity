@@ -187,7 +187,123 @@ async fn a_run_with_no_vision_ends_asking_for_a_person_and_names_the_reason() {
     );
 }
 
-// ── The event sequence a client timeline is built from ──────────────────────
+// ── The agent-facing entry point ─────────────────────────────────────────────
+//
+// `computer.run` is reachable from a client that knows it wants a run. The
+// agent already looking at a screen has no such client — it has a tool
+// registry — and `computer_run` is that half. The part worth proving end to
+// end is not that the tool starts a run (the unit tests cover its refusals)
+// but that the run it starts *knows which turn started it*: the tool takes the
+// turn id from the turn's trace, the checkpoint records it, and `turns.replay`
+// folds that run's steps into that turn. Without that last link the tool would
+// work and the timeline would still show nothing.
+
+/// A stand-in for the turn trace a real turn hands its tools: it names a turn
+/// and files nothing, because this test asserts the id, not the trace sink.
+#[derive(Debug)]
+struct TurnTraceForTest {
+    turn_id: String,
+}
+
+impl syscity::tools::TurnTrace for TurnTraceForTest {
+    fn record_action(&self, _rec: &syscity::observe::ActionTraceEvent) {}
+
+    fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+}
+
+/// The agent's path: a tool call inside turn `t1` starts the run, and the run's
+/// steps come back out of `turns.replay` for that same turn.
+#[tokio::test]
+#[serial]
+async fn a_tool_call_inside_a_turn_records_the_run_under_that_turn() {
+    use syscity::tools::{Tool, ToolContext};
+
+    let port = free_port();
+    let mut config = test_config(port, false);
+    config.model_provider = "mock".to_string();
+    config.model = "mock-model".to_string();
+    config.computer.enabled = true;
+    config.computer.settle_delay_ms = 1;
+    config.computer.max_steps = 4;
+    config.computer.vision.mode = "off".to_string();
+
+    let gateway = new_test_gateway(config).await;
+    register_mock_provider_with_model(&gateway.model_router(), clicking_then_done(2), "mock-model")
+        .await;
+    gateway
+        .state()
+        .tools
+        .computer_adapter
+        .write()
+        .await
+        .replace(ChangingDesktop::new());
+
+    // The turn this call belongs to. A real turn's trace is the collector's;
+    // the tool only ever reads the id off it.
+    let turn_id = "turn-from-agent";
+    // The same context shape the agent loop builds: identity, conversation and
+    // trace. The conversation matters — it is where the run's events go and
+    // what its inherited desktop approval is scoped to.
+    let context = ToolContext::new("user", "conv-agent")
+        .with_trace(Some(Arc::new(TurnTraceForTest { turn_id: turn_id.to_string() })));
+
+    let tool = syscity::tools::ComputerRunTool::new(gateway.state());
+    let result = tool
+        .execute(json!({ "goal": "click through Preferences" }), &context)
+        .await
+        .expect("a run inside a turn is not an error");
+    assert!(result.success, "{result:?}");
+    let run_id = result.data.as_ref().expect("data")["run_id"]
+        .as_str()
+        .expect("a run id")
+        .to_string();
+
+    start_gateway_and_wait_opts(port, gateway, true).await;
+
+    // Wait for the run to conclude; the checkpoint is written per step and
+    // again at the end, so a finished run is the point at which the file has
+    // every step in it.
+    let mut client = FrontendSimulator::connect(port).await;
+    let mut view = serde_json::Value::Null;
+    for _ in 0..200 {
+        let status = client
+            .request("computer.status", json!({ "run_id": &run_id }))
+            .await;
+        assert_eq!(status["ok"], true, "{status}");
+        view = status["payload"].clone();
+        if view["finished"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(view["finished"], true, "the run never finished: {view}");
+    assert_eq!(view["phase"], "done", "{view}");
+
+    // The join the whole change exists for: the turn's replay carries the run's
+    // steps, keyed by the turn id the tool read off its context.
+    let replay = client
+        .request("turns.replay", json!({ "turn_id": turn_id }))
+        .await;
+    assert_eq!(replay["ok"], true, "the turn replays: {replay}");
+    let payload = &replay["payload"];
+    let steps = payload["steps"].as_array().expect("steps");
+    assert_eq!(
+        steps.len(),
+        view["summary"]["steps"].as_u64().unwrap_or(0) as usize,
+        "every step the run took is in the timeline: {payload}"
+    );
+    for (i, step) in steps.iter().enumerate() {
+        assert_eq!(step["source"], "run", "{step}");
+        assert_eq!(step["run_id"], run_id.as_str(), "{step}");
+        assert_eq!(step["step"], i as u64, "positions run 0..n: {payload}");
+    }
+    let runs = payload["runs"].as_array().expect("runs");
+    assert_eq!(runs.len(), 1, "{payload}");
+    assert_eq!(runs[0]["run_id"], run_id.as_str(), "{payload}");
+}
+
 //
 // The plan's second verification gap: a scripted desktop and a scripted model,
 // three steps and an answer, and the `computer.step` stream must be exactly

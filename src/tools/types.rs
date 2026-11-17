@@ -388,6 +388,16 @@ impl DesktopGrant {
 pub trait TurnTrace: Send + Sync + std::fmt::Debug {
     /// File one computer-use step against the current round.
     fn record_action(&self, rec: &crate::observe::ActionTraceEvent);
+
+    /// The turn this trace belongs to.
+    ///
+    /// A tool that starts something outliving the call — a whole desktop run —
+    /// stamps it with this, so the record it leaves behind can be found from
+    /// the turn later. Empty when the trace has no turn to name, which is the
+    /// signal a caller should treat as "not inside a turn".
+    fn turn_id(&self) -> &str {
+        ""
+    }
 }
 
 /// Allowed environment variables that are safe to forward to child processes.

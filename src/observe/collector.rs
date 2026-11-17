@@ -618,6 +618,10 @@ impl crate::tools::TurnTrace for ActionTraceSink {
     fn record_action(&self, rec: &ActionTraceEvent) {
         ActionTraceSink::record_action(self, rec);
     }
+
+    fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
 }
 
 impl Drop for TurnMetricsCollector {

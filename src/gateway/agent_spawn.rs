@@ -1406,6 +1406,10 @@ pub(crate) async fn create_default_tool_registry(
     // pointer while `shell` was out of reach. The aggregate `computer` tool and
     // every per-platform input tool belong here.
     registry.mark_privileged("computer");
+    // The whole-goal half of the desktop family: it starts a run that acts on
+    // the screen for many steps under one approval, which is at least as far
+    // reaching as one `computer` action.
+    registry.mark_privileged("computer_run");
     registry.mark_privileged("applescript");
     registry.mark_privileged("windows_powershell");
     registry.mark_privileged("macos_desktop_control");

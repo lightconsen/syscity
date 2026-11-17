@@ -744,6 +744,14 @@ impl Gateway {
             .tools
             .registry
             .register_dynamic(Arc::new(crate::tools::MessageTool::new(state.clone())));
+        // The agent-facing half of `computer.run`. Registered here rather than
+        // in the tool init because it needs the whole gateway state — the run
+        // registry, the event bus and the config — and the run it starts must
+        // be the same one the WS methods answer for.
+        state
+            .tools
+            .registry
+            .register_dynamic(Arc::new(crate::tools::ComputerRunTool::new(state.clone())));
         state
             .tools
             .registry

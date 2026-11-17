@@ -65,21 +65,11 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
         );
     }
 
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let run = state
-        .tools
-        .computer_runs
-        .create(run_id.clone(), goal.clone())
-        .await;
-
     let session_id = params.session_id.clone().filter(|s| !s.is_empty());
     let turn_id = params.turn_id.clone().filter(|s| !s.is_empty());
-    let started = match launch(state, &config, run, session_id, turn_id, None).await {
+    let started = match start_run(state, &config, goal.clone(), session_id, turn_id).await {
         Ok(started) => started,
         Err(mut resp) => {
-            // Nothing was started, so the half-built run must not linger in the
-            // registry looking like something that is about to move.
-            state.tools.computer_runs.remove(&run_id).await;
             resp.id = req.id.clone();
             return resp;
         }
@@ -88,11 +78,11 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
     WsResponse::ok(
         &req.id,
         serde_json::json!({
-            "run_id": run_id,
+            "run_id": started.run_id,
             "goal": goal,
-            "model": started.model,
-            "model_supports_vision": started.model_supports_vision,
-            "max_steps": started.max_steps,
+            "model": started.started.model,
+            "model_supports_vision": started.started.model_supports_vision,
+            "max_steps": started.started.max_steps,
             "budget": {
                 "max_calls_per_run": config.computer.budget.max_calls_per_run,
                 "max_images_per_run": config.computer.budget.max_images_per_run,
@@ -251,10 +241,49 @@ pub(crate) async fn handle_computer_resume(
 }
 
 /// What `launch` established, for the response of the method that called it.
-struct StartedRun {
-    model: String,
-    model_supports_vision: bool,
-    max_steps: usize,
+pub(crate) struct StartedRun {
+    pub model: String,
+    pub model_supports_vision: bool,
+    pub max_steps: usize,
+}
+
+/// What [`start_run`] hands back: the id it minted, and what the loop will use.
+pub(crate) struct StartedComputerRun {
+    pub run_id: String,
+    pub started: StartedRun,
+}
+
+/// Mint a run id, register the run, and attach a loop to it.
+///
+/// The one path every entry point shares — `computer.run` over WS, and the
+/// `computer_run` tool an agent turn calls. They differ in who supplies the
+/// `turn_id` and in what they say afterwards, not in what a run is: a second
+/// copy here would be a second place for the refusals to drift, and the
+/// refusals are the part that must not (a caller who got a `run_id` has to be
+/// able to rely on the run moving).
+///
+/// On failure nothing is left behind: the half-built run is removed from the
+/// registry before the refusal goes back, exactly as if it had never been
+/// minted.
+pub(crate) async fn start_run(
+    state: &Arc<GatewayState>,
+    config: &crate::gateway::GatewayConfig,
+    goal: String,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+) -> Result<StartedComputerRun, WsResponse> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run = state.tools.computer_runs.create(run_id.clone(), goal).await;
+
+    match launch(state, config, run, session_id, turn_id, None).await {
+        Ok(started) => Ok(StartedComputerRun { run_id, started }),
+        Err(resp) => {
+            // Nothing was started, so the half-built run must not linger in the
+            // registry looking like something that is about to move.
+            state.tools.computer_runs.remove(&run_id).await;
+            Err(resp)
+        }
+    }
 }
 
 /// Attach a loop to `run` and spawn it.

@@ -197,6 +197,17 @@ mod workspace;
 pub(crate) use config_ws::push_default_agent_update;
 pub use core::{ws_auth_middleware, ws_handler};
 
+/// The in-process entry points other subsystems call directly.
+///
+/// A WS handler is normally reached over a socket, but two callers are already
+/// inside the process and have no connection: the `computer_run` tool an agent
+/// turn calls, and anything else that must behave exactly as the method does.
+/// Re-exporting the one function rather than copying its body is what keeps
+/// `computer.run` and the tool from drifting apart on which refusals exist.
+pub(crate) mod inproc {
+    pub(crate) use super::admin_ws::start_run;
+}
+
 #[cfg(test)]
 mod tests {
     use super::device_ws;

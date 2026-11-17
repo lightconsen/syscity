@@ -457,6 +457,10 @@ fn sniff_mime(bytes: &[u8]) -> &'static str {
 /// is simply never called.
 const RERUN_DESKTOP_TOOLS: &[&str] = &[
     "computer",
+    // A rerun of a turn that handed its work to a run needs the same tool the
+    // turn had, or the rerun can only replay the half that went through
+    // `computer` and silently miss the rest.
+    "computer_run",
     "screen_state",
     "screen_ocr",
     "screen_ui_detect",

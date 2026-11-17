@@ -606,16 +606,47 @@ impl PromptBuilder {
             return;
         }
 
-        let content = r#"## Desktop Control
+        // The run tool is the other shape a desktop task can take, and the
+        // choice between them is the one thing this section must say: a model
+        // that never learns about `computer_run` drives a twenty-step goal one
+        // action at a time, and a model that reaches for it on a single click
+        // pays for a whole run. Only mentioned when the tool is registered —
+        // a host without computer use has neither.
+        let has_run = tools.iter().any(|t| t.name == "computer_run");
+        let gui_tools = if has_run {
+            "`computer` or `computer_run`"
+        } else {
+            "`computer`"
+        };
+        let run_guidance = if has_run {
+            r#"
+- When the goal is a whole sequence the run can carry out on its own — "open
+  the invoice in Numbers and read out the total" — call `computer_run` with
+  the goal once instead of driving it step by step. It returns a `run_id` at
+  once and keeps going: poll `computer.status` for progress or the outcome,
+  and use `computer.control` to stop it. It cannot ask a question mid-way; on
+  a goal that needs a decision it stops with `need_help` and leaves a handoff
+  note, so put the decisions it cannot make into the goal or keep the task on
+  `computer`.
+- Use `computer` for the next action when that action depends on something only
+  this conversation knows: a value you were just told, a choice a person made,
+  or one action that needs no sequence.
+"#
+        } else {
+            ""
+        };
+
+        let content = format!(
+            r#"## Desktop Control
 
 Program state beats GUI, always. Prefer, in this order:
 1. A deterministic interface to the program itself — its CLI, its config files,
    an API, or `shell`. Same result, no focus or timing dependence.
 2. The app's own structured interface (a command palette, a URL, a documented
    keyboard shortcut) over clicking through its menus.
-3. GUI interaction via `computer` — the last resort, for programs that expose
-   nothing else.
-
+3. GUI interaction via {gui_tools} — the last resort, for
+   programs that expose nothing else.
+{run_guidance}
 When you do use the GUI:
 - Call `screen_state` first. Act from the returned tree, not from memory of the
   previous screen.
@@ -648,7 +679,8 @@ When you do use the GUI:
   privilege escalation) are stop points: confirm with the user before typing
   into or clicking them.
 - For long tasks, pin facts that the screen no longer shows — `computer` with
-  action `note` — and they will be echoed back on later observations."#;
+  action `note` — and they will be echoed back on later observations."#
+        );
 
         self.add_section(
             PromptSection::new("computer_use", content)
@@ -968,6 +1000,32 @@ mod tests {
         assert!(prompt.contains("Address elements by their `[id=…]`"));
         assert!(prompt.contains("from_screenshot: true"));
         assert!(prompt.contains("[sensitive: …]"));
+    }
+
+    /// The run tool is only mentioned when it is registered. A host without
+    /// computer use has neither tool, and a section telling the model to call
+    /// `computer_run` there would name a tool it cannot see.
+    #[test]
+    fn the_run_tool_is_described_only_when_the_model_has_it() {
+        let mut with = PromptBuilder::new("Base");
+        with.add_computer_use_guidance(&[
+            tool_definition("computer"),
+            tool_definition("computer_run"),
+        ]);
+        let prompt = with.build();
+        assert!(prompt.contains("call `computer_run`"), "{prompt}");
+        assert!(
+            prompt.contains("poll `computer.status`"),
+            "the model is told the call does not wait: {prompt}"
+        );
+
+        // `computer` alone: the step-by-step shape is all that exists, so no
+        // guidance about choosing between them.
+        let mut without = PromptBuilder::new("Base");
+        without.add_computer_use_guidance(&[tool_definition("computer")]);
+        let prompt = without.build();
+        assert!(prompt.contains("Desktop Control"), "{prompt}");
+        assert!(!prompt.contains("computer_run"), "{prompt}");
     }
 
     #[test]

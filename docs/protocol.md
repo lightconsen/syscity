@@ -429,6 +429,17 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 通过 `computer.runs` / `computer.status` 找到。`computer.resume` 沿用检查点里记着的 `turn_id`——续跑是
 同一个 run 接着跑，不是新开一个。
 
+**`computer_run` 工具（agent 侧的同一入口）。** 上面这张表是 WS 层：调用方有连接、并且已经决定"我要一个
+run"。agent 已经在看屏幕时两者都没有——它只有一个工具注册表——所以 `computer_run` 工具是这一层的人口：
+`{ goal }`，走的是**同一个** `start_run`（同一个 run 注册表、同一套拒绝、同样的 `computer.step` 事件）。
+它与 `computer` 工具的分工是"一次动作"和"一个目标"：`computer` 是模型看一步、点一下、再回来；
+`computer_run` 把整个序列交给 run，只回一个 `run_id`。**不阻塞**——run 受 `[computer] max_steps` 与预算约束，
+可以跑几分钟，而工具调用会把这一轮一直占着；立即返回 `run_id` 才能让模型继续、让人观看。
+`turn_id` 在这一层是工具**从这一轮的 trace 里读出来的**（`ToolContext::trace`），不需要模型传，也传不了——
+模型不知道自己是第几轮。没有 trace（测试、一次性调用）就是 `null`，run 仍可通过 `computer.runs` 找到。
+失败不是 `Err` 而是 `success: false` + `data.code`（`COMPUTER_DISABLED` / `RUN_REFUSED`）：这些都要求模型
+换个做法，而不是报告工具坏了。提示词里"何时用哪个"只在 `computer_run` 存在时注入。
+
 `computer.watch` / `computer.unwatch`：**只看，不动**。G 阶段的"远程帮我干活"里 SSH 已经能驱动对方机器，
 缺的是人能看见它——一个看不见屏幕的人被要求批准他没法核对的点击。这个 watch 就是那一半，且**只有**那一半：
 它按间隔截图并广播，模块里没有任何派发动作的路径，"能看不能动"是结构上成立而不是靠一个可以翻的开关。
