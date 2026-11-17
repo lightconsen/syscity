@@ -343,20 +343,31 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 原计划里没有兑现的条目。每条标注性质：**缺行为**（要写代码）还是**缺测试**
 （行为在，但没有能锁住它的用例）。
 
-### 6.1 前端还没有消费者 —— **缺行为**
+### 6.1 前端的界面还没有 —— **缺行为**
 
-这台引擎目前只有 agent 和脚本化客户端在用。`web/` 和 `desktop/` 里对
-`computer.run` / `computer.status` / `computer.step` / `turns.replay` 的调用数是 **0**：
-WS 面齐全、事件齐全、`docs/protocol.md` 有完整契约，缺的是浏览器界面那一侧。
+**已接线的部分**（不要和缺的那部分混在一起）：
 
-这不是"计划没做完"，而是原计划里没有这一项：计划把"过程可查"定义成**数据可查**
+- **agent 侧**：`computer_run` 工具已注册（`src/gateway/mod.rs:754`）、已 `mark_privileged`
+  （`agent_spawn.rs:1412`）、提示词里的分工说明只在模型有这个工具时注入
+  （`prompt_builder.rs:599`）、`turns.replay` 能把 run 的步骤并进那一轮的时间线。
+  一个 turn 里模型可以直接说"把整个桌面目标交给 run"。
+- **WS 侧**：十个 `computer.*` 方法全部有 handler、dispatch、scope、测试。
+  任何持有 WS 连接的东西都能用——CLI 的 `ws::call(method, params)`
+  （`src/cli/ws.rs:58`）就是通用入口，`turns.replay` 同样。
+
+**缺的是渲染那一层**：`web/` 和 `desktop/` 里对 `computer.*` / `turns.replay` 的
+调用数是 **0**（`grep -rn 'computer\.' web/src` 零命中），构建产物 `dist/` 里也没有。
+也就是说：模型能在 turn 里拉起一个 run，人却**在浏览器里看不见**它的步骤、
+看不出它花了多少、也没有一个"这个 turn 的回放"可以点。
+
+这不是计划没做完，是计划里没有这一项：计划把"过程可查"定义成**数据可查**
 （`turns.replay` 给出时间线），把"看得见"定义成**帧事件可推**（`computer.watch`）。
-把这两样接成 UI（动作+截图的时间线播放器、run 的实时步骤面板）是独立的一份工作，
+把这两样接成 UI（run 的实时步骤面板、动作+截图的时间线播放器）是独立的一份工作，
 不在 A–G 任何阶段里。
 
-一个直接后果：`computer_run` 工具这条入口先于 UI 落地了。agent 可以在 turn 里
-拉起 run、`turns.replay` 能把它并进时间线，但**人在浏览器里看不到**——今天要看
-只能用 WS 客户端。这是目前最值得补的缺口。
+今天要观察一个 run：`computer.status` 轮询、`computer.step` 事件、
+`computer.watch` 的 `computer.frame` 帧，或直接读 `turns.replay`。
+这是目前最值得补的缺口——引擎已经是"目标进、结果出"，缺的是最后一步"人看得见"。
 
 ### 6.2 明确能接受的两条"做不到"
 
