@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::computer::vision::model_download::LocalModels;
 use crate::config::VisionConfig;
 
 /// Which backend a lookup should use.
@@ -96,10 +97,26 @@ impl UnavailableReason {
 /// vision hard to test and therefore under-tested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Availability {
-    /// A local model (OCR or UI detection) is present and loadable.
-    pub local_model: bool,
+    /// UI-element detection weights are present and loadable.
+    pub ui_detect: bool,
+    /// The OCR detector, recogniser and dictionary are present.
+    pub ocr: bool,
     /// This build has the `vision` feature compiled in.
     pub feature_enabled: bool,
+}
+
+impl Availability {
+    /// Build from a presence probe, for callers that do not care which model.
+    pub fn from_models(
+        models: crate::computer::vision::model_download::LocalModels,
+        feature: bool,
+    ) -> Self {
+        Self {
+            ui_detect: models.ui_detect,
+            ocr: models.ocr,
+            feature_enabled: feature,
+        }
+    }
 }
 
 /// Decides which backend answers, and nothing else.
@@ -118,11 +135,12 @@ impl VisionResolver {
     ///
     /// Whether a model file is actually present is checked by the caller and
     /// passed in: downloading is a side effect this type must not have.
-    pub fn from_config(config: &VisionConfig, local_model_present: bool) -> Self {
+    pub fn from_config(config: &VisionConfig, local_models: LocalModels) -> Self {
         Self::new(
             config.clone(),
             Availability {
-                local_model: local_model_present,
+                ui_detect: local_models.ui_detect,
+                ocr: local_models.ocr,
                 feature_enabled: cfg!(feature = "vision"),
             },
         )
@@ -169,9 +187,38 @@ impl VisionResolver {
         })
     }
 
-    /// Whether a local model could answer.
-    fn local_available(&self) -> bool {
-        self.availability.feature_enabled && self.availability.local_model
+    /// Whether the OCR models are present, whether or not they are the rung
+    /// that answers.
+    ///
+    /// The detector is preferred when both are installed, and OCR is then used
+    /// to name the boxes it found. That is a separate question from "which
+    /// model answers", so it is asked separately — a caller that used
+    /// [`local_model`] to decide this would skip OCR on every machine that has
+    /// the detector, which is all of them.
+    ///
+    /// [`local_model`]: VisionResolver::local_model
+    pub fn has_ocr(&self) -> bool {
+        self.availability.feature_enabled && self.availability.ocr
+    }
+
+    /// Which local model answers when there is a choice.
+    ///
+    /// UI detection first: it produces addressable controls, and a control
+    /// that can be clicked is more useful than the words drawn on it. OCR is
+    /// the rung for the screen detection cannot parse — text in a canvas, a
+    /// PDF, a video call — and it is the only local backend on a machine that
+    /// downloaded the OCR models alone.
+    fn local_model(&self) -> Option<LocalModel> {
+        if !self.availability.feature_enabled {
+            return None;
+        }
+        if self.availability.ui_detect {
+            Some(LocalModel::UiDetect)
+        } else if self.availability.ocr {
+            Some(LocalModel::Ocr)
+        } else {
+            None
+        }
     }
 
     /// Pick a backend.
@@ -183,8 +230,8 @@ impl VisionResolver {
         match self.mode() {
             Mode::Off => VisionSource::Unavailable(UnavailableReason::DisabledByConfig),
             Mode::Local => {
-                if self.local_available() {
-                    VisionSource::Local(LocalModel::UiDetect)
+                if let Some(model) = self.local_model() {
+                    VisionSource::Local(model)
                 } else if !self.availability.feature_enabled {
                     VisionSource::Unavailable(UnavailableReason::FeatureDisabled)
                 } else {
@@ -196,8 +243,8 @@ impl VisionResolver {
                 None => VisionSource::Unavailable(UnavailableReason::ApiNotConfigured),
             },
             Mode::Auto => {
-                if self.local_available() {
-                    return VisionSource::Local(LocalModel::UiDetect);
+                if let Some(model) = self.local_model() {
+                    return VisionSource::Local(model);
                 }
                 if let Some(api) = self.api() {
                     return api;
@@ -277,7 +324,8 @@ mod tests {
         VisionResolver::new(
             cfg(mode, api),
             Availability {
-                local_model: local,
+                ui_detect: local,
+                ocr: false,
                 feature_enabled: feature,
             },
         )
@@ -361,7 +409,8 @@ mod tests {
         let r = VisionResolver::new(
             config,
             Availability {
-                local_model: true,
+                ui_detect: true,
+                ocr: false,
                 feature_enabled: true,
             },
         );
@@ -428,7 +477,8 @@ mod tests {
         let r = VisionResolver::new(
             config,
             Availability {
-                local_model: false,
+                ui_detect: false,
+                ocr: false,
                 feature_enabled: true,
             },
         );

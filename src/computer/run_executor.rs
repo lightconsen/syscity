@@ -496,16 +496,20 @@ async fn observe(
     // A read that failed is not a screen with nothing on it.
     //
     // This used to fall back to an empty `Vec`, and completeness is judged on
-    // what was read — `tree_is_complete(&[])` is `true` — so a host that
-    // cannot read its tree at all (a Wayland session without the AT-SPI
-    // bridge, a missing accessibility permission) was reported to the model
-    // as a complete tree with no elements. Two things then went wrong: the
-    // model decided against a "blank" screen instead of a screenshot, and the
-    // run loop's "attach an image because the tree is incomplete" rule never
-    // fired, because the tree did not look incomplete, it looked empty.
+    // what was read, so a host that cannot read its tree at all (a Wayland
+    // session without the AT-SPI bridge, a missing accessibility permission)
+    // was reported to the model as a complete tree with no elements. Two
+    // things then went wrong: the model decided against a "blank" screen
+    // instead of a screenshot, and the run loop's "attach an image because the
+    // tree is incomplete" rule never fired, because the tree did not look
+    // incomplete, it looked empty.
     //
     // The failure is now carried, so the step is honestly incomplete and the
-    // perception plan can reach for the picture.
+    // perception plan can reach for the picture. A read that *succeeds* with
+    // nothing in it is the same situation from the model's side:
+    // `tree_is_complete` refuses to call an empty list whole, so a tree-less
+    // app — a game canvas, an Electron window with accessibility switched off —
+    // now reaches the visual scan on its very first step instead of never.
     let (raw_tree, tree_read_failed) = match adapter.read_ui_tree(None).await {
         Ok(tree) => (tree, None),
         Err(e) => {
@@ -1133,6 +1137,9 @@ mod tests {
     /// desktop that never changes would make every image ceiling unreachable.
     struct FakeDesktop {
         tree_incomplete: bool,
+        /// The read succeeds and returns no roots at all: an app that
+        /// publishes no accessibility tree.
+        tree_less: bool,
         screen_changes: bool,
         executions: AtomicUsize,
         /// What the loop actually dispatched, in order.
@@ -1143,6 +1150,19 @@ mod tests {
         fn new(tree_incomplete: bool) -> Arc<Self> {
             Arc::new(Self {
                 tree_incomplete,
+                tree_less: false,
+                screen_changes: false,
+                executions: AtomicUsize::new(0),
+                actions: StdMutex::new(Vec::new()),
+            })
+        }
+
+        /// A desktop whose accessibility read succeeds and finds nothing —
+        /// a game canvas, an Electron window with accessibility off.
+        fn tree_less() -> Arc<Self> {
+            Arc::new(Self {
+                tree_incomplete: false,
+                tree_less: true,
                 screen_changes: false,
                 executions: AtomicUsize::new(0),
                 actions: StdMutex::new(Vec::new()),
@@ -1195,6 +1215,10 @@ mod tests {
             &self,
             _app: Option<&str>,
         ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+            if self.tree_less {
+                // A successful read with no roots: the app publishes none.
+                return Ok(Vec::new());
+            }
             Ok(vec![crate::computer::UiElement {
                 id: "w1".to_string(),
                 role: "window".to_string(),
@@ -1622,6 +1646,100 @@ mod tests {
             "a scan that saw nothing must not take the image away"
         );
         assert_eq!(outcome.images_attached, 1);
+    }
+
+    /// Step 0 of a tree-less app must reach the scan.
+    ///
+    /// `tree_is_complete(&[])` used to be `true`, so an app whose accessibility
+    /// read succeeds and returns nothing looked like a whole, empty desktop:
+    /// the step never asked for a picture and never ran the scan, and the
+    /// quality of the local model made no difference because nothing called
+    /// it. This is the case the fix exists for — the assertion is on the
+    /// prompt and on the image count, because "the scan ran" is only visible
+    /// through what the step was shown.
+    #[tokio::test]
+    async fn a_tree_less_screen_is_scanned_on_the_first_step() {
+        let provider = ScriptedProvider::new(vec![
+            click_answer(),
+            r#"{"decision": "done", "message": "clicked it"}"#,
+        ]);
+        let adapter = FakeDesktop::tree_less();
+        let run = ComputerRun::new("r1", "click Save");
+
+        let mut plan = fast_plan(provider.clone(), adapter.clone(), 15, true);
+        plan.vision = Some(fixed_look());
+
+        let outcome = execute(run.clone(), plan)
+            .await
+            .expect("the run machinery works");
+
+        assert!(outcome.success, "{}", outcome.message);
+
+        // The scan's controls were in the very first prompt, and the scan
+        // stood in for the image — both impossible if step 0 had decided the
+        // empty tree was a whole one.
+        let first = provider
+            .requests()
+            .first()
+            .cloned()
+            .expect("a decision was asked for");
+        let prompt = first
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prompt.contains("Detected from the screenshot:"),
+            "the scan's controls reached the prompt: {prompt}"
+        );
+        assert!(prompt.contains("\"Save\""), "and they were named: {prompt}");
+        assert_eq!(provider.images_sent(), 0, "the scan answered, so no image was needed");
+
+        let view = run.view().await;
+        assert_eq!(view["vision"], "api: 1 controls");
+    }
+
+    /// The same screen with nobody to look: the step says so and still acts.
+    ///
+    /// The other half of the change — the tree-less app is now understood as
+    /// incomplete, so the prompt asks for the picture instead of claiming the
+    /// desktop is bare.
+    #[tokio::test]
+    async fn a_tree_less_screen_without_a_scanner_still_asks_for_the_image() {
+        let provider = ScriptedProvider::new(vec![
+            r#"{"decision": "done", "message": "read it off the image"}"#,
+        ]);
+        let adapter = FakeDesktop::tree_less();
+        let run = ComputerRun::new("r1", "click Save");
+
+        let mut plan = fast_plan(provider.clone(), adapter, 15, true);
+        plan.vision = Some(blind_look());
+
+        let outcome = execute(run, plan).await.expect("the run machinery works");
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(provider.images_sent(), 1, "the picture is all there is");
+        assert_eq!(outcome.images_attached, 1);
+
+        let prompt = provider
+            .requests()
+            .first()
+            .map(|r| {
+                r.messages
+                    .iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        assert!(
+            prompt.contains("An image of the screen is attached"),
+            "the model was told why it got a picture: {prompt}"
+        );
+        assert!(
+            prompt.contains("no accessibility tree was read"),
+            "the empty tree is reported as unread, not as a bare desktop: {prompt}"
+        );
     }
 
     /// A scan that always answers with one control, through the API rung so

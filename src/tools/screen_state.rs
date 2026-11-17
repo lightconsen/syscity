@@ -903,16 +903,22 @@ mod tests {
     }
 
     /// An empty tree is not evidence that the screen is empty — it must not
-    /// be reported as a complete one.
+    /// be reported as a complete one, and the advice it carries must not be
+    /// the advice meant for a tree that was cut.
     #[test]
-    fn an_empty_tree_is_not_a_truncation() {
+    fn an_empty_tree_is_an_unread_tree_not_a_whole_one() {
         let mut outline = TreeOutline::default();
         outline.push_tree(&[], "accessibility", 100, false, 0, &no_sensitive());
         assert!(outline
             .text
-            .contains("(empty — no accessibility tree available)"));
+            .contains("(empty — the accessibility read found no elements)"));
         assert!(!outline.cut_by_cap);
-        assert!(outline.incomplete_note().is_none());
+        assert!(outline.incomplete, "an empty read is not a whole tree");
+        assert!(outline.no_roots);
+        let note = outline.incomplete_note().expect("an unread tree says so");
+        // Not "look deeper": there is nothing to read deeper.
+        assert!(!note.contains("max_depth"), "{note}");
+        assert!(note.contains("no accessibility tree was read"), "{note}");
     }
 
     /// The trust line rides with the tree, because a click on a guessed box
@@ -921,6 +927,15 @@ mod tests {
     fn the_trust_line_names_the_source() {
         assert!(trust_line("accessibility").contains("authoritative"));
         assert!(trust_line("omniparser").contains("inferred from pixels"));
+        // Every visual source says it is a guess. The catch-all arm is
+        // "authoritative", so a source value nothing here recognises would
+        // quietly be presented to the model as a real accessibility tree —
+        // the one misreading this line exists to prevent.
+        for source in ["ocr", "api-vision"] {
+            let line = trust_line(source);
+            assert!(line.contains("from pixels"), "{source} must be labelled as a guess: {line}");
+            assert!(!line.contains("authoritative"), "{source}: {line}");
+        }
     }
 
     /// A mock adapter that takes its time, for the capture budget.

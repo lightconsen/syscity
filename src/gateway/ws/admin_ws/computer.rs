@@ -715,7 +715,7 @@ async fn vision_look(
         return None;
     }
 
-    let local_present = local_model_present(&vision_config);
+    let local_present = local_models_present(&vision_config);
     let resolver = crate::computer::vision::resolver::VisionResolver::from_config(
         &vision_config,
         local_present,
@@ -735,17 +735,21 @@ async fn vision_look(
     ))
 }
 
-/// Whether the OmniParser weights are already on this machine.
+/// Which local vision models are already on this machine.
 ///
 /// A `stat`, deliberately: [`crate::computer::vision::model_download`] can
-/// fetch the model, and a run start is not the place to spend a minute and
-/// 88 MB of somebody's link on that.
-fn local_model_present(config: &crate::config::VisionConfig) -> bool {
+/// fetch the models, and a run start is not the place to spend a minute and
+/// 88 MB of somebody's link on that. Both models are probed, not just the
+/// detector, because a machine with only the OCR models is a machine that can
+/// still read a screen — and the resolver has to be told so, or `auto` would
+/// declare itself unavailable on a machine that could have answered.
+fn local_models_present(
+    config: &crate::config::VisionConfig,
+) -> crate::computer::vision::model_download::LocalModels {
     if !cfg!(feature = "vision") {
-        return false;
+        return crate::computer::vision::model_download::LocalModels::default();
     }
-    let dir = crate::computer::vision::model_download::vision_model_dir(&config.model_dir);
-    dir.join("omniparser.onnx").is_file()
+    crate::computer::vision::model_download::local_models_present(&config.model_dir)
 }
 
 /// The provider handle for the API rung, when one is configured.

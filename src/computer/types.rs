@@ -224,6 +224,41 @@ impl Rect {
         Self { x, y, width, height }
     }
 
+    /// Whether two rectangles share any area.
+    ///
+    /// An empty rectangle overlaps nothing: it occupies no point, so a
+    /// zero-width box cannot be "where the change happened". Callers that
+    /// compare a changed region against an intended target need exactly this
+    /// answer, and computing it by hand at each site is how off-by-one
+    /// overlap checks get written.
+    pub fn overlaps(&self, other: &Rect) -> bool {
+        if self.width == 0 || self.height == 0 || other.width == 0 || other.height == 0 {
+            return false;
+        }
+        let (ax0, ay0) = (self.x, self.y);
+        let (ax1, ay1) = (
+            self.x.saturating_add(self.width as i32),
+            self.y.saturating_add(self.height as i32),
+        );
+        let (bx0, by0) = (other.x, other.y);
+        let (bx1, by1) = (
+            other.x.saturating_add(other.width as i32),
+            other.y.saturating_add(other.height as i32),
+        );
+        ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+    }
+
+    /// Whether a point lies inside the rectangle. The right and bottom edges
+    /// are exclusive, so a pixel at `x + width` is not inside.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        self.width > 0
+            && self.height > 0
+            && x >= self.x
+            && y >= self.y
+            && x < self.x.saturating_add(self.width as i32)
+            && y < self.y.saturating_add(self.height as i32)
+    }
+
     /// Scale this rect by the given DPI factor (logical → physical).
     pub fn to_physical(&self, dpi_scale: f32) -> Self {
         Self {
@@ -558,8 +593,17 @@ impl UiElement {
     ///
     /// This is the proposition a resolution result needs: "not found" is only
     /// conclusive when the tree that was searched was whole.
+    ///
+    /// A read that produced **no roots at all** does not claim completeness.
+    /// "This desktop has no controls on it" and "this reader got nothing" look
+    /// identical in an empty list, and only one of the two is an answer.
+    /// Treating the other as whole is how a Wayland portal query once told the
+    /// agent, in the tree's own format, that there was nothing to look at —
+    /// see `platform::wayland::accessibility`. The distinction that survives:
+    /// a *node* with no children is a leaf and is complete; a *tree* with no
+    /// roots is a read that established nothing.
     pub fn tree_is_complete(roots: &[UiElement]) -> bool {
-        roots.iter().all(UiElement::subtree_is_complete)
+        !roots.is_empty() && roots.iter().all(UiElement::subtree_is_complete)
     }
 
     /// Whether the element says it supports this accessibility action.

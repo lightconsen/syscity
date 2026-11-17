@@ -261,6 +261,18 @@ pub enum ResolveError {
         /// The first few matches, so a caller can disambiguate.
         candidates: Vec<Candidate>,
     },
+    /// Nothing matched, and the snapshot held no elements at all.
+    ///
+    /// A separate case from [`Incomplete`](Self::Incomplete) because the next
+    /// step is different. An empty snapshot is not a tree that was cut short —
+    /// it is a read that produced no tree, which happens when the accessibility
+    /// bridge is missing, a permission was refused, or the app publishes no
+    /// tree at all. Telling that caller to "re-read with a deeper `max_depth`"
+    /// sends it to the same place for the same nothing.
+    Unread {
+        /// What was asked for, e.g. `label~Save`.
+        query: String,
+    },
     /// Nothing matched, and the tree that was searched was not complete.
     ///
     /// "Not found" is only a fact about a tree that was read in full. A depth
@@ -339,6 +351,12 @@ impl std::fmt::Display for ResolveError {
                 reason.advice()
             ),
             Self::NoSnapshot => write!(f, "no UI tree has been read yet"),
+            Self::Unread { query } => write!(
+                f,
+                "no element matched {query}, and the accessibility read produced no tree at all \
+                 — the app may publish none, or the bridge/permission may be missing; re-reading \
+                 will not help, so look at the screenshot or act by screen coordinates"
+            ),
             Self::Incomplete { query, searched } => write!(
                 f,
                 "no element matched {query}, but the UI tree is incomplete ({searched} elements \
@@ -382,6 +400,9 @@ impl ResolveError {
             // A partial tree cannot say "not there". The message carries the
             // next step, which is a deeper read rather than a different aim.
             Self::Incomplete { .. } => E::TreeIncomplete(self.to_string()),
+            // Neither can an empty one, and it is not a tree at all: the
+            // message says so rather than asking for a deeper read of nothing.
+            Self::Unread { .. } => E::TreeIncomplete(self.to_string()),
             Self::NotFound(_) | Self::NoSnapshot => E::ElementNotFound(self.to_string()),
         }
     }
@@ -494,6 +515,12 @@ impl UiSnapshot {
     /// tree that was read in full. A partial tree gets `Incomplete` instead,
     /// so the caller re-reads deeper rather than re-aiming at nothing.
     fn not_found(&self, query: String) -> ResolveError {
+        // No roots at all is not a tree that was cut short: nothing was read,
+        // so there is no depth to re-read. Saying "incomplete" here sent the
+        // caller to a deeper read of the same nothing.
+        if self.roots.is_empty() {
+            return ResolveError::Unread { query };
+        }
         if self.is_complete() {
             ResolveError::NotFound(query)
         } else {
@@ -818,6 +845,14 @@ mod tests {
         }
         .into_computer_error();
         assert!(matches!(incomplete, ComputerError::TreeIncomplete(_)));
+        let unread = ResolveError::Unread { query: "label~Save".into() }.into_computer_error();
+        assert!(matches!(unread, ComputerError::TreeIncomplete(_)));
+        // The same class as an incomplete tree — both say "this search did not
+        // establish absence" — but a different sentence, because the next step
+        // differs: an empty read cannot be fixed by reading deeper.
+        let unread_text = ResolveError::Unread { query: "label~Save".into() }.to_string();
+        assert!(unread_text.contains("no tree at all"), "{unread_text}");
+        assert!(!unread_text.contains("max_depth"), "{unread_text}");
         // The classes are what a caller branches on, so they must differ.
         use crate::error::ComputerErrorCode;
         let codes: Vec<&str> = [
@@ -834,6 +869,7 @@ mod tests {
             }
             .into_computer_error(),
             ResolveError::Incomplete { query: "q".into(), searched: 1 }.into_computer_error(),
+            ResolveError::Unread { query: "q".into() }.into_computer_error(),
         ]
         .iter()
         .map(|e| ComputerErrorCode::of(e).0.as_str())
@@ -844,6 +880,7 @@ mod tests {
                 "desktop.stale_ref",
                 "desktop.element_not_found",
                 "desktop.ambiguous_target",
+                "desktop.tree_incomplete",
                 "desktop.tree_incomplete",
             ]
         );

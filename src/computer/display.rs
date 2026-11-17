@@ -231,6 +231,25 @@ impl CoordinateSpace {
         (ix.round() as i32, iy.round() as i32)
     }
 
+    /// Convert a rectangle in screen points to screenshot pixels.
+    ///
+    /// Both corners are mapped and the result is re-based on the smaller one,
+    /// so a display with a negative origin cannot produce a negative width.
+    /// An empty rectangle stays empty: it names no area to look at.
+    pub fn screen_rect_to_image(&self, rect: &Rect) -> Rect {
+        if rect.width == 0 || rect.height == 0 {
+            return Rect::new(0, 0, 0, 0);
+        }
+        let (x0, y0) = self.screen_to_image(rect.x, rect.y);
+        let (x1, y1) = self.screen_to_image(
+            rect.x.saturating_add(rect.width as i32),
+            rect.y.saturating_add(rect.height as i32),
+        );
+        let (left, right) = (x0.min(x1), x0.max(x1));
+        let (top, bottom) = (y0.min(y1), y0.max(y1));
+        Rect::new(left, top, (right - left) as u32, (bottom - top) as u32)
+    }
+
     /// One-line description for tool output.
     pub fn summary(&self) -> String {
         format!(
@@ -569,6 +588,40 @@ mod tests {
         let shot = Screenshot::new(String::new(), 3600, 2338);
         let space = CoordinateSpace::from_screenshot(&shot, &retina_single()).unwrap();
         assert_eq!((space.image_width, space.image_height), (3600, 2338));
+    }
+
+    /// A rectangle the caller knows in screen points has to become pixels
+    /// before it can be compared against a pixel diff. Both corners are
+    /// mapped, so a Retina capture's box doubles on both axes.
+    #[test]
+    fn a_screen_rect_maps_to_image_pixels() {
+        let space = CoordinateSpace::new(3600, 2338, &retina_single()).unwrap();
+        let image = space.screen_rect_to_image(&Rect::new(100, 200, 80, 24));
+        assert_eq!(image, Rect::new(200, 400, 160, 48));
+    }
+
+    /// A display with a negative origin must not turn a mapped rectangle into
+    /// negative width: both corners are converted, then re-based on the
+    /// smaller one.
+    #[test]
+    fn a_negative_origin_rect_keeps_a_positive_size() {
+        let geometry = DisplayGeometry::new(vec![
+            DisplayInfo::new(0, 0, 1800, 1169)
+                .primary()
+                .named("Built-in"),
+            DisplayInfo::new(-1280, 0, 1280, 720).named("External"),
+        ]);
+        let space = CoordinateSpace::new(6160, 2338, &geometry).unwrap();
+        let image = space.screen_rect_to_image(&Rect::new(-1280, 0, 100, 50));
+        assert_eq!(image, Rect::new(0, 0, 200, 100));
+    }
+
+    /// An empty box names no area, and mapping one must not invent an area to
+    /// say the change was outside.
+    #[test]
+    fn an_empty_rect_maps_to_an_empty_rect() {
+        let space = CoordinateSpace::new(3600, 2338, &retina_single()).unwrap();
+        assert_eq!(space.screen_rect_to_image(&Rect::new(10, 10, 0, 4)), Rect::new(0, 0, 0, 0));
     }
 
     #[test]

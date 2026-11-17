@@ -352,6 +352,14 @@ pub enum ImageTrigger {
     /// tree means "look deeper", an unreadable one means "the picture is all
     /// there is" — and it decides whether re-reading is worth a step.
     TreeUnreadable,
+    /// The accessibility read succeeded and returned no roots at all: the app
+    /// publishes no tree rather than a short one.
+    ///
+    /// Distinct from [`Self::TreeUnreadable`] because it changes what the
+    /// model is told. An unreadable tree may come back on a retry or with a
+    /// permission granted; an app that publishes none answers the same way
+    /// every time, so the only honest next step is the picture.
+    TreeUnread,
     /// The last action did not verify — either it plainly did not land, or
     /// nothing could check it. Both mean the text says nothing trustworthy
     /// about what happened.
@@ -365,6 +373,9 @@ impl ImageTrigger {
         match self {
             ImageTrigger::TreeIncomplete => "the accessibility tree is incomplete",
             ImageTrigger::TreeUnreadable => "the accessibility tree could not be read",
+            ImageTrigger::TreeUnread => {
+                "the accessibility read produced no tree — this app may publish none"
+            }
             ImageTrigger::LastStepNotVerified => "the last action was not verified",
             ImageTrigger::RepeatedFailures => "repeated failures",
         }
@@ -394,6 +405,18 @@ pub struct PerceptionInputs {
     /// Implies `!tree_complete`, and is carried separately because "the tree
     /// was cut" and "there is no tree" call for different words in the prompt.
     pub tree_read_failed: bool,
+    /// Whether the read succeeded but produced no roots at all.
+    ///
+    /// A *third* case, distinct from both of the above. A tree-less app — a
+    /// game canvas, an Electron window with accessibility switched off — reads
+    /// successfully and hands back nothing. Completeness cannot be claimed for
+    /// an empty list (see [`UiElement::tree_is_complete`]), so without this the
+    /// trigger would say "the tree is incomplete" and the model would be told
+    /// to re-read a screen that will answer the same way — while the scan that
+    /// could have looked was never asked to.
+    ///
+    /// [`UiElement::tree_is_complete`]: crate::computer::types::UiElement::tree_is_complete
+    pub tree_unread: bool,
     /// The previous step's verification, if there was one.
     pub last_verified: Option<bool>,
     /// Consecutive failed steps so far.
@@ -441,6 +464,8 @@ pub fn plan_perception(inputs: PerceptionInputs) -> PerceptionPlan {
             attach_image: true,
             trigger: Some(if inputs.tree_read_failed {
                 ImageTrigger::TreeUnreadable
+            } else if inputs.tree_unread {
+                ImageTrigger::TreeUnread
             } else {
                 ImageTrigger::TreeIncomplete
             }),
@@ -479,6 +504,7 @@ mod tests {
         PerceptionInputs {
             tree_complete: true,
             tree_read_failed: false,
+            tree_unread: false,
             last_verified: Some(true),
             consecutive_failures: 0,
             model_supports_vision: true,
@@ -511,6 +537,23 @@ mod tests {
         assert!(plan.attach_image);
         assert_eq!(plan.trigger, Some(ImageTrigger::TreeIncomplete));
         assert!(!plan.tree_complete);
+    }
+
+    /// A successful read that produced no tree is not a truncated one.
+    #[test]
+    fn a_tree_less_app_asks_for_an_image_and_says_why() {
+        let plan = plan_perception(PerceptionInputs {
+            tree_complete: false,
+            tree_unread: true,
+            ..inputs()
+        });
+        assert!(plan.attach_image, "a tree-less app is exactly when a look helps");
+        assert_eq!(plan.trigger, Some(ImageTrigger::TreeUnread));
+        assert!(!plan.tree_complete);
+        // Three different facts, three different sentences: a reader must be
+        // able to tell "cut short" from "unreadable" from "nothing there".
+        assert_ne!(ImageTrigger::TreeUnread.describe(), ImageTrigger::TreeIncomplete.describe());
+        assert_ne!(ImageTrigger::TreeUnread.describe(), ImageTrigger::TreeUnreadable.describe());
     }
 
     /// A tree that could not be read at all is not a truncated one. Both ask
@@ -593,6 +636,7 @@ mod tests {
         let plan = plan_perception(PerceptionInputs {
             tree_complete: false,
             tree_read_failed: false,
+            tree_unread: false,
             last_verified: Some(false),
             consecutive_failures: 9,
             model_supports_vision: false,

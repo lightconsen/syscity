@@ -28,6 +28,13 @@ pub struct TreeOutline {
     pub cut_by_cap: bool,
     /// The accessibility read itself stopped early.
     pub incomplete: bool,
+    /// The read produced no roots at all.
+    ///
+    /// Kept apart from `incomplete`, which is also true here: "the read was
+    /// cut at its depth or element limit" and "the read produced nothing" call
+    /// for different advice, and telling the model to look deeper at a screen
+    /// nobody could read is the misdirection this flag exists to prevent.
+    pub no_roots: bool,
 }
 
 impl TreeOutline {
@@ -46,8 +53,19 @@ impl TreeOutline {
             format_element(root, 0, &mut self.text, &mut lines, max_lines, sensitive);
         }
         if roots.is_empty() {
+            // "The read found no elements", not "the screen is empty": the
+            // header describes what the read produced, and the note below says
+            // what that means.
             self.text
-                .push_str("(empty — no accessibility tree available)\n");
+                .push_str("(empty — the accessibility read found no elements)\n");
+            // Nothing was read, so nothing here claims the desktop is bare.
+            // `tree_is_complete(&[])` used to be `true`, which made this the
+            // one case where "the read produced nothing" was drawn as "the
+            // tree is whole". A caller deciding whether to fall back to pixels
+            // needs the honest answer, and it is the same one the renderer
+            // already gives for a cut read.
+            self.incomplete = !UiElement::tree_is_complete(roots);
+            self.no_roots = roots.is_empty();
             if cfg!(not(feature = "vision")) && want_fallback {
                 self.text
                     .push_str("(UI detection unavailable: built without 'vision' feature)\n");
@@ -71,6 +89,14 @@ impl TreeOutline {
     /// The sentence to append when the read — not the renderer — stopped
     /// short, and `None` when the tree is whole.
     pub fn incomplete_note(&self) -> Option<&'static str> {
+        if self.no_roots {
+            return Some(
+                "(⚠ no accessibility tree was read — this desktop may publish none, or the \
+                 accessibility bridge may be missing; an element you cannot see may exist, and \
+                 neither a deeper read nor a retry will show it. Use the screenshot or screen \
+                 coordinates.)\n",
+            );
+        }
         self.incomplete.then_some(
             "(⚠ tree incomplete — the accessibility read stopped at its depth or element \
              limit; an element you cannot see may still exist)\n",
@@ -85,6 +111,15 @@ pub fn trust_line(ui_source: &str) -> String {
         ui_source,
         match ui_source {
             "omniparser" => "inferred from pixels — treat roles/names as guesses, verify visually",
+            // OCR read these characters; they are on the screen, but what they
+            // *are* (a button, a label, a sentence) is still a guess.
+            "ocr" =>
+                "transcribed from pixels — the words are on screen, but what you can \
+                      click is a guess",
+            // A vision model answering the narrow "list the controls" question:
+            // same standing as a local detector, and it is the one source where
+            // saying "authoritative" would be the opposite of the truth.
+            "api-vision" => "proposed from pixels — treat roles/names as guesses, verify visually",
             _ => "authoritative — element ids address real accessibility elements",
         }
     )

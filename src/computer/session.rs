@@ -41,7 +41,7 @@ use crate::computer::vision::{
 };
 use crate::computer::{
     ActionEffect, ActionResult, ActionTarget, ClickTarget, ComputerAdapter, ComputerError,
-    DeliveryMode, DesktopAction, Escalation, Rung, Screenshot, UiElement,
+    DeliveryMode, DesktopAction, Escalation, Rect, Rung, Screenshot, UiElement,
 };
 
 /// How long to wait for the screen to stop changing after an action.
@@ -1471,6 +1471,12 @@ impl ComputerSession {
     /// bounds change. For everything else a `moved:`-only diff is the desktop
     /// reflowing, not the action landing — and reporting it as verified is
     /// how a click that did nothing kept telling the model it had worked.
+    ///
+    /// When the action aimed at a place and the diff can say where its pixels
+    /// changed, the aim is recorded on the diff and a change that happened
+    /// only elsewhere is not counted as verification: the screen moved, but
+    /// nothing here says because of this action. Without that test a clock
+    /// repainting in the corner counted as proof the click landed.
     async fn verify_by_diff(
         &self,
         action: &DesktopAction,
@@ -1493,20 +1499,114 @@ impl ComputerSession {
         let before =
             ScreenState::from_parts(tree_before.unwrap_or(&[]).to_vec(), shot_before.clone());
         let after = ScreenState::from_parts(tree_after, shot_after.clone());
-        let diff = before.diff(&after);
+        let mut diff = before.diff(&after);
+        if let Some(aim) = self.aim_in_image(action, shot_after).await {
+            diff = diff.with_aim(aim);
+        }
         let changed = diff.evidences_action(action_changes_geometry(action));
-        if !changed {
+        let landed_elsewhere = diff.changed_elsewhere();
+        if landed_elsewhere {
+            tracing::info!(
+                "verification: the screen changed, but not where the action aimed ({})",
+                diff.summary()
+            );
+        } else if !changed {
             tracing::info!(
                 "verification: no change attributable to the action ({})",
                 diff.summary()
             );
         }
-        let verdict = if changed {
+        // A change away from the target is not a failure — it is the absence
+        // of evidence either way. A link in a long page navigates without the
+        // link's own pixels changing, so "nothing moved where I clicked" is
+        // routinely true of a click that worked. What it does mean is that
+        // this diff cannot stand as proof *this* action landed, which is
+        // exactly `Unverifiable`: no counter moves, nothing rolls back, and
+        // the model is told the screen moved somewhere else.
+        let verdict = if landed_elsewhere {
+            StepVerification::Unverifiable
+        } else if changed {
             StepVerification::Verified
         } else {
             StepVerification::Failed
         };
         Ok((verdict, Some(diff)))
+    }
+
+    /// The box an action was aimed at, in the pixels of the compared capture.
+    ///
+    /// `None` whenever the answer would be a guess: an action with no target
+    /// (a key press, a launch), a target that no longer resolves, an element
+    /// whose geometry was not published, or a capture whose pixel-to-point
+    /// mapping the session never learned. Each of those is "not established",
+    /// and the diff falls back to the traffic-light answer rather than
+    /// claiming the change happened somewhere it did not.
+    ///
+    /// A bare coordinate aims at the pointer, and what a click causes is
+    /// usually drawn at or beside it — a context menu opens just below the
+    /// cursor — so the box is padded by a couple of diff blocks. An element's
+    /// box is padded too: a button's own pixels often do not change when it
+    /// opens a menu *next to* it, and the box is a claim about where the
+    /// action could plausibly show, not a pixel mask.
+    async fn aim_in_image(&self, action: &DesktopAction, screenshot: &Screenshot) -> Option<Rect> {
+        /// Half-width, in screen points, of the box a bare coordinate aims at.
+        const POINT_AIM_PADDING: i32 = 32;
+        /// How far outside an element's published box its effect may show.
+        ///
+        /// It has to be generous enough to keep a menu opening under its
+        /// button inside the box, and tight enough that a repaint in a far
+        /// corner is still excluded. One diff block (32 px) covers the usual
+        /// dropdown offset, and a little more covers menubars and tooltips.
+        const ELEMENT_AIM_PADDING: i32 = 48;
+
+        let target = match action {
+            DesktopAction::Click { target, .. }
+            | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Type { target: Some(target), .. } => target,
+            // A drag's effect may appear anywhere along the path, and a
+            // scroll's content moves under the pointer; neither has one box
+            // whose change would be evidence.
+            _ => return None,
+        };
+        // The changed regions are in image pixels, so the aim must be too.
+        // Without the mapping, absolution is impossible: on a Retina display
+        // screen points are half the pixel count.
+        let space = self.coordinate_space().await?;
+        if space.image_width != screenshot.width || space.image_height != screenshot.height {
+            return None;
+        }
+        let padded = |rect: Rect, padding: i32| {
+            Rect::new(
+                rect.x.saturating_sub(padding),
+                rect.y.saturating_sub(padding),
+                rect.width
+                    .saturating_add((padding * 2) as u32)
+                    .max(rect.width),
+                rect.height
+                    .saturating_add((padding * 2) as u32)
+                    .max(rect.height),
+            )
+        };
+        let point_box = |point: crate::computer::Point| {
+            padded(Rect::new(point.x, point.y, 0, 0), POINT_AIM_PADDING)
+        };
+        let screen_rect = match target {
+            ClickTarget::Coordinate(point) => point_box(*point),
+            other => {
+                let resolved = self.adapter.resolve_target(other).await.ok()?;
+                let bounds = resolved
+                    .element
+                    .as_ref()
+                    .and_then(|element| element.bounds)
+                    .filter(|bounds| bounds.width > 0 && bounds.height > 0);
+                match (bounds, resolved.point) {
+                    (Some(bounds), _) => padded(bounds, ELEMENT_AIM_PADDING),
+                    (None, Some(point)) => point_box(point),
+                    (None, None) => return None,
+                }
+            }
+        };
+        Some(space.screen_rect_to_image(&screen_rect))
     }
 
     /// Record an action that failed before it could be verified.
@@ -3563,5 +3663,166 @@ mod tests {
         let diff = outcome.diff.expect("a diff");
         assert!(!diff.has_meaningful_changes(), "{}", diff.summary());
         assert_eq!(outcome.verification, StepVerification::Failed);
+    }
+
+    /// A desktop whose only change is somewhere the click never aimed.
+    ///
+    /// The baseline frame is blank; every frame after it has one repainted
+    /// block at `block`. That is a clock ticking in the corner, a notification
+    /// fading, a neighbouring window redrawing — the screen really did change,
+    /// and none of it is evidence the click landed.
+    #[cfg(feature = "vision")]
+    struct CornerPaintingAdapter {
+        captures: std::sync::Mutex<usize>,
+        block: Rect,
+    }
+
+    #[cfg(feature = "vision")]
+    impl CornerPaintingAdapter {
+        fn new(block: Rect) -> Self {
+            Self {
+                captures: std::sync::Mutex::new(0),
+                block,
+            }
+        }
+
+        /// A 200x200 frame, blank on the first capture and painted afterwards.
+        fn frame(&self) -> Screenshot {
+            use base64::Engine as _;
+            let mut count = self.captures.lock().expect("lock");
+            let painted = *count > 0;
+            *count += 1;
+            let mut img = image::RgbImage::new(200, 200);
+            if painted {
+                for y in self.block.y as u32..(self.block.y as u32 + self.block.height) {
+                    for x in self.block.x as u32..(self.block.x as u32 + self.block.width) {
+                        img.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                    }
+                }
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .expect("a PNG");
+            Screenshot::new(
+                base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                200,
+                200,
+            )
+        }
+    }
+
+    #[cfg(feature = "vision")]
+    #[async_trait::async_trait]
+    impl ComputerAdapter for CornerPaintingAdapter {
+        async fn screenshot(&self, _region: Option<Rect>) -> crate::computer::Result<Screenshot> {
+            Ok(self.frame())
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(&self, _action: DesktopAction) -> crate::computer::Result<ActionResult> {
+            Ok(ActionResult::success("clicked"))
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: WaitCondition,
+            _timeout: Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+
+        async fn display_geometry(
+            &self,
+        ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+            Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                0, 0, 200, 200,
+            )
+            .primary()]))
+        }
+    }
+
+    #[cfg(feature = "vision")]
+    fn corner_session(adapter: &Arc<CornerPaintingAdapter>) -> ComputerSession {
+        ComputerSession::new(adapter.clone()).with_config(SessionConfig {
+            settle: SettleConfig {
+                initial_delay_ms: 0,
+                poll_interval_ms: 0,
+                max_rounds: 1,
+                stable_threshold: 0.5,
+                min_window_ms: 0,
+            },
+            ..SessionConfig::default()
+        })
+    }
+
+    /// The user-facing bug this pins: "the click aimed correctly" and "the
+    /// click took effect" used to be one answer, because verification only
+    /// asked whether the screen changed at all. A corner repaint counted as
+    /// proof that a click at (10,10) worked.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_change_far_from_the_click_does_not_verify_it() {
+        let adapter = Arc::new(CornerPaintingAdapter::new(Rect::new(150, 150, 32, 32)));
+        let session = corner_session(&adapter);
+        let outcome = session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(10, 10)),
+                button: MouseButton::Left,
+            })
+            .await
+            .expect("an outcome");
+
+        let diff = outcome.diff.expect("a diff");
+        assert!(diff.has_meaningful_changes(), "the screen did change: {}", diff.summary());
+        assert!(diff.evidences_action(false), "and the diff knows it");
+        assert_eq!(
+            diff.aim.as_ref().map(|aim| aim.at_target),
+            Some(false),
+            "but not where the click aimed"
+        );
+        assert_eq!(
+            outcome.verification,
+            StepVerification::Unverifiable,
+            "a change elsewhere is not this click working, and it is not proof it \
+             failed either: {}",
+            diff.summary()
+        );
+        assert_eq!(
+            session.consecutive_failures().await,
+            0,
+            "an unattributed change must not accumulate as a failure"
+        );
+        assert!(
+            diff.summary_for_action(false).contains("elsewhere"),
+            "the model is told where the change was: {}",
+            diff.summary_for_action(false)
+        );
+    }
+
+    /// The control: the same adapter, the repaint under the click. The aim
+    /// test must not turn a working click into a failure.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_change_under_the_click_verifies_it() {
+        let adapter = Arc::new(CornerPaintingAdapter::new(Rect::new(0, 0, 32, 32)));
+        let session = corner_session(&adapter);
+        let outcome = session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(10, 10)),
+                button: MouseButton::Left,
+            })
+            .await
+            .expect("an outcome");
+
+        let diff = outcome.diff.expect("a diff");
+        assert_eq!(diff.aim.as_ref().map(|aim| aim.at_target), Some(true));
+        assert_eq!(outcome.verification, StepVerification::Verified, "{}", diff.summary());
     }
 }

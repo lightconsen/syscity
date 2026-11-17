@@ -94,14 +94,94 @@ const REC_DICT_URL: &str =
 /// dictionary takes OCR down entirely, so try both.
 const REC_DICT_MIRROR_URL: &str =
     "https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@main/ppocr/utils/en_dict.txt";
-/// Cached names. Versioned because a cache written by an earlier release holds
-/// a different recognition model under the old shared name, and reusing it
-/// would silently restore the misreads above.
+/// Model files this build knows how to look for.
+///
+/// Named once so the probe, the loader and the size estimate cannot drift:
+/// the probe is what decides whether a rung exists, and a name that disagrees
+/// with the loader turns a present model into "absent" and a run that refuses
+/// to look at a screen it could have read.
+///
+/// The OCR names are versioned because a cache written by an earlier release
+/// holds a different recognition model under the old shared name, and reusing
+/// it would silently restore the misreads above.
+pub const OMNIPARSER_FILE: &str = "omniparser.onnx";
+pub const DET_FILE: &str = "det.onnx";
 const REC_FILE: &str = "rec_ppocrv3.onnx";
 const REC_DICT_FILE: &str = "rec_dict_ppocrv3.txt";
 /// OmniParser UI-element detector.
 const OMNIPARSER_URL: &str =
     "https://hf-mirror.com/onnx-community/OmniParser-icon_detect_640x640/resolve/main/onnx/model.onnx";
+
+/// Which local models are already on this machine.
+///
+/// A `stat` probe, never a download: a run start is not the place to discover
+/// that an 88 MB fetch is needed. Kept as its own type because the two models
+/// do different jobs — the detector finds controls, OCR reads text the tree
+/// cannot — and a machine may have one without the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalModels {
+    /// `omniparser.onnx` is present: controls can be detected.
+    pub ui_detect: bool,
+    /// `det.onnx`, the recognition model and its dictionary are all present:
+    /// text can be read.
+    pub ocr: bool,
+}
+
+impl LocalModels {
+    pub fn ui_detect() -> Self {
+        Self { ui_detect: true, ocr: false }
+    }
+
+    pub fn ocr() -> Self {
+        Self { ui_detect: false, ocr: true }
+    }
+
+    pub fn both() -> Self {
+        Self { ui_detect: true, ocr: true }
+    }
+
+    /// Whether any local model could answer.
+    pub fn any(&self) -> bool {
+        self.ui_detect || self.ocr
+    }
+}
+
+/// Which models are present under the configured (or default) model directory.
+///
+/// Deliberately separate from [`vision_model_dir`]: the directory is a
+/// configuration question, this is a fact about the disk, and the run loop
+/// needs the fact before it decides which rung exists.
+pub fn local_models_present(configured_dir: &str) -> LocalModels {
+    let dir = vision_model_dir(configured_dir);
+    LocalModels {
+        ui_detect: dir.join(OMNIPARSER_FILE).is_file(),
+        // The recogniser is useless without its dictionary, so all three files
+        // have to be there before OCR is claimed present — a partial download
+        // must read as "absent", not as a run that fails halfway through.
+        ocr: dir.join(DET_FILE).is_file()
+            && dir.join(REC_FILE).is_file()
+            && dir.join(REC_DICT_FILE).is_file(),
+    }
+}
+
+/// Paths to the OCR models under the configured directory, when all exist.
+///
+/// `None` when any is missing: [`RapidOcr::new`] needs all three, and handing
+/// it a path that does not exist turns "this rung is unavailable" into a load
+/// error in the middle of a step.
+///
+/// [`RapidOcr::new`]: crate::computer::vision::ocr_rapid::RapidOcr::new
+pub fn ocr_model_paths(configured_dir: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let dir = vision_model_dir(configured_dir);
+    let det = dir.join(DET_FILE);
+    let rec = dir.join(REC_FILE);
+    let dict = dir.join(REC_DICT_FILE);
+    if det.is_file() && rec.is_file() && dict.is_file() {
+        Some((det, rec, dict))
+    } else {
+        None
+    }
+}
 
 /// Resolve the RapidOCR models only: detection, recognition and its
 /// dictionary.
@@ -120,7 +200,7 @@ pub async fn resolve_or_download_ocr_models() -> crate::computer::Result<OcrMode
         ))
     })?;
 
-    let det = resolve_single_model(&dir, "det.onnx", DET_URL).await?;
+    let det = resolve_single_model(&dir, DET_FILE, DET_URL).await?;
     let rec = resolve_single_model(&dir, REC_FILE, REC_URL).await?;
     let rec_dict =
         resolve_single_model_mirrored(&dir, REC_DICT_FILE, &[REC_DICT_URL, REC_DICT_MIRROR_URL])
@@ -143,7 +223,7 @@ pub async fn resolve_or_download_vision_models() -> crate::computer::Result<Visi
         ))
     })?;
 
-    let omniparser = resolve_single_model(&dir, "omniparser.onnx", OMNIPARSER_URL).await?;
+    let omniparser = resolve_single_model(&dir, OMNIPARSER_FILE, OMNIPARSER_URL).await?;
 
     let OcrModelPaths { det, rec, rec_dict } = resolve_or_download_ocr_models().await?;
 

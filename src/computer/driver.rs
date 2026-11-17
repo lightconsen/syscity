@@ -251,6 +251,11 @@ impl ModelDriver {
         let mut perception = plan_perception(PerceptionInputs {
             tree_complete: ctx.tree_complete,
             tree_read_failed: ctx.tree_read_failed.is_some(),
+            // A successful read with no roots at all is the tree-less case: the
+            // read worked, and the app published nothing. Judged from the tree
+            // the prompt will show (pruning folds windows, it never drops
+            // roots), so the sentence and the outline cannot disagree.
+            tree_unread: ctx.tree.is_empty() && ctx.tree_read_failed.is_none(),
             last_verified: state.last_verified,
             consecutive_failures: state.consecutive_failures,
             model_supports_vision: ctx.model_supports_vision,
@@ -341,10 +346,11 @@ impl ModelDriver {
         // platform reports, the other is what a detector guessed from pixels.
         if let Some(vision) = ctx.vision.as_ref().filter(|v| !v.is_empty()) {
             wire.push_str("\nDetected from the screenshot:\n");
+            let source = vision.outline_source();
             let mut seen = TreeOutline::default();
             seen.push_tree(
                 &vision.snapshot.roots,
-                "omniparser",
+                source,
                 // A scan is an addition to the tree, not a replacement for
                 // it; half the tree's budget is enough to name what is on
                 // screen without pushing the tree itself out.
@@ -354,7 +360,7 @@ impl ModelDriver {
                 &std::collections::HashMap::new(),
             );
             wire.push_str(&seen.text);
-            wire.push_str(&crate::computer::tree_render::trust_line("omniparser"));
+            wire.push_str(&crate::computer::tree_render::trust_line(source));
             wire.push_str(&vision.note());
             wire.push('\n');
         }
@@ -878,13 +884,36 @@ mod tests {
 
     fn ctx(tree_complete: bool) -> StepContext {
         StepContext {
-            tree: vec![],
+            // A cut tree is a tree that has something in it: the read stopped
+            // part way through what it found. A whole tree has a whole root.
+            // Neither is empty, because an empty list is the *third* case — an
+            // app that publishes no tree — and `compose` distinguishes it by
+            // looking at the tree, so an empty fixture would silently turn
+            // every truncated-tree assertion into a tree-less one.
+            tree: vec![root(tree_complete)],
             tree_complete,
             tree_read_failed: None,
             screenshot: Some(screenshot()),
             model_supports_vision: true,
             image_budget_available: true,
             vision: None,
+        }
+    }
+
+    /// One window: whole when `complete`, cut by the read's limit otherwise.
+    fn root(complete: bool) -> crate::computer::types::UiElement {
+        crate::computer::types::UiElement {
+            id: "window-1".to_string(),
+            role: "window".to_string(),
+            label: Some("Calculator".to_string()),
+            value: None,
+            bounds: Some(crate::computer::types::Rect::new(0, 0, 400, 300)),
+            enabled: crate::computer::types::Tri::Unknown,
+            focused: crate::computer::types::Tri::Unknown,
+            actions: None,
+            children: vec![],
+            children_count: Some(if complete { 0 } else { 9 }),
+            truncated: !complete,
         }
     }
 

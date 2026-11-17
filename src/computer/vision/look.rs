@@ -52,6 +52,7 @@ use crate::providers::{CompletionRequest, Message, Provider};
 /// lookup that has to read 12 MB of weights off disk once per process is a
 /// different kind of wait. It is still bounded, because a corrupt model must
 /// not hold a step open forever.
+#[cfg_attr(not(feature = "vision"), allow(dead_code))] // only the local rungs load models
 const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Largest number of controls accepted from an API answer.
@@ -62,6 +63,15 @@ const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_API_ELEMENTS: usize = 20;
 
 const VISION_MAX_TOKENS: u32 = 900;
+
+/// Longest label a single element may carry.
+///
+/// OCR text is a whole line, often a sentence; the decision prompt renders
+/// every label, and an element labelled with a paragraph crowds out the rest
+/// of the tree. The cut keeps the beginning, which is where a control's own
+/// word ("Save", "Cancel", "Invoice total") lives.
+#[cfg_attr(not(feature = "vision"), allow(dead_code))] // used only by the local rungs
+const MAX_LABEL_CHARS: usize = 120;
 
 /// The narrow question asked of an API vision model.
 ///
@@ -101,7 +111,12 @@ impl ApiVision {
 /// What one visual lookup produced.
 #[derive(Debug, Clone)]
 pub struct VisionElements {
-    /// `"local"` or `"api"` — where the elements came from.
+    /// Where the elements came from: `"local"` (the UI detector), `"local-ocr"`
+    /// (the text reader), or `"api"`.
+    ///
+    /// Kept as a `&'static str` because it is written into the run's status and
+    /// the decision prompt, both of which outlive the scan; the three values
+    /// are the whole vocabulary.
     pub source: &'static str,
     /// The detected controls, with ids assigned.
     ///
@@ -133,14 +148,37 @@ impl VisionElements {
         self.snapshot.resolve_id(id)?.point
     }
 
+    /// The outline header for this scan's source.
+    ///
+    /// The outline says where its lines came from, and the three sources do
+    /// not carry the same authority: a detector drew boxes, OCR transcribed
+    /// words, an API model wrote prose. Rendering them all as `omniparser`
+    /// told the model that transcribed text was a guessed control.
+    pub fn outline_source(&self) -> &'static str {
+        match self.source {
+            "local-ocr" => "ocr",
+            "api" => "api-vision",
+            _ => "omniparser",
+        }
+    }
+
     /// The sentence that goes into the decision prompt.
     pub fn note(&self) -> String {
-        let source = match self.source {
-            "local" => "a local visual scan",
-            _ => "a vision model",
+        let source = if self.source.starts_with("local") {
+            "a local visual scan"
+        } else {
+            "a vision model"
+        };
+        // What the scan produced is not the same claim for every rung: a
+        // detector's boxes are guesses at what is clickable, while OCR's lines
+        // are a transcription of text that is definitely on the screen.
+        let what = if self.source == "local-ocr" {
+            "text lines"
+        } else {
+            "controls"
         };
         let mut note = format!(
-            "( {source} added {} controls to the tree above; they were inferred from pixels, \
+            "( {source} added {} {what} to the tree above; they were inferred from pixels, \
              so treat their roles and labels as guesses and verify them against the screen )",
             self.len()
         );
@@ -169,7 +207,14 @@ impl LookOutcome {
     pub fn status(&self) -> String {
         match self {
             LookOutcome::Found(found) => {
-                format!("{}: {} controls", found.source, found.len())
+                // "5 controls" and "5 text lines" are different claims, and the
+                // run log is read by whoever has to explain a bad click.
+                let what = if found.source == "local-ocr" {
+                    "text lines"
+                } else {
+                    "controls"
+                };
+                format!("{}: {} {what}", found.source, found.len())
             }
             LookOutcome::Unavailable(reason) => {
                 format!("unavailable: {}", reason.explain())
@@ -186,10 +231,15 @@ pub struct VisionLook {
     image_limit: ImageLimit,
     #[cfg(feature = "vision")]
     detector: SharedDetector,
+    #[cfg(feature = "vision")]
+    ocr: SharedOcr,
 }
 
 #[cfg(feature = "vision")]
 type SharedDetector = Arc<Mutex<Option<crate::computer::vision::ui_onnx::OmniParserDetector>>>;
+
+#[cfg(feature = "vision")]
+type SharedOcr = Arc<Mutex<Option<crate::computer::vision::ocr_rapid::RapidOcr>>>;
 
 /// The process-wide detector, loaded at most once.
 ///
@@ -204,6 +254,20 @@ fn shared_detector() -> SharedDetector {
     SHARED.get_or_init(|| Arc::new(Mutex::new(None))).clone()
 }
 
+/// The process-wide OCR engine, loaded at most once.
+///
+/// Same reason as [`shared_detector`]: the two ONNX sessions cost seconds to
+/// load, and the run loop asks for a look many times. The engine is built from
+/// whichever model directory was configured on first use; a later run pointed
+/// at a different directory still gets an answer from the files the process
+/// already holds, which is the same trade the detector makes.
+#[cfg(feature = "vision")]
+fn shared_ocr() -> SharedOcr {
+    use std::sync::OnceLock;
+    static SHARED: OnceLock<SharedOcr> = OnceLock::new();
+    SHARED.get_or_init(|| Arc::new(Mutex::new(None))).clone()
+}
+
 impl VisionLook {
     pub fn new(resolver: VisionResolver, api: Option<ApiVision>) -> Self {
         Self {
@@ -212,6 +276,8 @@ impl VisionLook {
             image_limit: ImageLimit::default(),
             #[cfg(feature = "vision")]
             detector: shared_detector(),
+            #[cfg(feature = "vision")]
+            ocr: shared_ocr(),
         }
     }
 
@@ -289,9 +355,9 @@ impl VisionLook {
     ) -> Result<VisionElements, String> {
         match source {
             VisionSource::Unavailable(reason) => Err(reason.explain().to_string()),
-            VisionSource::Local(_) => {
-                let elements = self.local(shot).await?;
-                Ok(self.finish(elements, shot, geometry, "local"))
+            VisionSource::Local(model) => {
+                let (elements, source) = self.local(*model, shot).await?;
+                Ok(self.finish(elements, shot, geometry, source))
             }
             VisionSource::Api { .. } => {
                 // Charge the call before making it. A vision call is a model
@@ -352,10 +418,69 @@ impl VisionLook {
     }
 
     /// The local ONNX rung.
+    ///
+    /// Two local models, and the resolver says which one answers. When both
+    /// are on disk the detector answers (it produces addressable controls) and
+    /// OCR is used to *label* those boxes — the detector knows a control is
+    /// there but never what it says, which left every detected element with
+    /// `label: None` and made them indistinguishable in the outline. A machine
+    /// with only the OCR models gets the text rung, which is the whole reason
+    /// `LocalModel::Ocr` exists: text drawn into a canvas or a PDF has no
+    /// control to detect but is exactly what OCR reads.
+    ///
+    /// Returns the elements and the source tag for them, because the two rungs
+    /// are not the same answer and the run's status must not pretend they are.
     #[cfg(feature = "vision")]
-    async fn local(&self, shot: &Screenshot) -> Result<Vec<UiElement>, String> {
-        use crate::computer::vision::ui_onnx::OmniParserDetector;
+    async fn local(
+        &self,
+        model: LocalModel,
+        shot: &Screenshot,
+    ) -> Result<(Vec<UiElement>, &'static str), String> {
+        match model {
+            LocalModel::UiDetect => {
+                let detected = self.detect_controls(shot).await?;
+                let mut elements =
+                    crate::computer::vision::ui_onnx::OmniParserDetector::to_ui_elements(detected);
+                // Labelling failure is not a detection failure: boxes without
+                // names are still clickable, so this is best-effort by design.
+                // Skipped outright when the OCR models are not installed, so a
+                // machine that downloaded only the detector does not pay a
+                // failed load on every step.
+                if self.resolver.has_ocr() {
+                    match self.read_text(shot).await {
+                        Ok(blocks) if !blocks.is_empty() => label_from_text(&mut elements, &blocks),
+                        Ok(_) => {}
+                        Err(why) => debug!("OCR could not label the detected controls: {why}"),
+                    }
+                }
+                Ok((elements, "local"))
+            }
+            LocalModel::Ocr => {
+                let blocks = self.read_text(shot).await?;
+                if blocks.is_empty() {
+                    return Err("the local OCR model read no text on this screen".to_string());
+                }
+                Ok((text_elements(&blocks), "local-ocr"))
+            }
+        }
+    }
 
+    /// A build without the `vision` feature cannot run a local model.
+    #[cfg(not(feature = "vision"))]
+    async fn local(
+        &self,
+        _model: LocalModel,
+        _shot: &Screenshot,
+    ) -> Result<(Vec<UiElement>, &'static str), String> {
+        Err("this build has no 'vision' feature, so no local model can run".to_string())
+    }
+
+    /// Detect controls with the local detector.
+    #[cfg(feature = "vision")]
+    async fn detect_controls(
+        &self,
+        shot: &Screenshot,
+    ) -> Result<Vec<crate::computer::vision::DetectedElement>, String> {
         let mut detector = self.detector_handle().await?;
         let shared = self.detector.clone();
         let shot = shot.clone();
@@ -387,13 +512,36 @@ impl VisionLook {
             // second rung for exactly this.
             return Err("the local model found no controls on this screen".to_string());
         }
-        Ok(OmniParserDetector::to_ui_elements(detected))
+        Ok(detected)
     }
 
-    /// A build without the `vision` feature cannot run a local model.
-    #[cfg(not(feature = "vision"))]
-    async fn local(&self, _shot: &Screenshot) -> Result<Vec<UiElement>, String> {
-        Err("this build has no 'vision' feature, so no local model can run".to_string())
+    /// Read the screen's text with the local OCR models, in image pixels.
+    #[cfg(feature = "vision")]
+    async fn read_text(
+        &self,
+        shot: &Screenshot,
+    ) -> Result<Vec<crate::computer::vision::TextBlock>, String> {
+        // Same shape as `detect_controls`: an engine out of the cache, run on
+        // its own task so the timeout can fire, handed back even when the
+        // caller above has already given up on it.
+        let mut engine = self.ocr_handle().await?;
+        let shared = self.ocr.clone();
+        let shot = shot.clone();
+        let task = tokio::spawn(async move {
+            let outcome = engine.detect_text(&shot).await;
+            *shared.lock().await = Some(engine);
+            outcome
+        });
+
+        match tokio::time::timeout(self.resolver.timeout(), task).await {
+            Ok(Ok(Ok(blocks))) => Ok(blocks),
+            Ok(Ok(Err(e))) => Err(format!("local OCR failed: {e}")),
+            Ok(Err(e)) => Err(format!("local OCR task failed: {e}")),
+            Err(_) => Err(format!(
+                "local OCR did not finish within {} s",
+                self.resolver.timeout().as_secs()
+            )),
+        }
     }
 
     /// Take the cached detector, loading it if this is the first use.
@@ -437,6 +585,57 @@ impl VisionLook {
         .map_err(|e| format!("could not load {}: {e}", path.display()))?;
 
         debug!("loaded the local vision model from {}", path.display());
+        Ok(loaded)
+    }
+
+    /// Take the cached OCR engine, loading it if this is the first use.
+    #[cfg(feature = "vision")]
+    async fn ocr_handle(&self) -> Result<crate::computer::vision::ocr_rapid::RapidOcr, String> {
+        use crate::computer::vision::model_download::ocr_model_paths;
+        use crate::computer::vision::ocr_rapid::RapidOcr;
+
+        {
+            let mut guard = self.ocr.lock().await;
+            if let Some(engine) = guard.take() {
+                return Ok(engine);
+            }
+        }
+
+        // `RapidOcr::new`, never `new_auto`: the latter downloads, and a run is
+        // not the place for an 88 MB fetch. The probe has already said the
+        // files are there; a `None` here means they went away since, which is
+        // "this rung is unavailable", not a reason to reach the network.
+        let Some((det, rec, dict)) = ocr_model_paths(&self.resolver.config().model_dir) else {
+            return Err(format!(
+                "no OCR models under {}",
+                crate::computer::vision::model_download::vision_model_dir(
+                    &self.resolver.config().model_dir
+                )
+                .display()
+            ));
+        };
+        let path = |p: std::path::PathBuf| {
+            p.to_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("the OCR model path is not valid UTF-8: {}", p.display()))
+        };
+        let (det, rec, dict) = (path(det)?, path(rec)?, path(dict)?);
+
+        let loaded = tokio::time::timeout(
+            MODEL_LOAD_TIMEOUT,
+            tokio::task::spawn_blocking(move || RapidOcr::new(&det, &rec, &dict)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "loading the OCR models did not finish within {} s",
+                MODEL_LOAD_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("the OCR model load task failed: {e}"))?
+        .map_err(|e| format!("could not load the OCR models: {e}"))?;
+
+        debug!("loaded the local OCR model");
         Ok(loaded)
     }
 
@@ -507,6 +706,102 @@ fn map_rect(space: &CoordinateSpace, bounds: Rect) -> Rect {
         bounds.y.saturating_add(bounds.height as i32),
     );
     Rect::new(left, top, (right - left).max(1) as u32, (bottom - top).max(1) as u32)
+}
+
+/// Give detected controls the text drawn inside them.
+///
+/// The detector knows *where* a control is, never what it says, so a scan used
+/// to produce a screenful of `button` with no labels — addressable by id and
+/// indistinguishable by name, which is barely an improvement over coordinates.
+/// OCR reads the words; the box a word falls inside is the control the word
+/// names.
+///
+/// A control keeps any label it already has (a richer source wins), and a
+/// control with no text inside it stays unlabelled rather than borrowing the
+/// nearest word: an icon-only button has no name, and inventing one is how a
+/// model learns to click the wrong thing confidently.
+#[cfg_attr(not(feature = "vision"), allow(dead_code))] // its tests run in every build
+fn label_from_text(elements: &mut [UiElement], blocks: &[crate::computer::vision::TextBlock]) {
+    for element in elements.iter_mut() {
+        if element
+            .label
+            .as_deref()
+            .is_some_and(|l| !l.trim().is_empty())
+        {
+            continue;
+        }
+        let Some(bounds) = element.bounds else {
+            continue;
+        };
+        let mut words: Vec<&crate::computer::vision::TextBlock> = blocks
+            .iter()
+            .filter(|block| block.bounds.overlaps(&bounds))
+            .collect();
+        if words.is_empty() {
+            continue;
+        }
+        // Reading order, so a label built from several blocks says what the
+        // control says rather than a shuffled version of it.
+        words.sort_by_key(|block| (block.bounds.y, block.bounds.x));
+        let mut label = words
+            .iter()
+            .map(|block| block.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if label.is_empty() {
+            continue;
+        }
+        if label.chars().count() > MAX_LABEL_CHARS {
+            label = label.chars().take(MAX_LABEL_CHARS).collect::<String>() + "…";
+        }
+        element.label = Some(label);
+    }
+}
+
+/// Turn recognized text blocks into elements.
+///
+/// The OCR rung's answer: each block of text becomes a `text` element carrying
+/// its own words as the label. It is not a control — nobody knows whether the
+/// words are a button, a heading or a sentence in a document — and saying
+/// `role: "text"` with the text as the label is the honest shape. It is still
+/// clickable by id when the box was mapped, which is what makes a tree-less
+/// screen addressable at all: the words on it become targets.
+#[cfg_attr(not(feature = "vision"), allow(dead_code))] // its tests run in every build
+fn text_elements(blocks: &[crate::computer::vision::TextBlock]) -> Vec<UiElement> {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let text = block.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let mut label: String = text.chars().take(MAX_LABEL_CHARS).collect();
+            if text.chars().count() > MAX_LABEL_CHARS {
+                label.push('…');
+            }
+            Some(UiElement {
+                id: String::new(),
+                role: "text".to_string(),
+                label: Some(label),
+                // The text here *is* the element — there is no separate value
+                // to read. Copying the label into `value` would render it
+                // twice in the outline (`text "Save" = "Save"`) and teach the
+                // model that a value is expected where none was read.
+                value: None,
+                bounds: Some(block.bounds),
+                // Same as the detector: a picture cannot say whether text
+                // accepts input, and claiming `enabled` would turn a guess
+                // into a pre-check that passes.
+                enabled: Tri::Unknown,
+                focused: Tri::Unknown,
+                actions: None,
+                children: Vec::new(),
+                children_count: None,
+                truncated: false,
+            })
+        })
+        .collect()
 }
 
 /// Read the API answer into elements.
@@ -648,7 +943,8 @@ pub(crate) mod test_support {
                 ..crate::config::VisionConfig::default()
             },
             crate::computer::vision::resolver::Availability {
-                local_model: false,
+                ui_detect: false,
+                ocr: false,
                 feature_enabled: true,
             },
         );
@@ -670,7 +966,8 @@ pub(crate) mod test_support {
                 ..crate::config::VisionConfig::default()
             },
             crate::computer::vision::resolver::Availability {
-                local_model: false,
+                ui_detect: false,
+                ocr: false,
                 feature_enabled: true,
             },
         );
@@ -734,7 +1031,8 @@ mod tests {
                 ..crate::config::VisionConfig::default()
             },
             crate::computer::vision::resolver::Availability {
-                local_model: local,
+                ui_detect: local,
+                ocr: false,
                 feature_enabled: true,
             },
         )
@@ -871,7 +1169,8 @@ mod tests {
         resolver = VisionResolver::new(
             config,
             crate::computer::vision::resolver::Availability {
-                local_model: true,
+                ui_detect: true,
+                ocr: false,
                 feature_enabled: cfg!(feature = "vision"),
             },
         );
@@ -915,7 +1214,8 @@ mod tests {
         let resolver = VisionResolver::new(
             config,
             crate::computer::vision::resolver::Availability {
-                local_model: true,
+                ui_detect: true,
+                ocr: false,
                 feature_enabled: cfg!(feature = "vision"),
             },
         );
@@ -961,6 +1261,170 @@ mod tests {
             .await;
         assert!(matches!(again, LookOutcome::Failed { .. }), "{}", again.status());
         assert_eq!(provider.calls(), 1);
+    }
+
+    /// The detector says *where*; OCR says *what*. A machine with both must
+    /// use both — a scan of unlabelled boxes is addressable but not nameable,
+    /// and `label: None` on every element was the state gap ③ started from.
+    #[test]
+    fn ocr_names_the_boxes_the_detector_found() {
+        use crate::computer::vision::TextBlock;
+
+        let mut elements = vec![
+            crate::computer::types::UiElement {
+                id: String::new(),
+                role: "button".to_string(),
+                label: None,
+                value: None,
+                bounds: Some(Rect::new(10, 20, 30, 10)),
+                enabled: Tri::Unknown,
+                focused: Tri::Unknown,
+                actions: None,
+                children: Vec::new(),
+                children_count: None,
+                truncated: false,
+            },
+            // An icon-only control: no text inside it, so it keeps no label.
+            crate::computer::types::UiElement {
+                id: String::new(),
+                role: "icon".to_string(),
+                label: None,
+                value: None,
+                bounds: Some(Rect::new(200, 200, 20, 20)),
+                enabled: Tri::Unknown,
+                focused: Tri::Unknown,
+                actions: None,
+                children: Vec::new(),
+                children_count: None,
+                truncated: false,
+            },
+        ];
+        let blocks = vec![
+            // Out of reading order on purpose: the label must be built in
+            // reading order, not in the order the detector emitted blocks.
+            TextBlock {
+                text: "new".to_string(),
+                confidence: 0.9,
+                bounds: Rect::new(25, 21, 10, 8),
+            },
+            TextBlock {
+                text: "File".to_string(),
+                confidence: 0.9,
+                bounds: Rect::new(12, 21, 12, 8),
+            },
+            TextBlock {
+                text: "stray".to_string(),
+                confidence: 0.9,
+                bounds: Rect::new(500, 500, 10, 8),
+            },
+        ];
+
+        label_from_text(&mut elements, &blocks);
+
+        assert_eq!(
+            elements[0].label.as_deref(),
+            Some("File new"),
+            "the words inside the box, in reading order"
+        );
+        assert_eq!(
+            elements[1].label, None,
+            "an icon with no text inside it must not borrow a neighbour's words"
+        );
+    }
+
+    /// A label that already exists wins: a richer source is not overwritten by
+    /// OCR text that happens to overlap the same box.
+    #[test]
+    fn ocr_does_not_overwrite_a_label_that_was_already_read() {
+        use crate::computer::vision::TextBlock;
+
+        let mut elements = vec![crate::computer::types::UiElement {
+            id: String::new(),
+            role: "button".to_string(),
+            label: Some("Save".to_string()),
+            value: None,
+            bounds: Some(Rect::new(10, 20, 30, 10)),
+            enabled: Tri::Unknown,
+            focused: Tri::Unknown,
+            actions: None,
+            children: Vec::new(),
+            children_count: None,
+            truncated: false,
+        }];
+        let blocks = vec![TextBlock {
+            text: "Sove".to_string(),
+            confidence: 0.4,
+            bounds: Rect::new(12, 21, 10, 8),
+        }];
+        label_from_text(&mut elements, &blocks);
+        assert_eq!(elements[0].label.as_deref(), Some("Save"));
+    }
+
+    /// The OCR rung's own answer: each block of text is a `text` element with
+    /// its words as the label and its box as bounds. Empty reads are dropped
+    /// rather than becoming elements with no name.
+    #[test]
+    fn recognized_text_becomes_addressable_text_elements() {
+        use crate::computer::vision::TextBlock;
+
+        let blocks = vec![
+            TextBlock {
+                text: "  Invoice total: 1234.50 USD  ".to_string(),
+                confidence: 0.9,
+                bounds: Rect::new(10, 20, 300, 20),
+            },
+            TextBlock {
+                text: "   ".to_string(),
+                confidence: 0.4,
+                bounds: Rect::new(0, 0, 5, 5),
+            },
+        ];
+        let elements = text_elements(&blocks);
+
+        assert_eq!(elements.len(), 1, "a blank read is not an element");
+        assert_eq!(elements[0].role, "text");
+        assert_eq!(elements[0].label.as_deref(), Some("Invoice total: 1234.50 USD"));
+        assert_eq!(elements[0].bounds, Some(Rect::new(10, 20, 300, 20)));
+        assert_eq!(elements[0].value, None, "the label is the text; no separate value");
+    }
+
+    /// A very long line is shortened rather than allowed to spend the whole
+    /// outline budget on itself.
+    #[test]
+    fn a_long_recognized_line_is_shortened() {
+        use crate::computer::vision::TextBlock;
+
+        let long = "word ".repeat(100);
+        let elements = text_elements(&[TextBlock {
+            text: long,
+            confidence: 0.9,
+            bounds: Rect::new(0, 0, 10, 10),
+        }]);
+        let label = elements[0].label.as_deref().expect("labelled");
+        assert_eq!(label.chars().count(), MAX_LABEL_CHARS + 1, "cut, with an ellipsis");
+        assert!(label.ends_with('…'));
+    }
+
+    /// The status line and the note are read by whoever explains a bad click,
+    /// so an OCR scan must not describe itself as a control detection.
+    #[test]
+    fn an_ocr_scan_says_it_read_text() {
+        use crate::computer::vision::TextBlock;
+
+        let (api, _provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+        let elements = text_elements(&[TextBlock {
+            text: "Continue".to_string(),
+            confidence: 0.9,
+            bounds: Rect::new(10, 20, 60, 20),
+        }]);
+        let found = look.finish(elements, &shot(100, 100), &geometry(), "local-ocr");
+
+        assert_eq!(found.outline_source(), "ocr");
+        assert!(found.note().contains("text lines"), "{}", found.note());
+        let status = LookOutcome::Found(found).status();
+        assert!(status.contains("text lines"), "{status}");
+        assert!(!status.contains("controls"), "{status}");
     }
 
     /// The contract the plan asks for: a detected control gets an id that the

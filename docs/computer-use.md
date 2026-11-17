@@ -144,10 +144,33 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
 |---|---|
 | `TreeIncomplete` | 树被深度/元素上限截断，语义不足以定位 |
 | `TreeUnreadable` | 树根本读不出来（不是短，是没有） |
+| `TreeUnread` | 读成功但一个 root 都没有——桌面没发布树，和"树是空的"不是一回事 |
 | `LastStepNotVerified` | 上一步没验证——没落地，或者没东西能验证 |
 | `RepeatedFailures` | 连续失败 ≥ 2，当前通道不管用 |
 
 触发原因写进 run 的步骤记录，所以"这一步为什么带图"事后能查。
+
+### L2.5 · 验证读"变化在哪里"，不只是"有没有变化"
+
+`ScreenDiff` 除了统计像素变化，还带着 `aim`（`AimCheck`）：动作瞄准的框，
+以及变化区域是否落在框里。框由 `session.rs` 的 `aim_in_image` 从目标算出来
+（坐标点按 32pt、元素按 48pt 膨胀后映射回图像像素），交给
+`ScreenDiff::with_aim`。
+
+验证裁决因此有三条：
+
+| 情况 | 裁决 |
+|---|---|
+| 变化落在瞄准框内，或树上有结构变化 | `Verified` |
+| 屏幕变了，但只在框外（时钟跳动、别的窗口重绘） | `Unverifiable`——"不是我证实的"，不是"失败了" |
+| 屏幕没变 | `Failed` |
+
+第二种情况不推任何计数，因为它证明的是"证据落在别处"，不是"动作没发生"——
+在长页面上点一个链接，链接自己的像素往往不变，整个页面却导航走了。
+
+两个保守处：变化区域列表最多留 8 个最大的框（`regions_truncated` 为真时，
+"框里没变化"不算数）；没有 `vision` 特征时字节采样给不出区域，`aim` 记为
+`None`，裁决退回原来的"有没有变化"。**不知道 ≠ 在别处。**
 
 ### L3 · 给图就给小的
 
@@ -200,6 +223,22 @@ run 结束时写一条 `RunSummary`：
 
 视觉路径的产物是**语义元素**（`to_ui_elements` → 并入 `UiSnapshot`，带合法
 `element_id`），不是裸坐标。这让视觉路和树路同构，模型拿到的仍是可寻址的东西。
+
+本地模型有两个，各自能单独缺席：
+
+| 模型 | 作用 | 产物 |
+|---|---|---|
+| `UiDetect`（OmniParser 检测） | 找控件框 | 控件元素，`label` 来自重叠的 OCR 文本 |
+| `Ocr`（RapidOCR） | 读屏幕上的字 | `role: "text"` 的元素，`label` 就是读出来的那行字 |
+
+`VisionLook` 按 `LocalModel` 分派：检测器给出框后，若本机也装了 OCR，
+就用重叠的文字给这些框补 `label`（检测器本身不认字，`ui_onnx.rs` 过去恒发
+`label: None`，等于发出一屏无名控件）；只有 OCR 没检测器时，整屏文字就是
+元素。`gen` 的原始来源（`"local"` / `"local-ocr"` / `"api"`）记在 run 状态里；
+渲染大纲时 `outline_source()` 把它翻成信任行认得的三个词——`"omniparser"` /
+`"ocr"` / `"api-vision"`，于是每种来源都有自己的信任行：
+"transcribed from pixels" 和 "inferred from pixels" 对模型的含义不同，而
+`"api-vision"` 不会被当成 accessibility 树说成 "authoritative"。
 
 视觉调用有超时（`[computer.vision] timeout_secs`，默认 10）：超时即降级，
 **绝不让视觉卡住整个 loop**——和 `update.status` 那次事故同一个教训。
@@ -392,6 +431,12 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 `UiElement` 并带 `element_id`，与树路径同构。但视觉会漏元素、会认错图标，也没有
 "这些 children 就是全部"这种结构性保证（`is_complete()` 只对树有意义）。
 计划能做的是更早触发 L2、更频繁验证、更早交还人类。**这仍是领域短板。**
+
+这里曾经还有一条**接线**缺陷，已经修掉：`tree_is_complete(&[])` 恒为 `true`，
+所以"读成功但一个 root 都没有"被当成完整树，第 0 步不触发视觉扫描——换再强的
+模型也永远不会被调用。现在三件事分开：读失败（`TreeUnreadable`）、读成功但零
+root（`TreeUnread`）、被深度/数量截断（`TreeIncomplete`），零 root 由
+`ImageTrigger::TreeUnread` 在会上第 0 步就要图。
 
 **"最小权限"是应用级，不是数据级。** `[computer] allow_apps` 能写"允许操作 Safari、
 禁止操作 1Password"，**不能**写"允许在这个 app 里点，但不允许把数据带出去"——

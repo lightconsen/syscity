@@ -135,6 +135,9 @@ impl ScreenState {
         ScreenDiff {
             pixel: pixel_diff(&self.screenshot, &after.screenshot),
             tree: tree_diff(&self.ui_tree, &after.ui_tree),
+            // Only the caller that dispatched the action knows where it
+            // aimed; see `ScreenDiff::with_aim`.
+            aim: None,
         }
     }
 }
@@ -144,6 +147,26 @@ impl ScreenState {
 pub struct ScreenDiff {
     pub pixel: PixelDiffResult,
     pub tree: TreeDiffResult,
+    /// Whether the pixel change happened where the action aimed, when the
+    /// caller knew where that was.
+    ///
+    /// Absent for actions that aim at no target (a key press, a launch) and
+    /// for a build whose diff carries no regions. It is filled in by the
+    /// caller that dispatched the action, because only that caller knows the
+    /// target — and without it the diff answered "did the screen change",
+    /// never "did the thing I clicked change", which is how a clock ticking
+    /// in the corner could stand in for a click that missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim: Option<AimCheck>,
+}
+
+/// Where an action aimed, and whether the change landed there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AimCheck {
+    /// The box the action aimed at, in the pixels of the compared capture.
+    pub target: Rect,
+    /// Whether a changed region overlapped that box.
+    pub at_target: bool,
 }
 
 impl ScreenDiff {
@@ -172,9 +195,17 @@ impl ScreenDiff {
     /// `move_window`, `resize_window`, `minimize_window`, `maximize_window`.
     /// For those a bounds change is the expected effect, not churn.
     pub fn evidences_action(&self, geometry_counts: bool) -> bool {
-        if self.pixel.change_percentage >= 0.5 {
-            return true;
-        }
+        self.pixel.change_percentage >= 0.5 || self.tree_evidences_action(geometry_counts)
+    }
+
+    /// The tree half of [`evidences_action`](Self::evidences_action).
+    ///
+    /// Split out because the two halves support different claims. A tree
+    /// change can be attributed to an element; a pixel change is only a
+    /// rectangle on the screen, and whether that rectangle is the thing the
+    /// action aimed at is a separate question that
+    /// [`evidences_effect_at`](Self::evidences_effect_at) answers.
+    pub fn tree_evidences_action(&self, geometry_counts: bool) -> bool {
         if !self.tree.added.is_empty() || !self.tree.removed.is_empty() {
             return true;
         }
@@ -229,6 +260,96 @@ impl ScreenDiff {
         }
     }
 
+    /// Whether the diff is evidence that *this* action did something.
+    ///
+    /// [`evidences_action`](Self::evidences_action) answers "did anything
+    /// change", which is not the same question once a click has a target. A
+    /// click aims at a control; a screen where only the clock ticked, a
+    /// notification faded, or a neighbouring window redrew has changed, and
+    /// none of it is evidence the click landed. That distinction is what makes
+    /// "aimed correctly" and "took effect" two claims instead of one.
+    ///
+    /// `target` is the box the action was aimed at, in the pixels of the
+    /// compared capture — the same space as `changed_regions`. A caller that
+    /// knows the target in screen points must map it first (see
+    /// [`CoordinateSpace::screen_rect_to_image`]).
+    ///
+    /// The tree half is answered by the caller's own action evidence: a
+    /// `value:`/`focus:` change on the target element is exact, and no region
+    /// test can improve on it. What this adds is the pixel half — where the
+    /// change happened.
+    ///
+    /// Returns `None` when the question cannot be answered — no target box,
+    /// or a diff that carries no regions (the sampled-byte fallback of a
+    /// build without `vision`, which cannot map bytes to pixels). `None` is
+    /// not `false`: the caller must fall back to the traffic-light answer
+    /// rather than report a failure it cannot substantiate.
+    ///
+    /// [`evidences_action`]: ScreenDiff::evidences_action
+    /// [`CoordinateSpace::screen_rect_to_image`]: crate::computer::display::CoordinateSpace::screen_rect_to_image
+    pub fn evidences_effect_at(&self, target: Rect) -> Option<bool> {
+        if self.pixel.changed_regions.is_empty() {
+            return None;
+        }
+        if self
+            .pixel
+            .changed_regions
+            .iter()
+            .any(|region| region.overlaps(&target))
+        {
+            return Some(true);
+        }
+        // The region list is capped at the largest few. When it was cut, a
+        // small change at the target may be in the part that was dropped, so
+        // "not among the regions" is not "not at the target".
+        if self.pixel.regions_truncated {
+            return None;
+        }
+        Some(false)
+    }
+
+    /// Record where the action aimed, when the diff can answer whether the
+    /// change landed there.
+    ///
+    /// Kept as a setter rather than an argument to `diff`: only the caller
+    /// that dispatched the action knows the target, and it knows it after the
+    /// two captures exist. A diff that cannot answer (no regions) records no
+    /// aim at all, so `None` still means "not established" rather than
+    /// "elsewhere".
+    pub fn with_aim(mut self, target: Rect) -> Self {
+        if let Some(at_target) = self.evidences_effect_at(target) {
+            self.aim = Some(AimCheck { target, at_target });
+        }
+        self
+    }
+
+    /// Whether the only change the diff found was somewhere the action did
+    /// not aim.
+    ///
+    /// The difference between a click that worked and a click that missed is
+    /// not "did the screen change" — a screen almost always changes. It is
+    /// whether the change happened where the action was aimed. When the diff
+    /// carries an [`AimCheck`] that says no, and the tree found nothing either,
+    /// nothing in this diff is evidence *for this action*: the pixels moved
+    /// somewhere else, and the tree saw nothing at all.
+    ///
+    /// `false` when no aim was recorded — an action with no target box (a key
+    /// press, a launch) or a build whose diff cannot map bytes to pixels. A
+    /// question nobody asked is not answered "elsewhere".
+    pub fn changed_elsewhere(&self) -> bool {
+        let Some(aim) = self.aim.as_ref() else {
+            return false;
+        };
+        if aim.at_target {
+            return false;
+        }
+        // A structural change is evidence *something* happened; the tree
+        // cannot say where, so it neither corroborates the aim nor rules it
+        // out. Only a diff whose entire content is pixels outside the target
+        // leaves the action unattributed.
+        !self.tree_evidences_action(false)
+    }
+
     /// The rendering of the facts, followed by what they do *not* establish.
     ///
     /// [`summary`](Self::summary) lists what moved; a page of `moved:` lines
@@ -236,7 +357,20 @@ impl ScreenDiff {
     /// up. The model reads the same text either way unless it is told which
     /// one it is looking at.
     pub fn summary_for_action(&self, geometry_counts: bool) -> String {
-        let summary = self.summary();
+        let mut summary = self.summary();
+        // Only when nothing else corroborates the action: a structural tree
+        // change is evidence something happened even if no pixel near the
+        // target moved, and saying "not evidence" then would contradict the
+        // `Verified` the same diff produces.
+        if self.changed_elsewhere() {
+            if let Some(aim) = self.aim.as_ref() {
+                summary.push_str(&format!(
+                    "\nNothing changed at or near ({},{}) {}x{}, where this action aimed — the \
+                     visible change is elsewhere. That is not evidence the action took effect.",
+                    aim.target.x, aim.target.y, aim.target.width, aim.target.height
+                ));
+            }
+        }
         if summary == "no visible change detected" || self.evidences_action(geometry_counts) {
             return summary;
         }
@@ -255,6 +389,14 @@ pub struct PixelDiffResult {
     pub change_percentage: f32,
     /// Bounding boxes of connected changed regions, largest first (max 8).
     pub changed_regions: Vec<Rect>,
+    /// Whether regions were dropped from `changed_regions` by the cap.
+    ///
+    /// The cap keeps the eight largest, so a region that is not listed is not
+    /// proof that nothing changed there — it may be a small change the list
+    /// had no room for. Anything comparing a target box against the regions
+    /// must treat a truncated list as "cannot say" rather than "no".
+    #[serde(default)]
+    pub regions_truncated: bool,
 }
 
 /// UI-tree comparison of two snapshots.
@@ -277,6 +419,15 @@ impl TreeDiffResult {
 /// Maximum diff entries per category before truncation.
 const MAX_DIFF_ENTRIES: usize = 20;
 
+/// How many changed regions a pixel diff keeps.
+///
+/// The list exists to tell a reader *where* the screen changed, and eight
+/// boxes is already more than a summary can use. Anything that must not miss
+/// a region has to check [`PixelDiffResult::regions_truncated`] instead of
+/// trusting the box that happened to be in the target.
+#[cfg(feature = "vision")]
+const MAX_CHANGED_REGIONS: usize = 8;
+
 // ── Pixel diff ─────────────────────────────────────────────────────────────
 
 /// Compare two screenshots. With the `vision` feature this decodes the PNGs
@@ -287,12 +438,14 @@ pub fn pixel_diff(before: &Screenshot, after: &Screenshot) -> PixelDiffResult {
         return PixelDiffResult {
             change_percentage: 0.0,
             changed_regions: Vec::new(),
+            regions_truncated: false,
         };
     }
     if before.width != after.width || before.height != after.height {
         return PixelDiffResult {
             change_percentage: 100.0,
             changed_regions: vec![Rect::new(0, 0, after.width, after.height)],
+            regions_truncated: false,
         };
     }
     pixel_diff_impl(&before.base64, &after.base64)
@@ -323,6 +476,8 @@ fn byte_sampled_diff(before_b64: &str, after_b64: &str) -> PixelDiffResult {
         return PixelDiffResult {
             change_percentage: 100.0,
             changed_regions: Vec::new(),
+            // Nothing could be compared, so no region list exists to be short.
+            regions_truncated: false,
         };
     }
     let step = 64;
@@ -331,6 +486,8 @@ fn byte_sampled_diff(before_b64: &str, after_b64: &str) -> PixelDiffResult {
     PixelDiffResult {
         change_percentage: (mismatches as f32 / samples as f32) * 100.0,
         changed_regions: Vec::new(),
+        // The byte fallback has no regions at all; emptiness already says so.
+        regions_truncated: false,
     }
 }
 
@@ -344,6 +501,7 @@ fn block_diff_bytes(before: &[u8], after: &[u8]) -> PixelDiffResult {
         _ => PixelDiffResult {
             change_percentage: 100.0,
             changed_regions: Vec::new(),
+            regions_truncated: false,
         },
     }
 }
@@ -361,6 +519,7 @@ fn block_diff_images(before: &image::DynamicImage, after: &image::DynamicImage) 
         return PixelDiffResult {
             change_percentage: 100.0,
             changed_regions: vec![Rect::new(0, 0, w, h)],
+            regions_truncated: false,
         };
     }
 
@@ -407,16 +566,21 @@ fn block_diff_images(before: &image::DynamicImage, after: &image::DynamicImage) 
         (changed_count as f32 / total as f32) * 100.0
     };
 
+    let (regions, truncated) = merge_changed_blocks(&changed, cols, rows, BLOCK);
     PixelDiffResult {
         change_percentage,
-        changed_regions: merge_changed_blocks(&changed, cols, rows, BLOCK),
+        regions_truncated: truncated,
+        changed_regions: regions,
     }
 }
 
-/// Flood-fill connected changed blocks and return bounding boxes,
-/// largest area first, capped at 8 regions.
+/// Flood-fill connected changed blocks into bounding boxes, largest first.
+///
+/// Returns the boxes and whether the cap dropped any. The second half is what
+/// lets a caller tell "no region overlapped the target" from "the region that
+/// did was not among the eight largest".
 #[cfg(feature = "vision")]
-fn merge_changed_blocks(changed: &[bool], cols: u32, rows: u32, block: u32) -> Vec<Rect> {
+fn merge_changed_blocks(changed: &[bool], cols: u32, rows: u32, block: u32) -> (Vec<Rect>, bool) {
     let mut visited = vec![false; changed.len()];
     let mut regions: Vec<Rect> = Vec::new();
 
@@ -461,8 +625,9 @@ fn merge_changed_blocks(changed: &[bool], cols: u32, rows: u32, block: u32) -> V
     }
 
     regions.sort_by_key(|r| std::cmp::Reverse(r.width as u64 * r.height as u64));
-    regions.truncate(8);
-    regions
+    let truncated = regions.len() > MAX_CHANGED_REGIONS;
+    regions.truncate(MAX_CHANGED_REGIONS);
+    (regions, truncated)
 }
 
 // ── Tree diff ──────────────────────────────────────────────────────────────
@@ -870,6 +1035,7 @@ mod tests {
             pixel: PixelDiffResult {
                 change_percentage: 0.0,
                 changed_regions: vec![],
+                regions_truncated: false,
             },
             tree: TreeDiffResult {
                 changed: vec![
@@ -878,6 +1044,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
+            aim: None,
         };
         assert!(diff.has_meaningful_changes(), "the screen did change");
         assert!(!diff.evidences_action(false), "but not because of the action");
@@ -891,6 +1058,7 @@ mod tests {
             pixel: PixelDiffResult {
                 change_percentage: 0.0,
                 changed_regions: vec![],
+                regions_truncated: false,
             },
             tree: TreeDiffResult {
                 changed: vec![
@@ -899,6 +1067,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
+            aim: None,
         };
         assert!(diff.evidences_action(false));
     }
@@ -938,8 +1107,10 @@ mod tests {
             pixel: PixelDiffResult {
                 change_percentage: 0.0,
                 changed_regions: vec![],
+                regions_truncated: false,
             },
             tree: TreeDiffResult::default(),
+            aim: None,
         };
         assert_eq!(diff.summary(), "no visible change detected");
         assert!(!diff.has_meaningful_changes());
@@ -951,12 +1122,14 @@ mod tests {
             pixel: PixelDiffResult {
                 change_percentage: 12.5,
                 changed_regions: vec![Rect::new(100, 140, 200, 160)],
+                regions_truncated: false,
             },
             tree: TreeDiffResult {
                 added: vec!["/window/button \"OK\"".to_string()],
                 removed: vec![],
                 changed: vec![],
             },
+            aim: None,
         };
         let s = diff.summary();
         assert!(s.contains("12.5%"));
@@ -1009,5 +1182,120 @@ mod tests {
         assert_eq!(diff.changed_regions.len(), 1);
         assert_eq!(diff.changed_regions[0].x, 32);
         assert_eq!(diff.changed_regions[0].y, 0);
+    }
+
+    /// A click that missed still leaves the screen changed — the clock ticks,
+    /// a notification fades. The whole point of `evidences_effect_at` is that
+    /// "something changed" and "the thing I clicked changed" are two answers.
+    #[test]
+    fn a_change_outside_the_target_is_not_evidence_the_click_landed() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 1.0,
+                changed_regions: vec![Rect::new(900, 0, 32, 32)],
+                regions_truncated: false,
+            },
+            tree: TreeDiffResult::default(),
+            aim: None,
+        };
+        let target = Rect::new(100, 100, 80, 24);
+        assert_eq!(diff.evidences_effect_at(target), Some(false));
+        assert!(diff.evidences_action(false), "the screen did change");
+
+        let diff = diff.with_aim(target);
+        assert_eq!(
+            diff.aim.as_ref().map(|aim| aim.at_target),
+            Some(false),
+            "the aim is recorded so the result can say where the change was"
+        );
+        assert!(
+            diff.changed_elsewhere(),
+            "the only evidence points somewhere the action never aimed"
+        );
+        let summary = diff.summary_for_action(false);
+        assert!(summary.contains("elsewhere"), "{summary}");
+        assert!(summary.contains("at or near (100,100) 80x24"), "{summary}");
+    }
+
+    #[test]
+    fn a_change_inside_the_target_is_evidence_the_click_landed() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 2.0,
+                changed_regions: vec![Rect::new(110, 104, 32, 32)],
+                regions_truncated: false,
+            },
+            tree: TreeDiffResult::default(),
+            aim: None,
+        }
+        .with_aim(Rect::new(100, 100, 80, 24));
+        assert_eq!(
+            diff.aim.as_ref().map(|aim| aim.at_target),
+            Some(true),
+            "the change overlapped the box"
+        );
+        assert!(!diff.changed_elsewhere());
+        assert_eq!(diff.summary_for_action(false), diff.summary());
+    }
+
+    /// A structural tree change cannot be located, so it neither corroborates
+    /// nor contradicts the aim: a dialog appearing is evidence *something*
+    /// happened, even if no pixel near the target moved.
+    #[test]
+    fn a_tree_change_keeps_an_off_target_pixel_change_from_being_dismissed() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 1.0,
+                changed_regions: vec![Rect::new(900, 0, 32, 32)],
+                regions_truncated: false,
+            },
+            tree: TreeDiffResult {
+                added: vec!["/window/dialog \"Save changes?\"".to_string()],
+                ..Default::default()
+            },
+            aim: None,
+        }
+        .with_aim(Rect::new(100, 100, 80, 24));
+        assert!(!diff.changed_elsewhere(), "the tree saw something happen");
+    }
+
+    /// The sampled-byte fallback of a build without `vision` reports a
+    /// percentage but no regions, so where the change was is unknown. Unknown
+    /// must not be recorded as "elsewhere": that would fail a click nobody
+    /// could check.
+    #[test]
+    fn a_diff_without_regions_records_no_aim_and_dismisses_nothing() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 4.0,
+                changed_regions: vec![],
+                regions_truncated: false,
+            },
+            tree: TreeDiffResult::default(),
+            aim: None,
+        }
+        .with_aim(Rect::new(100, 100, 80, 24));
+        assert!(diff.aim.is_none(), "no regions, no answer");
+        assert!(!diff.changed_elsewhere());
+        assert!(diff.evidences_action(false));
+    }
+
+    /// The region list keeps only the eight largest boxes. A target whose
+    /// change was dropped by that cap must not be reported as "changed
+    /// elsewhere" — the list is short, not the change absent.
+    #[test]
+    fn a_truncated_region_list_cannot_rule_the_target_out() {
+        let diff = ScreenDiff {
+            pixel: PixelDiffResult {
+                change_percentage: 9.0,
+                changed_regions: vec![Rect::new(900, 0, 320, 320)],
+                regions_truncated: true,
+            },
+            tree: TreeDiffResult::default(),
+            aim: None,
+        }
+        .with_aim(Rect::new(100, 100, 80, 24));
+        assert!(diff.aim.is_none(), "a truncated list cannot answer where the change was");
+        assert!(!diff.changed_elsewhere());
     }
 }
