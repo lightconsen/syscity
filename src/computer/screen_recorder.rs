@@ -640,19 +640,20 @@ async fn run_ffmpeg_capture(
 
     // Read raw RGBA frames from FFmpeg stdout.
     let mut reader = tokio::io::BufReader::new(stdout);
-    let _frame_size = (config.output_width * config.output_height * 4) as usize;
 
-    // If output dimensions are not set, detect them from the platform.
-    let (width, height) = if config.output_width == 0 || config.output_height == 0 {
-        match detect_screen_resolution().await {
+    // The frame size is what ffmpeg was told to *produce*, which is not always
+    // the screen: a region capture delivers region-sized frames, and reading
+    // full-screen-sized ones off that stream never completes a frame. This is
+    // the same rule `build_ffmpeg_command` applies to its input, stated once.
+    let (width, height) = match capture_size(&config) {
+        Some((w, h)) => (w, h),
+        None => match detect_screen_resolution().await {
             Some(res) => res,
             None => {
                 warn!("Could not detect screen resolution, falling back to 1920x1080");
                 (1920, 1080)
             }
-        }
-    } else {
-        (config.output_width, config.output_height)
+        },
     };
 
     let actual_frame_size = (width * height * 4) as usize;
@@ -729,6 +730,25 @@ async fn accept_frame(
     }
 }
 
+/// The frame size the capture will actually deliver, when it is known.
+///
+/// A region comes first because it is the one dimension ffmpeg is *told* to
+/// produce (`-video_size` on X11/Windows, a `crop` filter on macOS) and
+/// nothing downstream rescales it. `output_width`/`output_height` are the
+/// requested size and win only in the absence of a region; `None` means "the
+/// screen's own size, which only the platform can say".
+fn capture_size(config: &RecorderConfig) -> Option<(u32, u32)> {
+    if let Some(r) = config.region {
+        if r.width != 0 && r.height != 0 {
+            return Some((r.width, r.height));
+        }
+    }
+    if config.output_width != 0 && config.output_height != 0 {
+        return Some((config.output_width, config.output_height));
+    }
+    None
+}
+
 fn build_ffmpeg_command(
     config: RecorderConfig,
     ffmpeg_bin: &Path,
@@ -755,11 +775,16 @@ fn build_ffmpeg_command(
     {
         cmd.arg("-f").arg("avfoundation");
         if let Some(r) = config.region {
-            cmd.arg("-video_size")
-                .arg(format!("{}x{}", r.width, r.height))
-                .arg("-i")
-                .arg("1:"); // Capture display 1
-                            // TODO: apply offset crop
+            // `avfoundation` has no offset option of its own: `-video_size` on
+            // the input would ask the *device* for a size it does not support,
+            // not crop it. So the device is captured whole and the region is
+            // taken from it with a `crop` filter. Dropping the crop is what
+            // used to record the top-left corner while reporting the requested
+            // region — a recording of the wrong part of the screen is worse
+            // than no recording, because it looks like the right one.
+            cmd.arg("-i").arg("1:");
+            cmd.arg("-vf")
+                .arg(format!("crop={}:{}:{}:{}", r.width, r.height, r.x, r.y));
         } else {
             cmd.arg("-i").arg("1:");
         }
@@ -1113,6 +1138,73 @@ mod tests {
         let a = make_test_frame(100, 100, 0);
         let b = make_test_frame(200, 100, 0);
         assert_eq!(pixel_diff(&a, &b), 100 * 100);
+    }
+
+    /// A region capture must read region-sized frames off ffmpeg. Sizing the
+    /// read against the *screen* leaves the reader waiting for bytes that never
+    /// arrive: the capture then records nothing at all.
+    #[test]
+    fn a_region_capture_sizes_its_frames_to_the_region() {
+        let config = RecorderConfig {
+            region: Some(Rect {
+                x: 100,
+                y: 50,
+                width: 640,
+                height: 480,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(capture_size(&config), Some((640, 480)));
+    }
+
+    /// An explicit output size wins when there is no region to capture.
+    #[test]
+    fn an_explicit_output_size_is_used_without_a_region() {
+        let config = RecorderConfig {
+            output_width: 800,
+            output_height: 600,
+            ..Default::default()
+        };
+        assert_eq!(capture_size(&config), Some((800, 600)));
+    }
+
+    /// Nothing known: the platform has to be asked, and the caller can tell
+    /// that apart from "zero-sized frames".
+    #[test]
+    fn an_unconfigured_capture_has_no_size_of_its_own() {
+        assert_eq!(capture_size(&RecorderConfig::default()), None);
+    }
+
+    /// The command line says where the region is, on every platform. A macOS
+    /// region used to be *silently* dropped — it produced a recording of the
+    /// top-left corner under the requested region's name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_region_is_cropped_out_of_the_full_frame() {
+        let config = RecorderConfig {
+            region: Some(Rect {
+                x: 120,
+                y: 60,
+                width: 640,
+                height: 480,
+            }),
+            ..Default::default()
+        };
+        let cmd = build_ffmpeg_command(config, Path::new("ffmpeg")).expect("command");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("crop=640:480:120:60"),
+            "the requested region must be cropped, not recorded from the origin: {joined}"
+        );
+        assert!(
+            !joined.contains("-video_size"),
+            "a device-level size is not a crop: ffmpeg rejects it: {joined}"
+        );
     }
 
     /// A frame must reach the sink even when the buffer would drop it.
