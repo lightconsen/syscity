@@ -411,9 +411,9 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 | 方法 | 作用域 | 说明 |
 |--------|-------|-------------|
 | `computer.run` | `write` | 启动一个 run；返回 `run_id`、实际使用的 `model`、`model_supports_vision`、`max_steps` 与预算上限 |
-| `computer.status` | `read` | `{run_id}` 查单个 run，`{}` 列出全部（含已结束的，上限 20 条） |
+| `computer.status` | `read` | `{run_id}` 查单个 run，`{}` 列出全部（含已结束的，上限 20 条）；每个 run 带 `session_id`（发起它的会话，可空） |
 | `computer.control` | `write` | `{run_id, action}`，`action` ∈ `pause` / `resume` / `step` / `cancel` / `steer`（`steer` 必带非空 `message`） |
-| `computer.runs` | `read` | `{ include_finished? }` 列出**磁盘上被中断、可续跑**的 run（默认只列可续跑的） |
+| `computer.runs` | `read` | `{ include_finished? }` 列出**磁盘上被中断、可续跑**的 run（默认只列可续跑的，`true` 则连已结束的一起列出）；每项带 `session_id` / `turn_id` |
 | `computer.resume` | `write` | `{ run_id, confirm_sensitive? }` 从持久化状态里继续一个被中断的 run，从第 N+1 步接着跑 |
 | `computer.record_start` | `write` | `{ name? }` 开始录制：`computer` 工具的每一次成功动作都会被记下来 |
 | `computer.record_stop` | `write` | `{ name, description? }` 结束录制，存成 `workflows/<name>.json`，返回抽出的 `parameters` |

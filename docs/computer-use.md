@@ -22,7 +22,8 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
   后台 run → `computer.status` / `computer.step` 事件 → 交接单。
 - **成本受控**：文本优先的感知策略、按图片预算选的触发条件、run 级调用/图片上限、
   截图内容去重。
-- **过程可查**：`turns.replay` 把一轮的动作和它启动的 run 的步骤并成一条时间线。
+- **过程可查**：`turns.replay` 把一轮的动作和它启动的 run 的步骤并成一条时间线；
+  Web UI 的右侧分栏面板把当前会话的 run 逐步画出来（动作、截图、成本，只读）。
 - **跨重启可续**：检查点落盘，重启只提醒不自动续跑，人确认后从第 N+1 步接着走。
 - **越用越好**：失败 → badcase → 人工确认终态 → 回归用例 → shadow 验证 → 回滚。
 - **能录能放**：录制 `computer` 工具的成功动作，抽参数，回放前做歧义预检。
@@ -163,8 +164,9 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
 ### 截图去重
 
 `Screenshot.digest` 是 `sha256:<64 hex>`，与附件 CAS 的 key 同构
-（`src/computer/types.rs:604` 起）。连续两步屏幕没变时复用上一步的 ref：不重新
-编码、不重新上传、不再计费。
+（`src/computer/types.rs:615`，`Screenshot::new` 在构造时算好）。连续两步屏幕没变
+时复用上一步的 ref：`driver.rs` 的 `attach()` 按 digest 命中缓存，不解码、不重新
+编码；附件 CAS 也只存一份。
 
 被重复的图**会计费但不算进 run 的图片额度**——所以 `RunOutcome` 有两个数：
 `images_attached`（真正消耗额度的）和 `images_repeated`（被计费但没消耗额度的）。
@@ -340,34 +342,34 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 
 ## 6. 剩下的缺口
 
-原计划里没有兑现的条目。每条标注性质：**缺行为**（要写代码）还是**缺测试**
-（行为在，但没有能锁住它的用例）。
+原计划里没有兑现的条目，以及兑现了但故意只做到一半的。每条标注性质：
+**缺行为**（要写代码）、**缺测试**（行为在，但没有能锁住它的用例），
+或**明确不做**（做了会与别的东西冲突，理由在 §7）。
 
-### 6.1 前端的界面还没有 —— **缺行为**
+### 6.1 前端只到"看当前会话的 run" —— **已接线，剩三块不给**
 
-**已接线的部分**（不要和缺的那部分混在一起）：
+面板已经做了（`web/src/components/computer/ComputerPanel.tsx`）：标题栏的 Monitor
+按钮打开右侧分栏，列出本会话每次 run 的目标、阶段、结束说明、每步动作与结果、
+rung / 敏感 / verified·refused 判定、点开才加载的 before/after 截图，以及成本行
+（步数 · 模型调用 · 图片 · tokens）。**只读**——`computer.run` / `control` / `resume`
+在 UI 里依然没有入口，面板不能启动、暂停或操控。
 
-- **agent 侧**：`computer_run` 工具已注册（`src/gateway/mod.rs:754`）、已 `mark_privileged`
-  （`agent_spawn.rs:1412`）、提示词里的分工说明只在模型有这个工具时注入
-  （`prompt_builder.rs:599`）、`turns.replay` 能把 run 的步骤并进那一轮的时间线。
-  一个 turn 里模型可以直接说"把整个桌面目标交给 run"。
-- **WS 侧**：十个 `computer.*` 方法全部有 handler、dispatch、scope、测试。
-  任何持有 WS 连接的东西都能用——CLI 的 `ws::call(method, params)`
-  （`src/cli/ws.rs:58`）就是通用入口，`turns.replay` 同样。
+数据来自两条路，这是它能跨重载仍然对的原因：
+`computer.step` 事件（进程还活着时）+ `computer.runs` 落盘检查点（进程没了之后）。
+两条路都按 `session_id` 过滤：一个 run 属于发起它的会话，共享网关上别人的桌面
+不出现在你的面板里；没有 session 的 run（CLI、定时任务）保留，因为它的
+事件本来就广播给所有客户端。
 
-**缺的是渲染那一层**：`web/` 和 `desktop/` 里对 `computer.*` / `turns.replay` 的
-调用数是 **0**（`grep -rn 'computer\.' web/src` 零命中），构建产物 `dist/` 里也没有。
-也就是说：模型能在 turn 里拉起一个 run，人却**在浏览器里看不见**它的步骤、
-看不出它花了多少、也没有一个"这个 turn 的回放"可以点。
+**还没做的三块，都不是小缺口，是明确的取舍：**
 
-这不是计划没做完，是计划里没有这一项：计划把"过程可查"定义成**数据可查**
-（`turns.replay` 给出时间线），把"看得见"定义成**帧事件可推**（`computer.watch`）。
-把这两样接成 UI（run 的实时步骤面板、动作+截图的时间线播放器）是独立的一份工作，
-不在 A–G 任何阶段里。
+| 没做 | 现状 | 为什么现在不做 |
+|---|---|---|
+| **动作 + 截图的时间线播放器** | `turns.replay` 后端已经能把 run 的步骤并进一个 turn 的时间线，前端零调用 | 播放器和"当前 run 列表"是两种界面（回看 vs 看现在）。面板先解决"看得见"，回看是下一份工作 |
+| **移动端** | 面板只在 `md` 以上的分栏里存在（`App.tsx:1070` 的 `!isMobile`），手机上按钮也不显示 | 手机上分栏没有位置，塞进去会挤掉对话。移动端需要一个独立的全屏路由，不是把面板挪个位置 |
+| **`desktop/` 的独立实现** | `desktop/src` 里对 `computer.*` 零命中——但 `tauri.conf.json` 的 `frontendDist` 是 `../dist`，即桌面端跑的就是这份 web 产物 | 没有第二份 UI 要写，不是缺口 |
 
-今天要观察一个 run：`computer.status` 轮询、`computer.step` 事件、
-`computer.watch` 的 `computer.frame` 帧，或直接读 `turns.replay`。
-这是目前最值得补的缺口——引擎已经是"目标进、结果出"，缺的是最后一步"人看得见"。
+最后一行值得说清楚：旧版本这里写的是"`web/` 和 `desktop/` 都是零命中"。前半句
+已经变成事实的反面，后半句从来就不成立——桌面端不自己写界面。
 
 ### 6.2 明确能接受的两条"做不到"
 
@@ -474,6 +476,8 @@ Android 是例外：它在工具内部**按动作**门（`android/gate.rs`），
 | e2e | `tests/e2e/computer_play_tests.rs` | 录制 → 带新参数回放；视频开关；歧义预检拒单；watch 广播帧与停止 |
 | e2e | `tests/e2e/learning_loop_tests.rs` | 失败 → badcase → 人工确认 → 回归用例 → shadow 变差 → 回滚 |
 | e2e | `tests/e2e/computer_calculator_tests.rs` | 真屏幕（`skip_if_no_screen_capture`）：目标 → `Done` → 截图可读 |
+| e2e | `tests/e2e/planner_dag_tests.rs` | 3 读 + 1 写的真 DAG：读确实重叠（峰值并发 > 1，总耗时 < 串行）且写独占 |
+| UI | `web/e2e/computer.spec.mjs` | 面板：本会话的 run 可见、别的会话的 run 不可见、与 workspace 面板互斥（写一个检查点走真实的 `computer.runs` 读路径） |
 
 ---
 
