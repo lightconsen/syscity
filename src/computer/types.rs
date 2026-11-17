@@ -601,21 +601,42 @@ pub struct Screenshot {
     /// not natively supported by serde.
     #[serde(skip, default = "instant_now")]
     pub timestamp: std::time::Instant,
+    /// Content digest of the captured bytes, when they are known:
+    /// `sha256:<64 hex>`, the same key the attachment store files objects
+    /// under.
+    ///
+    /// Two captures of an unchanged screen have the same digest, which is what
+    /// lets a run stop re-encoding, re-uploading and re-billing an image it has
+    /// already sent. `None` means the bytes were not measured (a file-only
+    /// capture that has not been read yet, or a placeholder with no payload) —
+    /// an unknown digest must never compare equal to another unknown one, so
+    /// callers compare `Some` against `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 impl Screenshot {
     /// Construct with an in-memory base64 payload (no file backing).
+    ///
+    /// The digest is computed here when the payload decodes, so every consumer
+    /// of a capture sees the same key the store will file it under.
     pub fn new(base64: String, width: u32, height: u32) -> Self {
+        let digest = digest_of_base64(&base64);
         Self {
             base64,
             width,
             height,
             file_path: None,
             timestamp: std::time::Instant::now(),
+            digest,
         }
     }
 
     /// Construct with a file path reference (no base64 payload).
+    ///
+    /// The digest stays `None`: a path is not a measurement of what is behind
+    /// it, and nothing in the attach path reads the file (an attachment needs
+    /// the bytes in hand to send them), so an unknown digest costs nothing.
     pub fn with_file(file_path: std::path::PathBuf, width: u32, height: u32) -> Self {
         Self {
             base64: String::new(),
@@ -623,8 +644,31 @@ impl Screenshot {
             height,
             file_path: Some(file_path),
             timestamp: std::time::Instant::now(),
+            digest: None,
         }
     }
+}
+
+/// Decode a base64 payload and return its content digest.
+///
+/// Public because the driver needs the key for a `Screenshot` whose digest
+/// field was not populated (a platform adapter that built the struct by
+/// hand), and computing it a second way would be a second definition of the
+/// store key.
+pub fn digest_of_base64(base64: &str) -> Option<String> {
+    let bytes = base64_bytes(base64)?;
+    Some(crate::attachments::digest_of_bytes(&bytes))
+}
+
+/// Decode a standard base64 payload, or `None` when it is empty or invalid.
+fn base64_bytes(base64: &str) -> Option<Vec<u8>> {
+    if base64.is_empty() {
+        return None;
+    }
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(base64)
+        .ok()
 }
 
 /// Serde helper: default value for `#[serde(skip)]` timestamp fields.

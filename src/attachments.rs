@@ -155,6 +155,15 @@ fn cleanup_temp(tmp: &Path) {
     }
 }
 
+/// The store key of a byte payload: `sha256:<64 lowercase hex chars>`.
+///
+/// Public so a producer that wants to know whether it already has this object
+/// can compute the same key the store would — two spellings of the same bytes
+/// would defeat the dedup they both exist for.
+pub fn digest_of_bytes(bytes: &[u8]) -> String {
+    format!("{DIGEST_PREFIX}{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
 /// Store `bytes` under their sha256 digest and return the reference.
 ///
 /// Atomic: the payload is written to a unique temp file in the target
@@ -167,10 +176,14 @@ pub fn store_bytes(bytes: &[u8], mime: &str) -> io::Result<AttachmentRef> {
 
 /// [`store_bytes`] against an explicit store root (test seam).
 fn store_bytes_in(root: &Path, bytes: &[u8], mime: &str) -> io::Result<AttachmentRef> {
-    let hex_digest = hex::encode(sha2::Sha256::digest(bytes));
-    let path = object_path(root, &hex_digest);
+    let digest = digest_of_bytes(bytes);
+    let hex_digest = &digest[DIGEST_PREFIX.len()..];
+    let path = object_path(root, hex_digest);
+    // The temp name is derived before `digest` is moved into the reference.
+    let tmp_name =
+        format!(".{}.tmp-{}", &hex_digest[2..], &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let aref = AttachmentRef {
-        digest: format!("{DIGEST_PREFIX}{hex_digest}"),
+        digest,
         mime: mime.to_string(),
         size: bytes.len() as u64,
     };
@@ -181,11 +194,7 @@ fn store_bytes_in(root: &Path, bytes: &[u8], mime: &str) -> io::Result<Attachmen
         io::Error::new(io::ErrorKind::InvalidInput, "attachment path has no parent")
     })?;
     std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.tmp-{}",
-        &hex_digest[2..],
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let tmp = parent.join(tmp_name);
     if let Err(e) = write_private(&tmp, bytes) {
         cleanup_temp(&tmp);
         return Err(e);

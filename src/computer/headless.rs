@@ -237,13 +237,7 @@ impl VirtualDisplay for XvfbDisplay {
         let base64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &final_bytes);
 
-        Ok(Screenshot {
-            base64,
-            width: self.width,
-            height: self.height,
-            file_path: None,
-            timestamp: std::time::Instant::now(),
-        })
+        Ok(Screenshot::new(base64, self.width, self.height))
     }
 
     async fn shutdown(&mut self) -> Result<()> {

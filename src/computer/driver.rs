@@ -161,10 +161,27 @@ pub struct DecisionReport {
     pub image_attached: bool,
     /// Which condition asked for an image, when one was asked for.
     pub trigger: Option<ImageTrigger>,
+    /// Content digest of the image that went out, when one did.
+    ///
+    /// This is what lets the run tell "another picture" from "the same picture
+    /// again": two decisions against an unchanged screen carry the same digest,
+    /// and charging each of them would count one screen twice.
+    pub image_digest: Option<String>,
     /// Prompt tokens the provider reported, when it reported any.
     pub tokens_in: u64,
     /// Completion tokens the provider reported.
     pub tokens_out: u64,
+}
+
+/// One screenshot, ready to travel and named by its content.
+#[derive(Debug, Clone)]
+struct Attachment {
+    /// Base64 payload, already shrunk to the driver's image limit.
+    base64: String,
+    mime: &'static str,
+    /// Digest of the *source* bytes, so a repeated frame is recognisable
+    /// before it is decoded and re-encoded.
+    digest: String,
 }
 
 /// Decides the next action by asking a model provider.
@@ -177,6 +194,13 @@ pub struct ModelDriver {
     model: String,
     max_history: usize,
     attach_limit: crate::computer::image_budget::ImageLimit,
+    /// The last frame this driver encoded, kept so an unchanged screen is not
+    /// decoded and re-encoded for every step that looks at it.
+    ///
+    /// A `std::sync::Mutex` is right here: the critical section is a decode of
+    /// an in-memory buffer (no `.await` inside), and the driver is shared by
+    /// value across steps.
+    last_attachment: std::sync::Mutex<Option<Attachment>>,
 }
 
 impl ModelDriver {
@@ -186,6 +210,7 @@ impl ModelDriver {
             model: model.into(),
             max_history: HISTORY_IN_PROMPT,
             attach_limit: crate::computer::image_budget::ImageLimit::default(),
+            last_attachment: std::sync::Mutex::new(None),
         }
     }
 
@@ -214,7 +239,7 @@ impl ModelDriver {
         &self,
         state: &LoopState,
         ctx: &StepContext,
-    ) -> (String, String, PerceptionPlan, Option<(String, &'static str)>) {
+    ) -> (String, String, PerceptionPlan, Option<Attachment>) {
         // A visual scan answers the question an image would have been sent to
         // ask, and answers it in the same semantic form the tree uses. So when
         // one produced elements it *substitutes* for an attachment rather than
@@ -252,7 +277,6 @@ impl ModelDriver {
         } else {
             None
         };
-
         let mut wire = String::new();
         wire.push_str(&format!("Goal: {}\n", state.goal));
         wire.push_str(&format!("Step: {}\n", state.step));
@@ -395,10 +419,12 @@ impl ModelDriver {
 
         let mut message = Message::user(user);
         let mut image_attached = false;
+        let mut image_digest = None;
         if perception.attach_image {
-            if let Some((b64, mime)) = attachment {
-                message = message.with_image(b64, mime);
+            if let Some(attachment) = attachment {
+                message = message.with_image(attachment.base64, attachment.mime);
                 image_attached = true;
+                image_digest = Some(attachment.digest);
             }
         }
 
@@ -434,6 +460,7 @@ impl ModelDriver {
             } else {
                 None
             },
+            image_digest,
             tokens_in,
             tokens_out,
         })
@@ -444,17 +471,42 @@ impl ModelDriver {
     /// `None` when the screenshot carries no bytes (a file-only capture, or a
     /// headless placeholder): attaching an empty image is worse than attaching
     /// none, because the model is told to look and finds nothing.
-    fn attach(&self, shot: &Screenshot) -> Option<(String, &'static str)> {
+    ///
+    /// A screenshot whose content digest matches the last one this driver
+    /// encoded is served from the cache: the bytes are identical, so decoding
+    /// and re-encoding them would produce the same payload at the same cost.
+    /// The cache is keyed on the digest rather than on the `Screenshot` so two
+    /// separately captured frames of an unchanged screen also hit it.
+    fn attach(&self, shot: &Screenshot) -> Option<Attachment> {
         if shot.base64.is_empty() {
             return None;
         }
+        let digest = shot
+            .digest
+            .clone()
+            .or_else(|| crate::computer::types::digest_of_base64(&shot.base64))?;
+
+        if let Ok(cache) = self.last_attachment.lock() {
+            if let Some(last) = cache.as_ref().filter(|a| a.digest == digest) {
+                return Some(last.clone());
+            }
+        }
+
         use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD
             .decode(&shot.base64)
             .ok()?;
         let encoded =
             crate::computer::image_budget::encode_or_passthrough(&raw, &self.attach_limit).ok()?;
-        Some((encoded.base64, encoded.mime))
+        let attachment = Attachment {
+            base64: encoded.base64,
+            mime: encoded.mime,
+            digest,
+        };
+        if let Ok(mut cache) = self.last_attachment.lock() {
+            *cache = Some(attachment.clone());
+        }
+        Some(attachment)
     }
 }
 
@@ -1402,6 +1454,35 @@ mod tests {
             !text.contains("image of the screen is attached"),
             "the prompt must not promise an image it does not carry: {text}"
         );
+    }
+
+    /// Two decisions against an unchanged screen report the same image digest,
+    /// and the second one travels as the cached payload: the point of the
+    /// digest on `Screenshot` is that the run can recognise the repeat.
+    #[tokio::test]
+    async fn an_unchanged_screen_reports_the_same_image_digest() {
+        let provider = Arc::new(ScriptedProvider::answering(
+            r#"{"decision": "help", "reason": "cannot see"}"#,
+        ));
+        let driver = ModelDriver::new(provider.clone(), "test-model");
+        let context = ctx(false); // a truncated tree asks for an image
+
+        let first = driver.decide_reporting(&state(), &context).await.unwrap();
+        let second = driver.decide_reporting(&state(), &context).await.unwrap();
+
+        let first_digest = first.image_digest.expect("an image went out");
+        assert!(first.image_attached);
+        assert_eq!(
+            Some(first_digest),
+            second.image_digest,
+            "the same bytes must report the same digest, or the run cannot dedupe it"
+        );
+
+        // And it is the store's own key, so the summary and the CAS agree.
+        let shot = context.screenshot.as_ref().expect("a capture");
+        let expected = crate::computer::types::digest_of_base64(&shot.base64).expect("decodes");
+        assert_eq!(second.image_digest.as_deref(), Some(expected.as_str()));
+        assert!(expected.starts_with("sha256:"), "{expected}");
     }
 
     /// A model without vision must not be asked for one.

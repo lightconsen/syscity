@@ -95,13 +95,7 @@ fn create_white_text_screenshot(width: u32, height: u32, text_pixels: &[(u32, u3
     img.write_to(&mut buf, image::ImageFormat::Png)
         .expect("PNG encoding");
     let base64 = base64::engine::general_purpose::STANDARD.encode(&buf.into_inner());
-    Screenshot {
-        base64,
-        width,
-        height,
-        timestamp: std::time::Instant::now(),
-        file_path: None,
-    }
+    Screenshot::new(base64, width, height)
 }
 
 fn create_synthetic_ui_screenshot(width: u32, height: u32) -> Screenshot {
@@ -142,13 +136,7 @@ fn create_synthetic_ui_screenshot(width: u32, height: u32) -> Screenshot {
     img.write_to(&mut buf, image::ImageFormat::Png)
         .expect("PNG encoding");
     let base64 = base64::engine::general_purpose::STANDARD.encode(&buf.into_inner());
-    Screenshot {
-        base64,
-        width,
-        height,
-        timestamp: std::time::Instant::now(),
-        file_path: None,
-    }
+    Screenshot::new(base64, width, height)
 }
 
 // ── E2E Tests: RapidOCR ───────────────────────────────────────────────

@@ -100,6 +100,10 @@ pub struct RunBudget {
     limits: RunBudgetConfig,
     model_calls: usize,
     images_attached: usize,
+    /// Attachments that showed the frame a previous attachment already showed.
+    images_repeated: usize,
+    /// Digest of the last frame an attachment was charged for.
+    last_image_digest: Option<String>,
     tokens_in: u64,
     tokens_out: u64,
     exhausted: Option<Exhausted>,
@@ -111,6 +115,8 @@ impl RunBudget {
             limits,
             model_calls: 0,
             images_attached: 0,
+            images_repeated: 0,
+            last_image_digest: None,
             tokens_in: 0,
             tokens_out: 0,
             exhausted: None,
@@ -130,13 +136,27 @@ impl RunBudget {
     ///
     /// A resumed run continues the same spend, not a fresh allowance: handing it
     /// an empty budget would let one restart double what the caller permitted.
-    pub fn restore(limits: RunBudgetConfig, model_calls: usize, images_attached: usize) -> Self {
+    pub fn restore(
+        limits: RunBudgetConfig,
+        model_calls: usize,
+        images_attached: usize,
+        images_repeated: usize,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> Self {
         Self {
             limits,
             model_calls,
             images_attached,
-            tokens_in: 0,
-            tokens_out: 0,
+            images_repeated,
+            // The previous process's last frame is gone; a capture that repeats
+            // it is new to *this* process and is charged once here. That
+            // under-counts the run's repeats by at most one, which is the safe
+            // direction: the allowance, not the bill, is what must not be
+            // silently overspent.
+            last_image_digest: None,
+            tokens_in,
+            tokens_out,
             exhausted: None,
         }
     }
@@ -151,6 +171,62 @@ impl RunBudget {
 
     pub fn images_attached(&self) -> usize {
         self.images_attached
+    }
+
+    /// How many images the provider was sent in total, repeated frames
+    /// included.
+    ///
+    /// This is the bill. [`images_attached`](Self::images_attached) is the run's
+    /// *allowance* usage, which a repeated frame does not consume.
+    pub fn images_sent(&self) -> usize {
+        self.images_attached.saturating_add(self.images_repeated)
+    }
+
+    /// How many attached images showed a frame the run had already sent.
+    ///
+    /// Reported separately from `images_attached` because the two answer
+    /// different questions: the first says how much of the image spend bought
+    /// nothing new, the second how much of the allowance the run used.
+    pub fn images_repeated(&self) -> usize {
+        self.images_repeated
+    }
+
+    /// Prompt tokens the run has been billed for.
+    pub fn tokens_in(&self) -> u64 {
+        self.tokens_in
+    }
+
+    /// Completion tokens the run has been billed for.
+    pub fn tokens_out(&self) -> u64 {
+        self.tokens_out
+    }
+
+    /// Record an attachment and whether its frame was new.
+    ///
+    /// A frame the run has already attached is not charged to the allowance
+    /// again: the allowance exists to bound how many *different* screenshots a
+    /// run pays to capture, attach and store, and counting one unchanged screen
+    /// per step is how a stalled run spends the whole image budget re-sending
+    /// the same picture. The repeat is still recorded in `images_repeated`,
+    /// because the provider was sent it again and the run summary ought to say
+    /// how much of the bill bought nothing new.
+    ///
+    /// A digest of `None` is unknown, not equal to another unknown: it cannot
+    /// prove the frame repeated, so it is charged like a new one.
+    pub fn record_image(&mut self, digest: Option<&str>) -> Result<(), Exhausted> {
+        let repeated = matches!(
+            (digest, self.last_image_digest.as_deref()),
+            (Some(now), Some(prev)) if now == prev
+        );
+        if repeated {
+            self.images_repeated = self.images_repeated.saturating_add(1);
+            return Ok(());
+        }
+        self.record_images(1)?;
+        if let Some(digest) = digest {
+            self.last_image_digest = Some(digest.to_string());
+        }
+        Ok(())
     }
 
     /// Why the run is out of budget, once it is. Sticky: the first ceiling hit
@@ -238,6 +314,7 @@ impl RunBudget {
             steps,
             model_calls: self.model_calls,
             images_attached: self.images_attached,
+            images_repeated: self.images_repeated,
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
             stop_reason,
@@ -251,6 +328,13 @@ pub struct RunSummary {
     pub steps: usize,
     pub model_calls: usize,
     pub images_attached: usize,
+    /// How many of those images showed a frame an earlier one already showed.
+    ///
+    /// Zero on a run whose screen changed at every step. A high number says the
+    /// run kept looking at a screen it could not change — which is the
+    /// signature of a stalled run, not of an expensive one.
+    #[serde(default)]
+    pub images_repeated: usize,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub stop_reason: StopReason,
@@ -669,5 +753,55 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("model calls"), "{text}");
         assert!(text.contains("1/1"), "{text}");
+    }
+
+    /// The plan's acceptance item, on the accounting side: looking twice at an
+    /// unchanged screen must not spend the allowance twice.
+    #[test]
+    fn a_repeated_frame_does_not_consume_the_image_allowance() {
+        let mut b = budget(10, 5);
+        let frame = "sha256:aaaa";
+
+        b.record_image(Some(frame)).unwrap();
+        b.record_image(Some(frame)).unwrap();
+        b.record_image(Some(frame)).unwrap();
+
+        assert_eq!(b.images_attached(), 1, "one distinct screen, one charge");
+        assert_eq!(b.images_repeated(), 2, "and the repeats are still counted");
+        assert_eq!(b.images_sent(), 3, "the provider was sent three images");
+
+        // A different frame is new and is charged.
+        b.record_image(Some("sha256:bbbb")).unwrap();
+        assert_eq!(b.images_attached(), 2);
+        assert_eq!(b.images_repeated(), 2);
+    }
+
+    /// Repeating a frame after the ceiling was reached must not turn a spent
+    /// budget into a failure: the image was already paid for once.
+    #[test]
+    fn a_repeat_after_the_ceiling_is_not_an_error() {
+        let mut b = budget(10, 1);
+        b.record_image(Some("sha256:same")).unwrap();
+        // A new frame would be refused...
+        assert!(b.record_image(Some("sha256:other")).is_err());
+        // ...but the frame already sent is not a new purchase. The ceiling was
+        // reached, so the sticky flag says the run is over; what must not
+        // happen is the repeat being charged *and* refused a second time.
+        let mut fresh = budget(10, 1);
+        fresh.record_image(Some("sha256:same")).unwrap();
+        assert!(fresh.record_image(Some("sha256:same")).is_ok());
+        assert_eq!(fresh.images_attached(), 1, "one distinct frame, one charge");
+        assert_eq!(fresh.images_repeated(), 1);
+    }
+
+    /// An unknown digest proves nothing, so it cannot be read as "the same
+    /// frame as before" — two unmeasured captures are charged separately.
+    #[test]
+    fn an_unknown_digest_is_never_a_repeat() {
+        let mut b = budget(10, 5);
+        b.record_image(None).unwrap();
+        b.record_image(None).unwrap();
+        assert_eq!(b.images_attached(), 2);
+        assert_eq!(b.images_repeated(), 0);
     }
 }
