@@ -154,6 +154,13 @@ pub struct RunOutcome {
     pub steps: usize,
     pub model_calls: usize,
     pub images_attached: usize,
+    /// How many of those images showed a frame an earlier one already showed.
+    /// They were billed but did not consume the run's image allowance.
+    pub images_repeated: usize,
+    /// Prompt tokens the run was billed for, summed over its model calls.
+    pub tokens_in: u64,
+    /// Completion tokens the run was billed for.
+    pub tokens_out: u64,
     pub stop_reason: StopReason,
     /// Present when the run stopped without meeting the goal.
     pub handoff: Option<crate::computer::handoff::HandoffNote>,
@@ -163,13 +170,28 @@ impl RunOutcome {
     /// A one-line description for a CLI or a log.
     pub fn describe(&self) -> String {
         format!(
-            "{} ({} steps, {} model calls, {} images, {})",
+            "{} ({} steps, {} model calls, {} images, {} in / {} out tokens, {})",
             self.message,
             self.steps,
             self.model_calls,
             self.images_attached,
+            self.tokens_in,
+            self.tokens_out,
             self.stop_reason.describe()
         )
+    }
+
+    /// The cost line the plan asks a run to leave behind.
+    pub fn summary(&self) -> crate::computer::run_budget::RunSummary {
+        crate::computer::run_budget::RunSummary {
+            steps: self.steps,
+            model_calls: self.model_calls,
+            images_attached: self.images_attached,
+            images_repeated: self.images_repeated,
+            tokens_in: self.tokens_in,
+            tokens_out: self.tokens_out,
+            stop_reason: self.stop_reason,
+        }
     }
 }
 
@@ -186,6 +208,9 @@ pub async fn execute(run: Arc<ComputerRun>, plan: RunPlan) -> crate::Result<RunO
             plan.budget.clone(),
             checkpoint.model_calls,
             checkpoint.images_attached,
+            checkpoint.images_repeated,
+            checkpoint.tokens_in,
+            checkpoint.tokens_out,
         ),
         None => RunBudget::new(plan.budget.clone()),
     }));
@@ -341,8 +366,14 @@ async fn run_loop(
                 // Announce the step that just finished (the first iteration
                 // has none). Doing it here means the report carries the
                 // action's real result and verification.
-                announce_new_steps(&run, &state.history, observer.as_ref(), checkpointer.as_ref())
-                    .await;
+                announce_new_steps(
+                    &run,
+                    &state.history,
+                    observer.as_ref(),
+                    checkpointer.as_ref(),
+                    &budget,
+                )
+                .await;
                 let done = state.history.len();
                 run.update(|s| {
                     s.step = done;
@@ -394,7 +425,8 @@ async fn run_loop(
         .await?;
 
     // The loop is done; report any step it executed after the last decision.
-    announce_new_steps(&run, &decided.history, observer.as_ref(), checkpointer.as_ref()).await;
+    announce_new_steps(&run, &decided.history, observer.as_ref(), checkpointer.as_ref(), &budget)
+        .await;
 
     let runtime_state = controller.current_state().await;
     let stop_reason = {
@@ -404,11 +436,12 @@ async fn run_loop(
     let steps = decided.steps_taken.max(decided.history.len());
 
     // Settle the checkpoint before the handoff is written: the file is what a
-    // resume reads, and a resume is only meaningful for a run that stopped
-    // *without* an answer. `conclude` deletes it for `done`/`cancelled` and
-    // keeps it, with the reason, for every other stop.
+    // resume reads, and its cost figures are what the run's trace is. `conclude`
+    // writes the file for every stop — including `done`, whose file is the only
+    // durable record that the run ever happened.
     if let Some(checkpointer) = checkpointer.as_ref() {
-        checkpointer.conclude(stop_reason).await;
+        let spent = { budget.lock().await.clone() };
+        checkpointer.conclude(stop_reason, &spent).await;
     }
 
     let handoff = if decided.success {
@@ -435,6 +468,9 @@ async fn run_loop(
             steps,
             model_calls: spent.model_calls(),
             images_attached: spent.images_attached(),
+            images_repeated: spent.images_repeated(),
+            tokens_in: spent.tokens_in(),
+            tokens_out: spent.tokens_out(),
             stop_reason,
             handoff,
         },
@@ -679,10 +715,15 @@ async fn record_decision(
 ) {
     let mut b = budget.lock().await;
     if report.image_attached {
-        // `record_images` cannot fail here: the driver asked for an image only
-        // after `can_attach_image` said yes. If it somehow does, the run keeps
-        // going on text — the ceiling was reported at the point of refusal.
-        if let Err(e) = b.record_images(1) {
+        // A frame identical to the run's previous attachment is still sent —
+        // and still billed — but it does not consume the image allowance: the
+        // allowance bounds how many *different* screenshots a run pays for, and
+        // charging one unchanged screen per step is how a stalled run spends it
+        // all without learning anything new. `record_image` makes that
+        // distinction from the digest; `record_images` cannot fail for a
+        // non-repeated frame because the driver asked only after
+        // `can_attach_image` said yes.
+        if let Err(e) = b.record_image(report.image_digest.as_deref()) {
             debug!("image budget race: {e}");
         }
     }
@@ -703,6 +744,7 @@ async fn announce_new_steps(
     history: &[StepRecord],
     observer: Option<&RunObserver>,
     checkpointer: Option<&Arc<crate::computer::run_store::RunCheckpointer>>,
+    budget: &Arc<Mutex<RunBudget>>,
 ) {
     let already = run.snapshot().await.completed.len();
     if history.len() <= already {
@@ -745,7 +787,8 @@ async fn announce_new_steps(
                 // disagree with what the client was told.
                 rung,
             };
-            checkpointer.step(&completed, calls, images).await;
+            let spent = { budget.lock().await.clone() };
+            checkpointer.step(&completed, &spent).await;
         }
 
         if let Some(observer) = observer {
@@ -941,6 +984,10 @@ mod tests {
     /// placeholder string would make every image assertion vacuous.
     const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
+    /// A one-pixel PNG of a different pixel: same shape, different bytes, so a
+    /// frame-to-frame comparison sees a change without an image decoder.
+    const ONE_PIXEL_PNG_BLUE: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC";
+
     /// Answers with a fixed list, then repeats the last answer forever.
     ///
     /// Repeating rather than erroring matters: a run that ends with `Done`
@@ -1077,9 +1124,12 @@ mod tests {
     ///
     /// `tree_incomplete` flips the one fact that makes a step want an image,
     /// which is how the image-budget test drives perception without a real
-    /// screen.
+    /// screen. `screen_changes` decides whether consecutive captures differ:
+    /// a still screen is what makes a repeated frame recognisable, and a
+    /// desktop that never changes would make every image ceiling unreachable.
     struct FakeDesktop {
         tree_incomplete: bool,
+        screen_changes: bool,
         executions: AtomicUsize,
         /// What the loop actually dispatched, in order.
         actions: StdMutex<Vec<crate::computer::DesktopAction>>,
@@ -1089,9 +1139,23 @@ mod tests {
         fn new(tree_incomplete: bool) -> Arc<Self> {
             Arc::new(Self {
                 tree_incomplete,
+                screen_changes: false,
                 executions: AtomicUsize::new(0),
                 actions: StdMutex::new(Vec::new()),
             })
+        }
+
+        /// A desktop whose screen differs after every executed action.
+        ///
+        /// Flipped after construction rather than with a second constructor:
+        /// `Arc::get_mut` is the cheap way to set a field on a handle the test
+        /// still uniquely owns.
+        fn changing(tree_incomplete: bool) -> Arc<Self> {
+            let mut desktop = Self::new(tree_incomplete);
+            Arc::get_mut(&mut desktop)
+                .expect("the handle is still unique")
+                .screen_changes = true;
+            desktop
         }
 
         fn executions(&self) -> usize {
@@ -1109,7 +1173,18 @@ mod tests {
             // The declared size matches the display, so image pixels and
             // screen points coincide and a test can assert a coordinate
             // without also asserting the scale factor.
-            Ok(Screenshot::new(ONE_PIXEL_PNG.to_string(), 100, 100))
+            //
+            // A changing screen alternates by *executed action*, not by
+            // capture: verification and the step's own observation both
+            // capture within one step, and keying on the capture count would
+            // make the two disagree inside a step that has not acted yet.
+            let acted = self.executions.load(Ordering::SeqCst);
+            let png = if self.screen_changes && acted % 2 == 1 {
+                ONE_PIXEL_PNG_BLUE
+            } else {
+                ONE_PIXEL_PNG
+            };
+            Ok(Screenshot::new(png.to_string(), 100, 100))
         }
 
         async fn read_ui_tree(
@@ -1248,6 +1323,10 @@ mod tests {
     /// after `max_images_per_run` — the run continues on text rather than
     /// stopping, because stopping mid-goal over an image is worse than the
     /// tokens.
+    ///
+    /// The screen is made to change on every capture: a run that looked at one
+    /// unchanged frame four times is charged once (see the dedup test), which
+    /// would make this test measure the dedup rule instead of the ceiling.
     #[tokio::test]
     async fn the_image_ceiling_caps_images_without_ending_the_run() {
         let provider = ScriptedProvider::new(vec![
@@ -1257,7 +1336,7 @@ mod tests {
             click_answer(),
             r#"{"decision": "done", "message": "opened it"}"#,
         ]);
-        let adapter = FakeDesktop::new(true);
+        let adapter = FakeDesktop::changing(true);
         let run = ComputerRun::new("r1", "open the calculator");
 
         let outcome = execute(run, fast_plan(provider.clone(), adapter, 2, true))
@@ -1269,8 +1348,50 @@ mod tests {
             outcome.images_attached, 2,
             "the ceiling is a ceiling: 4 steps wanted an image, 2 were allowed"
         );
+        assert_eq!(outcome.images_repeated, 0, "every frame was new");
         assert_eq!(provider.images_sent(), 2, "and exactly those two carried one");
         assert!(provider.calls() > 2, "the run kept going on text");
+    }
+
+    /// The plan's acceptance item for L2, end to end: a run that keeps looking
+    /// at a screen that does not change pays for one distinct image, however
+    /// many steps ask for a picture.
+    #[tokio::test]
+    async fn looking_twice_at_an_unchanged_screen_attaches_one_image() {
+        let provider = ScriptedProvider::new(vec![
+            click_answer(),
+            click_answer(),
+            click_answer(),
+            r#"{"decision": "done", "message": "opened it"}"#,
+        ]);
+        // Truncated tree: every step wants an image. Static screen: every
+        // capture has the same digest.
+        let adapter = FakeDesktop::new(true);
+        let run = ComputerRun::new("r1", "open the calculator");
+
+        let outcome = execute(run, fast_plan(provider.clone(), adapter, 8, true))
+            .await
+            .expect("the run machinery works");
+
+        assert!(outcome.success, "{}", outcome.message);
+        assert_eq!(
+            outcome.images_attached, 1,
+            "one unchanged screen must not be charged once per step"
+        );
+        assert!(
+            outcome.images_repeated > 0,
+            "the run kept sending the same frame, and the summary should say so"
+        );
+        assert_eq!(
+            provider.images_sent(),
+            outcome.images_attached + outcome.images_repeated,
+            "every attached image reached the provider, repeats included"
+        );
+        let summary = outcome.summary();
+        assert_eq!(
+            summary.images_repeated, outcome.images_repeated,
+            "the run summary carries the repeat count, not a placeholder zero"
+        );
     }
 
     /// The same image ceiling with a model that cannot see: not one image is

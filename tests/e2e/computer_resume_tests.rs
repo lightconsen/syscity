@@ -321,13 +321,13 @@ async fn an_interrupted_run_is_listed_and_resumes_from_the_next_step() {
     let first = completed[0].as_str().unwrap_or_default();
     assert!(first.starts_with("1. "), "the resumed run keeps the earlier steps: {view}");
 
-    // A run that reached an answer has nothing to continue, so its checkpoint
-    // is gone and it is no longer offered.
+    // A run that reached an answer has nothing to continue, so it is not
+    // offered — but the file stays: it is the only record of what the run did
+    // once the in-memory state and the live event stream are gone. Deleting it
+    // is how a *successful* run used to leave no trace at all.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !checkpoint_dir.join(format!("{run_id}.json")).is_file(),
-        "a finished run's checkpoint is removed"
-    );
+    let finished_file = checkpoint_dir.join(format!("{run_id}.json"));
+    assert!(finished_file.is_file(), "a finished run keeps its record (the plan's 过程可查)");
     let listed_again = client_b.request("computer.runs", json!({})).await;
     assert!(
         !listed_again["payload"]["runs"]
@@ -337,6 +337,19 @@ async fn an_interrupted_run_is_listed_and_resumes_from_the_next_step() {
             .any(|r| r["run_id"] == run_id),
         "the finished run is not offered for resume: {listed_again}"
     );
+    // ...and it is reachable when the caller asks for the records, not the offers.
+    let with_finished = client_b
+        .request("computer.runs", json!({ "include_finished": true }))
+        .await;
+    let recorded = with_finished["payload"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["run_id"] == run_id)
+        .unwrap_or_else(|| panic!("the record is listed on request: {with_finished}"));
+    assert_eq!(recorded["stop_reason"], "done", "{recorded}");
+    assert_eq!(recorded["interrupted"], false, "{recorded}");
+    assert!(recorded["next_step"].as_u64().unwrap_or(0) >= next_step as u64, "{recorded}");
 
     gateway_b.stop().await.expect("gateway B stops");
 }

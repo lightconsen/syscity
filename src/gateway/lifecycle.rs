@@ -941,6 +941,18 @@ pub(crate) async fn start_gateway(
             );
             announce_interrupted_runs(&state, &interrupted).await;
         }
+
+        // A concluded run's file is kept as its trace, so the directory grows
+        // by one file per *successful* run forever. Sweep the old conclusions
+        // here, at startup, where a filesystem scan costs nothing and where
+        // nobody is waiting on it. Resumable files are never touched; see
+        // `RunStore::prune_finished`.
+        let removed = store
+            .prune_finished(std::time::Duration::from_secs(30 * 24 * 3600))
+            .await;
+        if removed > 0 {
+            info!("pruned {removed} concluded computer run record(s) older than 30 days");
+        }
     }
 
     // Run the server until the shutdown token is cancelled.  Axum's

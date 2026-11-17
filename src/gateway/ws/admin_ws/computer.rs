@@ -133,6 +133,10 @@ pub(crate) async fn handle_computer_runs(req: &WsRequest, state: &Arc<GatewaySta
         serde_json::json!({
             "runs": runs,
             "interrupted": all.iter().filter(|c| c.is_interrupted()).count(),
+            // Concluded runs are kept as records, not offers: the count says
+            // how many exist so a caller that asked only for resumable ones
+            // knows what `include_finished: true` would also show it.
+            "finished": all.iter().filter(|c| !c.is_resumable()).count(),
         }),
     )
 }

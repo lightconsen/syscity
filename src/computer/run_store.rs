@@ -14,9 +14,12 @@
 //!
 //! - **Nothing resumes on startup.** The files are read to build a list, and a
 //!   person resumes one with `computer.resume`.
-//! - **A finished run deletes its checkpoint.** Only runs that were cut off are
-//!   interesting to resume; keeping every completed run's steps as files would
-//!   grow the layout forever for no reader.
+//! - **A conclusion is kept, a resume is not offered.** The file survives
+//!   `done` and `cancelled` — it is the run's only durable trace once the
+//!   process's in-memory state and the live event broadcast are gone — but
+//!   [`Checkpoint::is_resumable`] is false for both, so it never appears as an
+//!   offer to continue. [`RunStore::prune_finished`] bounds the directory by
+//!   age instead of by deleting every conclusion.
 //!
 //! The checkpoint is not a transcript. It carries what a resume needs — the
 //! goal, the loop's configuration, the actions already taken with their
@@ -24,13 +27,19 @@
 //! and nothing that would let it *skip* a dangerous action: a sensitive-UI
 //! action is not replayed from the file, it is asked again (see
 //! [`Checkpoint::resumes_from`] and the executor).
+//!
+//! The cost figures (`model_calls`, `images_attached`, `images_repeated`,
+//! `tokens_in`, `tokens_out`) are written on every step and again on
+//! conclusion, so the file answers "what did this run cost" for a run that
+//! finished as well as for one that did not — the live summary in memory is
+//! gone once the run leaves the registry.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::computer::run_budget::StopReason;
+use crate::computer::run_budget::{RunBudget, StopReason};
 use crate::computer::types::DesktopAction;
 use crate::computer::use_loop::{LoopConfig, StepVerification};
 
@@ -150,6 +159,21 @@ pub struct Checkpoint {
     /// fresh budget and quietly double what the caller allowed.
     pub model_calls: usize,
     pub images_attached: usize,
+    /// How many of those images showed a frame the run had already sent.
+    ///
+    /// Kept so the file's cost line matches the live summary the gateway
+    /// showed: a stalled run is recognisable by this number, not by the total.
+    #[serde(default)]
+    pub images_repeated: usize,
+    /// Tokens the run has been billed for so far.
+    ///
+    /// Carried for the same reason as the call counter — a resumed run's
+    /// summary is the run's total, not the last process's share — and because
+    /// the file is the only place the figure survives a restart.
+    #[serde(default)]
+    pub tokens_in: u64,
+    #[serde(default)]
+    pub tokens_out: u64,
     /// Set once the run reaches a conclusion. A checkpoint with this set is not
     /// resumable — it exists only until the file is swept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +194,9 @@ impl Checkpoint {
             completed: Vec::new(),
             model_calls: 0,
             images_attached: 0,
+            images_repeated: 0,
+            tokens_in: 0,
+            tokens_out: 0,
             stop_reason: None,
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -195,10 +222,12 @@ impl Checkpoint {
 
     /// Whether [`crate::computer::run_executor`] can continue this run.
     ///
-    /// Everything on disk qualifies. `done` and `cancelled` delete their file,
-    /// so a file that exists and is not one of those was cut off, ran out of
-    /// room, or stopped to ask a person — and in all three cases continuing from
-    /// step N+1 is a meaningful offer.
+    /// Everything except a conclusion qualifies. A concluded run's file is kept
+    /// as its trace, but continuing a `done` run would re-run a goal that has
+    /// an answer, and continuing a `cancelled` one would override a person who
+    /// said stop. A file that was cut off, ran out of room, or stopped to ask a
+    /// person is resumable in all three cases: continuing from step N+1 is a
+    /// meaningful offer.
     pub fn is_resumable(&self) -> bool {
         !matches!(self.stop_reason, Some(StopReason::Done | StopReason::Cancelled))
     }
@@ -212,6 +241,9 @@ impl Checkpoint {
             "next_step": self.next_step(),
             "model_calls": self.model_calls,
             "images_attached": self.images_attached,
+            "images_repeated": self.images_repeated,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
             "interrupted": self.is_interrupted(),
             "stop_reason": self.stop_reason,
             "sensitive_steps": self.sensitive_steps(),
@@ -490,7 +522,11 @@ impl RunStore {
         }
     }
 
-    /// Remove a run's checkpoint. Used when the run reaches a conclusion.
+    /// Remove a run's checkpoint.
+    ///
+    /// Not called on conclusion any more — see [`RunCheckpointer::conclude`] —
+    /// but kept for an operator who wants a run gone, and for
+    /// [`RunStore::prune_finished`].
     pub async fn delete(&self, run_id: &str) {
         let path = self.state_path(run_id);
         if path.exists() {
@@ -499,6 +535,59 @@ impl RunStore {
             }
         }
     }
+
+    /// Delete concluded runs older than `max_age`, and report how many went.
+    ///
+    /// Resumable runs are never touched, however old: "you can continue this"
+    /// is an offer that does not expire on a clock. A concluded run is a
+    /// record, and a record older than `max_age` has stopped being the one a
+    /// person looks at. An unparseable file is also left alone — deleting
+    /// something this program could not read would destroy evidence of a bug.
+    pub async fn prune_finished(&self, max_age: std::time::Duration) -> usize {
+        // `spawn_blocking`: the loop is synchronous, and a directory scan on
+        // the async runtime would block every other task it is serving.
+        let dir = self.dir();
+        tokio::task::spawn_blocking(move || prune_finished_in(&dir, max_age))
+            .await
+            .unwrap_or(0)
+    }
+}
+
+/// [`RunStore::prune_finished`]'s body, synchronous so it can run off-runtime.
+fn prune_finished_in(dir: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let mut removed = 0usize;
+    let now = chrono::Utc::now();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(checkpoint) = serde_json::from_str::<Checkpoint>(&content) else {
+            continue;
+        };
+        if checkpoint.is_resumable() {
+            continue;
+        }
+        let age = chrono::DateTime::parse_from_rfc3339(&checkpoint.updated_at)
+            .map(|t| now.signed_duration_since(t.with_timezone(&chrono::Utc)))
+            .unwrap_or_else(|_| chrono::Duration::zero());
+        let age = std::time::Duration::from_secs(age.num_seconds().max(0) as u64);
+        if age <= max_age {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("[computer] could not prune finished run {path:?}: {e}");
+            continue;
+        }
+        removed += 1;
+    }
+    removed
 }
 
 /// Appends steps to a checkpoint as a run progresses, and settles it at the end.
@@ -524,12 +613,15 @@ impl RunCheckpointer {
     ///
     /// A write failure is logged, never propagated: losing a checkpoint costs a
     /// resume, but failing the step that just succeeded would be a worse deal.
-    pub async fn step(&self, step: &CompletedStep, model_calls: usize, images_attached: usize) {
+    pub async fn step(&self, step: &CompletedStep, spent: &RunBudget) {
         let snapshot = {
             let mut checkpoint = self.checkpoint.lock().await;
             checkpoint.completed.push(step.clone());
-            checkpoint.model_calls = model_calls;
-            checkpoint.images_attached = images_attached;
+            checkpoint.model_calls = spent.model_calls();
+            checkpoint.images_attached = spent.images_attached();
+            checkpoint.images_repeated = spent.images_repeated();
+            checkpoint.tokens_in = spent.tokens_in();
+            checkpoint.tokens_out = spent.tokens_out();
             checkpoint.updated_at = chrono::Utc::now().to_rfc3339();
             checkpoint.clone()
         };
@@ -540,22 +632,29 @@ impl RunCheckpointer {
 
     /// Settle the checkpoint when the run ends.
     ///
-    /// A run that reached a conclusion (`done`, `cancelled`) deletes its file —
-    /// there is nothing to resume, and keeping it would list every completed run
-    /// forever. The others keep it, with the reason recorded, so
-    /// `computer.runs` can say *why* it stopped and a person can decide whether
-    /// more room would help.
-    pub async fn conclude(&self, reason: StopReason) {
+    /// The file is **kept** for every conclusion, including `done` and
+    /// `cancelled`. A finished run is not resumable — [`Checkpoint::is_resumable`]
+    /// says so, and `computer.runs` hides it unless asked — but it is the only
+    /// record of what the run did that outlives the process: the run's live
+    /// state is in memory, its events were broadcast to whoever was connected at
+    /// the time, and the screenshots it references are content-addressed. Delete
+    /// the file and a *successful* run leaves no trace at all, which contradicts
+    /// "过程可查" more sharply than a failed one does.
+    ///
+    /// The directory is bounded by age instead ([`RunStore::prune_finished`]),
+    /// so keeping conclusions cannot grow it forever.
+    pub async fn conclude(&self, reason: StopReason, spent: &RunBudget) {
         let snapshot = {
             let mut checkpoint = self.checkpoint.lock().await;
             checkpoint.stop_reason = Some(reason);
+            checkpoint.model_calls = spent.model_calls();
+            checkpoint.images_attached = spent.images_attached();
+            checkpoint.images_repeated = spent.images_repeated();
+            checkpoint.tokens_in = spent.tokens_in();
+            checkpoint.tokens_out = spent.tokens_out();
             checkpoint.updated_at = chrono::Utc::now().to_rfc3339();
             checkpoint.clone()
         };
-        if matches!(reason, StopReason::Done | StopReason::Cancelled) {
-            self.store.delete(&snapshot.run_id).await;
-            return;
-        }
         if let Err(e) = self.store.save(&snapshot).await {
             tracing::warn!("[computer] could not finalize run {}: {e}", snapshot.run_id);
         }
@@ -720,5 +819,73 @@ mod tests {
         assert_eq!(back.max_steps, 7);
         assert_eq!(back.settle_delay_ms, 3);
         assert!(!back.verify_after_each);
+    }
+
+    /// A successful run leaves a file behind.
+    ///
+    /// This is the plan's "过程可查": the live state is in memory and the
+    /// events went to whoever was connected, so without the file a *successful*
+    /// run has nothing to read back. The conclusion used to delete it.
+    #[tokio::test]
+    async fn concluding_a_run_keeps_its_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RunStore::with_dir(dir.path().to_path_buf()));
+        let checkpointer = RunCheckpointer::new(store.clone(), checkpoint("r1"));
+
+        let mut spent = RunBudget::new(crate::config::RunBudgetConfig::default());
+        spent.record_call().expect("one call");
+        spent.record_tokens(120, 30);
+
+        checkpointer.conclude(StopReason::Done, &spent).await;
+
+        let kept = store
+            .load("r1")
+            .await
+            .expect("a finished run keeps its file");
+        assert_eq!(kept.stop_reason, Some(StopReason::Done));
+        assert_eq!(kept.tokens_in, 120);
+        assert_eq!(kept.tokens_out, 30);
+        assert!(!kept.is_resumable(), "but it is not offered as a resume");
+        assert!(!kept.is_interrupted());
+    }
+
+    /// Pruning removes an old conclusion and nothing else: a resumable run is
+    /// an offer that does not expire, and an unreadable file is evidence.
+    #[tokio::test]
+    async fn pruning_removes_only_old_conclusions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RunStore::with_dir(dir.path().to_path_buf());
+
+        let old_done = |id: &str| {
+            let mut cp = checkpoint(id);
+            cp.stop_reason = Some(StopReason::Done);
+            cp.updated_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            cp
+        };
+        let old_open = |id: &str| {
+            let mut cp = checkpoint(id);
+            cp.updated_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            cp
+        };
+        let mut recent_done = checkpoint("recent");
+        recent_done.stop_reason = Some(StopReason::Done);
+
+        store.save(&old_done("old-done")).await.expect("save");
+        store.save(&old_open("old-open")).await.expect("save");
+        store.save(&recent_done).await.expect("save");
+        std::fs::write(dir.path().join("corrupt.json"), b"not json").expect("write corrupt");
+
+        let removed = store
+            .prune_finished(std::time::Duration::from_secs(7 * 24 * 3600))
+            .await;
+        assert_eq!(removed, 1, "only the old conclusion went");
+
+        assert!(store.load("old-done").await.is_none(), "the old conclusion is gone");
+        assert!(store.load("old-open").await.is_some(), "a resumable run never expires");
+        assert!(store.load("recent").await.is_some(), "a recent conclusion is kept");
+        assert!(
+            dir.path().join("corrupt.json").exists(),
+            "an unreadable file is evidence, not rubbish"
+        );
     }
 }
