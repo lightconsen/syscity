@@ -495,4 +495,46 @@ mod tests {
             outline.text
         );
     }
+
+    /// Folding is not the whole answer. Here *both* windows are on screen, so
+    /// nothing is folded — and the small panel is still reported first, so if
+    /// ordering did not promote the main window the panel's rows would consume
+    /// the renderer's whole cap and the window being edited would be missing
+    /// from the outline. This is the half of the OpenShot bug that pruning
+    /// alone does not fix, and the reason `prune` orders as well as folds.
+    #[test]
+    fn a_tight_budget_reaches_the_main_window_when_both_windows_are_on_screen() {
+        use crate::computer::tree_render::TreeOutline;
+
+        let main = window(
+            "Untitled Project",
+            Some(Rect::new(0, 0, 1440, 900)),
+            vec![window(
+                "Timeline",
+                Some(Rect::new(0, 600, 1440, 300)),
+                vec![],
+            )],
+        );
+        // Parked against the right edge of the display, not outside it.
+        let panel = window("Emojis", Some(Rect::new(1500, 0, 400, 900)), items(119));
+
+        let (pruned, report) = prune(&[panel, main], &display());
+        assert_eq!(report.folded, 0, "both windows are visible; nothing to fold");
+        assert_eq!(report.promoted, 2, "the two roots swapped places");
+
+        let mut outline = TreeOutline::default();
+        outline.push_tree(
+            &pruned,
+            "accessibility",
+            10,
+            false,
+            0,
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            outline.text.contains("Untitled Project"),
+            "ordering alone must carry the main window into a tight budget: {}",
+            outline.text
+        );
+    }
 }
