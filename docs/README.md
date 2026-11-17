@@ -20,6 +20,7 @@ agents perceive and act on your computer.
 | Doc | What it covers |
 |-----|----------------|
 | [OS Capability Architecture](os.md) | Physical/desktop capability model |
+| [Computer Use](computer-use.md) | The run engine end to end: approval gates, cost policy, vision, persistence, replay, record/play (Chinese) |
 | [Protocol](protocol.md) | WebSocket RPC + ACP protocol surface |
 | [Security Configuration](security-config.md) | Auth, rate limiting, CORS/CSP, device pairing |
 | [Secret Storage](secret-storage.md) | Sensitive-info inventory + keyring/file storage design |

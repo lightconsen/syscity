@@ -20,7 +20,7 @@
 //! The one thing that is artificial is the *cause* of the regression: this
 //! model exports at temperature ≥ 0.75 and gives up below it, so the optimizer
 //! has a real, measurable effect to find. A genuine "L2 trigger rule" change has
-//! no scalar field (see `computer-todo.local.md`), so the gate can only be
+//! no scalar field (see `docs/computer-use.md` §5.3), so the gate can only be
 //! driven through a scalar — which is also the only thing the existing
 //! optimizer is allowed to move.
 
