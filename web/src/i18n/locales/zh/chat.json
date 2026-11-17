@@ -58,6 +58,7 @@
   "MessageBubble.helpful": "有帮助",
   "MessageBubble.notHelpful": "没帮助",
   "MessageBubble.regenerate": "重新生成",
+  "MessageBubble.replayTurn": "回看这一轮的桌面动作",
   "MessageBubble.thinkingCount": "{{count}} 条思考",
   "MessageBubble.toolCount_one": "{{count}} 个工具",
   "MessageBubble.toolCount_other": "{{count}} 个工具",

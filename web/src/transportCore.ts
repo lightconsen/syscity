@@ -41,7 +41,7 @@ import type {
 } from "./transportTypes";
 // The computer-use mixin's own shapes live with it; the facade
 // (`SyscityWebSocketTransport.ts`) re-exports them for components.
-import type { ComputerStatusAnswer, ComputerRunRecord } from "./transportMixins/computer";
+import type { ComputerStatusAnswer, ComputerRunRecord, TurnReplay } from "./transportMixins/computer";
 
 export type * from "./transportTypes";
 export * from "./transportTypes";
@@ -2504,6 +2504,8 @@ export interface SyscityWebSocketTransport {
   computerStatus(runId?: string): Promise<ComputerStatusAnswer | null>;
   /** Runs recorded on disk (survives a gateway restart). */
   computerRuns(includeFinished?: boolean): Promise<{ runs: ComputerRunRecord[]; interrupted: number; finished: number }>;
+  /** One turn as an ordered action/frame timeline, or null when unreadable. */
+  turnsReplay(turnId: string): Promise<TurnReplay | null>;
   /** A stored frame as a `data:` URL, or null when the frame is gone. */
   computerFrameUrl(digest: string): Promise<string | null>;
 }

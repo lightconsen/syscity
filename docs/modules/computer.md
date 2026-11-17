@@ -136,6 +136,23 @@ the count, writes a line into each run's originating session naming the run and 
 from, and `computer.runs` is the list behind it. Both live in `ws/admin_ws/computer.rs::launch`, which
 owns every pre-spawn refusal so `computer.run` and `computer.resume` cannot diverge.
 
+### Reading a turn back
+
+Two questions a person asks after a desktop turn, and two screens (both read-only, both in `web/`):
+
+- **What is happening now** — `ComputerPanel.tsx` in the right pane, fed by `computer.step` events
+  while the run is live and by `computer.runs` (the checkpoints above) after it. Filtered by
+  `session_id`: a run answers to the conversation that started it.
+- **What did that turn actually do** — `TurnReplayPlayer.tsx`, a dialog opened from an assistant
+  message's action bar, fed by `turns.replay { turn_id }`. The turn's own `computer`-tool steps and the
+  steps of every run it started come back as one list, in the order they happened; each step carries
+  its CAS digests, and the player fetches exactly one frame at a time via `attachment.get` — for the
+  step being looked at. A turn's trace is written by the gateway, so the dialog needs no desktop
+  adapter; `Checkpoint.turn_id` is the join that lets a run's steps appear in its turn's timeline.
+
+Neither screen can start, pause or resume a run. The point of both is that a person can see what
+already happened; a replay that could re-run the turn would be a second way to drive a machine.
+
 ### Recording and replay
 
 A run answers "do this goal". A workflow answers "do what I just did, with a different input" — the

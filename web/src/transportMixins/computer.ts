@@ -47,6 +47,33 @@ export function install(proto: typeof SyscityWebSocketTransport.prototype): void
   };
 
   /**
+   * One finished (or running) turn as an ordered action/frame timeline.
+   *
+   * Answers both halves of a turn's desktop work: the `computer` tool's steps
+   * from the turn's own trace, and the steps of any run the turn started, in
+   * the order they happened. `source` on each step says which half it came
+   * from, so a reader does not have to guess.
+   *
+   * `null` when the gateway cannot answer (not found, or the socket dropped):
+   * a timeline that is not there is not an empty timeline, and the player
+   * says so instead of drawing "this turn did nothing".
+   */
+  proto.turnsReplay = async function (
+    this: SyscityWebSocketTransport,
+    turnId: string
+  ): Promise<TurnReplay | null> {
+    try {
+      return (await this.sendRequestAndWait(
+        "turns.replay",
+        { turn_id: turnId },
+        15_000
+      )) as TurnReplay | null;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
    * One stored frame, by the digest a step carries.
    *
    * Returns a `data:` URL rather than the base64 body so the caller can hand
@@ -151,4 +178,82 @@ export interface ComputerRunRecord {
   updated_at: string;
   completed_steps: string[];
   steps: ComputerRunStep[];
+}
+
+/**
+ * One position on a turn's timeline, whichever half of the turn wrote it.
+ *
+ * A turn can act on the desktop two ways: the `computer` tool inside the turn
+ * (its steps live in the turn trace) or a `computer` run the turn started (its
+ * steps live in the run's checkpoint). `turns.replay` answers both in this one
+ * shape, so the player draws one list; `source` is the only thing that says
+ * which file a row came from.
+ *
+ * Fields a source cannot fill are `null`, not absent: an omitted key would
+ * read as "this gateway version does not have it", which is a different fact
+ * from "a run's steps have no round number".
+ */
+export interface TurnReplayStep {
+  /** Zero-based position across the whole timeline, in the order it happened. */
+  step: number;
+  /** Which half of the turn produced it. */
+  source: "turn" | "run";
+  /** The action, described semantically (`click element s1:0.2`, `press cmd+s`). */
+  action: string | null;
+  /** Verification verdict: `true` verified, `false` measured failure, `null`
+   *  nothing could say either way. */
+  verified: boolean | null;
+  rung?: string | null;
+  effect?: string | null;
+  /** Why the step stopped where it did (`turn` steps only). */
+  delivery?: string | null;
+  recovery?: string | null;
+  settle_ms?: number | null;
+  round?: number | null;
+  /** CAS digest of the frame captured before the action landed. */
+  before_ref?: string | null;
+  /** CAS digest of the frame captured after the action settled. */
+  after_ref?: string | null;
+  /** The run step's own words for what happened (`run` steps only). */
+  result?: string | null;
+  /** Whether the step touched a sensitive control (`run` steps only). */
+  sensitive?: boolean;
+  /** The run's own step number, so a row can be found in `computer.status`. */
+  run_step?: number;
+  /** Which run contributed the step (`run` steps only). */
+  run_id?: string;
+}
+
+/** The cost line of one run folded into a turn's timeline. */
+export interface TurnReplayRun {
+  run_id: string;
+  goal: string;
+  steps: number;
+  model_calls: number;
+  images_attached: number;
+  images_repeated: number;
+  tokens_in: number;
+  tokens_out: number;
+  stop_reason: string | null;
+}
+
+/**
+ * `turns.replay`'s answer: one turn as the ordered list of what it did.
+ *
+ * `image_method` names the read that turns a digest into pixels — it is
+ * `"attachment.get"` today, and it travels in the payload so a UI does not
+ * hardcode a scheme that another version could replace.
+ */
+export interface TurnReplay {
+  turn_id: string;
+  /** The turn's input, so the timeline says what the steps answered. */
+  input: string;
+  steps: TurnReplayStep[];
+  step_count: number;
+  /** Frames shown on the timeline (not the same as `steps.length`). */
+  image_count: number;
+  image_method: string;
+  /** The turn's summary record, when a trace was written for it. */
+  summary: Record<string, unknown> | null;
+  runs: TurnReplayRun[];
 }

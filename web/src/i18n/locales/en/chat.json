@@ -58,6 +58,7 @@
   "MessageBubble.helpful": "Helpful",
   "MessageBubble.notHelpful": "Not helpful",
   "MessageBubble.regenerate": "Regenerate",
+  "MessageBubble.replayTurn": "Replay this turn's desktop actions",
   "MessageBubble.thinkingCount": "{{count}} thinking",
   "MessageBubble.toolCount_one": "{{count}} tool",
   "MessageBubble.toolCount_other": "{{count}} tools",

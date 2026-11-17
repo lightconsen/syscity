@@ -72,4 +72,7 @@ export type {
   ComputerRunStep,
   ComputerRunSummary,
   ComputerRunPhase,
+  TurnReplay,
+  TurnReplayStep,
+  TurnReplayRun,
 } from "./transportMixins/computer";

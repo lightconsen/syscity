@@ -2,6 +2,7 @@ import { MarkdownMessage } from "@/components/shared/MarkdownMessage";
 import { ReasoningPart } from "@/components/shared/ReasoningPart";
 import { ToolCallPart } from "@/components/shared/ToolCallPart";
 import { DocumentRefPart } from "@/components/shared/DocumentRefPart";
+import { TurnReplayPlayer } from "@/components/computer/TurnReplayPlayer";
 import { Avatar } from "./Avatar";
 import { LiveStatusBar } from "./LiveStatusBar";
 import {
@@ -15,6 +16,7 @@ import {
   ChevronDown,
   ChevronUp,
   BrainCircuit,
+  History,
   ThumbsUp,
   ThumbsDown,
   Coins,
@@ -188,12 +190,16 @@ function AssistantMessageActions({
   content,
   onRegenerate,
   turnId,
+  onReplay,
   vote,
   onVote,
 }: {
   content: string;
   onRegenerate?: () => void;
   turnId?: string;
+  /** Open this turn's action/screenshot timeline. Offered only when the
+   *  caller can supply a transport and the turn has an id to look up. */
+  onReplay?: () => void;
   vote?: "up" | "down" | undefined;
   onVote?: (vote: "up" | "down") => void;
 }) {
@@ -208,6 +214,13 @@ function AssistantMessageActions({
         onClick={() => copy(content)}
         active={copied}
       />
+      {onReplay && (
+        <ActionButton
+          icon={History}
+          title={t("MessageBubble.replayTurn")}
+          onClick={onReplay}
+        />
+      )}
       {turnId && onVote && (
         <>
           <ActionButton
@@ -355,6 +368,7 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
 
   const turnId = message.turnId;
   const vote = useChatStore((s) => (turnId ? s.messageVotes[turnId] : undefined));
+  const [replayOpen, setReplayOpen] = useState(false);
 
   const handleVote = useCallback(
     async (v: "up" | "down") => {
@@ -439,7 +453,14 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
       message.credits !== undefined);
 
   return (
-    <div className="py-4 group" data-testid="message-assistant">
+    <div
+      className="py-4 group"
+      data-testid="message-assistant"
+      /* The turn's stable id, exposed for selectors that need to open *this*
+         turn's timeline (the action bar's own button is not unique on a page
+         with several answers). */
+      data-turn-id={turnId || undefined}
+    >
       <div className="flex gap-3 flex-row" style={centerStyle}>
         <Avatar role="assistant" />
         <div className="flex-1 min-w-0">
@@ -559,8 +580,22 @@ export function MessageBubble({ message, transport, onEdit }: MessageBubbleProps
               content={replyText}
               onRegenerate={handleRegenerate}
               turnId={turnId}
+              /* A turn can be replayed only once it has an id and a transport
+                 to ask the gateway with; a bubble rendered without either
+                 (a history entry from another surface, a storybook-style
+                 mount) gets no button rather than a dead one. */
+              onReplay={
+                turnId && transport ? () => setReplayOpen(true) : undefined
+              }
               vote={vote}
               onVote={handleVote}
+            />
+          )}
+          {replayOpen && turnId && transport && (
+            <TurnReplayPlayer
+              transport={transport}
+              turnId={turnId}
+              onClose={() => setReplayOpen(false)}
             />
           )}
         </div>
