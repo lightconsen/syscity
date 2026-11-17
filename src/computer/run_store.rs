@@ -138,6 +138,15 @@ pub struct CompletedStep {
     /// the rung did not work" (escalated through `pixel` / `keyboard`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rung: Option<crate::computer::types::Rung>,
+    /// What the adapter established about the screen's response.
+    ///
+    /// The same fact `computer.step` events carry and the same one a turn's
+    /// `ActionTraceEvent` records, kept here so a run's checkpoint can be drawn
+    /// as the identical timeline `turns.replay` draws for a turn. Absent for a
+    /// checkpoint written before this field existed, and for a step whose
+    /// adapter reported no evidence at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<crate::computer::types::ActionEffect>,
 }
 
 /// What a checkpoint needs to rebuild a run.
@@ -149,6 +158,14 @@ pub struct Checkpoint {
     /// keeps reporting to the same session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The turn that started the run, when one did.
+    ///
+    /// A run does not write into a turn's `full.json` — it has its own file and
+    /// its own step stream — so this is the only thing that lets `turns.replay`
+    /// answer "this turn, and the run it kicked off" as one timeline. Read by
+    /// [`RunStore::load_for_turn`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// The loop configuration the run started with.
     pub max_steps: usize,
     pub settle_delay_ms: u64,
@@ -188,6 +205,7 @@ impl Checkpoint {
             run_id: run_id.into(),
             goal: goal.into(),
             session_id: None,
+            turn_id: None,
             max_steps: config.max_steps,
             settle_delay_ms: config.settle_delay_ms,
             verify_after_each: config.verify_after_each,
@@ -440,6 +458,20 @@ impl RunStore {
         self.dir().join(format!("{run_id}.json"))
     }
 
+    /// A run id that is safe to use as a file name.
+    ///
+    /// The ids this gateway mints are UUIDs, but `computer.resume` and
+    /// `computer.status` take one from the caller, and the checkpoint path is
+    /// built by joining it onto a directory. A caller must not be able to name
+    /// `../…` and address a file outside the runs directory.
+    fn valid_run_id(run_id: &str) -> bool {
+        !run_id.is_empty()
+            && !run_id.contains('/')
+            && !run_id.contains('\\')
+            && !run_id.contains("..")
+            && !run_id.contains('\0')
+    }
+
     /// Write the checkpoint, atomically.
     ///
     /// Serialise to `<file>.tmp`, then rename over the real file: a crash
@@ -510,7 +542,14 @@ impl RunStore {
     }
 
     /// Load one checkpoint, if it exists.
+    ///
+    /// A caller-supplied id that is not safe as a file name is a miss, not an
+    /// error: "no run with that id" is the truth either way, and the read has
+    /// nothing to offer a path-shaped id.
     pub async fn load(&self, run_id: &str) -> Option<Checkpoint> {
+        if !Self::valid_run_id(run_id) {
+            return None;
+        }
         let path = self.state_path(run_id);
         let content = tokio::fs::read_to_string(&path).await.ok()?;
         match serde_json::from_str::<Checkpoint>(&content) {
@@ -522,12 +561,34 @@ impl RunStore {
         }
     }
 
+    /// Every run started by one turn, oldest first.
+    ///
+    /// For `turns.replay`: a turn that kicked off a computer run left the
+    /// action steps in the run's own checkpoint, not in the turn's `full.json`.
+    /// Without this lookup the timeline of such a turn shows a tool call and
+    /// nothing that happened on the screen.
+    pub async fn load_for_turn(&self, turn_id: &str) -> Vec<Checkpoint> {
+        let mut out: Vec<Checkpoint> = self
+            .load_all()
+            .await
+            .into_iter()
+            .filter(|c| c.turn_id.as_deref() == Some(turn_id))
+            .collect();
+        // A turn is one point in time; its runs are ordered by when they
+        // started writing, which for a single turn is the order they ran.
+        out.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        out
+    }
+
     /// Remove a run's checkpoint.
     ///
     /// Not called on conclusion any more — see [`RunCheckpointer::conclude`] —
     /// but kept for an operator who wants a run gone, and for
     /// [`RunStore::prune_finished`].
     pub async fn delete(&self, run_id: &str) {
+        if !Self::valid_run_id(run_id) {
+            return;
+        }
         let path = self.state_path(run_id);
         if path.exists() {
             if let Err(e) = tokio::fs::remove_file(&path).await {
@@ -680,6 +741,7 @@ mod tests {
             screenshot_ref: Some("sha256:abc".to_string()),
             sensitive: false,
             rung: Some(crate::computer::types::Rung::AxAction),
+            effect: Some(crate::computer::types::ActionEffect::Confirmed),
         });
         cp.model_calls = 1;
         cp
@@ -764,6 +826,7 @@ mod tests {
             screenshot_ref: None,
             sensitive: false,
             rung: None,
+            effect: None,
         });
         assert_eq!(cp.next_step(), 2);
     }

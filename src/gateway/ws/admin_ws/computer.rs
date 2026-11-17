@@ -73,7 +73,8 @@ pub(crate) async fn handle_computer_run(req: &WsRequest, state: &Arc<GatewayStat
         .await;
 
     let session_id = params.session_id.clone().filter(|s| !s.is_empty());
-    let started = match launch(state, &config, run, session_id, None).await {
+    let turn_id = params.turn_id.clone().filter(|s| !s.is_empty());
+    let started = match launch(state, &config, run, session_id, turn_id, None).await {
         Ok(started) => started,
         Err(mut resp) => {
             // Nothing was started, so the half-built run must not linger in the
@@ -223,7 +224,10 @@ pub(crate) async fn handle_computer_resume(
         .await;
 
     let session_id = checkpoint.session_id.clone();
-    let started = match launch(state, &config, run, session_id, Some(checkpoint)).await {
+    // The resumed run keeps the turn that started it: the checkpoint carries
+    // it, and a resume is the same run continuing, not a new one that happens
+    // to share a goal.
+    let started = match launch(state, &config, run, session_id, None, Some(checkpoint)).await {
         Ok(started) => started,
         Err(mut resp) => {
             state.tools.computer_runs.remove(&run_id).await;
@@ -264,6 +268,7 @@ async fn launch(
     config: &crate::gateway::GatewayConfig,
     run: Arc<crate::computer::run_registry::ComputerRun>,
     session_id: Option<String>,
+    turn_id: Option<String>,
     checkpoint: Option<crate::computer::run_store::Checkpoint>,
 ) -> Result<StartedRun, WsResponse> {
     let adapter = state.tools.computer_adapter.read().await.clone();
@@ -354,6 +359,7 @@ async fn launch(
                 &loop_config,
             );
             fresh.session_id = session_id.clone();
+            fresh.turn_id = turn_id.clone();
             fresh
         }
     });
@@ -1647,6 +1653,15 @@ struct RunParams {
     goal: String,
     #[serde(default)]
     session_id: Option<String>,
+    /// The turn that asked for this run, when one did.
+    ///
+    /// A run has its own checkpoint and does not write into a turn's
+    /// `full.json`, so without this the two records of the same work have
+    /// nothing to join on. A turn-scoped caller passes its own id; a caller
+    /// that starts a run outside a turn (the CLI, a headless job) leaves it
+    /// out, and the run is reachable through `computer.runs` alone.
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1854,6 +1869,7 @@ mod tests {
             screenshot_ref: None,
             sensitive,
             rung: None,
+            effect: None,
         });
         cp.model_calls = 1;
         RunStore::for_paths(&state.paths)

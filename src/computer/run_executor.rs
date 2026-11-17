@@ -786,6 +786,10 @@ async fn announce_new_steps(
                 // the same value rather than a second derivation that could
                 // disagree with what the client was told.
                 rung,
+                // Same reasoning for the effect: it is what makes a run's
+                // checkpoint drawable as the identical timeline `turns.replay`
+                // draws for a turn.
+                effect,
             };
             let spent = { budget.lock().await.clone() };
             checkpointer.step(&completed, &spent).await;

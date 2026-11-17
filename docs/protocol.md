@@ -421,9 +421,13 @@ run 不是为了某一个连接而活的：A 客户端发起的 run，B 客户�
 | `computer.watch` | `read` | `{ interval_ms? }`（默认 1000，钳在 200–10000）开始**看**屏幕：每次截图作为 `computer.frame` 事件广播出去 |
 | `computer.unwatch` | `write` | `{ watch_id }` 停止一个 watch；本来就没在跑也算成功 |
 
-`computer.run` 参数：`{ goal, session_id? }`。`goal` 为空返回 `INVALID_PARAMS`；`[computer] enabled = false`
+`computer.run` 参数：`{ goal, session_id?, turn_id? }`。`goal` 为空返回 `INVALID_PARAMS`；`[computer] enabled = false`
 返回 `COMPUTER_DISABLED`；本机没有适配器返回 `COMPUTER_UNAVAILABLE`；没有可用模型返回
 `NO_MODEL` / `NO_PROVIDER`。这些都在**创建 run 之前**拒绝，避免调用方拿到一个永远不会动的 `run_id`。
+`turn_id` 是这一轮自己的 id：run 有独立检查点、不写进那一轮的 `full.json`，这是两条记录唯一的连接键，
+`turns.replay` 靠它把 run 的步骤并进那一轮的时间线。在 turn 之外启动 run（CLI、无头任务）不传，run 仍可
+通过 `computer.runs` / `computer.status` 找到。`computer.resume` 沿用检查点里记着的 `turn_id`——续跑是
+同一个 run 接着跑，不是新开一个。
 
 `computer.watch` / `computer.unwatch`：**只看，不动**。G 阶段的"远程帮我干活"里 SSH 已经能驱动对方机器，
 缺的是人能看见它——一个看不见屏幕的人被要求批准他没法核对的点击。这个 watch 就是那一半，且**只有**那一半：
@@ -528,13 +532,27 @@ run 会在别人正在用的机器上真实动手，重启不是同意。重启�
 | `turns.rerun` | `write` | `{ turn_id, assertions?, criteria?, model? }` 把该轮输入重放给 harness |
 | `turns.rerun_result` | `read` | `{ turn_id, rerun_id }` 读一次已完成的重放结论 |
 
-`turns.replay` 响应：`{ turn_id, input, steps, step_count, image_count, image_method }`。每个 step 是
-`{ step, round, action, rung, effect, delivery, verified, before_ref, after_ref, recovery, settle_ms }`。
+`turns.replay` 响应：`{ turn_id, input, steps, step_count, image_count, image_method, summary, runs }`。
+每个 step 是 `{ step, round, action, rung, effect, delivery, verified, before_ref, after_ref, recovery,
+settle_ms, source }`（来自 run 的 step 另有 `run_id`、`run_step`、`result`、`sensitive`）。
 `step` 只数**动作事件**（`type: "action"`），编号与 run 自身 `computer.step` 的步数一致，所以时间线不
 会因为两次读取而错位。`verified` 是**三态**：`true` / `false` / `null`——`null` 是 `unverifiable`，
 意思是"没有任何东西确认或否认它"，把它画成失败就是在替适配器下它没下的结论。`before_ref` / `after_ref`
 是截图在附件库里的 CAS digest（`sha256:<64 hex>`），用 `attachment.get` 换成图片；`image_method` 直接写在
 payload 里，客户端不必猜路径。**不是像素回放**：坐标系在不同 DPI/窗口大小下不稳定，动作以语义描述为准。
+
+**一轮的动作可能来自两个文件。** 走 `computer` 工具的动作写在这一轮的 `full.json` 里；这一轮用
+`computer.run` 起的 run 则有自己的检查点（`computer-runs/<run_id>.json`）和自己的事件流。`turns.replay`
+把两者按"先本轮、后它起的 run（按 run 启动顺序）"拼成**一条**时间线，而不是让客户端去查两个地方：
+`source` 是 `"turn"` 或 `"run"`，来自 run 的 step 还带 `run_id`（可回查 `computer.status`）和 `run_step`
+（run 自己的编号，时间线位置仍由 `step` 给）。`round` / `delivery` / `recovery` / `settle_ms` 对 run 的 step
+是 `null` 而不是缺键——那是 turn 侧工具路径的概念，缺键会被读成"这个版本没有它"。`runs` 是这条时间线里
+被并入的 run 及其代价：`{ run_id, goal, steps, model_calls, images_attached, images_repeated, tokens_in,
+tokens_out, stop_reason }`。只显示做了什么、不显示花了多少，只回答了一半问题。
+
+如果这一轮根本没有 trace，但有 run 指名了它（`turn_id` 传对了、turn 文件没写成），`turns.replay` 仍然
+返回 ok：`steps` 是 run 的，`input` 取第一个 run 的 goal，`summary` 为 `null`。只有两者都不存在才是
+`NOT_FOUND`。
 
 `turns.rerun` 回答的是"改了提示词，这轮还会不会做对"。它把该轮**真实的用户消息**（`full.json` 里第一条
 `user` 消息，不是被截断到 4 KiB 的 preview）交给 `EvalHarness`（N=1），通过一个只预批了 eval 工具集 +

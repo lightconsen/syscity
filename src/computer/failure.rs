@@ -142,6 +142,7 @@ mod tests {
             screenshot_ref: Some(format!("sha256:after-{n}")),
             sensitive: false,
             rung,
+            effect: None,
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
                 screenshot_ref: None,
                 sensitive: r.sensitive,
                 rung: None,
+                effect: None,
             })
             .collect()
     }

@@ -118,6 +118,14 @@ fn digest_of(value: Option<&serde_json::Value>) -> Option<String> {
 /// event stream uses, so a timeline drawn from a trace and one drawn from live
 /// `computer.step` events agree.
 ///
+/// A turn can produce its actions two ways: through the `computer` tool inside
+/// the turn (those are in the turn's `full.json`), or through a `computer.run`
+/// the turn started (those are in the run's checkpoint under
+/// `computer-runs/`). Both are answered here, in one shape, because a person
+/// looking at "what happened during this turn" does not care which file the
+/// gateway wrote it to. The `source` field on each step says which, and `runs`
+/// lists the runs whose actions were folded in.
+///
 /// Deliberately **not** a coordinate replay: the frames are the CAS digests of
 /// what the screen looked like, and the action is described semantically
 /// ("click element s1:0.2"). Replaying pixels is not stable across DPI or
@@ -135,8 +143,42 @@ pub(crate) async fn handle_turns_replay(req: &WsRequest, state: &Arc<GatewayStat
         return WsResponse::err(&req.id, "INVALID_PARAMS", "invalid turn_id");
     }
 
+    // A turn started a run, or a run was started for a turn that has no turn
+    // record of its own (the caller passed a `turn_id` that never produced a
+    // trace). Either way the run's own record is the answer, and it is a
+    // legitimate one — refusing NOT_FOUND here would hide exactly the runs
+    // stage C introduced.
+    let runs = crate::computer::run_store::RunStore::for_paths(&state.paths)
+        .load_for_turn(&p.turn_id)
+        .await;
+
     let Some(dir) = find_turn_dir(state, &p.turn_id) else {
-        return WsResponse::err(&req.id, "NOT_FOUND", "turn not found");
+        if runs.is_empty() {
+            return WsResponse::err(
+                &req.id,
+                "NOT_FOUND",
+                format!("No turn or computer run record for turn {}", p.turn_id),
+            );
+        }
+        // No turn trace: the runs alone. Still the timeline, still NOT a
+        // special shape — a client that renders one turn renders this.
+        let timeline = run_timeline(&runs, 0);
+        return WsResponse::ok(
+            &req.id,
+            serde_json::json!({
+                "turn_id": p.turn_id,
+                // The runs' goals are the closest thing to the turn's input
+                // that exists; the turn file that would have said otherwise
+                // was never written.
+                "input": runs.first().map(|r| r.goal.clone()).unwrap_or_default(),
+                "steps": timeline.steps,
+                "step_count": timeline.steps.len(),
+                "image_count": timeline.image_refs,
+                "image_method": "attachment.get",
+                "summary": serde_json::Value::Null,
+                "runs": run_refs(&runs),
+            }),
+        );
     };
 
     let summary = std::fs::read_to_string(dir.join("summary.json"))
@@ -173,8 +215,17 @@ pub(crate) async fn handle_turns_replay(req: &WsRequest, state: &Arc<GatewayStat
             "after_ref": after_ref,
             "recovery": detail.get("recovery").and_then(|v| v.as_str()),
             "settle_ms": detail.get("settle_ms").and_then(|v| v.as_u64()),
+            "source": "turn",
         }));
     }
+
+    // Runs this turn started. Their steps were never in `full.json` — a run has
+    // its own file and its own event stream — so they are appended here, after
+    // the turn's own steps, in run order. Each carries its `run_id` so a client
+    // can link the step back to `computer.status` and to the run's summary.
+    let from_runs = run_timeline(&runs, steps.len());
+    image_refs += from_runs.image_refs;
+    steps.extend(from_runs.steps);
 
     // The turn's own input, so a client can show the goal the timeline answers.
     // `summary` carries a truncated preview; this is the same fact, not a new
@@ -198,8 +249,87 @@ pub(crate) async fn handle_turns_replay(req: &WsRequest, state: &Arc<GatewayStat
             // `attachment.get`. Said in the payload so a UI does not have to
             // guess the URL scheme.
             "image_method": "attachment.get",
+            "summary": summary,
+            "runs": run_refs(&runs),
         }),
     )
+}
+
+/// Steps drawn from the runs one turn started, plus how many frames they show.
+struct RunTimeline {
+    steps: Vec<serde_json::Value>,
+    image_refs: usize,
+}
+
+/// Render checkpoints as the same timeline entries a turn's actions produce.
+///
+/// Field-for-field the shape `handle_turns_replay` builds from `full.json`:
+/// a client must not need to know which of the two wrote a step to draw it.
+/// The fields a checkpoint cannot supply are `null` rather than omitted —
+/// `round`, `delivery`, `recovery` and `settle_ms` belong to the turn-scoped
+/// tool path, and a missing key would read as "this version does not have it".
+///
+/// `offset` is how many steps the turn already contributed: the timeline is one
+/// list, so its positions continue from where the turn's left off.
+fn run_timeline(runs: &[crate::computer::run_store::Checkpoint], offset: usize) -> RunTimeline {
+    let mut steps = Vec::new();
+    let mut image_refs = 0usize;
+    for run in runs {
+        for step in &run.completed {
+            let before_ref = step.screenshot_before_ref.clone();
+            let after_ref = step.screenshot_ref.clone();
+            if before_ref.is_some() || after_ref.is_some() {
+                image_refs += 1;
+            }
+            steps.push(serde_json::json!({
+                // Zero-based across the whole timeline, like the turn steps:
+                // one position is one step in the order it happened, whatever
+                // file it came from.
+                "step": offset + steps.len(),
+                // The run's own numbering, kept alongside so a person can
+                // find the step in `computer.status` without counting.
+                "run_step": step.step,
+                "run_id": run.run_id,
+                "action": crate::computer::driver::describe_action(&step.action),
+                "result": step.result,
+                "rung": step.rung.map(|r| r.rung_name()),
+                "effect": step.effect.map(|e| e.as_str()),
+                "verified": crate::computer::run_store::verified_word(step.verification),
+                "sensitive": step.sensitive,
+                "before_ref": before_ref,
+                "after_ref": after_ref,
+                "round": serde_json::Value::Null,
+                "delivery": serde_json::Value::Null,
+                "recovery": serde_json::Value::Null,
+                "settle_ms": serde_json::Value::Null,
+                "source": "run",
+            }));
+        }
+    }
+    RunTimeline { steps, image_refs }
+}
+
+/// The runs behind a timeline, as a reader needs to see them in the payload.
+///
+/// The summary numbers are the run's own (`computer.status` reports the same
+/// ones): a timeline that showed its steps but not what they cost would answer
+/// "what happened" and not "was it worth it".
+fn run_refs(runs: &[crate::computer::run_store::Checkpoint]) -> Vec<serde_json::Value> {
+    runs.iter()
+        .map(|run| {
+            serde_json::json!({
+                "run_id": run.run_id,
+                "goal": run.goal,
+                "steps": run.completed.len(),
+                "model_calls": run.model_calls,
+                "images_attached": run.images_attached,
+                "images_repeated": run.images_repeated,
+                "tokens_in": run.tokens_in,
+                "tokens_out": run.tokens_out,
+                "stop_reason": run.stop_reason,
+            })
+        })
+        .collect()
 }
 
 /// The largest payload `attachment.get` will hand back in one frame.
@@ -652,6 +782,7 @@ pub(crate) async fn handle_turns_rerun_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::computer::run_store::RunStore as RunStoreForTest;
     use crate::gateway::state_tests::make_test_state;
     use crate::gateway::GatewayConfig;
 
@@ -776,6 +907,135 @@ mod tests {
         let payload = resp.payload.expect("payload");
         assert_eq!(payload["steps"].as_array().map(Vec::len), Some(0));
         assert_eq!(payload["image_count"], 0);
+    }
+
+    /// A checkpoint saved for a turn, the way `computer.run` writes one.
+    async fn write_run(
+        state: &GatewayState,
+        run_id: &str,
+        turn_id: Option<&str>,
+        steps: &[(usize, &str, bool, Option<&str>)],
+    ) {
+        use crate::computer::run_store::{Checkpoint, CompletedStep};
+        use crate::computer::types::{ActionEffect, ClickTarget, DesktopAction, MouseButton, Rung};
+        use crate::computer::use_loop::StepVerification;
+
+        let mut cp = Checkpoint::new(
+            run_id,
+            "open the calculator",
+            &crate::computer::use_loop::LoopConfig::default(),
+        );
+        cp.turn_id = turn_id.map(str::to_string);
+        for (n, result, verified, after) in steps {
+            let verification = if *verified {
+                StepVerification::Verified
+            } else {
+                StepVerification::Failed
+            };
+            cp.completed.push(CompletedStep {
+                step: *n,
+                action: DesktopAction::Click {
+                    target: ClickTarget::ElementId(format!("s1:0.{n}")),
+                    button: MouseButton::Left,
+                },
+                verification,
+                result: (*result).to_string(),
+                screenshot_before_ref: None,
+                screenshot_ref: after.map(str::to_string),
+                sensitive: false,
+                rung: Some(Rung::AxAction),
+                effect: Some(ActionEffect::Confirmed),
+            });
+        }
+        cp.model_calls = 3;
+        cp.images_attached = 1;
+        cp.tokens_in = 1200;
+        cp.tokens_out = 40;
+        RunStoreForTest::for_paths(&state.paths)
+            .save(&cp)
+            .await
+            .expect("save run checkpoint");
+    }
+
+    /// The point of folding runs in: a turn that started `computer.run` has its
+    /// desktop actions in the run's checkpoint, and the timeline must show them
+    /// without the client having to know that.
+    #[tokio::test]
+    async fn a_turn_that_started_a_run_replays_the_runs_steps_after_its_own() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        write_turn(&state, "turn-run", &[action(0, "click", "confirmed", "verified")]);
+        write_run(
+            &state,
+            "r1",
+            Some("turn-run"),
+            &[
+                (0, "clicked 7", true, Some("sha256:aaaa")),
+                (1, "clicked 23", true, None),
+            ],
+        )
+        .await;
+
+        let resp = handle_turns_replay(
+            &req("turns.replay", serde_json::json!({"turn_id": "turn-run"})),
+            &state,
+        )
+        .await;
+        assert!(resp.ok, "{:?}", resp.error);
+        let payload = resp.payload.expect("payload");
+        let steps = payload["steps"].as_array().expect("steps");
+
+        assert_eq!(steps.len(), 3, "one turn step then two run steps: {payload}");
+        assert_eq!(steps[0]["source"], "turn");
+        assert_eq!(steps[1]["source"], "run");
+        assert_eq!(steps[1]["run_id"], "r1");
+        assert_eq!(steps[1]["run_step"], 0);
+        assert_eq!(steps[1]["action"], "click [s1:0.0]");
+        assert_eq!(steps[1]["verified"], true);
+        assert_eq!(steps[1]["rung"], "ax_action");
+        assert_eq!(steps[1]["effect"], "confirmed");
+        // The position is the timeline's, not the run's: a client draws one
+        // list, and the run's own numbering rides alongside as `run_step`.
+        assert_eq!(steps[2]["step"], 2);
+        assert_eq!(steps[2]["run_step"], 1);
+        assert_eq!(steps[2]["after_ref"], serde_json::Value::Null);
+
+        // The run's cost is in the payload: a timeline that showed the steps
+        // and not what they cost would answer half the question.
+        let runs = payload["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["run_id"], "r1");
+        assert_eq!(runs[0]["model_calls"], 3);
+        assert_eq!(runs[0]["tokens_in"], 1200);
+        assert_eq!(runs[0]["tokens_out"], 40);
+        assert_eq!(payload["image_count"], 2, "one turn frame, one run frame");
+    }
+
+    /// A run that names a turn with no turn trace of its own is still
+    /// replayable. Stage C keeps every concluded run, and a caller holding the
+    /// turn id it passed must not be told NOT_FOUND.
+    #[tokio::test]
+    async fn a_run_without_a_turn_record_replays_on_its_own() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        write_run(
+            &state,
+            "r-orphan",
+            Some("turn-orphan"),
+            &[(0, "opened it", true, Some("sha256:cccc"))],
+        )
+        .await;
+
+        let resp = handle_turns_replay(
+            &req("turns.replay", serde_json::json!({"turn_id": "turn-orphan"})),
+            &state,
+        )
+        .await;
+        assert!(resp.ok, "{:?}", resp.error);
+        let payload = resp.payload.expect("payload");
+        let steps = payload["steps"].as_array().expect("steps");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["source"], "run");
+        assert_eq!(payload["input"], "open the calculator");
+        assert_eq!(payload["summary"], serde_json::Value::Null);
     }
 
     #[tokio::test]
