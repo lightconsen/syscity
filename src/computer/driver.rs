@@ -107,6 +107,11 @@ Rules:
 - Dragging is how sliders, scrollbars, text selection and drag-and-drop move.
   Nothing else moves them: a click sets a scrollbar's position to that spot,
   which is not the same gesture and often does not do what was meant.
+- A drag is one gesture you cannot watch. You choose where it ends before you
+  start, and the thumb lands where you chose — so a long drag to an exact
+  value overshoots and you only find out afterwards. Drag to roughly the right
+  place, look at where the thumb actually is, then drag again from there by the
+  small distance that is left. Two short drags beat one long one aimed blind.
 - A scrollbar or slider's *position* is how you tell where you are. The thumb
   touching the far end of its track is "there is nothing more this way" — that
   is a fact you read off the picture, and it saves the scroll-and-look rounds
@@ -1845,6 +1850,33 @@ mod tests {
         // And the other half: a middle thumb is not the end, however bare the
         // pane looks — content may still be arriving.
         assert!(DRIVER_SYSTEM_PROMPT.contains("A thumb in the middle is not the end"));
+    }
+
+    /// A drag is one blind gesture, so the prompt must teach the correction.
+    ///
+    /// The gesture runs from the press to the release inside the platform's
+    /// script — there is no frame in the middle for the model to look at. What
+    /// a person does instead is drag roughly, look at where the thumb ended up,
+    /// and drag again by the remainder. Without that sentence the model spends
+    /// one long drag per step aiming for an exact pixel it cannot see, and a
+    /// slider lands past its target with no instruction to correct it.
+    #[test]
+    fn the_prompt_says_a_drag_is_aimed_blind_and_correctable() {
+        assert!(
+            DRIVER_SYSTEM_PROMPT.contains("a drag is one gesture you cannot watch")
+                || DRIVER_SYSTEM_PROMPT.contains("A drag is one gesture you cannot watch"),
+            "the prompt must say a drag cannot be watched as it happens"
+        );
+        assert!(
+            DRIVER_SYSTEM_PROMPT.contains("drag again"),
+            "the prompt must name the correction: look, then drag by the remainder"
+        );
+        // And the reason: it is the overshoot that makes one long drag wrong,
+        // not the gesture itself.
+        assert!(
+            DRIVER_SYSTEM_PROMPT.contains("overshoots"),
+            "the prompt must say why one long drag fails"
+        );
     }
 
     /// A region screenshot is how the model asks to look closer than the
