@@ -492,41 +492,42 @@ impl ModelDriver {
             // meant — and a close-up asked for at that point shows the wrong
             // place. So the scale is stated whenever the two differ.
             //
-            // A crop needs an offset as well as a factor: its first pixel is
-            // `region.x`, not zero, so the mapping is `origin + image × scale`.
-            // Stating only the factor would put every position in a close-up
-            // off by the distance from the screen's corner — the very error
-            // the close-up branch's "not offsets within the crop" sentence
-            // warns about, arriving from the other direction.
+            // The *screen area* is the region's own size when this is a crop:
+            // `shot.width` is the encoded pixel width, which for a crop says
+            // nothing about how many screen points it covers (a 1826 px crop
+            // of 600 points is right, not wrong). Dividing by it would hand the
+            // model a factor that is wrong in the opposite direction.
             let scale_note = match (&attachment, ctx.screenshot.as_ref()) {
-                (Some(image), Some(shot))
-                    if image.width != shot.width || image.height != shot.height =>
-                {
-                    let scale_x = shot.width as f64 / image.width.max(1) as f64;
-                    let scale_y = shot.height as f64 / image.height.max(1) as f64;
-                    match ctx.capture_region {
-                        Some(region) => format!(
-                            " The image is {}×{} but the screen area it shows is {}×{} screen \
-                             points, so an image position is not a screen position: multiply \
-                             by about {:.2} horizontally and {:.2} vertically, then add the \
-                             crop's origin ({}, {}) — or name a region in screen points \
-                             directly.",
-                            image.width,
-                            image.height,
-                            shot.width,
-                            shot.height,
-                            scale_x,
-                            scale_y,
-                            region.x,
-                            region.y,
-                        ),
-                        None => format!(
-                            " The image is {}×{} and the screen is {}×{} screen points, so an \
-                             image position is not a screen position: multiply by about {:.2} \
-                             horizontally and {:.2} vertically before giving a coordinate or \
-                             a close-up region.",
-                            image.width, image.height, shot.width, shot.height, scale_x, scale_y,
-                        ),
+                (Some(image), Some(shot)) => {
+                    let (area_w, area_h, origin) = match ctx.capture_region {
+                        Some(region) => {
+                            (region.width as f64, region.height as f64, Some((region.x, region.y)))
+                        }
+                        None => (shot.width as f64, shot.height as f64, None),
+                    };
+                    let scaled = image.width != area_w as u32 || image.height != area_h as u32;
+                    if !scaled {
+                        String::new()
+                    } else {
+                        let scale_x = area_w / image.width.max(1) as f64;
+                        let scale_y = area_h / image.height.max(1) as f64;
+                        match origin {
+                            Some((x, y)) => format!(
+                                " The image is {}×{} but the screen area it shows is {}×{} \
+                                 screen points, so an image position is not a screen position: \
+                                 multiply by about {:.2} horizontally and {:.2} vertically, \
+                                 then add the crop's origin ({}, {}) — or name a region in \
+                                 screen points directly.",
+                                image.width, image.height, area_w, area_h, scale_x, scale_y, x, y,
+                            ),
+                            None => format!(
+                                " The image is {}×{} and the screen is {}×{} screen points, so \
+                                 an image position is not a screen position: multiply by about \
+                                 {:.2} horizontally and {:.2} vertically before giving a \
+                                 coordinate or a close-up region.",
+                                image.width, image.height, area_w, area_h, scale_x, scale_y,
+                            ),
+                        }
                     }
                 }
                 _ => String::new(),
@@ -2623,6 +2624,65 @@ mod tests {
         assert!(
             text.contains("add the crop's origin (900, 300)"),
             "the offset is what a crop needs and a factor alone does not give: {text}"
+        );
+    }
+
+    /// A crop the encoder left alone is still not in screen points.
+    ///
+    /// On a 2× display a 400×250-point crop is captured at 800×500 pixels.
+    /// That is under the image limit, so the payload travels unchanged and
+    /// `Screenshot.width` (the encoded pixel width) equals the image's width —
+    /// nothing was shrunk. Comparing the image against the *capture's pixels*
+    /// therefore says "identity mapping" and stays silent, while every position
+    /// in the picture is still twice the screen distance the model means.
+    ///
+    /// The area the picture covers is the region's own size in points, so that
+    /// is what the factor divides by: 400 / 800 = 0.50, not 1.00.
+    #[tokio::test]
+    async fn a_retina_close_up_scales_by_the_regions_points_not_its_pixels() {
+        use image::{Rgb, RgbImage};
+
+        // A 2× capture: 400×250 points at (900, 300) arrives as 800×500 px.
+        let frame = RgbImage::from_pixel(800, 500, Rgb([240, 240, 240]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(frame)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode the fixture");
+        let base64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        };
+
+        let provider = Arc::new(ScriptedProvider::answering(
+            r#"{"decision": "help", "reason": "cannot see"}"#,
+        ));
+        let driver = ModelDriver::new(provider.clone(), "test-model");
+        let mut context = ctx(false);
+        // `Screenshot` reports the encoded size, so it says 800×500 — the same
+        // as the payload. The region says 400×250 points.
+        context.screenshot = Some(Screenshot::new(base64, 800, 500));
+        context.capture_region = Some(crate::computer::types::Rect::new(900, 300, 400, 250));
+
+        driver.decide(&state(), &context).await.unwrap();
+
+        let request = &provider.requests()[0];
+        let user = request
+            .messages
+            .iter()
+            .find(|m| m.role == crate::providers::Role::User)
+            .expect("a user message");
+        let text = &user.content;
+        assert!(
+            text.contains("is not a screen position"),
+            "an unshrunk 2× crop is still not in screen points: {text}"
+        );
+        assert!(
+            text.contains("multiply by about 0.50"),
+            "the factor must be points per pixel (400/800), not 1.00: {text}"
+        );
+        assert!(
+            text.contains("add the crop's origin (900, 300)"),
+            "the offset is still needed: {text}"
         );
     }
 
