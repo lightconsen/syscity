@@ -602,10 +602,7 @@ impl VisionLook {
             }
             LocalModel::Ocr => {
                 let blocks = self.read_text(shot).await?;
-                if blocks.is_empty() {
-                    return Err("the local OCR model read no text on this screen".to_string());
-                }
-                Ok((text_elements(&blocks), "local-ocr"))
+                ocr_answer(&blocks)
             }
         }
     }
@@ -953,6 +950,27 @@ fn text_elements(blocks: &[crate::computer::vision::TextBlock]) -> Vec<UiElement
             })
         })
         .collect()
+}
+
+/// The OCR rung's answer, or the reason it has none.
+///
+/// Split out of [`VisionLook::local`]'s `Ocr` arm so the *decision* at the end
+/// of the rung can be tested without an ONNX session: the model call is the
+/// part that needs files on disk, and what to do with its output is the part
+/// that can be wrong. See `the_ocr_rung_answers_with_text_or_says_it_read_nothing`.
+///
+/// The emptiness test is on the **elements**, not the blocks. A detector that
+/// finds white space reports a block holding a space; turning that into "1 text
+/// line" would tell the run it has a target when it has nothing to aim at.
+#[cfg_attr(not(feature = "vision"), allow(dead_code))] // its tests run in every build
+fn ocr_answer(
+    blocks: &[crate::computer::vision::TextBlock],
+) -> Result<(Vec<UiElement>, &'static str), String> {
+    let elements = text_elements(blocks);
+    if elements.is_empty() {
+        return Err("the local OCR model read no text on this screen".to_string());
+    }
+    Ok((elements, "local-ocr"))
 }
 
 /// Read the API answer into elements.
@@ -1416,6 +1434,53 @@ mod tests {
         assert_eq!(provider.calls(), 1, "the API rung was tried exactly once");
     }
 
+    /// `look()` on an OCR-only machine walks the OCR rung, not the detector's.
+    ///
+    /// Built through [`VisionResolver::from_config`] with [`LocalModels::ocr`] —
+    /// the same two functions the gateway uses to turn "the OCR files are on
+    /// disk" into a rung. A hand-built `Availability` would prove the arm works
+    /// while saying nothing about the mapping that feeds it, and the mapping is
+    /// where an OCR-only machine gets mis-classified.
+    ///
+    /// The rung's model files are not on disk in this test, so the run fails
+    /// and the *reason* is the observation: it names the OCR models. If the
+    /// detector had been picked instead, the same field would name
+    /// `omniparser.onnx` — the mis-wiring this test exists to catch.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn an_ocr_only_machine_looks_with_the_ocr_rung() {
+        let (api, provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let mut config = crate::config::VisionConfig {
+            mode: "local".to_string(),
+            ..crate::config::VisionConfig::default()
+        };
+        config.model_dir = std::env::temp_dir()
+            .join(format!("syscity-vision-ocr-empty-{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let resolver = VisionResolver::from_config(
+            &config,
+            crate::computer::vision::model_download::LocalModels::ocr(),
+        );
+        let look = VisionLook::new(resolver, api);
+
+        let outcome = look
+            .look(&shot(100, 100), "read the invoice total", &geometry(), &unlimited())
+            .await;
+
+        match outcome {
+            LookOutcome::Failed { why } => {
+                assert!(why.contains("OCR"), "the OCR rung should have been tried: {why}");
+                assert!(
+                    !why.to_lowercase().contains("omniparser"),
+                    "an OCR-only machine reached the detector rung: {why}"
+                );
+            }
+            other => panic!("expected the OCR rung's failure, got {}", other.status()),
+        }
+        assert_eq!(provider.calls(), 0, "mode = local called the API");
+    }
+
     /// The API rung is a model call, and a model call is what the run's
     /// ceiling counts. Without this the budget would be untrue on exactly the
     /// steps that cost the most.
@@ -1734,6 +1799,44 @@ mod tests {
         let label = elements[0].label.as_deref().expect("labelled");
         assert_eq!(label.chars().count(), MAX_LABEL_CHARS + 1, "cut, with an ellipsis");
         assert!(label.ends_with('…'));
+    }
+
+    /// The decision at the end of the OCR rung: readable text is an answer
+    /// tagged `local-ocr` — the tag every downstream consumer keys on — and
+    /// nothing readable is an error the ladder can act on.
+    ///
+    /// The rung's model call needs ONNX files, but this half does not, and this
+    /// half is what the run's behaviour depends on. Without it the `Ocr` arm
+    /// had no test at all: the only coverage of `"local-ocr"` reached it by
+    /// calling `finish` directly, which skips the arm entirely.
+    #[test]
+    fn the_ocr_rung_answers_with_text_or_says_it_read_nothing() {
+        use crate::computer::vision::TextBlock;
+
+        let (elements, source) = ocr_answer(&[TextBlock {
+            text: "Total due".to_string(),
+            confidence: 0.9,
+            bounds: Rect::new(10, 20, 80, 20),
+        }])
+        .expect("readable text is an answer");
+        assert_eq!(source, "local-ocr", "the rung that answered is named");
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].role, "text");
+
+        // No blocks at all: the ladder must be free to try its fallback.
+        let why = ocr_answer(&[]).expect_err("nothing read is not an answer");
+        assert!(why.contains("read no text"), "{why}");
+
+        // A block holding only white space is the same outcome. Turning it
+        // into "1 text line" would tell the run it has a target to aim at
+        // when there is nothing on the screen to aim at.
+        let why = ocr_answer(&[TextBlock {
+            text: "   ".to_string(),
+            confidence: 0.8,
+            bounds: Rect::new(0, 0, 5, 5),
+        }])
+        .expect_err("blank text is not an answer");
+        assert!(why.contains("read no text"), "{why}");
     }
 
     /// The status line and the note are read by whoever explains a bad click,

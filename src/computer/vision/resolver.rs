@@ -375,6 +375,68 @@ mod tests {
         assert_eq!(r.resolve(), VisionSource::Local(LocalModel::UiDetect));
     }
 
+    /// A machine that downloaded **only** the OCR models must get the OCR
+    /// rung, in every mode that allows a local model.
+    ///
+    /// This is the path `LocalModel::Ocr` exists for, and it is the one case
+    /// the other tests never build: every `resolver` helper in this file sets
+    /// `ocr: false`. Without this, `local_model()` could return `UiDetect` from
+    /// a rung whose detector is absent, or return `None` on an OCR-only machine
+    /// and make `auto` declare itself unavailable where it could have read the
+    /// screen — and no test would notice.
+    #[test]
+    fn an_ocr_only_machine_gets_the_ocr_rung() {
+        for mode in ["local", "auto"] {
+            let r = VisionResolver::new(
+                cfg(mode, true),
+                Availability {
+                    ui_detect: false,
+                    ocr: true,
+                    feature_enabled: true,
+                },
+            );
+            assert_eq!(
+                r.resolve(),
+                VisionSource::Local(LocalModel::Ocr),
+                "mode = {mode} on an OCR-only machine"
+            );
+            assert!(r.has_ocr(), "mode = {mode}: the models are present");
+        }
+    }
+
+    /// The detector still wins when both are installed — OCR is then a
+    /// labelling pass, not the answering rung. `has_ocr` stays true either way,
+    /// which is what lets the detector's boxes get named.
+    #[test]
+    fn the_detector_outranks_ocr_when_both_are_installed() {
+        let r = VisionResolver::new(
+            cfg("auto", false),
+            Availability {
+                ui_detect: true,
+                ocr: true,
+                feature_enabled: true,
+            },
+        );
+        assert_eq!(r.resolve(), VisionSource::Local(LocalModel::UiDetect));
+        assert!(r.has_ocr(), "OCR is still available to label the boxes");
+    }
+
+    /// The feature gate is checked before either model, or a build without the
+    /// `vision` feature would claim a rung it cannot run.
+    #[test]
+    fn an_ocr_only_machine_without_the_feature_is_unavailable() {
+        let r = VisionResolver::new(
+            cfg("local", false),
+            Availability {
+                ui_detect: false,
+                ocr: true,
+                feature_enabled: false,
+            },
+        );
+        assert_eq!(r.resolve(), VisionSource::Unavailable(UnavailableReason::FeatureDisabled));
+        assert!(!r.has_ocr(), "a build that cannot run OCR must not claim it can");
+    }
+
     #[test]
     fn a_build_without_the_feature_says_so() {
         let r = resolver("local", true, true, false);
