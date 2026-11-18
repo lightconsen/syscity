@@ -101,36 +101,11 @@ impl ScreenshotTool {
 
     /// The region to crop to, in `screencapture -R`'s `x,y,width,height` form.
     ///
-    /// Two shapes are accepted because two callers exist: the computer adapter
-    /// sends the structured `{"x","y","width","height"}` object, and a model
-    /// writing tool arguments by hand tends to follow the x11 tool's
-    /// `"x,y,w,h"` string. Anything else — a missing field, a negative width —
-    /// is refused rather than half-honoured, because `-R` with a malformed
-    /// value screenshots something the caller did not ask for, and a close-up
-    /// of the wrong rectangle is worse than no close-up at all.
+    /// The shape rules live in [`crate::computer::platform::common::screenshot_region`],
+    /// shared with the other platforms' tools, so a region cannot mean one thing
+    /// to the macOS tool and another to the x11 one.
     fn region_argument(args: &Value) -> Option<String> {
-        let region = args.get("region")?;
-        if let Some(text) = region.as_str() {
-            let parts: Vec<&str> = text.split(',').map(str::trim).collect();
-            if parts.len() != 4 {
-                return None;
-            }
-            let values: Option<Vec<i64>> = parts.iter().map(|p| p.parse::<i64>().ok()).collect();
-            let values = values?;
-            let (x, y, width, height) = (values[0], values[1], values[2], values[3]);
-            if width <= 0 || height <= 0 {
-                return None;
-            }
-            return Some(format!("{x},{y},{width},{height}"));
-        }
-        let x = region.get("x")?.as_i64()?;
-        let y = region.get("y")?.as_i64()?;
-        let width = region.get("width")?.as_i64()?;
-        let height = region.get("height")?.as_i64()?;
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-        Some(format!("{x},{y},{width},{height}"))
+        crate::computer::platform::common::screenshot_region_commas(args)
     }
 }
 

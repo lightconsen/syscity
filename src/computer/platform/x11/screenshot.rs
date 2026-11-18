@@ -42,6 +42,44 @@ impl ScreenshotTool {
         }
         None
     }
+
+    /// `maim`'s argv. `-g` takes `x,y,w,h`.
+    ///
+    /// Takes the raw tool arguments rather than a parsed region, so a test
+    /// exercises the same parse-then-build path `execute` runs. A builder
+    /// tested on its own would have passed while the caller dropped the region.
+    fn maim_arguments(args: &Value, destination: &std::path::Path) -> Vec<String> {
+        let region = crate::computer::platform::common::screenshot_region_commas(args);
+        let window = args.get("window").and_then(|v| v.as_str());
+        let mut argv = Vec::new();
+        if let Some(region) = region {
+            argv.push("-g".to_string());
+            argv.push(region);
+        }
+        if let Some(window) = window {
+            argv.push("-i".to_string());
+            argv.push(window.to_string());
+        }
+        argv.push(destination.display().to_string());
+        argv
+    }
+
+    /// ImageMagick's `import` argv. `-crop` takes `wxh+x+y`, not `x,y,w,h`.
+    ///
+    /// The order is the point: a rectangle written in the adapter's order is
+    /// silently a crop of a different shape (width and height swapped for x
+    /// and y), and the picture that comes back looks plausible.
+    fn import_arguments(args: &Value, destination: &std::path::Path) -> Vec<String> {
+        let region = crate::computer::platform::common::screenshot_region(args);
+        let window = args.get("window").and_then(|v| v.as_str());
+        let mut argv = vec!["-window".to_string(), window.unwrap_or("root").to_string()];
+        if let Some((x, y, width, height)) = region {
+            argv.push("-crop".to_string());
+            argv.push(format!("{width}x{height}+{x}+{y}"));
+        }
+        argv.push(destination.display().to_string());
+        argv
+    }
 }
 
 #[async_trait]
@@ -104,27 +142,22 @@ impl Tool for ScreenshotTool {
 
         info!("Taking X11 screenshot with {}: {}", tool, temp_path.display());
 
-        let region = args.get("region").and_then(|v| v.as_str());
         let window = args.get("window").and_then(|v| v.as_str());
 
         let result = match tool {
             "maim" => {
                 let mut cmd = Command::new("maim");
-                if let Some(reg) = region {
-                    cmd.arg("-g").arg(reg);
+                for arg in Self::maim_arguments(&args, &temp_path) {
+                    cmd.arg(arg);
                 }
-                if let Some(win) = window {
-                    cmd.arg("-i").arg(win);
-                }
-                cmd.arg(&temp_path).output().await
+                cmd.output().await
             }
             "import" => {
                 let mut cmd = Command::new("import");
-                cmd.arg("-window").arg(window.unwrap_or("root"));
-                if let Some(reg) = region {
-                    cmd.arg("-crop").arg(reg);
+                for arg in Self::import_arguments(&args, &temp_path) {
+                    cmd.arg(arg);
                 }
-                cmd.arg(&temp_path).output().await
+                cmd.output().await
             }
             "gnome-screenshot" => {
                 let mut cmd = Command::new("gnome-screenshot");
@@ -215,5 +248,45 @@ mod tests {
     fn test_screenshot_tool_creation() {
         let tool = ScreenshotTool::new();
         assert_eq!(tool.name(), "linux_x11_screenshot");
+    }
+
+    /// The adapter's region reaches `maim`'s command line.
+    ///
+    /// Asserted through the argv builder rather than the parser: reading the
+    /// region and then not passing it on is the failure this replaces.
+    #[test]
+    fn maim_is_given_the_region_at_full_resolution() {
+        let args = serde_json::json!({
+            "region": { "x": 100, "y": 50, "width": 300, "height": 200 }
+        });
+        assert_eq!(
+            ScreenshotTool::maim_arguments(&args, std::path::Path::new("/tmp/out.png")),
+            vec!["-g", "100,50,300,200", "/tmp/out.png"]
+        );
+    }
+
+    /// `import -crop` wants `wxh+x+y`, so the numbers are reordered.
+    ///
+    /// Passing the comma form would crop a rectangle whose width is the x
+    /// origin — plausible-looking output from a request that was never honoured.
+    #[test]
+    fn import_is_given_the_region_in_its_own_geometry() {
+        let args = serde_json::json!({
+            "region": { "x": 100, "y": 50, "width": 300, "height": 200 }
+        });
+        assert_eq!(
+            ScreenshotTool::import_arguments(&args, std::path::Path::new("/tmp/out.png")),
+            vec!["-window", "root", "-crop", "300x200+100+50", "/tmp/out.png"]
+        );
+    }
+
+    /// No region means no crop flag, not a zero-size one.
+    #[test]
+    fn a_whole_screen_capture_passes_no_crop_flag() {
+        let empty = serde_json::json!({});
+        let maim = ScreenshotTool::maim_arguments(&empty, std::path::Path::new("/tmp/o.png"));
+        assert!(!maim.iter().any(|a| a == "-g"), "{maim:?}");
+        let import = ScreenshotTool::import_arguments(&empty, std::path::Path::new("/tmp/o.png"));
+        assert!(!import.iter().any(|a| a == "-crop"), "{import:?}");
     }
 }

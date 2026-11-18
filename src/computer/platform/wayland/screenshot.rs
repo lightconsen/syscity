@@ -41,6 +41,21 @@ impl ScreenshotTool {
         }
         None
     }
+
+    /// `grim`'s argv. `-g` takes `x,y WxH` — the origin and size with a space.
+    ///
+    /// Takes the raw tool arguments so a test runs the same parse-then-build
+    /// path `execute` runs; testing the formatter alone would pass while the
+    /// caller ignored the region.
+    fn grim_arguments(args: &Value, destination: &std::path::Path) -> Vec<String> {
+        let mut argv = Vec::new();
+        if let Some(region) = crate::computer::platform::common::screenshot_region_grim(args) {
+            argv.push("-g".to_string());
+            argv.push(region);
+        }
+        argv.push(destination.display().to_string());
+        argv
+    }
 }
 
 #[async_trait]
@@ -93,15 +108,13 @@ impl Tool for ScreenshotTool {
 
         info!("Taking Wayland screenshot with {}: {}", tool, temp_path.display());
 
-        let region = args.get("region").and_then(|v| v.as_str());
-
         let result = match tool {
             "grim" => {
                 let mut cmd = Command::new("grim");
-                if let Some(reg) = region {
-                    cmd.arg("-g").arg(reg);
+                for arg in Self::grim_arguments(&args, &temp_path) {
+                    cmd.arg(arg);
                 }
-                cmd.arg(&temp_path).output().await
+                cmd.output().await
             }
             "spectacle" => {
                 let mut cmd = Command::new("spectacle");
@@ -189,5 +202,31 @@ mod tests {
     fn test_screenshot_tool_creation() {
         let tool = ScreenshotTool::new();
         assert_eq!(tool.name(), "linux_wayland_screenshot");
+    }
+
+    /// The adapter's region reaches `grim` as `x,y WxH`, which is its grammar.
+    ///
+    /// `grim -g` is not comma-separated: it takes the origin and the size with
+    /// a space between them. The comma form would either be rejected or, worse,
+    /// parsed as a rectangle nobody chose.
+    #[test]
+    fn grim_is_given_the_region_in_its_own_grammar() {
+        let args = serde_json::json!({
+            "region": { "x": 100, "y": 50, "width": 300, "height": 200 }
+        });
+        assert_eq!(
+            ScreenshotTool::grim_arguments(&args, std::path::Path::new("/tmp/out.png")),
+            vec!["-g", "100,50 300x200", "/tmp/out.png"]
+        );
+    }
+
+    /// With no region `grim` captures the output, not a zero-size crop.
+    #[test]
+    fn a_whole_screen_capture_passes_no_geometry() {
+        let argv = ScreenshotTool::grim_arguments(
+            &serde_json::json!({}),
+            std::path::Path::new("/tmp/out.png"),
+        );
+        assert!(!argv.iter().any(|a| a == "-g"), "{argv:?}");
     }
 }
