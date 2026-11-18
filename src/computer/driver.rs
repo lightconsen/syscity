@@ -295,22 +295,33 @@ impl ModelDriver {
         // one produced elements it *substitutes* for an attachment rather than
         // adding to it: sending both would pay twice for one answer.
         //
-        // That reasoning inverts on a tree-less screen. There the scan is not an
-        // answer about a screen the model can otherwise navigate — it is the
-        // only index the model has. And it is a lossy one: the detector resizes
-        // the screen into a fixed 640×640 frame before it looks, so anything
-        // smaller than a few dozen pixels is simply absent from the boxes, while
-        // the picture the model receives is up to 1024 wide and read by the
-        // model itself. Suppressing the picture there leaves the model with
-        // strictly less than the screen holds.
+        // That reasoning only holds where the text index is *authoritative*: a
+        // complete tree, every control named and addressable. There the scan's
+        // boxes are a second reading of a screen the model can already
+        // navigate, and the picture is redundant.
         //
-        // It is also the basis for asking to look more closely later: a model
-        // cannot point at a region of a picture it was never shown. The scan
-        // keeps the ids addressable; the image is what the model actually looks
-        // at.
+        // Everywhere else it inverts, and the inversion is not about cost. The
+        // detector resizes the screen into a fixed 640×640 frame before it
+        // looks, so on a wide display anything smaller than a few dozen pixels
+        // is simply absent from the boxes; the picture the model receives is up
+        // to 1024 wide and read by the model itself. Withholding it on an
+        // incomplete tree leaves the model with strictly less than the screen
+        // holds — and with no picture to point at.
+        //
+        // That last part is the reason this is a prerequisite rather than a
+        // nicety: a model cannot ask to look more closely at a region of a
+        // picture it was never shown. If the scan is the only index, the boxes
+        // it returns are also the limit of what the model knows exists, so a
+        // control the detector missed is a control nobody will ever ask to see.
+        // Region re-look is unreachable by construction. The scan keeps the ids
+        // addressable; the image is what makes "there is something over there,
+        // look closer" a request the run can act on.
         let tree_less = ctx.tree.is_empty() && ctx.tree_read_failed.is_none();
         let vision_answered = ctx.vision.as_ref().is_some_and(|v| !v.is_empty());
-        let the_scan_answers_alone = vision_answered && !tree_less;
+        // Suppress only under a complete tree. `tree_less` is checked as well
+        // because an empty list cannot claim completeness, and a tree-less
+        // screen is the case this rule was written for.
+        let the_scan_answers_alone = vision_answered && ctx.tree_complete && !tree_less;
 
         let mut perception = plan_perception(PerceptionInputs {
             tree_complete: ctx.tree_complete,
@@ -1263,19 +1274,50 @@ mod tests {
         );
     }
 
-    /// A visual scan on a screen that *has* a tree replaces the image: the scan
-    /// is a second reading of the same screen, and paying for both would buy
-    /// one answer twice.
+    /// A visual scan on a screen whose tree is whole replaces the image.
+    ///
+    /// This is the one case where the scan genuinely is a second reading: a
+    /// complete tree already names and addresses every control, so the boxes
+    /// add nothing the model cannot already act on, and the picture is a
+    /// duplicate.
     #[test]
-    fn a_visual_scan_replaces_the_image_when_the_tree_is_there() {
-        let mut context = ctx(false);
+    fn a_visual_scan_replaces_the_image_when_the_tree_is_whole() {
+        let mut context = ctx(true);
         context.vision = Some(vision_elements());
         let (_system, user) = driver().render_prompt(&state(), &context);
         assert!(
             !user.contains("image of the screen is attached"),
-            "a scan that answered stands in for the image: {user}"
+            "a scan that answered over a whole tree stands in for the image: {user}"
         );
         assert!(user.contains("Detected from the screenshot:"), "{user}");
+    }
+
+    /// An incomplete tree keeps the image even when the scan answered.
+    ///
+    /// This is the ordering the plan turns on: local re-look is empty without
+    /// it. The detector reads a 640×640 resize, so on a wide screen a small
+    /// control is absent from its boxes — and a control the scan did not name
+    /// is one the model will never ask to see closer, because the only picture
+    /// it was given is the one the boxes describe. Suppressing the image here
+    /// does not save a duplicate; it removes the one view that could show what
+    /// the scan missed.
+    ///
+    /// Falsified before being kept: this failed against a predicate that only
+    /// spared tree-less screens, which is what this file held until the plan's
+    /// ordering was re-checked.
+    #[test]
+    fn an_incomplete_tree_keeps_the_image_however_good_the_scan() {
+        let mut context = ctx(false);
+        context.vision = Some(vision_elements());
+        let (_system, user) = driver().render_prompt(&state(), &context);
+        assert!(
+            user.contains("image of the screen is attached"),
+            "an incomplete tree still needs the eye the scan does not have: {user}"
+        );
+        assert!(
+            user.contains("Detected from the screenshot:"),
+            "the scan is still an index to aim with: {user}"
+        );
     }
 
     /// On a tree-less screen the scan does **not** replace the image.

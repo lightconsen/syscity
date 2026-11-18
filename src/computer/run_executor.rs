@@ -1636,15 +1636,50 @@ mod tests {
         );
     }
 
-    /// A scan that found controls stands in for the image, so a run with a
-    /// scan sends no images even when the tree is truncated.
+    /// A truncated tree keeps the image even when a scan answered.
+    ///
+    /// This test used to assert the opposite, and that was the defect the plan's
+    /// ordering caught. The detector reads a 640×640 resize, so on a wide screen
+    /// a small control is absent from its boxes; a control the scan did not name
+    /// is one the model will never ask to see closer, because the only picture
+    /// it had was the one the boxes describe. Suppressing the image on a
+    /// truncated tree does not save a duplicate — it removes the one view that
+    /// could show what the scan missed, and with it the whole reason region
+    /// re-look exists.
     #[tokio::test]
-    async fn a_run_with_a_scan_sends_no_images() {
+    async fn a_truncated_tree_keeps_the_image_even_when_the_scan_answers() {
         let provider = ScriptedProvider::new(vec![
             click_answer(),
             r#"{"decision": "done", "message": "clicked it"}"#,
         ]);
         let adapter = FakeDesktop::new(true);
+        let run = ComputerRun::new("r1", "click Save");
+
+        let mut plan = fast_plan(provider.clone(), adapter, 15, true);
+        plan.vision = Some(fixed_look());
+
+        let outcome = execute(run, plan).await.expect("the run machinery works");
+
+        assert!(outcome.success, "{}", outcome.message);
+        // Both decision calls in this run see the truncated tree, so both get
+        // the picture. The point is that the count is not zero: the scan having
+        // answered no longer removes the one view that can show what it missed.
+        assert_eq!(
+            provider.images_sent(),
+            2,
+            "an incomplete tree still needs the eye the scan does not have"
+        );
+    }
+
+    /// A whole tree with an answering scan sends no image: the boxes are a
+    /// second reading of a screen the model can already name and address.
+    #[tokio::test]
+    async fn a_whole_tree_with_a_scan_sends_no_images() {
+        let provider = ScriptedProvider::new(vec![
+            click_answer(),
+            r#"{"decision": "done", "message": "clicked it"}"#,
+        ]);
+        let adapter = FakeDesktop::new(false);
         let run = ComputerRun::new("r1", "click Save");
 
         let mut plan = fast_plan(provider.clone(), adapter, 15, true);
@@ -1663,7 +1698,7 @@ mod tests {
     async fn a_blind_resolver_leaves_the_image_path_intact() {
         // A truncated tree wants a picture; nobody can scan, so the picture is
         // still the answer. This is the counterpart to
-        // `a_run_with_a_scan_sends_no_images`: an empty scan must not be
+        // `a_whole_tree_with_a_scan_sends_no_images`: an empty scan must not be
         // mistaken for a scan that answered.
         let provider = ScriptedProvider::new(vec![
             r#"{"decision": "done", "message": "read it off the image"}"#,
