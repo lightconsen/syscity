@@ -855,18 +855,24 @@ fn map_rect(space: &CoordinateSpace, bounds: Rect) -> Rect {
 
 /// Give detected controls the text drawn inside them.
 ///
-/// The detector knows *where* a control is, never what it says, so a scan used
-/// to produce a screenful of `button` with no labels — addressable by id and
-/// indistinguishable by name, which is barely an improvement over coordinates.
-/// OCR reads the words; the box a word falls inside is the control the word
-/// names.
+/// The detector answers *where*; OCR answers *what*. A box without a name is
+/// addressable but indistinguishable from every other anonymous control on the
+/// screen, which is barely an improvement over coordinates. OCR reads the
+/// words; the box a word falls inside is the control the word names.
 ///
 /// A control keeps any label it already has (a richer source wins), and a
 /// control with no text inside it stays unlabelled rather than borrowing the
 /// nearest word: an icon-only button has no name, and inventing one is how a
 /// model learns to click the wrong thing confidently.
+///
+/// `pub(crate)` because the run loop is not the only caller: the single-shot
+/// `screen_state` tool builds its fallback tree through the same
+/// `to_ui_elements` and has the same `label: None` boxes to name.
 #[cfg_attr(not(feature = "vision"), allow(dead_code))] // its tests run in every build
-fn label_from_text(elements: &mut [UiElement], blocks: &[crate::computer::vision::TextBlock]) {
+pub(crate) fn label_from_text(
+    elements: &mut [UiElement],
+    blocks: &[crate::computer::vision::TextBlock],
+) {
     for element in elements.iter_mut() {
         if element
             .label

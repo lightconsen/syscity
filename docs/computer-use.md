@@ -257,6 +257,12 @@ run 结束时写一条 `RunSummary`：
 视觉调用有超时（`[computer.vision] timeout_secs`，默认 10）：超时即降级，
 **绝不让视觉卡住整个 loop**——和 `update.status` 那次事故同一个教训。
 
+补 `label` 这件事有**两个消费者**，不是只有 run 循环。单发工具 `screen_state`
+的 `ui_fallback` 走的是同一个 `to_ui_elements`，拿到的也是同一批 `label: None`
+的框。它现在同样用 OCR 补名（`label_from_text`，`pub(crate)` 就是为此），并且
+在**没跑 OCR** 时报告还有多少框没有名字——那不是一个错误（纯图标按钮本来就没有
+文字），而是决定模型能不能说"第二个按钮"的事实。数字不给，模型只会自己猜。
+
 ### 4.1 同一帧只扫一次
 
 无树 app 的每一步都会触发扫描（树永久不完整，`ImageTrigger` 一直成立），而

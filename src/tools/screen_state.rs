@@ -222,6 +222,12 @@ impl ScreenStateTool {
         .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?
         .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?;
 
+        // Kept past the `state` fields because the detector fallback below
+        // needs the boxes to name the controls it finds. Both are in the same
+        // image-pixel space, which is what makes the overlap test meaningful.
+        #[cfg(feature = "vision")]
+        let mut ocr_blocks: Vec<crate::computer::vision::TextBlock> = Vec::new();
+
         #[cfg(feature = "vision")]
         if want_ocr {
             let mut guard = lock_ocr(&self.ocr).await?;
@@ -239,6 +245,7 @@ impl ScreenStateTool {
                 .iter()
                 .map(crate::computer::vision::TextBlockSer::from)
                 .collect();
+            ocr_blocks = blocks;
         }
 
         #[cfg(not(feature = "vision"))]
@@ -253,6 +260,15 @@ impl ScreenStateTool {
         let want_fallback = args["ui_fallback"].as_bool().unwrap_or(true);
         let mut ui_source = "accessibility";
         let mut fallback_count = 0usize;
+        // How many detected controls the tree shows with no name at all.
+        //
+        // Carries the one fact the model must not have to infer: it is looking
+        // at anonymous boxes, so "the third button" is not a thing it can mean.
+        // Counted after naming, so it covers both "OCR was not run" and "the
+        // control holds no text" — in either case the box has no name, and the
+        // model must be told rather than left to assume one exists.
+        #[cfg_attr(not(feature = "vision"), allow(unused_mut, unused_variables))]
+        let mut unlabelled_fallback = 0usize;
 
         #[cfg(feature = "vision")]
         if want_fallback && state.ui_tree.is_empty() {
@@ -262,10 +278,12 @@ impl ScreenStateTool {
                         match detector.detect_elements(&state.screenshot).await {
                             Ok(detected) if !detected.is_empty() => {
                                 fallback_count = detected.len();
-                                state.ui_tree =
+                                let mut elements =
                                     crate::computer::vision::ui_onnx::OmniParserDetector::to_ui_elements(
                                         detected,
                                     );
+                                unlabelled_fallback = name_detected(&mut elements, &ocr_blocks);
+                                state.ui_tree = elements;
                                 ui_source = "omniparser";
                             }
                             Ok(_) => warn!("OmniParser fallback found no elements"),
@@ -322,6 +340,19 @@ impl ScreenStateTool {
         }
         let mut output = outline.text;
         output.push_str(&trust_line(ui_source));
+        // An anonymous control cannot be described in words, so say so here
+        // rather than letting the model discover it by failing to name one.
+        // Being specific about what to do next is the point: a coordinate read
+        // off the screenshot still works, and `include_ocr` gives the boxes
+        // their names.
+        if unlabelled_fallback > 0 {
+            output.push_str(&format!(
+                "({} of the detected controls carry no name — nothing readable was inside \
+                 them, or OCR was not run. Refer to them by position, or call again with \
+                 include_ocr=true to label the boxes from their text.)\n",
+                unlabelled_fallback
+            ));
+        }
         if !findings.is_empty() {
             output.push_str(&format!(
                 "(⚠ sensitive UI detected: {}) — pause and confirm before typing or clicking here\n",
@@ -690,6 +721,35 @@ fn parse_region(args: &Value) -> Option<Rect> {
     Some(Rect::new(x as i32, y as i32, w as u32, h as u32))
 }
 
+/// Name the detected controls from the text drawn inside them.
+///
+/// The detector answers *where*, never *what*: every box it returns arrives
+/// with `label: None`, so a tree-less screen renders as a column of identical
+/// `button` lines. That is barely better than coordinates, and it is the same
+/// defect the run loop had — this is the single-shot tool's copy of it.
+///
+/// Returns how many controls are still anonymous afterwards, which is what the
+/// caller reports to the model. That count is *not* an error: an icon-only
+/// button genuinely has no text inside it. It is the fact that decides whether
+/// "the second button" is something the model can mean.
+///
+/// `blocks` is empty when the caller did not ask for OCR. Naming then costs
+/// nothing to skip, and the count says the boxes are unnamed rather than
+/// letting the model assume a name exists somewhere.
+#[cfg(feature = "vision")]
+fn name_detected(
+    elements: &mut [crate::computer::UiElement],
+    blocks: &[crate::computer::vision::TextBlock],
+) -> usize {
+    if !blocks.is_empty() {
+        crate::computer::vision::look::label_from_text(elements, blocks);
+    }
+    elements
+        .iter()
+        .filter(|e| e.label.as_deref().is_none_or(str::is_empty))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,6 +900,53 @@ mod tests {
         format_element(&tree, 0, &mut out, &mut lines, 100, &no_sensitive());
         assert_eq!(out, "button at (10,20) 100x30\n");
         assert!(!out.contains("\"\""));
+    }
+
+    /// The detector never names what it finds, so this tool's fallback tree
+    /// used to be a column of anonymous `button` lines — the same defect the
+    /// run loop had. OCR's blocks are already in hand when the caller asked
+    /// for them; the boxes must get their names from them.
+    ///
+    /// The assertion is on the label, not on "the tool ran": with the naming
+    /// removed the tree still renders, it just names nothing.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_detected_control_is_named_by_the_text_inside_it() {
+        use crate::computer::vision::TextBlock;
+
+        let mut elements = vec![
+            el("button", None, vec![]),
+            // An icon-only control: nothing readable inside, so it keeps no
+            // name rather than borrowing its neighbour's.
+            el("icon", None, vec![]),
+        ];
+        // `el` gives every element one box; the icon needs its own, away from
+        // the word, or the overlap test would name it too.
+        elements[1].bounds = Some(Rect::new(400, 400, 20, 20));
+        let blocks = vec![TextBlock {
+            text: "Save".to_string(),
+            confidence: 0.9,
+            bounds: Rect::new(12, 22, 20, 10),
+        }];
+
+        let unnamed = name_detected(&mut elements, &blocks);
+
+        assert_eq!(elements[0].label.as_deref(), Some("Save"), "the box got its name");
+        assert_eq!(elements[1].label, None, "an icon-only control stays anonymous");
+        assert_eq!(unnamed, 1, "the count says how many are still unnameable");
+    }
+
+    /// Without OCR there is nothing to name from, and the count is what lets
+    /// the output say so instead of leaving the model to guess.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn running_without_ocr_reports_the_unnamed_boxes() {
+        let mut elements = vec![el("button", None, vec![]), el("text_field", None, vec![])];
+
+        let unnamed = name_detected(&mut elements, &[]);
+
+        assert_eq!(unnamed, 2, "both boxes are anonymous");
+        assert!(elements.iter().all(|e| e.label.is_none()), "and nothing invented a name");
     }
 
     #[test]
