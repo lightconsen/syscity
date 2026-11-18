@@ -382,14 +382,19 @@ impl ComputerUseLoop {
         let mut last_error: Option<String> = None;
         let mut consecutive_failures: usize = resume.consecutive_failures;
 
-        // What the next capture should cover. The model asks for a closer look
-        // by answering with a region screenshot; on the next iteration this is
-        // what the loop actually captures. It is one-shot on purpose: a crop
-        // the model asked for answers *that* step's question, and the step
+        // What the *next* capture should cover. The model asks for a closer
+        // look by answering with a region screenshot; on the next iteration
+        // this is what the loop actually captures. It is one-shot on purpose: a
+        // crop the model asked for answers *that* step's question, and the step
         // after it should see the whole screen again unless it asks again.
         // Otherwise a single request for a close-up would narrow every later
         // decision to a rectangle it never chose.
-        let mut capture_region: Option<crate::computer::Rect> = None;
+        //
+        // It is taken (not read) when the capture is ordered, so the request
+        // describes exactly one capture. Leaving it in place would make the
+        // field "the region this and every later capture uses", which is the
+        // mode the paragraph above rules out.
+        let mut next_region: Option<crate::computer::Rect> = None;
 
         // A run is a task: failure counters and memory start clean — unless
         // this *is* a continued task, in which case the counters are the
@@ -436,6 +441,11 @@ impl ComputerUseLoop {
             // 1. Perceive — capture screenshot. A capture that failed is not
             //    an empty screen: carry the reason and let the decision maker
             //    answer "I cannot look" instead of planning on a blank frame.
+            //
+            //    `take` is what makes a close-up one-shot: the region answers
+            //    this capture and is gone, so the next iteration captures the
+            //    whole screen unless the model asks again.
+            let capture_region = next_region.take();
             let (screenshot, capture_error) = match self.adapter.screenshot(capture_region).await {
                 Ok(shot) => (shot, None),
                 Err(e) => {
@@ -487,7 +497,7 @@ impl ComputerUseLoop {
                             &mut consecutive_failures,
                             &mut last_verified,
                             &mut last_error,
-                            &mut capture_region,
+                            &mut next_region,
                             &screenshot,
                         )
                         .await;
@@ -518,7 +528,7 @@ impl ComputerUseLoop {
                             &mut consecutive_failures,
                             &mut last_verified,
                             &mut last_error,
-                            &mut capture_region,
+                            &mut next_region,
                             &screenshot,
                         )
                         .await;
@@ -577,7 +587,7 @@ impl ComputerUseLoop {
         consecutive_failures: &mut usize,
         last_verified: &mut Option<bool>,
         last_error: &mut Option<String>,
-        capture_region: &mut Option<crate::computer::Rect>,
+        next_region: &mut Option<crate::computer::Rect>,
         screenshot: &Screenshot,
     ) -> usize {
         // `step` is the loop's counter and only moves once per iteration; a
@@ -598,7 +608,7 @@ impl ComputerUseLoop {
             // after it were planned on a picture that no longer describes the
             // screen.
             if let DesktopAction::Screenshot { region } = &action {
-                *capture_region = *region;
+                *next_region = *region;
                 let coverage = match region {
                     Some(r) => format!("({}, {}) {}x{}", r.x, r.y, r.width, r.height),
                     None => "the whole screen".to_string(),
@@ -827,9 +837,17 @@ mod tests {
                         1 => Ok(LoopDecision::Action(DesktopAction::Screenshot {
                             region: Some(region),
                         })),
-                        // The model has looked; now it is done. A third step
-                        // would prove the crop is one-shot, but the loop has
-                        // already captured by then.
+                        // A second step that acts on what it saw, so the loop
+                        // takes a *third* capture. That third one is the only
+                        // observation that can show the crop was one-shot: with
+                        // two captures the loop has not yet been asked to take
+                        // a picture after the close-up was used.
+                        2 => Ok(LoopDecision::Action(DesktopAction::Click {
+                            target: crate::computer::ClickTarget::Coordinate(
+                                crate::computer::Point::new(10, 10),
+                            ),
+                            button: crate::computer::MouseButton::Left,
+                        })),
                         _ => Ok(LoopDecision::Done {
                             message: "read the close-up".to_string(),
                         }),
@@ -840,15 +858,27 @@ mod tests {
             .unwrap();
 
         let asked = adapter.asked.lock().unwrap().clone();
+        // Every capture the adapter was asked for, in order. The session's own
+        // settle polls appear here too (they take no region), so the claim is
+        // about the *positions*, not the total: none first, the crop exactly
+        // second, and never again.
+        assert_eq!(asked[0], None, "the first capture is the whole screen");
+        assert_eq!(asked[1], Some(region), "the second is the close-up");
+        assert!(
+            asked[2..].iter().all(|r| r.is_none()),
+            "the crop is a request, not a mode: it must not survive into any \
+             later capture, got {asked:?}"
+        );
         assert_eq!(
-            asked,
-            vec![None, Some(region)],
-            "the first capture is the whole screen, the second is the close-up"
+            asked.iter().filter(|r| r.is_some()).count(),
+            1,
+            "one request means one close-up: {asked:?}"
         );
         // What the decision maker was *told* it was looking at, which is what
         // the prompt renders. The second decision is made against the close-up,
-        // because that is the capture the loop took after the request.
-        assert_eq!(seen_regions, vec![None, Some(region)]);
+        // because that is the capture the loop took after the request; the
+        // third is made against the whole screen again.
+        assert_eq!(seen_regions, vec![None, Some(region), None]);
     }
 
     /// A whole-screen screenshot request widens the next capture back, which is
