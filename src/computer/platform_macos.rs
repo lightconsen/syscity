@@ -267,21 +267,19 @@ end tell"#,
                     to.x, to.y
                 )))
             }
-            DesktopAction::Scroll { target: _, direction, amount } => {
-                let key_code = match direction {
-                    crate::computer::ScrollDirection::Up => "116",
-                    crate::computer::ScrollDirection::Down => "121",
-                    crate::computer::ScrollDirection::Left => "123",
-                    crate::computer::ScrollDirection::Right => "124",
-                };
-                let mut script = String::new();
-                for _ in 0..amount {
-                    script.push_str(&format!(
-                        "tell application \"System Events\" to key code {}\ndelay 0.05\n",
-                        key_code
-                    ));
-                }
-                let apple_args = serde_json::json!({ "script": script });
+            DesktopAction::Scroll { target, direction, amount } => {
+                // A wheel event is delivered to the window under the pointer,
+                // so the pointer has to go there first. Sending PageDown keys
+                // instead — which is what this did — scrolls whatever holds
+                // *focus*, which is a different window whenever the model
+                // scrolls a list it has not clicked yet. That is the ordinary
+                // case: you look at a pane and scroll it without selecting it.
+                let (x, y) = self.resolve_click_point(target).await?;
+                let script = scroll_script(x, y, direction, amount);
+                let apple_args = serde_json::json!({
+                    "script": script,
+                    "language": "JavaScript",
+                });
                 let result = self
                     .registry
                     .execute("applescript", apple_args, &crate::tools::ToolContext::default())
@@ -290,19 +288,33 @@ end tell"#,
                         ComputerError::ToolFailed("applescript tool not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    return Err(ComputerError::ToolFailed(
+                        result
+                            .error
+                            .unwrap_or_else(|| "the scroll did not run".to_string()),
+                    ));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Drag { from, to } => {
                 let (from_x, from_y) = self.resolve_click_point(from).await?;
                 let (to_x, to_y) = self.resolve_click_point(to).await?;
-                // Release Guard: the modifier key is held across two separate
-                // clicks. If the second click raises, `key up option` is never
-                // reached and the system is left with a key held down — every
-                // later keystroke in every app arrives modified. The error
-                // branch releases it, and the result says whether the release
-                // itself had to run, so a caller is not told a clean "done".
+                // A drag is three Core Graphics events with the button held
+                // between the first and the last; see [`drag_script`]. It is
+                // JXA because AppleScript has no verb for a held-button move.
+                //
+                // Release Guard: if anything raises before the `leftMouseUp`,
+                // the button stays down and every later click in every app
+                // arrives as a drag. The script's `finally` posts the release
+                // on the error path too, and says which path ran, so a caller
+                // is never told a clean "dragged" for a release that had to
+                // recover.
                 let script = drag_script(from_x, from_y, to_x, to_y);
-                let apple_args = serde_json::json!({ "script": script });
+                let apple_args = serde_json::json!({
+                    "script": script,
+                    "language": "JavaScript",
+                });
                 let result = self
                     .registry
                     .execute("applescript", apple_args, &crate::tools::ToolContext::default())
@@ -313,8 +325,14 @@ end tell"#,
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 let output = result.output.trim().to_string();
                 if output.starts_with("release-failed:") {
-                    // The key may still be held. That is a failure a caller
-                    // must see, not a drag that "mostly worked".
+                    // The button may still be down. That is a failure a
+                    // caller must see, not a drag that "mostly worked".
+                    return Err(ComputerError::ToolFailed(output));
+                }
+                if output.starts_with("drag-failed:") {
+                    // The press happened but the motion did not. The release
+                    // ran in the `finally`, so nothing is stuck — but the
+                    // gesture never carried anything, which is a failure.
                     return Err(ComputerError::ToolFailed(output));
                 }
                 let mut action_result = ActionResult::success(output.clone());
@@ -1198,38 +1216,115 @@ $.CGEventPost($.kCGHIDEventTap, event);
     )
 }
 
+/// JXA that moves the pointer to `(x, y)` and posts wheel events there.
+///
+/// The move is not decoration: macOS routes a wheel event to the window under
+/// the cursor, not to the focused one, so posting a scroll without positioning
+/// the pointer scrolls whatever the cursor happened to be over. A caller aims
+/// at a pane and expects that pane to move.
+///
+/// One event per `amount`, because that is what `amount` means everywhere else
+/// in this adapter — a count of wheel notches, the unit the X11 and Windows
+/// rungs send. Folding them into one event with a larger line count would look
+/// the same in the source and scroll a different distance on every platform.
+///
+/// `CGEventCreateScrollWheelEvent2` takes three axis amounts; only the axis
+/// this direction is on is non-zero. The sign follows the system's own
+/// convention, which is inverted from the words: a positive vertical amount
+/// scrolls *down* the document (the content moves up). A reversed scroll is not
+/// an error a caller can see, so the mapping is written out once, here.
+fn scroll_script(
+    x: i32,
+    y: i32,
+    direction: crate::computer::ScrollDirection,
+    amount: i32,
+) -> String {
+    let (vertical, horizontal): (i32, i32) = match direction {
+        crate::computer::ScrollDirection::Up => (1, 0),
+        crate::computer::ScrollDirection::Down => (-1, 0),
+        crate::computer::ScrollDirection::Left => (0, 1),
+        crate::computer::ScrollDirection::Right => (0, -1),
+    };
+    format!(
+        r#"ObjC.import('CoreGraphics');
+var point = {{x: {x}, y: {y}}};
+var moved = $.CGEventCreateMouseEvent(null, $.kCGEventMouseMoved, point, 0);
+$.CGEventPost($.kCGHIDEventTap, moved);
+for (var notch = 0; notch < {amount}; notch++) {{
+    var wheel = $.CGEventCreateScrollWheelEvent2(null, $.kCGScrollEventUnitLine, 2, {vertical}, {horizontal}, 0);
+    $.CGEventPost($.kCGHIDEventTap, wheel);
+}}
+"scrolled at {x},{y}";"#
+    )
+}
+
 /// Factory for macOS.
 pub async fn create(registry: Arc<ToolRegistry>) -> Result<Box<dyn ComputerAdapter>> {
     Ok(Box::new(MacosComputerAdapter::new(registry)))
 }
 
-/// AppleScript for a modifier-held drag, with a Release Guard.
+/// JXA that presses at one point, moves with the button still down, and
+/// releases at another.
 ///
-/// The modifier is held across two separate clicks. If the second click
-/// raises, `key up option` is never reached and the system is left with a key
-/// held down — every later keystroke in every app arrives modified. The error
-/// branch releases it and reports which release path ran, so a caller is never
-/// told a clean "done" for a drag that stranded a modifier.
+/// This was two `click at` commands with Option held in between, and that is
+/// not a drag: a click is a complete press-and-release, so the second one
+/// landed as "Option-click over there" and nothing was ever carried along the
+/// path. A slider, a scrollbar thumb, a text selection and a kanban card all
+/// move by a *held* button being dragged, which is exactly the gesture that
+/// version could not produce — the action existed, reported success, and did
+/// the wrong thing.
+///
+/// The path is walked in steps rather than jumped. A single
+/// `leftMouseDragged` from A straight to B is delivered, but a drag session
+/// (AppKit's drag-and-drop, a scrollbar's tracking loop) arms itself on the
+/// *motion* after the press: it needs to see the pointer leave the press point
+/// before it commits to dragging. One instantaneous jump can arrive as "the
+/// pointer was already there when the button went down". The intermediate
+/// points are what make the gesture look like a hand.
+///
+/// A short sleep after the press is the other half of that: the press has to
+/// reach the window before the drag events do, and without it a fast script
+/// can deliver all three inside one run-loop pass.
+///
+/// The release is in a `finally`. A raise between the down and the up would
+/// otherwise leave the button held: every later click in every app arrives as
+/// a drag, and the machine is unusable until someone clicks to clear it. The
+/// `finally` is what makes the script unable to strand a press — and the
+/// output says which path ran, so a caller is never told a clean "dragged" for
+/// a release that had to recover.
 fn drag_script(from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> String {
+    /// Intermediate drag events between the press and the release.
+    const STEPS: i32 = 8;
     format!(
-        r#"tell application "System Events"
-    click at {{ {}, {} }}
-    delay 0.1
-    key down option
-    try
-        click at {{ {}, {} }}
-        key up option
-        return "dragged"
-    on error _err
-        try
-            key up option
-            return "emergency-release: " & _err
-        on error
-            return "release-failed: " & _err
-        end try
-    end try
-end tell"#,
-        from_x, from_y, to_x, to_y
+        r#"ObjC.import('CoreGraphics');
+ObjC.import('Foundation');
+function post(kind, x, y) {{
+    var point = {{x: x, y: y}};
+    var event = $.CGEventCreateMouseEvent(null, kind, point, 0);
+    $.CGEventPost($.kCGHIDEventTap, event);
+}}
+var result = "dragged";
+try {{
+    post($.kCGEventLeftMouseDown, {from_x}, {from_y});
+    // The press must land before the motion does; see the doc above.
+    $.NSThread.sleepForTimeInterval(0.05);
+    for (var step = 1; step <= {steps}; step++) {{
+        var x = {from_x} + Math.round(({to_x} - {from_x}) * step / {steps});
+        var y = {from_y} + Math.round(({to_y} - {from_y}) * step / {steps});
+        post($.kCGEventLeftMouseDragged, x, y);
+        $.NSThread.sleepForTimeInterval(0.01);
+    }}
+}} catch (dragErr) {{
+    result = "drag-failed: " + dragErr;
+}} finally {{
+    try {{
+        post($.kCGEventLeftMouseUp, {to_x}, {to_y});
+    }} catch (releaseErr) {{
+        result = "release-failed: " + releaseErr;
+    }}
+}}
+result;"#,
+        steps = STEPS,
     )
 }
 
@@ -1257,19 +1352,112 @@ mod tests {
         assert!(script.contains(r#"set value of (first UI element whose role is "AXTextField" and name is "Title") to "Hello""#));
     }
 
-    /// The drag script holds a modifier key across two clicks; if the second
-    /// raises, the key must be released and the caller told.
+    /// A drag must hold the button between the press and the release.
+    ///
+    /// This is the defect it was written for: the old script was two `click at`
+    /// commands, so the button went down and up at the origin and the second
+    /// click landed as an Option-click at the destination. Nothing was ever
+    /// carried. A slider, a scrollbar thumb, a selection and a kanban card all
+    /// move by a held button, which is the one gesture that version could not
+    /// produce.
     #[test]
-    fn a_drag_script_releases_the_modifier_on_error() {
+    fn a_drag_holds_the_button_across_the_motion() {
         let script = drag_script(10, 20, 100, 120);
-        assert!(script.contains("key down option"), "{script}");
-        assert!(script.contains("on error"), "{script}");
-        let error_branch = &script[script.find("on error").expect("error branch")..];
+        let down = script.find("kCGEventLeftMouseDown").expect("the press");
+        let dragged = script.find("kCGEventLeftMouseDragged").expect("the motion");
+        let up = script.find("kCGEventLeftMouseUp").expect("the release");
+        assert!(down < dragged, "the button must go down before the motion: {script}");
+        assert!(dragged < up, "the motion must happen before the release: {script}");
+        // The motion is walked, not jumped: an immediate jump can be delivered
+        // as "the pointer was already there".
+        assert!(script.contains("step <= 8"), "the path is one leap, not a drag: {script}");
+        // No click verb: a click is a complete press-and-release, which is the
+        // thing this script must not be made of.
+        assert!(!script.contains("click at"), "a click is not a drag: {script}");
+        assert!(!script.contains("key down option"), "a modifier is not a held button: {script}");
+    }
+
+    /// The release runs on the error path too.
+    ///
+    /// A press with no release leaves the button down: every later click in
+    /// every app arrives as a drag. `finally` is what makes that impossible.
+    #[test]
+    fn a_drag_releases_the_button_even_when_the_motion_raises() {
+        let script = drag_script(10, 20, 100, 120);
+        let finally_block = script.find("finally").expect("a finally block");
         assert!(
-            error_branch.contains("key up option"),
-            "the error branch must release the key: {script}"
+            script[finally_block..].contains("kCGEventLeftMouseUp"),
+            "the release must survive a raise in the motion: {script}"
         );
-        assert!(script.contains("emergency-release"), "{script}");
+        assert!(script.contains("release-failed"), "{script}");
+        assert!(script.contains("drag-failed"), "{script}");
+    }
+
+    /// A scroll must go to the window under the pointer, not to the focus.
+    ///
+    /// This is the second defect the drag test caught in the same gesture
+    /// family: the old scroll posted PageDown keys, which the *focused* window
+    /// receives. Scrolling a list you have not clicked is the ordinary case —
+    /// you look at a pane and scroll it — and that version scrolled a
+    /// different window.
+    #[test]
+    fn a_scroll_aims_the_pointer_and_posts_a_wheel() {
+        let script = scroll_script(300, 250, crate::computer::ScrollDirection::Up, 3);
+        let moved = script.find("kCGEventMouseMoved").expect("the pointer move");
+        let wheel = script
+            .find("kCGEventScrollWheelEvent")
+            .or_else(|| script.find("ScrollWheel"))
+            .expect("the wheel");
+        assert!(moved < wheel, "the pointer must arrive before the wheel: {script}");
+        assert!(
+            !script.contains("key code"),
+            "a keystroke goes to the focus, not to the point: {script}"
+        );
+        // One event per notch, like every other platform's `amount`.
+        assert!(script.contains("notch < 3"), "{script}");
+        // The sign is the system's, which is inverted from the words: "up"
+        // must move the content down, so the vertical amount is positive.
+        assert!(script.contains(", 1, 0, 0)"), "{script}");
+
+        let down = scroll_script(300, 250, crate::computer::ScrollDirection::Down, 1);
+        assert!(down.contains(", -1, 0, 0)"), "{down}");
+    }
+
+    /// The generated JavaScript must parse — but not run.
+    ///
+    /// A syntax error is a gesture that does nothing and reports success, so
+    /// this is worth an `osascript` call. The script is wrapped in a function
+    /// and never invoked: `osascript` compiles the whole file before running
+    /// any of it, so the syntax is checked with no mouse event posted and no
+    /// pointer moved. Calling it here would drive the developer's own screen
+    /// from a unit test.
+    #[cfg(target_os = "macos")]
+    fn assert_parses(script: &str) {
+        let out = std::process::Command::new("osascript")
+            .arg("-l")
+            .arg("JavaScript")
+            .arg("-e")
+            .arg(format!("function unwrapped() {{ {script} }}"))
+            .output()
+            .expect("osascript is present on macOS");
+        assert!(
+            out.status.success(),
+            "the script does not parse: {}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            script
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_scroll_script_is_valid_javascript() {
+        assert_parses(&scroll_script(0, 0, crate::computer::ScrollDirection::Down, 1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_drag_script_is_valid_javascript() {
+        assert_parses(&drag_script(10, 20, 100, 120));
     }
 
     #[test]
