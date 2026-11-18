@@ -491,21 +491,43 @@ impl ModelDriver {
             // it as a screen coordinate aims at less than half the distance it
             // meant — and a close-up asked for at that point shows the wrong
             // place. So the scale is stated whenever the two differ.
+            //
+            // A crop needs an offset as well as a factor: its first pixel is
+            // `region.x`, not zero, so the mapping is `origin + image × scale`.
+            // Stating only the factor would put every position in a close-up
+            // off by the distance from the screen's corner — the very error
+            // the close-up branch's "not offsets within the crop" sentence
+            // warns about, arriving from the other direction.
             let scale_note = match (&attachment, ctx.screenshot.as_ref()) {
                 (Some(image), Some(shot))
                     if image.width != shot.width || image.height != shot.height =>
                 {
-                    format!(
-                        " The image is {}×{} and the screen is {}×{} screen points, so an image \
-                         position is not a screen position: multiply by about {:.2} horizontally \
-                         and {:.2} vertically before giving a coordinate or a close-up region.",
-                        image.width,
-                        image.height,
-                        shot.width,
-                        shot.height,
-                        shot.width as f64 / image.width.max(1) as f64,
-                        shot.height as f64 / image.height.max(1) as f64,
-                    )
+                    let scale_x = shot.width as f64 / image.width.max(1) as f64;
+                    let scale_y = shot.height as f64 / image.height.max(1) as f64;
+                    match ctx.capture_region {
+                        Some(region) => format!(
+                            " The image is {}×{} but the screen area it shows is {}×{} screen \
+                             points, so an image position is not a screen position: multiply \
+                             by about {:.2} horizontally and {:.2} vertically, then add the \
+                             crop's origin ({}, {}) — or name a region in screen points \
+                             directly.",
+                            image.width,
+                            image.height,
+                            shot.width,
+                            shot.height,
+                            scale_x,
+                            scale_y,
+                            region.x,
+                            region.y,
+                        ),
+                        None => format!(
+                            " The image is {}×{} and the screen is {}×{} screen points, so an \
+                             image position is not a screen position: multiply by about {:.2} \
+                             horizontally and {:.2} vertically before giving a coordinate or \
+                             a close-up region.",
+                            image.width, image.height, shot.width, shot.height, scale_x, scale_y,
+                        ),
+                    }
                 }
                 _ => String::new(),
             };
@@ -2544,6 +2566,63 @@ mod tests {
         assert!(
             text.contains("multiply by about 2.50"),
             "the prompt must give the factor, not just warn: {text}"
+        );
+    }
+
+    /// A close-up's positions need the crop's origin added, not just a factor.
+    ///
+    /// The crop's first pixel is `region.x`, so the mapping is
+    /// `origin + image × scale`. A note that gave only the factor would place
+    /// every position in a close-up short by the distance from the screen's
+    /// corner — the same error as reading a raw screen position off a scaled
+    /// picture, arriving from the other direction. The fixture is deliberately
+    /// a crop nowhere near the origin, so omitting the offset is visible.
+    #[tokio::test]
+    async fn a_close_up_says_to_add_the_crops_origin() {
+        use image::{Rgb, RgbImage};
+
+        // 2560 wide, cropped to a 1200-wide region starting at x = 900.
+        let frame = RgbImage::from_pixel(2560, 1440, Rgb([230, 230, 230]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(frame)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode the fixture");
+        let base64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        };
+
+        let provider = Arc::new(ScriptedProvider::answering(
+            r#"{"decision": "help", "reason": "cannot see"}"#,
+        ));
+        let driver = ModelDriver::new(provider.clone(), "test-model");
+        let mut context = ctx(false);
+        // The crop is what the model asked for and is now looking at.
+        context.screenshot = Some(Screenshot::new(base64, 1200, 700));
+        context.capture_region = Some(crate::computer::types::Rect::new(900, 300, 1200, 700));
+
+        driver.decide(&state(), &context).await.unwrap();
+
+        let request = &provider.requests()[0];
+        let user = request
+            .messages
+            .iter()
+            .find(|m| m.role == crate::providers::Role::User)
+            .expect("a user message");
+        let text = &user.content;
+        assert!(
+            text.contains("it covers the rectangle from (900, 300)"),
+            "the close-up must say what it covers: {text}"
+        );
+        // A 1200-wide crop is over the 1024 limit, so the encoder shrank it and
+        // the note must fire — with the origin, not only the factor.
+        assert!(
+            text.contains("is not a screen position"),
+            "a scaled close-up must say it is scaled: {text}"
+        );
+        assert!(
+            text.contains("add the crop's origin (900, 300)"),
+            "the offset is what a crop needs and a factor alone does not give: {text}"
         );
     }
 
