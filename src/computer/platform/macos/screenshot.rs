@@ -65,6 +65,73 @@ impl ScreenshotTool {
         }
         (0, 0)
     }
+
+    /// The argv `screencapture` is given for a whole tool invocation.
+    ///
+    /// This is the composition `execute` runs — parse the caller's arguments,
+    /// then build the command — kept as one function so a test can assert the
+    /// *join* rather than its two halves. Testing the parser and the flag
+    /// builder separately would have passed while `execute` ignored the region
+    /// entirely, which is exactly the defect this replaces.
+    fn invocation_arguments(args: &Value, destination: &std::path::Path) -> Vec<String> {
+        let region = Self::region_argument(args);
+        Self::capture_arguments(region.as_deref(), destination)
+    }
+
+    /// The argv `screencapture` is given for one capture.
+    ///
+    /// Split out from the command so the flags can be asserted without a
+    /// display: a machine without screen-recording permission cannot take a
+    /// screenshot to inspect, and a test that silently skips there would prove
+    /// nothing about the flag it is meant to check.
+    fn capture_arguments(region: Option<&str>, destination: &std::path::Path) -> Vec<String> {
+        let mut args = vec!["-x".to_string(), "-C".to_string()];
+        if let Some(region) = region {
+            // `-R` crops in the display's own coordinate space, which is the
+            // space `Rect` is in. Cropping here rather than resizing the full
+            // capture afterwards is what makes a close-up a close-up: the
+            // pixels are the screen's resolution, not a zoom of a picture that
+            // already lost the small controls to the detector's 640-wide pass.
+            args.push("-R".to_string());
+            args.push(region.to_string());
+        }
+        args.push(destination.display().to_string());
+        args
+    }
+
+    /// The region to crop to, in `screencapture -R`'s `x,y,width,height` form.
+    ///
+    /// Two shapes are accepted because two callers exist: the computer adapter
+    /// sends the structured `{"x","y","width","height"}` object, and a model
+    /// writing tool arguments by hand tends to follow the x11 tool's
+    /// `"x,y,w,h"` string. Anything else — a missing field, a negative width —
+    /// is refused rather than half-honoured, because `-R` with a malformed
+    /// value screenshots something the caller did not ask for, and a close-up
+    /// of the wrong rectangle is worse than no close-up at all.
+    fn region_argument(args: &Value) -> Option<String> {
+        let region = args.get("region")?;
+        if let Some(text) = region.as_str() {
+            let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+            if parts.len() != 4 {
+                return None;
+            }
+            let values: Option<Vec<i64>> = parts.iter().map(|p| p.parse::<i64>().ok()).collect();
+            let values = values?;
+            let (x, y, width, height) = (values[0], values[1], values[2], values[3]);
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            return Some(format!("{x},{y},{width},{height}"));
+        }
+        let x = region.get("x")?.as_i64()?;
+        let y = region.get("y")?.as_i64()?;
+        let width = region.get("width")?.as_i64()?;
+        let height = region.get("height")?.as_i64()?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some(format!("{x},{y},{width},{height}"))
+    }
 }
 
 #[async_trait]
@@ -94,6 +161,20 @@ impl Tool for ScreenshotTool {
                 "window": {
                     "type": "string",
                     "description": "Optional window name to capture instead of full screen"
+                },
+                "region": {
+                    "type": "object",
+                    "description": "Optional region to capture, as {\"x\", \"y\", \"width\", \
+                                    \"height\"} in screen points. The capture is cropped by \
+                                    `screencapture -R`, so the pixels are the screen's own \
+                                    resolution rather than a zoom of the full screen.",
+                    "properties": {
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" },
+                        "width": { "type": "integer" },
+                        "height": { "type": "integer" }
+                    },
+                    "required": ["x", "y", "width", "height"]
                 }
             }),
             Vec::<String>::new(),
@@ -102,7 +183,7 @@ impl Tool for ScreenshotTool {
 
     async fn execute(
         &self,
-        _args: Value,
+        args: Value,
         context: &ToolContext,
     ) -> crate::Result<ToolExecutionResult> {
         let _t0 = std::time::Instant::now();
@@ -131,15 +212,11 @@ impl Tool for ScreenshotTool {
 
         info!("Taking screenshot: {} (final: {})", temp_path.display(), final_path.display());
 
-        let result = timeout(
-            Duration::from_secs(15),
-            Command::new("screencapture")
-                .arg("-x") // no camera shutter sound
-                .arg("-C") // capture cursor
-                .arg(&temp_path)
-                .output(),
-        )
-        .await;
+        let command_args = Self::invocation_arguments(&args, &temp_path);
+        let mut command = Command::new("screencapture");
+        command.args(&command_args);
+
+        let result = timeout(Duration::from_secs(15), command.output()).await;
 
         match result {
             Ok(Ok(output)) if output.status.success() => {
@@ -322,5 +399,75 @@ mod tests {
         assert!(result.is_some(), "tool should be found");
         let inner = result.unwrap();
         assert!(inner.is_ok(), "screenshot should succeed: {:?}", inner.err());
+    }
+
+    /// The adapter's structured region becomes `screencapture -R`'s argument.
+    ///
+    /// This is the join that was missing: the computer adapter has always sent
+    /// a region, and the tool always ignored it, so every close-up silently
+    /// returned the whole screen — and the caller then mapped those full-screen
+    /// pixels as if they were a crop.
+    #[test]
+    fn the_adapters_region_becomes_a_crop_argument() {
+        let args = serde_json::json!({
+            "region": { "x": 100, "y": 50, "width": 300, "height": 200 }
+        });
+        assert_eq!(ScreenshotTool::region_argument(&args).as_deref(), Some("100,50,300,200"));
+        // And it reaches the command line the tool really runs, before the
+        // destination. Asserted through `invocation_arguments` rather than
+        // `capture_arguments`, because the halves each being right is what
+        // let this defect live: the parser was fine and the flag builder was
+        // fine, and `execute` used neither.
+        assert_eq!(
+            ScreenshotTool::invocation_arguments(&args, std::path::Path::new("/tmp/out.png")),
+            vec!["-x", "-C", "-R", "100,50,300,200", "/tmp/out.png"],
+            "the crop flag must be on the command line, not merely parsed"
+        );
+    }
+
+    /// A whole-screen capture passes no crop flag at all.
+    ///
+    /// Not `-R 0,0,W,H` with a guessed size: the tool does not know the display
+    /// dimensions here, so the honest whole-screen request is the absence of a
+    /// rect, which is what `screencapture` treats as the full screen.
+    #[test]
+    fn a_whole_screen_capture_names_no_region() {
+        let argv = ScreenshotTool::invocation_arguments(
+            &serde_json::json!({}),
+            std::path::Path::new("/tmp/out.png"),
+        );
+        assert!(!argv.iter().any(|a| a == "-R"), "no region means no crop: {argv:?}");
+    }
+
+    /// The string form a model writes by hand is accepted too.
+    #[test]
+    fn a_region_string_is_understood() {
+        let args = serde_json::json!({ "region": " 10, 20 , 30,40 " });
+        assert_eq!(ScreenshotTool::region_argument(&args).as_deref(), Some("10,20,30,40"));
+    }
+
+    /// No region means the whole screen, not a refusal.
+    #[test]
+    fn a_screenshot_without_a_region_is_not_cropped() {
+        assert_eq!(ScreenshotTool::region_argument(&serde_json::json!({})), None);
+    }
+
+    /// A region that cannot be cropped is refused rather than guessed.
+    ///
+    /// `-R` with a bogus value captures something the caller never asked for.
+    /// A close-up of an empty rectangle is a wrong answer delivered
+    /// confidently, which is the one outcome worth avoiding here.
+    #[test]
+    fn a_malformed_region_is_refused() {
+        for bad in [
+            serde_json::json!({ "region": { "x": 0, "y": 0, "width": 0, "height": 10 } }),
+            serde_json::json!({ "region": { "x": 0, "y": 0, "width": -5, "height": 10 } }),
+            serde_json::json!({ "region": { "x": 0, "y": 0, "width": 10 } }),
+            serde_json::json!({ "region": "0,0,ten,10" }),
+            serde_json::json!({ "region": "0,0,0,10" }),
+            serde_json::json!({ "region": "0,0,10" }),
+        ] {
+            assert_eq!(ScreenshotTool::region_argument(&bad), None, "must refuse: {bad}");
+        }
     }
 }
