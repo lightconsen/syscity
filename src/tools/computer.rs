@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::computer::session::{render_notes, ComputerSession, StepOutcome};
+use crate::computer::session::{render_notes, ComputerSession, ReadBack, StepOutcome};
 use crate::computer::{
     ActionResult, ClickTarget, ComputerAdapter, ComputerError, CoordinateSpace, DesktopAction,
     MouseButton, Point, Rect, ScrollDirection,
@@ -45,6 +45,9 @@ pub struct ComputerTool {
     /// One handle for every session this tool makes, so a change reaches a
     /// conversation that is already running rather than only the next one.
     allow_apps: Arc<crate::computer::app_scope::AppAllowlist>,
+    /// Whether a step may read a typed value back off the screen
+    /// (`[computer.vision]`). See [`ReadBack`].
+    read_back: ReadBack,
 }
 
 impl ComputerTool {
@@ -55,7 +58,19 @@ impl ComputerTool {
             sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             recording: None,
             allow_apps: Arc::new(crate::computer::app_scope::AppAllowlist::default()),
+            read_back: ReadBack::default(),
         }
+    }
+
+    /// Set what `[computer.vision]` allows for reading a field back.
+    ///
+    /// The tool's sessions are built lazily and cached, so an edit to the
+    /// setting reaches the next session rather than a running one. That is the
+    /// same shape the vision config has everywhere else: it decides what a
+    /// look may do, and a look is per step.
+    pub fn with_read_back(mut self, read_back: ReadBack) -> Self {
+        self.read_back = read_back;
+        self
     }
 
     /// Attach the per-app boundary (`[computer] allow_apps`).
@@ -124,6 +139,7 @@ impl ComputerTool {
                         crate::computer::session::SessionConfig {
                             delivery,
                             allow_apps: self.allow_apps.as_ref().clone(),
+                            read_back: self.read_back.clone(),
                             // This tool passed the gate before any action was
                             // dispatched, and the adapter drives the screen by
                             // calling other approval-gated tools. Carrying the

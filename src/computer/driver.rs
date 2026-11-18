@@ -107,6 +107,11 @@ Rules:
 - Dragging is how sliders, scrollbars, text selection and drag-and-drop move.
   Nothing else moves them: a click sets a scrollbar's position to that spot,
   which is not the same gesture and often does not do what was meant.
+- A scrollbar or slider's *position* is how you tell where you are. The thumb
+  touching the far end of its track is "there is nothing more this way" — that
+  is a fact you read off the picture, and it saves the scroll-and-look rounds
+  a person would otherwise spend. A thumb in the middle is not the end, however
+  empty the rest of the pane looks: the content may still be loading.
 - To replace text already in a field, select it first: key_press
   ["cmd", "a"] (use "ctrl" on Linux and Windows), then type. Typing alone
   appends.
@@ -1779,6 +1784,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("zero"), "{err}");
+    }
+
+    /// The prompt must say the scrollbar's position is the answer.
+    ///
+    /// "Scroll to find the thing, and know you reached the bottom" is the one
+    /// scenario the plan credits to perception alone (item 4) rather than to an
+    /// action. It only works if the model is told that a thumb at the end of
+    /// its track *is* the end — otherwise it spends rounds scrolling into
+    /// nothing, which is the behaviour the sentence exists to replace.
+    #[test]
+    fn the_prompt_says_a_scrollbar_position_is_evidence() {
+        assert!(DRIVER_SYSTEM_PROMPT.contains("scrollbar"));
+        assert!(
+            DRIVER_SYSTEM_PROMPT.contains("nothing more this way"),
+            "the prompt must name what an end-of-track thumb means"
+        );
+        // And the other half: a middle thumb is not the end, however bare the
+        // pane looks — content may still be arriving.
+        assert!(DRIVER_SYSTEM_PROMPT.contains("A thumb in the middle is not the end"));
     }
 
     /// A region screenshot is how the model asks to look closer than the

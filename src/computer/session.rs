@@ -44,6 +44,94 @@ use crate::computer::{
     DeliveryMode, DesktopAction, Escalation, Rect, Rung, Screenshot, UiElement,
 };
 
+/// Whether a step may confirm a typed value by reading it back off the screen.
+///
+/// The accessibility tree answers this question when it publishes values, and
+/// [`typed_value_hint`] is that answer. Some fields do not publish one — a
+/// canvas widget, an Electron input whose value the app never exposes, a
+/// terminal — and there the tree says nothing about whether the text landed.
+/// A person in that position does not give up on the question: they lean in
+/// and read the field.
+///
+/// That is the entire feature: crop the focused field out of the frame the
+/// step already captured, OCR the crop, and compare it with what was typed. It
+/// is perceptual compensation for a tree that cannot answer, not a second
+/// opinion about the run, and it changes no model and no structure.
+///
+/// # The text never leaves this module
+///
+/// What OCR reads is matched against the typed text and then dropped. The
+/// verdict — a `StepVerification` and an `ActionEffect` — is all that travels
+/// on, and `EffectHint` has no field that could carry the text even by
+/// mistake. This is deliberate, and it is the difference between reading a
+/// field to check a typo and reading a password back to a model.
+///
+/// # Why a password is never read
+///
+/// Two independent reasons, because one is an argument and two is a guarantee:
+///
+/// 1. A field that masks what it holds cannot be read. Every masked character
+///    renders the same, so the crop is a row of dots and OCR returns either
+///    nothing or a row of `•` — there is no text in the picture to leak.
+/// 2. A field the tree marked sensitive is not cropped at all. The crop is
+///    skipped before any pixels are taken, so a widget that both masks poorly
+///    and renders a live password is never looked at. The findings come from
+///    [`scan_sensitive`] on the same tree the field was found in, so "the tree
+///    said sensitive" is the same question the prompt's `[sensitive: ...]`
+///    marker answers.
+///
+/// A miss is a `None` — "the screen could not be read" — never a `Failed`. A
+/// wrong OCR reading is not evidence that the typing failed, and turning it
+/// into one would send the ladder to retype into a field that is already
+/// correct.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReadBack {
+    /// Read back only when the models are already installed.
+    ///
+    /// The models are a separate optional download; when they are absent the
+    /// read-back is skipped, and the step falls back to the pixel diff as it
+    /// did before this existed. This is the default because it is the one that
+    /// cannot turn typing into a fetch.
+    #[default]
+    InstalledModels,
+    /// Never read back. The tree is the only source that may answer.
+    Off,
+    /// Read back from models under this directory. Same as
+    /// [`InstalledModels`](Self::InstalledModels) for a directory with the
+    /// files in it, and for a configured `[computer.vision].model_dir` in all
+    /// cases — a fetch still never happens.
+    ModelDir(String),
+}
+
+impl ReadBack {
+    /// What `[computer.vision]` says about reading a field back.
+    ///
+    /// `mode = "off"` is the one setting that turns this off: it says the tree
+    /// is the only input this deployment wants, and reading pixels back is
+    /// exactly the input it meant. Every other mode leaves the decision to
+    /// whether the models are on the machine, which is a `stat` per step and
+    /// never a download.
+    pub fn from_vision_config(config: &crate::config::VisionConfig) -> Self {
+        if config.mode.trim().eq_ignore_ascii_case("off") {
+            return Self::Off;
+        }
+        match config.model_dir.trim() {
+            "" => Self::InstalledModels,
+            dir => Self::ModelDir(dir.to_string()),
+        }
+    }
+}
+
+/// How long a field may be read back for, in one step.
+///
+/// The two ONNX sessions cost seconds to load on the first use of a process
+/// and tens of milliseconds per frame after that. This is not a budget the
+/// step pays from — it is a ceiling, so a corrupt model cannot hold a step
+/// open. A step whose own budget is shorter stops at that instead; the answer
+/// is then `None`, which is what "not checked" means everywhere else here.
+#[cfg(feature = "vision")]
+const READ_BACK_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long to wait for the screen to stop changing after an action.
 #[derive(Debug, Clone, Copy)]
 pub struct SettleConfig {
@@ -172,6 +260,9 @@ pub struct SessionConfig {
     /// Whether to check each action at all. When false every step reports
     /// `Unverifiable`, which is what "not checked" means.
     pub verify: bool,
+    /// Whether a step may read a typed value back off the screen. See
+    /// [`ReadBack`].
+    pub read_back: ReadBack,
     /// Where input may land. `Background` refuses an input-layer action that
     /// cannot reach the app without taking the foreground, instead of
     /// delivering it anyway.
@@ -213,6 +304,7 @@ impl Default for SessionConfig {
             auto_rollback_threshold: 3,
             snapshot_paths: Vec::new(),
             verify: true,
+            read_back: ReadBack::InstalledModels,
             delivery: DeliveryMode::Foreground,
             step_budget: None,
             allow_apps: crate::computer::app_scope::AppAllowlist::default(),
@@ -1514,8 +1606,19 @@ impl ComputerSession {
             // and half of it. Use the tree when it carries values; fall back
             // to pixels when it does not.
             DesktopAction::Type { text, .. } => {
-                if let (Some(before), Some(state)) = (tree_before, state_after) {
-                    if let Some(hint) = typed_value_hint(before, &state.ui_tree, text) {
+                let tree_answered = match (tree_before, state_after) {
+                    (Some(before), Some(state)) => typed_value_hint(before, &state.ui_tree, text),
+                    _ => None,
+                };
+                if let Some(hint) = tree_answered {
+                    return Ok((hint.verification, None, Some(hint)));
+                }
+                // The tree had no value to compare. Read the field off the
+                // frame instead, if the caller allows it — the answer is still
+                // only "did the text land", never the text.
+                #[cfg(feature = "vision")]
+                if let Some(state) = state_after {
+                    if let Some(hint) = self.read_back_typed(text, tree_before, state).await {
                         return Ok((hint.verification, None, Some(hint)));
                     }
                 }
@@ -1541,6 +1644,98 @@ impl ComputerSession {
                 .map(|(verification, diff)| (verification, diff, None)),
             _ => Ok((StepVerification::Unverifiable, None, None)),
         }
+    }
+
+    /// Read a typed value back off the screen, as a person would.
+    ///
+    /// This is the answer when [`typed_value_hint`] has none: the field is
+    /// there, the text went somewhere, and the tree does not publish what the
+    /// field now holds. The frame the step just took does. Crop the field,
+    /// read it, compare — and report only whether the typed text is in it.
+    ///
+    /// `None` is every way of not answering, and there are five of them:
+    ///
+    /// - read-back is off, or this build has no `vision` feature;
+    /// - the field cannot be identified — no editable element in the tree, or
+    ///   more than one — so there is no box to lean in on;
+    /// - the tree marked the field sensitive, or it masks what it holds. See
+    ///   [`ReadBack`] for why this is checked *before* any pixels are taken;
+    /// - the models are not installed. A `stat` of the three files decides
+    ///   that before an image is decoded, so a machine that never fetched the
+    ///   vision models pays for a file check and nothing else.
+    /// - the read is not trustworthy: OCR returned nothing, or the recognition
+    ///   confidence is below what [`OcrText::is_reliable`] calls solid.
+    ///
+    /// A wrong reading is not a failed action *by itself*; what makes it one
+    /// is the confidence gate in [`judge_read_back`]. Only a confident reading
+    /// that lacks the typed text produces `Failed`, and even then the recovery
+    /// is "look and retype", not a second keystroke.
+    ///
+    /// [`OcrText::is_reliable`]: crate::computer::vision::ocr_file::OcrText::is_reliable
+    #[cfg(feature = "vision")]
+    async fn read_back_typed(
+        &self,
+        typed: &str,
+        tree_before: Option<&[UiElement]>,
+        state: &ScreenState,
+    ) -> Option<EffectHint> {
+        if typed.is_empty() {
+            return None;
+        }
+        let model_dir = match &self.config.read_back {
+            ReadBack::Off => return None,
+            ReadBack::InstalledModels => String::new(),
+            ReadBack::ModelDir(dir) => dir.clone(),
+        };
+        // The tree the step started from is the one that can say which field
+        // the typing went into: the after-tree may hold the same fields with
+        // the values this feature exists because they do not publish.
+        let fields = editable_fields(tree_before?);
+        if fields.is_empty() || fields.len() > 1 {
+            return None;
+        }
+        let field = fields[0];
+        // Asked before any pixels are taken: a field the tree calls private is
+        // not looked at, whether or not its renderer masks what it holds.
+        if !crate::computer::sensitive_ui::scan_sensitive(std::slice::from_ref(field)).is_empty()
+            || masks(field)
+        {
+            return None;
+        }
+        let bounds = field.bounds?;
+        if bounds.width == 0 || bounds.height == 0 {
+            return None;
+        }
+
+        // A `stat` of the three model files, before anything expensive: "the
+        // models were never fetched" is the common case on a machine that
+        // never asked for vision, and it must not cost a decode.
+        if crate::computer::vision::model_download::ocr_model_paths(&model_dir).is_none() {
+            tracing::debug!("no OCR models installed; the typed value could not be read back");
+            return None;
+        }
+        let space = self.coordinate_space().await?;
+        let shot = &state.screenshot;
+        // A mapping built for another frame would crop the wrong part of this
+        // one; the frame in hand has to be the frame the space describes.
+        if space.image_width != shot.width || space.image_height != shot.height {
+            return None;
+        }
+        let crop = space.screen_rect_to_image(&bounds);
+
+        let read = crate::computer::budget::within(
+            &self.step_budget(),
+            "reading the field back",
+            tokio::time::timeout(
+                READ_BACK_TIMEOUT,
+                crate::computer::vision::ocr_file::ocr_screenshot(shot, Some(crop), &model_dir),
+            ),
+        )
+        .await
+        .ok()? // out of step budget
+        .ok()? // read-back timed out
+        .ok()?; // OCR could not run at all
+        judge_read_back(typed, &read)
     }
 
     /// Compare pre/post screen state.
@@ -1626,24 +1821,21 @@ impl ComputerSession {
     /// box is padded too: a button's own pixels often do not change when it
     /// opens a menu *next to* it, and the box is a claim about where the
     /// action could plausibly show, not a pixel mask.
+    ///
+    /// A drag aims at the **span between its ends**. A slider's thumb lands
+    /// somewhere between where it was grabbed and where it was released, and a
+    /// drag that moved a row of a list repaints that row; both are inside the
+    /// rectangle the two endpoints span. That is the difference between "the
+    /// screen changed somewhere" and "the drag did what it was aimed at doing",
+    /// which is the question the verdict is trying to answer.
     async fn aim_in_image(&self, action: &DesktopAction, screenshot: &Screenshot) -> Option<Rect> {
-        /// Half-width, in screen points, of the box a bare coordinate aims at.
-        const POINT_AIM_PADDING: i32 = 32;
-        /// How far outside an element's published box its effect may show.
-        ///
-        /// It has to be generous enough to keep a menu opening under its
-        /// button inside the box, and tight enough that a repaint in a far
-        /// corner is still excluded. One diff block (32 px) covers the usual
-        /// dropdown offset, and a little more covers menubars and tooltips.
-        const ELEMENT_AIM_PADDING: i32 = 48;
-
-        let target = match action {
+        // A scroll's content moves under the pointer — the whole pane, not one
+        // box — so there is nothing to attribute a change to.
+        let endpoints: Vec<&ClickTarget> = match action {
             DesktopAction::Click { target, .. }
             | DesktopAction::DoubleClick { target, .. }
-            | DesktopAction::Type { target: Some(target), .. } => target,
-            // A drag's effect may appear anywhere along the path, and a
-            // scroll's content moves under the pointer; neither has one box
-            // whose change would be evidence.
+            | DesktopAction::Type { target: Some(target), .. } => vec![target],
+            DesktopAction::Drag { from, to } => vec![from, to],
             _ => return None,
         };
         // The changed regions are in image pixels, so the aim must be too.
@@ -1653,6 +1845,45 @@ impl ComputerSession {
         if space.image_width != screenshot.width || space.image_height != screenshot.height {
             return None;
         }
+        let mut span: Option<Rect> = None;
+        for target in endpoints {
+            let Some(rect) = self.aim_box_for(target).await else {
+                // One end is a guess, so the span is a guess. Saying nothing is
+                // the honest answer; half a span would exclude the end that
+                // did resolve.
+                return None;
+            };
+            span = Some(match span {
+                None => rect,
+                Some(acc) => {
+                    let x0 = acc.x.min(rect.x);
+                    let y0 = acc.y.min(rect.y);
+                    let x1 = acc
+                        .x
+                        .saturating_add(acc.width as i32)
+                        .max(rect.x.saturating_add(rect.width as i32));
+                    let y1 = acc
+                        .y
+                        .saturating_add(acc.height as i32)
+                        .max(rect.y.saturating_add(rect.height as i32));
+                    Rect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
+                }
+            });
+        }
+        Some(space.screen_rect_to_image(&span?))
+    }
+
+    /// Where one end of an action lands, padded to what its effect could touch.
+    ///
+    /// Split out of [`aim_in_image`](Self::aim_in_image) because a drag has two
+    /// ends and they are resolved the same way; a closure that both awaited
+    /// and borrowed the adapter's target resolution would not compile, and
+    /// writing the resolution twice is how the two ends drift apart.
+    async fn aim_box_for(&self, target: &ClickTarget) -> Option<Rect> {
+        /// Half-width, in screen points, of the box a bare coordinate aims at.
+        const POINT_AIM_PADDING: i32 = 32;
+        /// How far outside an element's published box its effect may show.
+        const ELEMENT_AIM_PADDING: i32 = 48;
         let padded = |rect: Rect, padding: i32| {
             Rect::new(
                 rect.x.saturating_sub(padding),
@@ -1668,8 +1899,8 @@ impl ComputerSession {
         let point_box = |point: crate::computer::Point| {
             padded(Rect::new(point.x, point.y, 0, 0), POINT_AIM_PADDING)
         };
-        let screen_rect = match target {
-            ClickTarget::Coordinate(point) => point_box(*point),
+        match target {
+            ClickTarget::Coordinate(point) => Some(point_box(*point)),
             other => {
                 let resolved = self.adapter.resolve_target(other).await.ok()?;
                 let bounds = resolved
@@ -1678,13 +1909,12 @@ impl ComputerSession {
                     .and_then(|element| element.bounds)
                     .filter(|bounds| bounds.width > 0 && bounds.height > 0);
                 match (bounds, resolved.point) {
-                    (Some(bounds), _) => padded(bounds, ELEMENT_AIM_PADDING),
-                    (None, Some(point)) => point_box(point),
-                    (None, None) => return None,
+                    (Some(bounds), _) => Some(padded(bounds, ELEMENT_AIM_PADDING)),
+                    (None, Some(point)) => Some(point_box(point)),
+                    (None, None) => None,
                 }
             }
-        };
-        Some(space.screen_rect_to_image(&screen_rect))
+        }
     }
 
     /// Record an action that failed before it could be verified.
@@ -2257,6 +2487,94 @@ fn editable_values(tree: &[UiElement]) -> Vec<(String, String)> {
         walk(root, &mut out);
     }
     out
+}
+
+/// Every editable element in the tree, depth-first.
+///
+/// The read-back needs the element, not its value — the bounds are the box to
+/// crop and the id is what makes it addressable. `&'a UiElement` borrows the
+/// tree the step started from. Gated with its only caller: a build without the
+/// vision feature cannot crop anything to read.
+#[cfg(feature = "vision")]
+fn editable_fields(tree: &[UiElement]) -> Vec<&UiElement> {
+    fn walk<'a>(element: &'a UiElement, out: &mut Vec<&'a UiElement>) {
+        if is_editable(&element.role) {
+            out.push(element);
+        }
+        for child in &element.children {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    for root in tree {
+        walk(root, &mut out);
+    }
+    out
+}
+
+/// Whether a field renders what it holds as bullets.
+///
+/// The same test [`is_masked`] makes of a value, asked of an element whose
+/// value may be absent — which is exactly the field this read-back exists for.
+/// A secure or password role is enough on its own: the platform does not have
+/// to have published the masked text for the field to be one. Gated with its
+/// only caller, like [`editable_fields`].
+#[cfg(feature = "vision")]
+fn masks(field: &UiElement) -> bool {
+    let role = normalized_role(&field.role);
+    role.contains("secure")
+        || role.contains("password")
+        || field
+            .value
+            .as_deref()
+            .is_some_and(|value| is_masked(&field.role, value))
+}
+
+/// Turn what OCR read into a verdict, dropping the reading itself.
+///
+/// Free rather than a method: the comparison needs no session, no adapter
+/// and no display, so it is testable with two strings — and keeping it out
+/// of the impl is what lets the test prove the recognized text never
+/// reaches the `EffectHint` it produces.
+///
+/// Nothing found is not evidence of an empty field — a font the recognizer
+/// cannot parse reads as nothing too — and low confidence is not evidence
+/// of a typo. Both are `None`, "the screen could not answer".
+///
+/// Whitespace is stripped from both sides before comparing: a field
+/// renders `hello world` the same way at the right point size, and an OCR
+/// line break is an artifact of the detector, not a character in the
+/// field.
+#[cfg(feature = "vision")]
+pub(crate) fn judge_read_back(
+    typed: &str,
+    read: &crate::computer::vision::ocr_file::OcrText,
+) -> Option<EffectHint> {
+    if read.text.trim().is_empty() || !read.is_reliable() {
+        return None;
+    }
+    let shown: String = read.text.chars().filter(|c| !c.is_whitespace()).collect();
+    let wanted: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    if shown.contains(&wanted) {
+        return Some(EffectHint {
+            effect: ActionEffect::Confirmed,
+            verification: StepVerification::Verified,
+            recovery: None,
+        });
+    }
+    Some(EffectHint {
+        effect: ActionEffect::Partial,
+        verification: StepVerification::Failed,
+        recovery: Some(
+            "the field does not read back as the text that was typed — click it, select all, \
+             and retype; the reading is optical and is not proof the text is missing, so \
+             check the field before typing again"
+                .to_string(),
+        ),
+    })
 }
 
 /// Whether an action is aimed at an application at all.
@@ -2955,6 +3273,245 @@ mod tests {
         assert!(typed_value_hint(&same, &same, "hello").is_none());
     }
 
+    // ── Reading a typed value back off the screen ─────────────────────────
+    //
+    // `typed_value_hint` answers when the tree publishes the field's value.
+    // These cover the other case: the tree has the field but not its value, so
+    // the frame the step captured is read instead — and only the verdict
+    // travels on.
+
+    #[cfg(feature = "vision")]
+    fn read_back(text: &str, confidence: f32) -> crate::computer::vision::ocr_file::OcrText {
+        crate::computer::vision::ocr_file::OcrText {
+            text: text.to_string(),
+            mean_confidence: confidence,
+            blocks: 1,
+        }
+    }
+
+    /// The ordinary case: the field reads back as what was typed.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_field_that_reads_back_as_the_text_is_confirmed() {
+        let hint = judge_read_back("hello", &read_back("hello", 0.95)).expect("an answer");
+        assert_eq!(hint.effect, ActionEffect::Confirmed);
+        assert_eq!(hint.verification, StepVerification::Verified);
+        assert!(hint.recovery.is_none());
+    }
+
+    /// The leak-proofing is structural, not a promise.
+    ///
+    /// A field that reads back as something else produces a verdict with no
+    /// way to carry what was read: `EffectHint` has an effect, a verification
+    /// and a recovery sentence, and that is all. The test asserts the reading
+    /// is absent from the only text the hint does carry, and that the hint is a
+    /// fixed sender-chosen sentence — so a future field added to `EffectHint`
+    /// has to break this test to leak.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn what_the_field_read_back_is_never_carried_in_the_verdict() {
+        let secret = "correct horse battery staple";
+        let hint = judge_read_back("wrong", &read_back(secret, 0.98)).expect("an answer");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+        assert_eq!(hint.verification, StepVerification::Failed);
+
+        let carried = format!("{hint:?}");
+        assert!(!carried.contains(secret), "the reading leaked into the verdict: {carried}");
+        assert!(!carried.contains("horse"), "the reading leaked into the verdict: {carried}");
+        assert_eq!(
+            hint.recovery.as_deref(),
+            Some(
+                "the field does not read back as the text that was typed — click it, select all, \
+                 and retype; the reading is optical and is not proof the text is missing, so \
+                 check the field before typing again"
+            ),
+        );
+    }
+
+    /// A reading is not allowed to be evidence of an empty field.
+    ///
+    /// A font the recognizer cannot parse reads as nothing, and so does a field
+    /// whose text scrolled out of view. Neither is "the typing failed", so both
+    /// leave the answer to the pixel diff.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn an_empty_or_uncertain_reading_is_not_a_verdict() {
+        assert!(judge_read_back("hello", &read_back("", 0.0)).is_none());
+        assert!(judge_read_back("hello", &read_back("   \n ", 0.9)).is_none());
+        // Confident enough to say *something* was there, not confident enough
+        // to say it was not the typed text.
+        assert!(judge_read_back("hello", &read_back("he11o", 0.4)).is_none());
+        // The typed text is empty: there is nothing to look for.
+        assert!(judge_read_back("", &read_back("hello", 0.99)).is_none());
+    }
+
+    /// Whitespace is not a character the reader can see.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_line_break_from_the_reader_is_not_a_typo() {
+        // OCR returns one block per line, so a long value arrives with a
+        // newline the field does not contain.
+        let hint = judge_read_back("hello world", &read_back("hello\nworld", 0.9));
+        assert_eq!(hint.expect("an answer").effect, ActionEffect::Confirmed);
+        // And a typed space the reader dropped.
+        let hint = judge_read_back("hello world", &read_back("helloworld", 0.9));
+        assert_eq!(hint.expect("an answer").effect, ActionEffect::Confirmed);
+    }
+
+    /// A field the tree calls private is never cropped.
+    ///
+    /// Two separate reasons, tested separately because either one alone would
+    /// be enough — the role says password, and the mask says bullets. Either
+    /// makes the field unreadable to this feature.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_field_that_masks_what_it_holds_has_no_box_to_read() {
+        assert!(masks(&field("AXSecureTextField", "")));
+        assert!(masks(&field("password_field", "")));
+        assert!(masks(&field("AXTextField", "•••••")));
+        assert!(!masks(&field("AXTextField", "hello")));
+        // A field that does not publish a value is not thereby a secret one;
+        // it is the field this feature exists for.
+        let mut empty = field("AXTextField", "");
+        empty.value = None;
+        assert!(!masks(&empty));
+    }
+
+    /// The tree's own sensitivity scan is asked before any pixels are taken.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_field_the_tree_marks_sensitive_is_not_read() {
+        let mut private = field("AXTextField", "");
+        private.label = Some("Password".to_string());
+        assert!(
+            !crate::computer::sensitive_ui::scan_sensitive(std::slice::from_ref(&private))
+                .is_empty(),
+            "the fixture has to be found by the scan this feature uses"
+        );
+        // A role that names no secret and carries no secret-looking label is
+        // readable; the point is that the answer comes from the scan, not from
+        // a role list maintained twice.
+        let plain = field("AXTextField", "");
+        assert!(
+            crate::computer::sensitive_ui::scan_sensitive(std::slice::from_ref(&plain)).is_empty()
+        );
+    }
+
+    /// Finding the field depends on it being the *only* editable one.
+    ///
+    /// With two fields there is no box that can be attributed to the typing,
+    /// which is the same rule `typed_value_hint` applies for the same reason.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn only_one_field_can_be_read_back() {
+        let one = vec![field("AXTextField", "")];
+        assert_eq!(editable_fields(&one).len(), 1);
+
+        let two = vec![field("AXTextField", ""), field("AXTextField", "")];
+        assert_eq!(editable_fields(&two).len(), 2);
+
+        let none = vec![field("AXButton", "")];
+        assert!(editable_fields(&none).is_empty());
+
+        // Nested fields count: a tree is a tree.
+        let mut window = field("AXWindow", "");
+        window.children.push(field("AXTextField", ""));
+        assert_eq!(editable_fields(&[window]).len(), 1);
+    }
+
+    /// Read-back is off when the configuration says the tree is the only input.
+    #[test]
+    fn vision_off_turns_the_read_back_off_with_it() {
+        use crate::config::VisionConfig;
+
+        let off = VisionConfig {
+            mode: "off".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(ReadBack::from_vision_config(&off), ReadBack::Off);
+
+        let auto = VisionConfig {
+            mode: "auto".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(ReadBack::from_vision_config(&auto), ReadBack::InstalledModels);
+
+        let dir = VisionConfig {
+            mode: "auto".to_string(),
+            model_dir: "/models/vision".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ReadBack::from_vision_config(&dir),
+            ReadBack::ModelDir("/models/vision".to_string())
+        );
+
+        // A typo in the mode must not silently disable reading; it must not
+        // silently enable it either — `auto` is what an unknown string means
+        // everywhere else in the vision config.
+        let typo = VisionConfig {
+            mode: "lcoal".to_string(),
+            model_dir: "/models/vision".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ReadBack::from_vision_config(&typo),
+            ReadBack::ModelDir("/models/vision".to_string())
+        );
+    }
+
+    /// The step falls back to the pixel diff when read-back cannot answer.
+    ///
+    /// Every arm of [`ReadBack`] is exercised against an adapter with a frame
+    /// and no models, and each has to end in `None` — "the screen could not
+    /// answer" — rather than a refusal, a download or a hang. The verification
+    /// that consumes it then falls through to the pixel diff exactly as it did
+    /// before this feature existed.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_typed_step_falls_back_to_pixels_however_read_back_is_configured() {
+        let before = vec![field("AXTextField", "")];
+        for read_back in [
+            ReadBack::Off,
+            // The default: no models under the configuration's directory.
+            ReadBack::ModelDir("/nonexistent/syscity-read-back-test".to_string()),
+        ] {
+            let session = ComputerSession::new(Arc::new(HeadlessComputerAdapter::new()))
+                .with_config(SessionConfig {
+                    read_back: read_back.clone(),
+                    ..Default::default()
+                });
+            let state =
+                ScreenState::from_parts(before.clone(), Screenshot::new(String::new(), 100, 100));
+            assert!(
+                session
+                    .read_back_typed("hello", Some(&before), &state)
+                    .await
+                    .is_none(),
+                "{read_back:?} answered with no frame mapping to crop from"
+            );
+        }
+
+        // And the verification entry point agrees: an `Unverifiable` diff, not
+        // a failure and not a hang.
+        let session = ComputerSession::new(Arc::new(HeadlessComputerAdapter::new()));
+        let (outcome, _, _) = session
+            .verify_step(
+                &DesktopAction::Type {
+                    text: "hello".to_string(),
+                    target: None,
+                },
+                &ActionResult::success("typed"),
+                Some(&before),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("a step still answers");
+        assert_eq!(outcome, StepVerification::Unverifiable);
+    }
+
     #[test]
     fn a_partial_driver_verdict_is_not_turned_into_a_noop() {
         let driver = crate::computer::ActionEvidence::new(Rung::Pixel, ActionEffect::Partial);
@@ -3222,6 +3779,111 @@ mod tests {
             let ladder = session.ladder_for(&action).await;
             assert_eq!(ladder, vec![Rung::Pixel], "{action:?} → {ladder:?}");
         }
+    }
+
+    /// A drag aims at the span between its ends, not at a point.
+    ///
+    /// This is what lets "the screen changed" be read as "the drag did what it
+    /// was aimed at". A slider's thumb ends up somewhere between the grab and
+    /// the release, and the whole track between the two endpoints repaints, so
+    /// a box around either single point would exclude the change that proves
+    /// it worked.
+    ///
+    /// The box is asserted as a *span*, not a pixel count: both endpoints plus
+    /// their padding, and strictly wider than either end alone.
+    #[tokio::test]
+    async fn a_drag_aims_at_the_span_between_its_ends() {
+        let session = headless_session();
+        let shot = Screenshot::new(String::new(), 1440, 900);
+        // The headless adapter reports no displays, so the mapping is stated
+        // here rather than probed. Without it `aim_in_image` refuses rather
+        // than guess, which is what the sibling test below pins.
+        session
+            .record_coordinate_space(CoordinateSpace::new(
+                shot.width,
+                shot.height,
+                &crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                    0,
+                    0,
+                    shot.width,
+                    shot.height,
+                )
+                .primary()]),
+            ))
+            .await;
+        let drag = session
+            .aim_in_image(
+                &DesktopAction::Drag {
+                    from: ClickTarget::Coordinate(crate::computer::Point::new(100, 100)),
+                    to: ClickTarget::Coordinate(crate::computer::Point::new(400, 100)),
+                },
+                &shot,
+            )
+            .await
+            .expect("a span between two known points");
+        assert_eq!(drag.y, 100 - 32, "the span keeps the row the drag stayed on");
+        assert_eq!(drag.height, 64, "the span is one padded row tall");
+        assert!(
+            drag.width > 400 - 100,
+            "the span must reach from the grab to the release: {drag:?}"
+        );
+
+        // A click at one of those same points gets a point box, and the span
+        // is strictly wider — the drag box is not just "the first end".
+        let click = session
+            .aim_in_image(
+                &DesktopAction::Click {
+                    target: ClickTarget::Coordinate(crate::computer::Point::new(100, 100)),
+                    button: MouseButton::Left,
+                },
+                &shot,
+            )
+            .await
+            .expect("a point box");
+        assert_eq!(click.width, 64);
+        assert!(drag.width > click.width, "{drag:?} vs {click:?}");
+    }
+
+    /// Without a pixel-to-point mapping there is no aim, not a guessed one.
+    ///
+    /// The same refusal covers a drag: a span computed in the wrong space is
+    /// worse than no span, because it would excuse a miss.
+    #[tokio::test]
+    async fn an_aim_without_a_mapping_is_refused() {
+        let session = headless_session();
+        let shot = Screenshot::new(String::new(), 1440, 900);
+        assert!(session
+            .aim_in_image(
+                &DesktopAction::Drag {
+                    from: ClickTarget::Coordinate(crate::computer::Point::new(100, 100)),
+                    to: ClickTarget::Coordinate(crate::computer::Point::new(400, 100)),
+                },
+                &shot,
+            )
+            .await
+            .is_none());
+    }
+
+    /// A scroll has no aim box, and must not be given a pretend one.
+    ///
+    /// Its content moves under the pointer across the whole pane. A box around
+    /// the pointer would report a scroll that landed in the wrong pane as a
+    /// miss, when the truth is that a scroll has no one place it can show.
+    #[tokio::test]
+    async fn a_scroll_has_no_aim_box() {
+        let session = headless_session();
+        let shot = Screenshot::new(String::new(), 1440, 900);
+        assert!(session
+            .aim_in_image(
+                &DesktopAction::Scroll {
+                    target: ClickTarget::Coordinate(crate::computer::Point::new(100, 100)),
+                    direction: crate::computer::ScrollDirection::Down,
+                    amount: 3,
+                },
+                &shot,
+            )
+            .await
+            .is_none());
     }
 
     /// Hover establishes that the pointer arrived, and nothing more.

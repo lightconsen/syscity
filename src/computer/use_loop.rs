@@ -300,6 +300,19 @@ impl ComputerUseLoop {
         self
     }
 
+    /// Whether a step may read a typed value back off the screen.
+    ///
+    /// The run already carries a vision look, but that one answers "where is
+    /// this control" for the perception step. Reading a field back is the
+    /// verification step's use of the same models, and `mode = "off"` has to
+    /// reach both — a deployment that turned vision off must not have a typing
+    /// step quietly look at pixels.
+    pub fn with_read_back(mut self, read_back: crate::computer::session::ReadBack) -> Self {
+        self.session_config.read_back = read_back;
+        self.rebuild_session();
+        self
+    }
+
     /// The approval this loop's desktop work runs under.
     ///
     /// The adapter's inner calls require approval and run with a bare context

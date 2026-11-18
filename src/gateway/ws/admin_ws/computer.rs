@@ -405,6 +405,9 @@ async fn launch(
         loop_config,
         model_supports_vision,
         vision: vision_look(state, config, image_limit).await,
+        // Same `[computer.vision]` the look above is built from, so
+        // `mode = "off"` cannot leave one of them looking.
+        read_back: crate::computer::session::ReadBack::from_vision_config(&config.computer.vision),
         budget: config.computer.budget.clone(),
         observer: Some(observer),
         store: Some(Arc::new(crate::computer::run_store::RunStore::for_paths(&state.paths))),

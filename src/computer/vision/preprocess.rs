@@ -15,6 +15,41 @@ pub fn decode_screenshot(screenshot: &Screenshot) -> crate::Result<image::Dynami
         .map_err(|e| SyscityError::Internal(format!("Image decode failed: {}", e)))
 }
 
+/// Crop a rectangle out of a decoded image, clamped to what the image holds.
+///
+/// A field's published bounds can run past the edge of a capture — a window
+/// wider than the display, a control mid-scroll — and cropping beyond the
+/// image is an error in `image`, not a short answer. Clamping keeps the useful
+/// part; an intersection that is empty returns `None`, because a crop of
+/// nothing cannot be read and the caller must not mistake a black rectangle
+/// for an empty field.
+#[cfg(feature = "vision")]
+pub fn crop_clamped(
+    img: &image::DynamicImage,
+    rect: crate::computer::types::Rect,
+) -> Option<image::DynamicImage> {
+    let (width, height) = (img.width(), img.height());
+    let x0 = rect.x.max(0).min(width as i32) as u32;
+    let y0 = rect.y.max(0).min(height as i32) as u32;
+    // The far corner in the same clamped space, so a rectangle with a negative
+    // origin loses the part that is off the edge instead of gaining a second
+    // width from the saturating add.
+    let x1 = rect
+        .x
+        .saturating_add(rect.width as i32)
+        .max(0)
+        .min(width as i32) as u32;
+    let y1 = rect
+        .y
+        .saturating_add(rect.height as i32)
+        .max(0)
+        .min(height as i32) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(img.crop_imm(x0, y0, x1 - x0, y1 - y0))
+}
+
 /// Resize an image to a target size, maintaining aspect ratio with
 /// letterboxing.
 ///

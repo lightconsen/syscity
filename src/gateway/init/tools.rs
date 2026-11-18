@@ -441,6 +441,11 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
     let allow_apps = Arc::new(crate::computer::app_scope::AppAllowlist::new(
         config.computer.allow_apps.clone(),
     ));
+    // Whether a step may read a typed value back off the screen. Derived from
+    // `[computer.vision]`, so `mode = "off"` turns the tree into the only
+    // input in every sense, and a model_dir the resolver already trusts is the
+    // one the read-back looks in.
+    let read_back = crate::computer::session::ReadBack::from_vision_config(&config.computer.vision);
     if let Some(ref adapter) = computer_adapter {
         #[cfg(feature = "browser")]
         let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
@@ -449,17 +454,20 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 config.browser.pool.default_profile.clone(),
             )))
             .with_recording(recording.clone())
-            .with_allow_apps(allow_apps.clone());
+            .with_allow_apps(allow_apps.clone())
+            .with_read_back(read_back.clone());
         #[cfg(not(feature = "browser"))]
         let computer = crate::tools::computer::ComputerTool::new(Some(adapter.clone()))
             .with_recording(recording.clone())
-            .with_allow_apps(allow_apps.clone());
+            .with_allow_apps(allow_apps.clone())
+            .with_read_back(read_back.clone());
         tool_registry.register_dynamic(Arc::new(computer));
     } else {
         tool_registry.register_dynamic(Arc::new(
             crate::tools::computer::ComputerTool::new(None)
                 .with_recording(recording.clone())
-                .with_allow_apps(allow_apps.clone()),
+                .with_allow_apps(allow_apps.clone())
+                .with_read_back(read_back.clone()),
         ));
     }
 

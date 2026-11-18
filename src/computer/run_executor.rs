@@ -120,6 +120,10 @@ pub struct RunPlan {
     /// decides an image on its own, exactly as before B″. When it is `Some`,
     /// the resolver still decides per step whether anything can look.
     pub vision: Option<Arc<crate::computer::vision::look::VisionLook>>,
+    /// Whether a typing step may read the field back off the frame it
+    /// captured. Derived from `[computer.vision]` at the same place `vision`
+    /// is, so the two cannot disagree about whether looking is allowed.
+    pub read_back: crate::computer::session::ReadBack,
     /// The run's cost ceilings.
     pub budget: crate::config::RunBudgetConfig,
     pub observer: Option<RunObserver>,
@@ -317,6 +321,7 @@ async fn run_loop(
     let mut computer_loop = ComputerUseLoop::new(plan.adapter.clone())
         .with_config(plan.loop_config)
         .with_allow_apps(plan.allow_apps.clone())
+        .with_read_back(plan.read_back.clone())
         .with_approval_provenance(plan.approved_by.clone(), plan.conversation_id.clone())
         .with_execution_controller(controller.clone());
     if resume.start_step > 0 {
@@ -1322,6 +1327,10 @@ mod tests {
             },
             model_supports_vision,
             vision: None,
+            // No models are installed under a unit test's root, so this is the
+            // setting that reads nothing back — which is also the honest
+            // default: a test asserts what the loop did, not what a model saw.
+            read_back: crate::computer::session::ReadBack::InstalledModels,
             budget: crate::config::RunBudgetConfig {
                 max_calls_per_run: 20,
                 max_images_per_run: images,
