@@ -2421,6 +2421,84 @@ mod tests {
         assert!(expected.starts_with("sha256:"), "{expected}");
     }
 
+    /// A dense screen's picture must arrive at the model's own width.
+    ///
+    /// The plan's ceiling for a busy screen is "can the model find a small
+    /// target on a 1024-wide picture that the detector's 640×640 pass did not
+    /// box". That is only true if the picture really travels at 1024: the
+    /// encode step is silent about its output size, so a regression that
+    /// dropped back to the detector's frame — or to the bandwidth encoder's
+    /// 1920 — would leave every test green and quietly narrow the ceiling.
+    ///
+    /// A truncated tree is the case that sends an image, which is what makes
+    /// this the real path rather than a unit test of the encoder.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_wide_capture_travels_at_the_models_own_width() {
+        use image::{Rgb, RgbImage};
+
+        // A 2560-wide screen, the width the plan names as the dense case.
+        let mut frame = RgbImage::from_pixel(2560, 1440, Rgb([230, 230, 230]));
+        // A small control the 640 pass would lose: 12 px on a 2560-wide screen
+        // becomes ~3 px after the detector's resize.
+        for y in 700..712 {
+            for x in 1800..1812 {
+                frame.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(frame)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode the fixture");
+        let base64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        };
+        let shot = Screenshot::new(base64, 2560, 1440);
+
+        let provider = Arc::new(ScriptedProvider::answering(
+            r#"{"decision": "help", "reason": "cannot see"}"#,
+        ));
+        let driver = ModelDriver::new(provider.clone(), "test-model");
+        let mut context = ctx(false);
+        context.screenshot = Some(shot);
+
+        driver.decide(&state(), &context).await.unwrap();
+
+        let request = &provider.requests()[0];
+        let user = request
+            .messages
+            .iter()
+            .find(|m| m.role == crate::providers::Role::User)
+            .expect("a user message");
+        let image = user
+            .content_blocks
+            .as_ref()
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| match block {
+                    crate::providers::ContentBlock::Image { base64, .. } => Some(base64.clone()),
+                    _ => None,
+                })
+            })
+            .expect("the picture travelled");
+        let bytes = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(&image)
+                .expect("the payload decodes")
+        };
+        let decoded = image::load_from_memory(&bytes).expect("the payload is an image");
+        assert_eq!(
+            decoded.width(),
+            crate::computer::image_budget::ImageLimit::default().max_width,
+            "a dense screen's picture must arrive at the limit, not the detector's 640"
+        );
+        assert!(
+            decoded.width() > 640,
+            "the detector reads 640 wide; a picture no wider shows the model nothing more"
+        );
+    }
+
     /// A model without vision must not be asked for one.
     #[tokio::test]
     async fn a_model_without_vision_is_never_sent_an_image() {
