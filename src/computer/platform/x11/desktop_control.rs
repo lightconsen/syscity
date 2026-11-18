@@ -152,7 +152,7 @@ impl Tool for DesktopControlTool {
                 "action": {
                     "type": "string",
                     "description": "Action to perform: inspect, click, type, key, list_windows, activate_window",
-                    "enum": ["inspect", "click", "double_click", "type", "key", "scroll", "drag", "list_windows", "activate_window", "close_window", "get_window_geometry", "move_window", "resize_window", "minimize_window", "maximize_window"]
+                    "enum": ["inspect", "click", "double_click", "type", "key", "scroll", "drag", "move", "list_windows", "activate_window", "close_window", "get_window_geometry", "move_window", "resize_window", "minimize_window", "maximize_window"]
                 },
                 "x": {
                     "type": "integer",
@@ -382,6 +382,19 @@ impl Tool for DesktopControlTool {
                 let to_x = args.get("to_x").and_then(|v| v.as_i64()).unwrap_or(0);
                 let to_y = args.get("to_y").and_then(|v| v.as_i64()).unwrap_or(0);
                 Self::drag(from_x, from_y, to_x, to_y).await
+            }
+            // A bare pointer move: no button goes down, so this is a hover
+            // and not the first half of a click.
+            "move" => {
+                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                let (ok, _, err) =
+                    Self::run_xdotool(&["mousemove", &format!("{}", x), &format!("{}", y)]).await?;
+                if ok {
+                    Ok(ToolExecutionResult::success(format!("Moved the pointer to {}, {}", x, y)))
+                } else {
+                    Ok(ToolExecutionResult::error(format!("Move failed: {}", err)))
+                }
             }
             "activate_window" => {
                 let name = args.get("name").and_then(|v| v.as_str());

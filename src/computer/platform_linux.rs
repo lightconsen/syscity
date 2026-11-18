@@ -219,6 +219,11 @@ impl ComputerAdapter for X11ComputerAdapter {
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 Ok(ActionResult::success(result.output))
             }
+            DesktopAction::Hover { target } => {
+                let (x, y) = self.resolve_click_point(target).await?;
+                self.move_pointer(x, y, true).await
+            }
+            DesktopAction::PointerMove { to } => self.move_pointer(to.x, to.y, false).await,
             DesktopAction::CloseWindow { title_pattern } => {
                 let args = serde_json::json!({
                     "action": "close_window", "name": title_pattern,
@@ -548,6 +553,48 @@ impl ComputerAdapter for X11ComputerAdapter {
     }
 }
 
+/// The registry name of the desktop-control tool this backend uses.
+fn desktop_control_tool(&self) -> &'static str {
+    "linux_x11_desktop_control"
+}
+
+/// Move the pointer to a point through the desktop-control tool.
+///
+/// A hover and a bare move are the same gesture to the platform — one
+/// `mousemove` with no button — so they share one path and differ only in
+/// what the result claims. `hovered` is what decides the sentence: a
+/// hover says the next capture answers the question, a move says nothing
+/// was pressed and nothing is being asked.
+async fn move_pointer(&self, x: i32, y: i32, hovered: bool) -> Result<ActionResult> {
+    // Both Linux backends' schemas name the action `move`.
+    let args = serde_json::json!({ "action": "move", "x": x, "y": y });
+    let tool = self.desktop_control_tool();
+    let result = self
+        .registry
+        .execute(tool, args, &crate::tools::ToolContext::default())
+        .await
+        .ok_or_else(|| ComputerError::ToolFailed("desktop control not found".to_string()))?
+        .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+    if !result.success {
+        return Err(ComputerError::ToolFailed(
+            result
+                .error
+                .unwrap_or_else(|| "the pointer did not move".to_string()),
+        ));
+    }
+    if hovered {
+        Ok(ActionResult::success(
+            "the pointer is now over the target; the next capture shows whether the \
+                 control reacted",
+        )
+        .with_data(serde_json::json!({ "pointer": { "x": x, "y": y } })))
+    } else {
+        Ok(ActionResult::success(format!(
+            "the pointer moved to ({x}, {y}); nothing was pressed"
+        )))
+    }
+}
+
 impl X11ComputerAdapter {
     async fn resolve_target(&self, target: &ClickTarget) -> Result<ActionTarget> {
         if let ClickTarget::Coordinate(p) = target {
@@ -782,6 +829,11 @@ impl ComputerAdapter for WaylandComputerAdapter {
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 Ok(ActionResult::success(result.output))
             }
+            DesktopAction::Hover { target } => {
+                let (x, y) = self.resolve_click_point(target).await?;
+                self.move_pointer(x, y, true).await
+            }
+            DesktopAction::PointerMove { to } => self.move_pointer(to.x, to.y, false).await,
             DesktopAction::CloseWindow { title_pattern } => {
                 let args = serde_json::json!({
                     "action": "close_window", "name": title_pattern,
@@ -1013,6 +1065,48 @@ impl ComputerAdapter for WaylandComputerAdapter {
             tokio::time::sleep(poll_interval).await;
         }
         Ok(false)
+    }
+}
+
+/// The registry name of the desktop-control tool this backend uses.
+fn desktop_control_tool(&self) -> &'static str {
+    "linux_wayland_desktop_control"
+}
+
+/// Move the pointer to a point through the desktop-control tool.
+///
+/// A hover and a bare move are the same gesture to the platform — one
+/// `mousemove` with no button — so they share one path and differ only in
+/// what the result claims. `hovered` is what decides the sentence: a
+/// hover says the next capture answers the question, a move says nothing
+/// was pressed and nothing is being asked.
+async fn move_pointer(&self, x: i32, y: i32, hovered: bool) -> Result<ActionResult> {
+    // Both Linux backends' schemas name the action `move`.
+    let args = serde_json::json!({ "action": "move", "x": x, "y": y });
+    let tool = self.desktop_control_tool();
+    let result = self
+        .registry
+        .execute(tool, args, &crate::tools::ToolContext::default())
+        .await
+        .ok_or_else(|| ComputerError::ToolFailed("desktop control not found".to_string()))?
+        .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+    if !result.success {
+        return Err(ComputerError::ToolFailed(
+            result
+                .error
+                .unwrap_or_else(|| "the pointer did not move".to_string()),
+        ));
+    }
+    if hovered {
+        Ok(ActionResult::success(
+            "the pointer is now over the target; the next capture shows whether the \
+                 control reacted",
+        )
+        .with_data(serde_json::json!({ "pointer": { "x": x, "y": y } })))
+    } else {
+        Ok(ActionResult::success(format!(
+            "the pointer moved to ({x}, {y}); nothing was pressed"
+        )))
     }
 }
 

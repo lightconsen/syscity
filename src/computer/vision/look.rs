@@ -277,6 +277,12 @@ impl ScanCache {
     /// Every field is compared, not just the digest: a hit on stale geometry
     /// would hand back boxes in the previous coordinate space, which is the
     /// Retina mis-click this codebase already has an incident for.
+    ///
+    /// What the capture *covered* needs no field of its own: the digest is of
+    /// the captured bytes, so a crop of a region and a full-screen capture of
+    /// the same screen are different keys. That is also what makes the mapping
+    /// safe — a cached scan's boxes are in the screen points of the capture it
+    /// came from, and a different capture can never hit it.
     fn answers(
         &self,
         digest: &str,
@@ -376,6 +382,26 @@ impl VisionLook {
         geometry: &DisplayGeometry,
         budget: &Arc<Mutex<RunBudget>>,
     ) -> LookOutcome {
+        self.look_region(shot, goal, geometry, None, budget).await
+    }
+
+    /// [`look`](Self::look) at a capture that covers one rectangle of the screen.
+    ///
+    /// A full-screen capture is mapped from the display layout's origin. A crop
+    /// is not: its first pixel is the crop's corner, so the same mapping would
+    /// place every control at an offset proportional to how far the crop is
+    /// from the top-left — the click then lands somewhere else entirely, which
+    /// reads as a bad detector rather than a bad map. The region is carried
+    /// into [`VisionElements`]' coordinates here, once, so everything
+    /// downstream (element ids, `retarget`, the outline) is in screen points.
+    pub async fn look_region(
+        &self,
+        shot: &Screenshot,
+        goal: &str,
+        geometry: &DisplayGeometry,
+        region: Option<crate::computer::types::Rect>,
+        budget: &Arc<Mutex<RunBudget>>,
+    ) -> LookOutcome {
         let source = self.resolver.resolve();
         if let VisionSource::Unavailable(reason) = source {
             debug!("no vision backend: {}", reason.explain());
@@ -392,7 +418,10 @@ impl VisionLook {
             }
         }
 
-        let why = match self.attempt(&source, shot, goal, geometry, budget).await {
+        let why = match self
+            .attempt(&source, shot, goal, geometry, region, budget)
+            .await
+        {
             Ok(found) => {
                 self.remember(digest.as_deref(), &source, goal, geometry, &found)
                     .await;
@@ -402,7 +431,10 @@ impl VisionLook {
         };
 
         match self.resolver.fallback_after(&source) {
-            Some(fallback) => match self.attempt(&fallback, shot, goal, geometry, budget).await {
+            Some(fallback) => match self
+                .attempt(&fallback, shot, goal, geometry, region, budget)
+                .await
+            {
                 Ok(found) => {
                     debug!(
                         "{} could not look ({why}); {} answered instead",
@@ -496,13 +528,14 @@ impl VisionLook {
         shot: &Screenshot,
         goal: &str,
         geometry: &DisplayGeometry,
+        region: Option<crate::computer::types::Rect>,
         budget: &Arc<Mutex<RunBudget>>,
     ) -> Result<VisionElements, String> {
         match source {
             VisionSource::Unavailable(reason) => Err(reason.explain().to_string()),
             VisionSource::Local(model) => {
                 let (elements, source) = self.local(*model, shot).await?;
-                Ok(self.finish(elements, shot, geometry, source))
+                Ok(self.finish(elements, shot, geometry, region, source))
             }
             VisionSource::Api { .. } => {
                 // Charge the call before making it. A vision call is a model
@@ -515,7 +548,7 @@ impl VisionLook {
                     }
                 }
                 let elements = self.api_look(shot, goal).await?;
-                Ok(self.finish(elements, shot, geometry, "api"))
+                Ok(self.finish(elements, shot, geometry, region, "api"))
             }
         }
     }
@@ -524,14 +557,22 @@ impl VisionLook {
     ///
     /// The mapping happens here, once, so every rung produces the same
     /// contract: `bounds` are screen points, which is what a click uses.
+    ///
+    /// `region` says what the capture covers. A whole-screen capture is mapped
+    /// from the display layout; a crop is mapped from its own corner, because
+    /// its first pixel is not the screen's.
     fn finish(
         &self,
         elements: Vec<UiElement>,
         shot: &Screenshot,
         geometry: &DisplayGeometry,
+        region: Option<crate::computer::types::Rect>,
         source: &'static str,
     ) -> VisionElements {
-        let space = CoordinateSpace::from_screenshot(shot, geometry);
+        let space = match region {
+            Some(region) => CoordinateSpace::for_region(region, shot.width, shot.height),
+            None => CoordinateSpace::from_screenshot(shot, geometry),
+        };
         let mut roots = elements;
         match &space {
             Some(space) => {
@@ -1852,7 +1893,7 @@ mod tests {
             confidence: 0.9,
             bounds: Rect::new(10, 20, 60, 20),
         }]);
-        let found = look.finish(elements, &shot(100, 100), &geometry(), "local-ocr");
+        let found = look.finish(elements, &shot(100, 100), &geometry(), None, "local-ocr");
 
         assert_eq!(found.outline_source(), "ocr");
         assert!(found.note().contains("text lines"), "{}", found.note());
@@ -1869,7 +1910,7 @@ mod tests {
         let (api, _provider) = api("openai", "gpt-4o", ONE_CONTROL);
         let look = VisionLook::new(resolver("api", true, false), api);
         let detected = parse_api_elements(ONE_CONTROL).expect("the answer parses");
-        let found = look.finish(detected, &shot(100, 100), &geometry(), "api");
+        let found = look.finish(detected, &shot(100, 100), &geometry(), None, "api");
 
         assert_eq!(found.len(), 1);
         let element = &found.snapshot.roots[0];
@@ -1889,7 +1930,7 @@ mod tests {
         let (api, _provider) = api("openai", "gpt-4o", ONE_CONTROL);
         let look = VisionLook::new(resolver("api", true, false), api);
         let detected = parse_api_elements(ONE_CONTROL).expect("the answer parses");
-        let found = look.finish(detected, &shot(200, 200), &geometry(), "api");
+        let found = look.finish(detected, &shot(200, 200), &geometry(), None, "api");
 
         let element = &found.snapshot.roots[0];
         let bounds = element.bounds.expect("the box survived");
@@ -1905,7 +1946,8 @@ mod tests {
         let (api, _provider) = api("openai", "gpt-4o", ONE_CONTROL);
         let look = VisionLook::new(resolver("api", true, false), api);
         let detected = parse_api_elements(ONE_CONTROL).expect("the answer parses");
-        let found = look.finish(detected, &shot(100, 100), &DisplayGeometry::default(), "api");
+        let found =
+            look.finish(detected, &shot(100, 100), &DisplayGeometry::default(), None, "api");
 
         let element = &found.snapshot.roots[0];
         assert!(element.bounds.is_none());
@@ -1937,9 +1979,40 @@ mod tests {
         let (api, _provider) = api("openai", "gpt-4o", ONE_CONTROL);
         let look = VisionLook::new(resolver("api", true, false), api);
         let detected = parse_api_elements(ONE_CONTROL).expect("the answer parses");
-        let found = look.finish(detected, &shot(100, 100), &geometry(), "local");
+        let found = look.finish(detected, &shot(100, 100), &geometry(), None, "local");
         let note = found.note();
         assert!(note.contains("local visual scan"), "{note}");
         assert!(note.contains("guesses"), "{note}");
+    }
+
+    /// A control found in a close-up is at the crop's screen position, not at
+    /// its position inside the crop.
+    ///
+    /// This is the mapping half of "look closer". The model asked for a
+    /// 300×200-point crop at (100, 50) and the detector drew a box at the
+    /// crop's top-left pixel; the point the run clicks is the crop's corner —
+    /// (100, 50) on the screen. Reading the crop with the full-screen mapping
+    /// instead would place it near the screen's top-left, and the click would
+    /// land on whatever happens to be there.
+    #[test]
+    fn a_control_found_in_a_close_up_is_mapped_to_screen_points() {
+        use crate::computer::types::Rect;
+
+        let (api, _provider) = api("openai", "gpt-4o", ONE_CONTROL);
+        let look = VisionLook::new(resolver("api", true, false), api);
+        let detected = parse_api_elements(ONE_CONTROL).expect("the answer parses");
+        let region = Rect::new(100, 50, 300, 200);
+        // A 1:1 crop: 300×200 points captured as a 300×200 image.
+        let found = look.finish(detected, &shot(300, 200), &geometry(), Some(region), "api");
+
+        let root = &found.snapshot.roots[0];
+        let bounds = root.bounds.expect("a mapped box has bounds");
+        let point = found.resolve(&root.id).expect("the control is addressable");
+        assert!(
+            point.x >= 100 && point.x <= 400 && point.y >= 50 && point.y <= 250,
+            "the point must be inside the crop's screen rectangle, got ({}, {}) for {bounds:?}",
+            point.x,
+            point.y
+        );
     }
 }

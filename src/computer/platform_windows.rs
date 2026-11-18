@@ -30,6 +30,38 @@ impl WindowsComputerAdapter {
         }
     }
 
+    /// Move the pointer to a point without pressing anything.
+    ///
+    /// A hover and a bare move are the same gesture to the platform, so they
+    /// share one path and differ only in what the result claims.
+    async fn move_pointer(&self, x: i32, y: i32, hovered: bool) -> Result<ActionResult> {
+        let args = serde_json::json!({ "action": "move", "x": x, "y": y });
+        let result = self
+            .registry
+            .execute("windows_desktop_control", args, &crate::tools::ToolContext::default())
+            .await
+            .ok_or_else(|| ComputerError::ToolFailed("desktop control not found".to_string()))?
+            .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+        if !result.success {
+            return Err(ComputerError::ToolFailed(
+                result
+                    .error
+                    .unwrap_or_else(|| "the pointer did not move".to_string()),
+            ));
+        }
+        if hovered {
+            Ok(ActionResult::success(
+                "the pointer is now over the target; the next capture shows whether the \
+                 control reacted",
+            )
+            .with_data(serde_json::json!({ "pointer": { "x": x, "y": y } })))
+        } else {
+            Ok(ActionResult::success(format!(
+                "the pointer moved to ({x}, {y}); nothing was pressed"
+            )))
+        }
+    }
+
     /// Resolve a target and return only its coordinates.
     async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
         let resolved = self.resolve_target(&target).await?;
@@ -206,6 +238,11 @@ impl ComputerAdapter for WindowsComputerAdapter {
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 Ok(ActionResult::success(result.output))
             }
+            DesktopAction::Hover { target } => {
+                let (x, y) = self.resolve_click_point(target).await?;
+                self.move_pointer(x, y, true).await
+            }
+            DesktopAction::PointerMove { to } => self.move_pointer(to.x, to.y, false).await,
             DesktopAction::CloseWindow { title_pattern } => {
                 let args = serde_json::json!({
                     "action": "close_window", "name": title_pattern,

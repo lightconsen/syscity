@@ -33,6 +33,19 @@ pub fn action_changes_geometry(action: &DesktopAction) -> bool {
 
 /// Whether an action is expected to visibly change the screen — only these
 /// get pre/post verification snapshots.
+///
+/// A `hover` is deliberately absent. It does change the screen — a reacting
+/// control repaints, a tooltip opens — and that change is the evidence the
+/// probe exists to produce. But it must not be verified *by diffing*: the
+/// capture draws the pointer into the frame (`screencapture -C` on macOS,
+/// and the cursor is part of the desktop everywhere else), so the pointer's
+/// own move to the target would count as a change at the target and every
+/// hover would "verify" itself. The next step's frame is the answer; the
+/// hover step's verdict is `Unverifiable`, which is what "the pointer is
+/// there, the reaction is not yet seen" honestly is.
+///
+/// A `pointer_move` is the same kind of gesture with nothing expected at
+/// all: it moves the pointer so the next capture is not covered by a tooltip.
 pub fn is_screen_mutating_action(action: &DesktopAction) -> bool {
     matches!(
         action,

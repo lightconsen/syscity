@@ -155,10 +155,13 @@ impl DisplayGeometry {
 
 /// The mapping from one screenshot's pixels to screen points.
 ///
-/// The image is assumed to cover the union of the displays, with its top-left
-/// corner at the union's origin — which is what a full-screen capture does on
-/// every platform we drive. A region capture must not be described by this
-/// type; it needs its own origin.
+/// A full-screen capture covers the union of the displays, with its top-left
+/// corner at the union's origin. A *region* capture does not: its first pixel
+/// is wherever the rectangle started, and reading it as the screen's origin
+/// puts every control found in the crop at an offset that grows with the crop's
+/// distance from the top-left — a click that lands hundreds of points away,
+/// which looks like a bad detector rather than a bad map. Build those with
+/// [`for_region`](Self::for_region), never with [`new`](Self::new).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CoordinateSpace {
     /// Screenshot width in pixels.
@@ -191,6 +194,38 @@ impl CoordinateSpace {
             screen_y: union.y,
             screen_width: union.width,
             screen_height: union.height,
+        })
+    }
+
+    /// Build the mapping for a region capture.
+    ///
+    /// `region` is the area in screen points that was asked for, and
+    /// `image_width`×`image_height` is what came back. The two do not have to
+    /// agree — a Retina capture returns twice the points, and a tool may clip a
+    /// region that runs off the edge of the display layout — so the scale is
+    /// derived from both rather than assumed.
+    ///
+    /// `None` when either side names no area: a zero-sized crop or a rectangle
+    /// with no size is not a screen to map from, and a mapping invented for it
+    /// would put every control at an arbitrary point.
+    pub fn for_region(
+        region: crate::computer::types::Rect,
+        image_width: u32,
+        image_height: u32,
+    ) -> Option<Self> {
+        if image_width == 0 || image_height == 0 {
+            return None;
+        }
+        if region.width == 0 || region.height == 0 {
+            return None;
+        }
+        Some(Self {
+            image_width,
+            image_height,
+            screen_x: region.x,
+            screen_y: region.y,
+            screen_width: region.width,
+            screen_height: region.height,
         })
     }
 
@@ -631,6 +666,37 @@ mod tests {
         assert!(summary.contains("3600x2338"), "{summary}");
         assert!(summary.contains("1800x1169"), "{summary}");
         assert!(summary.contains("0.50"), "{summary}");
+    }
+
+    /// A region capture's first pixel is the crop's corner, not the screen's.
+    ///
+    /// The failure this prevents: a control at the crop's top-left is the
+    /// screen's `region.x`/`region.y`, and every pixel inward scales by the
+    /// ratio the crop implies — not by the full-screen ratio, which would place
+    /// a control in a 300-point-wide crop far from where it was drawn.
+    #[test]
+    fn a_region_capture_maps_from_its_own_corner() {
+        // A 300×200-point crop at (100, 50), captured at 2× on Retina.
+        let space = CoordinateSpace::for_region(Rect::new(100, 50, 300, 200), 600, 400).unwrap();
+
+        assert_eq!((space.screen_x, space.screen_y), (100, 50));
+        assert_eq!((space.screen_width, space.screen_height), (300, 200));
+        // The crop's own top-left pixel is exactly where the crop started.
+        assert_eq!(space.image_to_screen(0, 0), (100, 50));
+        // Its far corner is the far corner of the crop, not of the screen.
+        assert_eq!(space.image_to_screen(600, 400), (400, 250));
+        // A control in the middle is in the middle of the crop.
+        assert_eq!(space.image_to_screen(300, 200), (250, 150));
+    }
+
+    /// A crop with no size is not a screen to map from: inventing a mapping for
+    /// it would put every control at an arbitrary point.
+    #[test]
+    fn a_region_with_no_area_has_no_mapping() {
+        assert!(CoordinateSpace::for_region(Rect::new(10, 10, 0, 4), 100, 100).is_none());
+        assert!(CoordinateSpace::for_region(Rect::new(10, 10, 4, 0), 100, 100).is_none());
+        assert!(CoordinateSpace::for_region(Rect::new(10, 10, 4, 4), 0, 100).is_none());
+        assert!(CoordinateSpace::for_region(Rect::new(10, 10, 4, 4), 100, 0).is_none());
     }
 
     #[test]

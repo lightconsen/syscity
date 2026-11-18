@@ -80,6 +80,51 @@ pub struct SensitiveUiFinding {
     pub path: String,
 }
 
+/// Scan a set of roots and key what was found by element id.
+///
+/// This is the shape the prompt needs: [`TreeOutline::push_tree`] takes a map
+/// from id to category and writes `[sensitive: ...]` on the lines it applies
+/// to, so the warning sits next to the element instead of in a paragraph the
+/// model has to match back to a line by itself.
+///
+/// Findings without an id are dropped here and counted nowhere: an element
+/// with no id cannot be targeted by id either, so a marker on it would decorate
+/// a line the model cannot act on. [`scan_sensitive`] (which counts) is the one
+/// for the summary sentence.
+///
+/// [`TreeOutline::push_tree`]: crate::computer::tree_render::TreeOutline::push_tree
+/// [`scan_sensitive`]: crate::computer::sensitive_ui::scan_sensitive
+pub fn sensitive_markers(roots: &[UiElement]) -> std::collections::HashMap<String, &'static str> {
+    let detector = SensitiveUiDetector::new();
+    let mut markers = std::collections::HashMap::new();
+    for root in roots {
+        for finding in detector.scan_tree(root) {
+            if !finding.element_id.is_empty() {
+                markers
+                    .entry(finding.element_id)
+                    .or_insert(finding.category.as_str());
+            }
+        }
+    }
+    markers
+}
+
+/// Scan a set of roots for sensitive UI, keeping every finding.
+///
+/// One implementation for every caller that scans for this: the run loop, the
+/// single-shot `screen_state` tool, and the decision prompt. Three inline
+/// copies of `for root in roots { detector.scan_tree(root) }` had already
+/// drifted — the prompt's copy did not exist at all, so the system prompt's
+/// "never type into a field marked `[sensitive: ...]`" rule was unenforceable.
+pub fn scan_sensitive(roots: &[UiElement]) -> Vec<SensitiveUiFinding> {
+    let detector = SensitiveUiDetector::new();
+    let mut findings = Vec::new();
+    for root in roots {
+        findings.extend(detector.scan_tree(root));
+    }
+    findings
+}
+
 /// Detects sensitive UI elements in an accessibility tree.
 #[derive(Debug, Default, Clone)]
 pub struct SensitiveUiDetector;

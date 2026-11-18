@@ -266,6 +266,8 @@ fn desktop_action_name(action: &crate::computer::DesktopAction) -> String {
         crate::computer::DesktopAction::Screenshot { .. } => "screenshot",
         crate::computer::DesktopAction::Click { .. } => "click",
         crate::computer::DesktopAction::DoubleClick { .. } => "double_click",
+        crate::computer::DesktopAction::Hover { .. } => "hover",
+        crate::computer::DesktopAction::PointerMove { .. } => "pointer_move",
         crate::computer::DesktopAction::Type { .. } => "type",
         crate::computer::DesktopAction::KeyPress { .. } => "key_press",
         crate::computer::DesktopAction::Scroll { .. } => "scroll",

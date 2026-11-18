@@ -114,7 +114,7 @@ impl Tool for DesktopControlTool {
                 "action": {
                     "type": "string",
                     "description": "Action: inspect, click, type, key, list_windows, activate_window",
-                    "enum": ["inspect", "click", "double_click", "type", "key", "scroll", "drag", "list_windows", "activate_window", "close_window", "get_window_geometry", "move_window", "resize_window", "minimize_window", "maximize_window"]
+                    "enum": ["inspect", "click", "double_click", "type", "key", "scroll", "drag", "move", "list_windows", "activate_window", "close_window", "get_window_geometry", "move_window", "resize_window", "minimize_window", "maximize_window"]
                 },
                 "x": {
                     "type": "integer",
@@ -246,6 +246,25 @@ public class Click {{ [DllImport("user32.dll")] public static extern void mouse_
                     Ok(ToolExecutionResult::success(format!("Clicked at {}, {}", x, y)))
                 } else {
                     Ok(ToolExecutionResult::error(format!("Click failed: {}", err)))
+                }
+            }
+            // A bare pointer move: no button is pressed, so this is a hover
+            // and not half a click. `Cursor::Position` is the whole gesture.
+            "move" => {
+                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                let script = format!(
+                    r#"
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})
+"#,
+                    x, y
+                );
+                let (ok, _, err) = Self::run_ps(&script).await?;
+                if ok {
+                    Ok(ToolExecutionResult::success(format!("Moved the pointer to {}, {}", x, y)))
+                } else {
+                    Ok(ToolExecutionResult::error(format!("Move failed: {}", err)))
                 }
             }
             "double_click" => {

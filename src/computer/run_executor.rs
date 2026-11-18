@@ -551,6 +551,7 @@ async fn observe(
         image_budget_available,
         vision: found,
         tree_read_failed,
+        capture_region: state.capture_region,
     }
 }
 
@@ -586,7 +587,7 @@ async fn look_for_controls(
     }
 
     let outcome = look
-        .look(&state.screenshot, &state.goal, geometry, budget)
+        .look_region(&state.screenshot, &state.goal, geometry, state.capture_region, budget)
         .await;
     let status = outcome.status();
     debug!("vision step {}: {status}", state.step);
@@ -633,14 +634,20 @@ fn retarget(
 
 /// Apply [`retarget`] to wherever a decision carries a target.
 ///
-/// Only `Action` carries one; `Done` and `NeedHelp` are passed through so the
-/// call site does not have to match twice.
+/// `Action` and `Batch` carry targets; `Done` and `NeedHelp` are passed through
+/// so the call site does not have to match twice.
 fn rewrite_vision_target(
     decision: LoopDecision,
     vision: Option<&crate::computer::vision::look::VisionElements>,
 ) -> LoopDecision {
     match decision {
         LoopDecision::Action(action) => LoopDecision::Action(retarget_action(action, vision)),
+        LoopDecision::Batch(actions) => LoopDecision::Batch(
+            actions
+                .into_iter()
+                .map(|a| retarget_action(a, vision))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -673,6 +680,12 @@ fn retarget_action(
         DesktopAction::Drag { from, to } => DesktopAction::Drag {
             from: retarget(from, vision),
             to: retarget(to, vision),
+        },
+        // A hover on a visually-detected control is the same problem as a
+        // click on one: the adapter cannot resolve the scan's id, so the
+        // point is the only thing that gets the pointer there.
+        DesktopAction::Hover { target } => DesktopAction::Hover {
+            target: retarget(target, vision),
         },
         other => other,
     }
@@ -1663,7 +1676,7 @@ mod tests {
         assert_eq!(outcome.images_attached, 1);
     }
 
-    /// Step 0 of a tree-less app must reach the scan.
+    /// Step 0 of a tree-less app must reach the scan — and keep its picture.
     ///
     /// `tree_is_complete(&[])` used to be `true`, so an app whose accessibility
     /// read succeeds and returns nothing looked like a whole, empty desktop:
@@ -1672,6 +1685,14 @@ mod tests {
     /// it. This is the case the fix exists for — the assertion is on the
     /// prompt and on the image count, because "the scan ran" is only visible
     /// through what the step was shown.
+    ///
+    /// The image count is the second half of the fix. On a screen with a tree,
+    /// a scan that names controls can stand in for the picture: the tree is
+    /// still the index and the scan is a supplement. Here the scan is the
+    /// *only* index, and a lossy one — the detector reads a fixed 640×640
+    /// resize, so small controls are simply missing from its boxes. Suppressing
+    /// the picture would leave the model with strictly less than the screen
+    /// holds, and no basis for asking to look closer later.
     #[tokio::test]
     async fn a_tree_less_screen_is_scanned_on_the_first_step() {
         let provider = ScriptedProvider::new(vec![
@@ -1690,9 +1711,10 @@ mod tests {
 
         assert!(outcome.success, "{}", outcome.message);
 
-        // The scan's controls were in the very first prompt, and the scan
-        // stood in for the image — both impossible if step 0 had decided the
-        // empty tree was a whole one.
+        // The scan's controls were in the very first prompt — impossible if
+        // step 0 had decided the empty tree was a whole one — and the picture
+        // went out alongside them, because on a tree-less screen the scan is
+        // an index rather than an answer.
         let first = provider
             .requests()
             .first()
@@ -1709,7 +1731,14 @@ mod tests {
             "the scan's controls reached the prompt: {prompt}"
         );
         assert!(prompt.contains("\"Save\""), "and they were named: {prompt}");
-        assert_eq!(provider.images_sent(), 0, "the scan answered, so no image was needed");
+        assert!(
+            first
+                .messages
+                .iter()
+                .any(|m| m.role == crate::providers::Role::User && m.has_images()),
+            "on a tree-less screen the scan is an index, not a substitute for the picture"
+        );
+        assert!(outcome.images_attached >= 1);
 
         let view = run.view().await;
         assert_eq!(view["vision"], "api: 1 controls");

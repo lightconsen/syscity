@@ -10,6 +10,32 @@ use tracing::{info, warn};
 
 use crate::tools::{create_schema, Tool, ToolContext, ToolExecutionResult};
 
+/// Which language `osascript` should read the script in.
+///
+/// Only two are ever useful here. AppleScript drives applications through
+/// System Events; JavaScript is the shorter road to the Core Graphics
+/// functions AppleScript has no verb for (posting a pointer move).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptLanguage {
+    /// The default: `osascript -` with no language flag.
+    AppleScript,
+    /// `osascript -l JavaScript`.
+    JavaScript,
+}
+
+impl ScriptLanguage {
+    /// The `osascript` flag that selects this language, when one is needed.
+    ///
+    /// AppleScript is the default, so passing its flag would only be a
+    /// second way to say nothing.
+    pub fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::AppleScript => None,
+            Self::JavaScript => Some("JavaScript"),
+        }
+    }
+}
+
 /// Result of an AppleScript execution.
 #[derive(Debug, Clone, Serialize)]
 pub struct AppleScriptResult {
@@ -35,12 +61,31 @@ impl AppleScriptTool {
 
     /// Execute an AppleScript string and return the result.
     pub async fn execute_script(script: &str, timeout_secs: u64) -> AppleScriptResult {
-        info!("Executing AppleScript ({} chars)", script.len());
+        Self::execute_script_in(script, timeout_secs, ScriptLanguage::AppleScript).await
+    }
+
+    /// Execute a script in the given language and return the result.
+    ///
+    /// The JavaScript variant (`osascript -l JavaScript`) is how the adapter
+    /// reaches Core Graphics — a pointer move has no AppleScript verb, but
+    /// `CGEventPost` is one line of JXA. Routing it through this tool rather
+    /// than a second one keeps a single approval gate and a single target
+    /// lock in front of everything that drives the screen.
+    pub async fn execute_script_in(
+        script: &str,
+        timeout_secs: u64,
+        language: ScriptLanguage,
+    ) -> AppleScriptResult {
+        info!("Executing {:?} script ({} chars)", language, script.len());
 
         let script_owned = script.to_string();
 
         // Spawn child first so we can kill it if the timeout fires.
-        let mut child = match Command::new("osascript")
+        let mut command = Command::new("osascript");
+        if let Some(flag) = language.flag() {
+            command.arg(flag);
+        }
+        let mut child = match command
             .arg("-")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -136,6 +181,14 @@ impl Tool for AppleScriptTool {
                     "type": "string",
                     "description": "The AppleScript source code to execute"
                 },
+                "language": {
+                    "type": "string",
+                    "enum": ["AppleScript", "JavaScript"],
+                    "description": "Script language. AppleScript (default) drives apps through \
+                                    System Events; JavaScript reaches Core Graphics functions \
+                                    such as CGEventPost.",
+                    "default": "AppleScript"
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in seconds",
@@ -162,7 +215,12 @@ impl Tool for AppleScriptTool {
 
         let timeout_secs = args["timeout"].as_u64().unwrap_or(30);
 
-        let result = Self::execute_script(script, timeout_secs).await;
+        let language = match args["language"].as_str() {
+            Some("JavaScript") | Some("javascript") | Some("jxa") => ScriptLanguage::JavaScript,
+            _ => ScriptLanguage::AppleScript,
+        };
+
+        let result = Self::execute_script_in(script, timeout_secs, language).await;
 
         let json = serde_json::to_string_pretty(&result)
             .map_err(crate::error::SyscityError::Serialization)?;

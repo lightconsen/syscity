@@ -33,7 +33,7 @@ use crate::computer::element_index::SnapshotCache;
 use crate::computer::page::{PageAction, PageActor, PageTarget};
 use crate::computer::reflection::{FailureAnalysis, ReflectionEngine};
 use crate::computer::rollback::RollbackManager;
-use crate::computer::sensitive_ui::{SensitiveUiDetector, SensitiveUiFinding};
+use crate::computer::sensitive_ui::{scan_sensitive, SensitiveUiFinding};
 use crate::computer::use_loop::StepVerification;
 use crate::computer::verification::{VerificationConfig, VerificationCriteria, VerificationEngine};
 use crate::computer::vision::{
@@ -509,6 +509,37 @@ impl ComputerSession {
         self.execute_with_budget(action, None).await
     }
 
+    /// Execute one action in a batch, deciding whether to look afterwards.
+    ///
+    /// `look_after` is the batch's whole point. A batch is several actions a
+    /// person would take off one glance (`click → type → Tab → type`), and the
+    /// cost being removed is the settle-and-capture between them. So every
+    /// action but the last runs *unobserved*: it is dispatched, its failure is
+    /// still an error, and it is still accounted — but there is no post-action
+    /// capture and no pixel diff, because the diff would be paid for and then
+    /// thrown away by the next action in the same batch.
+    ///
+    /// The last action is observed exactly as [`Self::execute`] would, so the
+    /// step that follows the batch sees where the batch actually ended up.
+    ///
+    /// One thing an unobserved action keeps is the *refusal* checks: the app
+    /// boundary, the disabled-target rule and the ladder's own errors all
+    /// still run. What it gives up is the escalation loop's evidence (a diff),
+    /// which means it also gives up escalation — a batched click that silently
+    /// did nothing is not re-tried on another rung, because the next action
+    /// was already planned on top of it and a retry would run it twice. The
+    /// model learns the batch did not land from the last action's frame; a
+    /// mis-landed intermediate action is a reason to batch more conservatively,
+    /// which the prompt says.
+    pub async fn execute_in_batch(
+        &self,
+        action: DesktopAction,
+        look_after: bool,
+    ) -> crate::computer::Result<StepOutcome> {
+        self.execute_with_budget_observed(action, None, look_after)
+            .await
+    }
+
     /// Execute one action under a budget the caller set for this call.
     ///
     /// The tool wraps a step in the same ceiling the tool registry applies to
@@ -521,11 +552,29 @@ impl ComputerSession {
         action: DesktopAction,
         budget: Option<StepBudget>,
     ) -> crate::computer::Result<StepOutcome> {
+        self.execute_with_budget_observed(action, budget, true)
+            .await
+    }
+
+    /// The body of [`Self::execute_with_budget`], with the option to skip the
+    /// post-action look.
+    ///
+    /// `observed == false` is the batched case: dispatch and account, but do
+    /// not settle, capture or diff. See [`Self::execute_in_batch`].
+    async fn execute_with_budget_observed(
+        &self,
+        action: DesktopAction,
+        budget: Option<StepBudget>,
+        observed: bool,
+    ) -> crate::computer::Result<StepOutcome> {
         let budget = match budget {
             Some(budget) => budget,
             None => self.step_budget(),
         };
         let mutating = is_screen_mutating_action(&action);
+        // A baseline is only worth taking when the step will compare against
+        // it. In a batch, only the last action is observed.
+        let watch_screen = mutating && observed;
 
         // The per-app boundary, checked before anything is captured or
         // dispatched. It has to come first: a step that refuses because the app
@@ -583,7 +632,7 @@ impl ComputerSession {
 
             // Baseline for this attempt: one screenshot, and the tree only
             // when a diff will need it.
-            let screenshot_before = if mutating {
+            let screenshot_before = if watch_screen {
                 crate::computer::budget::within(&budget, "the baseline screenshot", async {
                     self.adapter.screenshot(None).await
                 })
@@ -593,7 +642,7 @@ impl ComputerSession {
             } else {
                 None
             };
-            let tree_before = if mutating {
+            let tree_before = if watch_screen {
                 crate::computer::budget::within(&budget, "the baseline tree read", async {
                     self.adapter.read_ui_tree(None).await
                 })
@@ -727,7 +776,7 @@ impl ComputerSession {
 
             // Settle, then capture the state verification compares against.
             let settle_start = std::time::Instant::now();
-            let state_after = if mutating {
+            let state_after = if watch_screen {
                 self.settle_and_capture(screenshot_before.as_ref(), &budget)
                     .await
             } else {
@@ -739,7 +788,10 @@ impl ComputerSession {
                 .is_some()
                 .then(|| settle_start.elapsed().as_millis() as u64);
 
-            let (verification, diff, hint) = if self.config.verify {
+            // An unobserved action has nothing to verify against: no
+            // baseline, no frame after, no tree. Saying `Unverifiable` is the
+            // honest answer — the batch's last action is what gets observed.
+            let (verification, diff, hint) = if self.config.verify && observed {
                 self.verify_step(
                     &action,
                     &result,
@@ -888,11 +940,28 @@ impl ComputerSession {
     /// remains when the field cannot be addressed. When the target is web
     /// content and a page is attached, `page` is the last resort: the same
     /// element, found in the document instead of on the screen.
+    ///
+    /// A coordinate has only one rung that can carry it — the point is the
+    /// whole instruction, and no accessibility path reaches a point. It gets
+    /// the pixel rung and nothing else; adding a keyboard rung for a click
+    /// would press a key at whatever holds focus, which is not the click the
+    /// model asked for. Retrying a coordinate is the model's decision on the
+    /// next step, made with a fresh look at the screen, and that is the right
+    /// place for it: the session cannot know a better point.
     async fn ladder_for(&self, action: &DesktopAction) -> Vec<Rung> {
+        // A hover is a pointer position and nothing else. The accessibility
+        // rung presses an element, the keyboard rung focuses and activates
+        // it — both would turn "does this react to the pointer" into "click
+        // it", which is the one thing a probe must not do.
+        if matches!(action, DesktopAction::Hover { .. } | DesktopAction::PointerMove { .. }) {
+            return vec![Rung::Pixel];
+        }
         let target = match action {
             DesktopAction::Click { target, .. }
             | DesktopAction::DoubleClick { target, .. }
-            | DesktopAction::Type { target: Some(target), .. } => target,
+            | DesktopAction::Type { target: Some(target), .. }
+            | DesktopAction::Scroll { target, .. }
+            | DesktopAction::Drag { from: target, .. } => target,
             _ => return vec![Rung::Pixel],
         };
 
@@ -1408,6 +1477,15 @@ impl ComputerSession {
         match action {
             DesktopAction::Screenshot { .. } => Ok((StepVerification::Verified, None, None)),
             DesktopAction::Wait { .. } => Ok((StepVerification::Verified, None, None)),
+            // The probe succeeded if the pointer moved, and that is the most
+            // the step can claim. Whether the control reacted is written on
+            // the *next* frame, which this step does not have — and it cannot
+            // be diffed here even if it did, because the capture draws the
+            // pointer and the pointer just moved onto the target. "Verified"
+            // would say "the control responds" on the strength of the cursor
+            // having arrived.
+            DesktopAction::Hover { .. } => Ok((StepVerification::Unverifiable, None, None)),
+            DesktopAction::PointerMove { .. } => Ok((StepVerification::Verified, None, None)),
             DesktopAction::LaunchApp { name, wait_for_ready, .. } => {
                 if *wait_for_ready {
                     self.verifier
@@ -1733,6 +1811,7 @@ impl ComputerSession {
             DesktopAction::Drag { from, to } => vec![from, to],
             DesktopAction::Click { target, .. }
             | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Hover { target }
             | DesktopAction::Scroll { target, .. } => vec![target],
             DesktopAction::Type { target: Some(target), .. } => vec![target],
             _ => Vec::new(),
@@ -1780,6 +1859,7 @@ impl ComputerSession {
             // different app.
             DesktopAction::Click { target, .. }
             | DesktopAction::DoubleClick { target, .. }
+            | DesktopAction::Hover { target }
             | DesktopAction::Scroll { target, .. } => {
                 if let ClickTarget::Coordinate(point) = target {
                     unnamed_parts += 1;
@@ -1811,6 +1891,12 @@ impl ComputerSession {
                         receivers.push(self.adapter.application_at(*point).await);
                     }
                 }
+            }
+            // A pointer move is a bare point: the app drawn there receives the
+            // move event, exactly as it would receive a click.
+            DesktopAction::PointerMove { to } => {
+                unnamed_parts += 1;
+                receivers.push(self.adapter.application_at(*to).await);
             }
             _ => {}
         }
@@ -2301,16 +2387,6 @@ fn refusal_recovery(error: &ComputerError) -> Option<&'static str> {
         ),
         _ => None,
     }
-}
-
-/// Scan a tree for password / payment / destructive-confirmation UI.
-fn scan_sensitive(tree: &[UiElement]) -> Vec<SensitiveUiFinding> {
-    let detector = SensitiveUiDetector::new();
-    let mut findings = Vec::new();
-    for root in tree {
-        findings.extend(detector.scan_tree(root));
-    }
-    findings
 }
 
 /// Combine what the screen showed with what the driver established.
@@ -3118,6 +3194,92 @@ mod tests {
             })
             .await;
         assert_eq!(ladder, vec![Rung::Pixel]);
+    }
+
+    /// A probe is not a click that lost its nerve.
+    ///
+    /// The default treatment for a named element starts at `AxAction`, whose
+    /// "click" is `AXPress` — so a hover given that ladder would press the
+    /// control it was only looking at, and the measurement would have caused
+    /// the event it was trying to predict. Hover and its move-away get the
+    /// pixel rung and nothing else, named element or not.
+    #[tokio::test]
+    async fn a_hover_only_ever_runs_the_pixel_rung() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let session = ladder_session(&adapter).with_page(FakePage::new(), "conv-1");
+
+        for action in [
+            DesktopAction::Hover {
+                target: ClickTarget::ElementId("e1".to_string()),
+            },
+            DesktopAction::Hover {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(5, 5)),
+            },
+            DesktopAction::PointerMove {
+                to: crate::computer::Point::new(5, 5),
+            },
+        ] {
+            let ladder = session.ladder_for(&action).await;
+            assert_eq!(ladder, vec![Rung::Pixel], "{action:?} → {ladder:?}");
+        }
+    }
+
+    /// Hover establishes that the pointer arrived, and nothing more.
+    ///
+    /// The frame a hover was verified against is the frame the cursor was
+    /// drawn into — the pointer *is* the change, so a pixel diff would report
+    /// "the control reacted" for every target, live or not. The honest verdict
+    /// is `Unverifiable`; the next step's picture is the evidence.
+    #[tokio::test]
+    async fn a_hover_is_unchecked_because_the_cursor_is_in_the_frame() {
+        let session = headless_session();
+        let (outcome, diff, hint) = session
+            .verify_step(
+                &DesktopAction::Hover {
+                    target: ClickTarget::ElementId("e1".to_string()),
+                },
+                &ActionResult::success("the pointer is now over the target"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, StepVerification::Unverifiable);
+        assert!(!outcome.verified());
+        assert!(diff.is_none());
+        assert!(hint.is_none());
+
+        // The move-away has no such ambiguity: it either runs or errors.
+        let (outcome, _, _) = session
+            .verify_step(
+                &DesktopAction::PointerMove {
+                    to: crate::computer::Point::new(900, 600),
+                },
+                &ActionResult::success("moved"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, StepVerification::Verified);
+    }
+
+    /// The pointer is shared by the whole machine, so a probe is input.
+    #[test]
+    fn a_hover_takes_the_input_lock() {
+        use crate::computer::types::DesktopAction as Action;
+        assert!(Action::Hover {
+            target: ClickTarget::Coordinate(crate::computer::Point::new(1, 1)),
+        }
+        .needs_input_lock());
+        assert!(Action::PointerMove {
+            to: crate::computer::Point::new(1, 1),
+        }
+        .needs_input_lock());
     }
 
     #[tokio::test]

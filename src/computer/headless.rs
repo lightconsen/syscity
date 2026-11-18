@@ -279,6 +279,22 @@ impl Default for HeadlessComputerAdapter {
 }
 
 impl HeadlessComputerAdapter {
+    /// Move the pointer to a point on the virtual display, pressing nothing.
+    async fn move_pointer(&self, display: &str, x: i32, y: i32) -> Result<()> {
+        let output = tokio::process::Command::new("xdotool")
+            .env("DISPLAY", display)
+            .args(["mousemove", &x.to_string(), &y.to_string()])
+            .output()
+            .await
+            .map_err(|e| ComputerError::ToolFailed(format!("xdotool: {}", e)))?;
+        if !output.status.success() {
+            return Err(ComputerError::ToolFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a new headless adapter **without** a virtual display.
     pub fn new() -> Self {
         Self { virtual_display: None }
@@ -444,6 +460,33 @@ impl ComputerAdapter for HeadlessComputerAdapter {
                     }
                 }
                 Ok(ActionResult::success(format!("Launched {}", name)))
+            }
+            // A pointer move with nothing pressed. xdotool's `mousemove` is
+            // the same primitive a click starts with, minus the button.
+            DesktopAction::Hover { target } => {
+                let display = self.display().ok_or_else(|| ComputerError::NoDisplay)?;
+                let (x, y) = match target {
+                    ClickTarget::Coordinate(p) => (p.x, p.y),
+                    _ => {
+                        return Err(ComputerError::Other(
+                            "Headless adapter only supports coordinate hovers".to_string(),
+                        ))
+                    }
+                };
+                self.move_pointer(display, x, y).await?;
+                Ok(ActionResult::success(
+                    "the pointer is now over the target; the next capture shows whether the \
+                     control reacted",
+                )
+                .with_data(serde_json::json!({ "pointer": { "x": x, "y": y } })))
+            }
+            DesktopAction::PointerMove { to } => {
+                let display = self.display().ok_or_else(|| ComputerError::NoDisplay)?;
+                self.move_pointer(display, to.x, to.y).await?;
+                Ok(ActionResult::success(format!(
+                    "the pointer moved to ({}, {}); nothing was pressed",
+                    to.x, to.y
+                )))
             }
             DesktopAction::Scroll { target, direction, amount } => {
                 let display = self.display().ok_or_else(|| ComputerError::NoDisplay)?;

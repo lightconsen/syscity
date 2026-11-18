@@ -292,6 +292,24 @@ impl ComputerAdapter for OsworldDesktop {
                 let (to_x, to_y) = self.resolve_click_point(&to).await?;
                 self.act(&drag_code(from_x, from_y, to_x, to_y)).await
             }
+            // pyautogui's `moveTo` is the pointer gesture with no button:
+            // the VM's own hover, delivered the way a person's hand would be.
+            DesktopAction::Hover { target } => {
+                let (x, y) = self.resolve_click_point(&target).await?;
+                self.act(&pointer_move_code(x, y)).await?;
+                Ok(ActionResult::success(
+                    "the pointer is now over the target; the next capture shows whether the \
+                     control reacted",
+                )
+                .with_data(json!({ "pointer": { "x": x, "y": y } })))
+            }
+            DesktopAction::PointerMove { to } => {
+                self.act(&pointer_move_code(to.x, to.y)).await?;
+                Ok(ActionResult::success(format!(
+                    "the pointer moved to ({}, {}); nothing was pressed",
+                    to.x, to.y
+                )))
+            }
             DesktopAction::Wait { milliseconds } => {
                 tokio::time::sleep(Duration::from_millis(milliseconds)).await;
                 Ok(ActionResult::success(format!("Waited {milliseconds}ms")))
@@ -831,6 +849,14 @@ fn drag_code(from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> String {
     )
 }
 
+/// The pyautogui spelling of a bare pointer move.
+///
+/// No `mouseDown`/`mouseUp`: this is the hover the probe needs, and pressing
+/// here would turn "does it react" into "did I click it".
+fn pointer_move_code(x: i32, y: i32) -> String {
+    format!("import pyautogui\npyautogui.moveTo({x}, {y})\n")
+}
+
 /// The pyautogui spelling of a key the session named.
 fn pyautogui_key(key: &str) -> String {
     let canonical = canonical_key(key);
@@ -863,6 +889,8 @@ fn action_name(action: &DesktopAction) -> &'static str {
         DesktopAction::Screenshot { .. } => "screenshot",
         DesktopAction::Click { .. } => "click",
         DesktopAction::DoubleClick { .. } => "double_click",
+        DesktopAction::Hover { .. } => "hover",
+        DesktopAction::PointerMove { .. } => "pointer_move",
         DesktopAction::Type { .. } => "type",
         DesktopAction::KeyPress { .. } => "key_press",
         DesktopAction::Scroll { .. } => "scroll",

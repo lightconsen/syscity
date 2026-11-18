@@ -438,6 +438,7 @@ pub fn stable_target(action: &DesktopAction, resolved: Option<&ResolvedElement>)
     match &mut out {
         DesktopAction::Click { target, .. }
         | DesktopAction::DoubleClick { target, .. }
+        | DesktopAction::Hover { target }
         | DesktopAction::Scroll { target, .. } => rewrite(target),
         DesktopAction::Drag { from, to } => {
             rewrite(from);
@@ -461,6 +462,7 @@ pub async fn stabilize(action: &DesktopAction, adapter: &dyn ComputerAdapter) ->
     match &out {
         DesktopAction::Click { target, .. }
         | DesktopAction::DoubleClick { target, .. }
+        | DesktopAction::Hover { target }
         | DesktopAction::Scroll { target, .. } => targets.push(target.clone()),
         DesktopAction::Drag { from, to } => {
             targets.push(from.clone());
@@ -509,6 +511,7 @@ pub async fn stabilize(action: &DesktopAction, adapter: &dyn ComputerAdapter) ->
     match &mut out {
         DesktopAction::Click { target, .. }
         | DesktopAction::DoubleClick { target, .. }
+        | DesktopAction::Hover { target }
         | DesktopAction::Scroll { target, .. } => rewrite(target),
         DesktopAction::Drag { from, to } => {
             rewrite(from);

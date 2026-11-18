@@ -769,6 +769,28 @@ pub enum DesktopAction {
         target: ClickTarget,
         button: MouseButton,
     },
+    /// Move the pointer onto a control and leave it there, as a probe.
+    ///
+    /// This is not a click that forgot to press: it is the only way to ask
+    /// "does this control respond to the pointer" without reading an
+    /// `enabled` flag the platform may not publish. A control that repaints
+    /// under the pointer is one a person would try; one that does not is
+    /// either inert or styled with no hover state at all — the answer is a
+    /// probability, and the step says so rather than dressing it up as fact.
+    ///
+    /// The pointer *stays* on the target, because that is what a person does
+    /// while looking. The step that runs next sees whatever the hover opened
+    /// (a tooltip, a highlighted row), so a hover that covers something is
+    /// followed by [`Self::PointerMove`] to somewhere empty — the move-away is
+    /// part of the gesture, not an afterthought.
+    Hover { target: ClickTarget },
+    /// Move the pointer to a point, without pressing anything.
+    ///
+    /// The companion to [`Self::Hover`]: it is how a tooltip or a hover menu
+    /// is dismissed so the next capture shows the screen rather than the
+    /// pointer's wake. It changes only the pointer's position, so it is not
+    /// expected to change the screen and is not verified against one.
+    PointerMove { to: Point },
     /// Type text (as if typed by keyboard).
     ///
     /// `target` names the field to type into when the caller has one. The
@@ -872,9 +894,12 @@ impl DesktopAction {
     /// The line is drawn wide on purpose. Scrolling moves the content under
     /// the pointer and a window action moves the focus, so both are input even
     /// though neither types a character: after either, an unaimed keystroke
-    /// lands somewhere it was not meant to. Callers that are unsure belong on
-    /// the input side, where the cost is waiting and the alternative is a
-    /// wrong action reported as a right one.
+    /// lands somewhere it was not meant to. A `hover` and a `pointer_move`
+    /// are input for the same reason — the pointer is the one thing this
+    /// machine has one of, and a keystroke after a hover lands wherever the
+    /// hover left focus. Callers that are unsure belong on the input side,
+    /// where the cost is waiting and the alternative is a wrong action
+    /// reported as a right one.
     pub fn needs_input_lock(&self) -> bool {
         !matches!(
             self,

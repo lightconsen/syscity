@@ -312,6 +312,8 @@ impl ReflectionEngine {
             DesktopAction::Screenshot { .. } => "Screenshot",
             DesktopAction::Click { .. } => "Click",
             DesktopAction::DoubleClick { .. } => "DoubleClick",
+            DesktopAction::Hover { .. } => "Hover",
+            DesktopAction::PointerMove { .. } => "PointerMove",
             DesktopAction::Type { .. } => "Type",
             DesktopAction::KeyPress { .. } => "KeyPress",
             DesktopAction::Scroll { .. } => "Scroll",

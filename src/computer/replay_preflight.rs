@@ -72,6 +72,7 @@ pub fn targets_of(action: &DesktopAction) -> Vec<&ClickTarget> {
     match action {
         DesktopAction::Click { target, .. }
         | DesktopAction::DoubleClick { target, .. }
+        | DesktopAction::Hover { target }
         | DesktopAction::Scroll { target, .. } => vec![target],
         DesktopAction::Drag { from, to } => vec![from, to],
         DesktopAction::Type { target: Some(target), .. } => vec![target],

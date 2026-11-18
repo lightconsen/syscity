@@ -10,14 +10,11 @@
 //!   detection (buttons, text fields, checkboxes, icons) via ONNX (OmniParser),
 //!   for when the accessibility tree is empty or incomplete.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tracing::warn;
 
-use crate::computer::sensitive_ui::SensitiveUiDetector;
 use crate::computer::tree_render::{trust_line, TreeOutline};
 use crate::computer::vision::ScreenState;
 #[cfg(feature = "vision")]
@@ -305,19 +302,8 @@ impl ScreenStateTool {
         // the warning is attached to the exact lines it applies to. Keyed by
         // element id; elements without a snapshot id cannot be targeted by id
         // anyway, so they are only counted in the header.
-        let detector = SensitiveUiDetector::new();
-        let mut findings = Vec::new();
-        for root in &state.ui_tree {
-            findings.extend(detector.scan_tree(root));
-        }
-        let mut sensitive: HashMap<String, &'static str> = HashMap::new();
-        for finding in &findings {
-            if !finding.element_id.is_empty() {
-                sensitive
-                    .entry(finding.element_id.clone())
-                    .or_insert(finding.category.as_str());
-            }
-        }
+        let findings = crate::computer::sensitive_ui::scan_sensitive(&state.ui_tree);
+        let sensitive = crate::computer::sensitive_ui::sensitive_markers(&state.ui_tree);
 
         let mut outline = TreeOutline::default();
         // Spend the line budget on windows a person can see. An app can keep
@@ -756,6 +742,7 @@ mod tests {
     use crate::computer::tree_render::format_element;
     use crate::computer::types::Rect;
     use crate::computer::{Tri, UiElement};
+    use std::collections::HashMap;
 
     fn no_sensitive() -> HashMap<String, &'static str> {
         HashMap::new()

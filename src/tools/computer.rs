@@ -178,7 +178,8 @@ Coordinates: x/y are screen points by default. When you read a position off a sc
                 "action": {
                     "type": "string",
                     "enum": [
-                        "screenshot", "click", "double_click", "type", "key_press",
+                        "screenshot", "click", "double_click", "hover", "pointer_move",
+                        "type", "key_press",
                         "scroll", "drag", "read_ui_tree", "launch_app",
                         "activate_window", "close_window", "wait",
                         "clipboard_get", "clipboard_set", "get_system_status",
@@ -549,6 +550,23 @@ fn action_to_desktop_action(action: &str, args: &Value) -> crate::Result<Desktop
             let amount = args["amount"].as_i64().unwrap_or(3) as i32;
             Ok(DesktopAction::Scroll { target, direction, amount })
         }
+        // A hover moves the pointer onto the target and leaves it there. It
+        // shares the target syntax with a click so the model can name the
+        // control it is asking about the same way it names the control it
+        // would click.
+        "hover" => {
+            let target = parse_click_target(args)?;
+            Ok(DesktopAction::Hover { target })
+        }
+        // A bare pointer move, for dismissing a tooltip the hover opened.
+        // It takes a point and nothing else: there is no element to move "to"
+        // that means anything beyond its pixels.
+        "pointer_move" => Ok(DesktopAction::PointerMove {
+            to: Point::new(
+                args["x"].as_i64().unwrap_or(0) as i32,
+                args["y"].as_i64().unwrap_or(0) as i32,
+            ),
+        }),
         "drag" => {
             // A drag names its ends the same way every other action does: an
             // element id first, then a point. Coordinates-only drags were the
@@ -1531,6 +1549,37 @@ mod tests {
             }
             other => panic!("expected Drag, got {other:?}"),
         }
+    }
+
+    /// A hover is aimed like a click and is not one: the same id-or-point
+    /// syntax, landing on `Hover` rather than `Click`.
+    #[test]
+    fn a_hover_maps_to_a_hover_not_a_click() {
+        let args = json!({"action": "hover", "element_id": "s1:0.4"});
+        assert_eq!(
+            action_to_desktop_action("hover", &args).unwrap(),
+            DesktopAction::Hover {
+                target: ClickTarget::ElementId("s1:0.4".to_string()),
+            }
+        );
+
+        let args = json!({"action": "hover", "x": 120, "y": 340});
+        assert_eq!(
+            action_to_desktop_action("hover", &args).unwrap(),
+            DesktopAction::Hover {
+                target: ClickTarget::Coordinate(Point::new(120, 340)),
+            }
+        );
+    }
+
+    /// The move-away is a bare point, so it reads x/y and nothing else.
+    #[test]
+    fn a_pointer_move_maps_to_a_bare_point() {
+        let args = json!({"action": "pointer_move", "x": 900, "y": 600});
+        assert_eq!(
+            action_to_desktop_action("pointer_move", &args).unwrap(),
+            DesktopAction::PointerMove { to: Point::new(900, 600) }
+        );
     }
 
     #[tokio::test]

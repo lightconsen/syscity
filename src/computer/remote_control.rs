@@ -789,6 +789,43 @@ public class SCMouse {{
         Ok(ActionResult::success("clicked"))
     }
 
+    /// Move the pointer on the remote host, pressing nothing.
+    ///
+    /// A hover and a bare move are the same gesture to every remote OS, so
+    /// they share one path. macOS uses `cliclick`'s bare `m:` (the click
+    /// spellings all press); Linux uses `xdotool mousemove`; Windows sets
+    /// `Cursor::Position` with no `mouse_event` after it.
+    async fn move_remote(&self, point: Point) -> Result<()> {
+        match self.remote_os {
+            RemoteOs::Linux => {
+                self.run_remote_text(
+                    "xdotool",
+                    &["mousemove", &point.x.to_string(), &point.y.to_string()],
+                )
+                .await?;
+            }
+            RemoteOs::Macos => {
+                self.run_remote_text("cliclick", &[&format!("m:{},{}", point.x, point.y)])
+                    .await?;
+            }
+            RemoteOs::Windows => {
+                let ps = format!(
+                    r#"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point({}, {})"#,
+                    point.x, point.y
+                );
+                self.run_remote_text("powershell", &["-Command", &ps])
+                    .await?;
+            }
+            _ => {
+                return Err(ComputerError::UnsupportedPlatform(format!(
+                    "Remote pointer move not supported for OS {:?}",
+                    self.remote_os
+                )))
+            }
+        }
+        Ok(())
+    }
+
     async fn type_remote(&self, text: &str) -> Result<ActionResult> {
         match self.remote_os {
             RemoteOs::Linux => {
@@ -1179,6 +1216,29 @@ impl ComputerAdapter for RemoteControlAdapter {
             }
             DesktopAction::Type { text, .. } => self.type_remote(&text).await,
             DesktopAction::KeyPress { keys } => self.keypress_remote(&keys).await,
+            DesktopAction::Hover { target } => {
+                let point = match target {
+                    ClickTarget::Coordinate(p) => p,
+                    _ => {
+                        return Err(ComputerError::ElementNotFound(
+                            "Remote adapter only supports coordinate hovers".to_string(),
+                        ));
+                    }
+                };
+                self.move_remote(point).await?;
+                Ok(ActionResult::success(
+                    "the pointer is now over the target; the next capture shows whether the \
+                     control reacted",
+                )
+                .with_data(serde_json::json!({ "pointer": { "x": point.x, "y": point.y } })))
+            }
+            DesktopAction::PointerMove { to } => {
+                self.move_remote(to).await?;
+                Ok(ActionResult::success(format!(
+                    "the pointer moved to ({}, {}); nothing was pressed",
+                    to.x, to.y
+                )))
+            }
             DesktopAction::Wait { milliseconds } => {
                 tokio::time::sleep(Duration::from_millis(milliseconds)).await;
                 Ok(ActionResult::success("waited"))

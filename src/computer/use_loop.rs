@@ -53,6 +53,19 @@ impl Default for LoopConfig {
 pub enum LoopDecision {
     /// Execute a desktop action.
     Action(DesktopAction),
+    /// Execute several actions, in order, against the same look.
+    ///
+    /// This is the batched form of [`Self::Action`], and it exists because a
+    /// person filling a form looks once and acts four times (`click → type →
+    /// Tab → type`): every action in the batch follows from the picture the
+    /// decision was made against. Running them without a capture between is
+    /// what turns a twenty-field form from twenty round trips into a handful.
+    ///
+    /// The loop still records one step per action, settles and verifies each,
+    /// and stops the batch at the first action that fails verification or is
+    /// refused — the actions after it were planned on a screen that did not
+    /// come to pass.
+    Batch(Vec<DesktopAction>),
     /// Task is complete.
     Done { message: String },
     /// The agent is stuck and needs human help.
@@ -122,6 +135,18 @@ pub struct LoopState {
     pub last_error: Option<String>,
     /// Number of consecutive failed steps.
     pub consecutive_failures: usize,
+    /// The screen area this capture covers, in screen points.
+    ///
+    /// `None` means the whole display layout — what a normal step captures.
+    /// `Some` means the model asked to look closer at one rectangle on the
+    /// previous step, and this capture is that crop. It is not decoration:
+    /// a crop's pixels start at the crop's corner, so anything mapping image
+    /// pixels back to screen points has to know the origin, or every control
+    /// it finds lands at an offset that grows with the distance from the
+    /// top-left. [`CoordinateSpace::for_region`] is the mapping built from it.
+    ///
+    /// [`CoordinateSpace::for_region`]: crate::computer::display::CoordinateSpace::for_region
+    pub capture_region: Option<crate::computer::Rect>,
 }
 
 /// What a verification established about an action.
@@ -344,6 +369,15 @@ impl ComputerUseLoop {
         let mut last_error: Option<String> = None;
         let mut consecutive_failures: usize = resume.consecutive_failures;
 
+        // What the next capture should cover. The model asks for a closer look
+        // by answering with a region screenshot; on the next iteration this is
+        // what the loop actually captures. It is one-shot on purpose: a crop
+        // the model asked for answers *that* step's question, and the step
+        // after it should see the whole screen again unless it asks again.
+        // Otherwise a single request for a close-up would narrow every later
+        // decision to a rectangle it never chose.
+        let mut capture_region: Option<crate::computer::Rect> = None;
+
         // A run is a task: failure counters and memory start clean — unless
         // this *is* a continued task, in which case the counters are the
         // previous process's.
@@ -354,7 +388,8 @@ impl ComputerUseLoop {
         // inventing facts about a screen that may have changed.
         self.session.reset().await;
 
-        for step in resume.start_step..self.config.max_steps {
+        let mut step = resume.start_step;
+        while step < self.config.max_steps {
             // Check execution controller for pause / resume / step / cancel.
             if let Some(ref ctrl) = self.execution_controller {
                 if let Err(reason) = ctrl.check_and_wait().await {
@@ -388,14 +423,13 @@ impl ComputerUseLoop {
             // 1. Perceive — capture screenshot. A capture that failed is not
             //    an empty screen: carry the reason and let the decision maker
             //    answer "I cannot look" instead of planning on a blank frame.
-            let (screenshot, capture_error) =
-                match self.adapter.screenshot(self.config.screenshot_region).await {
-                    Ok(shot) => (shot, None),
-                    Err(e) => {
-                        tracing::warn!("screen capture failed: {e}");
-                        (Screenshot::new(String::new(), 0, 0), Some(e.to_string()))
-                    }
-                };
+            let (screenshot, capture_error) = match self.adapter.screenshot(capture_region).await {
+                Ok(shot) => (shot, None),
+                Err(e) => {
+                    tracing::warn!("screen capture failed: {e}");
+                    (Screenshot::new(String::new(), 0, 0), Some(e.to_string()))
+                }
+            };
 
             // 2. Plan — ask the decision maker what to do.
             let state = LoopState {
@@ -407,6 +441,7 @@ impl ComputerUseLoop {
                 last_verified,
                 last_error: last_error.clone(),
                 consecutive_failures,
+                capture_region,
             };
 
             let decision = decide(state).await?;
@@ -431,66 +466,63 @@ impl ComputerUseLoop {
                     });
                 }
                 LoopDecision::Action(action) => {
-                    // Act → settle → verify, in the session. Snapshots before
-                    // the step, three-state verification after it, failure
-                    // accounting, auto-rollback and reflection all happen
-                    // there — the loop only decides what to do next.
-                    match self.session.execute(action.clone()).await {
-                        Ok(outcome) => {
-                            let verification = outcome.verification;
-                            let sensitive = outcome.sensitive_target;
-                            // Read before the outcome is taken apart: the diff
-                            // is the only thing that knows where the change
-                            // happened, and this record outlives it.
-                            let aim_missed = outcome.diff.as_ref().and_then(|d| d.aim_missed());
-                            consecutive_failures = self.session.consecutive_failures().await;
-                            last_error = self.session.last_error().await;
-                            last_verified = match verification {
-                                StepVerification::Verified => Some(true),
-                                StepVerification::Failed => Some(false),
-                                StepVerification::Unverifiable => None,
-                            };
-                            if outcome.rolled_back {
-                                tracing::warn!("step rolled back automatically");
-                            }
-
-                            history.push(StepRecord {
-                                step,
-                                action,
-                                result: outcome.result,
-                                verification,
-                                // The frame the decision was made against. Kept
-                                // on the record because the replay timeline
-                                // pairs it with the post-action one; a run that
-                                // dropped it could show what a step changed but
-                                // never what it was looking at.
-                                screenshot_before: outcome.screenshot_before,
-                                screenshot_after: outcome.state_after.map(|state| state.screenshot),
-                                snapshots_taken: outcome.snapshots_taken,
-                                sensitive,
-                                aim_missed,
-                            });
-                        }
-                        Err(e) => {
-                            consecutive_failures = self.session.record_error(&e.to_string()).await;
-                            last_verified = Some(false);
-                            last_error = Some(e.to_string());
-
-                            history.push(StepRecord {
-                                step,
-                                action,
-                                result: ActionResult::error(e.to_string()),
-                                // The action itself errored: that is a failure,
-                                // not an absent check.
-                                verification: StepVerification::Failed,
-                                screenshot_before: None,
-                                screenshot_after: None,
-                                snapshots_taken: 0,
-                                sensitive: false,
-                                // Nothing was delivered, so nothing aimed.
-                                aim_missed: None,
-                            });
-                        }
+                    let ran = self
+                        .run_actions(
+                            &mut history,
+                            vec![action],
+                            step,
+                            &mut consecutive_failures,
+                            &mut last_verified,
+                            &mut last_error,
+                            &mut capture_region,
+                            &screenshot,
+                        )
+                        .await;
+                    step += ran.max(1);
+                    if last_verified == Some(false) && consecutive_failures >= 5 {
+                        // The batch's failure reached the escalation ceiling;
+                        // stop here rather than looping once more.
+                        let final_screenshot = self.fallback_screenshot().await;
+                        return Ok(LoopResult {
+                            success: false,
+                            steps_taken: step,
+                            history,
+                            final_screenshot,
+                            message: format!(
+                                "Stuck after {} consecutive failures. Last error: {}",
+                                consecutive_failures,
+                                last_error.as_deref().unwrap_or("unknown")
+                            ),
+                        });
+                    }
+                }
+                LoopDecision::Batch(actions) => {
+                    let ran = self
+                        .run_actions(
+                            &mut history,
+                            actions,
+                            step,
+                            &mut consecutive_failures,
+                            &mut last_verified,
+                            &mut last_error,
+                            &mut capture_region,
+                            &screenshot,
+                        )
+                        .await;
+                    step += ran.max(1);
+                    if last_verified == Some(false) && consecutive_failures >= 5 {
+                        let final_screenshot = self.fallback_screenshot().await;
+                        return Ok(LoopResult {
+                            success: false,
+                            steps_taken: step,
+                            history,
+                            final_screenshot,
+                            message: format!(
+                                "Stuck after {} consecutive failures. Last error: {}",
+                                consecutive_failures,
+                                last_error.as_deref().unwrap_or("unknown")
+                            ),
+                        });
                     }
                 }
             }
@@ -505,6 +537,156 @@ impl ComputerUseLoop {
             final_screenshot,
             message: format!("Max steps ({}) reached", self.config.max_steps),
         })
+    }
+
+    /// Run one step's worth of actions, recording each as its own step.
+    ///
+    /// The first actions of a batch run unobserved — dispatched and accounted,
+    /// with no settle-and-capture between them — because that is the cost the
+    /// batch exists to remove. The last one is observed as any single action
+    /// is, so the next decision sees where the batch really ended up.
+    ///
+    /// The batch stops at the first action that fails. The rest were planned
+    /// on top of it; running them would be acting on a screen that did not
+    /// come to pass. A `Screenshot` action is a request for the *next*
+    /// capture, not something to dispatch, so it ends the batch the way it
+    /// ends a single-action step: the loop takes the picture next iteration.
+    ///
+    /// Every action gets its own `StepRecord` and its own number. A batch is
+    /// one look with several actions, not one step: the record still has to
+    /// show what each action did, and undo counts actions.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_actions(
+        &self,
+        history: &mut Vec<StepRecord>,
+        actions: Vec<DesktopAction>,
+        step: usize,
+        consecutive_failures: &mut usize,
+        last_verified: &mut Option<bool>,
+        last_error: &mut Option<String>,
+        capture_region: &mut Option<crate::computer::Rect>,
+        screenshot: &Screenshot,
+    ) -> usize {
+        // `step` is the loop's counter and only moves once per iteration; a
+        // batch's actions are numbered from it so the history stays sorted.
+        let total = actions.len();
+        let mut ran = 0usize;
+        for (index, action) in actions.into_iter().enumerate() {
+            let record_step = step + ran;
+            ran += 1;
+            let is_last = index + 1 == total;
+
+            // A screenshot is a request for the *next* capture, not an action
+            // to dispatch: capturing it inside the session and then also
+            // capturing at the top of the next iteration takes two pictures,
+            // and the session's copy is thrown away. The loop owns the
+            // capture, so it records what the model asked to see and lets the
+            // next iteration take it. It also ends the batch: the actions
+            // after it were planned on a picture that no longer describes the
+            // screen.
+            if let DesktopAction::Screenshot { region } = &action {
+                *capture_region = *region;
+                let coverage = match region {
+                    Some(r) => format!("({}, {}) {}x{}", r.x, r.y, r.width, r.height),
+                    None => "the whole screen".to_string(),
+                };
+                history.push(StepRecord {
+                    step: record_step,
+                    action: action.clone(),
+                    result: ActionResult::success(format!(
+                        "the next capture will cover {coverage}; nothing was changed on the screen"
+                    )),
+                    verification: StepVerification::Unverifiable,
+                    screenshot_before: Some(screenshot.clone()),
+                    screenshot_after: None,
+                    snapshots_taken: 0,
+                    sensitive: false,
+                    aim_missed: None,
+                });
+                // Asking to look is not a failure, and it is not a success
+                // either. Neither counter should move, or a model that asked
+                // for a close-up before acting would arrive at its first
+                // action already flagged as having failed once.
+                *last_verified = None;
+                *last_error = None;
+                break;
+            }
+
+            // Act → settle → verify, in the session. Snapshots before the
+            // step, three-state verification after it, failure accounting,
+            // auto-rollback and reflection all happen there — the loop only
+            // decides what to do next. Only the last action of the batch is
+            // observed.
+            let observed = is_last || total == 1;
+            match self
+                .session
+                .execute_in_batch(action.clone(), observed)
+                .await
+            {
+                Ok(outcome) => {
+                    let verification = outcome.verification;
+                    let sensitive = outcome.sensitive_target;
+                    // Read before the outcome is taken apart: the diff is the
+                    // only thing that knows where the change happened, and
+                    // this record outlives it.
+                    let aim_missed = outcome.diff.as_ref().and_then(|d| d.aim_missed());
+                    *consecutive_failures = self.session.consecutive_failures().await;
+                    *last_error = self.session.last_error().await;
+                    *last_verified = match verification {
+                        StepVerification::Verified => Some(true),
+                        StepVerification::Failed => Some(false),
+                        StepVerification::Unverifiable => None,
+                    };
+                    if outcome.rolled_back {
+                        tracing::warn!("step rolled back automatically");
+                    }
+
+                    history.push(StepRecord {
+                        step: record_step,
+                        action,
+                        result: outcome.result,
+                        verification,
+                        // The frame the decision was made against. Kept on
+                        // the record because the replay timeline pairs it
+                        // with the post-action one; a run that dropped it
+                        // could show what a step changed but never what it
+                        // was looking at.
+                        screenshot_before: outcome.screenshot_before,
+                        screenshot_after: outcome.state_after.map(|state| state.screenshot),
+                        snapshots_taken: outcome.snapshots_taken,
+                        sensitive,
+                        aim_missed,
+                    });
+                }
+                Err(e) => {
+                    *consecutive_failures = self.session.record_error(&e.to_string()).await;
+                    *last_verified = Some(false);
+                    *last_error = Some(e.to_string());
+
+                    history.push(StepRecord {
+                        step: record_step,
+                        action,
+                        result: ActionResult::error(e.to_string()),
+                        // The action itself errored: that is a failure, not an
+                        // absent check.
+                        verification: StepVerification::Failed,
+                        screenshot_before: None,
+                        screenshot_after: None,
+                        snapshots_taken: 0,
+                        sensitive: false,
+                        // Nothing was delivered, so nothing aimed.
+                        aim_missed: None,
+                    });
+                }
+            }
+
+            // A failed action ends the batch: everything after it was planned
+            // on the screen it was supposed to produce.
+            if *last_verified == Some(false) {
+                break;
+            }
+        }
+        ran
     }
 
     /// Take a screenshot, falling back to an empty placeholder when the
@@ -558,10 +740,137 @@ mod tests {
             last_verified: None,
             last_error: None,
             consecutive_failures: 0,
+            capture_region: None,
         };
         assert_eq!(state.step, 0);
         assert!(state.history.is_empty());
         assert_eq!(state.consecutive_failures, 0);
+    }
+
+    /// An adapter that records what area each capture was asked for.
+    ///
+    /// The region the loop captures with is the whole point of a close-up, and
+    /// it is invisible from the decision side: the model asks, and whether the
+    /// request reached the adapter is a fact only the adapter can report.
+    struct RegionRecorder {
+        asked: std::sync::Mutex<Vec<Option<crate::computer::Rect>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::computer::ComputerAdapter for RegionRecorder {
+        async fn screenshot(
+            &self,
+            region: Option<crate::computer::Rect>,
+        ) -> crate::computer::Result<Screenshot> {
+            self.asked.lock().unwrap().push(region);
+            Ok(Screenshot::new(String::new(), 100, 100))
+        }
+
+        async fn read_ui_tree(
+            &self,
+            _app: Option<&str>,
+        ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(
+            &self,
+            _action: crate::computer::DesktopAction,
+        ) -> crate::computer::Result<crate::computer::ActionResult> {
+            Ok(crate::computer::ActionResult::success("ok"))
+        }
+
+        async fn wait_for(
+            &self,
+            _condition: crate::computer::WaitCondition,
+            _timeout: std::time::Duration,
+        ) -> crate::computer::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// The model asks for a close-up, and the next capture is that close-up —
+    /// once. A request is not a mode: the step after it sees the whole screen
+    /// again, because the model chose the crop to answer one question and never
+    /// said it wanted every later decision made through that rectangle.
+    #[tokio::test]
+    async fn a_region_request_narrows_exactly_the_next_capture() {
+        use crate::computer::DesktopAction;
+
+        let adapter = Arc::new(RegionRecorder {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let loop_ = ComputerUseLoop::new(adapter.clone());
+        let region = crate::computer::Rect::new(100, 50, 300, 200);
+        let mut step = 0usize;
+        let mut seen_regions = Vec::new();
+
+        loop_
+            .run("look closer at the dialog", |state| {
+                seen_regions.push(state.capture_region);
+                step += 1;
+                async move {
+                    match step {
+                        1 => Ok(LoopDecision::Action(DesktopAction::Screenshot {
+                            region: Some(region),
+                        })),
+                        // The model has looked; now it is done. A third step
+                        // would prove the crop is one-shot, but the loop has
+                        // already captured by then.
+                        _ => Ok(LoopDecision::Done {
+                            message: "read the close-up".to_string(),
+                        }),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        let asked = adapter.asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![None, Some(region)],
+            "the first capture is the whole screen, the second is the close-up"
+        );
+        // What the decision maker was *told* it was looking at, which is what
+        // the prompt renders. The second decision is made against the close-up,
+        // because that is the capture the loop took after the request.
+        assert_eq!(seen_regions, vec![None, Some(region)]);
+    }
+
+    /// A whole-screen screenshot request widens the next capture back, which is
+    /// how a model escapes a close-up it no longer wants.
+    #[tokio::test]
+    async fn a_whole_screen_request_widens_the_next_capture() {
+        use crate::computer::DesktopAction;
+
+        let adapter = Arc::new(RegionRecorder {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let loop_ = ComputerUseLoop::new(adapter.clone());
+        let region = crate::computer::Rect::new(0, 0, 50, 50);
+        let mut step = 0usize;
+
+        loop_
+            .run("zoom out again", |_state| {
+                step += 1;
+                async move {
+                    match step {
+                        1 => Ok(LoopDecision::Action(DesktopAction::Screenshot {
+                            region: Some(region),
+                        })),
+                        2 => Ok(LoopDecision::Action(DesktopAction::Screenshot { region: None })),
+                        _ => Ok(LoopDecision::Done {
+                            message: "back to the whole screen".to_string(),
+                        }),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        let asked = adapter.asked.lock().unwrap().clone();
+        assert_eq!(asked, vec![None, Some(region), None]);
     }
 
     #[tokio::test]
@@ -849,6 +1158,276 @@ mod tests {
         assert!(
             !target.overlaps(&crate::computer::Rect::new(150, 150, 32, 32)),
             "and not where the change was: {target:?}"
+        );
+    }
+
+    /// A batch is one look and several actions.
+    ///
+    /// The cost this removes is the settle-and-capture after each action: on a
+    /// form, `click → type → Tab → type` would otherwise be four looks. The
+    /// assertion is on the adapter's capture count, because "the run
+    /// finished and the history is right" passes with the batching removed
+    /// entirely — the same actions would simply have cost four times as much.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_batch_looks_once_even_when_it_acts_several_times() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Captures count themselves; actions remember their order.
+        struct CountingDesktop {
+            captures: AtomicUsize,
+            actions: std::sync::Mutex<Vec<String>>,
+            /// Every capture and dispatch, in the order they happened.
+            sequence: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::computer::ComputerAdapter for CountingDesktop {
+            async fn screenshot(
+                &self,
+                _region: Option<crate::computer::Rect>,
+            ) -> crate::computer::Result<Screenshot> {
+                use base64::Engine as _;
+                self.captures.fetch_add(1, Ordering::SeqCst);
+                self.sequence.lock().unwrap().push("capture".to_string());
+                let img = image::RgbImage::new(64, 64);
+                let mut buf = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut buf, image::ImageFormat::Png)
+                    .expect("a PNG");
+                Ok(Screenshot::new(
+                    base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                    64,
+                    64,
+                ))
+            }
+
+            async fn read_ui_tree(
+                &self,
+                _app: Option<&str>,
+            ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+                Ok(Vec::new())
+            }
+
+            async fn execute(
+                &self,
+                action: DesktopAction,
+            ) -> crate::computer::Result<ActionResult> {
+                let name = crate::computer::driver::describe_action(&action);
+                self.actions.lock().unwrap().push(name.clone());
+                self.sequence.lock().unwrap().push(name);
+                Ok(ActionResult::success("done"))
+            }
+
+            async fn wait_for(
+                &self,
+                _condition: crate::computer::WaitCondition,
+                _timeout: std::time::Duration,
+            ) -> crate::computer::Result<bool> {
+                Ok(true)
+            }
+
+            async fn display_geometry(
+                &self,
+            ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+                Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                    0, 0, 64, 64,
+                )
+                .primary()]))
+            }
+        }
+
+        let adapter = Arc::new(CountingDesktop {
+            captures: AtomicUsize::new(0),
+            actions: std::sync::Mutex::new(Vec::new()),
+            sequence: std::sync::Mutex::new(Vec::new()),
+        });
+        let loop_ = ComputerUseLoop::new(adapter.clone()).with_config(LoopConfig {
+            max_steps: 5,
+            ..LoopConfig::default()
+        });
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let asked_in_loop = asked.clone();
+        let result = loop_
+            .run("fill the form", move |state| {
+                asked_in_loop.fetch_add(1, Ordering::SeqCst);
+                let first = state.history.is_empty();
+                async move {
+                    if !first {
+                        return Ok(LoopDecision::Done { message: "filled".to_string() });
+                    }
+                    Ok(LoopDecision::Batch(vec![
+                        DesktopAction::Click {
+                            target: crate::computer::types::ClickTarget::Coordinate(
+                                crate::computer::types::Point::new(5, 5),
+                            ),
+                            button: crate::computer::types::MouseButton::Left,
+                        },
+                        DesktopAction::Type {
+                            text: "Ada".to_string(),
+                            target: None,
+                        },
+                        DesktopAction::KeyPress { keys: vec!["tab".to_string()] },
+                        DesktopAction::Type {
+                            text: "Lovelace".to_string(),
+                            target: None,
+                        },
+                    ]))
+                }
+            })
+            .await
+            .expect("a run");
+
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "one look for the batch, one to finish");
+        assert_eq!(result.history.len(), 4, "every action is its own step record");
+        assert_eq!(
+            adapter.actions.lock().unwrap().len(),
+            4,
+            "and every action was dispatched, in order"
+        );
+
+        // Where the captures happen is the point. The last action's
+        // observation legitimately settles (that costs several polls), so a
+        // raw count would pass or fail for reasons that have nothing to do
+        // with batching. What must not happen is a capture *between* the
+        // batch's actions: the first three dispatches have to be adjacent in
+        // the sequence.
+        let sequence = adapter.sequence.lock().unwrap().clone();
+        let dispatches: Vec<usize> = sequence
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.as_str() != "capture")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(dispatches.len(), 4, "four actions were dispatched: {sequence:?}");
+        for window in dispatches[..3].windows(2) {
+            let between = &sequence[window[0] + 1..window[1]];
+            assert!(
+                between.is_empty(),
+                "a batched action captured before the next one ran: {sequence:?}"
+            );
+        }
+    }
+
+    /// Only the batch's last action is observed, so only it can be verified
+    /// against a diff. The earlier ones stay `Unverifiable` rather than
+    /// claiming a reading nobody took.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_batch_observes_only_its_last_action() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PaintsOnClick {
+            clicked: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::computer::ComputerAdapter for PaintsOnClick {
+            async fn screenshot(
+                &self,
+                _region: Option<crate::computer::Rect>,
+            ) -> crate::computer::Result<Screenshot> {
+                use base64::Engine as _;
+                let painted = self.clicked.load(Ordering::SeqCst);
+                let mut img = image::RgbImage::new(64, 64);
+                if painted {
+                    // A full 32×32 block: the diff averages blocks and only
+                    // counts one at three-channel distance > 30, so a
+                    // half-painted block is a change the diff cannot see.
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            img.put_pixel(x, y, image::Rgb([255, 0, 0]));
+                        }
+                    }
+                }
+                let mut buf = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut buf, image::ImageFormat::Png)
+                    .expect("a PNG");
+                Ok(Screenshot::new(
+                    base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                    64,
+                    64,
+                ))
+            }
+
+            async fn read_ui_tree(
+                &self,
+                _app: Option<&str>,
+            ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+                Ok(Vec::new())
+            }
+
+            async fn execute(
+                &self,
+                action: DesktopAction,
+            ) -> crate::computer::Result<ActionResult> {
+                // Only the click paints: the type is dispatched first, and a
+                // paint there would already be in the last action's baseline.
+                if matches!(action, DesktopAction::Click { .. }) {
+                    self.clicked.store(true, Ordering::SeqCst);
+                }
+                Ok(ActionResult::success("done"))
+            }
+
+            async fn wait_for(
+                &self,
+                _condition: crate::computer::WaitCondition,
+                _timeout: std::time::Duration,
+            ) -> crate::computer::Result<bool> {
+                Ok(true)
+            }
+
+            async fn display_geometry(
+                &self,
+            ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+                Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                    0, 0, 64, 64,
+                )
+                .primary()]))
+            }
+        }
+
+        let loop_ = ComputerUseLoop::new(Arc::new(PaintsOnClick {
+            clicked: AtomicBool::new(false),
+        }))
+        .with_config(LoopConfig {
+            max_steps: 4,
+            ..LoopConfig::default()
+        });
+
+        let result = loop_
+            .run("click and confirm", move |state| async move {
+                if !state.history.is_empty() {
+                    return Ok(LoopDecision::Done { message: "done".to_string() });
+                }
+                Ok(LoopDecision::Batch(vec![
+                    DesktopAction::Type {
+                        text: "ok".to_string(),
+                        target: None,
+                    },
+                    DesktopAction::Click {
+                        target: crate::computer::types::ClickTarget::Coordinate(
+                            crate::computer::types::Point::new(4, 4),
+                        ),
+                        button: crate::computer::types::MouseButton::Left,
+                    },
+                ]))
+            })
+            .await
+            .expect("a run");
+
+        assert_eq!(result.history.len(), 2);
+        assert_eq!(
+            result.history[0].verification,
+            StepVerification::Unverifiable,
+            "the batched click was not looked at"
+        );
+        assert_eq!(
+            result.history[1].verification,
+            StepVerification::Verified,
+            "the last action is observed, and the screen did change under it"
         );
     }
 

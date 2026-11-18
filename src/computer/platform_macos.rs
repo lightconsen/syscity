@@ -209,6 +209,64 @@ end tell"#,
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
                 Ok(ActionResult::success(apple_script_output(&result).to_string()))
             }
+            DesktopAction::Hover { target } => {
+                let (x, y) = self.resolve_click_point(target).await?;
+                let script = pointer_move_script(x, y);
+                let apple_args = serde_json::json!({
+                    "script": script,
+                    "language": "JavaScript",
+                });
+                let result = self
+                    .registry
+                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
+                    .await
+                    .ok_or_else(|| {
+                        ComputerError::ToolFailed("applescript tool not found".to_string())
+                    })?
+                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    return Err(ComputerError::ToolFailed(
+                        result
+                            .error
+                            .unwrap_or_else(|| "the pointer did not move".to_string()),
+                    ));
+                }
+                // The message says what the step established and what it did
+                // not. "Hovered" alone reads as a result; the honest claim is
+                // that the pointer is on the control and the next frame is
+                // what answers the question.
+                Ok(ActionResult::success(
+                    "the pointer is now over the target; the next capture shows whether the \
+                     control reacted",
+                )
+                .with_data(serde_json::json!({ "pointer": { "x": x, "y": y } })))
+            }
+            DesktopAction::PointerMove { to } => {
+                let script = pointer_move_script(to.x, to.y);
+                let apple_args = serde_json::json!({
+                    "script": script,
+                    "language": "JavaScript",
+                });
+                let result = self
+                    .registry
+                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
+                    .await
+                    .ok_or_else(|| {
+                        ComputerError::ToolFailed("applescript tool not found".to_string())
+                    })?
+                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    return Err(ComputerError::ToolFailed(
+                        result
+                            .error
+                            .unwrap_or_else(|| "the pointer did not move".to_string()),
+                    ));
+                }
+                Ok(ActionResult::success(format!(
+                    "the pointer moved to ({}, {}); nothing was pressed",
+                    to.x, to.y
+                )))
+            }
             DesktopAction::Scroll { target: _, direction, amount } => {
                 let key_code = match direction {
                     crate::computer::ScrollDirection::Up => "116",
@@ -1113,8 +1171,31 @@ fn desktop_action_name(action: &DesktopAction) -> &'static str {
         DesktopAction::KeyPress { .. } => "a key press",
         DesktopAction::Scroll { .. } => "scrolling",
         DesktopAction::Drag { .. } => "a drag",
+        DesktopAction::Hover { .. } => "a hover",
+        DesktopAction::PointerMove { .. } => "a pointer move",
         _ => "this action",
     }
+}
+
+/// JXA that moves the pointer to a point without pressing anything.
+///
+/// Core Graphics is the only place macOS exposes a bare pointer move: System
+/// Events' `click at` always presses, and AppleScript has no "move" verb at
+/// all. `CGEventPost` with `kCGEventMouseMoved` is precisely the event the
+/// system sends when a person moves the mouse, so the receiving app sees an
+/// ordinary hover — which is the whole point of the probe.
+///
+/// The event is posted at the HID tap, the same level the hardware sends at,
+/// so apps that only listen to real input still see it. Nothing is pressed:
+/// a `mouse_moved` event's button argument is ignored by the system.
+fn pointer_move_script(x: i32, y: i32) -> String {
+    format!(
+        r#"ObjC.import('CoreGraphics');
+var point = {{x: {x}, y: {y}}};
+var event = $.CGEventCreateMouseEvent(null, $.kCGEventMouseMoved, point, 0);
+$.CGEventPost($.kCGHIDEventTap, event);
+"moved to {x},{y}";"#
+    )
 }
 
 /// Factory for macOS.
@@ -1197,5 +1278,27 @@ mod tests {
         // turn the rest of the name into script.
         let script = background_set_value_script("App", "AXTextField", r#"He said "hi""#, "a");
         assert!(script.contains(r#"name is "He said \"hi\"""#), "{script}");
+    }
+
+    /// A hover must move the pointer and press nothing.
+    ///
+    /// `kCGEventMouseMoved` is the event the system itself sends for a pointer
+    /// move; a `leftMouseDown` in the same script would make the probe a click
+    /// that reports "hovered", and the model would act on a control it had
+    /// already pressed.
+    #[test]
+    fn a_hover_moves_the_pointer_without_pressing() {
+        let script = pointer_move_script(320, 240);
+        assert!(script.contains("kCGEventMouseMoved"), "{script}");
+        assert!(script.contains("CGEventPost"), "{script}");
+        assert!(script.contains("x: 320"), "{script}");
+        assert!(script.contains("y: 240"), "{script}");
+        for pressed in [
+            "kCGEventLeftMouseDown",
+            "kCGEventLeftMouseUp",
+            "CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown",
+        ] {
+            assert!(!script.contains(pressed), "a hover must not press: {script}");
+        }
     }
 }

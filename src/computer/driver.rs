@@ -55,8 +55,16 @@ accessibility tree of the screen, and what happened on the last few steps.
 Answer with ONE JSON object and nothing else:
 
   {"decision": "act",   "action": {...}}
+  {"decision": "act",   "actions": [{...}, {...}]}
   {"decision": "done",  "message": "what was accomplished"}
   {"decision": "help",  "reason": "what is blocking you"}
+
+A step may carry more than one action: `"actions": [...]` runs them in order
+without looking at the screen between them. Use it when the next actions follow
+from this picture alone — clicking a field, typing, pressing Tab, typing the
+next field. It costs one look instead of four. Do not chain actions whose
+success decides the next one: if the second needs to know whether the first
+worked, give it its own step and look.
 
 Actions are one of:
   {"type": "click", "element_id": "id from the tree"}
@@ -66,20 +74,50 @@ Actions are one of:
   {"type": "type", "text": "..."}
   {"type": "key_press", "keys": ["cmd", "s"]}
   {"type": "scroll", "element_id": "...", "direction": "down", "amount": 3}
+  {"type": "drag", "element_id": "source", "to_element_id": "target"}
+  {"type": "drag", "x": 100, "y": 200, "to_x": 400, "to_y": 300}
+  {"type": "hover", "element_id": "control to test"}
+  {"type": "hover", "x": 100, "y": 200}
+  {"type": "pointer_move", "x": 900, "y": 600}
+  {"type": "wait", "milliseconds": 2000}
+  {"type": "clipboard_set", "text": "..."}
+  {"type": "clipboard_get"}
   {"type": "launch_app", "name": "Calculator"}
   {"type": "activate_window", "title_pattern": "Untitled"}
+  {"type": "close_window", "title_pattern": "Untitled"}
+  {"type": "list_windows"}
+  {"type": "move_window", "title_pattern": "Untitled", "x": 0, "y": 0}
+  {"type": "resize_window", "title_pattern": "Untitled", "width": 800, "height": 600}
   {"type": "read_ui_tree"}
   {"type": "screenshot"}
+  {"type": "screenshot", "region": {"x": 0, "y": 0, "width": 300, "height": 200}}
 
 Rules:
 - Prefer element_id over coordinates. An id addresses the exact control; a
   coordinate is a guess that a screen change invalidates. An id is bound to one
   observation — if the screen changed, re-read the tree rather than reusing it.
-- One action per step. Do not chain.
+- One look, one decision. The actions in a step all run against this picture,
+  so only batch what this picture already answers. A field you clicked is not
+  focused until the action runs, so follow a click with a type, not with a
+  second click whose target you expected the first to reveal.
 - If the goal is already met, answer "done" — do not take another step to be
   sure. If it is not met and you do not know what to do next, answer "help"
   with the specific thing you would need. Guessing is worse than asking.
-- Never type into a field marked [sensitive: ...] without the goal naming it."#;
+- Never type into a field marked [sensitive: ...] without the goal naming it.
+- Dragging is how sliders, scrollbars, text selection and drag-and-drop move.
+  Nothing else moves them: a click sets a scrollbar's position to that spot,
+  which is not the same gesture and often does not do what was meant.
+- To replace text already in a field, select it first: key_press
+  ["cmd", "a"] (use "ctrl" on Linux and Windows), then type. Typing alone
+  appends.
+- When you cannot tell from the picture whether a control is live, hover it
+  and look at the next step's screen. A control that reacts to the pointer is
+  one a click will probably reach. This is a measurement, not proof: a disabled
+  control may still be styled to react, and a live one may not react at all.
+  After a hover, move the pointer away (pointer_move) before acting somewhere
+  else — a tooltip the probe opened covers what you wanted to see.
+- If something is still loading, wait rather than acting again. A second click
+  on a control that has not drawn yet lands on whatever is under it."#;
 
 /// A decision the driver could not use.
 ///
@@ -147,6 +185,13 @@ pub struct StepContext {
     /// decidable — a merged element would be indistinguishable from an
     /// accessibility one that genuinely resolves.
     pub vision: Option<crate::computer::vision::look::VisionElements>,
+    /// The area this step's capture covers, in screen points.
+    ///
+    /// `None` is the whole display layout. `Some` means the model asked for a
+    /// close-up on the previous step: the prompt says which rectangle the
+    /// picture shows, and the scan's boxes were mapped from that rectangle's
+    /// corner rather than the screen's.
+    pub capture_region: Option<crate::computer::types::Rect>,
 }
 
 /// What one decision cost, alongside the decision itself.
@@ -243,10 +288,24 @@ impl ModelDriver {
         // A visual scan answers the question an image would have been sent to
         // ask, and answers it in the same semantic form the tree uses. So when
         // one produced elements it *substitutes* for an attachment rather than
-        // adding to it: sending both would pay twice for one answer. When the
-        // scan produced nothing, `ctx.vision` is `None` and the image rung
-        // stands — B′'s "nobody could look, so look yourself" rule.
+        // adding to it: sending both would pay twice for one answer.
+        //
+        // That reasoning inverts on a tree-less screen. There the scan is not an
+        // answer about a screen the model can otherwise navigate — it is the
+        // only index the model has. And it is a lossy one: the detector resizes
+        // the screen into a fixed 640×640 frame before it looks, so anything
+        // smaller than a few dozen pixels is simply absent from the boxes, while
+        // the picture the model receives is up to 1024 wide and read by the
+        // model itself. Suppressing the picture there leaves the model with
+        // strictly less than the screen holds.
+        //
+        // It is also the basis for asking to look more closely later: a model
+        // cannot point at a region of a picture it was never shown. The scan
+        // keeps the ids addressable; the image is what the model actually looks
+        // at.
+        let tree_less = ctx.tree.is_empty() && ctx.tree_read_failed.is_none();
         let vision_answered = ctx.vision.as_ref().is_some_and(|v| !v.is_empty());
+        let the_scan_answers_alone = vision_answered && !tree_less;
 
         let mut perception = plan_perception(PerceptionInputs {
             tree_complete: ctx.tree_complete,
@@ -255,7 +314,7 @@ impl ModelDriver {
             // read worked, and the app published nothing. Judged from the tree
             // the prompt will show (pruning folds windows, it never drops
             // roots), so the sentence and the outline cannot disagree.
-            tree_unread: ctx.tree.is_empty() && ctx.tree_read_failed.is_none(),
+            tree_unread: tree_less,
             last_verified: state.last_verified,
             consecutive_failures: state.consecutive_failures,
             model_supports_vision: ctx.model_supports_vision,
@@ -263,7 +322,7 @@ impl ModelDriver {
             // *and* this step may have a capture worth sending.
             image_budget_available: ctx.image_budget_available && can_attach(ctx),
         });
-        if vision_answered && perception.attach_image {
+        if the_scan_answers_alone && perception.attach_image {
             perception.attach_image = false;
             perception.trigger = None;
         }
@@ -318,6 +377,13 @@ impl ModelDriver {
         }
 
         wire.push_str("\nCurrent screen:\n");
+        // What the sensitive-UI detector flagged, keyed by element id. The
+        // system prompt tells the model never to type into a field marked
+        // `[sensitive: ...]`; before this map was filled in, that marker was
+        // never written on either outline and the rule was unenforceable. The
+        // tree and the scan are marked from the same detector, so an element
+        // drawn on one of them is drawn identically.
+        let sensitive = crate::computer::sensitive_ui::sensitive_markers(&ctx.tree);
         let mut outline = TreeOutline::default();
         outline.push_tree(
             &ctx.tree,
@@ -328,7 +394,7 @@ impl ModelDriver {
             160,
             false,
             0,
-            &std::collections::HashMap::new(),
+            &sensitive,
         );
         wire.push_str(&outline.text);
         if let Some(reason) = state.capture_error.as_deref() {
@@ -358,6 +424,14 @@ impl ModelDriver {
         if let Some(vision) = ctx.vision.as_ref().filter(|v| !v.is_empty()) {
             wire.push_str("\nDetected from the screenshot:\n");
             let source = vision.outline_source();
+            // A scan's elements have ids from the same `assign_ids` sequence an
+            // accessibility read uses, so the sensitive map from the tree above
+            // cannot collide with them — and the scan itself is scanned for the
+            // same markers. Without this a password field on a tree-less screen
+            // had no marker at all, which is the one place the "never type into
+            // a sensitive field" rule most needed to be visible.
+            let vision_sensitive =
+                crate::computer::sensitive_ui::sensitive_markers(&vision.snapshot.roots);
             let mut seen = TreeOutline::default();
             seen.push_tree(
                 &vision.snapshot.roots,
@@ -368,7 +442,7 @@ impl ModelDriver {
                 80,
                 false,
                 vision.len(),
-                &std::collections::HashMap::new(),
+                &vision_sensitive,
             );
             wire.push_str(&seen.text);
             wire.push_str(&crate::computer::tree_render::trust_line(source));
@@ -381,13 +455,33 @@ impl ModelDriver {
                 .trigger
                 .map(ImageTrigger::describe)
                 .unwrap_or("the tree is not enough");
-            wire.push_str(&format!(
-                "\nAn image of the screen is attached because {why}. Use it to find the \
-                 control, then act by element id if the tree names one.\n"
-            ));
+            // A crop is a close-up, and a close-up has two traps: the model
+            // reads positions off the crop as if they were screen positions,
+            // and it forgets that what it cannot see in the crop may still be
+            // on the screen. Both are answered by saying what the image covers.
+            match ctx.capture_region {
+                Some(region) => wire.push_str(&format!(
+                    "\nA close-up of the screen is attached because {why}: it covers the \
+                     rectangle from ({}, {}) to ({}, {}). Coordinates in it are still screen \
+                     points, not offsets within the crop. Anything outside that rectangle is \
+                     not shown here — take another screenshot with no region to see the \
+                     whole screen again.\n",
+                    region.x,
+                    region.y,
+                    region.x + region.width as i32,
+                    region.y + region.height as i32,
+                )),
+                None => wire.push_str(&format!(
+                    "\nAn image of the screen is attached because {why}. Use it to find the \
+                     control, then act by element id if the tree names one.\n"
+                )),
+            }
         }
 
-        wire.push_str("\nWhat is the next single step? Answer with one JSON object.\n");
+        wire.push_str(
+            "\nWhat is the next single step? Answer with one JSON object. One action, or \
+             `\"actions\": [...]` for several that follow from this picture.\n",
+        );
 
         // Keyed off the failure count rather than off `perception.trigger`:
         // which reason asked for an image and whether the approach is working
@@ -582,6 +676,8 @@ pub fn describe_action(action: &DesktopAction) -> String {
         DesktopAction::DoubleClick { target, .. } => {
             format!("double-click {}", describe_target(target))
         }
+        DesktopAction::Hover { target } => format!("hover {}", describe_target(target)),
+        DesktopAction::PointerMove { to } => format!("move the pointer to ({}, {})", to.x, to.y),
         DesktopAction::Type { text, target } => {
             let preview = summary_of(text);
             match target {
@@ -644,21 +740,67 @@ fn direction_word(direction: ScrollDirection) -> &'static str {
 }
 
 /// The wire format the model is asked to produce.
+///
+/// A step carries one action or a short list of them. Both are accepted, and
+/// they deserialize into the same field, because a model that answers
+/// `"action"` and one that answers `"actions"` are saying the same thing at
+/// different granularity.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 enum WireDecision {
-    Act { action: WireAction },
-    Done { message: String },
-    Help { reason: String },
+    Act {
+        #[serde(default)]
+        action: Option<WireAction>,
+        #[serde(default)]
+        actions: Option<Vec<WireAction>>,
+    },
+    Done {
+        message: String,
+    },
+    Help {
+        reason: String,
+    },
+}
+
+impl WireDecision {
+    /// The actions this decision carries, in the order they were written.
+    ///
+    /// `"action"` and `"actions"` both work. When a model writes both — some
+    /// do, aping the examples — they are not silently concatenated: the
+    /// single action is the amendment to the list, so it goes last. The
+    /// alternative, dropping one, would discard an action the model meant to
+    /// run.
+    fn into_actions(self) -> Result<Vec<DesktopAction>, String> {
+        let (single, list) = match self {
+            WireDecision::Act { action, actions } => (action, actions),
+            _ => return Err("not an act decision".to_string()),
+        };
+        let mut wire: Vec<WireAction> = list.unwrap_or_default();
+        if let Some(action) = single {
+            wire.push(action);
+        }
+        if wire.is_empty() {
+            return Err("no action in the decision".to_string());
+        }
+        wire.into_iter().map(WireAction::into_action).collect()
+    }
 }
 
 /// One action, as the model writes it.
 ///
 /// Deliberately a separate type from [`DesktopAction`]: the wire form carries
-/// only the six things a model can usefully decide, and each is validated
-/// here rather than by a deserializer that would accept a malformed action and
-/// fail later inside the adapter — where the error is about the desktop, not
-/// about the answer.
+/// only the actions a model can usefully decide, and each is validated here
+/// rather than by a deserializer that would accept a malformed action and fail
+/// later inside the adapter — where the error is about the desktop, not about
+/// the answer.
+///
+/// The set is smaller than [`DesktopAction`] on purpose — process control and
+/// system queries are not step-by-step UI decisions — but it is not *arbitrarily*
+/// smaller. `drag`, `wait`, the clipboard pair and the window quartet are what a
+/// person reaches for on an ordinary screen, and their absence made whole
+/// classes of UI unreachable no matter how good the perception was: a slider,
+/// a kanban column, a text selection and a scrollbar only move by dragging, and
+/// a run with no `wait` retried a slow dialog as if it had failed.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireAction {
@@ -697,6 +839,41 @@ enum WireAction {
         #[serde(default = "default_scroll_amount")]
         amount: i32,
     },
+    /// Press at one place, move, release at another.
+    ///
+    /// Flat fields rather than nested objects: the model already writes
+    /// `element_id`/`x`/`y` for a click, and the same shape twice with a `to_`
+    /// prefix is one convention instead of two.
+    Drag {
+        #[serde(default)]
+        element_id: Option<String>,
+        #[serde(default)]
+        x: Option<i32>,
+        #[serde(default)]
+        y: Option<i32>,
+        #[serde(default)]
+        to_element_id: Option<String>,
+        #[serde(default)]
+        to_x: Option<i32>,
+        #[serde(default)]
+        to_y: Option<i32>,
+    },
+    /// Sleep, then look at the screen again.
+    ///
+    /// A first-class action rather than something the loop does behind the
+    /// model's back: only the model knows whether the dialog it just opened is
+    /// expected to take a moment, and a run that treats "not yet" as "failed"
+    /// burns steps retrying something already in progress.
+    Wait {
+        #[serde(default = "default_wait_ms")]
+        milliseconds: u64,
+    },
+    /// Read the clipboard into the next step's context.
+    ClipboardGet,
+    /// Put text on the clipboard, for pasting into a field with `key_press`.
+    ClipboardSet {
+        text: String,
+    },
     LaunchApp {
         name: String,
         #[serde(default)]
@@ -705,11 +882,72 @@ enum WireAction {
     ActivateWindow {
         title_pattern: String,
     },
+    CloseWindow {
+        title_pattern: String,
+    },
+    ListWindows,
+    MoveWindow {
+        title_pattern: String,
+        x: i32,
+        y: i32,
+    },
+    ResizeWindow {
+        title_pattern: String,
+        width: u32,
+        height: u32,
+    },
     ReadUiTree {
         #[serde(default)]
         app: Option<String>,
     },
-    Screenshot,
+    /// Put the pointer on a control and leave it there, to see whether the
+    /// control reacts.
+    ///
+    /// A person answers "is this clickable" by moving over it: a button that
+    /// highlights, a row that tints, a link that underlines has a hover state,
+    /// and one that does not is either inert or invisible to the pointer. That
+    /// is a *measurement*, not the `enabled` flag the platform often will not
+    /// publish — which is why this exists as an action instead of a field.
+    ///
+    /// It is not a click, and it does not press anything.
+    Hover {
+        #[serde(default)]
+        element_id: Option<String>,
+        #[serde(default)]
+        x: Option<i32>,
+        #[serde(default)]
+        y: Option<i32>,
+    },
+    /// Move the pointer to a bare point without touching anything.
+    ///
+    /// The companion to `hover`: a tooltip or a hover menu the probe opened
+    /// covers part of the next frame, and moving away is how it is dismissed.
+    PointerMove {
+        x: i32,
+        y: i32,
+    },
+    /// Capture the screen, or one rectangle of it.
+    ///
+    /// `region` is what makes "look closer" possible: the detector reads a
+    /// fixed 640×640 resize, so a small control is simply not in its answer,
+    /// while a region capture is taken at the screen's own resolution.
+    Screenshot {
+        #[serde(default)]
+        region: Option<WireRegion>,
+    },
+}
+
+/// A rectangle, as the model writes it.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+struct WireRegion {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn default_wait_ms() -> u64 {
+    1_000
 }
 
 fn default_scroll_amount() -> i32 {
@@ -777,11 +1015,52 @@ impl WireAction {
                 args,
                 wait_for_ready: true,
             }),
+            WireAction::Drag {
+                element_id,
+                x,
+                y,
+                to_element_id,
+                to_x,
+                to_y,
+            } => Ok(DesktopAction::Drag {
+                from: to_target(element_id, x, y)?,
+                to: to_target(to_element_id, to_x, to_y)?,
+            }),
+            WireAction::Wait { milliseconds } => {
+                if milliseconds == 0 {
+                    return Err("a wait of zero milliseconds is not a step".to_string());
+                }
+                Ok(DesktopAction::Wait { milliseconds })
+            }
+            WireAction::ClipboardGet => Ok(DesktopAction::ClipboardGet),
+            WireAction::ClipboardSet { text } => Ok(DesktopAction::ClipboardSet { text }),
+            WireAction::CloseWindow { title_pattern } => {
+                Ok(DesktopAction::CloseWindow { title_pattern })
+            }
+            WireAction::ListWindows => Ok(DesktopAction::ListWindows),
+            WireAction::MoveWindow { title_pattern, x, y } => {
+                Ok(DesktopAction::MoveWindow { title_pattern, x, y })
+            }
+            WireAction::ResizeWindow { title_pattern, width, height } => {
+                if width == 0 || height == 0 {
+                    return Err("a window resized to zero is a window closed".to_string());
+                }
+                Ok(DesktopAction::ResizeWindow { title_pattern, width, height })
+            }
             WireAction::ActivateWindow { title_pattern } => {
                 Ok(DesktopAction::ActivateWindow { title_pattern })
             }
             WireAction::ReadUiTree { app } => Ok(DesktopAction::ReadUiTree { app }),
-            WireAction::Screenshot => Ok(DesktopAction::Screenshot { region: None }),
+            WireAction::Hover { element_id, x, y } => Ok(DesktopAction::Hover {
+                target: to_target(element_id, x, y)?,
+            }),
+            WireAction::PointerMove { x, y } => {
+                Ok(DesktopAction::PointerMove { to: Point::new(x, y) })
+            }
+            WireAction::Screenshot { region } => Ok(DesktopAction::Screenshot {
+                region: region
+                    .map(|r| crate::computer::types::Rect::new(r.x, r.y, r.width, r.height)),
+            }),
         }
     }
 }
@@ -819,10 +1098,14 @@ pub fn parse_decision(text: &str) -> Result<LoopDecision, DriverError> {
     match wire {
         WireDecision::Done { message } => Ok(LoopDecision::Done { message }),
         WireDecision::Help { reason } => Ok(LoopDecision::NeedHelp { reason }),
-        WireDecision::Act { action } => action
-            .into_action()
-            .map(LoopDecision::Action)
-            .map_err(DriverError::Unparseable),
+        act @ WireDecision::Act { .. } => {
+            let mut actions = act.into_actions().map_err(DriverError::Unparseable)?;
+            if actions.len() == 1 {
+                Ok(LoopDecision::Action(actions.remove(0)))
+            } else {
+                Ok(LoopDecision::Batch(actions))
+            }
+        }
     }
 }
 
@@ -890,6 +1173,7 @@ mod tests {
             last_verified: None,
             last_error: None,
             consecutive_failures: 0,
+            capture_region: None,
         }
     }
 
@@ -908,6 +1192,7 @@ mod tests {
             model_supports_vision: true,
             image_budget_available: true,
             vision: None,
+            capture_region: None,
         }
     }
 
@@ -973,10 +1258,11 @@ mod tests {
         );
     }
 
-    /// When the scan answered the question, no image is sent: paying for both
-    /// would buy one answer twice.
+    /// A visual scan on a screen that *has* a tree replaces the image: the scan
+    /// is a second reading of the same screen, and paying for both would buy
+    /// one answer twice.
     #[test]
-    fn a_visual_scan_replaces_the_image_attachment() {
+    fn a_visual_scan_replaces_the_image_when_the_tree_is_there() {
         let mut context = ctx(false);
         context.vision = Some(vision_elements());
         let (_system, user) = driver().render_prompt(&state(), &context);
@@ -985,6 +1271,32 @@ mod tests {
             "a scan that answered stands in for the image: {user}"
         );
         assert!(user.contains("Detected from the screenshot:"), "{user}");
+    }
+
+    /// On a tree-less screen the scan does **not** replace the image.
+    ///
+    /// Two reasons, and neither is about cost. The detector sees a fixed
+    /// 640×640 resize of the screen, so it misses anything small; the picture
+    /// the model receives is up to 1024 wide and is read by the model itself.
+    /// And a model cannot ask to look closer at a region of a picture it was
+    /// never shown — the image is what makes "look there" a request the run can
+    /// act on.
+    #[test]
+    fn a_visual_scan_keeps_the_image_on_a_tree_less_screen() {
+        let mut context = ctx(true);
+        context.tree.clear();
+        context.tree_complete = false;
+        context.vision = Some(vision_elements());
+        let (_system, user) = driver().render_prompt(&state(), &context);
+
+        assert!(
+            user.contains("image of the screen is attached"),
+            "the picture is the only full-resolution view on a tree-less screen: {user}"
+        );
+        assert!(
+            user.contains("Detected from the screenshot:"),
+            "the scan is still the index the model aims with: {user}"
+        );
     }
 
     /// A scan that found nothing is not an answer, so the image rung stands.
@@ -1004,6 +1316,79 @@ mod tests {
         let (_system, user) = driver().render_prompt(&state(), &ctx(false));
         assert!(user.contains("image of the screen is attached"), "{user}");
         assert!(user.contains("accessibility tree is incomplete"), "{user}");
+    }
+
+    /// The system prompt says "never type into a field marked
+    /// `[sensitive: ...]`". That rule was unenforceable for as long as the
+    /// marker was never written: `compose` passed an empty map to the tree
+    /// outline, so a password field in the accessibility tree rendered without
+    /// a marker — and on a tree-less screen the scan's copy of the same field
+    /// had no marker either.
+    #[test]
+    fn a_sensitive_field_carries_its_marker_into_the_prompt() {
+        use crate::computer::types::{Rect, Tri, UiElement};
+
+        let mut context = ctx(true);
+        context.tree = vec![UiElement {
+            id: "password-1".to_string(),
+            role: "password_text".to_string(),
+            label: Some("Password".to_string()),
+            value: Some("hunter2".to_string()),
+            bounds: Some(Rect::new(0, 0, 200, 24)),
+            enabled: Tri::Known(true),
+            focused: Tri::Known(false),
+            actions: None,
+            children: vec![],
+            children_count: None,
+            truncated: false,
+        }];
+        let (_system, user) = driver().render_prompt(&state(), &context);
+
+        assert!(
+            user.contains("[sensitive: password_field]"),
+            "the marker the system prompt names must be on the line: {user}"
+        );
+        assert!(
+            !user.contains("hunter2"),
+            "a sensitive field's value is the secret being warned about: {user}"
+        );
+    }
+
+    /// The same rule on a tree-less screen, where the only element list is the
+    /// scan's. A password field found by OCR/detection is exactly as sensitive
+    /// as one the platform reported, and the model is told the same thing
+    /// about it.
+    #[test]
+    fn a_sensitive_field_found_visually_carries_its_marker() {
+        use crate::computer::types::{Rect, Tri, UiElement};
+
+        let mut context = ctx(false);
+        let mut scan = vision_elements();
+        let mut roots = vec![UiElement {
+            id: String::new(),
+            role: "text".to_string(),
+            label: Some("Password".to_string()),
+            value: None,
+            bounds: Some(Rect::new(10, 40, 200, 24)),
+            enabled: Tri::Unknown,
+            focused: Tri::Unknown,
+            actions: None,
+            children: vec![],
+            children_count: None,
+            truncated: false,
+        }];
+        let id = crate::computer::element_index::next_snapshot_id();
+        crate::computer::element_index::assign_ids(&mut roots, id);
+        scan.snapshot.roots = roots;
+
+        context.vision = Some(scan);
+        let (_system, user) = driver().render_prompt(&state(), &context);
+
+        assert!(user.contains("Detected from the screenshot:"), "{user}");
+        assert!(
+            user.contains("[sensitive: password_field]"),
+            "a visually found password field needs the marker too: {user}"
+        );
     }
 
     /// A tree that could not be read is not a tree that was cut. The old
@@ -1257,6 +1642,221 @@ mod tests {
         );
     }
 
+    // ── the action vocabulary beyond click and type ─────────────────────
+    //
+    // These were facts about the type, not about any test: `WireAction` had no
+    // way to say them, so a model watching a slider, a kanban column or a
+    // scrollbar had nothing to say and the run could not do what a person
+    // would. Each is parsed from the JSON a model actually writes.
+
+    #[test]
+    fn a_drag_between_two_points_becomes_a_drag() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "action": {"type": "drag", "x": 10, "y": 20,
+                "to_x": 300, "to_y": 400}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            LoopDecision::Action(DesktopAction::Drag {
+                from: ClickTarget::Coordinate(Point::new(10, 20)),
+                to: ClickTarget::Coordinate(Point::new(300, 400)),
+            })
+        );
+    }
+
+    #[test]
+    fn a_drag_can_name_both_ends_by_element_id() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "action": {"type": "drag",
+                "element_id": "s1:0.1", "to_element_id": "s1:0.2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            LoopDecision::Action(DesktopAction::Drag {
+                from: ClickTarget::ElementId("s1:0.1".to_string()),
+                to: ClickTarget::ElementId("s1:0.2".to_string()),
+            })
+        );
+    }
+
+    /// Half a drag is not a drag. The end that was named cannot be guessed.
+    #[test]
+    fn a_drag_with_no_destination_is_refused() {
+        let err =
+            parse_decision(r#"{"decision": "act", "action": {"type": "drag", "x": 10, "y": 20}}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("no element_id"), "{err}");
+    }
+
+    #[test]
+    fn a_wait_becomes_a_wait() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "action": {"type": "wait", "milliseconds": 2500}}"#,
+        )
+        .unwrap();
+        assert_eq!(decision, LoopDecision::Action(DesktopAction::Wait { milliseconds: 2500 }));
+    }
+
+    /// A wait with no duration still is a wait — one second is the default the
+    /// prompt documents. What is *not* accepted is an explicit zero, which is
+    /// not a step at all.
+    #[test]
+    fn a_wait_defaults_to_a_second_and_refuses_zero() {
+        let decision =
+            parse_decision(r#"{"decision": "act", "action": {"type": "wait"}}"#).unwrap();
+        assert_eq!(decision, LoopDecision::Action(DesktopAction::Wait { milliseconds: 1_000 }));
+        let err =
+            parse_decision(r#"{"decision": "act", "action": {"type": "wait", "milliseconds": 0}}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("zero"), "{err}");
+    }
+
+    #[test]
+    fn the_clipboard_can_be_read_and_written() {
+        let set = parse_decision(
+            r#"{"decision": "act", "action": {"type": "clipboard_set", "text": "hello"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            set,
+            LoopDecision::Action(DesktopAction::ClipboardSet { text: "hello".to_string() })
+        );
+        let get =
+            parse_decision(r#"{"decision": "act", "action": {"type": "clipboard_get"}}"#).unwrap();
+        assert_eq!(get, LoopDecision::Action(DesktopAction::ClipboardGet));
+    }
+
+    #[test]
+    fn the_window_quartet_parses() {
+        let close = parse_decision(
+            r#"{"decision": "act", "action": {"type": "close_window", "title_pattern": "Untitled"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            close,
+            LoopDecision::Action(DesktopAction::CloseWindow {
+                title_pattern: "Untitled".to_string()
+            })
+        );
+        let list =
+            parse_decision(r#"{"decision": "act", "action": {"type": "list_windows"}}"#).unwrap();
+        assert_eq!(list, LoopDecision::Action(DesktopAction::ListWindows));
+        let moved = parse_decision(
+            r#"{"decision": "act", "action": {"type": "move_window",
+                "title_pattern": "Untitled", "x": 0, "y": 0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            moved,
+            LoopDecision::Action(DesktopAction::MoveWindow {
+                title_pattern: "Untitled".to_string(),
+                x: 0,
+                y: 0
+            })
+        );
+        let sized = parse_decision(
+            r#"{"decision": "act", "action": {"type": "resize_window",
+                "title_pattern": "Untitled", "width": 800, "height": 600}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sized,
+            LoopDecision::Action(DesktopAction::ResizeWindow {
+                title_pattern: "Untitled".to_string(),
+                width: 800,
+                height: 600
+            })
+        );
+    }
+
+    #[test]
+    fn a_zero_size_resize_is_refused() {
+        let err = parse_decision(
+            r#"{"decision": "act", "action": {"type": "resize_window",
+                "title_pattern": "Untitled", "width": 0, "height": 600}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("zero"), "{err}");
+    }
+
+    /// A region screenshot is how the model asks to look closer than the
+    /// detector's fixed 640×640 view. Without it, a control too small to detect
+    /// was unreachable no matter how good the model was.
+    #[test]
+    fn a_screenshot_can_name_a_region() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "action": {"type": "screenshot",
+                "region": {"x": 100, "y": 50, "width": 300, "height": 200}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            LoopDecision::Action(DesktopAction::Screenshot {
+                region: Some(crate::computer::types::Rect::new(100, 50, 300, 200))
+            })
+        );
+    }
+
+    /// The bare form still works: the region is optional, not required.
+    #[test]
+    fn a_screenshot_without_a_region_is_the_whole_screen() {
+        let decision =
+            parse_decision(r#"{"decision": "act", "action": {"type": "screenshot"}}"#).unwrap();
+        assert_eq!(decision, LoopDecision::Action(DesktopAction::Screenshot { region: None }));
+    }
+
+    /// A hover names its control the same way a click does, so the model can
+    /// reuse the id it already read out of the tree. It becomes `Hover`, not
+    /// `Click` — the point of the gesture is that nothing is pressed.
+    #[test]
+    fn a_hover_names_its_control_the_way_a_click_does() {
+        let by_id = parse_decision(
+            r#"{"decision": "act", "action": {"type": "hover", "element_id": "s1:0.4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_id,
+            LoopDecision::Action(DesktopAction::Hover {
+                target: ClickTarget::ElementId("s1:0.4".to_string()),
+            })
+        );
+
+        let by_point = parse_decision(
+            r#"{"decision": "act", "action": {"type": "hover", "x": 120, "y": 340}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            by_point,
+            LoopDecision::Action(DesktopAction::Hover {
+                target: ClickTarget::Coordinate(Point::new(120, 340)),
+            })
+        );
+    }
+
+    /// A hover with nothing named is not a hover of "somewhere".
+    #[test]
+    fn a_hover_with_no_target_is_refused() {
+        let err =
+            parse_decision(r#"{"decision": "act", "action": {"type": "hover"}}"#).unwrap_err();
+        assert!(err.to_string().contains("no element_id"), "{err}");
+    }
+
+    /// The move-away is a bare point: there is nothing to name, and nothing
+    /// is pressed.
+    #[test]
+    fn a_pointer_move_is_a_bare_point() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "action": {"type": "pointer_move", "x": 900, "y": 600}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            LoopDecision::Action(DesktopAction::PointerMove { to: Point::new(900, 600) })
+        );
+    }
+
     /// An id wins over coordinates when both are present: the id is exact.
     #[test]
     fn an_element_id_outranks_a_coordinate() {
@@ -1284,6 +1884,103 @@ mod tests {
                 keys: vec!["cmd".to_string(), "s".to_string()]
             })
         );
+    }
+
+    // ── several actions against one look ────────────────────────────────
+    //
+    // A person filling a form looks once and acts four times. Every action in
+    // a batch has to follow from the picture the decision was made against;
+    // what makes the batch worth having is that the loop need not settle and
+    // capture between them.
+
+    #[test]
+    fn a_list_of_actions_becomes_a_batch_in_the_order_written() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "actions": [
+                {"type": "click", "element_id": "f1"},
+                {"type": "type", "text": "Ada"},
+                {"type": "key_press", "keys": ["tab"]},
+                {"type": "type", "text": "Lovelace"}]}"#,
+        )
+        .unwrap();
+        let LoopDecision::Batch(actions) = decision else {
+            panic!("expected a batch, got {decision:?}");
+        };
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(actions[0], DesktopAction::Click { .. }));
+        assert!(matches!(actions[1], DesktopAction::Type { .. }));
+        assert!(matches!(actions[2], DesktopAction::KeyPress { .. }));
+        assert!(matches!(actions[3], DesktopAction::Type { .. }));
+    }
+
+    /// A list of one is a single action. The callers that treat `Action`
+    /// specially — a screenshot request, most of all — must not have to know
+    /// the batched form exists just because the model wrapped one action.
+    #[test]
+    fn a_batch_of_one_is_a_plain_action() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "actions": [{"type": "click", "x": 10, "y": 20}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            LoopDecision::Action(DesktopAction::Click {
+                target: ClickTarget::Coordinate(Point::new(10, 20)),
+                button: MouseButton::Left,
+            })
+        );
+    }
+
+    /// The singular form still works, unchanged. Batched answers are an
+    /// addition, not a replacement: a model that answers one action per step
+    /// behaves exactly as it did before.
+    #[test]
+    fn the_single_action_form_still_parses() {
+        let decision = parse_decision(
+            r#"{"decision": "act", "action": {"type": "key_press", "keys": ["escape"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(decision, LoopDecision::Action(DesktopAction::KeyPress { .. })));
+    }
+
+    /// A bad action anywhere in the batch refuses the whole thing. Running the
+    /// good ones would be executing half of an answer the model did not mean.
+    #[test]
+    fn one_bad_action_refuses_the_whole_batch() {
+        let err = parse_decision(
+            r#"{"decision": "act", "actions": [
+                {"type": "click", "x": 10, "y": 20},
+                {"type": "drag", "x": 10, "y": 20}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no element_id"), "{err}");
+    }
+
+    /// An `act` with neither field names no action, and guessing one would be
+    /// inventing a step.
+    #[test]
+    fn an_act_with_no_action_is_refused() {
+        let err = parse_decision(r#"{"decision": "act"}"#).unwrap_err();
+        assert!(err.to_string().contains("no action"), "{err}");
+    }
+
+    /// Some models write both fields, aping the two examples. Neither is
+    /// dropped: the single action goes last, so the batch runs what the model
+    /// listed and then what it singled out.
+    #[test]
+    fn both_fields_together_keep_both() {
+        let decision = parse_decision(
+            r#"{"decision": "act",
+                "actions": [{"type": "type", "text": "first"}],
+                "action": {"type": "key_press", "keys": ["enter"]}}"#,
+        )
+        .unwrap();
+        let LoopDecision::Batch(actions) = decision else {
+            panic!("expected a batch, got {decision:?}");
+        };
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], DesktopAction::Type { .. }));
+        assert!(matches!(actions[1], DesktopAction::KeyPress { .. }));
     }
 
     #[test]
