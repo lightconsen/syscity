@@ -237,6 +237,15 @@ struct Attachment {
     /// Digest of the *source* bytes, so a repeated frame is recognisable
     /// before it is decoded and re-encoded.
     digest: String,
+    /// The size of the payload that travels, in image pixels.
+    ///
+    /// Not the capture's size: the encoder may have shrunk it to fit
+    /// [`ImageLimit`]. The prompt says so, because a model that reads a
+    /// position off a 1024-wide picture of a 2560-wide screen and emits it as
+    /// a screen coordinate aims at something less than half as far right as
+    /// it meant — and asks for a close-up centred there.
+    width: u32,
+    height: u32,
 }
 
 /// Decides the next action by asking a model provider.
@@ -476,6 +485,30 @@ impl ModelDriver {
                 .trigger
                 .map(ImageTrigger::describe)
                 .unwrap_or("the tree is not enough");
+            // The picture may not be the size of the screen: the encoder
+            // shrinks it to the driver's image limit. A model that reads a
+            // position off a 1024-wide picture of a 2560-wide screen and emits
+            // it as a screen coordinate aims at less than half the distance it
+            // meant — and a close-up asked for at that point shows the wrong
+            // place. So the scale is stated whenever the two differ.
+            let scale_note = match (&attachment, ctx.screenshot.as_ref()) {
+                (Some(image), Some(shot))
+                    if image.width != shot.width || image.height != shot.height =>
+                {
+                    format!(
+                        " The image is {}×{} and the screen is {}×{} screen points, so an image \
+                         position is not a screen position: multiply by about {:.2} horizontally \
+                         and {:.2} vertically before giving a coordinate or a close-up region.",
+                        image.width,
+                        image.height,
+                        shot.width,
+                        shot.height,
+                        shot.width as f64 / image.width.max(1) as f64,
+                        shot.height as f64 / image.height.max(1) as f64,
+                    )
+                }
+                _ => String::new(),
+            };
             // A crop is a close-up, and a close-up has two traps: the model
             // reads positions off the crop as if they were screen positions,
             // and it forgets that what it cannot see in the crop may still be
@@ -486,7 +519,7 @@ impl ModelDriver {
                      rectangle from ({}, {}) to ({}, {}). Coordinates in it are still screen \
                      points, not offsets within the crop. Anything outside that rectangle is \
                      not shown here — take another screenshot with no region to see the \
-                     whole screen again.\n",
+                     whole screen again.{scale_note}\n",
                     region.x,
                     region.y,
                     region.x + region.width as i32,
@@ -494,7 +527,7 @@ impl ModelDriver {
                 )),
                 None => wire.push_str(&format!(
                     "\nAn image of the screen is attached because {why}. Use it to find the \
-                     control, then act by element id if the tree names one.\n"
+                     control, then act by element id if the tree names one.{scale_note}\n"
                 )),
             }
         }
@@ -642,6 +675,8 @@ impl ModelDriver {
             base64: encoded.base64,
             mime: encoded.mime,
             digest,
+            width: encoded.width,
+            height: encoded.height,
         };
         if let Ok(mut cache) = self.last_attachment.lock() {
             *cache = Some(attachment.clone());
@@ -2496,6 +2531,48 @@ mod tests {
         assert!(
             decoded.width() > 640,
             "the detector reads 640 wide; a picture no wider shows the model nothing more"
+        );
+
+        // And the prompt must say the picture is not the size of the screen.
+        // Without this the model reads a position off a 1024-wide picture and
+        // emits it as a screen point — about 2.5× short on this fixture.
+        let text = &user.content;
+        assert!(
+            text.contains("is not a screen position"),
+            "a scaled picture must say it is scaled: {text}"
+        );
+        assert!(
+            text.contains("multiply by about 2.50"),
+            "the prompt must give the factor, not just warn: {text}"
+        );
+    }
+
+    /// A picture that is already the screen's size says nothing about scale.
+    ///
+    /// The note is a correction, and a correction on an identity mapping is
+    /// noise that costs a sentence of the model's attention on every step.
+    #[tokio::test]
+    async fn an_unscaled_picture_does_not_mention_scale() {
+        let provider = Arc::new(ScriptedProvider::answering(
+            r#"{"decision": "help", "reason": "cannot see"}"#,
+        ));
+        let driver = ModelDriver::new(provider.clone(), "test-model");
+        // The one-pixel fixture is under the limit, so it travels unchanged.
+        let mut context = ctx(false);
+        context.screenshot = Some(Screenshot::new(ONE_PIXEL_PNG.to_string(), 1, 1));
+
+        driver.decide(&state(), &context).await.unwrap();
+
+        let request = &provider.requests()[0];
+        let user = request
+            .messages
+            .iter()
+            .find(|m| m.role == crate::providers::Role::User)
+            .expect("a user message");
+        assert!(
+            !user.content.contains("is not a screen position"),
+            "an identity mapping needs no correction: {}",
+            user.content
         );
     }
 
