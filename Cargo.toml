@@ -103,7 +103,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "cors", "limit"] }
 
 # WebSocket client
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 
 # TLS for a raw TCP client (the IRC channel). Both are already in the tree
 # transitively, so these add no crate.
