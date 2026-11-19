@@ -46,7 +46,10 @@ path, and each one exists because the naive version of it had a specific failure
 - **`run_budget.rs`** — per-run cost ceilings (`max_calls_per_run`, `max_images_per_run`) and
   `plan_perception`: an image is attached only when the text cannot carry the question (truncated
   tree, unverified last step, two failures in a row). The eight-image cap on a *request* does not
-  bound a thirty-step run.
+  bound a thirty-step run. A successful visual scan suppresses the image **only over a complete
+  tree**; on an incomplete or tree-less screen both go out, because the 640-wide detector's boxes
+  are then the limit of what the model knows exists, and a model cannot ask to look closer at a
+  region of a picture it was never shown — which is what makes the region re-look reachable.
 - **`run_registry.rs`** — the runs themselves, kept on the gateway rather than a connection so one
   client can watch or steer another's run. Finished runs are retained (bounded) so "run, then ask what
   happened" is not a race.
