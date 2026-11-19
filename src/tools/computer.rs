@@ -723,6 +723,16 @@ fn action_to_desktop_action(action: &str, args: &Value) -> crate::Result<Desktop
                     "Missing 'height' for resize_window action".to_string(),
                 )
             })? as u32;
+            // A zero dimension is not a small window; it is a window the user
+            // cannot see, cannot click and may not be able to find again. The
+            // platforms disagree about what they do with 0 (X11 refuses it,
+            // System Events accepts it), so the refusal belongs here where it
+            // is one rule rather than three accident reports.
+            if width == 0 || height == 0 {
+                return Err(crate::error::SyscityError::Validation(format!(
+                    "resize_window needs a non-zero size, got {width}x{height}"
+                )));
+            }
             Ok(DesktopAction::ResizeWindow { title_pattern, width, height })
         }
         "minimize_window" => {
@@ -1645,6 +1655,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A resize that would make the window invisible is refused.
+    ///
+    /// The platforms do different things with zero (xdotool errors, System
+    /// Events accepts it and the window becomes a title bar), so the answer
+    /// belongs in one place rather than in three accident reports. A zero
+    /// window is also unrecoverable by the model that asked for it: it cannot
+    /// see the window to move or resize it back.
+    #[test]
+    fn a_window_cannot_be_resized_to_nothing() {
+        for (width, height) in [(0, 400), (400, 0), (0, 0)] {
+            let args = json!({
+                "action": "resize_window",
+                "title_pattern": "Notes",
+                "width": width,
+                "height": height,
+            });
+            let err = action_to_desktop_action("resize_window", &args)
+                .expect_err(&format!("a {width}x{height} resize must not reach the adapter"));
+            assert!(
+                err.to_string().contains("non-zero"),
+                "the refusal must say the size is the problem: {err}"
+            );
+        }
+        // A one-pixel window is silly but visible, and it is not this layer's
+        // job to have opinions about taste.
+        assert!(action_to_desktop_action(
+            "resize_window",
+            &json!({"action": "resize_window", "title_pattern": "Notes", "width": 1, "height": 1}),
+        )
+        .is_ok());
     }
 
     #[tokio::test]

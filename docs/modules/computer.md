@@ -304,6 +304,11 @@ pub enum DesktopAction {
     ReadUiTree { app: Option<String> },
     LaunchApp { name: String, args: Vec<String>, wait_for_ready: bool },
     ActivateWindow { title_pattern: String },
+    // A window action that matched no window is a failure, not an action
+    // whose message happens to read "not found": the adapters turn the
+    // script's own "not found" into `ElementNotFound`, and a script that
+    // raised into `ToolFailed`. Reporting either as success is how a move
+    // that moved nothing came back green.
     CloseWindow { title_pattern: String },
     ListWindows,
     GetWindowGeometry { title_pattern: String },

@@ -133,6 +133,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::DoubleClick { target, button } => {
@@ -157,6 +165,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Scroll { target, direction, amount } => {
@@ -182,6 +198,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Drag { from, to } => {
@@ -202,6 +226,35 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                // Read the release guard's flag *before* the success check: it
+                // is set on a drag that failed after the button went down, so
+                // `!result.success` is true there too and a bare failure would
+                // drop the one fact the caller needs — that the button was
+                // released, so a retry is safe rather than a pointer that may
+                // still be held.
+                let released = result
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("emergency_release_posted"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if released {
+                    let mut action_result =
+                        ActionResult::error(result.error.unwrap_or_else(|| {
+                            "the drag failed after pressing the button; it was released".to_string()
+                        }));
+                    action_result.data =
+                        Some(serde_json::json!({ "emergency_release_posted": true }));
+                    return Ok(action_result);
+                }
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Hover { target } => {
@@ -225,6 +278,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Type { text, .. } => {
@@ -241,6 +302,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::KeyPress { keys } => {
@@ -257,6 +326,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::ClipboardGet => {
@@ -269,6 +346,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("clipboard tool not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::ClipboardSet { text } => {
@@ -281,6 +366,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("clipboard tool not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::LaunchApp { name, wait_for_ready, .. } => {
@@ -321,6 +414,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Wait { milliseconds } => {
@@ -389,6 +490,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::GetWindowGeometry { title_pattern, .. } => {
@@ -406,6 +515,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::MoveWindow { title_pattern, x, y } => {
@@ -422,6 +539,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::ResizeWindow { title_pattern, width, height } => {
@@ -438,6 +563,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::MinimizeWindow { title_pattern } => {
@@ -455,6 +588,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::MaximizeWindow { title_pattern } => {
@@ -472,6 +613,14 @@ impl ComputerAdapter for X11ComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::ReadUiTree { app } => {
@@ -728,6 +877,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::DoubleClick { target, button } => {
@@ -752,6 +909,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Scroll { target, direction, amount } => {
@@ -777,6 +942,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Drag { from, to } => {
@@ -797,6 +970,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Hover { target } => {
@@ -820,6 +1001,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Type { text, .. } => {
@@ -836,6 +1025,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::KeyPress { keys } => {
@@ -852,6 +1049,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::ClipboardGet => {
@@ -864,6 +1069,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("clipboard tool not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::ClipboardSet { text } => {
@@ -876,6 +1089,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("clipboard tool not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::LaunchApp { name, wait_for_ready, .. } => {
@@ -916,6 +1137,14 @@ impl ComputerAdapter for WaylandComputerAdapter {
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    // The tool ran; what it ran said it failed. Reducing that
+                    // to `success` reports an action that did not happen as one
+                    // that did — the whole point of the tool's own flag.
+                    return Err(ComputerError::ToolFailed(result.error.unwrap_or_else(|| {
+                        "the action reported failure without a reason".to_string()
+                    })));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Wait { milliseconds } => {

@@ -28,6 +28,40 @@ fn apple_script_output(result: &crate::tools::ToolExecutionResult) -> &str {
         .unwrap_or("")
 }
 
+/// The script's own error, when it raised.
+///
+/// The tool's `error` field is the transport's verdict ("osascript could not
+/// be spawned"); the script's is in the same envelope's `error`. Both are
+/// worth reporting, so this prefers the script's and falls back to the tool's.
+fn apple_script_error(result: &crate::tools::ToolExecutionResult) -> Option<String> {
+    result
+        .data
+        .as_ref()
+        .and_then(|d| d.get("error"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| result.error.clone())
+}
+
+/// What a script run answered.
+///
+/// Not the same question as "did the tool run". The `applescript` tool
+/// returns `ToolExecutionResult::success` with a JSON envelope in `output`,
+/// so `result.output` is the serialized `{ success, output, error }` — never
+/// the script's stdout. Reading it as the answer is how a script that raised
+/// ("no window matched") came back as a successful action whose message was
+/// the word "not found", and how the drag's Release Guard report — the one
+/// thing that says the left button may still be held — was never read at all.
+struct ScriptRun {
+    /// Whether the script completed. A script that raised is a failed run
+    /// even though the tool that spawned `osascript` succeeded.
+    success: bool,
+    /// What the script returned, trimmed.
+    output: String,
+    /// Why it raised, when it did.
+    error: Option<String>,
+}
+
 /// macOS adapter backed by `macos_screenshot`, `macos_accessibility`,
 /// `macos_desktop_control`, and `macos_applescript` tools.
 pub struct MacosComputerAdapter {
@@ -158,16 +192,14 @@ impl ComputerAdapter for MacosComputerAdapter {
                 let (x, y) = self.resolve_click_point(target).await?;
                 let script =
                     format!(r#"tell application "System Events" to click at {{ {}, {} }}"#, x, y);
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the click at ({x}, {y}) did not run: {}",
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success(format!("clicked at ({x}, {y})")))
             }
             DesktopAction::DoubleClick { target, button: _ } => {
                 let (x, y) = self.resolve_click_point(target).await?;
@@ -179,38 +211,25 @@ impl ComputerAdapter for MacosComputerAdapter {
 end tell"#,
                     x, y, x, y
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the double click at ({x}, {y}) did not run: {}",
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success(format!("double clicked at ({x}, {y})")))
             }
             DesktopAction::Hover { target } => {
                 let (x, y) = self.resolve_click_point(target).await?;
                 let script = pointer_move_script(x, y);
-                let apple_args = serde_json::json!({
-                    "script": script,
-                    "language": "JavaScript",
-                });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                if !result.success {
-                    return Err(ComputerError::ToolFailed(
-                        result
-                            .error
-                            .unwrap_or_else(|| "the pointer did not move".to_string()),
-                    ));
+                let run = self.run_script(script, Some("JavaScript")).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the pointer did not move: {}",
+                        run.error
+                            .unwrap_or_else(|| "the script did not run".to_string())
+                    )));
                 }
                 // The message says what the step established and what it did
                 // not. "Hovered" alone reads as a result; the honest claim is
@@ -224,24 +243,13 @@ end tell"#,
             }
             DesktopAction::PointerMove { to } => {
                 let script = pointer_move_script(to.x, to.y);
-                let apple_args = serde_json::json!({
-                    "script": script,
-                    "language": "JavaScript",
-                });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                if !result.success {
-                    return Err(ComputerError::ToolFailed(
-                        result
-                            .error
-                            .unwrap_or_else(|| "the pointer did not move".to_string()),
-                    ));
+                let run = self.run_script(script, Some("JavaScript")).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the pointer did not move: {}",
+                        run.error
+                            .unwrap_or_else(|| "the script did not run".to_string())
+                    )));
                 }
                 Ok(ActionResult::success(format!(
                     "the pointer moved to ({}, {}); nothing was pressed",
@@ -257,26 +265,15 @@ end tell"#,
                 // case: you look at a pane and scroll it without selecting it.
                 let (x, y) = self.resolve_click_point(target).await?;
                 let script = scroll_script(x, y, direction, amount);
-                let apple_args = serde_json::json!({
-                    "script": script,
-                    "language": "JavaScript",
-                });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                if !result.success {
-                    return Err(ComputerError::ToolFailed(
-                        result
-                            .error
-                            .unwrap_or_else(|| "the scroll did not run".to_string()),
-                    ));
+                let run = self.run_script(script, Some("JavaScript")).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the scroll did not run: {}",
+                        run.error
+                            .unwrap_or_else(|| "the script did not run".to_string())
+                    )));
                 }
-                Ok(ActionResult::success(result.output))
+                Ok(ActionResult::success(run.output))
             }
             DesktopAction::Drag { from, to } => {
                 let (from_x, from_y) = self.resolve_click_point(from).await?;
@@ -292,19 +289,19 @@ end tell"#,
                 // is never told a clean "dragged" for a release that had to
                 // recover.
                 let script = drag_script(from_x, from_y, to_x, to_y);
-                let apple_args = serde_json::json!({
-                    "script": script,
-                    "language": "JavaScript",
-                });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                let output = result.output.trim().to_string();
+                let run = self.run_script(script, Some("JavaScript")).await?;
+                // The release guard's report is the script's *output*, not the
+                // tool's. Reading `result.output` here read the JSON envelope
+                // the `applescript` tool wraps around it, so none of these
+                // prefixes ever matched and every drag — including one that
+                // left the button down — was reported as a clean success.
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the drag did not run: {}",
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                let output = run.output;
                 if output.starts_with("release-failed:") {
                     // The button may still be down. That is a failure a
                     // caller must see, not a drag that "mostly worked".
@@ -335,6 +332,13 @@ end tell"#,
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                if !result.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "could not close {:?}: {}",
+                        title_pattern,
+                        result.error.unwrap_or_default()
+                    )));
+                }
                 Ok(ActionResult::success(result.output))
             }
             DesktopAction::Type { text, .. } => {
@@ -347,7 +351,16 @@ end tell"#,
                         ComputerError::ToolFailed("desktop control not found".to_string())
                     })?
                     .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(result.output))
+                if !result.success {
+                    // The keystrokes may have gone nowhere, or half of them
+                    // may have landed. Either way this is not a success, and
+                    // the text must not appear in the message.
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the text could not be typed: {}",
+                        result.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success("the text was typed"))
             }
             DesktopAction::KeyPress { keys } => {
                 let args = serde_json::json!({ "action": "key_shortcut", "keys": keys });
@@ -363,63 +376,79 @@ end tell"#,
                 // raised. The tool's result says whether the Release Guard had
                 // to post the release, so the adapter does not report a clean
                 // key press for one that stranded a modifier.
+                //
+                // Read the flag *before* the success check: the guard fires on
+                // a failed chord, so `!result.success` is true there too and an
+                // early return would drop the one fact the caller needs — that
+                // the modifiers are not still held.
                 let released = result
                     .data
                     .as_ref()
                     .and_then(|d| d.get("emergency_release_posted"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let mut action_result = ActionResult::success(result.output);
                 if released {
-                    action_result.success = false;
-                    action_result.message = "key press failed after pressing its modifiers;                                              they were released"
-                        .to_string();
+                    let mut action_result = ActionResult::error(
+                        "key press failed after pressing its modifiers; they were released",
+                    );
                     action_result.data = Some(serde_json::json!({
                         "emergency_release_posted": true,
                     }));
+                    return Ok(action_result);
                 }
-                Ok(action_result)
+                if !result.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the key press did not run: {}",
+                        result.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success(result.output))
             }
             DesktopAction::ClipboardGet => {
-                let args = serde_json::json!({ "script": "get the clipboard" });
-                let result = self
-                    .registry
-                    .execute("applescript", args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self
+                    .run_script("get the clipboard".to_string(), None)
+                    .await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the clipboard could not be read: {}",
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success(run.output))
             }
             DesktopAction::ClipboardSet { text } => {
                 let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
                 let script = format!("set the clipboard to \"{}\"", escaped);
-                let args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "the clipboard could not be set: {}",
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success("the clipboard now holds the text"))
             }
             DesktopAction::LaunchApp {
                 name,
                 args: _app_args,
                 wait_for_ready,
             } => {
-                let script = format!(r#"tell application "{}" to activate"#, name);
-                let apple_args = serde_json::json!({ "script": script });
-                self.registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                // The name lands inside a quoted literal, so it is escaped
+                // rather than interpolated: an app name carrying a quote would
+                // otherwise close the literal and turn the rest of itself into
+                // script — and the syntax error that produces reaches here as
+                // an empty output, which used to be read as a successful
+                // launch.
+                let script =
+                    format!(r#"tell application "{}" to activate"#, apple_script_escape(&name));
+                let result = self.run_script(script, None).await?;
+                if !result.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "could not launch {}: {}",
+                        name,
+                        result.error.unwrap_or_default()
+                    )));
+                }
 
                 if wait_for_ready {
                     let ready = self
@@ -442,18 +471,20 @@ end tell"#,
                     r#"tell application "System Events"
     set frontmost of (first process whose name contains "{}") to true
 end tell"#,
-                    title_pattern
+                    apple_script_escape(&title_pattern)
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                if !run.success {
+                    // System Events raises when no process matched, which is
+                    // the ordinary "that window is not open" answer — and it
+                    // used to reach the caller as an empty success.
+                    return Err(ComputerError::ElementNotFound(format!(
+                        "no running app matched {:?}: {}",
+                        title_pattern,
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                Ok(ActionResult::success(format!("brought {:?} to the front", title_pattern)))
             }
             DesktopAction::Wait { milliseconds } => {
                 tokio::time::sleep(Duration::from_millis(milliseconds)).await;
@@ -525,18 +556,16 @@ end tell"#,
     end repeat
     return output
 end tell"#;
-                let args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+                let run = self.run_script(script.to_string(), None).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "listing windows failed: {}",
+                        run.error.unwrap_or_default()
+                    )));
+                }
 
                 let mut windows: Vec<crate::computer::WindowInfo> = Vec::new();
-                for line in apple_script_output(&result).lines() {
+                for line in run.output.lines() {
                     let parts: Vec<&str> = line.splitn(4, "|||").collect();
                     if parts.len() >= 3 {
                         windows.push(crate::computer::WindowInfo {
@@ -572,19 +601,18 @@ end tell"#;
     end repeat
     return ""
 end tell"#,
-                    title_pattern
+                    apple_script_escape(&title_pattern)
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                let coords: Vec<i32> = apple_script_output(&result)
-                    .trim()
+                let run = self.run_script(script, None).await?;
+                if !run.success {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "reading the geometry of {:?} failed: {}",
+                        title_pattern,
+                        run.error.unwrap_or_default()
+                    )));
+                }
+                let coords: Vec<i32> = run
+                    .output
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
@@ -618,18 +646,12 @@ end tell"#,
     end repeat
     return "not found"
 end tell"#,
-                    title_pattern, x, y
+                    apple_script_escape(&title_pattern),
+                    x,
+                    y
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                window_action_result(run, "move", &title_pattern)
             }
             DesktopAction::ResizeWindow { title_pattern, width, height } => {
                 let script = format!(
@@ -648,18 +670,12 @@ end tell"#,
     end repeat
     return "not found"
 end tell"#,
-                    title_pattern, width, height
+                    apple_script_escape(&title_pattern),
+                    width,
+                    height
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                window_action_result(run, "resize", &title_pattern)
             }
             DesktopAction::MinimizeWindow { title_pattern } => {
                 let script = format!(
@@ -683,18 +699,11 @@ end tell"#,
     end try
     return "not found"
 end tell"#,
-                    title_pattern, title_pattern
+                    apple_script_escape(&title_pattern),
+                    apple_script_escape(&title_pattern)
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                window_action_result(run, "minimize", &title_pattern)
             }
             DesktopAction::MaximizeWindow { title_pattern } => {
                 let script = format!(
@@ -718,18 +727,11 @@ end tell"#,
     end try
     return "not found"
 end tell"#,
-                    title_pattern, title_pattern
+                    apple_script_escape(&title_pattern),
+                    apple_script_escape(&title_pattern)
                 );
-                let apple_args = serde_json::json!({ "script": script });
-                let result = self
-                    .registry
-                    .execute("applescript", apple_args, &crate::tools::ToolContext::default())
-                    .await
-                    .ok_or_else(|| {
-                        ComputerError::ToolFailed("applescript tool not found".to_string())
-                    })?
-                    .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-                Ok(ActionResult::success(apple_script_output(&result).to_string()))
+                let run = self.run_script(script, None).await?;
+                window_action_result(run, "maximize", &title_pattern)
             }
             DesktopAction::ReadUiTree { app } => {
                 let tree = self.read_ui_tree(app.as_deref()).await?;
@@ -941,14 +943,22 @@ end tell"#,
             }
         };
 
-        let apple_args = serde_json::json!({ "script": script });
-        let result = self
-            .registry
-            .execute("applescript", apple_args, &crate::tools::ToolContext::default())
+        let run = self
+            .run_script(script, None)
             .await
-            .ok_or_else(|| ComputerError::ToolFailed("applescript tool not found".to_string()))?
             .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
-        Ok(ActionResult::success(apple_script_output(&result).to_string()))
+        if !run.success {
+            return Err(ComputerError::ToolFailed(format!(
+                "the background {} did not run: {}",
+                desktop_action_name(action),
+                run.error.unwrap_or_default()
+            )));
+        }
+        Ok(ActionResult::success(if run.output.is_empty() {
+            "the element was acted on in the background".to_string()
+        } else {
+            run.output
+        }))
     }
 
     async fn wait_for(&self, condition: WaitCondition, timeout: Duration) -> Result<bool> {
@@ -969,31 +979,19 @@ end tell"#,
                 }
                 WaitCondition::WindowTitleContains { pattern } => {
                     let script = r#"tell application "System Events" to return name of first process whose frontmost is true"#;
-                    let args = serde_json::json!({ "script": script });
-                    if let Some(Ok(result)) = self
-                        .registry
-                        .execute("applescript", args, &crate::tools::ToolContext::default())
-                        .await
-                    {
-                        apple_script_output(&result).contains(pattern)
-                    } else {
-                        false
+                    match self.run_script(script.to_string(), None).await {
+                        Ok(run) if run.success => run.output.contains(pattern),
+                        _ => false,
                     }
                 }
                 WaitCondition::ProcessRunning { name } => {
                     let script = format!(
                         r#"tell application "System Events" to return (name of processes) contains "{}""#,
-                        name
+                        apple_script_escape(name)
                     );
-                    let args = serde_json::json!({ "script": script });
-                    if let Some(Ok(result)) = self
-                        .registry
-                        .execute("applescript", args, &crate::tools::ToolContext::default())
-                        .await
-                    {
-                        apple_script_output(&result) == "true"
-                    } else {
-                        false
+                    match self.run_script(script, None).await {
+                        Ok(run) if run.success => run.output == "true",
+                        _ => false,
                     }
                 }
                 WaitCondition::FileExists { path } => {
@@ -1012,6 +1010,27 @@ end tell"#,
 }
 
 impl MacosComputerAdapter {
+    /// Run one AppleScript and report what the *script* said.
+    ///
+    /// See [`ScriptRun`] for why the tool's own `output` cannot be used.
+    async fn run_script(&self, script: String, language: Option<&str>) -> Result<ScriptRun> {
+        let mut args = serde_json::json!({ "script": script });
+        if let Some(language) = language {
+            args["language"] = serde_json::json!(language);
+        }
+        let result = self
+            .registry
+            .execute("applescript", args, &crate::tools::ToolContext::default())
+            .await
+            .ok_or_else(|| ComputerError::ToolFailed("applescript tool not found".to_string()))?
+            .map_err(|e| ComputerError::ToolFailed(e.to_string()))?;
+        Ok(ScriptRun {
+            success: result.success,
+            output: apple_script_output(&result).trim().to_string(),
+            error: apple_script_error(&result),
+        })
+    }
+
     /// Resolve a target and return only its coordinates.
     async fn resolve_click_point(&self, target: ClickTarget) -> Result<(i32, i32)> {
         let resolved = self.resolve_target(&target).await?;
@@ -1122,6 +1141,32 @@ fn parse_position_size(position: &str, size: &str) -> Option<Rect> {
 /// Escape a string for an AppleScript double-quoted literal.
 fn apple_script_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Turn a window script's answer into an action result.
+///
+/// The scripts answer `"not found"` when no window matched, which is a
+/// *failure*: the action did not happen. Reporting it as `ActionResult::
+/// success("not found")` is how a move that moved nothing came back with
+/// `success: true` and a message the caller had to read closely to notice.
+/// A script that raised is a failure for the same reason — it may have
+/// matched nothing, or System Events may have refused it; either way no
+/// window moved.
+fn window_action_result(run: ScriptRun, verb: &str, title_pattern: &str) -> Result<ActionResult> {
+    if !run.success {
+        return Err(ComputerError::ToolFailed(format!(
+            "could not {verb} the window matching {:?}: {}",
+            title_pattern,
+            run.error.unwrap_or_default()
+        )));
+    }
+    if run.output == "not found" || run.output.is_empty() {
+        return Err(ComputerError::ElementNotFound(format!(
+            "no window matched {:?}, so nothing was {verb}d",
+            title_pattern
+        )));
+    }
+    Ok(ActionResult::success(format!("{verb}d the window: {}", run.output)))
 }
 
 /// Press an element in an app that is not in front.
@@ -1447,6 +1492,138 @@ mod tests {
         // turn the rest of the name into script.
         let script = background_set_value_script("App", "AXTextField", r#"He said "hi""#, "a");
         assert!(script.contains(r#"name is "He said \"hi\"""#), "{script}");
+    }
+
+    /// A window that matched nothing is a failure, not a success.
+    ///
+    /// The scripts answer `"not found"`. Reporting that as
+    /// `ActionResult::success("not found")` gave a move that moved nothing
+    /// `success: true`, and only the message hinted otherwise.
+    #[test]
+    fn a_window_that_matched_nothing_is_not_a_success() {
+        let run = ScriptRun {
+            success: true,
+            output: "not found".to_string(),
+            error: None,
+        };
+        match window_action_result(run, "move", "Untitled") {
+            Err(ComputerError::ElementNotFound(message)) => {
+                assert!(message.contains("Untitled"), "{message}");
+                assert!(
+                    message.contains("moved"),
+                    "the verb must say what did not happen: {message}"
+                );
+            }
+            other => panic!("a miss must be an ElementNotFound, not {other:?}"),
+        }
+
+        // The same answer with no text at all: a script that returned nothing
+        // did not move anything either.
+        let empty = ScriptRun {
+            success: true,
+            output: String::new(),
+            error: None,
+        };
+        assert!(matches!(
+            window_action_result(empty, "resize", "Untitled"),
+            Err(ComputerError::ElementNotFound(_))
+        ));
+    }
+
+    /// A script that raised is a failure even though the tool that ran it
+    /// succeeded: "osascript spawned" is not "the window moved".
+    #[test]
+    fn a_script_that_raised_is_not_a_success() {
+        let run = ScriptRun {
+            success: false,
+            output: String::new(),
+            error: Some("System Events got an error".to_string()),
+        };
+        match window_action_result(run, "minimize", "Notes") {
+            Err(ComputerError::ToolFailed(message)) => {
+                assert!(message.contains("System Events got an error"), "{message}");
+            }
+            other => panic!("a raised script must fail, not {other:?}"),
+        }
+    }
+
+    /// A window action that did happen keeps its own answer.
+    #[test]
+    fn a_window_action_that_happened_is_reported_with_what_it_answered() {
+        let run = ScriptRun {
+            success: true,
+            output: "resized".to_string(),
+            error: None,
+        };
+        let result = window_action_result(run, "resize", "Notes").expect("a success");
+        assert!(result.success);
+        assert!(result.message.contains("resized"), "{}", result.message);
+    }
+
+    /// The drag's release-guard report is the script's output, not the tool's.
+    ///
+    /// The `applescript` tool answers with a JSON envelope in `output`, so
+    /// reading `result.output` never saw the script's own line: every drag —
+    /// including one that left the button down — was reported as a clean
+    /// success. `run_script` reduces the envelope to what the script said.
+    #[tokio::test]
+    async fn the_script_answer_is_read_through_the_tool_envelope() {
+        let envelope = serde_json::json!({
+            "success": true,
+            "output": "emergency-release: something raised",
+            "error": null,
+        });
+        let result = crate::tools::ToolExecutionResult::success(envelope.to_string())
+            .with_data(envelope.clone());
+
+        // What the old code read: the envelope, as text.
+        assert!(result.output.starts_with('{'), "{}", result.output);
+        // What the new code reads: the script's answer.
+        assert_eq!(apple_script_output(&result), "emergency-release: something raised");
+    }
+
+    /// A title carrying a quote must not end the script literal.
+    ///
+    /// Every window action interpolates the title into a double-quoted
+    /// AppleScript string. Unescaped, a window called `He said "hi"` closes
+    /// the literal and the rest of the title becomes script.
+    #[test]
+    fn a_window_title_with_a_quote_stays_inside_the_literal() {
+        let escaped = apple_script_escape(r#"He said "hi""#);
+        assert_eq!(escaped, r#"He said \"hi\""#);
+        // A backslash must survive too, or the escape itself is escaped.
+        assert_eq!(apple_script_escape(r#"C:\Temp"#), r#"C:\\Temp"#);
+    }
+
+    /// The release-guard fact must survive the failure.
+    ///
+    /// A chord that raised after pressing its modifiers arrives with
+    /// `success: false` *and* `emergency_release_posted: true`. Checking
+    /// success first turns it into a bare `ToolFailed` and throws away the one
+    /// thing the caller needs: the system is not left with a modifier held, so
+    /// retrying is safe.
+    #[test]
+    fn a_stranded_chord_reports_that_the_modifiers_were_released() {
+        let payload = serde_json::json!({
+            "success": false,
+            "action": "key_shortcut",
+            "error": "emergency-release: Command was held",
+            "emergency_release_posted": true,
+        });
+        // The tool surfaces that payload as an error result; the adapter still
+        // has to read the flag out of it rather than returning at the first
+        // `!success`.
+        let result =
+            crate::tools::ToolExecutionResult::error("emergency-release: Command was held")
+                .with_data(payload);
+        let released = result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("emergency_release_posted"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(released, "the flag must be readable from a failed result");
+        assert!(!result.success);
     }
 
     /// A hover must move the pointer and press nothing.
