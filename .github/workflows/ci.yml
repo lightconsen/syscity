@@ -453,7 +453,14 @@ jobs:
     if: github.event_name == 'push'
     runs-on: macos-latest
     needs: check
-    timeout-minutes: 90
+    # 120, the same ceiling `windows` carries. 90 was already the job's real
+    # duration rather than a comfortable margin: on consecutive runs the same
+    # command took 80.1 min (passed) and was still linking when 90 expired
+    # (cancelled at 09:57:46, 88.3 min into the step). The variance is the
+    # runner, not the code — `macos-latest` restores a cold `target/` whenever
+    # the cache key misses and links ~1300 test binaries. A job that is
+    # cancelled looks like a failure in the branch status for no reason.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
