@@ -119,7 +119,7 @@ skip-tree = [
     # config 0.14 uses toml 0.8; other crates pull toml 0.9
     { crate = "config@0.14.1", depth = 5 },
     # wasmtime ecosystem pulls in multiple versions of wasm-encoder, wasmparser, hashbrown, etc.
-    { crate = "wasmtime@50.0.0", depth = 10 },
+    { crate = "wasmtime@50.0.2", depth = 10 },
     # dialoguer pulls console 0.16 alongside our console 0.15 (via other deps)
     { crate = "dialoguer@0.11.0", depth = 5 },
     # itertools duplicates from different upstream crates
