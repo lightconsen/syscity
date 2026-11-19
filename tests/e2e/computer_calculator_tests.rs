@@ -25,9 +25,16 @@
 //! Everything is undone at the end — the calculator is quit — because this test
 //! clicks into the session it runs in.
 
+// The permission probe only exists on macOS (`platform::macos` is
+// `cfg(target_os = "macos")` in the lib), so importing it unconditionally
+// makes this whole test binary fail to compile everywhere else — which is what
+// it did on the Linux CI runner. The script logic below needs no display and
+// runs on every platform; only the journey does.
+#[cfg(target_os = "macos")]
+use syscity::computer::platform::macos::permissions::has_accessibility_permission;
+
 use std::sync::Mutex;
 
-use syscity::computer::platform::macos::permissions::has_accessibility_permission;
 use syscity::computer::types::UiElement;
 
 use super::*;
@@ -48,13 +55,30 @@ const KEYS: &[&[&str]] = &[
     &["=", "Equals"],
 ];
 
+/// Whether this runner may drive another app through its accessibility tree.
+///
+/// On macOS that is TCC's Accessibility grant. On any other platform the
+/// journey cannot run at all — `skip_if_no_screen_capture` has already
+/// returned by then, and the message it prints says why — so `false` here is
+/// not a silent pass but the second half of a skip the caller has announced.
+fn may_drive_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        has_accessibility_permission()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn a_goal_on_a_real_screen_ends_done_with_a_readable_capture() {
     if !skip_if_no_screen_capture() {
         return;
     }
-    if !has_accessibility_permission() {
+    if !may_drive_accessibility() {
         eprintln!(
             "Skipping computer.run E2E: Accessibility permission is not granted to the \
              terminal/runner, so the calculator cannot be driven. Grant it in System Settings \
