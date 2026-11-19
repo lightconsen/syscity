@@ -5,6 +5,15 @@
 # Advisory IDs to ignore with documented justification.
 # These are all unfixable in the current dependency tree.
 ignore = [
+    # chrono (RUSTSEC-2026-0543, 2026-09-14): unmaintained. Informational only —
+    # `patched = []`, so no release fixes it, because nothing is broken in a
+    # release: upstream stopped maintaining the crate. jiff/time are named as
+    # alternatives, but chrono is both a direct dependency and a transitive one
+    # from four more (sqlx 0.9, oauth2 5, teloxide, cron), so the replacement is
+    # a migration of the whole time-keeping surface. Same reasoning, same
+    # entry, in deny.toml.
+    "RUSTSEC-2026-0543",
+
     # rsa (RUSTSEC-2023-0071): timing sidechannel in RSA key operations.
     # Two paths reach it, and neither is affected at runtime:
     #   - sqlx-macros -> sqlx-mysql: a transitive dependency pulled in only for

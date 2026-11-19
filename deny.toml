@@ -8,6 +8,16 @@ all-features = true
 [advisories]
 # A list of advisory IDs to ignore with documented justification
 ignore = [
+    # `chrono` is unmaintained (RUSTSEC-2026-0543, 2026-09-14): the advisory is
+    # informational, `patched = []` — there is no version to move to, and the
+    # maintenance status is a statement about the upstream project rather than
+    # a defect in a release. It is not a drop-in swap either: chrono arrives
+    # from four independent directions (`sqlx 0.9`, `oauth2 5`, `teloxide`,
+    # `cron`) *and* is a direct dependency of ours, so replacing it with `jiff`
+    # or `time` is a migration across the whole time-keeping surface, not a
+    # bump. Drop this entry when a dependency release does that migration for
+    # us.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, patched = []: no fixed version exists; reached from sqlx, oauth2, teloxide, cron and our own direct use, so replacing it is a migration, not an upgrade" },
     # `proc-macro-error2` is unmaintained but used by transitive proc-macro crates.
     { id = "RUSTSEC-2026-0173", reason = "transitive unmaintained dependency; no actionable upgrade path" },
     # The three zip `extract()` advisories (RUSTSEC-2026-0367/0368/0369) are no
