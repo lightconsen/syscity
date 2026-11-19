@@ -347,12 +347,32 @@ impl ModelDriver {
             tree_unread: tree_less,
             last_verified: state.last_verified,
             consecutive_failures: state.consecutive_failures,
+            // A hover's answer is this frame: the control either reacted to
+            // the pointer or it did not, and that repaint is only in the
+            // picture. Read off the history rather than a state field because
+            // the fact is "the step that just ran", which is exactly the last
+            // record — and a `pointer_move` that follows a hover ends it
+            // deliberately, since moving away is what dismisses the tooltip
+            // the probe opened.
+            last_step_hovered: state
+                .history
+                .last()
+                .is_some_and(|r| matches!(r.action, DesktopAction::Hover { .. })),
             model_supports_vision: ctx.model_supports_vision,
             // Two conditions, not one: the run may still have images to spend
             // *and* this step may have a capture worth sending.
             image_budget_available: ctx.image_budget_available && can_attach(ctx),
         });
-        if the_scan_answers_alone && perception.attach_image {
+        // One exception to the substitution: a hover probe. A scan is a second
+        // reading of *what is there*, and it is exactly what a hover is not
+        // asking. The question is whether the control changed when the pointer
+        // arrived — a hover style, a tooltip, a menu — and no box list can
+        // answer it, however complete. Substituting here would suppress the one
+        // frame the probe exists to produce.
+        if the_scan_answers_alone
+            && perception.attach_image
+            && perception.trigger != Some(ImageTrigger::HoverProbe)
+        {
             perception.attach_image = false;
             perception.trigger = None;
         }
@@ -1294,6 +1314,110 @@ mod tests {
 
     fn driver() -> ModelDriver {
         ModelDriver::new(Arc::new(ScriptedProvider::default()), "test-model")
+    }
+
+    /// A hover is a measurement, and the frame being measured is the *next*
+    /// one. The step after a probe must therefore carry a picture even when the
+    /// tree is whole and nothing failed — otherwise the run pays for the probe
+    /// and is handed text that cannot answer what it asked.
+    #[test]
+    fn the_step_after_a_hover_carries_the_frame_it_probed() {
+        let mut s = state();
+        s.step = 1;
+        // Exactly what a hover leaves behind: no verdict, no failure count.
+        s.last_verified = None;
+        s.consecutive_failures = 0;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::Hover {
+                target: ClickTarget::Coordinate(Point::new(10, 10)),
+            },
+            result: ActionResult::success("the pointer moved onto the control".to_string()),
+            verification: StepVerification::Unverifiable,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(true));
+
+        assert!(user.contains("image of the screen is attached"), "{user}");
+        assert!(user.contains("hovered"), "the reason names the probe: {user}");
+    }
+
+    /// A visual scan of a whole tree normally stands in for the picture — but
+    /// a scan cannot show that a control *reacted to the pointer*, which is the
+    /// only thing a hover probe is asking. Suppressing the frame there would
+    /// make the probe cost a step and answer nothing.
+    #[test]
+    fn a_scan_does_not_stand_in_for_the_frame_a_hover_probed() {
+        let mut s = state();
+        s.step = 1;
+        s.last_verified = None;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::Hover {
+                target: ClickTarget::Coordinate(Point::new(10, 10)),
+            },
+            result: ActionResult::success("hovered".to_string()),
+            verification: StepVerification::Unverifiable,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+        let mut context = ctx(true);
+        context.vision = Some(vision_elements());
+
+        let (_system, user) = driver().render_prompt(&s, &context);
+
+        assert!(user.contains("Detected from the screenshot:"), "{user}");
+        assert!(user.contains("image of the screen is attached"), "{user}");
+    }
+
+    /// And a probe followed by its move-away is spent: the pointer is no longer
+    /// on the control, so the frame says nothing about how the control reacted.
+    #[test]
+    fn a_pointer_move_after_a_hover_ends_the_probe() {
+        let mut s = state();
+        s.step = 2;
+        s.last_verified = None;
+        s.history = vec![
+            StepRecord {
+                step: 0,
+                action: DesktopAction::Hover {
+                    target: ClickTarget::Coordinate(Point::new(10, 10)),
+                },
+                result: ActionResult::success("hovered".to_string()),
+                verification: StepVerification::Unverifiable,
+                screenshot_before: None,
+                screenshot_after: None,
+                snapshots_taken: 0,
+                sensitive: false,
+                aim_missed: None,
+            },
+            StepRecord {
+                step: 1,
+                action: DesktopAction::PointerMove { to: Point::new(900, 600) },
+                result: ActionResult::success("moved".to_string()),
+                verification: StepVerification::Verified,
+                screenshot_before: None,
+                screenshot_after: None,
+                snapshots_taken: 0,
+                sensitive: false,
+                aim_missed: None,
+            },
+        ];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(true));
+
+        assert!(
+            !user.contains("image of the screen is attached"),
+            "the hover it followed is over: {user}"
+        );
     }
 
     // ── prompt rendering ────────────────────────────────────────────────

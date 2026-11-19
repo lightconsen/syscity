@@ -366,6 +366,19 @@ pub enum ImageTrigger {
     LastStepNotVerified,
     /// Two or more failures in a row: the current channel is not working.
     RepeatedFailures,
+    /// The last action was a `hover`, whose whole answer is written on the next
+    /// frame.
+    ///
+    /// A hover is a *measurement* — "does this control react to the pointer?" —
+    /// and it cannot be verified in the step that performs it: the reaction is
+    /// a repaint that happens after the pointer arrives, and the capture taken
+    /// in that step has the pointer sitting on the target for the first time.
+    /// So the verdict is `Unverifiable`, `last_verified` stays `None`, and
+    /// `consecutive_failures` does not move. Without this trigger the probe
+    /// step's successor would fall through to "no image" and the model would be
+    /// handed text for a question only the picture answers — the run would pay
+    /// for a measurement and never read it.
+    HoverProbe,
 }
 
 impl ImageTrigger {
@@ -378,6 +391,9 @@ impl ImageTrigger {
             }
             ImageTrigger::LastStepNotVerified => "the last action was not verified",
             ImageTrigger::RepeatedFailures => "repeated failures",
+            ImageTrigger::HoverProbe => {
+                "the last step hovered a control — whether it reacted is in the picture"
+            }
         }
     }
 }
@@ -421,6 +437,12 @@ pub struct PerceptionInputs {
     pub last_verified: Option<bool>,
     /// Consecutive failed steps so far.
     pub consecutive_failures: usize,
+    /// Whether the step that just ran was a hover.
+    ///
+    /// Hover has no verifying rung of its own, so it arrives here as its own
+    /// fact rather than as a `last_verified` value: the answer it produces is
+    /// the next frame, and this is what asks for that frame.
+    pub last_step_hovered: bool,
     /// Whether the model routed to can accept an image at all.
     pub model_supports_vision: bool,
     /// Whether the run has image budget left.
@@ -486,6 +508,18 @@ pub fn plan_perception(inputs: PerceptionInputs) -> PerceptionPlan {
             tree_complete: true,
         };
     }
+    // Last, because it is the only trigger that is not about something going
+    // wrong: a probe that arrived at a whole tree is still a probe, and the
+    // frame after it is the whole answer. Ordering it after the two failure
+    // triggers keeps their sentence when both apply — "the last action was not
+    // verified" is the larger fact.
+    if inputs.last_step_hovered {
+        return PerceptionPlan {
+            attach_image: true,
+            trigger: Some(ImageTrigger::HoverProbe),
+            tree_complete: true,
+        };
+    }
     no_image(None)
 }
 
@@ -507,6 +541,7 @@ mod tests {
             tree_unread: false,
             last_verified: Some(true),
             consecutive_failures: 0,
+            last_step_hovered: false,
             model_supports_vision: true,
             image_budget_available: true,
         }
@@ -587,6 +622,12 @@ mod tests {
 
     /// `None` is "nothing was checked", which is not a failure. Attaching an
     /// image on every `Unverifiable` would make the cheap path the exception.
+    ///
+    /// A hover is the one `Unverifiable` action that is not in this category,
+    /// and it arrives as its own input (`last_step_hovered`) rather than as a
+    /// `None` — the probe has a defined answer, it is just written on the next
+    /// frame. So this test is about the other unchecked steps: a wait, a
+    /// clipboard read, a mere launch. Those really are "nothing to see".
     #[test]
     fn an_unchecked_step_alone_does_not_ask_for_an_image() {
         let plan = plan_perception(PerceptionInputs {
@@ -641,6 +682,7 @@ mod tests {
             consecutive_failures: 9,
             model_supports_vision: false,
             image_budget_available: true,
+            last_step_hovered: false,
         });
         assert!(!plan.attach_image, "{plan:?}");
         assert_eq!(plan.trigger, None, "nothing was attached, so nothing prompted it");
@@ -655,6 +697,68 @@ mod tests {
             ..inputs()
         });
         assert!(!plan.attach_image);
+    }
+
+    /// A hover is measured on the *next* frame, so the step after one must
+    /// carry that picture.
+    ///
+    /// Without this the probe is unreadable: the hover's own step is
+    /// `Unverifiable`, so `last_verified` is `None` and `consecutive_failures`
+    /// does not move, and a whole tree with nothing else wrong reaches the
+    /// "no image" fallthrough. The run would pay for a measurement and never
+    /// look at what it measured.
+    #[test]
+    fn a_hovered_control_gets_a_picture_even_under_a_whole_tree() {
+        let plan = plan_perception(PerceptionInputs {
+            last_step_hovered: true,
+            ..inputs()
+        });
+        assert!(plan.attach_image, "{plan:?}");
+        assert_eq!(plan.trigger, Some(ImageTrigger::HoverProbe));
+        // It is not a complaint about the tree, so the tree is still whole.
+        assert!(plan.tree_complete);
+    }
+
+    /// The probe's sentence has to say what the picture is for — a model told
+    /// only "here is an image" will read it as a refresh of the same outline.
+    #[test]
+    fn the_hover_trigger_says_what_to_look_for() {
+        let sentence = ImageTrigger::HoverProbe.describe();
+        assert!(sentence.contains("reacted"), "{sentence}");
+        assert_ne!(sentence, ImageTrigger::LastStepNotVerified.describe());
+        assert_ne!(sentence, ImageTrigger::RepeatedFailures.describe());
+    }
+
+    /// When a hover also left the last step unverified, the failure is the
+    /// larger fact and keeps the sentence. Both ask for the same picture; only
+    /// the reason it is reported differs.
+    #[test]
+    fn a_failed_probe_is_reported_as_the_failure_not_as_the_probe() {
+        let plan = plan_perception(PerceptionInputs {
+            last_verified: Some(false),
+            last_step_hovered: true,
+            ..inputs()
+        });
+        assert!(plan.attach_image);
+        assert_eq!(plan.trigger, Some(ImageTrigger::LastStepNotVerified));
+    }
+
+    /// A model that cannot take a picture, or a run with none left, still gets
+    /// text. The hover trigger is not an exception to either rule.
+    #[test]
+    fn a_hover_does_not_override_the_vision_or_budget_checks() {
+        let blind = plan_perception(PerceptionInputs {
+            last_step_hovered: true,
+            model_supports_vision: false,
+            ..inputs()
+        });
+        assert!(!blind.attach_image);
+        let spent = plan_perception(PerceptionInputs {
+            last_step_hovered: true,
+            image_budget_available: false,
+            ..inputs()
+        });
+        assert!(!spent.attach_image);
     }
 
     #[test]

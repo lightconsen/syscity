@@ -294,6 +294,11 @@ pub enum DesktopAction {
     // not a read of an `enabled` flag the platform may not publish. Because the
     // tooltip it may open covers the next frame, a hover is expected to be
     // followed by `PointerMove` somewhere empty.
+    //
+    // The measurement is why the step after one always carries a picture
+    // (`ImageTrigger::HoverProbe`): the reaction is a repaint that happens
+    // after the pointer arrives, so the verdict this step can reach is
+    // `Unverifiable` and the answer is only in the *next* frame.
     Hover { target: ClickTarget },
     PointerMove { to: Point },
     ReadUiTree { app: Option<String> },

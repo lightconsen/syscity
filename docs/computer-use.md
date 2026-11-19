@@ -135,10 +135,10 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
 调用点：`src/tools/screen_state.rs:311`（`screen_state` 工具）和
 `src/computer/run_executor.rs`（run 每步）。
 
-### L2 · 只在三种情况下给图
+### L2 · 只在有理由的情况下给图
 
 `plan_perception`（`src/computer/run_budget.rs`）的触发条件
-（`ImageTrigger`，`:346`）：
+（`ImageTrigger`）：
 
 | 触发 | 含义 |
 |---|---|
@@ -147,6 +147,16 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
 | `TreeUnread` | 读成功但一个 root 都没有——桌面没发布树，和"树是空的"不是一回事 |
 | `LastStepNotVerified` | 上一步没验证——没落地，或者没东西能验证 |
 | `RepeatedFailures` | 连续失败 ≥ 2，当前通道不管用 |
+| `HoverProbe` | 上一步是 hover——"控件有没有反应"只写在下一帧里 |
+
+`HoverProbe` 是唯一一个**不是"出了事"**的触发。hover 的判定是
+`Unverifiable`（反应发生在指针到达之后，而这一步的截图里指针是刚到的），
+所以 `last_verified` 是 `None`、失败计数不动——没有这条触发，探测的那一步
+后面就会落到"不发图"，等于付了一次测量的钱却不去读结果。它排在两个失败触发
+之后，两者同时成立时按更大的事实报；也**不受**"整棵树 + 视觉扫描可以替代整图"
+那条规则的抑制（扫描能说"那里有什么"，说不了"它刚才变了没有"）。
+跟随 hover 的 `pointer_move` 会结束这个探测——移开正是为了关掉 tooltip，
+移开之后的帧就不再是那一次测量的答案。
 
 触发原因写进 run 的步骤记录，所以"这一步为什么带图"事后能查。
 
