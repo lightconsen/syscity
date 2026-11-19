@@ -11,6 +11,39 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Added
+
+- **A close-up.** `screenshot` takes a region, so the model can look at what
+  the detector's fixed 640-wide view erased rather than living with it. The
+  crop's boxes come back in screen points — `CoordinateSpace::for_region` maps
+  them, and the scaling uses the region's points, not the picture's encoded
+  pixels, which are two different numbers on a Retina display.
+- **`hover` and `pointer_move`**, as a pair. A hover exists to answer "does
+  this control react to the pointer?" — a question an `enabled` flag cannot
+  answer, because the platform may not publish one. It is verified at the
+  pixel rung only; the accessibility rung would press the thing it is merely
+  looking at. The move-away is part of the gesture: the tooltip a hover opens
+  covers the next frame.
+- **Drag, wait, the clipboard pair, and the window quartet** — list, close,
+  move, resize — in the desktop action vocabulary, and **several actions per
+  step**. A step may carry `actions: [...]`; all but the last run unobserved,
+  which is the settle-and-capture cost the batch removes, and the last is
+  observed so the next decision sees where it ended up.
+- **Sensitive UI is marked, everywhere it is found.** One detector marks the
+  accessibility tree, the visual scan and a close-up alike, so the "never type
+  into `[sensitive: …]`" rule in the prompt finally has something to bind to.
+
+### Changed
+
+- **A tree-less screen keeps its picture.** The tree is an index there, not an
+  answer: the screenshot used to be withdrawn whenever the scan succeeded,
+  which left the model holding less than the screen contains and no way to ask
+  for a closer look at it.
+- **wasmtime 50.0.2** (from 50.0.1), for eight advisories patched in that
+  release — a stale GC heap base pointer, host aborts and panics reachable
+  from a guest, and unbounded host memory through empty writes to
+  `AsyncWriteStream`.
+
 ## [0.3.20] - 2026-11-13
 
 ### Changed
