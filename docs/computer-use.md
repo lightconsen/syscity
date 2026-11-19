@@ -377,10 +377,17 @@ PendingBadcaseStore（去重、SQLite）
 
 | 类别 | 变体 | 持锁 |
 |---|---|---|
-| 输入 | `Click`, `DoubleClick`, `Type`, `KeyPress`, `Drag`, `Scroll` | 是 |
+| 输入 | `Click`, `DoubleClick`, `Type`, `KeyPress`, `Drag`, `Scroll`, `ClipboardSet` | 是 |
+| 指针探测 | `Hover`, `PointerMove` | 是 |
 | 观察 | `Screenshot`, `ReadUiTree`, `ListWindows`, `GetWindowGeometry` | 否 |
 | 窗口状态 | `Activate`/`Close`/`Move`/`Resize`/`Minimize`/`Maximize`/`LaunchApp` | 是 |
 | 无副作用 | `Wait` | 否 |
+
+`Hover` 和 `PointerMove` 看起来什么也不改，但它们移动的是真正的指针：一个运行时，
+鼠标停在别处，下一个盲点击落点就不同；而且 hover 会弹出 tooltip 或菜单，改掉下一帧。
+所以它们和点击一样持锁。`needs_input_lock` 是"不在观察名单里就持锁"的写法，
+新增的变体默认落进持锁一侧——这是有意的：漏判一个观察动作只是少并一点，
+漏判一个输入动作就是两个 loop 抢鼠标。
 
 `Scroll` 与窗口操作极易被误判为无害：滚动会把内容移走，改焦点会让后续的盲输入
 落到别处。默认按持锁处理，宁可串行。

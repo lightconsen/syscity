@@ -1654,6 +1654,17 @@ mod tests {
                 args: vec![],
                 wait_for_ready: false,
             },
+            // Pointing actions look like observation and are not: they move
+            // the one real pointer, so a coordinated click in another loop
+            // lands wherever this one left the cursor. A hover also opens the
+            // tooltip that changes the next frame.
+            DesktopAction::Hover {
+                target: ClickTarget::Coordinate(Point::new(1, 2)),
+            },
+            DesktopAction::PointerMove { to: Point::new(3, 4) },
+            // Writing the clipboard is not observation either: it replaces
+            // what the machine's copy-paste will deliver.
+            DesktopAction::ClipboardSet { text: "x".to_string() },
         ] {
             assert!(action.needs_input_lock(), "{action:?} must take the display lock");
         }
