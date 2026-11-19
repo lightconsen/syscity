@@ -894,7 +894,8 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     # Push-only. The instrumented `--all-features` build is this repo's most
-    # expensive job (~25 min, tens of GB) and its number is not yet
+    # expensive job (tens of GB; over an hour end to end, see the timeout note
+    # below) and its number is not yet
     # reproducible: identical tests on identical commits have measured 18%
     # and >55% in different runs, which is a property of the measurement, not
     # of the change. Blocking a pull request on a number that moves on its
@@ -904,7 +905,14 @@ jobs:
     # job in this file carries; a job may name `if` once, so both live here.
     if: github.event_name == 'push'
     needs: check
-    timeout-minutes: 50
+    # 90, matching the other whole-suite jobs (Test (macOS), Release Link).
+    # It was 50 on a "~25 min" estimate, and that held only while the job was
+    # dying early: an unbuildable test binary aborts the run before anything
+    # is measured. With the `e2e_test` compile break fixed, the job reaches
+    # its own step for the first time — the uninstrumented suite alone is
+    # ~34 min, and `llvm-cov` builds a second tree and runs it slower, so 50
+    # killed it mid-report on the first run that got that far.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
