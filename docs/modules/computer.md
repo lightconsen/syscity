@@ -290,6 +290,12 @@ pub enum DesktopAction {
     KeyPress { keys: Vec<String> },
     Scroll { target: ClickTarget, direction: ScrollDirection, amount: i32 },
     Drag { from: ClickTarget, to: ClickTarget },
+    // A hover is a *measurement* — does this control react to the pointer? —
+    // not a read of an `enabled` flag the platform may not publish. Because the
+    // tooltip it may open covers the next frame, a hover is expected to be
+    // followed by `PointerMove` somewhere empty.
+    Hover { target: ClickTarget },
+    PointerMove { to: Point },
     ReadUiTree { app: Option<String> },
     LaunchApp { name: String, args: Vec<String>, wait_for_ready: bool },
     ActivateWindow { title_pattern: String },
