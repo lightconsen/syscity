@@ -33,6 +33,18 @@ if no section matches, the release falls back to auto-generated notes.
   accessibility tree, the visual scan and a close-up alike, so the "never type
   into `[sensitive: …]`" rule in the prompt finally has something to bind to.
 
+### Fixed
+
+- **An action that did not happen is no longer reported as one that did.**
+  Every adapter built its result from the tool's output and ignored the tool's
+  own success flag, so a script that raised, a window that matched nothing, and
+  a drag that had to recover its button all came back green. The macOS drag's
+  Release Guard report was unreachable outright — it read the `applescript`
+  tool's JSON envelope instead of the script's answer, so a drag that left the
+  button down was reported clean. `resize_window` also refuses a zero
+  dimension: X11 errors on it, System Events accepts it, and a zero window
+  cannot be seen or found again by the model that asked for it.
+
 ### Changed
 
 - **A tree-less screen keeps its picture.** The tree is an index there, not an
