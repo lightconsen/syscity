@@ -316,6 +316,18 @@ mod tests {
         // And a listed name that no tool answers to is a stale entry: the tool
         // was renamed (or the set stopped exposing it) and the gate has been
         // quietly watching a name that does not exist.
+        //
+        // Except where the absence is the build rather than a rename: the
+        // macOS toolset is the one set compiled only on its own host
+        // (`platform::macos` is `cfg(target_os = "macos")` in the lib), so on
+        // any other host its names answer to nothing by construction. They are
+        // still checked for staleness — on a macOS checkout, where the set
+        // exists.
+        #[cfg(not(target_os = "macos"))]
+        const ABSENT_BY_BUILD: &[&str] = &["applescript", "macos_desktop_control"];
+        #[cfg(target_os = "macos")]
+        const ABSENT_BY_BUILD: &[&str] = &[];
+
         let present: std::collections::HashSet<String> = every_compiled_toolset()
             .iter()
             .flat_map(|set| set.tools())
@@ -325,6 +337,7 @@ mod tests {
             .iter()
             .copied()
             .filter(|n| !present.contains(*n))
+            .filter(|n| !ABSENT_BY_BUILD.contains(n))
             .collect();
         assert!(
             missing.is_empty(),
