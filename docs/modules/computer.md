@@ -330,6 +330,13 @@ pub enum LoopDecision {
     Done { message: String },
     NeedHelp { reason: String },
     Action(DesktopAction),
+    // Several actions against one look: a person filling a form looks once and
+    // acts four times (`click → type → Tab → type`). The loop records one step
+    // per action but settles, captures and verifies only the last, so the next
+    // decision sees where the batch ended up. It stops at the first action that
+    // fails or is refused — the rest were planned on a screen that did not
+    // come to pass.
+    Batch(Vec<DesktopAction>),
 }
 ```
 

@@ -598,6 +598,11 @@ impl ComputerUseLoop {
             let record_step = step + ran;
             ran += 1;
             let is_last = index + 1 == total;
+            // Whether this action refused. A refusal is not a verification
+            // failure, so `last_verified` cannot carry it; the batch still has
+            // to stop on one. Declared out here because the decision to break
+            // is made after the match.
+            let mut refused = false;
 
             // A screenshot is a request for the *next* capture, not an action
             // to dispatch: capturing it inside the session and then also
@@ -649,6 +654,17 @@ impl ComputerUseLoop {
                 Ok(outcome) => {
                     let verification = outcome.verification;
                     let sensitive = outcome.sensitive_target;
+                    // A refusal is `Unverifiable` on purpose — nothing was
+                    // delivered, so nothing failed, and a run of refusals must
+                    // not trip the rollback threshold. But it *ends the batch*
+                    // all the same: everything after it was planned on the
+                    // screen the refused action was supposed to produce.
+                    // Reading `last_verified` alone cannot see this, because a
+                    // refusal leaves it `None`.
+                    refused = outcome
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|e| e.effect == crate::computer::ActionEffect::Refused);
                     // Read before the outcome is taken apart: the diff is the
                     // only thing that knows where the change happened, and
                     // this record outlives it.
@@ -704,8 +720,10 @@ impl ComputerUseLoop {
             }
 
             // A failed action ends the batch: everything after it was planned
-            // on the screen it was supposed to produce.
-            if *last_verified == Some(false) {
+            // on the screen it was supposed to produce. A refused one ends it
+            // for the same reason, and it is checked separately because a
+            // refusal deliberately leaves `last_verified` unset.
+            if *last_verified == Some(false) || refused {
                 break;
             }
         }
@@ -1496,5 +1514,132 @@ mod tests {
         // Same handle, so a config edit reaches a running loop.
         allow.replace(vec!["Finder".to_string()]);
         assert_eq!(loop_.session.config().allow_apps.refusal(Some("Finder")), None);
+    }
+
+    /// A refused action ends the batch, exactly as a failed one does.
+    ///
+    /// A refusal is recorded as `Unverifiable` on purpose — nothing was
+    /// delivered, so nothing failed, and three refusals in a row must not roll
+    /// back work that may be fine. But the *batch* has to stop on one anyway:
+    /// everything after it was planned on the screen the refused action was
+    /// supposed to produce, and running it would act on a screen that did not
+    /// come to pass. The two facts are separate, and keying the break on
+    /// `last_verified == Some(false)` conflates them — a refused click leaves
+    /// `None`, so the rest of the batch used to run.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_refused_action_ends_the_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Refuses every click the way the ladder refuses a stale element;
+        /// counts what it dispatched.
+        struct RefusingClicks {
+            dispatched: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::computer::ComputerAdapter for RefusingClicks {
+            async fn screenshot(
+                &self,
+                _region: Option<crate::computer::Rect>,
+            ) -> crate::computer::Result<Screenshot> {
+                use base64::Engine as _;
+                let img = image::RgbImage::new(64, 64);
+                let mut buf = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut buf, image::ImageFormat::Png)
+                    .expect("a PNG");
+                Ok(Screenshot::new(
+                    base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                    64,
+                    64,
+                ))
+            }
+
+            async fn read_ui_tree(
+                &self,
+                _app: Option<&str>,
+            ) -> crate::computer::Result<Vec<crate::computer::UiElement>> {
+                Ok(Vec::new())
+            }
+
+            async fn execute(
+                &self,
+                action: DesktopAction,
+            ) -> crate::computer::Result<ActionResult> {
+                self.dispatched.fetch_add(1, Ordering::SeqCst);
+                // The ladder's terminal case: nothing delivered, and the
+                // caller must change the request rather than retry.
+                if matches!(action, DesktopAction::Click { .. }) {
+                    return Err(crate::computer::ComputerError::StaleElement(
+                        "e1 no longer exists".to_string(),
+                    ));
+                }
+                Ok(ActionResult::success("done"))
+            }
+
+            async fn wait_for(
+                &self,
+                _condition: crate::computer::WaitCondition,
+                _timeout: std::time::Duration,
+            ) -> crate::computer::Result<bool> {
+                Ok(true)
+            }
+
+            async fn display_geometry(
+                &self,
+            ) -> crate::computer::Result<crate::computer::DisplayGeometry> {
+                Ok(crate::computer::DisplayGeometry::new(vec![crate::computer::DisplayInfo::new(
+                    0, 0, 64, 64,
+                )
+                .primary()]))
+            }
+        }
+
+        let adapter = Arc::new(RefusingClicks {
+            dispatched: AtomicUsize::new(0),
+        });
+        let loop_ = ComputerUseLoop::new(adapter.clone()).with_config(LoopConfig {
+            max_steps: 3,
+            ..LoopConfig::default()
+        });
+
+        let result = loop_
+            .run("click, then type", move |state| async move {
+                if !state.history.is_empty() {
+                    return Ok(LoopDecision::Done { message: "done".to_string() });
+                }
+                Ok(LoopDecision::Batch(vec![
+                    DesktopAction::Click {
+                        target: crate::computer::types::ClickTarget::Coordinate(
+                            crate::computer::types::Point::new(4, 4),
+                        ),
+                        button: crate::computer::types::MouseButton::Left,
+                    },
+                    DesktopAction::Type {
+                        text: "abc".to_string(),
+                        target: None,
+                    },
+                ]))
+            })
+            .await
+            .expect("a run");
+
+        assert_eq!(
+            result.history.len(),
+            1,
+            "the type after the refused click was not run: {:?}",
+            result.history[1..]
+                .iter()
+                .map(|r| &r.action)
+                .collect::<Vec<_>>()
+        );
+        let record = &result.history[0];
+        assert!(record.result.message.contains("refused"), "{:?}", record.result.message);
+        assert_eq!(
+            record.verification,
+            StepVerification::Unverifiable,
+            "a refusal is not a verification failure"
+        );
     }
 }
