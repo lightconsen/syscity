@@ -92,27 +92,11 @@ impl ComputerAdapter for WindowsComputerAdapter {
             return Err(ComputerError::ScreenshotFailed(result.error.unwrap_or_default()));
         }
 
-        let data = result.data.as_ref();
-
-        let base64 = data
-            .and_then(|d| d.get("base64").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or_default();
-
-        let width = data
-            .and_then(|d| d.get("width").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        let height = data
-            .and_then(|d| d.get("height").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        Ok(Screenshot {
-            base64,
-            width,
-            height,
-            file_path: None,
-            timestamp: std::time::Instant::now(),
-        })
+        // The tool emits `image_base64` and no `width`; reading `base64` here
+        // returned an empty 0×0 picture and called it a success.
+        Ok(crate::computer::platform::common::screenshot_from_tool_data(
+            result.data.as_ref(),
+        ))
     }
 
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {

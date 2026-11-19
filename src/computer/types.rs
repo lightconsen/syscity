@@ -705,7 +705,12 @@ pub fn digest_of_base64(base64: &str) -> Option<String> {
 }
 
 /// Decode a standard base64 payload, or `None` when it is empty or invalid.
-fn base64_bytes(base64: &str) -> Option<Vec<u8>> {
+///
+/// `pub(crate)` because a platform adapter has to look at the bytes a tool
+/// handed it — to read the picture's real size — before it can build a
+/// `Screenshot`, and decoding it a second way would be a second definition of
+/// what the payload is.
+pub(crate) fn base64_bytes(base64: &str) -> Option<Vec<u8>> {
     if base64.is_empty() {
         return None;
     }

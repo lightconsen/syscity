@@ -70,29 +70,10 @@ impl ComputerAdapter for MacosComputerAdapter {
 
         let data = result.data.as_ref();
 
-        let base64 = data
-            .and_then(|d| {
-                d.get("image_base64")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .unwrap_or_default();
-
-        let width = data
-            .and_then(|d| d.get("width").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        let height = data
-            .and_then(|d| d.get("height").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        let file_path = data
-            .and_then(|d| d.get("file_path").and_then(|v| v.as_str()))
-            .map(std::path::PathBuf::from);
-
-        let mut ss = Screenshot::new(base64, width, height);
-        ss.file_path = file_path;
-        Ok(ss)
+        // One join for every platform: the key spelling and the size are read
+        // by the same code the x11 and Windows adapters use, so the three
+        // cannot drift into reading three different payload shapes again.
+        Ok(crate::computer::platform::common::screenshot_from_tool_data(data))
     }
 
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {

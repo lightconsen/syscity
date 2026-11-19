@@ -57,27 +57,12 @@ impl ComputerAdapter for X11ComputerAdapter {
             return Err(ComputerError::ScreenshotFailed(result.error.unwrap_or_default()));
         }
 
-        let data = result.data.as_ref();
-
-        let base64 = data
-            .and_then(|d| d.get("base64").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or_default();
-
-        let width = data
-            .and_then(|d| d.get("width").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        let height = data
-            .and_then(|d| d.get("height").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        Ok(Screenshot {
-            base64,
-            width,
-            height,
-            file_path: None,
-            timestamp: std::time::Instant::now(),
-        })
+        // Both the key spelling and the size used to be guessed here, and both
+        // guesses were wrong: the desktop tools emit `image_base64` and no
+        // `width`, so this returned an empty 0×0 picture reported as success.
+        Ok(crate::computer::platform::common::screenshot_from_tool_data(
+            result.data.as_ref(),
+        ))
     }
 
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {
@@ -665,27 +650,12 @@ impl ComputerAdapter for WaylandComputerAdapter {
             return Err(ComputerError::ScreenshotFailed(result.error.unwrap_or_default()));
         }
 
-        let data = result.data.as_ref();
-
-        let base64 = data
-            .and_then(|d| d.get("base64").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or_default();
-
-        let width = data
-            .and_then(|d| d.get("width").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        let height = data
-            .and_then(|d| d.get("height").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        Ok(Screenshot {
-            base64,
-            width,
-            height,
-            file_path: None,
-            timestamp: std::time::Instant::now(),
-        })
+        // Both the key spelling and the size used to be guessed here, and both
+        // guesses were wrong: the desktop tools emit `image_base64` and no
+        // `width`, so this returned an empty 0×0 picture reported as success.
+        Ok(crate::computer::platform::common::screenshot_from_tool_data(
+            result.data.as_ref(),
+        ))
     }
 
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {

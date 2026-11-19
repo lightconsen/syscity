@@ -26,44 +26,12 @@ impl ScreenshotTool {
     }
 
     /// Extract image dimensions from raw PNG or JPEG bytes by parsing headers.
+    ///
+    /// Delegates to the shared reader so the size reported here and the size
+    /// the adapter derives agree by construction — two parsers that both
+    /// "work" can still disagree on a payload one of them mishandles.
     fn image_dimensions(data: &[u8]) -> (u32, u32) {
-        // PNG: signature + IHDR chunk — width at offset 16, height at offset 20
-        if data.len() >= 24 && data[..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
-            let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
-            let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
-            return (w, h);
-        }
-        // JPEG: find SOF0 marker (0xFF 0xC0)
-        if data.len() > 4 && data[0] == 0xFF && data[1] == 0xD8 {
-            let mut i = 2;
-            while i + 4 < data.len() {
-                if data[i] == 0xFF {
-                    let marker = data[i + 1];
-                    if marker == 0xC0 {
-                        // SOF0: next 2 bytes are length, then 1 byte precision,
-                        // then 2 bytes height (BE), 2 bytes width (BE)
-                        if i + 9 < data.len() {
-                            let h = u16::from_be_bytes([data[i + 5], data[i + 6]]);
-                            let w = u16::from_be_bytes([data[i + 7], data[i + 8]]);
-                            return (w as u32, h as u32);
-                        }
-                    }
-                    if (0xD0..=0xD9).contains(&marker) {
-                        i += 2; // markers with no length
-                        continue;
-                    }
-                    if i + 2 < data.len() {
-                        let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
-                        i += 2 + seg_len;
-                    } else {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        (0, 0)
+        crate::computer::platform::common::image_dimensions(data)
     }
 
     /// The argv `screencapture` is given for a whole tool invocation.
