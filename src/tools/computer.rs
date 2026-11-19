@@ -588,23 +588,25 @@ fn action_to_desktop_action(action: &str, args: &Value) -> crate::Result<Desktop
             // element id first, then a point. Coordinates-only drags were the
             // one place the tool's "elements before pixels" contract did not
             // hold.
-            let from = if let Some(id) = args["from_element_id"].as_str().filter(|s| !s.is_empty())
-            {
-                ClickTarget::ElementId(id.to_string())
-            } else {
-                ClickTarget::Coordinate(Point::new(
-                    args["from_x"].as_i64().unwrap_or(0) as i32,
-                    args["from_y"].as_i64().unwrap_or(0) as i32,
-                ))
+            //
+            // Each end is required. An absent one used to default to (0, 0),
+            // which made `{"action": "drag"}` a gesture from the top-left
+            // corner to itself — a no-op that reported success.
+            let end = |id_key: &str, x_key: &str, y_key: &str, which: &str| {
+                if let Some(id) = args[id_key].as_str().filter(|s| !s.is_empty()) {
+                    return Ok(ClickTarget::ElementId(id.to_string()));
+                }
+                match (args[x_key].as_i64(), args[y_key].as_i64()) {
+                    (Some(x), Some(y)) => {
+                        Ok(ClickTarget::Coordinate(Point::new(x as i32, y as i32)))
+                    }
+                    _ => Err(crate::error::SyscityError::Validation(format!(
+                        "the drag has no {which}: name {id_key} or both {x_key} and {y_key}"
+                    ))),
+                }
             };
-            let to = if let Some(id) = args["to_element_id"].as_str().filter(|s| !s.is_empty()) {
-                ClickTarget::ElementId(id.to_string())
-            } else {
-                ClickTarget::Coordinate(Point::new(
-                    args["to_x"].as_i64().unwrap_or(0) as i32,
-                    args["to_y"].as_i64().unwrap_or(0) as i32,
-                ))
-            };
+            let from = end("from_element_id", "from_x", "from_y", "start")?;
+            let to = end("to_element_id", "to_x", "to_y", "end")?;
             Ok(DesktopAction::Drag { from, to })
         }
         "read_ui_tree" => {
@@ -826,8 +828,15 @@ fn parse_click_target(args: &Value) -> crate::Result<ClickTarget> {
     if let Some(label) = args["text"].as_str() {
         return Ok(ClickTarget::ElementLabel(label.to_string()));
     }
-    // Fall back to coordinate (0, 0) — let the adapter handle it.
-    Ok(ClickTarget::Coordinate(Point::new(0, 0)))
+    // Nothing named a target. The old fallback was `Coordinate(0, 0)` with a
+    // comment saying the adapter could handle it — and it could not: it
+    // dispatched at the top-left corner of the screen and reported success.
+    // A click with no target, a hover that quietly leaves the pointer in the
+    // corner and a drag that starts there are all the same bug wearing
+    // different names, so they are refused here, where the caller learns why.
+    Err(crate::error::SyscityError::Validation(
+        "no target: name an element_id, an x/y pair, or a label".to_string(),
+    ))
 }
 
 /// Parse the field a `type` action should write into, when one was named.
@@ -1596,6 +1605,46 @@ mod tests {
             action_to_desktop_action("pointer_move", &args).unwrap(),
             DesktopAction::PointerMove { to: Point::new(900, 600) }
         );
+    }
+
+    /// An action that names no target is refused, not aimed at the corner.
+    ///
+    /// This used to fall back to `Coordinate(0, 0)` "for the adapter to
+    /// handle", and the adapter dispatched: a hover with no target left the
+    /// pointer in the screen's top-left corner and reported success, so a
+    /// probe that measured nothing looked like a probe that worked. The same
+    /// fallback served click, double_click, scroll and drag.
+    ///
+    /// The assertion is on the *field names*, because that is what makes the
+    /// refusal actionable: the caller is told which keys would have worked,
+    /// not merely that something was wrong.
+    #[test]
+    fn an_action_with_no_target_is_refused_rather_than_aimed_at_the_corner() {
+        let cases: [(&str, Value, &[&str]); 6] = [
+            ("click", json!({"action": "click"}), &["no target"]),
+            ("double_click", json!({"action": "double_click"}), &["no target"]),
+            ("scroll", json!({"action": "scroll"}), &["no target"]),
+            ("hover", json!({"action": "hover"}), &["no target"]),
+            // Both ends are required, and each is reported on its own: the
+            // first case proves the start is checked, the second the end.
+            ("drag", json!({"action": "drag"}), &["from_element_id", "from_x"]),
+            (
+                "drag",
+                json!({"action": "drag", "from_x": 10, "from_y": 20}),
+                &["to_element_id", "to_x", "to_y"],
+            ),
+        ];
+        for (action, args, expected) in cases {
+            let err = action_to_desktop_action(action, &args)
+                .expect_err(&format!("{action} with no target must not dispatch"));
+            let message = err.to_string();
+            for needle in expected {
+                assert!(
+                    message.contains(needle),
+                    "{action} must name {needle} as the way out, got: {message}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
