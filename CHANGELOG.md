@@ -44,6 +44,13 @@ if no section matches, the release falls back to auto-generated notes.
   button down was reported clean. `resize_window` also refuses a zero
   dimension: X11 errors on it, System Events accepts it, and a zero window
   cannot be seen or found again by the model that asked for it.
+- **A refused action ends its batch.** A refusal is recorded `Unverifiable` —
+  nothing was delivered, so nothing failed — and the batch break tested only
+  for a verification failure. A refused click in the middle of a batch used to
+  run every action after it, on a screen those actions assumed it had produced.
+  The break now reads `ActionEffect::Refused` from the step's evidence; the
+  verdict stays `Unverifiable`, so a run of refusals still cannot trip the
+  auto-rollback threshold.
 
 ### Changed
 
