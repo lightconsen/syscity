@@ -86,8 +86,11 @@ Actions are one of:
   {"type": "activate_window", "title_pattern": "Untitled"}
   {"type": "close_window", "title_pattern": "Untitled"}
   {"type": "list_windows"}
+  {"type": "get_window_geometry", "title_pattern": "Untitled"}
   {"type": "move_window", "title_pattern": "Untitled", "x": 0, "y": 0}
   {"type": "resize_window", "title_pattern": "Untitled", "width": 800, "height": 600}
+  {"type": "minimize_window", "title_pattern": "Untitled"}
+  {"type": "maximize_window", "title_pattern": "Untitled"}
   {"type": "read_ui_tree"}
   {"type": "screenshot"}
   {"type": "screenshot", "region": {"x": 0, "y": 0, "width": 300, "height": 200}}
@@ -815,6 +818,12 @@ pub fn describe_action(action: &DesktopAction) -> String {
         DesktopAction::ResizeWindow { title_pattern, .. } => {
             format!("resize the window {title_pattern:?}")
         }
+        DesktopAction::MinimizeWindow { title_pattern } => {
+            format!("minimize the window {title_pattern:?}")
+        }
+        DesktopAction::MaximizeWindow { title_pattern } => {
+            format!("maximize the window {title_pattern:?}")
+        }
         DesktopAction::Screenshot { .. } => "take a screenshot".to_string(),
         other => format!("{other:?}"),
     }
@@ -895,11 +904,19 @@ impl WireDecision {
 ///
 /// The set is smaller than [`DesktopAction`] on purpose — process control and
 /// system queries are not step-by-step UI decisions — but it is not *arbitrarily*
-/// smaller. `drag`, `wait`, the clipboard pair and the window quartet are what a
+/// smaller. `drag`, `wait`, the clipboard pair and the window actions are what a
 /// person reaches for on an ordinary screen, and their absence made whole
 /// classes of UI unreachable no matter how good the perception was: a slider,
 /// a kanban column, a text selection and a scrollbar only move by dragging, and
 /// a run with no `wait` retried a slow dialog as if it had failed.
+///
+/// The window set is the whole one: measure, activate, move, resize, minimize,
+/// maximize, close, list. Move and resize alone were the reason "put these two
+/// side by side" was unreachable — positioning a window you have not measured
+/// is a guess, and making it "as wide as its half" needs the display's size,
+/// which `maximize_window` supplies without the model knowing it. Still left
+/// out: `get_system_status`, the process actions, and the clipboard's
+/// read-modify-write pair, none of which is a decision taken from a picture.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireAction {
@@ -994,6 +1011,24 @@ enum WireAction {
         title_pattern: String,
         width: u32,
         height: u32,
+    },
+    /// Measure a window, so a later `move_window` can be aimed rather than
+    /// guessed. Also how a side-by-side layout is planned: a person reads the
+    /// two frames before dragging one next to the other.
+    GetWindowGeometry {
+        title_pattern: String,
+    },
+    MinimizeWindow {
+        title_pattern: String,
+    },
+    /// Fill the screen with the window.
+    ///
+    /// The counterpart to `resize_window`: "as large as this display allows"
+    /// without the model having to know the display's size. It matters for the
+    /// layout work `move_window`/`resize_window` exist for — two windows side
+    /// by side, one of them made as wide as its half.
+    MaximizeWindow {
+        title_pattern: String,
     },
     ReadUiTree {
         #[serde(default)]
@@ -1148,6 +1183,15 @@ impl WireAction {
             }
             WireAction::ActivateWindow { title_pattern } => {
                 Ok(DesktopAction::ActivateWindow { title_pattern })
+            }
+            WireAction::GetWindowGeometry { title_pattern } => {
+                Ok(DesktopAction::GetWindowGeometry { title_pattern })
+            }
+            WireAction::MinimizeWindow { title_pattern } => {
+                Ok(DesktopAction::MinimizeWindow { title_pattern })
+            }
+            WireAction::MaximizeWindow { title_pattern } => {
+                Ok(DesktopAction::MaximizeWindow { title_pattern })
             }
             WireAction::ReadUiTree { app } => Ok(DesktopAction::ReadUiTree { app }),
             WireAction::Hover { element_id, x, y } => Ok(DesktopAction::Hover {
@@ -1962,8 +2006,15 @@ mod tests {
         assert_eq!(get, LoopDecision::Action(DesktopAction::ClipboardGet));
     }
 
+    /// Every window action the loop can name, in one place.
+    ///
+    /// The set is no longer a quartet: measuring a window and the two
+    /// display-relative sizes are what a side-by-side layout needs beyond move
+    /// and resize. All seven parse from the wire rather than only existing on
+    /// `DesktopAction`, because an action the decision maker cannot name does
+    /// not exist as far as a run is concerned.
     #[test]
-    fn the_window_quartet_parses() {
+    fn the_window_actions_parse() {
         let close = parse_decision(
             r#"{"decision": "act", "action": {"type": "close_window", "title_pattern": "Untitled"}}"#,
         )
@@ -2001,6 +2052,45 @@ mod tests {
                 title_pattern: "Untitled".to_string(),
                 width: 800,
                 height: 600
+            })
+        );
+
+        // The three that finished the set. They were in `DesktopAction` — and
+        // in the `computer` tool — but not here, so the loop's decision maker
+        // could not name them: "put these two side by side" had move and
+        // resize, but no way to measure a window first, and no way to say
+        // "as large as the display allows" without knowing its size.
+        let measured = parse_decision(
+            r#"{"decision": "act", "action": {"type": "get_window_geometry",
+                "title_pattern": "Untitled"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            measured,
+            LoopDecision::Action(DesktopAction::GetWindowGeometry {
+                title_pattern: "Untitled".to_string()
+            })
+        );
+        let minimized = parse_decision(
+            r#"{"decision": "act", "action": {"type": "minimize_window",
+                "title_pattern": "Untitled"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            minimized,
+            LoopDecision::Action(DesktopAction::MinimizeWindow {
+                title_pattern: "Untitled".to_string()
+            })
+        );
+        let maximized = parse_decision(
+            r#"{"decision": "act", "action": {"type": "maximize_window",
+                "title_pattern": "Untitled"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            maximized,
+            LoopDecision::Action(DesktopAction::MaximizeWindow {
+                title_pattern: "Untitled".to_string()
             })
         );
     }

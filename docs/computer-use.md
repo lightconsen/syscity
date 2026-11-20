@@ -601,6 +601,30 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 每一帧在选中那一步时才通过 `attachment.get` 取一次，因为一轮可以有三十步，先把图全取回来
 是为没人看的画面付费。
 
+### 6.1b 多窗口排布 —— 已收口，但先纠正一个判断
+
+原判断是"`CloseWindow`/`ListWindows`/`MoveWindow`/`ResizeWindow` 都在
+`DesktopAction` 里，模型发不出去"。**前半句对，后半句当时只对了一半**：`computer`
+工具早就全都能发（29 个 action 一个不缺），真正缺的是 use-loop 的
+`WireAction`——模型的决策 JSON。缺的是**三个**，不是四个：
+`get_window_geometry`、`minimize_window`、`maximize_window`。四件套里的四个
+本来就是通的。
+
+为什么缺的偏偏是这三个，值得说：`move_window` 需要坐标，而"窗口现在多大、在哪"
+本来只能靠 `list_windows` 猜；`minimize` 是"腾出这块地方"最直接的手，缺了它
+"先把这个挪开"只能靠移动或关闭；`maximize` 是"先铺满再说"。侧并排（人做的
+第一件事）因此要走一条更绕的路——先量、再算、再拖，而量那一步当时不存在。
+
+补齐之后，`WireAction` 与 `DesktopAction` 的差集只剩五项，全部是**不是从图片里
+做决定**的那类：`get_system_status`、`list_processes`、`kill_process`、
+`restart_process`、`set_process_priority`。这个差集是有意的（见 `driver.rs` 里
+`WireAction` 的文档），不是遗漏——进程控制和系统查询不是逐步的 UI 决定。
+
+剩下的真实限制不在接线，在**感知**：两个窗口并排之后，屏外的那个会被
+`tree_budget` 折叠成一行，而视觉扫描只覆盖当前屏。对照操作是可行的，"同时盯着
+两个窗口里的小字对照"仍然受 1024 宽整图的限制——这条属于 §6.2 的感知短板，
+不是窗口动作的缺失。
+
 ### 6.2 明确能接受的几条"做不到"
 
 不是工作量问题，是领域硬限制。

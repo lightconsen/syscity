@@ -13,6 +13,17 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **The decision maker can name every window action.** `get_window_geometry`,
+  `minimize_window` and `maximize_window` existed on `DesktopAction` and in the
+  `computer` tool, but had no `WireAction` variant — so the loop's decision
+  maker could not emit them, and "put these two windows side by side" was
+  unreachable through the loop (the `computer` tool path could already do it).
+  Measuring a window is what turns a later `move_window` from a guess into an
+  aim, and `maximize_window` is "as large as this display allows" without the
+  model having to know the display's size. All seven window actions now parse
+  from the wire, covered by `the_window_actions_parse`. The remaining wire
+  difference is deliberate and five items long: process control and system
+  queries are not step-by-step UI decisions.
 - **A hover's tooltip is cleared for the model.** A `hover` probe leaves the
   pointer on the control — that is what makes the measurement — and everything
   the probe opened (tooltip, highlight, fly-out menu) is drawn into every later
