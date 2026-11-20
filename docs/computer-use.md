@@ -177,6 +177,24 @@ Computer use 的**单步质量**早就是第一梯队：动作效果三态验证
 零 root（`TreeUnread`，桌面没发布树）、被深度/数量截断（`TreeIncomplete`）。零 root
 不能算完整——空列表证明不了"就这些了"，那正是这条规则要防的情况。
 
+**"这个模型能不能看图"有两个来源，顺序是硬的。** `plan_perception` 的第一条就是
+`model_supports_vision`，为假时**一张图都不发**——给看不见的模型发图，除了烧 token
+就是让请求被拒。这个布尔来自模型目录，而目录填它的方式是：
+
+1. 模型 id 说出了这个 build 认得的一个家族（Claude 的 opus/sonnet/haiku、
+   `gpt-4o`、`o1`/`o3`），就按家族答；家族答"不能看"时（`gpt-4`、`gpt-3.5`）
+   **就到此为止**，不去问 provider——OpenAI 的 preset 整体支持视觉，不代表
+   `gpt-4` 能看。
+2. id 什么都没说（`qwen3.7-plus`、`kimi-k2.6`、`gpt-5.4-mini`、用户的部署名），
+   才回落到 provider preset 的 `default_supports_vision`。这是唯一一处手写的
+   厂商能力声明，`presets.toml` 里每个 variant 一行。
+3. provider 根本不是内置 preset（自定义 endpoint），**什么都不假设**——给它发图
+   可能被整个拒掉，而"不知道"不等于"能看"。
+
+第一条曾把第 2 种情况一起答成"不能看"，于是 Qwen / Kimi / 甚至 OpenAI preset
+自带的 `gpt-5.4-mini` 在 computer-use 里一张截图都收不到，界面上显示
+`model_supports_vision: false`，而它其实是能看的。
+
 ### L2.5 · 验证读"变化在哪里"，不只是"有没有变化"
 
 `ScreenDiff` 除了统计像素变化，还带着 `aim`（`AimCheck`）：动作瞄准的框，

@@ -48,6 +48,34 @@ pub fn canonical_provider_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+/// Whether a provider's models take images, as the preset declares it.
+///
+/// The preset is the only place a vendor's capability is stated by hand, and
+/// it is stated per *variant* (Kimi's OpenAI-compatible and Anthropic-
+/// compatible endpoints are both vision-capable; Ollama's default is not).
+/// A caller that does not know which variant is in use takes the first, which
+/// is the one `default_model` comes from.
+///
+/// Both spellings a config can hold resolve: the preset key, and the vendor's
+/// display name (a provider registered as `"DeepSeek"` sits on the `deepseek`
+/// preset — the same rule the router applies when it builds the provider).
+///
+/// `None` for a provider that is not a built-in preset (a custom endpoint):
+/// nothing here knows that vendor, and guessing would be worse than saying so.
+pub fn preset_supports_vision(provider: &str) -> Option<bool> {
+    let provider = canonical_provider_name(provider);
+    let providers = builtin_providers();
+    providers
+        .get(provider)
+        .or_else(|| {
+            providers
+                .values()
+                .find(|definition| definition.display_name.eq_ignore_ascii_case(provider))
+        })
+        .and_then(|definition| definition.variants.first())
+        .map(|variant| variant.default_supports_vision)
+}
+
 /// All built-in provider definitions.
 ///
 /// The key is the preset name used in config (e.g. `"openai"`, `"kimi"`).
@@ -296,5 +324,28 @@ mod tests {
                 "{name}: the model list must lead with the default model"
             );
         }
+    }
+
+    /// The catalog falls back to this for every model id it was not taught, so
+    /// it has to answer for the three cases its caller distinguishes: a
+    /// vision-capable preset, a preset that says no, and a name that is not a
+    /// preset at all.
+    #[test]
+    fn preset_supports_vision_answers_per_vendor() {
+        assert_eq!(preset_supports_vision("qwen"), Some(true));
+        assert_eq!(preset_supports_vision("deepseek"), Some(false));
+        assert_eq!(preset_supports_vision("ollama"), Some(false));
+        // The alias table resolves before the look-up, so an old config key
+        // gets whatever the canonical name gets — here, nothing: `volcengine`
+        // is not one of the seven shipped presets, and the alias must not turn
+        // an unknown name into a claimed capability.
+        assert_eq!(preset_supports_vision("doubao"), None);
+        assert_eq!(preset_supports_vision("doubao"), preset_supports_vision("volcengine"));
+        // Not a preset — a custom endpoint — is answered as unknown, not false.
+        assert_eq!(preset_supports_vision("my-custom-deployment"), None);
+        // A provider registered under its display name resolves to the same
+        // preset the router would build it from.
+        assert_eq!(preset_supports_vision("DeepSeek"), Some(false));
+        assert_eq!(preset_supports_vision("Qwen"), Some(true));
     }
 }

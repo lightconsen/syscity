@@ -151,11 +151,16 @@ impl ModelDiscoverySource for StaticModelSource {
     async fn discover(&self) -> crate::Result<Vec<ModelCatalogEntry>> {
         let mut entries = Vec::new();
         for (provider, model_id) in &self.models {
-            let mut entry =
+            let entry =
                 ModelCatalogEntry::new(model_id.clone(), model_id.clone(), provider.clone());
-
-            // Heuristic: set known context windows and capabilities
-            entry = apply_known_model_metadata(entry, model_id);
+            // What the model id itself says, when it names a family this build
+            // has been taught — and it is authoritative when it does, because
+            // `gpt-4` is text-only even though the OpenAI preset is not.
+            // `None` means the id says nothing — `qwen3.7-plus`, `gpt-5.4-mini`,
+            // a custom deployment name — and then the provider's own preset
+            // answers, which is where a vendor's capability is written down.
+            let entry = apply_known_model_metadata(entry.clone(), model_id)
+                .unwrap_or_else(|| apply_provider_defaults(entry, provider));
             entries.push(entry);
         }
         Ok(entries)
@@ -166,8 +171,19 @@ impl ModelDiscoverySource for StaticModelSource {
     }
 }
 
-/// Apply known metadata heuristics for common models.
-fn apply_known_model_metadata(mut entry: ModelCatalogEntry, model_id: &str) -> ModelCatalogEntry {
+/// What this build knows about a model id on sight.
+///
+/// `None` is the important answer: it means the id names no family this build
+/// has been taught, and the caller must fall back to the provider's
+/// declaration rather than to a `false` that nobody stated. The previous
+/// `-> ModelCatalogEntry` made "not a known family" indistinguishable from
+/// "known, and it cannot see", so every unlisted id — `gpt-5.4-mini`,
+/// `qwen3.7-plus`, a user's custom deployment name — was recorded as
+/// text-only and a computer-use run never attached a single image.
+fn apply_known_model_metadata(
+    mut entry: ModelCatalogEntry,
+    model_id: &str,
+) -> Option<ModelCatalogEntry> {
     let id_lower = model_id.to_lowercase();
 
     // Family match, not version match. The list this replaced enumerated
@@ -176,6 +192,8 @@ fn apply_known_model_metadata(mut entry: ModelCatalogEntry, model_id: &str) -> M
     // (`claude-sonnet-4-6` — the version sits in the middle) and would have
     // missed every later id too. What is true of a family stays true across its
     // generations: Claude models take images, call tools, and read 200k tokens.
+    //
+    // `haiku` needs no arm of its own: it is in the family list below.
     let is_claude = id_lower.starts_with("claude")
         && ["opus", "sonnet", "haiku"]
             .iter()
@@ -187,26 +205,56 @@ fn apply_known_model_metadata(mut entry: ModelCatalogEntry, model_id: &str) -> M
         entry.supports_reasoning = true;
         entry.input_modalities = vec!["text".to_string(), "image".to_string()];
         entry.capabilities = vec!["long_context".to_string(), "vision".to_string()];
-    // (The `claude-3-haiku` branch that used to sit here is subsumed by the
-    // family match above: any Claude model with `haiku` in the id takes it.)
+        Some(entry)
     } else if id_lower.contains("gpt-4o") || id_lower.contains("gpt-4-turbo") {
         entry.context_window = Some(128_000);
         entry.supports_vision = true;
         entry.supports_tools = true;
         entry.input_modalities = vec!["text".to_string(), "image".to_string()];
+        Some(entry)
     } else if id_lower.contains("gpt-4") {
         entry.context_window = Some(8192);
         entry.supports_tools = true;
+        Some(entry)
     } else if id_lower.contains("gpt-3.5") || id_lower.contains("gpt-35") {
         entry.context_window = Some(16_385);
         entry.supports_tools = true;
+        Some(entry)
     } else if id_lower.contains("o1") || id_lower.contains("o3") {
         entry.context_window = Some(200_000);
         entry.supports_reasoning = true;
         entry.supports_tools = true;
         entry.input_modalities = vec!["text".to_string(), "image".to_string()];
+        Some(entry)
+    } else {
+        // Not a family this build recognises — say so instead of asserting
+        // the model cannot see.
+        None
     }
+}
 
+/// Fill in what the provider promises, for a model id that named no family.
+///
+/// The preset's `default_supports_vision` is the only hand-written statement
+/// of a vendor's capability, and it was previously unreachable: it fed
+/// `ProviderInstanceConfig`, which nothing reads into the catalog. So a
+/// deployment on Qwen, Kimi or `gpt-5.4-mini` — all declared vision-capable —
+/// was recorded as text-only, and `plan_perception` sent it no image at all.
+///
+/// A provider that is not a built-in preset contributes nothing: a custom
+/// endpoint's capabilities are unknown here, and inventing `true` would send
+/// images to a model that may reject the request outright.
+fn apply_provider_defaults(mut entry: ModelCatalogEntry, provider: &str) -> ModelCatalogEntry {
+    let Some(vision) = crate::providers::preset::preset_supports_vision(provider) else {
+        return entry;
+    };
+    entry.supports_vision = vision;
+    if vision {
+        entry.input_modalities = vec!["text".to_string(), "image".to_string()];
+        if !entry.capabilities.iter().any(|c| c == "vision") {
+            entry.capabilities.push("vision".to_string());
+        }
+    }
     entry
 }
 
@@ -446,7 +494,8 @@ mod tests {
             "claude-opus-5",
             "claude-haiku-4-5",
         ] {
-            let entry = apply_known_model_metadata(ModelCatalogEntry::new(id, id, "anthropic"), id);
+            let entry = apply_known_model_metadata(ModelCatalogEntry::new(id, id, "anthropic"), id)
+                .expect("a Claude id names a known family");
             assert_eq!(
                 entry.context_window,
                 Some(200_000),
@@ -456,14 +505,13 @@ mod tests {
             assert!(entry.supports_tools, "{id} should be known to call tools");
         }
 
-        // A non-Claude id is still left alone.
+        // A non-Claude id takes its own family's answer, not Claude's.
         let other = apply_known_model_metadata(
             ModelCatalogEntry::new("gpt-4o", "GPT-4o", "openai"),
             "gpt-4o",
-        );
-        assert!(
-            other.capabilities.is_empty() || !other.capabilities.contains(&"vision".to_string())
-        );
+        )
+        .expect("gpt-4o names a known family");
+        assert_eq!(other.context_window, Some(128_000));
     }
 
     #[test]
@@ -602,7 +650,7 @@ mod tests {
     #[test]
     fn test_known_metadata_gpt4o() {
         let entry = ModelCatalogEntry::new("gpt-4o", "GPT-4o", "openai");
-        let entry = apply_known_model_metadata(entry, "gpt-4o");
+        let entry = apply_known_model_metadata(entry, "gpt-4o").expect("gpt-4o is a known family");
         assert_eq!(entry.context_window, Some(128_000));
         assert!(entry.supports_vision);
         assert!(entry.supports_tools);
@@ -611,8 +659,71 @@ mod tests {
     #[test]
     fn test_known_metadata_claude_opus() {
         let entry = ModelCatalogEntry::new("claude-3-opus-20240229", "Claude 3 Opus", "anthropic");
-        let entry = apply_known_model_metadata(entry, "claude-3-opus-20240229");
+        let entry = apply_known_model_metadata(entry, "claude-3-opus-20240229")
+            .expect("a Claude id names a known family");
         assert_eq!(entry.context_window, Some(200_000));
         assert!(entry.supports_reasoning);
+    }
+
+    /// The gap this closes: an id the build has never been taught used to be
+    /// recorded as text-only, so a computer-use run on Qwen, Kimi or the
+    /// OpenAI preset's own `gpt-5.4-mini` never attached an image.
+    #[tokio::test]
+    async fn an_unrecognised_id_takes_the_provider_preset() {
+        for (provider, model_id) in [
+            ("qwen", "qwen3.7-plus"),
+            ("kimi", "kimi-k2.6"),
+            ("openai", "gpt-5.4-mini"),
+        ] {
+            let source = StaticModelSource::new(
+                provider,
+                vec![(provider.to_string(), model_id.to_string())],
+            );
+            let entries = source.discover().await.unwrap();
+            assert!(
+                entries[0].supports_vision,
+                "{provider}/{model_id} is declared vision-capable in presets.toml"
+            );
+            assert!(
+                entries[0].input_modalities.contains(&"image".to_string()),
+                "{provider}/{model_id} should accept image input"
+            );
+        }
+    }
+
+    /// A preset that says `false` must say so. This also covers the case the
+    /// fallback must not swallow: `gpt-4` is a plain text model even though
+    /// the openai preset as a whole is vision-capable, because the id names a
+    /// family and the family's answer wins.
+    #[tokio::test]
+    async fn a_text_only_family_keeps_its_own_answer() {
+        let source =
+            StaticModelSource::new("openai", vec![("openai".to_string(), "gpt-4".to_string())]);
+        let entries = source.discover().await.unwrap();
+        assert!(
+            !entries[0].supports_vision,
+            "the gpt-4 family is text-only; the openai preset must not turn it back on"
+        );
+        assert!(
+            !entries[0].input_modalities.contains(&"image".to_string()),
+            "a text-only model must not advertise image input"
+        );
+    }
+
+    /// A custom endpoint is not a built-in preset, so nothing here knows what
+    /// it can do. Inventing `true` would send images to a model that may
+    /// reject the whole request.
+    #[tokio::test]
+    async fn an_unknown_provider_falls_back_without_claiming_vision() {
+        let source = StaticModelSource::new(
+            "my-custom-deployment",
+            vec![("my-custom-deployment".to_string(), "internal-model-1".to_string())],
+        );
+        let entries = source.discover().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].supports_vision,
+            "an unknown provider's capabilities are unknown, not assumed"
+        );
     }
 }

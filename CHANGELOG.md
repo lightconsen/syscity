@@ -45,6 +45,15 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **A vision-capable model is no longer recorded as text-only.** The catalog
+  decided "can this model see?" from a table of model-id patterns, and
+  everything the table did not recognise — `qwen3.7-plus`, `kimi-k2.6`,
+  `gpt-5.4-mini`, a user's deployment name — was written down as text-only, so
+  a computer-use run on it attached no screenshots at all. The pattern table
+  still answers when an id names a family it knows (`gpt-4` stays text-only
+  even on a vision-capable provider), and otherwise the provider's preset
+  answers, which is the only place a vendor's capability is stated by hand. A
+  provider that is not a built-in preset is still not assumed to take images.
 - **An action that did not happen is no longer reported as one that did.**
   Every adapter built its result from the tool's output and ignored the tool's
   own success flag, so a script that raised, a window that matched nothing, and

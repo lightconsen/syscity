@@ -82,6 +82,14 @@ Only the OpenAI protocol is listed above; `kimi` is the dual-protocol vendor
 (its Anthropic-compatible endpoint is `api.moonshot.cn/anthropic`, selected with
 `protocol = "anthropic"`).
 
+`preset_supports_vision(provider)` is the reader of each variant's
+`default_supports_vision`. It exists because the model catalog needs one fact —
+"do this vendor's models take images?" — for a model id it has never been
+taught, and the preset is where that fact is written by hand. It resolves the
+preset key, the alias table, and the display-name spelling; it answers `None`
+(not `false`) for anything that is not a preset, so a custom endpoint is never
+granted a capability nobody stated.
+
 **These seven are the whole list by design.** `presets.toml` had grown to 35 in a
 breadth pass; it is now seven, because a preset buys *convenience*, not
 capability: any OpenAI-compatible endpoint was always reachable through
