@@ -625,6 +625,34 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 两个窗口里的小字对照"仍然受 1024 宽整图的限制——这条属于 §6.2 的感知短板，
 不是窗口动作的缺失。
 
+**但补完之后立刻暴露了一个动作层的单向门，值得单独记一笔**：`minimize_window`
+交出去以后，唯一能把它叫回来的动作是 `activate_window`，而三个平台的实现并不
+一样。Windows 走 `ShowWindowAsync(SW_SHOWNORMAL)`，会还原。Linux 原来只发
+`xdotool windowactivate`，也就是 `_NET_ACTIVE_WINDOW` 这个**请求**——由 WM 决定
+怎么处理，没有 pager 的 WM 可以直接忽略，窗口仍然是 unmap 状态。macOS 原本只有
+`set frontmost of (first process whose name contains ...) to true`——它抬起的是
+**应用**，最小化的窗口仍在 Dock 里躺着，而且拿 `title_pattern` 去匹**进程名**，
+字段名和语义都对不上。也就是说：在 macOS 上，模型一旦最小化一个窗口，就再也拿
+不回来了。
+
+现在 Linux 先发 `xdotool windowmap` 再 `windowactivate`：`windowminimize` 是
+`XUnmapWindow`，`windowmap` 是它的直接逆操作（`XMapWindow`），不经过 WM 的判断，
+本工具最小化的窗口一定能回来；两半各自独立汇报，只有都失败才报失败——窗口已经
+回到屏幕上却因为没能抢到焦点而报 "Activate failed"，会让模型重试一个已经成功的
+动作。
+
+macOS 则先按**窗口标题**找（`list_windows` 给的就是标题），把 `minimized` 写回
+false 还原、再 `AXRaise` 置顶，进程名只作为兜底。用 System Events 自己的
+`minimized` 属性而不是 `AXMinimized` 属性，是因为 `MinimizeWindow` 写的就是它
+——读写走两个名字，就是同一件事的两种拼法，迟早对不上。同时 `list_windows`
+在 macOS 上开始真的报 `minimized`——原来的脚本把这字段硬编码成 `false`，于是
+"窗口不见了"和"窗口在后面"在模型眼里是同一件事，而唯一能区分它们的动作正好是
+还原。一个最小化的窗口既不在树里（被折叠）也不在截图里（屏外），没有这个标志，
+模型连"我该还原哪一个"都问不出来。
+
+这也是这一类改动的通用教训：**加一个"收起"的动作时，同一个 commit 里就要有
+"展开"的路**，否则它是一个能把窗口变没、但变不回来的门。
+
 ### 6.2 明确能接受的几条"做不到"
 
 不是工作量问题，是领域硬限制。

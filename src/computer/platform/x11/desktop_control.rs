@@ -126,6 +126,19 @@ impl DesktopControlTool {
             Err(_) => Ok((false, String::new(), "wmctrl timed out".to_string())),
         }
     }
+
+    /// Map a window and make it the active one.
+    ///
+    /// `windowminimize` is `XUnmapWindow`, so `windowmap` is its exact inverse:
+    /// whatever the window manager does with `_NET_ACTIVE_WINDOW`, the window
+    /// this tool minimised comes back. `windowactivate` is still attempted,
+    /// because mapping alone does not raise or focus.
+    async fn activate_window_id(window_id: &str) -> crate::Result<ToolExecutionResult> {
+        let (mapped, _, map_err) = Self::run_xdotool(&["windowmap", window_id]).await?;
+        let (activated, _, activate_err) =
+            Self::run_xdotool(&["windowactivate", window_id]).await?;
+        Ok(activate_outcome(window_id, mapped, activated, &map_err, &activate_err))
+    }
 }
 
 #[async_trait]
@@ -401,33 +414,14 @@ impl Tool for DesktopControlTool {
                 let window_id = args.get("window_id").and_then(|v| v.as_str());
 
                 if let Some(wid) = window_id {
-                    let (ok, _, err) = Self::run_xdotool(&["windowactivate", wid]).await?;
-                    if ok {
-                        return Ok(ToolExecutionResult::success(format!(
-                            "Activated window {}",
-                            wid
-                        )));
-                    } else {
-                        return Ok(ToolExecutionResult::error(format!("Activate failed: {}", err)));
-                    }
+                    return Self::activate_window_id(wid).await;
                 }
 
                 if let Some(n) = name {
                     let (ok, wid, err) = Self::run_xdotool(&["search", "--name", n]).await?;
                     if ok && !wid.trim().is_empty() {
                         let first = wid.lines().next().unwrap_or("").trim();
-                        let (ok2, _, err2) = Self::run_xdotool(&["windowactivate", first]).await?;
-                        if ok2 {
-                            return Ok(ToolExecutionResult::success(format!(
-                                "Activated window '{}' (id: {})",
-                                n, first
-                            )));
-                        } else {
-                            return Ok(ToolExecutionResult::error(format!(
-                                "Activate failed: {}",
-                                err2
-                            )));
-                        }
+                        return Self::activate_window_id(first).await;
                     }
                     return Ok(ToolExecutionResult::error(format!(
                         "Window '{}' not found: {}",
@@ -658,6 +652,35 @@ impl Tool for DesktopControlTool {
     }
 }
 
+/// Decide what a window restore reports.
+///
+/// Split out from [`DesktopControlTool::activate_window_id`] so that the two
+/// halves can be exercised without xdotool. The distinction that matters is
+/// that mapping and focusing fail independently: a window that is back on
+/// screen but could not take focus is a success, because the caller's next
+/// step — look at it — works. Reporting it as "Activate failed" would send the
+/// caller looking for a problem it does not have.
+fn activate_outcome(
+    window_id: &str,
+    mapped: bool,
+    activated: bool,
+    map_err: &str,
+    activate_err: &str,
+) -> ToolExecutionResult {
+    match (mapped, activated) {
+        (true, true) => ToolExecutionResult::success(format!("Activated window {window_id}")),
+        (true, false) => ToolExecutionResult::success(format!(
+            "Mapped window {window_id}, but could not focus it: {activate_err}"
+        )),
+        (false, true) => ToolExecutionResult::success(format!(
+            "Focused window {window_id}, but could not map it: {map_err}"
+        )),
+        (false, false) => {
+            ToolExecutionResult::error(format!("Activate failed: {map_err} / {activate_err}"))
+        }
+    }
+}
+
 /// Decide what a finished drag reports.
 ///
 /// Split out from [`DesktopControlTool::drag`] so the Release Guard's three
@@ -747,5 +770,32 @@ mod tests {
         let result = drag_outcome(Err("move died".into()), false, "mouseup died", 0, 0, 0, 0);
         assert!(!result.success);
         assert!(text(&result).contains("may still be held"), "{}", text(&result));
+    }
+
+    /// Either half succeeding means the window is on screen.
+    ///
+    /// `windowmap` is a direct `XMapWindow`; `windowactivate` asks the window
+    /// manager to raise it, and a window manager that raises a window also
+    /// deiconifies it. So a failed map with a successful activate still puts
+    /// the window back — the two are different routes to the same outcome, and
+    /// requiring both would report a restored window as broken.
+    #[test]
+    fn either_route_back_counts_as_restored() {
+        let via_focus = activate_outcome("12345", false, true, "no such window", "");
+        assert!(via_focus.success, "{}", text(&via_focus));
+        assert!(text(&via_focus).contains("could not map"), "{}", text(&via_focus));
+
+        let via_map = activate_outcome("12345", true, false, "", "_NET_ACTIVE_WINDOW ignored");
+        assert!(via_map.success, "{}", text(&via_map));
+        assert!(text(&via_map).contains("could not focus"), "{}", text(&via_map));
+    }
+
+    /// Neither route working is the only real failure.
+    #[test]
+    fn both_halves_failing_names_both_reasons() {
+        let result = activate_outcome("12345", false, false, "map died", "focus died");
+        assert!(!result.success);
+        let text = text(&result);
+        assert!(text.contains("map died") && text.contains("focus died"), "{text}");
     }
 }

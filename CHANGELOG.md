@@ -24,6 +24,24 @@ if no section matches, the release falls back to auto-generated notes.
   from the wire, covered by `the_window_actions_parse`. The remaining wire
   difference is deliberate and five items long: process control and system
   queries are not step-by-step UI decisions.
+- **Restoring a minimised window now works on macOS and Linux.** Wiring
+  `minimize_window` through the decision maker exposed a one-way door:
+  `activate_window` on macOS ran `set frontmost of (first process whose name
+  contains …)`, which raises the *application* and leaves a minimised window in
+  the Dock — so the model could hide a window and never get it back, and the
+  title it was given by `list_windows` was matched against a *process name*. It
+  now matches the window title first, sets the window's `minimized` back to
+  false (the same System Events property `minimize_window` writes, rather than a
+  second spelling through `AXMinimized`), and raises the restored window; the
+  process name survives only as a fallback. On Linux, `activate_window` sent
+  only `_NET_ACTIVE_WINDOW` — a request a window manager without a pager may
+  ignore — and now sends `windowmap` first, the direct inverse of
+  `windowminimize`'s unmap; the two halves report independently, and only both
+  failing is a failure. `list_windows` on macOS also reports each window's real
+  minimised state (it was hardcoded `false`), so "the window vanished" and "the
+  window is behind the front one" are no longer the same observation — both are
+  off-screen to the tree and the screenshot, and the restore action is the only
+  thing that can tell them apart.
 - **A hover's tooltip is cleared for the model.** A `hover` probe leaves the
   pointer on the control — that is what makes the measurement — and everything
   the probe opened (tooltip, highlight, fly-out menu) is drawn into every later

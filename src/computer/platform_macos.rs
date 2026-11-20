@@ -467,24 +467,10 @@ end tell"#,
                 Ok(ActionResult::success(format!("Launched {}", name)))
             }
             DesktopAction::ActivateWindow { title_pattern } => {
-                let script = format!(
-                    r#"tell application "System Events"
-    set frontmost of (first process whose name contains "{}") to true
-end tell"#,
-                    apple_script_escape(&title_pattern)
-                );
-                let run = self.run_script(script, None).await?;
-                if !run.success {
-                    // System Events raises when no process matched, which is
-                    // the ordinary "that window is not open" answer — and it
-                    // used to reach the caller as an empty success.
-                    return Err(ComputerError::ElementNotFound(format!(
-                        "no running app matched {:?}: {}",
-                        title_pattern,
-                        run.error.unwrap_or_default()
-                    )));
-                }
-                Ok(ActionResult::success(format!("brought {:?} to the front", title_pattern)))
+                let run = self
+                    .run_script(activate_window_script(&title_pattern), None)
+                    .await?;
+                window_action_result(run, "activate", &title_pattern)
             }
             DesktopAction::Wait { milliseconds } => {
                 tokio::time::sleep(Duration::from_millis(milliseconds)).await;
@@ -539,24 +525,7 @@ end tell"#,
             }
             // ── Window management ──────────────────────────────────────────
             DesktopAction::ListWindows => {
-                let script = r#"tell application "System Events"
-    set output to ""
-    set procList to (every process whose visible is true)
-    repeat with proc in procList
-        set procName to name of proc
-        set procPid to unix id of proc
-        try
-            set winTitles to title of every window of proc
-            set winIndex to 1
-            repeat with winTitle in winTitles
-                set output to output & procName & "|||" & (procPid as string) & "|||" & winTitle & "|||" & (winIndex as string) & "\n"
-                set winIndex to winIndex + 1
-            end repeat
-        end try
-    end repeat
-    return output
-end tell"#;
-                let run = self.run_script(script.to_string(), None).await?;
+                let run = self.run_script(list_windows_script(), None).await?;
                 if !run.success {
                     return Err(ComputerError::ToolFailed(format!(
                         "listing windows failed: {}",
@@ -564,22 +533,7 @@ end tell"#;
                     )));
                 }
 
-                let mut windows: Vec<crate::computer::WindowInfo> = Vec::new();
-                for line in run.output.lines() {
-                    let parts: Vec<&str> = line.splitn(4, "|||").collect();
-                    if parts.len() >= 3 {
-                        windows.push(crate::computer::WindowInfo {
-                            id: parts[1].to_string(),
-                            title: parts[2].to_string(),
-                            app_name: Some(parts[0].to_string()),
-                            pid: parts[1].parse().ok(),
-                            bounds: None,
-                            minimized: false,
-                            maximized: false,
-                            focused: false,
-                        });
-                    }
-                }
+                let windows = parse_list_windows(&run.output);
                 Ok(ActionResult::success(format!("Found {} windows", windows.len()))
                     .with_data(serde_json::json!({ "windows": windows })))
             }
@@ -1143,6 +1097,112 @@ fn apple_script_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// List every visible app's windows, with each window's minimised state.
+///
+/// A minimised window is off-screen: the tree folds it to one line and the
+/// screenshot does not contain it. Without the flag, "the window vanished" and
+/// "the window is behind the front one" look the same, and the only action
+/// that could tell them apart is the one that restores it.
+///
+/// `minimized` is System Events' own property, the one `MinimizeWindow` writes;
+/// reading it through `AXMinimized` instead would make the read and the write
+/// two different things that happen to mean the same.
+///
+/// The title is the *last* field because a title may itself contain `|||`,
+/// and the three fields before it may not.
+fn list_windows_script() -> String {
+    r#"tell application "System Events"
+    set output to ""
+    set procList to (every process whose visible is true)
+    repeat with proc in procList
+        set procName to name of proc
+        set procPid to unix id of proc
+        try
+            repeat with win in (windows of proc)
+                set winMin to "shown"
+                try
+                    if minimized of win is true then set winMin to "minimized"
+                end try
+                set output to output & procName & "|||" & (procPid as string) & "|||" & winMin & "|||" & (title of win) & "\n"
+            end repeat
+        end try
+    end repeat
+    return output
+end tell"#
+        .to_string()
+}
+
+/// Parse [`list_windows_script`]'s output into window records.
+///
+/// A line with fewer than four fields is skipped rather than shifted: the
+/// fields before the title are machine-written, so a short line means the
+/// script produced something this parser does not understand, and guessing
+/// which field is which would put a process id in a title.
+fn parse_list_windows(output: &str) -> Vec<crate::computer::WindowInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(4, "|||").collect();
+            if parts.len() != 4 {
+                tracing::debug!("skipping an unparseable window line: {line:?}");
+                return None;
+            }
+            Some(crate::computer::WindowInfo {
+                id: parts[1].to_string(),
+                title: parts[3].to_string(),
+                app_name: Some(parts[0].to_string()),
+                pid: parts[1].parse().ok(),
+                bounds: None,
+                minimized: parts[2] == "minimized",
+                maximized: false,
+                focused: false,
+            })
+        })
+        .collect()
+}
+
+/// Bring a window to the front, restoring it if it was in the Dock.
+///
+/// `set frontmost` alone raises the *application*: a window the person had
+/// minimised stays minimised, and the desktop is unchanged. That made
+/// `minimize_window` a one-way door on macOS — the only action that names a
+/// window could hide it, and nothing could bring it back. Setting `minimized`
+/// back to false is what reopens the door, and it is the same property
+/// `MinimizeWindow` writes; `AXRaise` then puts the restored window above its
+/// siblings instead of behind them.
+///
+/// The match is on the window title first (the name the caller was given by
+/// `list_windows`), and falls back to the process name, which is what the
+/// previous version matched.
+fn activate_window_script(title_pattern: &str) -> String {
+    format!(
+        r#"tell application "System Events"
+    set wanted to "{}"
+    repeat with proc in (every process whose visible is true)
+        try
+            repeat with win in (windows of proc)
+                if (title of win) contains wanted then
+                    set frontmost of proc to true
+                    set minimized of win to false
+                    try
+                        perform action "AXRaise" of win
+                    end try
+                    return "restored " & (title of win) & " in " & (name of proc)
+                end if
+            end repeat
+        end try
+    end repeat
+    try
+        set targetProc to first process whose name contains wanted
+        set frontmost of targetProc to true
+        return "brought " & (name of targetProc) & " to the front"
+    end try
+    return "not found"
+end tell"#,
+        apple_script_escape(title_pattern)
+    )
+}
+
 /// Turn a window script's answer into an action result.
 ///
 /// The scripts answer `"not found"` when no window matched, which is a
@@ -1449,6 +1509,80 @@ mod tests {
         assert!(down.contains(", -1, 0, 0)"), "{down}");
     }
 
+    /// Bringing a window back must also un-minimise it.
+    ///
+    /// `set frontmost` raises the application, not the window: a window the
+    /// model had just minimised stayed in the Dock, so `minimize_window` was a
+    /// one-way door. Clearing `AXMinimized` is the way back; the earlier
+    /// version of this script had neither the attribute nor a title match.
+    #[test]
+    fn activating_a_window_restores_it_from_the_dock() {
+        let script = activate_window_script("Untitled");
+        assert!(
+            script.contains("set minimized of win to false"),
+            "activating is not restoring without this: {script}"
+        );
+        // The same property `MinimizeWindow` writes — a read that went
+        // through `AXMinimized` would be a second spelling of one fact.
+        assert!(!script.contains("AXMinimized"), "{script}");
+        // The window-title match has to precede the process-name fallback:
+        // matching the process first would raise the app and leave the window
+        // where it was.
+        let by_title = script.find("title of win").expect("the window-title match");
+        let by_app = script
+            .find("process whose name contains")
+            .expect("the process fallback");
+        assert!(by_title < by_app, "the title match must be tried first: {script}");
+        // Raising after restoring is what puts it above its siblings.
+        assert!(script.contains("AXRaise"), "{script}");
+    }
+
+    /// Listing windows must say which ones are in the Dock.
+    ///
+    /// A minimised window is missing from both the tree (folded) and the
+    /// screenshot (off-screen), so without this flag "gone" and "behind"
+    /// are indistinguishable — and the model cannot ask to restore either.
+    #[test]
+    fn the_window_list_reports_minimised_state() {
+        let script = list_windows_script();
+        assert!(
+            script.contains("minimized of win"),
+            "a window list that cannot tell minimised from hidden is not a list: {script}"
+        );
+        assert!(script.contains(r#"set winMin to "minimized""#), "{script}");
+        assert!(script.contains(r#"set winMin to "shown""#), "{script}");
+        // The property has to be the one the restore writes, or a window the
+        // model just hid reads back as shown.
+        assert!(!script.contains("AXMinimized"), "{script}");
+    }
+
+    /// A title holding the field separator must survive parsing.
+    ///
+    /// The previous format put the title third of four and parsed with
+    /// `splitn(4)`, so a title containing `|||` landed in the wrong field. The
+    /// title moved last for exactly this reason.
+    #[test]
+    fn a_title_holding_the_separator_does_not_shift_the_fields() {
+        let windows = parse_list_windows(
+            "Notes|||1234|||shown|||Meeting ||| notes\nSafari|||99|||minimized|||Untitled",
+        );
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].app_name.as_deref(), Some("Notes"));
+        assert_eq!(windows[0].pid, Some(1234));
+        assert_eq!(windows[0].title, "Meeting ||| notes");
+        assert!(!windows[0].minimized);
+        assert_eq!(windows[1].title, "Untitled");
+        assert!(windows[1].minimized, "the Dock state is lost: {windows:?}");
+    }
+
+    /// A short line is skipped, not shifted into a plausible-looking record.
+    #[test]
+    fn a_malformed_window_line_is_skipped() {
+        let windows = parse_list_windows("Notes|||1234\nSafari|||99|||shown|||Untitled");
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert_eq!(windows[0].title, "Untitled");
+    }
+
     /// The generated JavaScript must parse — but not run.
     ///
     /// A syntax error is a gesture that does nothing and reports success, so
@@ -1484,6 +1618,53 @@ mod tests {
     #[test]
     fn the_drag_script_is_valid_javascript() {
         assert_parses(&drag_script(10, 20, 100, 120));
+    }
+
+    /// Compile an AppleScript without running it.
+    ///
+    /// `osacompile` parses the whole script and writes an empty bundle to
+    /// `/dev/null`, so a syntax error is caught with no window touched and no
+    /// pointer moved. Running it would minimise the developer's own windows.
+    #[cfg(target_os = "macos")]
+    fn assert_apple_script_compiles(script: &str) {
+        use std::io::Write;
+        let mut child = std::process::Command::new("osacompile")
+            .args(["-o", "/dev/null", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("osacompile is present on macOS");
+        child
+            .stdin
+            .as_mut()
+            .expect("a piped stdin")
+            .write_all(script.as_bytes())
+            .expect("write the script");
+        let out = child.wait_with_output().expect("osacompile finishes");
+        assert!(
+            out.status.success(),
+            "the script does not compile: {}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            script
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_window_scripts_compile() {
+        assert_apple_script_compiles(&list_windows_script());
+        assert_apple_script_compiles(&activate_window_script("Untitled"));
+    }
+
+    /// A quote in the title must not end the AppleScript literal.
+    ///
+    /// Window titles are attacker-adjacent input — a web page chooses its own
+    /// title — so this is the injection boundary for the two new scripts.
+    #[test]
+    fn a_quoted_window_title_does_not_escape_the_script() {
+        let script = activate_window_script(r#"He said "hi""#);
+        assert!(script.contains(r#"set wanted to "He said \"hi\"""#), "{script}");
     }
 
     #[test]
