@@ -246,7 +246,30 @@ struct SessionState {
     snapshot_counts: Vec<usize>,
     /// Pixel → point mapping of the most recent screenshot the session took.
     coordinate_space: Option<CoordinateSpace>,
+    /// Where a `hover` probe left the pointer, when it is still there.
+    pointer_on_probe: Option<ProbeRest>,
 }
+
+/// The control a `hover` probe left the pointer resting on.
+#[derive(Debug, Clone, Copy)]
+struct ProbeRest {
+    /// The control's bounds, when the platform published them.
+    ///
+    /// `None` still parks the pointer — the corner of the screen is outside a
+    /// control whose geometry nobody could read, too — it just cannot *prove*
+    /// the point is off the control before moving there.
+    bounds: Option<Rect>,
+}
+
+/// How long the pointer's move off a probe gets before the step's own actions
+/// begin.
+///
+/// Long enough for a tooltip's dismiss animation — a fade is typically 100–200
+/// ms, and a capture taken mid-fade records the dismissing tooltip as a change
+/// of its own, outside the action's aim, turning that action's verdict from
+/// `Failed` into `Unverifiable`. Short enough that it is not the dominant cost
+/// of a step whose budget is usually measured in seconds.
+const PARK_SETTLE_MS: u64 = 200;
 
 /// Configuration for a [`ComputerSession`].
 #[derive(Debug, Clone)]
@@ -551,6 +574,53 @@ impl ComputerSession {
         }
     }
 
+    /// Remember, or forget, that the pointer is resting on a probe.
+    ///
+    /// Only a `hover` that actually ran leaves the pointer on a control. A
+    /// `pointer_move` is the move-away itself and a failed gesture moves
+    /// nothing, so both clear it. Anything else leaves the fact alone: a click
+    /// does not lift the pointer off a control either.
+    async fn note_pointer_rest(&self, action: &DesktopAction, result: &ActionResult) {
+        // Resolved before the lock: `resolve_target` may re-read the tree, and
+        // holding the session's state across that await would serialise every
+        // other reader behind a platform call.
+        let rest = match action {
+            DesktopAction::Hover { target } if result.success => {
+                // The bounds are read from the target the hover actually
+                // aimed at, not re-resolved: a snapshot id names the element
+                // it named when the probe ran. A target that cannot be
+                // resolved leaves the bounds unknown, which still parks the
+                // pointer — it just cannot prove the corner is off the
+                // control. That is why the error is logged rather than
+                // propagated: the record is a hint for where *not* to park,
+                // not the reason to skip parking.
+                let bounds = match target {
+                    ClickTarget::Coordinate(_) => None,
+                    other => match self.adapter.resolve_target(other).await {
+                        Ok(resolved) => resolved.element.and_then(|element| element.bounds),
+                        Err(e) => {
+                            tracing::debug!("the hovered control's bounds could not be read: {e}");
+                            None
+                        }
+                    },
+                };
+                Some(ProbeRest { bounds })
+            }
+            _ => None,
+        };
+
+        let mut state = self.state.lock().await;
+        match action {
+            DesktopAction::PointerMove { .. } => state.pointer_on_probe = None,
+            DesktopAction::Hover { .. } if result.success => state.pointer_on_probe = rest,
+            // A failed hover moved nothing, so whatever the pointer was
+            // resting on before is where it still is.
+            DesktopAction::Hover { .. } => {}
+            // A click does not lift the pointer off the control either.
+            _ => {}
+        }
+    }
+
     // ── Snapshot bookkeeping (used by the loop's undo) ────────────────────
 
     pub(crate) async fn push_snapshot_count(&self, count: usize) {
@@ -708,6 +778,14 @@ impl ComputerSession {
                 .await);
         }
 
+        // The probe's tooltip is still on screen. Unless this step is itself a
+        // pointer gesture, park the pointer before dispatching: a `hover`
+        // leaves the pointer where it was put, and everything the probe opened
+        // is drawn into the next capture — which is the frame the *next*
+        // decision is made from. Waiting for the model to remember to move it
+        // away made that discipline a prompt rule; this makes it a fact.
+        let parked_at = self.park_after_hover(&action, &budget).await;
+
         for (index, rung) in ladder.iter().copied().enumerate() {
             let last_rung = index + 1 == ladder.len();
 
@@ -860,6 +938,20 @@ impl ComputerSession {
             };
             let mut result = result;
             self.note_space_from_result(&result).await;
+            self.note_pointer_rest(&action, &result).await;
+            // A park that ran before this step is part of what happened to
+            // the screen, so it travels in the result's structured data
+            // rather than only in the log — a caller replaying the session
+            // can see the pointer was moved on purpose.
+            if let Some(point) = parked_at {
+                let data = result.data.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert(
+                        "pointer_parked".to_string(),
+                        serde_json::json!({ "x": point.x, "y": point.y }),
+                    );
+                }
+            }
             let mut driver_evidence = result.evidence.clone().unwrap_or_else(|| {
                 crate::computer::ActionEvidence::new(rung, ActionEffect::Unverifiable)
             });
@@ -1138,6 +1230,163 @@ impl ComputerSession {
             result: ActionResult::error(format!("refused: {recovery}")),
             evidence,
         })
+    }
+
+    /// Park the pointer after a hover, before the next real step.
+    ///
+    /// A `hover` is a measurement, and the pointer *stays* on the control —
+    /// that is what a person does while looking. The cost is that whatever the
+    /// probe opened stays open: a tooltip, a highlighted row, a fly-out menu,
+    /// all drawn into every capture taken until something moves the pointer.
+    /// The frame the next decision is made from is one of those captures, so a
+    /// model that hovers and then asks "what is on screen" is answered partly
+    /// by its own probe.
+    ///
+    /// The prompt used to carry this as a rule ("after a hover, move the
+    /// pointer away"). A rule is something the model can forget, and a model
+    /// that forgets has no way to notice: the tooltip it opened looks like a
+    /// normal part of the screen. Since the session is the thing that knows
+    /// the pointer is still on the probe, it is also the thing that should
+    /// clean up — so the prompt sentence was replaced with a note that the
+    /// clean-up already happens.
+    ///
+    /// Nothing happens when this step is itself a pointer gesture — a
+    /// `pointer_move` *is* the move-away, and a second `hover` re-aims the
+    /// pointer anyway, so parking before either would be a wasted round trip
+    /// and, for the re-aimed hover, a frame captured mid-gesture. Everything
+    /// else (a click, typing, a key press, a wait) is preceded by the park.
+    ///
+    /// Best-effort by design: an adapter that cannot move the pointer, a
+    /// display it could not describe, or a budget already spent all leave the
+    /// step to run as before. A probe whose tooltip is still open is a worse
+    /// frame; a step that refuses to run because the clean-up failed is a
+    /// broken run. The failure is logged, not returned.
+    async fn park_after_hover(
+        &self,
+        action: &DesktopAction,
+        budget: &StepBudget,
+    ) -> Option<crate::computer::Point> {
+        if matches!(action, DesktopAction::Hover { .. } | DesktopAction::PointerMove { .. }) {
+            return None;
+        }
+        let rest = self.state.lock().await.pointer_on_probe?;
+        if budget.is_exhausted() {
+            tracing::warn!("not parking the pointer after a hover: the step has no time left");
+            return None;
+        }
+        // Cleared before the move is attempted, not after it succeeds: a park
+        // that fails must not be retried before every later step, and the
+        // pointer has not become any less dirty for the failure.
+        self.state.lock().await.pointer_on_probe = None;
+        let point = match self.park_point(rest).await {
+            Some(point) => point,
+            None => {
+                tracing::warn!(
+                    "not parking the pointer after a hover: no display geometry to aim at"
+                );
+                return None;
+            }
+        };
+        // The per-app boundary still applies: a park is a move event like any
+        // other, and it lands in whatever app is drawn at that point. A corner
+        // of the screen is usually the desktop, but "usually" is not the check.
+        if let Some(reason) = self.park_border_refusal(point).await {
+            tracing::info!("not parking the pointer after a hover: {reason}");
+            return None;
+        }
+        let park = DesktopAction::PointerMove { to: point };
+        match crate::computer::budget::within(budget, "the pointer park after a hover", async {
+            self.dispatch(&park, Rung::Pixel, budget).await
+        })
+        .await
+        {
+            Ok(Ok(result)) if result.success => {
+                tracing::debug!("pointer parked at ({}, {}) after a hover", point.x, point.y);
+                // The dismiss is a screen change of its own, and it lands
+                // *after* this step's baseline would have been taken: a
+                // tooltip that fades out while the action's own baseline
+                // screenshot is being captured shows up in the diff as
+                // "changed, but not where the action aimed", which reads as
+                // `Unverifiable` rather than `Failed`. A short pause lets the
+                // dismiss finish so the baseline describes the screen the
+                // action is about to change.
+                //
+                // Deliberately not a full `settle_and_capture`: that pays for
+                // a capture and a poll loop to answer "has the screen
+                // stopped", and the answer here is known — it is the
+                // dismissal of a tooltip, which has a bounded animation. The
+                // budget still caps it.
+                tokio::time::sleep(budget.cap(Duration::from_millis(PARK_SETTLE_MS))).await;
+                Some(point)
+            }
+            Ok(Ok(result)) => {
+                tracing::warn!("pointer park after a hover failed: {}", result.message);
+                None
+            }
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!("pointer park after a hover failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// A point the pointer can rest at without being on `rest`.
+    ///
+    /// The adapter cannot report where the pointer is, so there is no "somewhere
+    /// else" to compute — the target has to be chosen from what *is* known: the
+    /// display layout. The bottom-left corner of the union, inset by a margin,
+    /// is far from any control a hover picked, and the margin keeps it inside
+    /// the display so the move is a real position rather than a clamp.
+    ///
+    /// When the control's bounds are known, a corner *inside* them is rejected
+    /// and the opposite corner tried. That is what makes this a move-away
+    /// rather than a guess.
+    async fn park_point(&self, rest: ProbeRest) -> Option<crate::computer::Point> {
+        let geometry = match self.adapter.display_geometry().await {
+            Ok(geometry) => geometry,
+            Err(e) => {
+                tracing::debug!("display geometry unavailable for the park: {e}");
+                return None;
+            }
+        };
+        let union = geometry.union()?;
+        if union.width == 0 || union.height == 0 {
+            return None;
+        }
+        const MARGIN: i32 = 4;
+        let corners = [
+            (union.x + MARGIN, union.y + union.height as i32 - MARGIN),
+            (union.x + union.width as i32 - MARGIN, union.y + MARGIN),
+            (union.x + MARGIN, union.y + MARGIN),
+            (union.x + union.width as i32 - MARGIN, union.y + union.height as i32 - MARGIN),
+        ];
+        let inside =
+            |p: crate::computer::Point| rest.bounds.is_some_and(|bounds| bounds.contains(p.x, p.y));
+        let point = corners
+            .into_iter()
+            .map(|(x, y)| crate::computer::Point::new(x, y))
+            .find(|p| !inside(*p))?;
+        Some(point)
+    }
+
+    /// Whether the per-app boundary forbids a park at `point`.
+    ///
+    /// Mirrors the pre-dispatch rule for a bare pointer move: the app drawn at
+    /// the point receives the event. Only a positive mismatch refuses — a
+    /// platform that cannot answer is not evidence of a violation, and a park
+    /// is the one gesture whose whole purpose is to be harmless.
+    async fn park_border_refusal(&self, point: crate::computer::Point) -> Option<String> {
+        if self.config.allow_apps.is_empty() {
+            return None;
+        }
+        let receiving = self.adapter.application_at(point).await?;
+        if self.config.allow_apps.allows(&receiving) {
+            return None;
+        }
+        Some(format!(
+            "the pointer would park in {receiving:?}, which is not on the [computer] allow_apps \
+             list"
+        ))
     }
 
     /// Why this action should not be attempted, when the target said so.
@@ -3236,6 +3485,12 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(milliseconds)).await;
                     Ok(ActionResult::success("waited"))
                 }
+                // Recorded so a test can see the automatic park after a hover
+                // as a real instruction to the adapter, not a session flag.
+                DesktopAction::PointerMove { to } => {
+                    self.record(format!("pointer_move:{},{}", to.x, to.y)).await;
+                    Ok(ActionResult::success(format!("moved to ({}, {})", to.x, to.y)))
+                }
                 _ => Ok(ActionResult::success("ok")),
             }
         }
@@ -4377,6 +4632,142 @@ mod tests {
             let ladder = session.ladder_for(&action).await;
             assert_eq!(ladder, vec![Rung::Pixel], "{action:?} → {ladder:?}");
         }
+    }
+
+    /// A hover's tooltip is cleaned up by the session, not by the model.
+    ///
+    /// The prompt used to carry this as a rule ("after a hover, move the
+    /// pointer away"). A rule is something the model can forget, and a model
+    /// that forgets cannot tell: the tooltip it opened looks like part of the
+    /// screen. The session knows the pointer is still on the probe, so it
+    /// moves it off before the next real step and the next capture is of the
+    /// screen rather than of the probe's own wake.
+    #[tokio::test]
+    async fn the_step_after_a_hover_parks_the_pointer_first() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let session = ladder_session(&adapter);
+
+        session
+            .execute(DesktopAction::Hover {
+                target: ClickTarget::ElementId("e1".to_string()),
+            })
+            .await
+            .expect("the probe");
+        // The hover itself moves the pointer onto the control and nothing
+        // else: parking here would clear the tooltip the probe exists to
+        // produce, one frame too early.
+        assert_eq!(adapter.recorded().await, Vec::<String>::new());
+
+        let outcome = session
+            .execute(DesktopAction::Wait { milliseconds: 1 })
+            .await
+            .expect("the step after the probe");
+        let log = adapter.recorded().await;
+        assert!(
+            log.iter().any(|e| e.starts_with("pointer_move:")),
+            "the pointer was not parked: {log:?}"
+        );
+        // The park is reported, so a caller can see the pointer moved on
+        // purpose rather than inferring it from the picture.
+        let parked = outcome
+            .result
+            .data
+            .as_ref()
+            .and_then(|d| d.get("pointer_parked"))
+            .expect("the park is in the result's data");
+        assert!(parked.get("x").is_some() && parked.get("y").is_some());
+
+        // Once, not before every later step: the pointer is clean now.
+        let before = adapter.recorded().await;
+        session
+            .execute(DesktopAction::Wait { milliseconds: 1 })
+            .await
+            .expect("a second step");
+        let after = adapter.recorded().await;
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| e.starts_with("pointer_move:"))
+                .count(),
+            before
+                .iter()
+                .filter(|e| e.starts_with("pointer_move:"))
+                .count(),
+            "the pointer was parked again: {after:?}"
+        );
+    }
+
+    /// A pointer gesture is its own move-away.
+    ///
+    /// Two cases, and both must not park: an explicit `pointer_move` is the
+    /// clean-up (parking first would move the pointer twice), and a second
+    /// `hover` re-aims it (parking first would capture a frame mid-gesture and
+    /// add a round trip to a step that is itself a probe).
+    #[tokio::test]
+    async fn a_pointer_gesture_is_not_preceded_by_a_park() {
+        // Asserted against the exact log rather than by counting: a park is a
+        // `pointer_move` too, so a count would confuse the gesture with the
+        // clean-up when the gesture happens to be a `pointer_move`.
+        for (next, expected) in [
+            (
+                DesktopAction::PointerMove {
+                    to: crate::computer::Point::new(900, 600),
+                },
+                vec!["pointer_move:900,600".to_string()],
+            ),
+            (
+                DesktopAction::Hover {
+                    target: ClickTarget::Coordinate(crate::computer::Point::new(300, 200)),
+                },
+                Vec::<String>::new(),
+            ),
+        ] {
+            let adapter = Arc::new(LadderAdapter::new("button", true));
+            let session = ladder_session(&adapter);
+            session
+                .execute(DesktopAction::Hover {
+                    target: ClickTarget::ElementId("e1".to_string()),
+                })
+                .await
+                .expect("the first probe");
+
+            session.execute(next.clone()).await.expect("the gesture");
+            assert_eq!(adapter.recorded().await, expected, "{next:?} was preceded by a park");
+        }
+    }
+
+    /// A mouse gesture that is not a pointer move still clears the probe rest.
+    ///
+    /// A click does not lift the pointer off the control it clicked, so a
+    /// click does *not* clear it — but that is the conservative direction.
+    /// What must never happen is the pointer being reported clean while it is
+    /// still on a tooltip.
+    #[tokio::test]
+    async fn a_click_does_not_pretend_the_pointer_moved_away() {
+        let adapter = Arc::new(LadderAdapter::new("button", true));
+        let session = ladder_session(&adapter);
+        session
+            .execute(DesktopAction::Hover {
+                target: ClickTarget::ElementId("e1".to_string()),
+            })
+            .await
+            .expect("the probe");
+        session
+            .execute(DesktopAction::Click {
+                target: ClickTarget::Coordinate(crate::computer::Point::new(50, 50)),
+                button: MouseButton::Left,
+            })
+            .await
+            .expect("the click");
+        // The click step parked first, so the pointer is clean afterwards and
+        // the hover's probe has been dismissed exactly once.
+        let moves = adapter
+            .recorded()
+            .await
+            .iter()
+            .filter(|e| e.starts_with("pointer_move:"))
+            .count();
+        assert_eq!(moves, 1, "the click should park the pointer once");
     }
 
     /// A drag aims at the span between its ends, not at a point.

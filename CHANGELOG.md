@@ -13,6 +13,25 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **A hover's tooltip is cleared for the model.** A `hover` probe leaves the
+  pointer on the control — that is what makes the measurement — and everything
+  the probe opened (tooltip, highlight, fly-out menu) is drawn into every later
+  capture, including the frame the next decision is made from. The prompt used
+  to carry this as a rule ("after a hover, move the pointer away"); a rule is
+  something a model can forget, and a model that forgets cannot tell, because
+  the tooltip looks like part of the screen. The session now records the
+  pointer as resting on the probe and, before the next non-pointer step,
+  parks it at a corner of the display layout (avoiding the control's own
+  bounds when the platform published them, and respecting `allow_apps`). A
+  `pointer_move` is already the move-away and a second `hover` re-aims the
+  pointer, so neither is preceded by a park. A 200 ms pause after the park
+  (still inside the step budget) lets a tooltip's fade finish, so the step's
+  own baseline is not captured mid-dismissal — a dismissing tooltip is a
+  screen change outside the action's aim, and it would turn a real `Failed`
+  into `Unverifiable`. The park's point is reported in
+  the step's `data.pointer_parked`; a park that fails is logged and the step
+  runs anyway — a frame with a stale tooltip is worse, but refusing to run
+  because the clean-up failed is a broken run.
 - **A Vision tab in settings.** Everything `[computer.vision]` decides is now
   editable without hand-editing the config: the input mode, the API rung's
   provider and model (picked from the models already configured), the OCR

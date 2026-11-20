@@ -124,8 +124,8 @@ Rules:
   and look at the next step's screen. A control that reacts to the pointer is
   one a click will probably reach. This is a measurement, not proof: a disabled
   control may still be styled to react, and a live one may not react at all.
-  After a hover, move the pointer away (pointer_move) before acting somewhere
-  else — a tooltip the probe opened covers what you wanted to see.
+  The tooltip a probe opens is cleared for you before the next action, so you
+  do not need to move the pointer away first.
 - If something is still loading, wait rather than acting again. A second click
   on a control that has not drawn yet lands on whatever is under it."#;
 
