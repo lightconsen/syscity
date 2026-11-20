@@ -334,6 +334,35 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
             config.computer.vision.model_dir = raw.trim().to_string();
             vision_changed = true;
         }
+        // The API rung. `provider` and `model` are only read when `mode` is
+        // `"api"`, or is `"auto"` and no local model is installed — so they are
+        // stored as given and an empty string clears the rung entirely.
+        // [`VisionResolver::has_api`] requires both, which is why clearing one
+        // is enough to turn the rung off.
+        "computer.vision.provider" => {
+            let Some(raw) = params.value.as_str() else {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.vision.provider takes a provider id (empty to clear)",
+                );
+            };
+            let trimmed = raw.trim();
+            config.computer.vision.provider = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            vision_changed = true;
+        }
+        "computer.vision.model" => {
+            let Some(raw) = params.value.as_str() else {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.vision.model takes a model id (empty to clear)",
+                );
+            };
+            let trimmed = raw.trim();
+            config.computer.vision.model = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            vision_changed = true;
+        }
         "computer.vision.timeout_secs" => match params.value.as_u64() {
             // Zero would make every lookup fail instantly; the resolver floors
             // it anyway, and accepting it would store a setting that reads as
@@ -1261,6 +1290,57 @@ mod tests {
         );
 
         let _ = set_and_ok(&state, "computer.vision.ocr", serde_json::json!("ppocrv3-en")).await;
+    }
+
+    /// The API rung is two paths, and it only exists when both are set. An
+    /// empty string has to *clear* rather than store `Some("")` — otherwise
+    /// `has_api()` sees a provider and a blank model, calls it configured, and
+    /// the resolver hands back a source that cannot answer.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn config_set_vision_api_rung_stores_and_clears() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res =
+            set_and_ok(&state, "computer.vision.provider", serde_json::json!(" anthropic ")).await;
+        assert!(res.ok, "the provider must set: {:?}", res.error);
+        let res = set_and_ok(&state, "computer.vision.model", serde_json::json!("claude-x")).await;
+        assert!(res.ok, "the model must set: {:?}", res.error);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.computer.vision.provider.as_deref(), Some("anthropic"), "trimmed");
+            assert_eq!(cfg.computer.vision.model.as_deref(), Some("claude-x"));
+            // Both halves present is what makes the rung exist.
+            let resolver = crate::computer::vision::resolver::VisionResolver::from_config(
+                &cfg.computer.vision,
+                crate::computer::vision::model_download::LocalModels::default(),
+            );
+            assert!(resolver.has_api(), "both halves set means the rung answers");
+        }
+
+        // Clearing one half turns the rung off rather than leaving a blank.
+        let res = set_and_ok(&state, "computer.vision.provider", serde_json::json!("   ")).await;
+        assert!(res.ok);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.computer.vision.provider, None, "blank clears, not Some(\"\")");
+            assert_eq!(
+                cfg.computer.vision.model.as_deref(),
+                Some("claude-x"),
+                "the other half is its own path"
+            );
+            let resolver = crate::computer::vision::resolver::VisionResolver::from_config(
+                &cfg.computer.vision,
+                crate::computer::vision::model_download::LocalModels::default(),
+            );
+            assert!(!resolver.has_api(), "one half cleared means no rung");
+        }
+
+        // Junk is refused, not coerced — a number is not a provider id.
+        let res = set_and_ok(&state, "computer.vision.provider", serde_json::json!(7)).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert_eq!(state.config.read().await.computer.vision.provider, None);
     }
 
     #[tokio::test]

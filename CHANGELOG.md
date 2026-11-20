@@ -13,6 +13,19 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **A Vision tab in settings.** Everything `[computer.vision]` decides is now
+  editable without hand-editing the config: the input mode, the API rung's
+  provider and model (picked from the models already configured), the OCR
+  preset, the model directory and the per-lookup timeout. The preset row
+  reports whether *that preset's* files are on disk, since english models do
+  not mean a chinese screen can be read, and it says so before the first use
+  rather than after a run that read nothing.
+- **`config.set` accepts the API rung.** `computer.vision.provider` and
+  `computer.vision.model` were readable but had no write path, so a client
+  could select `mode = "api"` and have no way to configure the backend that
+  mode uses. Both trim, both treat an empty string as "clear" rather than
+  storing `Some("")` — a blank provider with a set model would otherwise pass
+  `has_api()` and hand the resolver a source that cannot answer.
 - **The OCR recogniser is configurable.** `[computer.vision].ocr` picks a
   named preset — `ppocrv3-en` (97 classes, the default) or `ppocrv3-ch`
   (6625 classes, CJK) — instead of hardcoding english. Each preset carries its
@@ -54,6 +67,16 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **A slow model download is no longer mistaken for a broken one.** The
+  downloader had a 300-second *total* deadline. On a link slow enough to be
+  believable — `hf-mirror.com` answers a proxied request with a redirect to
+  `huggingface.co`, and the detector came through at about 55 KB/s — the
+  88 MB detector was cut off three quarters of the way through and the failure
+  read as "the model is not downloadable". The deadline now applies per read
+  and resets on every successful one, so a slow download finishes at any speed
+  while a dead connection still fails in half a minute. Verified end to end:
+  a fresh directory fetched all four chinese-preset files (128 MB) in 16
+  seconds with no proxy.
 - **The bundled ONNX Runtime was silently running these models on CoreML.**
   `ort`'s `Session::builder` sets the EP selection policy to `MaxEfficiency`
   (`PreferNPU`), so on macOS ONNX Runtime registered CoreML for the CRNN

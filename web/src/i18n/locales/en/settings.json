@@ -7,6 +7,7 @@
   "SettingsPanel.tab.agents": "Agents",
   "SettingsPanel.tab.channels": "Channels",
   "SettingsPanel.tab.tools": "Web Search",
+  "SettingsPanel.tab.vision": "Vision",
   "SettingsPanel.tab.mcp": "MCP Server",
   "SettingsPanel.tab.marketplace": "Extensions",
   "SettingsPanel.tab.skills": "Skills",
@@ -131,6 +132,38 @@
   "ToolsSettings.fallbackOrder": "Fallback Order",
   "ToolsSettings.addProvider": "+ Add Provider",
   "ToolsSettings.apiKeys": "Provider API Keys",
+
+  "VisionSettings.mode": "Input",
+  "VisionSettings.mode_auto": "Auto — local model if installed, else API",
+  "VisionSettings.mode_local": "Local only — never sends a screenshot off this machine",
+  "VisionSettings.mode_api": "API only — for a machine with no local model",
+  "VisionSettings.mode_off": "Off — the accessibility tree is the only input",
+  "VisionSettings.modeHint_auto":
+    "Uses the local ONNX model when it is installed, and the API model below otherwise. OCR is used to name the boxes the detector finds, whether or not it answers.",
+  "VisionSettings.modeHint_local":
+    "Never calls the API, even when the local model fails — this is the setting that promises a screenshot never leaves the machine.",
+  "VisionSettings.modeHint_api":
+    "Only the API model answers. Use this where the local models cannot be installed.",
+  "VisionSettings.modeHint_off":
+    "No screenshots are read at all: controls come from the accessibility tree alone, and typing is confirmed by a pixel diff rather than by reading the field back.",
+  "VisionSettings.apiRung": "Vision API Model",
+  "VisionSettings.provider": "Provider",
+  "VisionSettings.model": "Model",
+  "VisionSettings.none": "None",
+  "VisionSettings.noModels": "No models are configured yet. Add one on the Models tab first.",
+  "VisionSettings.apiHint":
+    "Both a provider and a model are required; clearing either turns this rung off. The model must accept images.",
+  "VisionSettings.ocrPreset": "Recognition Model",
+  "VisionSettings.ocrInstalled": "This preset's model files are on disk.",
+  "VisionSettings.ocrMissing":
+    "This preset's model files are not on disk yet. They are downloaded on first use — about 100 MB over the network.",
+  "VisionSettings.modelDir": "Model Directory",
+  "VisionSettings.modelDirPlaceholder": "Leave empty for the default (~/.syscity/models/vision)",
+  "VisionSettings.modelDirHint":
+    "Where the ONNX model files live, and where downloads are written. Empty means the default location.",
+  "VisionSettings.timeout": "Lookup Timeout (seconds)",
+  "VisionSettings.timeoutHint":
+    "The ceiling for one visual lookup. A lookup that hits it is abandoned, and the step carries on without the screenshot.",
 
   "McpSettings.presets": "Presets",
   "McpSettings.configureTokens": "Configure tokens",

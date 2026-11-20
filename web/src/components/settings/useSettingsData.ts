@@ -38,6 +38,22 @@ export interface SyscityConfig {
     max_consecutive_idle?: number;
   };
   channels?: ChannelConfig[];
+  /** `[computer.vision]` as `config.get` reports it. `ocr_installed` is about
+   *  the reported preset's own files, not "OCR is installed". */
+  computer?: {
+    enabled?: boolean;
+    allow_apps?: string[];
+    vision?: {
+      mode?: string;
+      model_dir?: string;
+      ocr?: string;
+      ocr_presets?: Array<{ key: string; label: string }>;
+      ocr_installed?: boolean;
+      provider?: string | null;
+      model?: string | null;
+      timeout_secs?: number;
+    };
+  };
   search?: {
     provider?: string;
     providers?: string[];
@@ -266,7 +282,10 @@ export function useSettingsData(
           section[parts[1]] = value;
           (next as Record<string, unknown>)[parts[0]] = section as never;
         } else if (parts.length === 3) {
-          // agent_overrides.<agent_id>.<field>
+          // One nested level: `agent_overrides.<agent_id>.<field>` needs it, and
+          // so does `computer.vision.<field>` (the vision tab writes three-deep
+          // paths). A value of `null` removes the key rather than storing it —
+          // that is what "inherit / clear" means to the backend.
           const section = { ...((next[parts[0] as keyof SyscityConfig] as Record<string, unknown>) ?? {}) };
           const entry = { ...((section[parts[1]] as Record<string, unknown>) ?? {}) };
           if (value === null) {
@@ -571,6 +590,10 @@ export function useSettingsData(
     { id: "agents", label: "Agents" },
     { id: "channels", label: "Channels" },
     { id: "tools", label: "Web Search" },
+    // How computer use reads a screen: the local OCR preset, the API rung
+    // that answers when no local model is installed, and where the models
+    // live.
+    { id: "vision", label: "Vision" },
     { id: "mcp", label: "MCP Server" },
     { id: "marketplace", label: "Extensions" },
     { id: "skills", label: "Skills" },

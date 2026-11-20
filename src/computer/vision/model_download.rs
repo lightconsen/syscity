@@ -604,13 +604,22 @@ async fn resolve_single_model_mirrored(
 
 /// Download raw bytes from a URL.
 ///
-/// Five minutes total and fifteen seconds to connect: the detector alone is
-/// 88 MB, and a mirror can serve it at well under a megabyte a second without
-/// being down — the short cap this replaces cut such downloads off mid-body.
+/// Stalls, not totals. There is no overall deadline: the detector alone is
+/// 88 MB, and a mirror that is serving it slowly is not the same problem as a
+/// mirror that stopped serving it. A 300-second *total* cap looked generous
+/// and was not — measured through a proxy, `hf-mirror.com` redirects to
+/// `huggingface.co` and the detector came through at ~55 KB/s, so a download
+/// that was still making progress was cut off with three quarters of the file
+/// in hand. Total-timeout failures also look like "the model is not
+/// downloadable", which is the wrong thing to tell the user.
+///
+/// `read_timeout` is the right knob: it bounds one read, and the clock
+/// restarts on every successful read, so a slow link finishes at any speed
+/// while a connection that has died fails in half a minute instead of hanging.
 async fn download_bytes(url: &str) -> crate::computer::Result<Vec<u8>> {
     let response = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(300))
+        .read_timeout(std::time::Duration::from_secs(30))
         .user_agent("syscity/0.1")
         .build()
         .map_err(|e| crate::computer::ComputerError::Other(format!("HTTP client: {}", e)))?

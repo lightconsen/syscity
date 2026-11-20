@@ -7,6 +7,7 @@ import { ModelsSettings } from "@/components/settings/ModelsSettings";
 import { AgentsSettings } from "@/components/settings/AgentsSettings";
 import { ChannelsSettings } from "@/components/settings/ChannelsSettings";
 import { ToolsSettings } from "@/components/settings/ToolsSettings";
+import { VisionSettings } from "@/components/settings/VisionSettings";
 import { McpSettings } from "@/components/settings/McpSettings";
 import { SkillsSettings } from "@/components/settings/SkillsSettings";
 import { MarketplaceSettings } from "@/components/settings/MarketplaceSettings";
@@ -121,6 +122,14 @@ export function SettingsPanel({
             )}
             {d.activeTab === "tools" && (
               <ToolsSettings config={d.config} update={d.update} />
+            )}
+            {d.activeTab === "vision" && (
+              <VisionSettings
+                config={d.config}
+                models={d.models}
+                update={d.update}
+                onRefresh={d.refreshConfig}
+              />
             )}
             {d.activeTab === "mcp" && (
               <McpSettings

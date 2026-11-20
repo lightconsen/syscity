@@ -290,6 +290,31 @@ run 结束时写一条 `RunSummary`：
 | `UiDetect`（OmniParser 检测） | 找控件框 | 控件元素，`label` 来自重叠的 OCR 文本 |
 | `Ocr`（RapidOCR） | 读屏幕上的字 | `role: "text"` 的元素，`label` 就是读出来的那行字 |
 
+模型文件在**首次使用时**下载到 `[computer.vision].model_dir`（默认
+`~/.syscity/models/vision`），不随安装包分发。四个文件合计约 128 MB
+（det 88 MB、OmniParser 12 MB、识别器 10 MB、字典 26 KB），局域网慢速下
+第一次使用会明显等一会儿。
+
+下载器判的是**停滞**而不是总时长：`read_timeout` 给单次读取 30 秒上限，
+读成功后重新计时。总时长的写法（曾经是 300 秒）会把一个"慢但在前进"的
+下载砍掉，用户看到的却是"这个模型下不下来"——实测走代理时 `hf-mirror.com`
+会 308 到 `huggingface.co`，det 掉到约 55 KB/s，300 秒只够下四分之三。
+现在换一台机器、空目录、无代理，四个文件 16 秒下完。
+
+#### 设置页
+
+`设置 → 视觉` 这一页就是本节所有字段的编辑器，不用手改配置：输入模式、
+API 路径的 provider 与 model（从已配置的模型里选）、识别预设、模型目录、
+单次识别超时。识别预设那一行报告的是**当前预设自己的文件**在不在盘上——
+英文模型在盘上不代表中文能读，它在第一次使用前就告诉你，而不是跑完一次
+什么都没读到的 run 之后。
+
+它背后是 `config.get` 的 `computer.vision`（含 `ocr_presets` 与按预设算的
+`ocr_installed`）和 `config.set` 的 `computer.vision.{mode,provider,model,ocr,model_dir,timeout_secs}`。
+`provider` / `model` 各自一条路径，空字符串是**清除**而不是存成 `Some("")`：
+`has_api()` 要求两者都在，只清一项就足以关掉这条路径，而不会留下一个
+"看起来配了、实际答不了"的状态。
+
 #### 换识别器：`[computer.vision].ocr`
 
 识别器不是插件接口——整条流水线写死了输入张量 `"x"`、取

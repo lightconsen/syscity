@@ -7,6 +7,7 @@
   "SettingsPanel.tab.agents": "智能体",
   "SettingsPanel.tab.channels": "渠道",
   "SettingsPanel.tab.tools": "网络搜索",
+  "SettingsPanel.tab.vision": "视觉",
   "SettingsPanel.tab.mcp": "MCP 服务器",
   "SettingsPanel.tab.marketplace": "扩展",
   "SettingsPanel.tab.skills": "技能",
@@ -131,6 +132,35 @@
   "ToolsSettings.fallbackOrder": "回退顺序",
   "ToolsSettings.addProvider": "+ 添加提供商",
   "ToolsSettings.apiKeys": "提供商 API 密钥",
+
+  "VisionSettings.mode": "输入来源",
+  "VisionSettings.mode_auto": "自动 —— 已装本地模型就用本地，否则用 API",
+  "VisionSettings.mode_local": "仅本地 —— 截图绝不离开这台机器",
+  "VisionSettings.mode_api": "仅 API —— 适用于装不了本地模型的环境",
+  "VisionSettings.mode_off": "关闭 —— 只用无障碍树作为输入",
+  "VisionSettings.modeHint_auto":
+    "本地 ONNX 模型已安装时用它，否则用下面的 API 模型。无论谁负责识别，OCR 都会为检测到的控件补上文字。",
+  "VisionSettings.modeHint_local":
+    "即使本地模型失败也不调用 API —— 选了它，就等于承诺截图不会离开这台机器。",
+  "VisionSettings.modeHint_api": "只由 API 模型作答。适用于无法安装本地模型的机器。",
+  "VisionSettings.modeHint_off":
+    "完全不用截图：控件只来自无障碍树，输入是否生效靠像素差异判断，而不是把输入框读回来。",
+  "VisionSettings.apiRung": "视觉 API 模型",
+  "VisionSettings.provider": "提供商",
+  "VisionSettings.model": "模型",
+  "VisionSettings.none": "无",
+  "VisionSettings.noModels": "还没有配置任何模型。请先到 Models 标签页添加。",
+  "VisionSettings.apiHint":
+    "提供商和模型两者都要设置；清空任意一项即关闭这条路径。所选模型必须支持图片输入。",
+  "VisionSettings.ocrPreset": "识别模型",
+  "VisionSettings.ocrInstalled": "该预设的模型文件已在本地。",
+  "VisionSettings.ocrMissing":
+    "该预设的模型文件还不在本地。首次使用时会自动下载，约 100 MB 网络流量。",
+  "VisionSettings.modelDir": "模型目录",
+  "VisionSettings.modelDirPlaceholder": "留空则使用默认位置（~/.syscity/models/vision）",
+  "VisionSettings.modelDirHint": "ONNX 模型文件所在的目录，下载也写到这里。留空表示使用默认位置。",
+  "VisionSettings.timeout": "识别超时（秒）",
+  "VisionSettings.timeoutHint": "单次视觉识别的上限。超时即放弃这次识别，该步骤不再使用截图继续执行。",
 
   "McpSettings.presets": "预设",
   "McpSettings.configureTokens": "配置令牌",
