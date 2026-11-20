@@ -126,6 +126,10 @@ check "fmt" cargo fmt -- --check
 check "clippy" cargo clippy --all-features -- -D warnings
 check "toolchain-parity" ./scripts/check-toolchain-parity.sh
 check "static-analysis" ./scripts/static-analysis.sh
+# CI runs these two as their own jobs; the mirror skipped both, so a local
+# green run said nothing about them. They are cheap shell scans.
+check "invariant-decls" ./scripts/check-invariant-decls.sh
+check "ort-cpu-pin" ./scripts/check-ort-cpu-pin.sh
 check "cargo check (all-features)" cargo check --all-features
 check "cargo doc" cargo doc --no-deps --all-features
 

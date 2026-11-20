@@ -322,6 +322,8 @@ CoreML 对这两个模型的判定是错的：CRNN 识别器的 squeeze-and-exci
 `with_execution_providers` **不能**撤销它——手动注册的 EP 与自动注册的并列，
 不替代它。必须把策略设回 `AutoDevicePolicy::PreferCPU`；`cpu_session()` 就是
 为此而存在，三个加载点（det、rec、OmniParser）全部经由它。
+`scripts/check-ort-cpu-pin.sh` 会拒绝任何绕过它的 session：在别处
+`commit_from_*`、builder 不设策略、或 helper 自己丢了那行，都直接失败。
 
 `VisionLook` 按 `LocalModel` 分派：检测器给出框后，若本机也装了 OCR，
 就用重叠的文字给这些框补 `label`（检测器本身不认字，`ui_onnx.rs` 过去恒发

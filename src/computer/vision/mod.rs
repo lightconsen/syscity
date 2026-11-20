@@ -49,8 +49,12 @@ mod preprocess;
 /// ort 2.0.0-rc.14 made the environment an explicit argument to
 /// `Session::builder`, and ONNX Runtime allows only one environment per
 /// process, so both vision backends share this one.
+///
+/// Private on purpose: a session built from it inherits ort's default EP
+/// policy (`MaxEfficiency`, i.e. CoreML on macOS), which miscomputes wide
+/// inputs. [`cpu_session`] is the way to get a session — see it for why.
 #[cfg(feature = "vision")]
-pub(crate) fn ort_environment() -> crate::Result<&'static ort::environment::Environment> {
+fn ort_environment() -> crate::Result<&'static ort::environment::Environment> {
     use std::sync::OnceLock;
 
     use crate::error::SyscityError;

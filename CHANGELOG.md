@@ -59,11 +59,14 @@ if no section matches, the release falls back to auto-generated notes.
   (`PreferNPU`), so on macOS ONNX Runtime registered CoreML for the CRNN
   recognizer's squeeze-and-excitation branch — and computed something else
   there. Every input wider than roughly 320 px decoded as all-blank, while the
-  same bytes read correctly through the CPU provider; the english recogniser
-  was narrowed enough to mask it, the 6625-class chinese one was not. Pinning
-  the policy to `PreferCPU` makes the two agree bit for bit. Note that
-  `with_execution_providers` cannot fix this: a manually registered EP runs
-  alongside the automatically selected one, it does not displace it.
+  same bytes read correctly through the CPU provider. The 6625-class chinese
+  head was wide enough to hit it; the 97-class english one was not, at any
+  width tried (up to 4096). Pinning the policy to `PreferCPU` makes the two
+  agree bit for bit. Note that `with_execution_providers` cannot fix this: a
+  manually registered EP runs alongside the automatically selected one, it
+  does not displace it. `scripts/check-ort-cpu-pin.sh` now fails the build
+  when a session is built outside the pinned helper, when a builder does not
+  set the policy, or when the helper loses it.
 - **A vision-capable model is no longer recorded as text-only.** The catalog
   decided "can this model see?" from a table of model-id patterns, and
   everything the table did not recognise — `qwen3.7-plus`, `kimi-k2.6`,

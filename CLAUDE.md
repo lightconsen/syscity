@@ -139,6 +139,10 @@ syscity/
    - Run `./scripts/self-check.sh` (runs all automated checks)
    - Or run individual steps: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`
    - Run `./scripts/static-analysis.sh --full` for cross-module anti-patterns
+   - Run `./scripts/check-ort-cpu-pin.sh` — every ONNX session must be built by
+     `computer::vision::cpu_session()`. `ort`'s default EP policy is
+     `MaxEfficiency`, which registers CoreML on macOS and makes wide inputs
+     decode as all-blank; `with_execution_providers` does not override it.
    - Run `cargo doc` to check docs build
    - Environment-dependent tests must *probe*, not assume: `tests/e2e` skips
      screenshot journeys when `screencapture` cannot read the display
@@ -164,6 +168,8 @@ syscity/
    - Security audit: `./scripts/audit.sh` (`cargo audit`, `pnpm audit`,
      `cargo deny` — the CI job splits the first two across steps)
    - Static analysis: `./scripts/static-analysis.sh`
+   - Invariant declarations: `./scripts/check-invariant-decls.sh`
+   - ONNX CPU pin: `./scripts/check-ort-cpu-pin.sh`
    - Toolchain parity: `./scripts/check-toolchain-parity.sh` (the mirror and
      template CI must never run a toolchain other than the pinned one — a
      `cargo +stable` in a script resolves to whatever the machine has, and

@@ -117,6 +117,16 @@ jobs:
           chmod +x scripts/check-invariant-decls.sh
           ./scripts/check-invariant-decls.sh
 
+      - name: Run ORT CPU-pin check
+        # `ort`'s `Session::builder` sets the EP selection policy to
+        # `MaxEfficiency`, which registers CoreML on macOS — and CoreML
+        # computes the CRNN recognizer's squeeze-and-excitation branch wrongly,
+        # decoding any input wider than ~320px as all-blank. A session that
+        # skips the `PreferCPU` pin silently reads nothing on wide screens.
+        run: |
+          chmod +x scripts/check-ort-cpu-pin.sh
+          ./scripts/check-ort-cpu-pin.sh
+
       - name: Gate integrity checks
         run: |
           chmod +x scripts/gate-integrity.sh
