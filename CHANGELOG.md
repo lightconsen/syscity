@@ -32,6 +32,16 @@ if no section matches, the release falls back to auto-generated notes.
 - **Sensitive UI is marked, everywhere it is found.** One detector marks the
   accessibility tree, the visual scan and a close-up alike, so the "never type
   into `[sensitive: …]`" rule in the prompt finally has something to bind to.
+- **Typing is confirmed off the picture on a screen with no tree.** Read-back
+  used to require the tree to name exactly one editable field, which is the one
+  thing a tree-less app cannot do — so "type, then look to check" was
+  unavailable on exactly the screens it was written for. With no editable field
+  in the tree, the change between the frame before the typing and the frame
+  after it now names the box to read: one text-shaped region is the field, and
+  the crop goes through the same OCR-and-compare. Two changed boxes, a change
+  covering half the screen or more, or a truncated region list are refused —
+  each is a case where the box cannot be attributed to this typing. The verdict
+  is still a boolean: the reading never leaves the verdict.
 
 ### Fixed
 

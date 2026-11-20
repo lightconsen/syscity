@@ -1618,7 +1618,13 @@ impl ComputerSession {
                 // only "did the text land", never the text.
                 #[cfg(feature = "vision")]
                 if let Some(state) = state_after {
-                    if let Some(hint) = self.read_back_typed(text, tree_before, state).await {
+                    // `screenshot_before` is what the tree-less branch crops
+                    // from: with no tree there is no box, and the change
+                    // between the two frames is the only thing that names one.
+                    if let Some(hint) = self
+                        .read_back_typed(text, action, tree_before, screenshot_before, state)
+                        .await
+                    {
                         return Ok((hint.verification, None, Some(hint)));
                     }
                 }
@@ -1653,11 +1659,33 @@ impl ComputerSession {
     /// field now holds. The frame the step just took does. Crop the field,
     /// read it, compare — and report only whether the typed text is in it.
     ///
-    /// `None` is every way of not answering, and there are five of them:
+    /// There are two ways to find the box, because the tree's way does not
+    /// reach the screens this exists for:
+    ///
+    /// - **The tree names exactly one editable field.** Its bounds are the box.
+    ///   This is also the only path that can ask "is this field private?"
+    ///   before any pixels are taken, so a tree-marked password is never
+    ///   cropped.
+    /// - **The tree names none** — a tree-less app, or one that publishes
+    ///   controls the walker cannot classify as editable. Then the change
+    ///   between the two frames is the box: see [`typed_box_from_change`] for
+    ///   how it is bounded, and for why half of those changes are refused
+    ///   rather than read.
+    ///
+    /// The second path cannot ask the sensitivity question, and it does not
+    /// pretend to: what it reads is what is *drawn* in the changed rectangle,
+    /// and a field that masks what it holds draws bullets. That is the same
+    /// argument [`ReadBack`] makes for the tree path — the picture has no text
+    /// in it to leak — with one difference worth stating: a tree-less secure
+    /// field whose renderer shows what it holds would be read. There is no
+    /// marker to check, so the guarantee is the renderer's, not this code's.
+    ///
+    /// `None` is every way of not answering:
     ///
     /// - read-back is off, or this build has no `vision` feature;
-    /// - the field cannot be identified — no editable element in the tree, or
-    ///   more than one — so there is no box to lean in on;
+    /// - the field cannot be identified — two or more editable elements in the
+    ///   tree, or no tree and no single text-shaped change — so there is no
+    ///   box to lean in on;
     /// - the tree marked the field sensitive, or it masks what it holds. See
     ///   [`ReadBack`] for why this is checked *before* any pixels are taken;
     /// - the models are not installed. A `stat` of the three files decides
@@ -1676,7 +1704,9 @@ impl ComputerSession {
     async fn read_back_typed(
         &self,
         typed: &str,
+        action: &DesktopAction,
         tree_before: Option<&[UiElement]>,
+        screenshot_before: Option<&Screenshot>,
         state: &ScreenState,
     ) -> Option<EffectHint> {
         if typed.is_empty() {
@@ -1687,25 +1717,59 @@ impl ComputerSession {
             ReadBack::InstalledModels => String::new(),
             ReadBack::ModelDir(dir) => dir.clone(),
         };
-        // The tree the step started from is the one that can say which field
-        // the typing went into: the after-tree may hold the same fields with
-        // the values this feature exists because they do not publish.
-        let fields = editable_fields(tree_before?);
-        if fields.is_empty() || fields.len() > 1 {
-            return None;
-        }
-        let field = fields[0];
-        // Asked before any pixels are taken: a field the tree calls private is
-        // not looked at, whether or not its renderer masks what it holds.
-        if !crate::computer::sensitive_ui::scan_sensitive(std::slice::from_ref(field)).is_empty()
-            || masks(field)
-        {
-            return None;
-        }
-        let bounds = field.bounds?;
-        if bounds.width == 0 || bounds.height == 0 {
-            return None;
-        }
+        let shot = &state.screenshot;
+        // Two ways to find the box, and the tree's is preferred because it can
+        // also say what the field *is*. See [`typed_box_from_change`] for the
+        // other one.
+        //
+        // An empty tree and no tree are the same case here — a screen that
+        // publishes no editable field — so both fall through to the frame.
+        // Two or more fields are not: there is no box that can be attributed
+        // to this typing, which is the rule [`editable_fields`] exists for.
+        let fields = tree_before.map(editable_fields).unwrap_or_default();
+        let crop = match fields.as_slice() {
+            [field] => {
+                // Asked before any pixels are taken: a field the tree calls
+                // private is not looked at, whether or not its renderer masks
+                // what it holds.
+                if !crate::computer::sensitive_ui::scan_sensitive(std::slice::from_ref(field))
+                    .is_empty()
+                    || masks(field)
+                {
+                    return None;
+                }
+                let bounds = field.bounds?;
+                if bounds.width == 0 || bounds.height == 0 {
+                    return None;
+                }
+                let space = self.coordinate_space().await?;
+                // A mapping built for another frame would crop the wrong part
+                // of this one; the frame in hand has to be the frame the space
+                // describes.
+                if space.image_width != shot.width || space.image_height != shot.height {
+                    return None;
+                }
+                space.screen_rect_to_image(&bounds)
+            }
+            // No field the tree can name — the screen this feature is really
+            // for. The tree was never going to answer here, and neither would
+            // a scan: what changed between the two frames is the only thing
+            // that says where the typing went.
+            [] => {
+                let before = screenshot_before?;
+                let change = pixel_diff(before, shot);
+                // Where the action aimed, in the same pixel space. A `type`
+                // with no target aimed at the focus, and nothing here knows
+                // where that is — so the counting rule is what answers, and
+                // `aim_in_image` already returns `None` for it.
+                let aim = self.aim_in_image(action, shot).await;
+                typed_box_from_change(before, shot, &change, aim)?
+            }
+            // Two or more: there is no box that can be attributed to this
+            // typing. Guessing one would read the wrong field and compare the
+            // other's text against it.
+            _ => return None,
+        };
 
         // A `stat` of the three model files, before anything expensive: "the
         // models were never fetched" is the common case on a machine that
@@ -1714,14 +1778,6 @@ impl ComputerSession {
             tracing::debug!("no OCR models installed; the typed value could not be read back");
             return None;
         }
-        let space = self.coordinate_space().await?;
-        let shot = &state.screenshot;
-        // A mapping built for another frame would crop the wrong part of this
-        // one; the frame in hand has to be the frame the space describes.
-        if space.image_width != shot.width || space.image_height != shot.height {
-            return None;
-        }
-        let crop = space.screen_rect_to_image(&bounds);
 
         let read = crate::computer::budget::within(
             &self.step_budget(),
@@ -2530,6 +2586,143 @@ fn masks(field: &UiElement) -> bool {
             .is_some_and(|value| is_masked(&field.role, value))
 }
 
+/// Which rectangle of the screen the typing went into, when the tree cannot
+/// say.
+///
+/// This is the tree-less half of the read-back, and it exists because the
+/// tree's half is unavailable exactly where the answer matters most. A screen
+/// that publishes no tree — a canvas app, an Electron input that exposes
+/// nothing, a remote desktop — is also a screen whose scan supplies no
+/// editable field: the detector names a `text_field` in the *outline*, but
+/// that element never enters `tree_before`, and OCR's elements carry
+/// `role: "text"`, which [`is_editable`] does not match. So on such a screen
+/// there is no `editable_fields` answer and no box to crop, and "type, then
+/// look to confirm" — the thing a person does without thinking — had no
+/// implementation.
+///
+/// What is left is what a person has: the frame before, the frame after, and
+/// the knowledge that typing changes pixels. The box that changed is the box
+/// to lean in on. Three ways of not answering, each for a reason that would
+/// make a guess wrong:
+///
+/// - **Nothing in either frame.** There is no comparison, so no change.
+/// - **The change is not text-shaped.** A whole window repainting: a box that
+///   covers a large part of the frame is not evidence about one field, and
+///   cropping it would ask OCR "what does this screen say" and then compare
+///   that with the typed text. A containment test that could pass by accident
+///   is worse than no test.
+/// - **More than one box changed and nothing says which is the field.** Two
+///   fields changing at once means the typing cannot be attributed to either;
+///   that is the same rule [`editable_fields`] applies when it refuses two
+///   candidates.
+///
+/// # Why the caller's target matters
+///
+/// Counting changed boxes alone is not enough on a real desktop: a menu-bar
+/// clock repaints every second, a spinner turns, a video plays. On such a
+/// screen "exactly one box changed" is almost never true, and the read-back
+/// would be dead on the very screens it exists for.
+///
+/// So when the action named a target, the target decides: a changed box that
+/// overlaps it is this typing, and a changed box elsewhere is the clock. The
+/// crop is clipped to the target's own box, which also stops a neighbour's
+/// text from being read in and matched against what was typed.
+///
+/// `aim` is in the pixel space of `after`, like the regions. `None` means the
+/// action named no target — a bare `type` into whatever holds focus — and the
+/// counting rule is what is left. That case is the honest ceiling of this
+/// function: it cannot tell a field from a clock, so it only answers when the
+/// screen offers exactly one candidate.
+///
+/// All boxes are in the pixel space of `after` — the same space
+/// [`ScreenState::diff`] reports its regions in.
+///
+/// A caret is the case that makes this narrow: it blinks inside the field, so
+/// the changed box is the caret's body, not the field's. Widening it by a
+/// fixed margin is deliberate — the reading needs a box big enough to hold
+/// text, and a caret's box is not.
+#[cfg(feature = "vision")]
+fn typed_box_from_change(
+    before: &Screenshot,
+    after: &Screenshot,
+    change: &crate::computer::vision::PixelDiffResult,
+    aim: Option<Rect>,
+) -> Option<Rect> {
+    /// How far past a changed box the reading looks, in image pixels.
+    ///
+    /// A caret blinks *inside* the field, so its box is a few pixels wide and
+    /// says nothing about where the text is. The field it sits in is the thing
+    /// that changed; the margin is what turns one into the other.
+    const TEXT_MARGIN: i32 = 24;
+    /// The largest share of the frame a "field" may cover.
+    ///
+    /// Beyond this the change is the screen, not a field — a page load, a
+    /// theme switch, a window that just came forward. Cropping it and calling
+    /// the result a field's value would confirm any typing anywhere.
+    const MAX_FRAME_SHARE: f32 = 0.5;
+
+    if before.width == 0 || before.height == 0 || after.width == 0 || after.height == 0 {
+        return None;
+    }
+    // The regions are only comparable when both frames are in one space. A
+    // capture taken while the display reconfigured — or a crop against a
+    // full-screen frame — would compare unrelated pixels, and the box it
+    // produced would be a place, not the place.
+    if before.width != after.width || before.height != after.height {
+        return None;
+    }
+    // A region list that was cut short cannot say how many boxes changed, and
+    // both rules below turn on counting them.
+    if change.regions_truncated {
+        return None;
+    }
+    let frame = after.width as f32 * after.height as f32;
+    let region = match aim {
+        Some(aim) => {
+            // The boxes that touch the target. A box somewhere else on the
+            // screen is not this typing, however much it changed.
+            let mut touching = change
+                .changed_regions
+                .iter()
+                .filter(|region| region.overlaps(&aim));
+            let first = *touching.next()?;
+            if touching.next().is_some() {
+                // Two changes inside the target's own box: the field and
+                // something drawn over it, or a menu that opened under the
+                // pointer. Nothing here says which is the text.
+                return None;
+            }
+            if first.width as f32 * first.height as f32 > frame * MAX_FRAME_SHARE {
+                return None;
+            }
+            first
+        }
+        None => {
+            let [region] = change.changed_regions.as_slice() else {
+                return None;
+            };
+            let box_area = region.width as f32 * region.height as f32;
+            if box_area > frame * MAX_FRAME_SHARE {
+                return None;
+            }
+            *region
+        }
+    };
+
+    let x = region.x.saturating_sub(TEXT_MARGIN).max(0);
+    let y = region.y.saturating_sub(TEXT_MARGIN).max(0);
+    let right =
+        (region.x as i64 + region.width as i64 + TEXT_MARGIN as i64).min(after.width as i64) as i32;
+    let bottom = (region.y as i64 + region.height as i64 + TEXT_MARGIN as i64)
+        .min(after.height as i64) as i32;
+    let width = (right - x).max(0) as u32;
+    let height = (bottom - y).max(0) as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect::new(x, y, width, height))
+}
+
 /// Turn what OCR read into a verdict, dropping the reading itself.
 ///
 /// Free rather than a method: the comparison needs no session, no adapter
@@ -3061,6 +3254,17 @@ mod tests {
         })
     }
 
+    /// The step the read-back tests type through: a `type` with no target, so
+    /// the tree-less branch has to fall back to the counting rule. Tests that
+    /// want a target build their own.
+    #[cfg(feature = "vision")]
+    fn type_step() -> DesktopAction {
+        DesktopAction::Type {
+            text: String::new(),
+            target: None,
+        }
+    }
+
     fn field(role: &str, value: &str) -> UiElement {
         UiElement {
             id: String::new(),
@@ -3485,10 +3689,20 @@ mod tests {
                 ScreenState::from_parts(before.clone(), Screenshot::new(String::new(), 100, 100));
             assert!(
                 session
-                    .read_back_typed("hello", Some(&before), &state)
+                    .read_back_typed("hello", &type_step(), Some(&before), None, &state)
                     .await
                     .is_none(),
                 "{read_back:?} answered with no frame mapping to crop from"
+            );
+            // The tree-less branch has two of its own ways to refuse, and both
+            // have to reach the same `None`: no frame before to compare
+            // against, and a frame with nothing in it to see.
+            assert!(
+                session
+                    .read_back_typed("hello", &type_step(), None, None, &state)
+                    .await
+                    .is_none(),
+                "{read_back:?} answered with no baseline frame"
             );
         }
 
@@ -3510,6 +3724,364 @@ mod tests {
             .await
             .expect("a step still answers");
         assert_eq!(outcome, StepVerification::Unverifiable);
+    }
+
+    // ── The tree-less half of the read-back ───────────────────────────────
+    //
+    // On a screen that publishes no editable field there is no `editable_fields`
+    // answer, so the box to crop has to come from somewhere else: the change
+    // between the frame before the typing and the frame after it. These pin
+    // which changes are allowed to name a field and which are not.
+
+    #[cfg(feature = "vision")]
+    fn change_in(regions: Vec<Rect>, truncated: bool) -> crate::computer::vision::PixelDiffResult {
+        crate::computer::vision::PixelDiffResult {
+            // The percentage is the diff's other answer and this function does
+            // not read it; the regions are the whole input.
+            change_percentage: 1.0,
+            changed_regions: regions,
+            regions_truncated: truncated,
+        }
+    }
+
+    /// The ordinary case: one box changed, so that box is the field.
+    ///
+    /// The box is widened by a margin before it is returned, because a caret
+    /// blinks *inside* the field and its own box is a few pixels wide — big
+    /// enough to name the place, too small to read text out of.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_single_changed_box_names_the_field() {
+        let before = Screenshot::new(String::new(), 800, 600);
+        let after = Screenshot::new(String::new(), 800, 600);
+        let crop = typed_box_from_change(
+            &before,
+            &after,
+            &change_in(vec![Rect::new(300, 200, 10, 18)], false),
+            None,
+        )
+        .expect("one changed box is an answer");
+        // Widened by the margin on every side, and the box it covers contains
+        // the change rather than the change's exact pixels.
+        assert!(crop.contains(300, 200), "{crop:?} must cover the change");
+        assert!(crop.contains(309, 217), "{crop:?} must cover the change");
+        assert!(crop.width > 10, "{crop:?} is the caret, not the field");
+        assert!(crop.height > 18, "{crop:?} is the caret, not the field");
+        // Never outside the frame: a crop the decoder clamps anyway would make
+        // the test above pass for the wrong reason.
+        assert!(crop.x >= 0 && crop.y >= 0);
+        assert!(crop.x as u32 + crop.width <= 800);
+        assert!(crop.y as u32 + crop.height <= 600);
+    }
+
+    /// Two boxes changing at once cannot be attributed to this typing.
+    ///
+    /// Same rule the tree path applies to two editable fields: picking one of
+    /// two is a guess with the verifier's name on it, and it would compare the
+    /// other field's text against what was typed.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn two_changed_boxes_are_not_attributed_to_one_typing() {
+        let shot = Screenshot::new(String::new(), 800, 600);
+        assert!(typed_box_from_change(
+            &shot,
+            &shot,
+            &change_in(vec![Rect::new(10, 10, 10, 18), Rect::new(400, 300, 12, 18)], false),
+            None,
+        )
+        .is_none());
+    }
+
+    /// A change the size of the screen is the screen, not a field.
+    ///
+    /// Without the size ceiling, a page load or a window coming forward would
+    /// become "the field", OCR would read the whole screen, and any typed text
+    /// appearing anywhere in it would "confirm" the typing.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_change_covering_most_of_the_screen_is_not_a_field() {
+        let shot = Screenshot::new(String::new(), 800, 600);
+        assert!(typed_box_from_change(
+            &shot,
+            &shot,
+            &change_in(vec![Rect::new(0, 0, 800, 600)], false),
+            None
+        )
+        .is_none());
+        // And a box that is large but still field-shaped gets through: the
+        // ceiling is a sanity bound, not a second editor.
+        assert!(typed_box_from_change(
+            &shot,
+            &shot,
+            &change_in(vec![Rect::new(100, 100, 400, 100)], false),
+            None
+        )
+        .is_some());
+    }
+
+    /// A truncated region list cannot say how many boxes changed.
+    ///
+    /// The cap keeps the eight largest regions, so a second changed field may
+    /// simply be missing from the list. Counting what is there would turn a
+    /// cut list into "exactly one box changed" — the one reading the rule
+    /// above must not make.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_truncated_region_list_is_not_read_as_one_box() {
+        let shot = Screenshot::new(String::new(), 800, 600);
+        assert!(typed_box_from_change(
+            &shot,
+            &shot,
+            &change_in(vec![Rect::new(300, 200, 10, 18)], true),
+            None
+        )
+        .is_none());
+    }
+
+    /// Nothing changed, so there is nothing to lean in on.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn no_change_names_no_field() {
+        let shot = Screenshot::new(String::new(), 800, 600);
+        assert!(typed_box_from_change(&shot, &shot, &change_in(Vec::new(), false), None).is_none());
+        // An unmeasured frame is not an unchanged one.
+        let empty = Screenshot::new(String::new(), 0, 0);
+        assert!(typed_box_from_change(
+            &empty,
+            &empty,
+            &change_in(vec![Rect::new(1, 1, 10, 10)], false),
+            None
+        )
+        .is_none());
+    }
+
+    /// The tree-less path is reached only when the tree names no field.
+    ///
+    /// The tree path is asked first and wins: it is the only one that can
+    /// check the field's sensitivity before any pixels are taken, so a screen
+    /// that publishes a password field must never fall through to the frame.
+    /// Here the tree has the field and no models are installed, so the answer
+    /// is `None` from the tree path — and the frame, which *did* change, must
+    /// not be read instead.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_tree_that_names_the_field_is_not_bypassed_by_the_frame() {
+        use base64::Engine as _;
+        fn shot(white: Option<Rect>) -> Screenshot {
+            let mut img = image::RgbImage::new(200, 120);
+            if let Some(r) = white {
+                for y in r.y as u32..(r.y as u32 + r.height).min(120) {
+                    for x in r.x as u32..(r.x as u32 + r.width).min(200) {
+                        img.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                    }
+                }
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            Screenshot::new(
+                base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                200,
+                120,
+            )
+        }
+        let before = vec![field("AXTextField", "")];
+        let session = ComputerSession::new(Arc::new(HeadlessComputerAdapter::new())).with_config(
+            SessionConfig {
+                read_back: ReadBack::ModelDir("/nonexistent/syscity-read-back-test".to_string()),
+                ..Default::default()
+            },
+        );
+        let changed = ScreenState::from_parts(Vec::new(), shot(Some(Rect::new(20, 20, 40, 16))));
+        assert!(
+            session
+                .read_back_typed("hello", &type_step(), Some(&before), Some(&shot(None)), &changed)
+                .await
+                .is_none(),
+            "the tree path answered, so the frame must not be consulted"
+        );
+    }
+
+    /// The whole tree-less chain, against the models on this machine.
+    ///
+    /// The unit tests above pin the box arithmetic and the refusals; this one
+    /// proves the chain they feed — no tree, two frames, a changed box, a
+    /// crop, OCR, a verdict — actually produces a verdict, and that the
+    /// verdict still carries no text. Without it, every piece could be right
+    /// and the wiring between them wrong, which is the exact class of defect
+    /// this feature exists to close.
+    ///
+    /// The frame is drawn at runtime from 5×7 glyph bitmaps, the same shape
+    /// `ocr_file`'s own test uses: no font is available in a test and none
+    /// should be. The glyphs are "HELO" — the recognizer's spelling of them is
+    /// the model's business, so the assertion is about *agreement*, not a
+    /// spelling: the same picture typed as either spelling must confirm, and a
+    /// picture typed as something else must not.
+    ///
+    /// The skip is loud on stderr, like the rest of this suite's
+    /// model-dependent tests: a machine without the optional models must see
+    /// that this never ran.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_tree_less_typing_is_read_back_from_the_changed_box() {
+        use base64::Engine as _;
+        use image::{Rgb, RgbImage};
+
+        /// 5×7 bitmaps, one per row, most significant bit leftmost.
+        const GLYPHS: &[[u8; 7]] = &[
+            // H
+            [
+                0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            // E
+            [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+            ],
+            // L
+            [
+                0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+            ],
+            // O
+            [
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+        ];
+        const SCALE: u32 = 12;
+
+        /// A frame with the glyphs drawn into one band, or a blank one.
+        fn frame(with_text: bool) -> Screenshot {
+            let mut img = RgbImage::from_pixel(400, 200, Rgb([255, 255, 255]));
+            if with_text {
+                let (left, top) = (40, 60);
+                for (index, glyph) in GLYPHS.iter().enumerate() {
+                    let origin = left + index as u32 * (5 * SCALE + SCALE);
+                    for (row, bits) in glyph.iter().enumerate() {
+                        for column in 0..5u32 {
+                            if bits & (1 << (4 - column)) == 0 {
+                                continue;
+                            }
+                            for dy in 0..SCALE {
+                                for dx in 0..SCALE {
+                                    img.put_pixel(
+                                        origin + column * SCALE + dx,
+                                        top + row as u32 * SCALE + dy,
+                                        Rgb([0, 0, 0]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .expect("encode the fixture");
+            Screenshot::new(
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+                400,
+                200,
+            )
+        }
+
+        if crate::computer::vision::model_download::ocr_model_paths("").is_none() {
+            eprintln!(
+                "SKIPPED a_tree_less_typing_is_read_back_from_the_changed_box: no OCR models \
+                 under {}",
+                crate::computer::vision::model_download::vision_model_dir("").display()
+            );
+            return;
+        }
+
+        let session = ComputerSession::new(Arc::new(HeadlessComputerAdapter::new()));
+        let blank = frame(false);
+        let typed = frame(true);
+        // No tree at all: this is the screen the branch exists for.
+        let state = ScreenState::from_parts(Vec::new(), typed.clone());
+
+        // First: what the differing region says, read the same way the
+        // feature reads it. Two OCR runs over the *same* pixels are not
+        // guaranteed to be identical readings — glyph fixtures are small and
+        // the recognizer's margin is thin — so the assertion is on the path
+        // and not on the recognizer's spelling of it. `HELU` once, `HELD` the
+        // next: both are "it read the place that changed".
+        let change = crate::computer::vision::pixel_diff(&blank, &typed);
+        let crop = typed_box_from_change(&blank, &typed, &change, None).expect("one box changed");
+        let read = crate::computer::vision::ocr_file::ocr_screenshot(&typed, Some(crop), "")
+            .await
+            .expect("the models are installed");
+        assert!(
+            !read.text.trim().is_empty() && read.is_reliable(),
+            "the changed box holds nothing the reader can read: {read:?}"
+        );
+        let shown: String = read.text.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // The text the box shows is confirmed — and the box came from the
+        // change between the two frames, not from a tree.
+        let hint = session
+            .read_back_typed(&shown, &type_step(), None, Some(&blank), &state)
+            .await
+            .expect("the changed box was read and agreed");
+        assert_eq!(hint.effect, ActionEffect::Confirmed);
+        assert_eq!(hint.verification, StepVerification::Verified);
+        // The leak rule holds on this path too: the hint has no field that
+        // could carry the reading.
+        assert!(!format!("{hint:?}").contains(&shown), "the reading leaked");
+
+        // A real typo is the case this feature exists for: text that is not
+        // what the screen shows must not confirm. `zzzznotonscreen` shares no
+        // run with any reading of these glyphs, so no recognizer's spelling
+        // could turn it into a match.
+        let wrong = "zzzznotonscreen";
+        let hint = session
+            .read_back_typed(wrong, &type_step(), None, Some(&blank), &state)
+            .await
+            .expect("the changed box was read");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+        assert_eq!(hint.verification, StepVerification::Failed);
+        assert!(!format!("{hint:?}").contains(&shown), "the reading leaked");
+
+        // And with nothing changed between the frames there is no box, so no
+        // reading is attempted — the step falls back to the diff as before.
+        assert!(
+            session
+                .read_back_typed(
+                    &shown,
+                    &type_step(),
+                    None,
+                    Some(&blank),
+                    &ScreenState::from_parts(Vec::new(), blank.clone())
+                )
+                .await
+                .is_none(),
+            "an unchanged screen names no field"
+        );
+    }
+
+    /// A clock repaints every second; the field still has to be readable.
+    ///
+    /// This is the case that makes counting changed boxes insufficient on a
+    /// real desktop. With a target, the box that overlaps it is this typing
+    /// and the one that does not is the clock — and the crop is clipped to the
+    /// target, so the clock's digits are not read into the comparison.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_change_away_from_the_target_is_not_this_typing() {
+        let shot = Screenshot::new(String::new(), 800, 600);
+        let change = change_in(vec![Rect::new(20, 8, 30, 14), Rect::new(300, 200, 120, 24)], false);
+        // Aimed at the field: the field's box is the answer.
+        let aimed =
+            typed_box_from_change(&shot, &shot, &change, Some(Rect::new(280, 190, 160, 44)))
+                .expect("the box at the target is this typing");
+        assert!(aimed.contains(300, 200), "{aimed:?} must cover the field");
+        assert!(!aimed.contains(25, 10), "{aimed:?} must not cover the clock");
+        // Aimed nowhere near either change: nothing can be attributed.
+        assert!(typed_box_from_change(&shot, &shot, &change, Some(Rect::new(600, 400, 100, 40)))
+            .is_none());
+        // No target at all: two boxes, so no answer — the counting rule is
+        // what the target exists to replace.
+        assert!(typed_box_from_change(&shot, &shot, &change, None).is_none());
     }
 
     #[test]
