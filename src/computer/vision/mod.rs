@@ -70,6 +70,35 @@ pub(crate) fn ort_environment() -> crate::Result<&'static ort::environment::Envi
         .ok_or_else(|| SyscityError::Internal("ORT environment not initialized".to_string()))
 }
 
+/// Load an ONNX model into a session pinned to the CPU execution provider.
+///
+/// `Session::builder` sets the EP selection policy to `MaxEfficiency`, which
+/// on macOS means "prefer the NPU" — and ONNX Runtime then registers CoreML
+/// for whatever it believes it can run. It is wrong about these models: the
+/// CRNN recognizer's squeeze-and-excitation branch is partitioned onto CoreML
+/// and computes something else there, so a wide input (roughly `w >= 320`)
+/// decodes as all-blank while the same bytes read correctly through the CPU
+/// provider. Chinese is hit first because its 6625-class head needs the most
+/// width before the pooled feature map collapses, but the english recognizer
+/// goes through the same nodes.
+///
+/// `with_execution_providers` does not undo this — manually registered EPs
+/// take precedence *alongside* the automatic one, it does not displace it.
+/// The policy has to be set back to `PreferCPU`, which registers nothing.
+#[cfg(feature = "vision")]
+pub(crate) fn cpu_session(path: &str) -> crate::Result<ort::session::Session> {
+    use crate::error::SyscityError;
+
+    let builder = ort::session::Session::builder(ort_environment()?)
+        .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?;
+    let mut builder = builder
+        .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+        .map_err(|e| SyscityError::Internal(format!("ORT execution provider error: {}", e)))?;
+    builder
+        .commit_from_file(path)
+        .map_err(|e| SyscityError::Internal(format!("Failed to load ONNX model {path}: {}", e)))
+}
+
 #[cfg(feature = "vision")]
 pub use model_download::{resolve_or_download_vision_models, VisionModelPaths};
 #[cfg(feature = "vision")]

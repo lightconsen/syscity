@@ -1773,8 +1773,14 @@ impl ComputerSession {
         // A `stat` of the three model files, before anything expensive: "the
         // models were never fetched" is the common case on a machine that
         // never asked for vision, and it must not cost a decode.
-        if crate::computer::vision::model_download::ocr_model_paths(&model_dir).is_none() {
-            tracing::debug!("no OCR models installed; the typed value could not be read back");
+        let preset = crate::computer::vision::model_download::configured_preset();
+        if crate::computer::vision::model_download::ocr_model_paths_for(&model_dir, preset)
+            .is_none()
+        {
+            tracing::debug!(
+                "no OCR models ({}) installed; the typed value could not be read back",
+                preset.key()
+            );
             return None;
         }
 

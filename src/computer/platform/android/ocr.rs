@@ -46,24 +46,31 @@ pub(super) fn ocr_lines(blocks: Vec<crate::computer::vision::TextBlock>) -> Vec<
 #[cfg(feature = "vision")]
 pub async fn ocr_png(png: &[u8]) -> Result<Vec<OcrLine>, String> {
     use crate::computer::types::Screenshot;
+    use crate::computer::vision::model_download::OcrPreset;
     use crate::computer::vision::ocr_rapid::RapidOcr;
     use base64::Engine as _;
 
-    static ENGINE: tokio::sync::Mutex<Option<RapidOcr>> = tokio::sync::Mutex::const_new(None);
+    // Tagged with the preset, because `new_auto` follows
+    // `[computer.vision].ocr` — a phone told to read Chinese must not keep
+    // decoding through the english dictionary it loaded at boot.
+    static ENGINE: tokio::sync::Mutex<Option<(OcrPreset, RapidOcr)>> =
+        tokio::sync::Mutex::const_new(None);
 
     let (width, height) =
         png_dimensions(png).ok_or_else(|| "the screenshot's size could not be read".to_string())?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(png);
     let screenshot = Screenshot::new(encoded, width, height);
 
+    let preset = crate::computer::vision::model_download::configured_preset();
+
     let mut guard = ENGINE.lock().await;
-    if guard.is_none() {
+    if !crate::computer::vision::model_download::engine_matches(&*guard, preset) {
         let engine = RapidOcr::new_auto()
             .await
             .map_err(|e| format!("the OCR models could not be loaded ({e})"))?;
-        *guard = Some(engine);
+        *guard = Some((preset, engine));
     }
-    let engine = guard
+    let (_, engine) = guard
         .as_mut()
         .ok_or_else(|| "the OCR engine is unavailable".to_string())?;
     let blocks = engine

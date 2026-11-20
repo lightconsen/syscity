@@ -462,6 +462,15 @@ pub(crate) async fn register_hot_reload_handlers(
                     if allow_apps_changed {
                         config.computer.allow_apps = new_config.computer.allow_apps.clone();
                     }
+                    // The vision settings are read through a process-wide
+                    // handle by tools that have no config, so a file edit that
+                    // moves the model directory or changes the recognition
+                    // preset has to reach that handle — assigning the config
+                    // alone would change the answer only after a restart.
+                    let vision_changed = config.computer.vision != new_config.computer.vision;
+                    if vision_changed {
+                        config.computer.vision = new_config.computer.vision.clone();
+                    }
                     drop(config_guard);
                     // The apps a desktop session may act on are read through a
                     // handle shared with every session already running, so the
@@ -470,6 +479,10 @@ pub(crate) async fn register_hot_reload_handlers(
                     if allow_apps_changed {
                         let apps = state.config.read().await.computer.allow_apps.clone();
                         state.tools.computer_allow_apps.replace(apps);
+                    }
+                    if vision_changed {
+                        let vision = state.config.read().await.computer.vision.clone();
+                        crate::computer::vision::model_download::install_settings(&vision);
                     }
                     // The permission gate reads the shared runtime — reload it
                     // here so a file edit takes effect without a restart.

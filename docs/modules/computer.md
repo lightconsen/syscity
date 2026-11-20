@@ -81,7 +81,16 @@ provider = "openai"    # the API rung, when it exists
 model = "gpt-4o"
 model_dir = ""         # empty → ~/.syscity/models/vision
 timeout_secs = 10      # one lookup, then degrade — never block the loop
+ocr = "ppocrv3-en"     # ppocrv3-en (97 classes) | ppocrv3-ch (6625 classes)
 ```
+
+The recognizer is not a plug-in point — the pipeline fixes the input tensor name, the output shape,
+the 48-pixel rec height, the 32-multiple black padding and the greedy CTC decode, so what `ocr`
+switches is a **preset** whose three files travel together (det, rec, dictionary) and whose class
+count is checked against the dictionary at load. Engine caches are tagged with the preset they were
+built from, so a switch takes effect on the next frame and switching back does not reload. See
+[`docs/computer-use.md`](../computer-use.md#换识别器computervisionocr) for the full preset table and
+the runtime caveat about execution providers.
 
 ### Platform Adapters
 

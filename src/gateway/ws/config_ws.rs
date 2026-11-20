@@ -59,6 +59,24 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
                 // from the shared handle, so `config.get` and `config.set` are
                 // about the same value rather than about two lifetimes.
                 "allow_apps": config.computer.allow_apps,
+                // Which recognition model reads text, and whether the local
+                // rung will find it. Reported as the presence of the
+                // configured preset's own files rather than "OCR is
+                // installed", because a machine holding only the english pair
+                // cannot read a Chinese screen.
+                "vision": {
+                    "mode": config.computer.vision.mode,
+                    "model_dir": config.computer.vision.model_dir,
+                    "ocr": config.computer.vision.ocr,
+                    "ocr_presets": crate::computer::vision::model_download::OcrPreset::all()
+                        .iter()
+                        .map(|p| serde_json::json!({ "key": p.key(), "label": p.label() }))
+                        .collect::<Vec<_>>(),
+                    "ocr_installed": ocr_installed(&config.computer.vision),
+                    "provider": config.computer.vision.provider,
+                    "model": config.computer.vision.model,
+                    "timeout_secs": config.computer.vision.timeout_secs,
+                },
             },
             "search": {
                 "provider": config.search.provider,
@@ -77,6 +95,23 @@ pub(super) async fn handle_config_get(req: &WsRequest, state: &Arc<GatewayState>
             },
         }),
     )
+}
+
+/// Whether the configured recognition preset's files are on this machine.
+///
+/// A `stat`, never a download: `config.get` is asked before a run starts, and
+/// answering it must not become an 88 MB fetch. `false` is not an error — it
+/// is the answer the settings page needs in order to say "not installed yet".
+fn ocr_installed(config: &crate::config::VisionConfig) -> bool {
+    if !cfg!(feature = "vision") {
+        return false;
+    }
+    // An unknown spelling is refused at write time, and if one arrives anyway
+    // the loader reads the default; report what the loader would do.
+    let preset = crate::computer::vision::model_download::OcrPreset::parse(&config.ocr)
+        .unwrap_or(crate::computer::vision::model_download::DEFAULT_OCR_PRESET);
+    crate::computer::vision::model_download::ocr_model_paths_for(&config.model_dir, preset)
+        .is_some()
 }
 
 pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
@@ -182,6 +217,11 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // Set by the `computer.allow_apps` arm; the shared handle is refreshed
     // after the write lock is dropped, so a session already running sees it.
     let mut allow_apps_changed = false;
+    // Set by a `computer.vision.*` arm; the process-wide settings handle is
+    // refreshed after the write lock is dropped, so the tools that read it —
+    // `screen_ocr`, the image tool, a step's read-back — see the new preset or
+    // directory rather than only the next process.
+    let mut vision_changed = false;
 
     match params.path.as_str() {
         // Scalar `default_agent.*` paths share the same pure application logic
@@ -231,6 +271,85 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
             config.computer.allow_apps = apps;
             allow_apps_changed = true;
         }
+        // `[computer.vision]` — one path per field, so a client can change the
+        // recognition model without restating the mode and directory.
+        "computer.vision.ocr" => {
+            let Some(raw) = params.value.as_str() else {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.vision.ocr takes a preset name",
+                );
+            };
+            let Some(preset) = crate::computer::vision::model_download::OcrPreset::parse(raw)
+                .filter(|_| !raw.trim().is_empty())
+            else {
+                // Refused rather than stored-and-ignored: an unknown name is
+                // one keystroke from the default, and quietly reading english
+                // after a user asked for chinese is the failure this names.
+                let choices = crate::computer::vision::model_download::OcrPreset::all()
+                    .iter()
+                    .map(|p| format!("\"{}\" ({})", p.key(), p.label()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    format!("Unknown OCR preset \"{}\"; expected one of {choices}", raw.trim()),
+                );
+            };
+            config.computer.vision.ocr = preset.key().to_string();
+            vision_changed = true;
+        }
+        "computer.vision.mode" => {
+            let Some(raw) = params.value.as_str() else {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.vision.mode takes \"auto\", \"local\", \"api\" or \"off\"",
+                );
+            };
+            let normalised = raw.trim().to_ascii_lowercase();
+            if !matches!(normalised.as_str(), "auto" | "local" | "api" | "off") {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    format!(
+                        "Unknown vision mode \"{}\"; expected \"auto\", \"local\", \"api\" or \"off\"",
+                        raw.trim()
+                    ),
+                );
+            }
+            config.computer.vision.mode = normalised;
+            vision_changed = true;
+        }
+        "computer.vision.model_dir" => {
+            let Some(raw) = params.value.as_str() else {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.vision.model_dir takes a path (empty for the default)",
+                );
+            };
+            config.computer.vision.model_dir = raw.trim().to_string();
+            vision_changed = true;
+        }
+        "computer.vision.timeout_secs" => match params.value.as_u64() {
+            // Zero would make every lookup fail instantly; the resolver floors
+            // it anyway, and accepting it would store a setting that reads as
+            // "on" while answering nothing.
+            Some(v) if v > 0 => {
+                config.computer.vision.timeout_secs = v;
+                vision_changed = true;
+            }
+            _ => {
+                return WsResponse::err(
+                    &req.id,
+                    "INVALID_PARAMS",
+                    "computer.vision.timeout_secs takes a positive number of seconds",
+                )
+            }
+        },
         "heartbeat.enabled" => {
             if let Some(v) = params.value.as_bool() {
                 config.heartbeat.enabled = v;
@@ -525,6 +644,7 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
         None
     };
     let updated_allow_apps = allow_apps_changed.then(|| config_guard.computer.allow_apps.clone());
+    let updated_vision = vision_changed.then(|| config_guard.computer.vision.clone());
     drop(config_guard);
 
     // Push the recomputed effective config to running agents so the change
@@ -545,6 +665,13 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // has to reach it rather than only the config snapshot.
     if let Some(apps) = updated_allow_apps {
         state.tools.computer_allow_apps.replace(apps);
+    }
+    // The model directory and recognition preset are read by tools that were
+    // built at startup and have no config in hand — publishing the edit is what
+    // makes "switch to Chinese" take effect on the next frame instead of on the
+    // next launch.
+    if let Some(vision) = updated_vision {
+        crate::computer::vision::model_download::install_settings(&vision);
     }
 
     WsResponse::ok(
@@ -1029,6 +1156,111 @@ mod tests {
         assert_eq!(p["heartbeat"]["enabled"].as_bool(), Some(true));
         assert_eq!(p["heartbeat"]["interval_seconds"].as_u64(), Some(42));
         assert_eq!(p["heartbeat"]["active_hours_start"].as_str(), Some("09:00"));
+    }
+
+    /// Switching the recognition model is a config write, and an unknown name
+    /// must be refused rather than stored: a user who asked for Chinese and got
+    /// english silently is the failure this path exists to prevent.
+    ///
+    /// The process-wide settings handle is global, so this test restores the
+    /// default preset before returning rather than leaving a Chinese default
+    /// behind for whatever else reads a screen in this binary. `serial`
+    /// because the other vision test publishes to the same handle.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn config_set_vision_ocr_roundtrips_and_refuses_junk() {
+        use crate::computer::vision::model_download::{shared_settings, OcrPreset};
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res = set_and_ok(&state, "computer.vision.ocr", serde_json::json!("ppocrv3-ch")).await;
+        assert!(res.ok, "the preset must set: {:?}", res.error);
+        assert_eq!(state.config.read().await.computer.vision.ocr, "ppocrv3-ch");
+        // Published, not only stored: the tools that read a screen have no
+        // config in hand and ask the shared handle.
+        assert_eq!(shared_settings().ocr_preset(), "ppocrv3-ch");
+
+        let res = handle_config_get(&req("g", "config.get", serde_json::json!({})), &state).await;
+        let p = res.payload.expect("payload");
+        assert_eq!(p["computer"]["vision"]["ocr"].as_str(), Some("ppocrv3-ch"));
+        assert!(p["computer"]["vision"]["ocr_installed"].is_boolean());
+        let presets = p["computer"]["vision"]["ocr_presets"]
+            .as_array()
+            .expect("the choices are reported");
+        assert_eq!(presets.len(), OcrPreset::all().len());
+        assert!(presets.iter().any(|v| v["key"] == "ppocrv3-ch"));
+        assert!(presets.iter().all(|v| v["label"].as_str().is_some()));
+
+        // A name no preset has is refused, and the reject is inert.
+        let res = set_and_ok(&state, "computer.vision.ocr", serde_json::json!("ppocrv4")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert!(
+            res.error
+                .as_ref()
+                .is_some_and(|e| e.message.contains("ppocrv3-ch")),
+            "the refusal must name the choices: {:?}",
+            res.error
+        );
+        assert_eq!(
+            state.config.read().await.computer.vision.ocr,
+            "ppocrv3-ch",
+            "the reject must leave the previous preset intact"
+        );
+
+        // A non-string, too — not coerced into the default.
+        let res = set_and_ok(&state, "computer.vision.ocr", serde_json::json!(3)).await;
+        assert!(!res.ok);
+        assert_eq!(state.config.read().await.computer.vision.ocr, "ppocrv3-ch");
+
+        // Leave the process on the default preset for the rest of the binary.
+        let _ = set_and_ok(&state, "computer.vision.ocr", serde_json::json!("ppocrv3-en")).await;
+    }
+
+    /// The mode decides whether pixels are consulted at all; junk must not
+    /// become "auto" by omission, and the neighbour fields must survive.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn config_set_vision_mode_normalises_and_refuses_junk() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+
+        let res = set_and_ok(&state, "computer.vision.mode", serde_json::json!(" LOCAL ")).await;
+        assert!(res.ok, "the mode must set: {:?}", res.error);
+        assert_eq!(state.config.read().await.computer.vision.mode, "local");
+
+        let res = set_and_ok(&state, "computer.vision.mode", serde_json::json!("sometimes")).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert_eq!(
+            state.config.read().await.computer.vision.mode,
+            "local",
+            "the reject must leave the previous mode intact"
+        );
+
+        // Each field is its own path: setting the directory must not reset the
+        // mode or the preset.
+        let _ = set_and_ok(&state, "computer.vision.ocr", serde_json::json!("ppocrv3-ch")).await;
+        let res =
+            set_and_ok(&state, "computer.vision.model_dir", serde_json::json!(" /tmp/models "))
+                .await;
+        assert!(res.ok, "the directory must set: {:?}", res.error);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.computer.vision.model_dir, "/tmp/models", "stored trimmed");
+            assert_eq!(cfg.computer.vision.mode, "local", "the neighbour holds");
+            assert_eq!(cfg.computer.vision.ocr, "ppocrv3-ch", "the neighbour holds");
+        }
+
+        // Zero seconds would make every lookup fail instantly.
+        let res = set_and_ok(&state, "computer.vision.timeout_secs", serde_json::json!(0)).await;
+        assert!(!res.ok);
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_PARAMS"));
+        assert!(
+            state.config.read().await.computer.vision.timeout_secs > 0,
+            "the reject must leave the previous timeout intact"
+        );
+
+        let _ = set_and_ok(&state, "computer.vision.ocr", serde_json::json!("ppocrv3-en")).await;
     }
 
     #[tokio::test]

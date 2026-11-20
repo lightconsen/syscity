@@ -372,6 +372,11 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
     // The permission gate's shared runtime: config defaults now, session
     // overrides and `permissions.*` config writes later.
     let permissions = Arc::new(crate::tools::PermissionsRuntime::from_config(&config.permissions));
+    // `[computer.vision]`, published before anything can read a screen. The
+    // tools that read it have no config in hand — `screen_ocr`, the image
+    // tool, a step's read-back, the phone's OCR — and used to look in the
+    // default model directory whatever `model_dir` said.
+    crate::computer::vision::model_download::install_settings(&config.computer.vision);
     let memory_manager_holder: Arc<RwLock<Option<Arc<MemoryManager>>>> =
         Arc::new(RwLock::new(None));
 

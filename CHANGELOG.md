@@ -13,6 +13,15 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **The OCR recogniser is configurable.** `[computer.vision].ocr` picks a
+  named preset — `ppocrv3-en` (97 classes, the default) or `ppocrv3-ch`
+  (6625 classes, CJK) — instead of hardcoding english. Each preset carries its
+  own detector, recogniser and dictionary, and the class count is checked
+  against the dictionary at load. The four engine caches tag their engine with
+  the preset that built it, so a switch applies to the next frame and a switch
+  back does not reload. "OCR is installed" is now asked per preset: english
+  models on disk no longer mean chinese can be read. Unknown spellings are
+  refused at write time rather than silently falling back at load.
 - **A close-up.** `screenshot` takes a region, so the model can look at what
   the detector's fixed 640-wide view erased rather than living with it. The
   crop's boxes come back in screen points — `CoordinateSpace::for_region` maps
@@ -45,6 +54,16 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **The bundled ONNX Runtime was silently running these models on CoreML.**
+  `ort`'s `Session::builder` sets the EP selection policy to `MaxEfficiency`
+  (`PreferNPU`), so on macOS ONNX Runtime registered CoreML for the CRNN
+  recognizer's squeeze-and-excitation branch — and computed something else
+  there. Every input wider than roughly 320 px decoded as all-blank, while the
+  same bytes read correctly through the CPU provider; the english recogniser
+  was narrowed enough to mask it, the 6625-class chinese one was not. Pinning
+  the policy to `PreferCPU` makes the two agree bit for bit. Note that
+  `with_execution_providers` cannot fix this: a manually registered EP runs
+  alongside the automatically selected one, it does not displace it.
 - **A vision-capable model is no longer recorded as text-only.** The catalog
   decided "can this model see?" from a table of model-id patterns, and
   everything the table did not recognise — `qwen3.7-plus`, `kimi-k2.6`,

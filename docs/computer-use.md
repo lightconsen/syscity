@@ -290,6 +290,39 @@ run 结束时写一条 `RunSummary`：
 | `UiDetect`（OmniParser 检测） | 找控件框 | 控件元素，`label` 来自重叠的 OCR 文本 |
 | `Ocr`（RapidOCR） | 读屏幕上的字 | `role: "text"` 的元素，`label` 就是读出来的那行字 |
 
+#### 换识别器：`[computer.vision].ocr`
+
+识别器不是插件接口——整条流水线写死了输入张量 `"x"`、取
+`outputs.iter().next()`、`[T,1,C]` 形状、rec 高 48、右侧补黑到 32 的倍数、
+`[0,1]` 归一化、贪心 CTC 解码（`类别 i → dict[i-1]`）。所以"换 OCR"换的是
+**预设**（`OcrPreset`），不是任意模型：每个预设自带 det / rec / 字典三件套，
+类别数在加载时校验（`num_classes` 必须是 `dict_len + 1` 或 `+2`）。
+
+| 预设 | 类别数 | 适用 |
+|---|---|---|
+| `ppocrv3-en`（默认） | 97 | 拉丁字母、数字、常见符号 |
+| `ppocrv3-ch` | 6625 | 中文等 CJK 字符 |
+
+设置写 `[computer.vision].ocr`；未知拼写在写入时就被拒绝，而不是在加载时
+才安静地退回默认。**切换会生效于下一帧**：四个引擎缓存
+（`ocr_file`、`look`、`screen_state`、`android/ocr`）都把预设和引擎放在一起
+打标签，`engine_matches` 是唯一的判据，所以切回来不用重新加载。
+
+"OCR 装没装"同样是按预设问的：英文模型在盘上不代表中文能读。
+
+#### 一个运行时陷阱：EP 选择策略
+
+`ort` 的 `Session::builder` 无条件把 ONNX Runtime 的 EP 选择策略设成
+`MaxEfficiency`（= `PreferNPU`）。macOS 上这意味着自动注册 CoreML，而
+CoreML 对这两个模型的判定是错的：CRNN 识别器的 squeeze-and-excitation 分支
+被切到 CoreML 上算出了别的数，于是**宽输入（约 `w >= 320`）整行解码成空**，
+而同样的字节走 CPU 逐位正确。中文先中招（6625 类需要更宽才能让池化特征
+塌缩），但英文识别器走的是同一批节点。
+
+`with_execution_providers` **不能**撤销它——手动注册的 EP 与自动注册的并列，
+不替代它。必须把策略设回 `AutoDevicePolicy::PreferCPU`；`cpu_session()` 就是
+为此而存在，三个加载点（det、rec、OmniParser）全部经由它。
+
 `VisionLook` 按 `LocalModel` 分派：检测器给出框后，若本机也装了 OCR，
 就用重叠的文字给这些框补 `label`（检测器本身不认字，`ui_onnx.rs` 过去恒发
 `label: None`，等于发出一屏无名控件）；只有 OCR 没检测器时，整屏文字就是

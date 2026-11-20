@@ -41,6 +41,8 @@ use crate::computer::element_index::{assign_ids, next_snapshot_id, UiSnapshot};
 use crate::computer::image_budget::{encode_or_passthrough, ImageLimit};
 use crate::computer::run_budget::RunBudget;
 use crate::computer::types::{Point, Rect, Screenshot, Tri, UiElement};
+#[cfg(feature = "vision")]
+use crate::computer::vision::model_download::OcrPreset;
 use crate::computer::vision::resolver::{
     LocalModel, UnavailableReason, VisionResolver, VisionSource,
 };
@@ -301,7 +303,7 @@ impl ScanCache {
 type SharedDetector = Arc<Mutex<Option<crate::computer::vision::ui_onnx::OmniParserDetector>>>;
 
 #[cfg(feature = "vision")]
-type SharedOcr = Arc<Mutex<Option<crate::computer::vision::ocr_rapid::RapidOcr>>>;
+type SharedOcr = Arc<Mutex<Option<(OcrPreset, crate::computer::vision::ocr_rapid::RapidOcr)>>>;
 
 /// The process-wide detector, loaded at most once.
 ///
@@ -707,12 +709,12 @@ impl VisionLook {
         // Same shape as `detect_controls`: an engine out of the cache, run on
         // its own task so the timeout can fire, handed back even when the
         // caller above has already given up on it.
-        let mut engine = self.ocr_handle().await?;
+        let (preset, mut engine) = self.ocr_handle().await?;
         let shared = self.ocr.clone();
         let shot = shot.clone();
         let task = tokio::spawn(async move {
             let outcome = engine.detect_text(&shot).await;
-            *shared.lock().await = Some(engine);
+            *shared.lock().await = Some((preset, engine));
             outcome
         });
 
@@ -772,15 +774,32 @@ impl VisionLook {
     }
 
     /// Take the cached OCR engine, loading it if this is the first use.
+    ///
+    /// The preset is returned alongside because the caller hands the engine
+    /// back to the same slot, and the slot is tagged: an engine loaded for
+    /// english must never be filed under a chinese tag, or the next read would
+    /// decode Chinese classes through the english dictionary.
     #[cfg(feature = "vision")]
-    async fn ocr_handle(&self) -> Result<crate::computer::vision::ocr_rapid::RapidOcr, String> {
-        use crate::computer::vision::model_download::ocr_model_paths;
+    async fn ocr_handle(
+        &self,
+    ) -> Result<(OcrPreset, crate::computer::vision::ocr_rapid::RapidOcr), String> {
+        use crate::computer::vision::model_download::ocr_model_paths_for;
         use crate::computer::vision::ocr_rapid::RapidOcr;
+
+        // `[computer.vision].ocr`, read at the time of use: the resolver was
+        // built when the run started, and a preset edit does not rebuild it.
+        let preset = crate::computer::vision::model_download::configured_preset();
 
         {
             let mut guard = self.ocr.lock().await;
-            if let Some(engine) = guard.take() {
-                return Ok(engine);
+            if let Some((tag, engine)) = guard.take() {
+                if tag == preset {
+                    return Ok((tag, engine));
+                }
+                // A different preset's engine. Dropping it is the point of
+                // tagging the slot; the next frame is read with the model the
+                // configuration now names.
+                drop(engine);
             }
         }
 
@@ -788,9 +807,11 @@ impl VisionLook {
         // not the place for an 88 MB fetch. The probe has already said the
         // files are there; a `None` here means they went away since, which is
         // "this rung is unavailable", not a reason to reach the network.
-        let Some((det, rec, dict)) = ocr_model_paths(&self.resolver.config().model_dir) else {
+        let Some((det, rec, dict)) = ocr_model_paths_for(&self.resolver.config().model_dir, preset)
+        else {
             return Err(format!(
-                "no OCR models under {}",
+                "no OCR models ({}) under {}",
+                preset.key(),
                 crate::computer::vision::model_download::vision_model_dir(
                     &self.resolver.config().model_dir
                 )
@@ -818,8 +839,8 @@ impl VisionLook {
         .map_err(|e| format!("the OCR model load task failed: {e}"))?
         .map_err(|e| format!("could not load the OCR models: {e}"))?;
 
-        debug!("loaded the local OCR model");
-        Ok(loaded)
+        debug!("loaded the local OCR model ({})", preset.key());
+        Ok((preset, loaded))
     }
 
     /// The API rung: one narrow question, one JSON answer.

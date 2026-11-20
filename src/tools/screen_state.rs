@@ -26,9 +26,24 @@ use crate::tools::{
 };
 
 /// Lazily-initialized shared OCR engine (model loading is expensive, so it
-/// only happens on first use).
+/// only happens on first use), tagged with the preset that trained it.
+///
+/// Tagged because [`RapidOcr::new_auto`] follows `[computer.vision].ocr`, and
+/// a switch from english to chinese has to change which model reads the next
+/// frame — an untagged slot would keep answering with the language it started
+/// in for the life of the process. The pair of engines is at most two, so a
+/// switch back does not reload.
+///
+/// [`RapidOcr::new_auto`]: crate::computer::vision::ocr_rapid::RapidOcr::new_auto
 #[cfg(feature = "vision")]
-pub type SharedOcr = Arc<tokio::sync::Mutex<Option<crate::computer::vision::ocr_rapid::RapidOcr>>>;
+pub type SharedOcr = Arc<
+    tokio::sync::Mutex<
+        Option<(
+            crate::computer::vision::model_download::OcrPreset,
+            crate::computer::vision::ocr_rapid::RapidOcr,
+        )>,
+    >,
+>;
 
 #[cfg(feature = "vision")]
 pub fn new_shared_ocr() -> SharedOcr {
@@ -41,17 +56,27 @@ pub fn new_shared_ocr() -> SharedOcr {
 #[cfg(feature = "vision")]
 async fn lock_ocr(
     shared: &SharedOcr,
-) -> crate::Result<tokio::sync::MutexGuard<'_, Option<crate::computer::vision::ocr_rapid::RapidOcr>>>
-{
+) -> crate::Result<
+    tokio::sync::MutexGuard<
+        '_,
+        Option<(
+            crate::computer::vision::model_download::OcrPreset,
+            crate::computer::vision::ocr_rapid::RapidOcr,
+        )>,
+    >,
+> {
+    use crate::computer::vision::model_download::{configured_preset, engine_matches};
     let mut guard = shared.lock().await;
-    if guard.is_none() {
-        *guard = Some(
+    let preset = configured_preset();
+    if !engine_matches(&*guard, preset) {
+        *guard = Some((
+            preset,
             crate::computer::vision::ocr_rapid::RapidOcr::new_auto()
                 .await
                 .map_err(|e| {
                     crate::error::SyscityError::Internal(format!("OCR init failed: {}", e))
                 })?,
-        );
+        ));
     }
     Ok(guard)
 }
@@ -228,7 +253,7 @@ impl ScreenStateTool {
         #[cfg(feature = "vision")]
         if want_ocr {
             let mut guard = lock_ocr(&self.ocr).await?;
-            let ocr = guard.as_mut().ok_or_else(|| {
+            let (_, ocr) = guard.as_mut().ok_or_else(|| {
                 crate::error::SyscityError::Internal("OCR engine unavailable".to_string())
             })?;
             let blocks = ocr.detect_text(&state.screenshot).await.unwrap_or_default();
@@ -521,7 +546,7 @@ Use when the accessibility tree lacks the text you need: PDF viewers, dialogs, i
                 .map_err(|e| crate::error::SyscityError::Internal(e.to_string()))?;
 
             let mut guard = lock_ocr(&self.ocr).await?;
-            let ocr = guard.as_mut().ok_or_else(|| {
+            let (_, ocr) = guard.as_mut().ok_or_else(|| {
                 crate::error::SyscityError::Internal("OCR engine unavailable".to_string())
             })?;
             let blocks = ocr

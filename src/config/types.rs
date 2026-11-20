@@ -583,7 +583,7 @@ pub struct ComputerConfig {
 /// that has none must still be able to see; the third rung is admitting that
 /// neither is available, which callers must handle rather than discover as a
 /// timeout.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VisionConfig {
     /// `"auto"` (default), `"local"`, `"api"`, or `"off"`.
     ///
@@ -606,6 +606,25 @@ pub struct VisionConfig {
     /// (`~/.syscity/models/vision` by default).
     #[serde(default)]
     pub model_dir: String,
+    /// Which recognition model to read text with: `"ppocrv3-en"` (default) or
+    /// `"ppocrv3-ch"`.
+    ///
+    /// This is a *named preset*, not a path. The recogniser is not a plug-in
+    /// point: the pipeline names its input tensor, picks the first output,
+    /// assumes a `[T, 1, classes]` shape, resizes to a fixed height and
+    /// decodes class indices through one exact dictionary. A file picked by
+    /// hand that disagrees with any of those is loaded without complaint and
+    /// decodes to confident garbage; the dictionary check only catches a
+    /// *length* mismatch, never a wrong order or a wrong pipeline. So the
+    /// choices here are model sets this build has been taught end to end —
+    /// see [`crate::computer::vision::model_download::OcrPreset`].
+    ///
+    /// The two differ in the language they read: `en` covers ASCII, the
+    /// invoice/UI text the english model was trained on; `ch` adds Chinese.
+    /// An unknown name is rejected at config load and falls back to the
+    /// default rather than reinterpreting the string as a path.
+    #[serde(default = "default_ocr_preset")]
+    pub ocr: String,
     /// How long one visual lookup may take before it is abandoned.
     #[serde(default = "default_vision_timeout_secs")]
     pub timeout_secs: u64,
@@ -646,6 +665,18 @@ fn default_vision_mode() -> String {
     "auto".to_string()
 }
 
+/// The recognition model a fresh install reads text with.
+///
+/// English: it is the model this build has been calibrated against (the
+/// detection threshold, box expansion and confidence floor are all its
+/// measurements), and it does not need the 6 600-entry dictionary a Chinese
+/// model carries.
+fn default_ocr_preset() -> String {
+    crate::computer::vision::model_download::DEFAULT_OCR_PRESET
+        .key()
+        .to_string()
+}
+
 fn default_vision_timeout_secs() -> u64 {
     10
 }
@@ -665,6 +696,7 @@ impl Default for VisionConfig {
             provider: None,
             model: None,
             model_dir: String::new(),
+            ocr: default_ocr_preset(),
             timeout_secs: default_vision_timeout_secs(),
         }
     }

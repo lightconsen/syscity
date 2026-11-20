@@ -19,20 +19,32 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+use super::model_download::OcrPreset;
 use super::ocr_rapid::RapidOcr;
 use crate::computer::types::Screenshot;
 
-/// Lazily initialized, process-wide OCR engine.
-fn shared_engine() -> &'static tokio::sync::Mutex<Option<RapidOcr>> {
-    static ENGINE: OnceLock<tokio::sync::Mutex<Option<RapidOcr>>> = OnceLock::new();
+/// Lazily initialized, process-wide OCR engine, tagged with the preset that
+/// trained it.
+///
+/// The preset is part of the slot rather than of the process: switching
+/// `[computer.vision].ocr` from english to chinese has to change which model
+/// reads the next frame, and an `Option<RapidOcr>` with no tag would keep
+/// answering with the old one for the life of the process. Tagging also means
+/// a switch back does not reload — the pair of engines is at most two.
+fn shared_engine() -> &'static tokio::sync::Mutex<Option<(OcrPreset, RapidOcr)>> {
+    static ENGINE: OnceLock<tokio::sync::Mutex<Option<(OcrPreset, RapidOcr)>>> = OnceLock::new();
     ENGINE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
 /// Initialize the shared engine from the cached RapidOCR models.
 async fn engine() -> crate::Result<RapidOcr> {
-    let paths = super::model_download::resolve_or_download_ocr_models()
-        .await
-        .map_err(|e| crate::error::SyscityError::Internal(format!("OCR models: {}", e)))?;
+    let preset = super::model_download::configured_preset();
+    let paths = super::model_download::resolve_or_download_ocr_models_for(
+        preset,
+        &super::model_download::shared_settings().model_dir(),
+    )
+    .await
+    .map_err(|e| crate::error::SyscityError::Internal(format!("OCR models: {}", e)))?;
     RapidOcr::new(
         paths.det.to_str().ok_or_else(|| not_utf8("det"))?,
         paths.rec.to_str().ok_or_else(|| not_utf8("rec"))?,
@@ -53,9 +65,12 @@ fn not_utf8(which: &str) -> crate::error::SyscityError {
 /// live step takes, and "the models were never fetched" has to stay a cheap
 /// answer rather than becoming an 88 MB side effect of typing into a field.
 async fn engine_installed(model_dir: &str) -> crate::Result<RapidOcr> {
-    let Some((det, rec, dict)) = super::model_download::ocr_model_paths(model_dir) else {
+    let preset = super::model_download::configured_preset();
+    let Some((det, rec, dict)) = super::model_download::ocr_model_paths_for(model_dir, preset)
+    else {
         return Err(crate::error::SyscityError::Internal(format!(
-            "no OCR models under {}",
+            "no OCR models ({}) under {}",
+            preset.key(),
             super::model_download::vision_model_dir(model_dir).display()
         )));
     };
@@ -150,8 +165,9 @@ pub async fn ocr_image_file(path: &Path) -> crate::Result<OcrText> {
     let screenshot = Screenshot::new(base64, width, height);
 
     let mut guard = shared_engine().lock().await;
-    if guard.is_none() {
-        *guard = Some(engine().await?);
+    let preset = super::model_download::configured_preset();
+    if !super::model_download::engine_matches(&*guard, preset) {
+        *guard = Some((preset, engine().await?));
     }
     read_with(&mut guard, &screenshot).await
 }
@@ -189,18 +205,19 @@ pub async fn ocr_screenshot(
         None => screenshot.clone(),
     };
     let mut guard = shared_engine().lock().await;
-    if guard.is_none() {
-        *guard = Some(engine_installed(model_dir).await?);
+    let preset = super::model_download::configured_preset();
+    if !super::model_download::engine_matches(&*guard, preset) {
+        *guard = Some((preset, engine_installed(model_dir).await?));
     }
     read_with(&mut guard, &source).await
 }
 
 /// Run the shared engine over one image and package the answer.
 async fn read_with(
-    guard: &mut tokio::sync::MutexGuard<'_, Option<RapidOcr>>,
+    guard: &mut tokio::sync::MutexGuard<'_, Option<(OcrPreset, RapidOcr)>>,
     screenshot: &Screenshot,
 ) -> crate::Result<OcrText> {
-    let Some(ocr) = guard.as_mut() else {
+    let Some((_, ocr)) = guard.as_mut() else {
         return Err(crate::error::SyscityError::Internal(
             "OCR engine is not initialized".to_string(),
         ));
@@ -417,7 +434,12 @@ mod tests {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png.into_inner());
         let shot = Screenshot::new(base64, 400, 200);
 
-        if crate::computer::vision::model_download::ocr_model_paths("").is_none() {
+        if crate::computer::vision::model_download::ocr_model_paths_for(
+            "",
+            crate::computer::vision::model_download::DEFAULT_OCR_PRESET,
+        )
+        .is_none()
+        {
             eprintln!(
                 "SKIPPED a_cropped_frame_reads_nothing_from_outside_the_box: no OCR models under {}",
                 crate::computer::vision::model_download::vision_model_dir("").display()

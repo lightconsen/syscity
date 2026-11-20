@@ -752,7 +752,14 @@ fn local_models_present(
     if !cfg!(feature = "vision") {
         return crate::computer::vision::model_download::LocalModels::default();
     }
-    crate::computer::vision::model_download::local_models_present(&config.model_dir)
+    // The configured preset's own files: "OCR is installed" is a question
+    // about *that* vocabulary, and a machine holding only the english pair
+    // cannot read a Chinese screen. Probing the default preset regardless
+    // would tell the resolver a rung exists and then have the loader open a
+    // file that does not.
+    let preset = crate::computer::vision::model_download::OcrPreset::parse(&config.ocr)
+        .unwrap_or(crate::computer::vision::model_download::DEFAULT_OCR_PRESET);
+    crate::computer::vision::model_download::local_models_present_for(&config.model_dir, preset)
 }
 
 /// The provider handle for the API rung, when one is configured.

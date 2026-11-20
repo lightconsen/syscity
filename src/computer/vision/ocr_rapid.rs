@@ -53,20 +53,12 @@ impl RapidOcr {
     /// and decoding them with a guessed alphabet produces confident garbage.
     pub fn new(det_path: &str, rec_path: &str, dict_path: &str) -> crate::Result<Self> {
         let dict = Self::load_dict(dict_path)?;
-        let env = super::ort_environment()?;
-        let det_model = ort::session::Session::builder(env)
-            .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
-            .commit_from_file(det_path)
-            .map_err(|e| {
-                SyscityError::Internal(format!("Failed to load detection model: {}", e))
-            })?;
-
-        let rec_model = ort::session::Session::builder(env)
-            .map_err(|e| SyscityError::Internal(format!("ORT builder error: {}", e)))?
-            .commit_from_file(rec_path)
-            .map_err(|e| {
-                SyscityError::Internal(format!("Failed to load recognition model: {}", e))
-            })?;
+        let det_model = super::cpu_session(det_path).map_err(|e| {
+            SyscityError::Internal(format!("Failed to load detection model: {}", e))
+        })?;
+        let rec_model = super::cpu_session(rec_path).map_err(|e| {
+            SyscityError::Internal(format!("Failed to load recognition model: {}", e))
+        })?;
 
         Ok(Self {
             det_model,
