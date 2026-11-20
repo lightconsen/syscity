@@ -2709,12 +2709,25 @@ fn typed_box_from_change(
         }
     };
 
-    let x = region.x.saturating_sub(TEXT_MARGIN).max(0);
-    let y = region.y.saturating_sub(TEXT_MARGIN).max(0);
-    let right =
+    // The margin widens the change to something readable, and the frame is the
+    // enclosing bound. When the action named a target, the target is the other
+    // bound: a crop that reached past it would read a neighbour's text and
+    // compare that with what was typed, which is a confirmation the typing did
+    // not earn.
+    let mut x = region.x.saturating_sub(TEXT_MARGIN).max(0);
+    let mut y = region.y.saturating_sub(TEXT_MARGIN).max(0);
+    let mut right =
         (region.x as i64 + region.width as i64 + TEXT_MARGIN as i64).min(after.width as i64) as i32;
-    let bottom = (region.y as i64 + region.height as i64 + TEXT_MARGIN as i64)
+    let mut bottom = (region.y as i64 + region.height as i64 + TEXT_MARGIN as i64)
         .min(after.height as i64) as i32;
+    if let Some(aim) = aim {
+        let aim_right = aim.x.saturating_add(aim.width as i32);
+        let aim_bottom = aim.y.saturating_add(aim.height as i32);
+        x = x.max(aim.x);
+        y = y.max(aim.y);
+        right = right.min(aim_right);
+        bottom = bottom.min(aim_bottom);
+    }
     let width = (right - x).max(0) as u32;
     let height = (bottom - y).max(0) as u32;
     if width == 0 || height == 0 {
@@ -4076,6 +4089,14 @@ mod tests {
                 .expect("the box at the target is this typing");
         assert!(aimed.contains(300, 200), "{aimed:?} must cover the field");
         assert!(!aimed.contains(25, 10), "{aimed:?} must not cover the clock");
+        // Clipped to the target, not merely centred on it: the reading must
+        // not reach a neighbour's text either, which the margin alone would
+        // have allowed.
+        assert!(aimed.x >= 280 && aimed.y >= 190, "{aimed:?} starts outside the target's box");
+        assert!(
+            aimed.x as u32 + aimed.width <= 440 && aimed.y as u32 + aimed.height <= 234,
+            "{aimed:?} reaches outside the target's box"
+        );
         // Aimed nowhere near either change: nothing can be attributed.
         assert!(typed_box_from_change(&shot, &shot, &change, Some(Rect::new(600, 400, 100, 40)))
             .is_none());
