@@ -1669,8 +1669,7 @@ impl ComputerSession {
     /// - **The tree names none** — a tree-less app, or one that publishes
     ///   controls the walker cannot classify as editable. Then the change
     ///   between the two frames is the box: see [`typed_box_from_change`] for
-    ///   how it is bounded, and for why half of those changes are refused
-    ///   rather than read.
+    ///   how it is bounded, and for the changes it refuses rather than reads.
     ///
     /// The second path cannot ask the sensitivity question, and it does not
     /// pretend to: what it reads is what is *drawn* in the changed rectangle,
