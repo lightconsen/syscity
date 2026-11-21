@@ -2005,7 +2005,9 @@ mod tests {
         let gateway = TestGateway::start().await;
         let (state, client) = connect(&gateway).await;
 
-        command_theme("banana", &state, &client).await;
+        command_theme("banana", &state, &client)
+            .await
+            .expect("a bad argument is a notice, not an error");
 
         let lines = output(&state).await;
         assert!(lines[0].contains("one of dark, light or auto"), "got {lines:?}");
@@ -2028,7 +2030,9 @@ mod tests {
         let (state, client) = connect(&gateway).await;
         state.write().await.startup_bg = Some(crate::tui::ui::ThemeId::Light);
 
-        command_theme("auto", &state, &client).await;
+        command_theme("auto", &state, &client)
+            .await
+            .expect("`auto` resolves from the startup detection without erroring");
 
         let mode = osc11::color_mode();
         assert_eq!(
