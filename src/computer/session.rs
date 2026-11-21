@@ -2045,15 +2045,129 @@ impl ComputerSession {
         .ok()? // out of step budget
         .ok()? // read-back timed out
         .ok()?; // OCR could not run at all
-                // What the field held before the step, when the tree publishes it —
-                // which is a different fact from "the tree could answer", because
-                // [`typed_value_hint`] also refuses when more than one field moved or
-                // the counts differ. It is handed to the OCR verdict so the reading is
-                // held to the same standard the tree is: a field that kept its old
-                // text *and* took the new one is an append, and a reading alone cannot
-                // tell that from a replacement.
+
+        // What the field held before the step, when the tree publishes it —
+        // which is a different fact from "the tree could answer", because
+        // [`typed_value_hint`] also refuses when more than one field moved or
+        // the counts differ. It is handed to the OCR verdict so the reading is
+        // held to the same standard the tree is: a field that kept its old
+        // text *and* took the new one is an append, and a reading alone cannot
+        // tell that from a replacement.
         let prior = fields.first().and_then(|field| field.value.as_deref());
-        judge_read_back(typed, &read, prior)
+        if prior.is_some() {
+            return judge_read_back(typed, &read, prior);
+        }
+
+        // The tree published no value — the screen this path exists for — so
+        // nothing yet says whether the field kept text from before. Paid for
+        // only when the answer could change the verdict: a reading that does
+        // not contain the typed text is already `Partial`, and one that matches
+        // it exactly cannot have anything left over. Everything else is "the
+        // text landed, and the box may hold more than the text", which is
+        // precisely the question an append asks.
+        //
+        // The verdict below is what today's code would return. Everything
+        // after this point may only make it *narrower* — a neighbour read into
+        // a wide box must never be able to confirm a typing that did not land,
+        // which is why the append test gets its own pair of reads instead of
+        // replacing the one the verdict is built on.
+        let base = judge_read_back(typed, &read, None);
+        if !needs_prior(&read, typed) {
+            return base;
+        }
+        let Some(before) = screenshot_before else {
+            return base;
+        };
+        // The crop was computed in the *after* frame's pixel space, and a
+        // frame of different dimensions is a place, not the place: a display
+        // that reconfigured mid-step, or a crop against a full-screen frame.
+        if before.width != shot.width || before.height != shot.height {
+            return base;
+        }
+        // The changed box holds the *new* text and nothing else — the old text
+        // is exactly what did not change, so it lies outside. Reading that box
+        // in the before frame would answer "" for every append, which is not a
+        // narrow miss but the wrong question. The field is a horizontal band,
+        // not the change: widen to the full row, where both frames hold the old
+        // text *and* the new, and identical neighbours cancel between them.
+        let band = field_band(crop, shot);
+        let Some((read_band_before, read_band_after)) =
+            self.read_band_pair(before, shot, band, &model_dir).await
+        else {
+            return base;
+        };
+        if band_kept_its_old_text(
+            &squeeze(&read_band_before.text),
+            &squeeze(&read_band_after.text),
+            &squeeze(typed),
+        ) {
+            return Some(EffectHint {
+                effect: ActionEffect::Partial,
+                verification: StepVerification::Failed,
+                recovery: Some(
+                    "the field still holds what was in it before, and the new text was added to \
+                     that rather than replacing it — select all and retype the whole value; \
+                     typing into a field that already has content appends to it"
+                        .to_string(),
+                ),
+            });
+        }
+        base
+    }
+
+    /// Read the same band out of the frame before the step and the one after.
+    ///
+    /// Both or neither: a pair is what makes static neighbours cancel, and one
+    /// half of a comparison is not evidence. Every failure — no budget left, a
+    /// timeout, OCR unable to run, a reading too poor to use — returns `None`,
+    /// which leaves the caller's existing verdict standing rather than
+    /// downgrading a `Confirmed` because a second opinion could not be had.
+    #[cfg(feature = "vision")]
+    async fn read_band_pair(
+        &self,
+        before: &Screenshot,
+        after: &Screenshot,
+        band: Rect,
+        model_dir: &str,
+    ) -> Option<(
+        crate::computer::vision::ocr_file::OcrText,
+        crate::computer::vision::ocr_file::OcrText,
+    )> {
+        let read = |frame: &Screenshot| {
+            let frame = frame.clone();
+            let model_dir = model_dir.to_string();
+            async move {
+                crate::computer::budget::within(
+                    &self.step_budget(),
+                    "reading the field around the typing",
+                    tokio::time::timeout(
+                        READ_BACK_TIMEOUT,
+                        crate::computer::vision::ocr_file::ocr_screenshot(
+                            &frame,
+                            Some(band),
+                            &model_dir,
+                        ),
+                    ),
+                )
+                .await
+            }
+        };
+        // Sequential, not concurrent: the engine is one shared session behind
+        // a mutex, so two in flight would only queue and hold the lock longer.
+        let (Ok(Ok(Ok(old))), Ok(Ok(Ok(new)))) = (read(before).await, read(after).await) else {
+            return None;
+        };
+        let usable = |text: &crate::computer::vision::ocr_file::OcrText| {
+            text.is_reliable() && !text.text.trim().is_empty()
+        };
+        // An empty *after* band is the one case that is not "unusable": a field
+        // cleared and retyped elsewhere in the row would read as absent, and
+        // the append test needs a reading it can trust. Both are required.
+        if usable(&old) && usable(&new) {
+            Some((old, new))
+        } else {
+            None
+        }
     }
 
     /// Compare pre/post screen state.
@@ -3052,6 +3166,105 @@ fn typed_box_from_change(
     Some(Rect::new(x, y, width, height))
 }
 
+/// Whether a band that gained text still reads as holding what it held.
+///
+/// The question an append asks, asked of two *readings* rather than of a typed
+/// string and a value: the recognizer is free to spell the same glyphs
+/// differently in two crops, so the test cannot be "the typed text is still
+/// there". It is the weaker, still decisive one — the old reading survives
+/// inside the new one, and the new one is longer — which is what an append
+/// produces and what a replacement destroys.
+///
+/// Two things keep it from firing on a replacement:
+///
+/// - the earlier band must have held *something*: an empty band was not a
+///   field, and "nothing survived" is trivially true of it;
+/// - the new band must hold more than the typed text accounts for. If a field
+///   is replaced with text that happens to contain the old text as a run
+///   (`cat` → `concatenate`), the new band reads as the typed text plus a
+///   little, and the old reading (`cat`) does survive — the honest verdict
+///   there is a coin flip between "typed over it" and "typed onto it", and the
+///   safe direction is the one that asks the model to look. The typed text is
+///   passed in so this can be measured against the band, not assumed.
+#[cfg(feature = "vision")]
+fn band_kept_its_old_text(old_band: &str, new_band: &str, typed: &str) -> bool {
+    if old_band.is_empty() {
+        return false;
+    }
+    if new_band.len() <= old_band.len() {
+        return false;
+    }
+    if !new_band.contains(old_band) {
+        return false;
+    }
+    // The old reading surviving is necessary but not sufficient: if the whole
+    // band reads as the typed text, the old text was replaced by text that
+    // merely contains it. The extra characters have to exist somewhere the
+    // typing does not account for.
+    new_band.len() > typed.len()
+}
+
+/// The full-width row a field sits in, given the changed box inside it.
+///
+/// The box that changed is the *new* text. An append's old text is precisely
+/// what did not change, so it lies beside that box rather than in it, and a
+/// reading confined to the box would answer "" for every append — the wrong
+/// question answered confidently. Widening to the whole row is what puts both
+/// texts in one crop; the cost is that the row holds neighbours too, which is
+/// what pairing it with the same row in the earlier frame pays for: identical
+/// pixels read the same on both sides and cancel in the append test.
+///
+/// Clamped to the frame, because a crop past the edge is not a wider field.
+#[cfg(feature = "vision")]
+fn field_band(crop: Rect, frame: &Screenshot) -> Rect {
+    let top = crop.y.max(0) as u32;
+    let height = crop.height.min(frame.height.saturating_sub(top));
+    Rect::new(0, crop.y, frame.width, height)
+}
+
+/// A reading with its whitespace removed.
+///
+/// Two readings of one field differ in whitespace when the detector splits a
+/// line differently, and that is not a character in the field. The same rule
+/// [`judge_read_back`] applies, in the one place both readings are compared to
+/// each other rather than to a typed string.
+#[cfg(feature = "vision")]
+fn squeeze(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Whether the band pair should be read at all.
+///
+/// This is the gate on the extra decodes the tree-less path may pay for. It
+/// asks the one question that every append and nothing else answers *yes* to:
+/// did the typing land? A reading that does not contain the typed text is
+/// already `Partial` and no earlier frame can change that; a reading below the
+/// confidence floor is `None` either way; and an empty typed string has no
+/// question to ask.
+///
+/// It deliberately does **not** require the reading to have characters the
+/// typing does not account for. That was the first version of this gate and it
+/// was wrong for exactly the case it was written for: the box that changed is
+/// the *new* text, so on an append it reads as the typed text and nothing more
+/// — the old text did not change and so lies outside the box. "The box holds
+/// only what I typed" is therefore evidence *for* an append, not against one,
+/// and gating on its absence meant the extra read never happened.
+///
+/// The cost of the wider gate is a band pair on every tree-less typing step
+/// that reads back cleanly. That is two decodes on a path that already paid
+/// for one, and it buys the only answer the screen can give.
+#[cfg(feature = "vision")]
+fn needs_prior(read: &crate::computer::vision::ocr_file::OcrText, typed: &str) -> bool {
+    if read.text.trim().is_empty() || !read.is_reliable() {
+        return false;
+    }
+    let wanted = squeeze(typed);
+    if wanted.is_empty() {
+        return false;
+    }
+    squeeze(&read.text).contains(&wanted)
+}
+
 /// Turn what OCR read into a verdict, dropping the reading itself.
 ///
 /// Free rather than a method: the comparison needs no session, no adapter
@@ -3084,7 +3297,6 @@ pub(crate) fn judge_read_back(
     if read.text.trim().is_empty() || !read.is_reliable() {
         return None;
     }
-    let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
     let shown = squeeze(&read.text);
     let wanted = squeeze(typed);
     if wanted.is_empty() {
@@ -3951,6 +4163,61 @@ mod tests {
         assert!(hint.recovery.is_none());
     }
 
+    /// The extra decodes are only paid for when the typing landed.
+    ///
+    /// This is the gate, not the verdict. It asks "did the text land", because
+    /// that is the precondition for the append question to mean anything: a
+    /// step that failed outright does not need an earlier frame, and one whose
+    /// reading is unusable has no verdict to refine. Everything that reads back
+    /// cleanly asks the band pair, including a reading that is *exactly* the
+    /// typed text — that shape is what an append looks like from inside the
+    /// changed box, which is why an earlier gate that excluded it meant the
+    /// extra read never happened at all.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn the_band_pair_is_read_once_the_typing_is_known_to_have_landed() {
+        // The text landed — with or without anything alongside it in the box.
+        assert!(needs_prior(&read_back("JohnJane", 0.95), "Jane"));
+        assert!(needs_prior(&read_back("Jane", 0.95), "Jane"));
+        assert!(needs_prior(&read_back("hello world", 0.95), "helloworld"));
+
+        // The text did not land: already `Partial`, and no earlier frame can
+        // change that.
+        assert!(!needs_prior(&read_back("somethingelse", 0.95), "Jane"));
+        assert!(!needs_prior(&read_back("", 0.0), "Jane"));
+
+        // Below the confidence floor the verdict is `None` either way, so the
+        // pair would be spent on an answer that is never produced.
+        assert!(!needs_prior(&read_back("JohnJane", 0.4), "Jane"));
+
+        // Nothing typed: there is no question.
+        assert!(!needs_prior(&read_back("JohnJane", 0.95), ""));
+    }
+
+    /// The band test separates an append from a replacement on readings alone.
+    ///
+    /// The recognizer is not obliged to spell the same glyphs the same way in
+    /// two crops, so the test never compares a reading with the typed string.
+    /// It asks the weaker decisive thing: the earlier band's reading survives
+    /// inside the later one, the later one is longer, and the extra characters
+    /// are not fully explained by the typed text.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_band_that_kept_its_old_text_reads_as_an_append() {
+        // `HELO` held, `WORLD` added: the old reading survives and the band
+        // gained characters.
+        assert!(band_kept_its_old_text("HELO", "HELOWORLD", "WORLD"));
+        // A replacement: the old reading is gone.
+        assert!(!band_kept_its_old_text("HELO", "WORLD", "WORLD"));
+        // Cleared and retyped shorter — nothing survived.
+        assert!(!band_kept_its_old_text("HELLO", "HI", "HI"));
+        // The earlier band was not a field: "nothing survived" is trivially
+        // true of an empty reading, so it proves nothing.
+        assert!(!band_kept_its_old_text("", "WORLD", "WORLD"));
+        // Old text survives, but the band gained nothing — the same reading.
+        assert!(!band_kept_its_old_text("HELO", "HELO", ""));
+    }
+
     /// A reading is held to the tree's standard when the tree supplies the
     /// field's old value.
     ///
@@ -4582,6 +4849,151 @@ mod tests {
                 .is_none(),
             "an unchanged screen names no field"
         );
+    }
+
+    /// The tree-less path asks the frame before the step what the field held.
+    ///
+    /// This is the residue the tree path does not cover: on a screen that
+    /// publishes no field value there is no `prior` to hand
+    /// [`judge_read_back`], so an append reads as a confirmation — `HELO`
+    /// followed by `WORLD` reads back as containing `WORLD`. The box in the
+    /// *before* frame answers it, and this proves the wiring end to end: real
+    /// glyphs, a real recognizer, and a verdict that flips only because of the
+    /// second read.
+    ///
+    /// It is deliberately a journey and not a rule test — the rule is pinned by
+    /// `a_reading_of_an_append_is_judged_the_way_the_tree_judges_one`. What can
+    /// only be checked with models on disk is that the second crop is taken
+    /// from the right frame and reaches the verdict at all.
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn a_tree_less_append_is_caught_by_reading_the_frame_before_the_step() {
+        use base64::Engine as _;
+        use image::{Rgb, RgbImage};
+
+        /// 5×7 bitmaps: H, E, L, O, W, R, D.
+        const H: [u8; 7] = [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ];
+        const E: [u8; 7] = [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ];
+        const L: [u8; 7] = [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ];
+        const O: [u8; 7] = [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ];
+        const W: [u8; 7] = [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ];
+        const R: [u8; 7] = [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ];
+        const D: [u8; 7] = [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ];
+        const SCALE: u32 = 10;
+
+        /// A frame with the given glyphs drawn into one band.
+        fn frame(glyphs: &[[u8; 7]]) -> Screenshot {
+            let mut img = RgbImage::from_pixel(520, 200, Rgb([255, 255, 255]));
+            let (left, top) = (20, 60);
+            for (index, glyph) in glyphs.iter().enumerate() {
+                let origin = left + index as u32 * (5 * SCALE + SCALE);
+                for (row, bits) in glyph.iter().enumerate() {
+                    for column in 0..5u32 {
+                        if bits & (1 << (4 - column)) == 0 {
+                            continue;
+                        }
+                        for dy in 0..SCALE {
+                            for dx in 0..SCALE {
+                                img.put_pixel(
+                                    origin + column * SCALE + dx,
+                                    top + row as u32 * SCALE + dy,
+                                    Rgb([0, 0, 0]),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .expect("encode the fixture");
+            Screenshot::new(
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+                520,
+                200,
+            )
+        }
+
+        if crate::computer::vision::model_download::ocr_model_paths("").is_none() {
+            eprintln!(
+                "SKIPPED a_tree_less_append_is_caught_by_reading_the_frame_before_the_step: no \
+                 OCR models under {}",
+                crate::computer::vision::model_download::vision_model_dir("").display()
+            );
+            return;
+        }
+
+        let session = ComputerSession::new(Arc::new(HeadlessComputerAdapter::new()));
+        // `HELO` held, `WORLD` typed after it without selecting — the append
+        // the prompt warns about.
+        let before = frame(&[H, E, L, O]);
+        let after = frame(&[H, E, L, O, W, R, D]);
+        let state = ScreenState::from_parts(Vec::new(), after.clone());
+
+        // What the recognizer made of the change box — the new text — so the
+        // assertion is on the verdict and not on the model's spelling of these
+        // glyphs.
+        let change = crate::computer::vision::pixel_diff(&before, &after);
+        let crop = typed_box_from_change(&before, &after, &change, None).expect("one box changed");
+        let read_after = crate::computer::vision::ocr_file::ocr_screenshot(&after, Some(crop), "")
+            .await
+            .expect("the models are installed");
+        assert!(
+            read_after.is_reliable(),
+            "the fixture's new text is not readable: {read_after:?}"
+        );
+        let typed = squeeze(&read_after.text);
+        assert!(!typed.is_empty(), "the changed box holds no text");
+
+        // The band is where both texts live: the change box holds only what
+        // was typed, because the old text is exactly what did not change.
+        let band = field_band(crop, &after);
+        let band_before =
+            crate::computer::vision::ocr_file::ocr_screenshot(&before, Some(band), "")
+                .await
+                .expect("the models are installed");
+        let band_after = crate::computer::vision::ocr_file::ocr_screenshot(&after, Some(band), "")
+            .await
+            .expect("the models are installed");
+        let (shown_before, shown_after) = (squeeze(&band_before.text), squeeze(&band_after.text));
+        // The fixture only tests what it claims if the band really did gain
+        // text while keeping the old: that is the append shape.
+        assert!(
+            shown_after.len() > shown_before.len()
+                && !shown_before.is_empty()
+                && shown_after.contains(&shown_before),
+            "the band does not read as the earlier frame plus text \
+             (before {shown_before:?}, after {shown_after:?}) — the fixture is not an append"
+        );
+
+        // The whole point: the changed box alone reads the new text and would
+        // say "confirmed", and the tree-less path has no `prior` to correct it.
+        // The band pair is what catches it.
+        let hint = session
+            .read_back_typed(&typed, &type_step(), None, Some(&before), &state)
+            .await
+            .expect("the box was read and judged");
+        assert_eq!(hint.effect, ActionEffect::Partial, "an append confirmed itself: {hint:?}");
+        assert_eq!(hint.verification, StepVerification::Failed);
+        assert!(hint.recovery.is_some(), "an append has to say how to fix it");
+        // The leak rule holds on the second read too.
+        assert!(!format!("{hint:?}").contains(&shown_before), "the reading leaked");
+        assert!(!format!("{hint:?}").contains(&shown_after), "the reading leaked");
     }
 
     /// A clock repaints every second; the field still has to be readable.

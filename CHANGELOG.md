@@ -11,6 +11,39 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Added
+
+- **A tree-less screen can now tell an append from a replacement.** The
+  previous entry left this open on purpose: the OCR path had no `prior`, so on
+  a screen that publishes no field value, `HELO` followed by `WORLD` typed
+  without selecting read back as containing `WORLD` and was reported
+  `Confirmed`. The screen still cannot say what the field holds, but it can be
+  asked twice — the same horizontal *band* in the frame before the step and the
+  one after.
+  The band, not the changed box. The box that changed holds only the new text;
+  the old text is exactly what did not change and so lies outside it, which
+  makes a second read of that box answer `""` for every append — the wrong
+  question, answered confidently. `field_band` widens to the full row, where
+  both frames hold the old text and the new, and identical neighbours cancel
+  between them.
+  The verdict is `band_kept_its_old_text`, not the tree path's
+  `was_appended`: the recognizer is not obliged to spell the same glyphs the
+  same way in two crops, so it never compares a reading with the typed string.
+  It asks the weaker decisive thing — the earlier band's reading survives
+  inside the later one, the later one is longer, and it has characters the
+  typed text does not account for.
+  The gate is `needs_prior`, and its first version was backwards: it required
+  the reading to have characters beyond the typed text, which is exactly what
+  an append does *not* look like from inside the changed box. The extra read
+  therefore never happened, and only a real-glyph journey test with models on
+  disk caught it — the rule's unit test was green throughout.
+  Costs, in `docs/computer-use.md`: two more decodes per tree-less typing step,
+  paid only when the typing landed; every failure (budget, timeout, OCR
+  unavailable, frames of different dimensions) leaves the existing verdict
+  standing rather than downgrading a `Confirmed`; and a replacement whose text
+  contains the old text (`cat` → `concatenate`) falls back to "go and look",
+  which the tree path does not, because it has the field's actual values.
+
 ### Fixed
 
 - **Typing into a field that already held text was reported as a success.**
