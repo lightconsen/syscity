@@ -11,6 +11,38 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Typing into a field that already held text was reported as a success.**
+  Both read-back verdicts ended on a containment test — `actual.contains(typed)`
+  from the tree, `shown.contains(&wanted)` from OCR — and a field that keeps its
+  old contents *and* takes the new text contains the new text. `John` plus
+  `Jane` producing `JohnJane` was `Confirmed`. That is exactly the mistake the
+  driver prompt warns the model about ("To replace text already in a field,
+  select it first … Typing alone appends"), so the one failure mode the prompt
+  names was the one the verifier certified. `Confirmed` is not a label: it sets
+  the delivery to `DeliveredVerified` (so `retry` is `Unsafe`), clears
+  `escalation`, resets `consecutive_failures`, and suppresses the
+  `LastStepNotVerified` / `RepeatedFailures` image triggers — a false
+  confirmation switches off every recovery the run has.
+  The tree publishes the field's value on both sides of the step, so this is
+  decidable rather than heuristic: delete one occurrence of the typed text from
+  what the field holds now, and if what remains is exactly what it held before,
+  the keystrokes went between existing characters. `was_appended` is that test,
+  and it covers append, prepend and insert-between. Its verdict is `Partial`
+  with a recovery that says the field kept its old contents and to select all
+  and retype.
+  The same rule now applies to the OCR path, where the tree can still say what
+  the field held before the step even when it cannot say what it holds after —
+  `judge_read_back` takes a `prior` and holds the reading to the same standard.
+  A test asserts the two paths agree on the same facts, because the tree answers
+  first and a disagreement would only ever surface on screens where it does not.
+  Two costs, both stated in `docs/computer-use.md`: a field with a fixed affix
+  (`$` before `12`, reading back `$12`) now reports `Partial` where it used to
+  report `Confirmed` — a false negative in the safe direction; and the tree-less
+  OCR path, which has no `prior`, keeps the weaker containment answer, because
+  nothing there can say what else the field holds.
+
 ### Added
 
 - **`list_windows` now names the windows it found.** Every window action —

@@ -2045,7 +2045,15 @@ impl ComputerSession {
         .ok()? // out of step budget
         .ok()? // read-back timed out
         .ok()?; // OCR could not run at all
-        judge_read_back(typed, &read)
+                // What the field held before the step, when the tree publishes it —
+                // which is a different fact from "the tree could answer", because
+                // [`typed_value_hint`] also refuses when more than one field moved or
+                // the counts differ. It is handed to the OCR verdict so the reading is
+                // held to the same standard the tree is: a field that kept its old
+                // text *and* took the new one is an append, and a reading alone cannot
+                // tell that from a replacement.
+        let prior = fields.first().and_then(|field| field.value.as_deref());
+        judge_read_back(typed, &read, prior)
     }
 
     /// Compare pre/post screen state.
@@ -2671,6 +2679,11 @@ pub(crate) struct EffectHint {
 /// Returns `None` when the tree cannot answer — no editable field changed,
 /// more than one did, or a field is masked (a secure field reports bullets,
 /// not the text) — and the caller falls back to the pixel diff.
+///
+/// A field that changed and now contains the typed text is *not* automatically
+/// a success: appending to a field that already held something also produces
+/// that. [`was_appended`] separates the two from the field's own before and
+/// after values, which is what this reads them for.
 pub(crate) fn typed_value_hint(
     before: &[UiElement],
     after: &[UiElement],
@@ -2684,7 +2697,10 @@ pub(crate) fn typed_value_hint(
     if before_fields.is_empty() || before_fields.len() != after_fields.len() {
         return None;
     }
-    let mut changed: Option<&str> = None;
+    // Both values, not just the one after: `contains` cannot tell a
+    // replacement from an append, and the field's old contents are what make
+    // the difference decidable. See [`was_appended`].
+    let mut changed: Option<(&str, &str)> = None;
     for ((role, before_value), (after_role, after_value)) in before_fields.iter().zip(&after_fields)
     {
         if role != after_role || is_masked(role, before_value) || is_masked(role, after_value) {
@@ -2695,11 +2711,26 @@ pub(crate) fn typed_value_hint(
                 // More than one field moved: we cannot attribute the text.
                 return None;
             }
-            changed = Some(after_value);
+            changed = Some((before_value.as_str(), after_value.as_str()));
         }
     }
-    let actual = changed?;
+    let (was, actual) = changed?;
     if actual.contains(typed) {
+        // The typed text is in the field — but so may be the text that was
+        // there before it. Appending is the mistake the prompt itself warns
+        // about, and a field holding `JohnJane` contains `Jane`.
+        if was_appended(was, actual, typed) {
+            return Some(EffectHint {
+                effect: ActionEffect::Partial,
+                verification: StepVerification::Failed,
+                recovery: Some(
+                    "the field still holds what was in it before, and the new text was added to \
+                     that rather than replacing it — select all and retype the whole value; \
+                     typing into a field that already has content appends to it"
+                        .to_string(),
+                ),
+            });
+        }
         return Some(EffectHint {
             effect: ActionEffect::Confirmed,
             verification: StepVerification::Verified,
@@ -2714,6 +2745,37 @@ pub(crate) fn typed_value_hint(
              do not retype on top of it without clearing first"
                 .to_string(),
         ),
+    })
+}
+
+/// Whether the typed text was *inserted* into the field rather than replacing
+/// what it held.
+///
+/// The tree publishes the field's value on both sides of the step, so this is
+/// decidable rather than guessed: if deleting one occurrence of `typed` from
+/// what the field holds now leaves exactly what it held before, the keystrokes
+/// went *between* existing characters and the old text is still there. That
+/// covers all three shapes — typed at the end (`John` + `Jane` → `JohnJane`),
+/// typed at the front, and typed in the middle between two selections.
+///
+/// Typing into an empty field is not this: `""` + `hello` is the ordinary
+/// case, and it is what "typing into a field" means.
+///
+/// The one shape it cannot separate is a field with a fixed affix — a `$`
+/// before an amount reads `$12` after typing `12` from empty — which reports
+/// as an append. That is a false `Partial`, in the safe direction: it asks the
+/// model to look at the field, where the old behaviour reported a false
+/// `Confirmed` and asked it to look at nothing.
+fn was_appended(was: &str, actual: &str, typed: &str) -> bool {
+    if was.is_empty() || typed.is_empty() {
+        return false;
+    }
+    // `contains` already held, so at least one occurrence exists.
+    actual.match_indices(typed).any(|(start, _)| {
+        let mut rest = String::with_capacity(actual.len() - typed.len());
+        rest.push_str(&actual[..start]);
+        rest.push_str(&actual[start + typed.len()..]);
+        rest == was
     })
 }
 
@@ -3005,20 +3067,48 @@ fn typed_box_from_change(
 /// renders `hello world` the same way at the right point size, and an OCR
 /// line break is an artifact of the detector, not a character in the
 /// field.
+///
+/// `prior` is what the field held before the step, when the tree knows it —
+/// a reading cannot say on its own whether the typed text replaced the field's
+/// contents or was added to them, and this is the same containment question
+/// [`typed_value_hint`] answers from the tree. When it is `None` (the tree-less
+/// screen this path exists for) the answer is the older, weaker one: a reading
+/// that contains the typed text confirms, because nothing available can say
+/// what else the field holds.
 #[cfg(feature = "vision")]
 pub(crate) fn judge_read_back(
     typed: &str,
     read: &crate::computer::vision::ocr_file::OcrText,
+    prior: Option<&str>,
 ) -> Option<EffectHint> {
     if read.text.trim().is_empty() || !read.is_reliable() {
         return None;
     }
-    let shown: String = read.text.chars().filter(|c| !c.is_whitespace()).collect();
-    let wanted: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let shown = squeeze(&read.text);
+    let wanted = squeeze(typed);
     if wanted.is_empty() {
         return None;
     }
     if shown.contains(&wanted) {
+        if let Some(prior) = prior {
+            // The tree said what was there before, so an append is decidable
+            // here the same way it is on the tree path — and for the same
+            // reason: a field holding both the old text and the new one
+            // contains the new one.
+            if was_appended(&squeeze(prior), &shown, &wanted) {
+                return Some(EffectHint {
+                    effect: ActionEffect::Partial,
+                    verification: StepVerification::Failed,
+                    recovery: Some(
+                        "the field still holds what was in it before, and the new text was added \
+                         to that rather than replacing it — select all and retype the whole \
+                         value; typing into a field that already has content appends to it"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
         return Some(EffectHint {
             effect: ActionEffect::Confirmed,
             verification: StepVerification::Verified,
@@ -3733,6 +3823,91 @@ mod tests {
         assert!(!recovery.contains("hel"), "the hint must not quote the text");
     }
 
+    /// An append is not a confirmation, and the field's old value is what says
+    /// so.
+    ///
+    /// A field holding `John` that receives `Jane` without being selected now
+    /// holds `JohnJane`, which *contains* `Jane` — so the containment test this
+    /// used to be called it a success. It is exactly the mistake the prompt
+    /// warns the model about ("Typing alone appends"), reported as if it had
+    /// worked. The tree publishes both sides of the step, so this is decidable
+    /// and does not need a heuristic.
+    #[test]
+    fn text_added_to_a_field_that_already_held_some_is_not_a_confirmation() {
+        // Appended at the end.
+        let before = vec![field("AXTextField", "John")];
+        let after = vec![field("AXTextField", "JohnJane")];
+        let hint = typed_value_hint(&before, &after, "Jane").expect("the field answers");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+        assert_eq!(hint.verification, StepVerification::Failed);
+        let recovery = hint.recovery.expect("an append comes with a hint");
+        assert!(recovery.contains("select all"), "{recovery}");
+        assert!(!recovery.contains("John"), "the hint must not quote the field: {recovery}");
+
+        // Prepended, which is the same keystrokes with the caret at home.
+        let before = vec![field("AXTextField", "world")];
+        let after = vec![field("AXTextField", "helloworld")];
+        let hint = typed_value_hint(&before, &after, "hello").expect("the field answers");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+
+        // And typed into the middle of an existing selection.
+        let before = vec![field("AXTextField", "helloworld")];
+        let after = vec![field("AXTextField", "hello there world")];
+        let hint = typed_value_hint(&before, &after, " there ").expect("the field answers");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+    }
+
+    /// A replacement is still a confirmation, including when the old value is a
+    /// substring of the new one.
+    ///
+    /// The short-circuit on `was_appended` has to be deletion-tested, not just
+    /// "contains": `concatenate` contains `cat` and was never an append, and
+    /// reporting it as one would make every incremental edit a failure.
+    #[test]
+    fn a_replacement_that_happens_to_contain_the_old_value_is_confirmed() {
+        for (before, typed, after) in [
+            // Selecting `cat` and typing `concatenate` — the old text is gone
+            // as a separate run, and the field is exactly what was typed.
+            ("cat", "concatenate", "concatenate"),
+            // The old value recurs but the new one replaced it.
+            ("ab", "abab", "abab"),
+            // Nothing was there before, so there is nothing that could have
+            // been kept.
+            ("", "hello", "hello"),
+        ] {
+            let before_tree = vec![field("AXTextField", before)];
+            let after_tree = vec![field("AXTextField", after)];
+            let hint = typed_value_hint(&before_tree, &after_tree, typed)
+                .unwrap_or_else(|| panic!("{before:?} → {after:?} should answer"));
+            assert_eq!(
+                hint.effect,
+                ActionEffect::Confirmed,
+                "{before:?} + typed {typed:?} = {after:?} is a replacement, not an append"
+            );
+        }
+    }
+
+    /// The append rule is a deletion test, not a prefix test.
+    ///
+    /// `was_appended` has to be right about a field whose old value recurs in
+    /// the new one in more than one place, or a substring check would call
+    /// every one of these an append.
+    #[test]
+    fn the_append_rule_removes_one_occurrence_rather_than_matching_a_prefix() {
+        // `ab` appears twice; removing either occurrence leaves `ab`, not the
+        // old `b`, so this is not an append.
+        assert!(!was_appended("b", "abab", "ab"), "removing one `ab` leaves `ab`, not `b`");
+        // Only one occurrence, and removing it still does not leave the old
+        // value.
+        assert!(!was_appended("b", "abaxb", "ab"));
+        // …and a real append is still one.
+        assert!(was_appended("ab", "abab", "ab"));
+        // Empty on either side is not an append: typing into an empty field is
+        // the ordinary case, and an empty typed text adds nothing.
+        assert!(!was_appended("", "hello", "hello"));
+        assert!(!was_appended("hello", "hello", ""));
+    }
+
     #[test]
     fn masked_and_ambiguous_fields_fall_back_to_pixels() {
         // A secure field reports bullets, not the text.
@@ -3770,10 +3945,87 @@ mod tests {
     #[cfg(feature = "vision")]
     #[test]
     fn a_field_that_reads_back_as_the_text_is_confirmed() {
-        let hint = judge_read_back("hello", &read_back("hello", 0.95)).expect("an answer");
+        let hint = judge_read_back("hello", &read_back("hello", 0.95), None).expect("an answer");
         assert_eq!(hint.effect, ActionEffect::Confirmed);
         assert_eq!(hint.verification, StepVerification::Verified);
         assert!(hint.recovery.is_none());
+    }
+
+    /// A reading is held to the tree's standard when the tree supplies the
+    /// field's old value.
+    ///
+    /// The reading alone cannot say whether the typed text replaced what the
+    /// field held or was added to it — `JohnJane` reads back as containing
+    /// `Jane` either way. `prior` is what makes the question decidable, and
+    /// this is the same rule [`typed_value_hint`] applies, so the two paths
+    /// cannot disagree about the same pixels and the same tree.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn a_reading_of_an_append_is_judged_the_way_the_tree_judges_one() {
+        // The field held `John`; the reading shows both, so this typing was
+        // added to the field rather than replacing its contents.
+        let hint =
+            judge_read_back("Jane", &read_back("JohnJane", 0.95), Some("John")).expect("an answer");
+        assert_eq!(hint.effect, ActionEffect::Partial);
+        assert_eq!(hint.verification, StepVerification::Failed);
+        assert!(hint.recovery.is_some(), "an append has to say how to fix it");
+
+        // The same reading with a replacement: the field held `John`, and now
+        // holds `Jane`.
+        let hint =
+            judge_read_back("Jane", &read_back("Jane", 0.95), Some("John")).expect("an answer");
+        assert_eq!(hint.effect, ActionEffect::Confirmed);
+
+        // And an empty field: typing into one is the ordinary case.
+        let hint = judge_read_back("Jane", &read_back("Jane", 0.95), Some("")).expect("an answer");
+        assert_eq!(hint.effect, ActionEffect::Confirmed);
+
+        // Without a prior — the tree-less screen this path exists for — the
+        // weaker answer stands. This is a documented limit, not a silent one:
+        // nothing available can say what else the field holds.
+        let hint = judge_read_back("Jane", &read_back("JohnJane", 0.95), None).expect("an answer");
+        assert_eq!(hint.effect, ActionEffect::Confirmed);
+    }
+
+    /// The two paths agree on the same facts.
+    ///
+    /// The property that matters is not that either one is right in isolation
+    /// but that a tree and a reading of the same screen produce the same
+    /// verdict. Anything else means the run is judged by which sensor happened
+    /// to answer — and the tree answers first, so the reading's disagreement
+    /// would only ever surface on the screens where the tree does not.
+    #[cfg(feature = "vision")]
+    #[test]
+    fn the_tree_and_a_reading_of_the_same_state_reach_the_same_verdict() {
+        // (old value, typed, new value) — the reading is the new value, which
+        // is what a perfect recognizer would return, so any disagreement is
+        // the rule's and not the recognizer's.
+        for (before, typed, after) in [
+            ("", "hello", "hello"),
+            ("John", "Jane", "Jane"),
+            ("John", "Jane", "JohnJane"),
+            ("cat", "concatenate", "concatenate"),
+            ("world", "hello", "helloworld"),
+            // A field its own formatter rewrote: both paths see text that is
+            // not the typed run, and both say `Partial`. Listed because
+            // agreeing on a false negative is still agreeing — the pair must
+            // not disagree in either direction.
+            ("1000", "1000", "1,000.00"),
+        ] {
+            let by_tree = typed_value_hint(
+                &[field("AXTextField", before)],
+                &[field("AXTextField", after)],
+                typed,
+            )
+            .unwrap_or_else(|| panic!("the tree should answer for {before:?} → {after:?}"));
+            let by_reading = judge_read_back(typed, &read_back(after, 0.95), Some(before))
+                .unwrap_or_else(|| panic!("the reading should answer for {after:?}"));
+            assert_eq!(
+                by_tree.effect, by_reading.effect,
+                "the two paths disagree on {before:?} + {typed:?} = {after:?}"
+            );
+            assert_eq!(by_tree.verification, by_reading.verification);
+        }
     }
 
     /// The leak-proofing is structural, not a promise.
@@ -3788,7 +4040,7 @@ mod tests {
     #[test]
     fn what_the_field_read_back_is_never_carried_in_the_verdict() {
         let secret = "correct horse battery staple";
-        let hint = judge_read_back("wrong", &read_back(secret, 0.98)).expect("an answer");
+        let hint = judge_read_back("wrong", &read_back(secret, 0.98), None).expect("an answer");
         assert_eq!(hint.effect, ActionEffect::Partial);
         assert_eq!(hint.verification, StepVerification::Failed);
 
@@ -3813,13 +4065,13 @@ mod tests {
     #[cfg(feature = "vision")]
     #[test]
     fn an_empty_or_uncertain_reading_is_not_a_verdict() {
-        assert!(judge_read_back("hello", &read_back("", 0.0)).is_none());
-        assert!(judge_read_back("hello", &read_back("   \n ", 0.9)).is_none());
+        assert!(judge_read_back("hello", &read_back("", 0.0), None).is_none());
+        assert!(judge_read_back("hello", &read_back("   \n ", 0.9), None).is_none());
         // Confident enough to say *something* was there, not confident enough
         // to say it was not the typed text.
-        assert!(judge_read_back("hello", &read_back("he11o", 0.4)).is_none());
+        assert!(judge_read_back("hello", &read_back("he11o", 0.4), None).is_none());
         // The typed text is empty: there is nothing to look for.
-        assert!(judge_read_back("", &read_back("hello", 0.99)).is_none());
+        assert!(judge_read_back("", &read_back("hello", 0.99), None).is_none());
     }
 
     /// Whitespace is not a character the reader can see.
@@ -3828,10 +4080,10 @@ mod tests {
     fn a_line_break_from_the_reader_is_not_a_typo() {
         // OCR returns one block per line, so a long value arrives with a
         // newline the field does not contain.
-        let hint = judge_read_back("hello world", &read_back("hello\nworld", 0.9));
+        let hint = judge_read_back("hello world", &read_back("hello\nworld", 0.9), None);
         assert_eq!(hint.expect("an answer").effect, ActionEffect::Confirmed);
         // And a typed space the reader dropped.
-        let hint = judge_read_back("hello world", &read_back("helloworld", 0.9));
+        let hint = judge_read_back("hello world", &read_back("helloworld", 0.9), None);
         assert_eq!(hint.expect("an answer").effect, ActionEffect::Confirmed);
     }
 
