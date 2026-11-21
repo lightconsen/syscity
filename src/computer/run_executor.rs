@@ -1459,6 +1459,68 @@ mod tests {
         );
     }
 
+    /// A tree-less run goes blind when the image allowance runs out — and is
+    /// told so.
+    ///
+    /// Every step of a tree-less screen wants a picture (`plan_perception`
+    /// attaches whenever the tree is incomplete), and the default allowance is
+    /// 15 images against a default ceiling of 30 steps. This test states the
+    /// consequence as a number instead of leaving it to be discovered on a long
+    /// run: with a changing screen, steps past the allowance get no image. The
+    /// second half is the fix — the prompt must say why, because the other
+    /// three ways a step can be blind (capture failed, tree unreadable, tree
+    /// truncated) are all stated, and a model that does not know it is blind
+    /// still plans as if it could see.
+    ///
+    /// The screen changes on every action, so the dedup rule charges each
+    /// frame and the ceiling is reached at exactly `images`.
+    #[tokio::test]
+    async fn a_tree_less_run_loses_its_picture_at_the_image_ceiling() {
+        let provider = ScriptedProvider::new(vec![
+            click_answer(),
+            click_answer(),
+            click_answer(),
+            click_answer(),
+            click_answer(),
+            r#"{"decision": "done", "message": "done"}"#,
+        ]);
+        let adapter = FakeDesktop::changing(true);
+        let run = ComputerRun::new("r1", "press the four buttons");
+
+        // Four images for six decisions: the last two steps are text-only.
+        let outcome = execute(run, fast_plan(provider.clone(), adapter, 4, true))
+            .await
+            .expect("the run machinery works");
+
+        assert_eq!(outcome.images_attached, 4, "the ceiling is a ceiling on a tree-less run too");
+        assert_eq!(provider.images_sent(), 4);
+
+        let requests = provider.requests();
+        let text_only: Vec<_> = requests
+            .iter()
+            .filter(|r| !r.messages.iter().any(|m| m.has_images()))
+            .collect();
+        assert!(
+            text_only.len() >= 2,
+            "the run went past the ceiling on text alone: {requests:?}"
+        );
+        // Every text-only step says why it has no picture. Silence here is the
+        // defect this test was written for: the step looks ordinary, and the
+        // model plans against a screen it cannot see.
+        for request in &text_only {
+            let prompt = request
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                prompt.contains("used its image allowance"),
+                "a blind step must say so: {prompt}"
+            );
+        }
+    }
+
     /// The same image ceiling with a model that cannot see: not one image is
     /// attached, however incomplete the tree is.
     #[tokio::test]

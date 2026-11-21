@@ -470,6 +470,27 @@ impl ModelDriver {
             wire.push_str(note);
         }
 
+        // The fourth way a step can be blind, and the only one that used to go
+        // unmentioned. A tree-less screen attaches a picture on every step, so
+        // the run's image allowance is spent fast; past it `plan_perception`
+        // stops attaching, and the sentence that explains a picture simply
+        // disappears. The model then sees an ordinary-looking step with no
+        // image and no reason for it — and a model that does not know it is
+        // blind still plans as if it could see. The other three states above
+        // are all stated for exactly this reason.
+        //
+        // The advice is deliberately "say so" rather than "retry": the
+        // allowance will not come back in this run, so the honest moves are
+        // asking for help and finishing in one action.
+        if !perception.attach_image && !ctx.image_budget_available && ctx.screenshot.is_some() {
+            wire.push_str(
+                "(no picture is attached to this step: the run has used its image allowance. \
+                 The screen is still capturable, but you are working without it from here — \
+                 prefer actions the tree names, and answer `help` if the goal cannot be met \
+                 without seeing the screen.)\n",
+            );
+        }
+
         // The visual scan, as a second outline in the same format. It is kept
         // apart from the accessibility tree rather than merged into it so the
         // model can weigh two kinds of evidence separately: one is what the
@@ -1714,6 +1735,42 @@ mod tests {
     fn a_successful_capture_says_nothing_about_failure() {
         let (_system, user) = driver().render_prompt(&state(), &ctx(true));
         assert!(!user.contains("could NOT be captured"), "{user}");
+    }
+
+    /// A step that has spent the run's image allowance must say so.
+    ///
+    /// This is the fourth kind of blindness and the one that used to be
+    /// silent. A tree-less screen attaches a picture every step, so the
+    /// allowance runs out mid-run; past it the picture simply stops arriving,
+    /// and a model that does not know it is blind keeps planning as though it
+    /// could see. The other three (failed capture, unreadable tree, truncated
+    /// tree) are all stated — this one now is too.
+    #[test]
+    fn a_step_past_the_image_allowance_says_the_picture_is_gone() {
+        let mut context = ctx(false);
+        context.image_budget_available = false;
+        let (_system, user) = driver().render_prompt(&state(), &context);
+        assert!(user.contains("used its image allowance"), "{user}");
+        // It must not claim the screen is unseeable in general: the capture
+        // still works, and a model told "the screen cannot be captured" would
+        // stop asking for close-ups it can still get.
+        assert!(!user.contains("could NOT be captured"), "{user}");
+        assert!(
+            !user.contains("An image of the screen is attached"),
+            "the prompt must not promise a picture it did not send: {user}"
+        );
+    }
+
+    /// The notice is keyed on the budget, not on the model being sighted.
+    ///
+    /// A text-only model gets no image on any step, and telling it about an
+    /// allowance it never had would be noise on every single step.
+    #[test]
+    fn a_blind_model_is_not_told_about_an_image_allowance() {
+        let mut context = ctx(true);
+        context.model_supports_vision = false;
+        let (_system, user) = driver().render_prompt(&state(), &context);
+        assert!(!user.contains("used its image allowance"), "{user}");
     }
 
     #[test]

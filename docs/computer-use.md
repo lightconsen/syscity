@@ -265,6 +265,25 @@ session 判出了"在别处"，`StepRecord` 没接，run 的决策prompt 只能�
 超限**不静默停**：走交接单，明说"因预算停在第 N 步，已完成 X，剩余 Y"。
 静默停会让用户以为任务做完了，这是最坏的结果。
 
+**无树界面会把图片额度花得最快**，因为 `plan_perception` 在树不完整时**每一步**
+都要图：默认 15 张对默认 30 步，意味着一个无树 run 到第 16 步就没有图了。这时
+run 不会停（"为图停在中途比花 token 更糟"），它会退化成纯文本。
+
+这里曾经有一处静默：图没了，但 prompt 里**没有一句话说明为什么**。prompt 对这个
+问题的其他几种成因都明说了——截图失败、树读不出来、树被截断——唯独预算耗尽那一
+句缺席。模型看到的是一个普普通通的步骤，于是继续当成能看见来规划。
+
+现在补上了第四种，措辞和另外几种同构：
+
+> (no picture is attached to this step: the run has used its image allowance. …)
+
+它由 `image_budget_available` 驱动，而不是 `model_supports_vision`——一个本来就
+没有视觉能力的模型不该在每一步都被提醒一个它从未有过的额度。
+
+`a_tree_less_run_loses_its_picture_at_the_image_ceiling` 把这个数字钉住了：
+它断言超出额度的那几步**必须**带上这句话。把这句话删掉，测试立刻变红——这条
+断言是先写"没有这句话"、确认它会失败之后才改成"必须有"的。
+
 ### 截图去重
 
 `Screenshot.digest` 是 `sha256:<64 hex>`，与附件 CAS 的 key 同构

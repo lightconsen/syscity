@@ -13,6 +13,20 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **A step past the image allowance says the picture is gone.** A tree-less
+  screen attaches a picture on every step — `plan_perception` attaches whenever
+  the tree is incomplete — so the default allowance of 15 images runs out long
+  before the default ceiling of 30 steps. The run continues on text rather than
+  stopping, which is right, but the prompt used to say nothing about it: the
+  sentence explaining the image simply disappeared, and the model saw an
+  ordinary-looking step and kept planning as if it could see. The other causes
+  of a pictureless step (a failed capture, an unreadable tree, a truncated
+  tree) are all stated in the prompt; this one now is too, keyed on the budget
+  rather than on the model's capabilities so a text-only model is not told
+  about an allowance it never had.
+  `a_tree_less_run_loses_its_picture_at_the_image_ceiling` pins the behaviour,
+  and the assertion was checked in both directions — writing it as "no notice"
+  first, watching it fail once the notice landed, then flipping it.
 - **The decision maker can name every window action.** `get_window_geometry`,
   `minimize_window` and `maximize_window` existed on `DesktopAction` and in the
   `computer` tool, but had no `WireAction` variant — so the loop's decision
