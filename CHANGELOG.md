@@ -46,6 +46,30 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **Windows `list_windows` wrote a corrupt line for the one window it most had
+  to describe.** The PowerShell `EnumAll()` emitted each window's state as
+  `IsIconic(hWnd) ? "1" : "0" + "|||"`. C# binds the conditional `?:` looser
+  than `+`, so that parses as `IsIconic(hWnd) ? "1" : ("0" + "|||")`: a
+  **minimised** window emitted a bare `1` with no separator and the following
+  zoomed field glued onto it (`11` instead of `1|||1`). The taskbar window — the
+  exact case the list exists to name, because it is in neither the tree nor the
+  screenshot — was the one the line corrupted. Each conditional is now
+  parenthesised, and `the_window_state_fields_keep_their_separator` pins it from
+  both sides (the parenthesised form must be present, the bare form absent), so
+  a later "tidy-up" that drops the parentheses fails.
+  Separately, Windows returned only its raw `Windows:\n<pipe lines>` text, so
+  the `[minimised]` flag never reached the model — a taskbar window read the
+  same as one behind the front window. Windows now parses its own output into
+  typed `WindowInfo` records (7-field parser, `data.windows`), exactly as macOS
+  does, and prints a count ("Found N windows") rather than the raw lines when
+  records exist — otherwise the list would appear twice. If the parser rejects
+  every line, the raw text is kept instead of answering "Found 0 windows", so a
+  format shift degrades to the old behaviour rather than silently dropping a
+  list the model can see. **A text list that cannot carry state is a state
+  loss** — the same error as macOS once hardcoding `minimized: false`, on a
+  different platform. Linux remains text-only: `wmctrl -l -p` carries no EWMH
+  state and reporting `minimised` would need a per-window `xprop`, which is left
+  as a stated residual rather than done blind here.
 - **Typing into a field that already held text was reported as a success.**
   Both read-back verdicts ended on a containment test — `actual.contains(typed)`
   from the tree, `shown.contains(&wanted)` from OCR — and a field that keeps its
@@ -88,10 +112,10 @@ if no section matches, the release falls back to auto-generated notes.
   Linux and Windows put them in the step's *message*, which was cut at the same
   120 characters, losing every title past the first window. Either way the
   model could emit `move_window` and had no string to put in `title_pattern`.
-  A `list_windows` step now prints its payload: typed records on macOS (with
-  `[minimised]` / `[maximised]`, the only place a Dock-hidden window is
-  distinguishable from one behind the front window) and the `Windows:` text on
-  Linux and Windows. Twenty entries, with the omitted tail counted rather than
+  A `list_windows` step now prints its payload: typed records on macOS and
+  Windows (with `[minimised]` / `[maximised]`, the only place a Dock-hidden
+  window is distinguishable from one behind the front window) and the
+  `Windows:` text on Linux. Twenty entries, with the omitted tail counted rather than
   dropped — "there are 5 more" is not the same fact as "that is all". The
   prompt now says to copy a title from that list instead of guessing at one.
   The text path's test fixture is deliberately longer than the 120-character

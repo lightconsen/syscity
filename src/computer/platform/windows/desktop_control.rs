@@ -27,6 +27,61 @@ impl DesktopControlTool {
         Self
     }
 
+    /// PowerShell that enumerates every titled window, with state via P/Invoke.
+    ///
+    /// One line per window, seven `|||`-separated fields:
+    /// `hwnd|||title|||pid|||left,top,width,height|||focused|||iconic|||zoomed`.
+    /// The title has its `|` stripped so it can never introduce a separator.
+    ///
+    /// The parentheses around each state conditional are load-bearing, not
+    /// decoration. C# binds `?:` looser than `+`, so `IsIconic(hWnd) ? "1" :
+    /// "0" + "|||"` parses as `IsIconic(hWnd) ? "1" : ("0" + "|||")`: a
+    /// *minimised* window would emit a bare `1` with no separator and the
+    /// zoomed field would glue onto it, corrupting exactly the line this list
+    /// exists to produce.
+    fn build_list_windows_script() -> &'static str {
+        r#"
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+using System.Text;
+public class WinAPI {
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    public static string EnumAll() {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        IntPtr fg = GetForegroundWindow();
+        EnumWindows((hWnd, _) => {
+            System.Text.StringBuilder title = new System.Text.StringBuilder(256);
+            GetWindowText(hWnd, title, 256);
+            if (title.Length > 0) {
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                RECT r; GetWindowRect(hWnd, out r);
+                sb.Append(hWnd.ToInt64().ToString() + "|||");
+                sb.Append(title.ToString().Replace("|","") + "|||");
+                sb.Append(pid.ToString() + "|||");
+                sb.Append(r.Left + "," + r.Top + "," + (r.Right - r.Left) + "," + (r.Bottom - r.Top) + "|||");
+                sb.Append((hWnd == fg ? "1" : "0") + "|||");
+                sb.Append((IsIconic(hWnd) ? "1" : "0") + "|||");
+                sb.Append(IsZoomed(hWnd) ? "1" : "0");
+                sb.AppendLine();
+            }
+            return true;
+        }, IntPtr.Zero);
+        return sb.ToString().Trim();
+    }
+}
+"@
+[WinAPI]::EnumAll()
+"#
+    }
+
     /// PowerShell for a mouse drag, with a Release Guard.
     ///
     /// The button goes down at the start and only comes up at the end. A
@@ -488,50 +543,15 @@ if ($proc -ne $null) {{
             }
             // ── Window management ──────────────────────────────────────────
             "list_windows" => {
-                // Enhanced with bounds and window state via P/Invoke
-                let script = r#"
-Add-Type @"
-using System; using System.Runtime.InteropServices;
-using System.Text;
-public class WinAPI {
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-    public static string EnumAll() {
-        System.Text.StringBuilder sb = new System.Text.StringBuilder();
-        IntPtr fg = GetForegroundWindow();
-        EnumWindows((hWnd, _) => {
-            System.Text.StringBuilder title = new System.Text.StringBuilder(256);
-            GetWindowText(hWnd, title, 256);
-            if (title.Length > 0) {
-                GetWindowThreadProcessId(hWnd, out uint pid);
-                RECT r; GetWindowRect(hWnd, out r);
-                sb.Append(hWnd.ToInt64().ToString() + "|||");
-                sb.Append(title.ToString().Replace("|","") + "|||");
-                sb.Append(pid.ToString() + "|||");
-                sb.Append(r.Left + "," + r.Top + "," + (r.Right - r.Left) + "," + (r.Bottom - r.Top) + "|||");
-                sb.Append((hWnd == fg ? "1" : "0") + "|||");
-                sb.Append(IsIconic(hWnd) ? "1" : "0" + "|||");
-                sb.Append(IsZoomed(hWnd) ? "1" : "0");
-                sb.AppendLine();
-            }
-            return true;
-        }, IntPtr.Zero);
-        return sb.ToString().Trim();
-    }
-}
-"@
-[WinAPI]::EnumAll()
-"#;
-                let (ok, stdout, err) = Self::run_ps(script).await?;
+                let (ok, stdout, err) = Self::run_ps(Self::build_list_windows_script()).await?;
                 if ok {
-                    Ok(ToolExecutionResult::success(format!("Windows:\n{}", stdout)))
+                    // Keep the text (the prompt's text shape still reads it) but
+                    // attach typed records so the `[minimised]` marker reaches
+                    // the model — the raw list cannot say which window is in the
+                    // taskbar.
+                    let windows = parse_list_windows(&stdout);
+                    Ok(ToolExecutionResult::success(format!("Windows:\n{}", stdout))
+                        .with_data(serde_json::json!({ "windows": windows })))
                 } else {
                     Ok(ToolExecutionResult::error(format!("List windows failed: {}", err)))
                 }
@@ -708,6 +728,82 @@ if ($proc -ne $null) {{
     }
 }
 
+/// Parse the `EnumAll()` output into typed window records.
+///
+/// The line format is seven `|||`-separated fields:
+/// `hwnd|||title|||pid|||left,top,width,height|||focused|||iconic|||zoomed`.
+/// The script strips `|` from titles, so a title can never introduce a
+/// separator, and `splitn(7)` keeps a title that slipped a `|` through from
+/// shifting the fields after it into another window's state.
+///
+/// Emitting typed records is what makes `[minimised]` reachable on Windows.
+/// The tool used to return its raw text, and the prompt's window renderer only
+/// knows the text shape when it carries a `Windows:` prefix — so a window hidden
+/// in the taskbar read the same as one behind the front window, which is exactly
+/// the distinction `activate_window` exists to resolve. macOS has produced typed
+/// records for the same reason; this closes the gap for Windows.
+///
+/// A line with the wrong field count is skipped rather than shifted: the fields
+/// before the title are machine-written, so a short line means the script
+/// produced something this parser does not understand, and guessing would put a
+/// process id where a title belongs.
+fn parse_list_windows(output: &str) -> Vec<crate::computer::WindowInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let parts: Vec<&str> = line.splitn(7, "|||").collect();
+            if parts.len() != 7 {
+                tracing::debug!("skipping an unparseable window line: {line:?}");
+                return None;
+            }
+            let title = parts[1].to_string();
+            if title.trim().is_empty() {
+                // The script already drops empty titles; a blank or
+                // whitespace-only one here means the line is not a window
+                // record worth naming — and every window action names a window
+                // by a title substring, so one that is only spaces can never be
+                // addressed.
+                return None;
+            }
+            let pid = parts[2].parse().ok();
+            let bounds = parse_bounds(parts[3]);
+            Some(crate::computer::WindowInfo {
+                id: parts[0].to_string(),
+                title,
+                app_name: None,
+                pid,
+                bounds,
+                minimized: parts[5] == "1",
+                maximized: parts[6] == "1",
+                focused: parts[4] == "1",
+            })
+        })
+        .collect()
+}
+
+/// Parse the `left,top,width,height` bounds field.
+///
+/// All four have to be present and in range: a partially-read rectangle is not
+/// a smaller rectangle, it is an unknown position, and reporting half of one
+/// would put a window somewhere it is not.
+fn parse_bounds(bounds: &str) -> Option<crate::computer::Rect> {
+    let mut nums = bounds.split(',');
+    let x: i32 = nums.next()?.trim().parse().ok()?;
+    let y: i32 = nums.next()?.trim().parse().ok()?;
+    let width: i32 = nums.next()?.trim().parse().ok()?;
+    let height: i32 = nums.next()?.trim().parse().ok()?;
+    if nums.next().is_some() {
+        return None;
+    }
+    let width = u32::try_from(width).ok()?;
+    let height = u32::try_from(height).ok()?;
+    Some(crate::computer::Rect::new(x, y, width, height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,5 +827,80 @@ mod tests {
         );
         assert!(script.contains("emergency-release"), "{script}");
         assert!(script.contains("release-failed"), "{script}");
+    }
+
+    /// The iconic/zoomed state must be parenthesised before the separator is
+    /// appended.
+    ///
+    /// This is a C# precedence fact, not a style preference: `?:` binds looser
+    /// than `+`, so an unparenthesised `IsIconic(hWnd) ? "1" : "0" + "|||"`
+    /// emits a bare `1` for a minimised window and glues the zoomed field onto
+    /// it. The minimised line is the one the whole list exists for, so the bug
+    /// would corrupt exactly the case it was meant to serve. The assertion is on
+    /// the parenthesised form, so it fails if the parentheses are ever "tidied
+    /// away".
+    #[test]
+    fn the_window_state_fields_keep_their_separator() {
+        let script = DesktopControlTool::build_list_windows_script();
+        assert!(
+            script.contains(r#"(IsIconic(hWnd) ? "1" : "0") + "|||""#),
+            "the iconic field must be parenthesised before its separator: {script}"
+        );
+        assert!(
+            !script.contains(r#"IsIconic(hWnd) ? "1" : "0" + "|||""#),
+            "an unparenthesised conditional appends the separator only in the else branch: {script}"
+        );
+    }
+
+    /// A full line parses into a typed record, state included.
+    ///
+    /// Two windows, one minimised and one not, so a hardcoded `minimized: true`
+    /// (or a reversed flag) cannot pass: the non-minimised line pins the false
+    /// side, the minimised line pins the true side.
+    #[test]
+    fn a_window_line_parses_with_its_state() {
+        let parsed = parse_list_windows(
+            "12345|||Notes — Shopping|||4242|||10,20,800,600|||0|||1|||0\n\
+             67890|||Calculator|||4243|||0,0,400,300|||1|||0|||0\n",
+        );
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        let w = &parsed[0];
+        assert_eq!(w.id, "12345");
+        assert_eq!(w.title, "Notes — Shopping");
+        assert_eq!(w.pid, Some(4242));
+        assert_eq!(w.bounds, Some(crate::computer::Rect::new(10, 20, 800, 600)));
+        assert!(w.minimized, "a taskbar window must read as minimised: {w:?}");
+        assert!(!w.maximized);
+        assert!(!w.focused);
+        let c = &parsed[1];
+        assert_eq!(c.title, "Calculator");
+        assert!(!c.minimized, "a visible window must not read as minimised: {c:?}");
+        assert!(c.focused);
+    }
+
+    /// A blank title is not a window; the script already filters it, and the
+    /// parser must not turn that into a nameless record.
+    #[test]
+    fn a_blank_title_is_skipped() {
+        let parsed = parse_list_windows("1|||   |||2|||0,0,1,1|||0|||0|||0\n");
+        assert!(parsed.is_empty(), "{parsed:?}");
+    }
+
+    /// A short line is skipped rather than shifted: the fields before the title
+    /// are machine-written, so a short line is not a window with a shorter
+    /// title, it is output this parser does not understand.
+    #[test]
+    fn a_short_window_line_is_skipped() {
+        let parsed = parse_list_windows("1|||Title|||2|||0,0,1,1|||0|||1\n");
+        assert!(parsed.is_empty(), "{parsed:?}");
+    }
+
+    /// A partial bounds field is unknown, not a smaller rectangle. Reporting
+    /// half of one would place the window somewhere it is not.
+    #[test]
+    fn partial_bounds_are_unknown() {
+        let parsed = parse_list_windows("1|||Title|||2|||10,20,800|||0|||1|||0\n");
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(parsed[0].bounds, None, "three numbers is not a rectangle");
     }
 }

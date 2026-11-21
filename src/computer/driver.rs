@@ -821,12 +821,12 @@ const WINDOW_LIST_LIMIT: usize = 20;
 /// `move_window`, `resize_window`, `minimize_window` or `close_window`, and a
 /// summary of "Found 3 windows" names none of them.
 ///
-/// There are two shapes, because the platforms differ. macOS returns typed
-/// [`WindowInfo`]s in `data`, so the state (minimised/maximised) is readable
-/// and worth printing. Linux and Windows return the desktop tool's own text in
-/// the *message* — `"Windows:\n<wmctrl or EnumWindows output>"` — which
-/// `summary_of` would cut off mid-line, so the lines are carried through
-/// instead. Anything else renders nothing and the step's message stands.
+/// There are two shapes, because the platforms differ. macOS and Windows
+/// return typed [`WindowInfo`]s in `data`, so the state (minimised/maximised)
+/// is readable and worth printing. Linux returns the desktop tool's own text in
+/// the *message* — `"Windows:\n<wmctrl output>"` — which `summary_of` would cut
+/// off mid-line, so the lines are carried through instead. Anything else
+/// renders nothing and the step's message stands.
 fn window_list_note(record: &StepRecord) -> Option<String> {
     if !matches!(record.action, DesktopAction::ListWindows) {
         return None;
@@ -841,10 +841,11 @@ fn window_list_note(record: &StepRecord) -> Option<String> {
         return Some(typed_window_list(windows));
     }
 
-    // Text platforms. `Windows:` is the prefix both the x11 and the PowerShell
-    // tool put in front of their output; the count-bearing macOS message never
-    // matches it, so a macOS result without `data` still falls through to the
-    // one-line summary rather than printing "Found 3 windows" twice.
+    // Text platforms. `Windows:` is the prefix the x11 tool puts in front of
+    // its output; the count-bearing macOS message (and Windows' now, which
+    // attaches typed records instead) never matches it, so a result without
+    // `data` still falls through to the one-line summary rather than printing
+    // "Found 3 windows" twice.
     let body = record
         .result
         .message
@@ -2058,6 +2059,54 @@ mod tests {
         let (_system, user) = driver().render_prompt(&s, &ctx(false));
         assert!(user.contains("Found 3 windows"), "{user}");
         assert!(!user.contains("named windows"), "no list was present to name: {user}");
+    }
+
+    /// Windows now returns typed records too, without an app name.
+    ///
+    /// The tool used to hand back only its `Windows:\n…` text, so the
+    /// `[minimised]` flag — the one fact that tells a taskbar window apart from
+    /// a window merely behind the front one — never reached the model. The
+    /// records carry no `app_name` (Windows' enumeration does not name the
+    /// process), so this pins that the title-only shape still marks state
+    /// rather than printing an empty app prefix.
+    #[test]
+    fn a_typed_window_list_without_an_app_name_still_marks_state() {
+        let mut result = ActionResult::success("Found 1 windows".to_string());
+        result.data = Some(serde_json::json!({
+            "windows": [
+                {
+                    "id": "975",
+                    "title": "Shopping list",
+                    "app_name": null,
+                    "pid": 1234,
+                    "bounds": { "x": 0, "y": 0, "width": 800, "height": 600 },
+                    "minimized": true,
+                    "maximized": false,
+                    "focused": false
+                }
+            ]
+        }));
+        let mut s = state();
+        s.step = 1;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::ListWindows,
+            result,
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+        assert!(user.contains("Shopping list"), "{user}");
+        assert!(user.contains("[minimised]"), "the taskbar state must survive: {user}");
+        assert!(!user.contains(": [minimised]"), "no empty app prefix before the title: {user}");
+        // The raw pipe-delimited line must not also be printed: the typed
+        // records are the reading, and printing both would double the list.
+        assert!(!user.contains("|||"), "the raw line must not leak beside the records: {user}");
     }
 
     /// A very long list is truncated with a count, never silently.

@@ -654,11 +654,28 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 结果：模型能发 `move_window`，却没有可以填进 `title_pattern` 的字符串。
 
 现在 `list_windows` 是唯一一个**把载荷本身**摊进提示词的步骤，两种形状各走一条：
-`data.windows`（macOS，带 `[minimised]` / `[maximised]` 标记）和以 `Windows:`
-开头的文本（Linux / Windows，逐行带出）。列表上限 20 条，超出部分**数出来**而
-不是默默丢掉——"还剩 N 个"和"没有了"是两个不同的事实。macOS 那句 "Found N
-windows" 不会被误认成列表：它没有 `Windows:` 前缀，也没有 `data`，落到普通的一行
-摘要。提示词里也加了一条：标题从 `list_windows` 里抄，不要猜。
+`data.windows`（macOS 和 Windows，带 `[minimised]` / `[maximised]` 标记）和以
+`Windows:` 开头的文本（只有 Linux 还是纯文本，逐行带出）。列表上限 20 条，超出
+部分**数出来**而不是默默丢掉——"还剩 N 个"和"没有了"是两个不同的事实。没有
+`data` 的那句 "Found N windows" 不会被误认成列表：它没有 `Windows:` 前缀，落到
+普通的一行摘要。提示词里也加了一条：标题从 `list_windows` 里抄，不要猜。
+
+**Windows 曾经输在回程的一半上，而且错在那个列表专门要报的那种窗口上。**
+PowerShell 的 `EnumAll()` 把每个窗口写成七个 `|||` 分隔字段，状态两位用的是
+`IsIconic(hWnd) ? "1" : "0" + "|||"`。C# 的 `?:` 比 `+` 松，这一行实际解析成
+`IsIconic(hWnd) ? "1" : ("0" + "|||")`——**最小化**的分支只吐出裸的 `1`，分隔符
+被吞掉，紧接着的 zoomed 字段就粘在它后面（`11` 而不是 `1|||1`）。也就是说，这个
+列表存在的唯一理由——"哪个窗口缩进了任务栏"——恰好是它写坏的那一行（`8dfac668`
+之后的 Windows 补齐里修的）。现在每个条件都加了括号，测试
+`the_window_state_fields_keep_their_separator` 正着断括号存在、反着断没有不加括号
+的写法，将来谁把它"整理"掉都会红。同时 Windows 也和 macOS 一样产出
+`WindowInfo` 记录，模型终于能看到 `[minimised]`，不再只有那种每行长得一样的文本。
+**逐行文本读不出状态，这本身就是一种状态丢失**——和 macOS 当初把 `minimized` 硬编码成
+`false` 是同一类错误，只是换了个平台犯。
+
+Linux 仍是纯文本：`wmctrl -l -p` 不带 EWMH 状态位，要报 `minimised` 得对每个窗口
+再发一次 `xprop -id <wid> _NET_WM_STATE`，N 次子进程调用，且本机无 X 会话无法验证。
+留作已知残留，不在这条 commit 里做。
 
 **但补完之后立刻暴露了一个动作层的单向门，值得单独记一笔**：`minimize_window`
 交出去以后，唯一能把它叫回来的动作是 `activate_window`，而三个平台的实现并不

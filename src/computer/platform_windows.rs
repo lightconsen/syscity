@@ -502,7 +502,32 @@ impl ComputerAdapter for WindowsComputerAdapter {
                         "the action reported failure without a reason".to_string()
                     })));
                 }
-                Ok(ActionResult::success(result.output))
+                // Emit a count, as macOS does, when the typed records parsed:
+                // the raw `Windows:\n<pipe lines>` message is the old text
+                // shape, and printing it *and* the typed records would show the
+                // list twice — once as machine fields, once as the marked
+                // lines. A count names nothing, so it cannot be mistaken for a
+                // second reading.
+                //
+                // Only when the records are non-empty. If the parser rejected
+                // every line — a format shift, a changed script — the raw text
+                // is the only surviving copy of the titles, and answering
+                // "Found 0 windows" would drop a list the model can see while
+                // claiming there is nothing to name.
+                let parsed_windows = result
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("windows"))
+                    .and_then(|w| w.as_array())
+                    .filter(|w| !w.is_empty())
+                    .cloned();
+                match parsed_windows {
+                    Some(windows) => {
+                        Ok(ActionResult::success(format!("Found {} windows", windows.len()))
+                            .with_data(serde_json::json!({ "windows": windows })))
+                    }
+                    None => Ok(ActionResult::success(result.output)),
+                }
             }
             DesktopAction::GetWindowGeometry { title_pattern } => {
                 let args =
