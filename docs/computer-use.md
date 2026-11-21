@@ -644,6 +644,22 @@ Recording），而且会起进程。会起进程的特性应该被要求，而�
 两个窗口里的小字对照"仍然受 1024 宽整图的限制——这条属于 §6.2 的感知短板，
 不是窗口动作的缺失。
 
+**但"能发出去"不等于"能命名"。** 补完 `WireAction` 之后还有第三处断点，在回程
+而不是去程：每个窗口动作都靠 `title_pattern` 指名一个窗口，而标题的唯一来源是
+`list_windows`——这一步的结果把标题放在 `data.windows` 里，`render_step` 却把
+每一步压成一行、再经 `summary_of` 截到 120 字符。于是 macOS 上模型读到的是
+"Found 3 windows"，一个名字也没有；Linux / Windows 把标题塞在**消息**里
+（`"Windows:\n<wmctrl -l>"` / PowerShell `EnumAll` 的输出），那条消息同样在 120
+字符处被切断，第二个窗口的标题在模型看到第一个之前就没了。三条路都通向同一个
+结果：模型能发 `move_window`，却没有可以填进 `title_pattern` 的字符串。
+
+现在 `list_windows` 是唯一一个**把载荷本身**摊进提示词的步骤，两种形状各走一条：
+`data.windows`（macOS，带 `[minimised]` / `[maximised]` 标记）和以 `Windows:`
+开头的文本（Linux / Windows，逐行带出）。列表上限 20 条，超出部分**数出来**而
+不是默默丢掉——"还剩 N 个"和"没有了"是两个不同的事实。macOS 那句 "Found N
+windows" 不会被误认成列表：它没有 `Windows:` 前缀，也没有 `data`，落到普通的一行
+摘要。提示词里也加了一条：标题从 `list_windows` 里抄，不要猜。
+
 **但补完之后立刻暴露了一个动作层的单向门，值得单独记一笔**：`minimize_window`
 交出去以后，唯一能把它叫回来的动作是 `activate_window`，而三个平台的实现并不
 一样。Windows 走 `ShowWindowAsync(SW_SHOWNORMAL)`，会还原。Linux 原来只发

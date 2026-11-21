@@ -129,6 +129,13 @@ Rules:
   control may still be styled to react, and a live one may not react at all.
   The tooltip a probe opens is cleared for you before the next action, so you
   do not need to move the pointer away first.
+- Every window action names a window by a *substring of its title*, and
+  `title_pattern` is the only way to say which one. The titles come from
+  `list_windows` — the step's own line says how many it found, and the titles
+  are listed underneath it. Call `list_windows` first, then copy a title from
+  that list rather than guessing at one. A window that is minimised is marked
+  `[minimised]`: it is visible in neither the tree nor the screenshot, so it
+  can only be reached by naming it.
 - If something is still loading, wait rather than acting again. A second click
   on a control that has not drawn yet lands on whatever is under it."#;
 
@@ -425,6 +432,13 @@ impl ModelDriver {
                         "     {}\n",
                         crate::computer::vision::off_target_note(&target)
                     ));
+                }
+                // A window list is the one result whose entire payload is the
+                // list, and the one-line form throws it away: macOS says
+                // "Found 3 windows", which names nothing the model can
+                // `activate_window`, `move_window` or `close_window` by.
+                if let Some(note) = window_list_note(record) {
+                    wire.push_str(&note);
                 }
             }
         }
@@ -790,6 +804,98 @@ fn summary_of(message: &str) -> String {
     } else {
         head
     }
+}
+
+/// How many windows a `list_windows` step prints into the prompt.
+///
+/// A desktop with forty windows is not a list the model can use — it needs the
+/// two or three it means to arrange. The tail is counted rather than dropped,
+/// so "there are more, and this is not all of them" is never implied away.
+const WINDOW_LIST_LIMIT: usize = 20;
+
+/// What a `list_windows` result found, for the prompt.
+///
+/// A window list is the one result whose whole payload is the list, and
+/// [`render_step`] flattens a step to one 120-character line: the titles are
+/// what the model needs in order to name a window to `activate_window`,
+/// `move_window`, `resize_window`, `minimize_window` or `close_window`, and a
+/// summary of "Found 3 windows" names none of them.
+///
+/// There are two shapes, because the platforms differ. macOS returns typed
+/// [`WindowInfo`]s in `data`, so the state (minimised/maximised) is readable
+/// and worth printing. Linux and Windows return the desktop tool's own text in
+/// the *message* — `"Windows:\n<wmctrl or EnumWindows output>"` — which
+/// `summary_of` would cut off mid-line, so the lines are carried through
+/// instead. Anything else renders nothing and the step's message stands.
+fn window_list_note(record: &StepRecord) -> Option<String> {
+    if !matches!(record.action, DesktopAction::ListWindows) {
+        return None;
+    }
+    if let Some(windows) = record
+        .result
+        .data
+        .as_ref()
+        .and_then(|d| d.get("windows"))
+        .and_then(|w| w.as_array())
+    {
+        return Some(typed_window_list(windows));
+    }
+
+    // Text platforms. `Windows:` is the prefix both the x11 and the PowerShell
+    // tool put in front of their output; the count-bearing macOS message never
+    // matches it, so a macOS result without `data` still falls through to the
+    // one-line summary rather than printing "Found 3 windows" twice.
+    let body = record
+        .result
+        .message
+        .strip_prefix("Windows:")?
+        .trim_start_matches(['\n', '\r']);
+    let lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Some("     the desktop reported no windows\n".to_string());
+    }
+    let mut note = String::from("     named windows:\n");
+    for line in lines.iter().take(WINDOW_LIST_LIMIT) {
+        note.push_str(&format!("     - {line}\n"));
+    }
+    if lines.len() > WINDOW_LIST_LIMIT {
+        note.push_str(&format!("     … and {} more\n", lines.len() - WINDOW_LIST_LIMIT));
+    }
+    Some(note)
+}
+
+/// Render typed window records, the shape macOS produces.
+fn typed_window_list(windows: &[serde_json::Value]) -> String {
+    if windows.is_empty() {
+        return "     the desktop reported no windows\n".to_string();
+    }
+    let mut note = String::new();
+    for window in windows.iter().take(WINDOW_LIST_LIMIT) {
+        let title = window.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let app = window.get("app_name").and_then(|v| v.as_str());
+        // State matters as much as the name: a minimised window is in neither
+        // the tree nor the screenshot, so "which one do I restore" is only
+        // answerable from this flag.
+        let state = if window.get("minimized").and_then(|v| v.as_bool()) == Some(true) {
+            " [minimised]"
+        } else if window.get("maximized").and_then(|v| v.as_bool()) == Some(true) {
+            " [maximised]"
+        } else {
+            ""
+        };
+        match app.filter(|a| !a.is_empty()) {
+            Some(app) => note.push_str(&format!("     - {app}: {title}{state}\n")),
+            None => note.push_str(&format!("     - {title}{state}\n")),
+        }
+    }
+    if windows.len() > WINDOW_LIST_LIMIT {
+        note.push_str(&format!("     … and {} more\n", windows.len() - WINDOW_LIST_LIMIT));
+    }
+    note
 }
 
 /// A short human-readable form of an action, for the history lines.
@@ -1773,6 +1879,218 @@ mod tests {
         assert!(!user.contains("used its image allowance"), "{user}");
     }
 
+    /// A window list is only useful if the titles survive into the prompt.
+    ///
+    /// `list_windows` is the step that answers "what can I arrange?": every
+    /// window action takes a title pattern, and the result's *message* is a
+    /// count. The titles live in `data`, which `render_step`'s one 120-char
+    /// line never sees — so before this, the model was told "Found 3 windows"
+    /// and had nothing to name.
+    #[test]
+    fn a_window_list_reaches_the_prompt_with_its_titles() {
+        let mut s = state();
+        s.step = 1;
+        let mut result = ActionResult::success("Found 2 windows".to_string());
+        result.data = Some(serde_json::json!({
+            "windows": [
+                {
+                    "id": "101",
+                    "title": "Notes — Shopping",
+                    "app_name": "Notes",
+                    "pid": 101,
+                    "bounds": null,
+                    "minimized": true,
+                    "maximized": false,
+                    "focused": false
+                },
+                {
+                    "id": "202",
+                    "title": "Calculator",
+                    "app_name": "Calculator",
+                    "pid": 202,
+                    "bounds": null,
+                    "minimized": false,
+                    "maximized": false,
+                    "focused": true
+                }
+            ]
+        }));
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::ListWindows,
+            result,
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+
+        assert!(user.contains("Notes — Shopping"), "the title must survive: {user}");
+        assert!(user.contains("Calculator"), "every window, not just the first: {user}");
+        // The count alone is exactly what the model already got, and it names
+        // nothing it can pass to `activate_window`.
+        assert!(user.contains("Notes: Notes — Shopping"), "app and title together: {user}");
+        // "Hidden in the Dock" and "behind the front window" are the same
+        // observation everywhere else — the tree folds it and the screenshot
+        // cannot see it — so the flag is the only place this is readable.
+        assert!(user.contains("[minimised]"), "a minimised window must say so: {user}");
+    }
+
+    /// Only `list_windows` gets the expansion.
+    ///
+    /// Any other action whose `data` happens to hold a `windows` key would be
+    /// rendered twice — once in its message and once here — and the second
+    /// copy would be indistinguishable from a list the model did not ask for.
+    #[test]
+    fn another_actions_data_is_not_rendered_as_a_window_list() {
+        let mut s = state();
+        s.step = 1;
+        let mut result = ActionResult::success("clicked".to_string());
+        result.data = Some(serde_json::json!({ "windows": [{ "title": "not a list" }] }));
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::Click {
+                target: ClickTarget::Coordinate(Point::new(1, 2)),
+                button: MouseButton::Left,
+            },
+            result,
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+        assert!(!user.contains("not a list"), "{user}");
+    }
+
+    /// An empty list is stated rather than silently omitted.
+    ///
+    /// "The desktop reported no windows" is a fact the model can act on (it
+    /// may need to launch the app first); a missing line reads as a step that
+    /// said nothing, which invites a retry.
+    #[test]
+    fn an_empty_window_list_says_it_is_empty() {
+        let mut s = state();
+        s.step = 1;
+        let mut result = ActionResult::success("Found 0 windows".to_string());
+        result.data = Some(serde_json::json!({ "windows": [] }));
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::ListWindows,
+            result,
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+        assert!(user.contains("reported no windows"), "{user}");
+    }
+
+    /// Linux and Windows answer `list_windows` with text, not typed records.
+    ///
+    /// Their titles arrive in the step's *message* (`"Windows:\n<wmctrl -l>"`,
+    /// or the PowerShell `EnumAll` output), and a message goes through
+    /// `summary_of`, which cuts at 120 characters. The fixture below is longer
+    /// than that on purpose: the title it asserts on sits past the cut, so the
+    /// test fails on the old one-line-only rendering instead of passing because
+    /// a short list happened to fit.
+    #[test]
+    fn a_text_window_list_reaches_the_prompt_with_its_lines() {
+        let mut s = state();
+        s.step = 1;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::ListWindows,
+            result: ActionResult::success(
+                "Windows:\n0x03a00007  0 terminal  Terminal — zsh\n\
+                 0x03c00003  0 notes  Notes — Shopping list for Saturday\n\
+                 0x03d00001  0 calc  Calculator\n\
+                 0x03e00009  0 safari  Safari — Release notes\n",
+            ),
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+        // Past the 120-character cut: this is the assertion that fails on the
+        // old rendering, where the whole list became one truncated line.
+        assert!(user.contains("Release notes"), "the last title must survive: {user}");
+        assert!(user.contains("Calculator"), "{user}");
+        assert!(user.contains("named windows"), "the lines must be carried as a list: {user}");
+    }
+
+    /// A macOS result without typed `data` falls back to its one-line summary.
+    ///
+    /// The `"Windows:"` prefix is the text platforms' marker. macOS says
+    /// "Found 3 windows"; matching that as a list would print the count twice
+    /// and imply a list that was not there.
+    #[test]
+    fn a_count_is_not_mistaken_for_a_window_list() {
+        let mut s = state();
+        s.step = 1;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::ListWindows,
+            result: ActionResult::success("Found 3 windows".to_string()),
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+        assert!(user.contains("Found 3 windows"), "{user}");
+        assert!(!user.contains("named windows"), "no list was present to name: {user}");
+    }
+
+    /// A very long list is truncated with a count, never silently.
+    ///
+    /// Dropping the tail without saying so would let the model conclude the
+    /// window it wants is not on screen, which is a different fact.
+    #[test]
+    fn a_long_window_list_says_how_many_were_left_out() {
+        let windows: Vec<serde_json::Value> = (0..25)
+            .map(|i| serde_json::json!({ "id": i.to_string(), "title": format!("w{i}") }))
+            .collect();
+        let mut result = ActionResult::success("Found 25 windows".to_string());
+        result.data = Some(serde_json::json!({ "windows": windows }));
+        let mut s = state();
+        s.step = 1;
+        s.history = vec![StepRecord {
+            step: 0,
+            action: DesktopAction::ListWindows,
+            result,
+            verification: StepVerification::Verified,
+            screenshot_before: None,
+            screenshot_after: None,
+            snapshots_taken: 0,
+            sensitive: false,
+            aim_missed: None,
+        }];
+
+        let (_system, user) = driver().render_prompt(&s, &ctx(false));
+        assert!(user.contains("and 5 more"), "the omitted tail must be counted: {user}");
+        assert!(user.contains("w0"), "{user}");
+        assert!(!user.contains("w24"), "past the limit: {user}");
+    }
+
     #[test]
     fn the_history_is_rendered_as_one_line_per_step() {
         let mut s = state();
@@ -2205,6 +2523,26 @@ mod tests {
         assert!(
             DRIVER_SYSTEM_PROMPT.contains("overshoots"),
             "the prompt must say why one long drag fails"
+        );
+    }
+
+    /// The prompt must say where a `title_pattern` comes from.
+    ///
+    /// Every window action names a window by a substring of its title, and the
+    /// only place those titles are ever printed is the `list_windows` step. A
+    /// model told to `move_window` by `title_pattern` but never told where to
+    /// find one guesses, and the guessed title matches nothing — which reads
+    /// as "the window does not exist" rather than "I never asked for its name".
+    #[test]
+    fn the_prompt_says_where_a_window_title_comes_from() {
+        assert!(
+            DRIVER_SYSTEM_PROMPT.contains("list_windows"),
+            "the prompt must point at the step that names windows"
+        );
+        assert!(
+            DRIVER_SYSTEM_PROMPT.contains("minimised")
+                || DRIVER_SYSTEM_PROMPT.contains("minimized"),
+            "the prompt must explain the [minimised] marker it will be shown"
         );
     }
 

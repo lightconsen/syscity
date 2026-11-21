@@ -13,6 +13,25 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **`list_windows` now names the windows it found.** Every window action —
+  `activate_window`, `close_window`, `move_window`, `resize_window`,
+  `minimize_window`, `maximize_window`, `get_window_geometry` — names its
+  target by a substring of the window title, and `list_windows` was the only
+  step that ever produced those titles. It did not deliver them: macOS put
+  them in `data.windows` while `render_step` flattened a step to one line and
+  `summary_of` cut it at 120 characters, so the model read "Found 3 windows";
+  Linux and Windows put them in the step's *message*, which was cut at the same
+  120 characters, losing every title past the first window. Either way the
+  model could emit `move_window` and had no string to put in `title_pattern`.
+  A `list_windows` step now prints its payload: typed records on macOS (with
+  `[minimised]` / `[maximised]`, the only place a Dock-hidden window is
+  distinguishable from one behind the front window) and the `Windows:` text on
+  Linux and Windows. Twenty entries, with the omitted tail counted rather than
+  dropped — "there are 5 more" is not the same fact as "that is all". The
+  prompt now says to copy a title from that list instead of guessing at one.
+  The text path's test fixture is deliberately longer than the 120-character
+  cut and was mutation-tested: with the list rendering disabled it fails,
+  which a shorter fixture did not.
 - **A step past the image allowance says the picture is gone.** A tree-less
   screen attaches a picture on every step — `plan_perception` attaches whenever
   the tree is incomplete — so the default allowance of 15 images runs out long
