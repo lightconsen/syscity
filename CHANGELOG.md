@@ -180,6 +180,16 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Changed
 
+- **A drag still cannot be watched in progress, and the docs no longer imply
+  it can.** The perception plan listed a slider, a scrollbar and a marquee as
+  "`drag` plus a look while dragging"; there is no look while dragging, in the
+  protocol (`Drag { from, to }` has no press/move/release decomposition) or in
+  any platform (each drag is one script from `leftMouseDown` to `leftMouseUp`,
+  and the release guard that keeps the button from being stranded is exactly
+  what a mid-gesture exit would defeat). The prompt's substitute — drag
+  roughly, look where the thumb landed, drag again by the remainder — is what
+  a person does, and `docs/computer-use.md` §6.2 now records that instead of
+  implying a mid-drag re-look exists.
 - **A tree-less screen keeps its picture.** The tree is an index there, not an
   answer: the screenshot used to be withdrawn whenever the scan succeeded,
   which left the model holding less than the screen contains and no way to ask
