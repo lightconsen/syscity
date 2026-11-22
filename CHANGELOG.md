@@ -11,6 +11,8 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-11-22
+
 ### Added
 
 - **A tree-less screen can now tell an append from a replacement.** The
