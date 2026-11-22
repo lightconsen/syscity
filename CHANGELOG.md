@@ -11,6 +11,16 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **wasmtime 50.0.3** (from 50.0.2), for RUSTSEC-2026-0587
+  (GHSA-f2pq-268w-886c): a WASI filesystem sandbox escape on Windows through a
+  drive-prefixed path component, reachable from a plugin the gateway hosts.
+  The advisory was published on 2026-11-19 — after v0.3.21 was cut — so the tag
+  built a green tree and the Security Audit job went red on the next push
+  without a single line changing. `deny.toml`'s duplicate-tree skip named
+  `wasmtime@50.0.2` and would have stopped matching, so it names 50.0.3 now.
+
 ## [0.3.21] - 2026-11-22
 
 ### Added
