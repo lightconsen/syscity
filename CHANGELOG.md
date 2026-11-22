@@ -15,11 +15,15 @@ if no section matches, the release falls back to auto-generated notes.
 
 - **wasmtime 50.0.3** (from 50.0.2), for RUSTSEC-2026-0587
   (GHSA-f2pq-268w-886c): a WASI filesystem sandbox escape on Windows through a
-  drive-prefixed path component, reachable from a plugin the gateway hosts.
-  The advisory was published on 2026-11-19 — after v0.3.21 was cut — so the tag
-  built a green tree and the Security Audit job went red on the next push
-  without a single line changing. `deny.toml`'s duplicate-tree skip named
-  `wasmtime@50.0.2` and would have stopped matching, so it names 50.0.3 now.
+  drive-prefixed path component. RustSec published it on 2026-11-19 and the
+  Security Audit job has been red since 2026-11-20 15:43 UTC — six commits
+  before this tag — with no line of ours changing, which is why v0.3.21 itself
+  built a failing tree. The WASI contexts this build creates preopen no
+  directories at all (`inherit_stdio` and nothing else), and the advisory is
+  Windows-only, so the sandbox it escapes had nothing in it here; the version
+  still moves, because `cargo audit` fails the gate on the class, not the
+  reachability. `deny.toml`'s duplicate-tree skip named `wasmtime@50.0.2` and
+  would have silently stopped matching: it names 50.0.3 now.
 
 ## [0.3.21] - 2026-11-22
 
