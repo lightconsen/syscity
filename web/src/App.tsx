@@ -333,12 +333,25 @@ function ChatShell() {
 
   // Check whether an LLM is configured. When no models exist, show the
   // first-launch Welcome screen so the user can add their initial model.
+  //
+  // `listModels` is a WS round trip with a 5s budget and the startup gate waits
+  // on this, so a timeout used to leave `needsSetup` at `null` — i.e. on
+  // StartingScreen — forever. The gateway could be healthy and model-steered
+  // the whole time; the only symptom was "Still connecting". Nothing retried it
+  // either: the reconnect hook fires only on a status *change*, and the 8s
+  // poll below refreshes sessions and agents. So a single slow answer parked
+  // the app before its first render. Retry until it resolves.
   const checkModelConfig = useCallback(async () => {
-    try {
-      const { models } = await transport.listModels();
-      setNeedsSetup(models.length === 0);
-    } catch {
-      /* keep needsSetup as-is; retried on next connect */
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const { models } = await transport.listModels();
+        setNeedsSetup(models.length === 0);
+        return;
+      } catch {
+        // Not connected yet, or the request lost the race with the handshake —
+        // back off and try again rather than leaving the gate unset.
+      }
+      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
     }
   }, [transport]);
 

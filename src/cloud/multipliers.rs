@@ -43,12 +43,39 @@ type CacheSlot = Option<(Instant, Arc<CloudModelTable>)>;
 
 static CACHE: LazyLock<RwLock<CacheSlot>> = LazyLock::new(|| RwLock::new(None));
 
+/// The cached cloud catalog as it stands right now, with no network I/O.
+///
+/// This exists because [`fetch_cloud_models`] blocks on a cloud round trip.
+/// `models.list` is on the app's cold-start path — the UI renders nothing but a
+/// spinner until it answers — while the cloud client's own bound is 10s
+/// (`CloudClient::new`), larger than the 5s the web client waits. So a slow or
+/// unreachable cloud used to hold the startup gate open, and the request timed
+/// out client-side before the reply could arrive: the app sat on "Starting
+/// syscity" with the gateway healthy the whole time.
+///
+/// Startup callers read this instead and refresh in the background.
+pub async fn cached_cloud_models() -> Option<Arc<CloudModelTable>> {
+    CACHE.read().await.as_ref().map(|(_, t)| t.clone())
+}
+
+/// Whether the cache holds nothing fresh enough to skip a refresh.
+pub async fn cloud_catalog_is_stale() -> bool {
+    CACHE
+        .read()
+        .await
+        .as_ref()
+        .is_none_or(|(fetched_at, _)| fetched_at.elapsed() >= TTL)
+}
+
 /// The cached cloud catalog, refreshed from cloud `/v1/models` when the TTL
 /// has expired. `None` when there is no data (not logged in, or the first
 /// fetch failed) — callers fall back to their static seed.
 ///
 /// Failures never error out: a stale table keeps serving past its TTL so a
 /// transient cloud outage doesn't blank the UI.
+///
+/// **Blocks on the network.** Do not call this from a path the UI is waiting
+/// on at startup — use [`cached_cloud_models`] there and refresh off-path.
 pub async fn fetch_cloud_models(
     cfg: &CloudConfig,
     secrets: &Arc<SecretStoreHandle>,
@@ -189,6 +216,39 @@ mod tests {
             assert!(table.ids.is_empty());
             assert!(table.multipliers.is_empty());
         }
+    }
+
+    /// The startup path must answer from the cache and never wait on the
+    /// network. A stale table is still served — that is the whole point: the
+    /// app renders model setup from what it already knows and refreshes behind
+    /// the scenes, instead of blocking the first frame on a WAN round trip.
+    #[tokio::test]
+    async fn cached_read_serves_stale_and_reports_staleness() {
+        let model = |ids: &[&str]| {
+            Arc::new(CloudModelTable {
+                ids: ids.iter().map(|s| s.to_string()).collect(),
+                multipliers: Arc::new(HashMap::new()),
+            })
+        };
+
+        *CACHE.write().await = None;
+        assert!(cached_cloud_models().await.is_none(), "empty cache holds nothing");
+        assert!(cloud_catalog_is_stale().await, "empty cache wants a refresh");
+
+        *CACHE.write().await = Some((Instant::now(), model(&["cloud/a"])));
+        assert!(!cloud_catalog_is_stale().await, "fresh entry needs no refresh");
+        let fresh = cached_cloud_models().await.expect("fresh entry served");
+        assert_eq!(fresh.ids, vec!["cloud/a".to_string()]);
+
+        // Expired by more than the TTL: still served, but flagged stale.
+        *CACHE.write().await = Some((Instant::now() - TTL * 2, model(&["cloud/b"])));
+        let stale = cached_cloud_models()
+            .await
+            .expect("stale entry still served");
+        assert_eq!(stale.ids, vec!["cloud/b".to_string()]);
+        assert!(cloud_catalog_is_stale().await, "expired entry wants a refresh");
+
+        *CACHE.write().await = None;
     }
 }
 

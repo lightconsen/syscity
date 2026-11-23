@@ -45,28 +45,45 @@ pub(super) async fn handle_models_list(req: &WsRequest, state: &Arc<GatewayState
     #[cfg(not(feature = "cloud"))]
     let logged_in = false;
 
-    // Refresh the cloud provider's model list from cloud `/v1/models` (TTL
-    // cached) before listing, so the picker reflects the proxy's live catalog
-    // instead of the static seed. The same fetch yields the billing
-    // multipliers; failures keep the previous list and never fail the listing.
+    // Use the cloud provider's model list so the picker reflects the proxy's
+    // live catalog instead of the static seed, and annotate the billing
+    // multipliers. This used to call `fetch_cloud_models` inline, which blocks
+    // on a cloud round trip bounded at 10s — longer than the 5s the web client
+    // waits for `models.list`. On a slow or unreachable cloud every startup
+    // listing therefore timed out client-side, `needsSetup` never resolved, and
+    // the app sat on the startup screen with the gateway healthy. Serve
+    // whatever is cached and refresh off the request path.
     #[cfg(feature = "cloud")]
     let cloud_table = if logged_in {
         let cloud_cfg = { state.config.read().await.cloud.clone() };
         if cloud_cfg.enabled {
-            let table =
-                crate::cloud::multipliers::fetch_cloud_models(&cloud_cfg, &state.secrets).await;
-            if let Some(ref t) = table {
-                if let Err(e) = crate::cloud::provider::apply_discovered_models(
-                    &state.infra.model_router,
-                    &cloud_cfg,
-                    &t.ids,
-                )
-                .await
-                {
-                    warn!("Failed to apply cloud model list: {e}");
-                }
+            let cached = crate::cloud::multipliers::cached_cloud_models().await;
+            if crate::cloud::multipliers::cloud_catalog_is_stale().await {
+                let bg_state = state.clone();
+                let cfg = cloud_cfg.clone();
+                let handle = tokio::spawn(async move {
+                    let Some(table) =
+                        crate::cloud::multipliers::fetch_cloud_models(&cfg, &bg_state.secrets)
+                            .await
+                    else {
+                        return;
+                    };
+                    if let Err(e) = crate::cloud::provider::apply_discovered_models(
+                        &bg_state.infra.model_router,
+                        &cfg,
+                        &table.ids,
+                    )
+                    .await
+                    {
+                        warn!("Failed to apply cloud model list: {e}");
+                    }
+                });
+                state
+                    .task_registry
+                    .insert_join("cloud:models_refresh", handle)
+                    .await;
             }
-            table
+            cached
         } else {
             None
         }
@@ -769,6 +786,94 @@ mod tests {
             .and_then(|p| p["default_model"].as_str())
             .unwrap_or_default();
         assert_eq!(default, crate::providers::DEFAULT_MODEL);
+    }
+
+    /// Regression: `models.list` must not wait on the cloud round trip.
+    ///
+    /// A signed-in user with cloud enabled used to have every startup listing
+    /// block on `fetch_cloud_models`, bounded at 10s by `CloudClient`, while the
+    /// web client waits only 5s for the reply. The request therefore timed out,
+    /// `needsSetup` stayed `null`, and the app sat on its startup screen with
+    /// the gateway healthy. The handler now serves the cached catalog and
+    /// refreshes off-path, so the only thing that can make it slow is the
+    /// refresh task it does not wait for.
+    ///
+    /// The black-hole listener below matters: a closed port refuses instantly
+    /// and would let a blocking implementation pass. One that accepts and then
+    /// never replies pins any inline fetch for the client's full 10s bound.
+    #[cfg(feature = "cloud")]
+    #[tokio::test]
+    async fn models_list_does_not_wait_on_the_cloud_round_trip() {
+        // reqwest honours the proxy env, and the operator's shell has one set
+        // here: the fetch would be tunneled and never reach the listener
+        // below, so the assertion would pass without exercising anything.
+        // Nothing in CI sets these; fail loudly rather than skip.
+        for var in [
+            "http_proxy",
+            "https_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} is set, so the request is proxied and this test proves nothing; \
+                 unset the proxy env for the test run"
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind black-hole listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let blockhole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // accept, then never write a byte back
+            }
+        });
+
+        let mut config = GatewayConfig::default();
+        config.cloud = crate::cloud::config::CloudConfig {
+            enabled: true,
+            api_base: format!("http://{addr}/v1"),
+            ..crate::cloud::config::CloudConfig::default()
+        };
+        let state = Arc::new(make_test_state(config).await);
+        register_provider(&state, "openai", &["gpt-4o-mini"]).await;
+        crate::cloud::session::set_token(&state.secrets, "test-session-token")
+            .await
+            .expect("store session token");
+        assert!(
+            crate::cloud::session::logged_in(&state.secrets).await,
+            "the slow path only engages when signed in"
+        );
+
+        let started = std::time::Instant::now();
+        let res = handle_models_list(&req("l", "models.list", serde_json::json!({})), &state).await;
+        let elapsed = started.elapsed();
+
+        assert!(res.ok);
+        // The web client's budget is 5s; anything near the cloud client's 10s
+        // bound means the fetch is still inline.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "models.list took {elapsed:?}; it is waiting on the cloud again"
+        );
+        // The local provider is still listed even though the cloud catalog is
+        // empty on a cold cache — the listing degrades, it does not fail.
+        let models = res
+            .payload
+            .as_ref()
+            .and_then(|p| p["models"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(models.iter().any(|m| m["id"] == "gpt-4o-mini"));
+
+        crate::cloud::session::clear_token(&state.secrets)
+            .await
+            .expect("clear session token");
+        blockhole.abort();
     }
 
     #[tokio::test]
