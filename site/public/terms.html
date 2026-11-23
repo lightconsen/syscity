@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="index,follow" />
+    <title>Terms of Service — Syscity</title>
+    <meta
+      name="description"
+      content="Terms for using syscity.net and the Syscity open-source software."
+    />
+    <link rel="canonical" href="https://www.syscity.net/terms.html" />
+    <link rel="icon" href="./favicon.ico" sizes="32x32" />
+    <link rel="icon" type="image/png" href="./favicon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" sizes="180x180" />
+    <!-- Shared look with the landing page, inlined: these pages are opened
+         rarely and should not pay a round trip for a stylesheet. -->
+    <style>
+      :root {
+        --ink: #191a23; --muted: #5a5a66; --faint: #6f6f80;
+        --line: #e8e8ee; --alt: #f8f9fa; --brand: #b22ac2;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: #fff; color: var(--ink);
+        font-family: var(--sans); -webkit-font-smoothing: antialiased;
+        line-height: 1.65;
+      }
+      header { border-bottom: 1px solid var(--line); }
+      .bar {
+        max-width: 760px; margin: 0 auto; padding: 16px 24px;
+        display: flex; align-items: center; justify-content: space-between;
+      }
+      .bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+      .bar a:hover { color: var(--ink); }
+      .brand { font-weight: 700; color: var(--ink) !important; font-size: 15px; }
+      main { max-width: 760px; margin: 0 auto; padding: 48px 24px 72px; }
+      h1 { font-size: 2rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 8px; }
+      h2 { font-size: 1.25rem; margin: 2.2em 0 0.6em; letter-spacing: -0.01em; }
+      h3 { font-size: 1rem; margin: 1.6em 0 0.4em; }
+      p, li { color: var(--muted); }
+      strong { color: var(--ink); }
+      .updated { color: var(--faint); font-size: 14px; margin: 0 0 2em; }
+      ul { padding-left: 1.25em; }
+      li { margin: 0.35em 0; }
+      a { color: var(--brand); }
+      .note {
+        background: var(--alt); border: 1px solid var(--line);
+        border-radius: 10px; padding: 16px 20px; margin: 1.5em 0;
+      }
+      .note p:first-child { margin-top: 0; }
+      .note p:last-child { margin-bottom: 0; }
+      hr { border: 0; border-top: 1px solid var(--line); margin: 3em 0; }
+      footer {
+        border-top: 1px solid var(--line); background: var(--alt);
+      }
+      .foot {
+        max-width: 760px; margin: 0 auto; padding: 24px;
+        display: flex; flex-wrap: wrap; gap: 8px 20px;
+        font-size: 13px; color: var(--faint);
+      }
+      .foot a { color: var(--faint); text-decoration: none; }
+      .foot a:hover { color: var(--ink); }
+      @media (prefers-color-scheme: dark) {
+        /* Deliberately not themed: the site is light-first, and a half-themed
+           legal page looks broken. Kept light on purpose. */
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="bar">
+        <a class="brand" href="./">Syscity</a>
+        <a href="./">← Back to syscity.net</a>
+      </div>
+    </header>
+
+    <main>
+      <h1>Terms of Service</h1>
+      <p class="updated">Last updated: 23 November 2026</p>
+
+      <div class="note">
+        <p>
+          <strong>The short version.</strong> The Syscity software is open
+          source under the Apache-2.0 licence and comes with no warranty. This
+          website is provided as-is. You are responsible for how you use the
+          agent, including any account, service or machine you point it at.
+        </p>
+      </div>
+
+      <h2>1. Who these terms cover</h2>
+      <p>
+        These terms apply to your use of <strong>syscity.net</strong> and the
+        binaries, installers and source code we distribute to you. By using
+        the site or the software you accept them. If you do not accept them,
+        do not use the site or the software.
+      </p>
+      <p>
+        “We” and “us” mean the Syscity project maintainers. “You” means the
+        person or organisation using the site or the software.
+      </p>
+
+      <h2>2. The software licence</h2>
+      <p>
+        The Syscity software is licensed under the
+        <a href="https://github.com/lightconsen/syscity/blob/main/LICENSE"
+           target="_blank" rel="noreferrer">Apache License 2.0</a>. That licence
+        governs your rights to use, modify and redistribute the code, and it
+        takes precedence over anything in these terms that concerns the code
+        itself. In short:
+      </p>
+      <ul>
+        <li>you may use, modify and redistribute it, including commercially;</li>
+        <li>you must keep the copyright and licence notices; and</li>
+        <li>
+          it is provided <strong>without warranties or conditions of any
+          kind</strong>, and the authors are not liable for damages arising
+          from its use.
+        </li>
+      </ul>
+
+      <h2>3. What the agent does on your machine</h2>
+      <p>
+        Syscity is an agent runtime. Configured with a model provider, it can
+        control your desktop: click, type, read the screen, run shell commands,
+        run code, and read or write files. It acts with the permissions of the
+        account you run it under. That is the point of the product, and it is
+        also the main risk you accept by using it.
+      </p>
+      <ul>
+        <li>
+          <strong>Review what you grant.</strong> Any capability you enable —
+          desktop control, shell, browser automation, connected channels — can
+          be used by the model you connect. Grant only what you need.
+        </li>
+        <li>
+          <strong>Keep backups.</strong> An agent can delete or overwrite
+          files. Keep backups of anything you cannot lose.
+        </li>
+        <li>
+          <strong>Separate your secrets.</strong> Do not run the agent with
+          credentials you would not want an automated process to use.
+        </li>
+      </ul>
+      <p>
+        We are not responsible for actions the software takes on your machine,
+        for data it sends to endpoints you configured, or for the consequences
+        of a model's output.
+      </p>
+
+      <h2>4. Third-party services</h2>
+      <p>
+        Syscity connects to services you choose — model providers, chat
+        platforms, MCP servers, and optionally Syscity Cloud. Your use of each
+        is governed by that provider's own terms and pricing. We do not control
+        them and are not responsible for their availability, output or
+        handling of your data.
+      </p>
+
+      <h2>5. Acceptable use</h2>
+      <p>You agree not to use the site or the software to:</p>
+      <ul>
+        <li>break any law that applies to you;</li>
+        <li>
+          access systems or data you are not authorised to access, or operate
+          the agent against someone else's machine without their permission;
+        </li>
+        <li>
+          distribute malware, or build something whose purpose is to harm
+          others; or
+        </li>
+        <li>interfere with this site's operation or security.</li>
+      </ul>
+
+      <h2>6. The website</h2>
+      <p>
+        The site is provided as-is and may change or go offline without notice.
+        Downloads are offered in good faith; verify what you download against
+        the checksums and signatures published with each release.
+      </p>
+
+      <h2>7. No warranty</h2>
+      <p>
+        To the fullest extent permitted by law, the site and the software are
+        provided <strong>“as is” and “as available”</strong>, without warranty
+        of any kind, express or implied, including merchantability, fitness for
+        a particular purpose and non-infringement.
+      </p>
+
+      <h2>8. Limitation of liability</h2>
+      <p>
+        To the fullest extent permitted by law, we are not liable for any
+        indirect, incidental, special, consequential or punitive damages, or
+        for lost profits, data or goodwill, arising from your use of the site
+        or the software. Where liability cannot be excluded, it is limited to
+        the amount you paid us for the software, which for the open-source
+        distribution is zero.
+      </p>
+
+      <h2>9. Changes</h2>
+      <p>
+        We may update these terms. The “last updated” date above changes when we
+        do, and continued use after a change means you accept the new version.
+      </p>
+
+      <h2>10. Contact</h2>
+      <p>
+        Questions about these terms:
+        <a href="mailto:legal@example.com">legal@example.com</a>
+        <em>(address pending — replace before publishing)</em>.
+      </p>
+
+      <hr />
+      <p class="updated">
+        中文摘要：Syscity 软件以 Apache-2.0 许可开源，按“现状”提供，不附带任何担保。
+        它是一个智能体运行时，能以你的账号权限操作桌面、执行命令和读写文件，因此请只授予
+        必要的能力、做好备份，并妥善隔离密钥。你配置的第三方服务受其各自条款约束。禁止将
+        其用于违法用途或未经授权访问他人系统。
+      </p>
+    </main>
+
+    <footer>
+      <div class="foot">
+        <span>© 2026 Syscity</span>
+        <a href="./privacy.html">Privacy</a>
+        <a href="./terms.html">Terms</a>
+        <a href="https://github.com/lightconsen/syscity" target="_blank" rel="noreferrer">GitHub</a>
+        <span>Apache-2.0 Licensed · Open Source</span>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -38,6 +38,10 @@ jobs:
 
       - name: Build site
         working-directory: site
+        env:
+          # Repository *variable* (not a secret): the Cloudflare Web Analytics
+          # beacon token. Unset means postbuild.mjs omits the beacon entirely.
+          CFA_ANALYTICS_TOKEN: ${{ vars.CFA_ANALYTICS_TOKEN }}
         run: |
           pnpm install --frozen-lockfile
           pnpm build

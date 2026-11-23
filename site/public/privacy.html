@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="index,follow" />
+    <title>Privacy Policy — Syscity</title>
+    <meta
+      name="description"
+      content="How syscity.net handles data: a static marketing site with no accounts, no tracking cookies, and cookieless analytics."
+    />
+    <link rel="canonical" href="https://www.syscity.net/privacy.html" />
+    <link rel="icon" href="./favicon.ico" sizes="32x32" />
+    <link rel="icon" type="image/png" href="./favicon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" sizes="180x180" />
+    <!-- Shared look with the landing page, inlined: these pages are opened
+         rarely and should not pay a round trip for a stylesheet. -->
+    <style>
+      :root {
+        --ink: #191a23; --muted: #5a5a66; --faint: #6f6f80;
+        --line: #e8e8ee; --alt: #f8f9fa; --brand: #b22ac2;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: #fff; color: var(--ink);
+        font-family: var(--sans); -webkit-font-smoothing: antialiased;
+        line-height: 1.65;
+      }
+      header { border-bottom: 1px solid var(--line); }
+      .bar {
+        max-width: 760px; margin: 0 auto; padding: 16px 24px;
+        display: flex; align-items: center; justify-content: space-between;
+      }
+      .bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+      .bar a:hover { color: var(--ink); }
+      .brand { font-weight: 700; color: var(--ink) !important; font-size: 15px; }
+      main { max-width: 760px; margin: 0 auto; padding: 48px 24px 72px; }
+      h1 { font-size: 2rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 8px; }
+      h2 { font-size: 1.25rem; margin: 2.2em 0 0.6em; letter-spacing: -0.01em; }
+      h3 { font-size: 1rem; margin: 1.6em 0 0.4em; }
+      p, li { color: var(--muted); }
+      strong { color: var(--ink); }
+      .updated { color: var(--faint); font-size: 14px; margin: 0 0 2em; }
+      ul { padding-left: 1.25em; }
+      li { margin: 0.35em 0; }
+      a { color: var(--brand); }
+      .note {
+        background: var(--alt); border: 1px solid var(--line);
+        border-radius: 10px; padding: 16px 20px; margin: 1.5em 0;
+      }
+      .note p:first-child { margin-top: 0; }
+      .note p:last-child { margin-bottom: 0; }
+      hr { border: 0; border-top: 1px solid var(--line); margin: 3em 0; }
+      footer {
+        border-top: 1px solid var(--line); background: var(--alt);
+      }
+      .foot {
+        max-width: 760px; margin: 0 auto; padding: 24px;
+        display: flex; flex-wrap: wrap; gap: 8px 20px;
+        font-size: 13px; color: var(--faint);
+      }
+      .foot a { color: var(--faint); text-decoration: none; }
+      .foot a:hover { color: var(--ink); }
+      @media (prefers-color-scheme: dark) {
+        /* Deliberately not themed: the site is light-first, and a half-themed
+           legal page looks broken. Kept light on purpose. */
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="bar">
+        <a class="brand" href="./">Syscity</a>
+        <a href="./">← Back to syscity.net</a>
+      </div>
+    </header>
+
+    <main>
+      <h1>Privacy Policy</h1>
+      <p class="updated">Last updated: 23 November 2026</p>
+
+      <div class="note">
+        <p>
+          <strong>The short version.</strong> syscity.net is a static marketing
+          page. It has no accounts, no sign-in, no contact form and no
+          advertising. It sets no tracking cookies. The software you download
+          runs on your own machine and does not report to us.
+        </p>
+      </div>
+
+      <p>
+        This policy covers <strong>syscity.net</strong> (this website) and the
+        download links it serves. It does not cover third-party sites we link
+        to, and it does not replace the terms of any model provider, chat
+        platform or cloud service you choose to connect to your own Syscity
+        installation.
+      </p>
+
+      <h2>1. What this website collects</h2>
+
+      <h3>Nothing that identifies you, directly</h3>
+      <p>
+        There is no account system, no comment form, no newsletter and no
+        checkout on this site. We do not ask for a name, an email address or a
+        payment detail, so we do not hold any.
+      </p>
+
+      <h3>Aggregate page-view counts</h3>
+      <p>
+        We use <strong>Cloudflare Web Analytics</strong> to count page views.
+        It is cookieless and does not fingerprint visitors: it records the page
+        URL, the referring page, the country (from the network, not from a
+        stored profile), and coarse device/browser information. No identifier
+        is stored in your browser, and the data is aggregated — we cannot pick
+        out an individual visit.
+      </p>
+
+      <h3>Your language preference</h3>
+      <p>
+        If you switch the page to Chinese, the site stores one value in your
+        browser's <code>localStorage</code> under the key
+        <code>syscity-lang</code>, so the choice survives a reload. It never
+        leaves your browser, and clearing site data removes it.
+      </p>
+
+      <h3>Server logs and bot protection</h3>
+      <p>
+        The site is served through Cloudflare, which processes every request in
+        order to deliver it and to filter abusive traffic. To do that it may
+        set a short-lived security cookie (<code>__cf_bm</code>) on automated
+        or suspicious requests, and it keeps standard request logs (IP address,
+        user agent, timestamp) for a limited retention period. We do not
+        combine those logs with anything else and do not use them to profile
+        visitors.
+      </p>
+
+      <h2>2. What the Syscity software does</h2>
+      <p>
+        Syscity is local-first. Installed on your machine, it stores its
+        memory, knowledge base and artifacts on your own disk. It talks to the
+        network only where you configure it to:
+      </p>
+      <ul>
+        <li>
+          <strong>Model providers</strong> you add (for example OpenAI,
+          Anthropic, DeepSeek, or a local Ollama) — those providers receive
+          whatever you send them, under their own policies.
+        </li>
+        <li>
+          <strong>Chat channels and MCP servers</strong> you connect — likewise.
+        </li>
+        <li>
+          <strong>Syscity Cloud</strong>, if you sign in to it for hosted
+          models, search or the marketplace. That service is governed by its
+          own privacy policy, shown in the console.
+        </li>
+        <li>
+          <strong>Update checks</strong>, if enabled, which fetch release
+          metadata from this domain.
+        </li>
+      </ul>
+      <p>
+        The software does not include telemetry that sends your prompts, files
+        or screen contents to us. Anything that leaves your machine goes to an
+        endpoint you chose.
+      </p>
+
+      <h2>3. Cookies</h2>
+      <p>
+        This website sets no cookies of its own. Because of that there is no
+        cookie banner — there is nothing to consent to. The only cookie that
+        can appear is Cloudflare's short-lived bot-management cookie described
+        above, which is strictly necessary for security and is not used for
+        advertising or profiling.
+      </p>
+
+      <h2>4. Downloads</h2>
+      <p>
+        Installer and app downloads are served as static files from this
+        domain. We do not embed per-download identifiers in the files. Your
+        browser or operating system may still record the download locally.
+      </p>
+
+      <h2>5. Links to other sites</h2>
+      <p>
+        The page links to GitHub, Discord, the Apple App Store, Google Play and
+        the Syscity Cloud console. Those sites have their own privacy policies;
+        once you follow a link, this policy no longer applies.
+      </p>
+
+      <h2>6. Children</h2>
+      <p>
+        This site is not directed at children under 13, and we do not knowingly
+        collect personal data from them.
+      </p>
+
+      <h2>7. Your rights</h2>
+      <p>
+        Because we do not hold personal data tied to you, there is usually
+        nothing to access, correct or delete. If you believe we do hold
+        something about you, write to us and we will tell you what we have and
+        remove it on request where we are able to.
+      </p>
+
+      <h2>8. Changes</h2>
+      <p>
+        If this policy changes materially — for example if we ever add accounts
+        or advertising — the “last updated” date above changes and the new
+        policy is posted here before the change takes effect.
+      </p>
+
+      <h2>9. Contact</h2>
+      <p>
+        Privacy questions: <a href="mailto:privacy@example.com">privacy@example.com</a>
+        <em>(address pending — replace before publishing)</em>.
+      </p>
+
+      <hr />
+      <p class="updated">
+        中文摘要：syscity.net 是一个静态介绍页，没有账号、表单、广告，也不写入
+        跟踪 Cookie。页面仅使用不写 Cookie 的 Cloudflare Web Analytics 统计访问量，
+        并在浏览器本地保存你的语言偏好。下载的软件在本机运行，不会把提示词、文件或
+        屏幕内容回传给我们；只有你主动配置的模型服务、聊天渠道或云端会收到相应内容。
+      </p>
+    </main>
+
+    <footer>
+      <div class="foot">
+        <span>© 2026 Syscity</span>
+        <a href="./privacy.html">Privacy</a>
+        <a href="./terms.html">Terms</a>
+        <a href="https://github.com/lightconsen/syscity" target="_blank" rel="noreferrer">GitHub</a>
+        <span>Apache-2.0 Licensed · Open Source</span>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -14,6 +14,7 @@ agents perceive and act on your computer.
 | [Slash Commands](command.md) | `/` commands available in chat, TUI, and channels |
 | [Goal-Based Execution](goal.md) | `/goal` autonomous execution with stop conditions |
 | [Channels Setup](channels.md) | Supported channels, credentials, and webhook configuration |
+| [Marketing Site](site.md) | The `site/` landing page: build, analytics, and the Cloudflare settings it needs |
 
 ## Core concepts
 

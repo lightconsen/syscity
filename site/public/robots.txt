@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+
+# One page, so nothing to keep out of the index. The deploy bakes this file
+# into `dist/`; before it existed Cloudflare's managed robots.txt was the only
+# one served, it is not versioned here, and it carried no `Sitemap:` line.
+Sitemap: https://www.syscity.net/sitemap.xml

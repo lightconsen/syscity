@@ -64,6 +64,24 @@ if (!linkTag.test(html)) {
 }
 html = html.replace(linkTag, `<style>${css}</style>`);
 
+// ── 2b. Analytics beacon ─────────────────────────────────────────────────
+// Cloudflare Web Analytics is cookieless, which is why the site needs no
+// consent banner. The token is a site-specific public identifier, not a
+// secret, but it is still injected from the environment rather than
+// committed: an absent token must mean "no beacon", not "a beacon pointed at
+// nothing". The CI job passes it from a repository variable.
+const CFA_TOKEN = process.env.CFA_ANALYTICS_TOKEN ?? "";
+const BEACON_MARK = "<!--CFA-BEACON-->";
+if (!html.includes(BEACON_MARK)) {
+  throw new Error(`expected ${BEACON_MARK} in ${INDEX}`);
+}
+html = html.replace(
+  BEACON_MARK,
+  CFA_TOKEN
+    ? `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"${CFA_TOKEN}"}'></script>`
+    : "",
+);
+
 // The inlined stylesheet is referenced by nothing now; leaving it would ship
 // the same bytes twice and advertise a file no visitor requests.
 rmSync(join(DIST, "assets", cssFile));
@@ -73,5 +91,6 @@ rmSync(SSR_DIST, { recursive: true, force: true });
 
 const kb = (bytes) => (bytes / 1024).toFixed(1);
 console.log(
-  `prerendered ${kb(appHtml.length)} kB of markup; inlined ${kb(css.length)} kB of CSS`,
+  `prerendered ${kb(appHtml.length)} kB of markup; inlined ${kb(css.length)} kB of CSS; ` +
+    (CFA_TOKEN ? "analytics beacon injected" : "no analytics token, beacon omitted"),
 );

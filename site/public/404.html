@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex" />
+    <title>Page not found — Syscity</title>
+    <meta
+      name="description"
+      content="That page does not exist on syscity.net."
+    />
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="icon" type="image/png" href="/favicon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+    <!-- Shared look with the landing page, inlined: these pages are opened
+         rarely and should not pay a round trip for a stylesheet. -->
+    <style>
+      :root {
+        --ink: #191a23; --muted: #5a5a66; --faint: #6f6f80;
+        --line: #e8e8ee; --alt: #f8f9fa; --brand: #b22ac2;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: #fff; color: var(--ink);
+        font-family: var(--sans); -webkit-font-smoothing: antialiased;
+        line-height: 1.65;
+      }
+      header { border-bottom: 1px solid var(--line); }
+      .bar {
+        max-width: 760px; margin: 0 auto; padding: 16px 24px;
+        display: flex; align-items: center; justify-content: space-between;
+      }
+      .bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+      .bar a:hover { color: var(--ink); }
+      .brand { font-weight: 700; color: var(--ink) !important; font-size: 15px; }
+      main { max-width: 760px; margin: 0 auto; padding: 48px 24px 72px; }
+      h1 { font-size: 2rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 8px; }
+      h2 { font-size: 1.25rem; margin: 2.2em 0 0.6em; letter-spacing: -0.01em; }
+      h3 { font-size: 1rem; margin: 1.6em 0 0.4em; }
+      p, li { color: var(--muted); }
+      strong { color: var(--ink); }
+      .updated { color: var(--faint); font-size: 14px; margin: 0 0 2em; }
+      ul { padding-left: 1.25em; }
+      li { margin: 0.35em 0; }
+      a { color: var(--brand); }
+      .note {
+        background: var(--alt); border: 1px solid var(--line);
+        border-radius: 10px; padding: 16px 20px; margin: 1.5em 0;
+      }
+      .note p:first-child { margin-top: 0; }
+      .note p:last-child { margin-bottom: 0; }
+      hr { border: 0; border-top: 1px solid var(--line); margin: 3em 0; }
+      footer {
+        border-top: 1px solid var(--line); background: var(--alt);
+      }
+      .foot {
+        max-width: 760px; margin: 0 auto; padding: 24px;
+        display: flex; flex-wrap: wrap; gap: 8px 20px;
+        font-size: 13px; color: var(--faint);
+      }
+      .foot a { color: var(--faint); text-decoration: none; }
+      .foot a:hover { color: var(--ink); }
+      @media (prefers-color-scheme: dark) {
+        /* Deliberately not themed: the site is light-first, and a half-themed
+           legal page looks broken. Kept light on purpose. */
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="bar">
+        <a class="brand" href="/">Syscity</a>
+        <a href="/">← Back to syscity.net</a>
+      </div>
+    </header>
+
+    <main>
+      <p style="font-size:13px;font-weight:600;letter-spacing:.18em;text-transform:uppercase;color:var(--brand);margin:0 0 12px">
+        Error 404
+      </p>
+      <h1>This page does not exist.</h1>
+      <p>
+        The link may be outdated, or the address may have a typo. The whole site
+        is one page, so everything you were probably looking for is on the
+        front page.
+      </p>
+      <p style="margin-top:2em">
+        <a href="/" style="display:inline-block;background:var(--brand);color:#fff;text-decoration:none;font-weight:600;padding:12px 22px;border-radius:8px">
+          Back to syscity.net
+        </a>
+      </p>
+      <h2>Looking for something specific?</h2>
+      <ul>
+        <li><a href="/#features">Features</a></li>
+        <li><a href="/#download">Downloads per platform</a></li>
+        <li><a href="/#quickstart">Quick start</a></li>
+        <li><a href="https://github.com/lightconsen/syscity/tree/main/docs">Documentation</a></li>
+      </ul>
+      <!-- GitHub Pages serves this file for unknown paths at *any* depth, and a
+           relative href would resolve against the requested directory. The
+           links are therefore root-absolute: the site has a custom domain
+           (CNAME -> syscity.net) and is served at "/". -->
+      <p class="updated" style="margin-top:2em">
+        中文：该页面不存在。<a href="/">返回首页</a>。
+      </p>
+    </main>
+
+    <footer>
+      <div class="foot">
+        <span>© 2026 Syscity</span>
+        <a href="/privacy.html">Privacy</a>
+        <a href="/terms.html">Terms</a>
+        <a href="https://github.com/lightconsen/syscity" target="_blank" rel="noreferrer">GitHub</a>
+        <span>Apache-2.0 Licensed · Open Source</span>
+      </div>
+    </footer>
+  </body>
+</html>
