@@ -33,6 +33,7 @@ agents perceive and act on your computer.
 | Doc | What it covers |
 |-----|----------------|
 | [Benchmark Results](benchmark.md) | Current BFCL / GAIA scores first, then the plan and method for public benchmarks |
+| [Reproducing the Numbers](reproducing.md) | Clean checkout → the same score, for BFCL / GAIA / Cua Bench, and what each number does and does not measure |
 | [Computer Use Benchmark](computer-use-benchmark.md) | Plan for scoring syscity on OSWorld-Verified and Cua Bench (Chinese) |
 | [Computer Use Benchmark Catalog](computer-use-benchmark-catalog.md) | Which CU benchmarks exist, which run here, which cannot — kicad/workflows results, the a11y-tree truncation, and the `/dev/uinput` constraint (Chinese) |
 | [OSWorld on a KVM Server](osworld-kvm-server.md) | Runbook: provision a KVM host, verify the VM, run the OSWorld × syscity harness (Chinese) |

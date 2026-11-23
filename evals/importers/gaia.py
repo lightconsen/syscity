@@ -19,12 +19,18 @@ token you use. Then, once per machine, install the parquet reader the importer
 needs (Python has no stdlib parquet support):
 
     python3 -m venv ~/.cache/syscity-bench/gaia/venv
-    ~/.cache/syscity-bench/gaia/venv/bin/pip install pyarrow
+    ~/.cache/syscity-bench/gaia/venv/bin/pip install pyarrow pyyaml
     ~/.cache/syscity-bench/gaia/venv/bin/python evals/importers/gaia.py
 
-The token is read from `--token`, `$HF_TOKEN`, or `~/.cache/huggingface/token`
-(in that order); `$HTTPS_PROXY` is honoured, as the HF endpoints are often
-unreachable otherwise.
+The token is read from `--token`, `$HF_TOKEN`, `secrets/hf.secret` (line 2, the
+repo-local store), or `~/.cache/huggingface/token` (in that order).
+`$HTTPS_PROXY` is honoured, as the HF endpoints are often unreachable
+otherwise.
+
+Only the account that accepted the dataset's terms can download it. The
+`~/.cache/huggingface/token` fallback is the one that bites: it holds whatever
+account last ran `hf auth login`, which is not necessarily that account, and the
+resulting 403 reads like "you never accepted the terms" when you did.
 
 Why a generated file rather than a checked-in one
 -------------------------------------------------
@@ -72,10 +78,21 @@ def cache_root(explicit: str | None) -> Path:
 
 def read_token(explicit: str | None) -> str | None:
     if explicit:
-        return explicit
+        return explicit.strip()
     env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if env:
         return env.strip()
+    # `secrets/hf.secret` is the repo-local store (gitignored by `secrets/`);
+    # line 1 is the account email, line 2 the token. It sits before the global
+    # cache because the cache usually belongs to whichever account last ran
+    # `hf auth login`, and that account is not necessarily authorized for a
+    # gated dataset — silently falling back to it turned a few seconds of
+    # setup into a 403 that reads like "you never accepted the terms".
+    local = REPO_ROOT / "secrets" / "hf.secret"
+    if local.is_file():
+        lines = local.read_text(encoding="utf-8").splitlines()
+        if len(lines) >= 2 and lines[1].strip():
+            return lines[1].strip()
     token_file = Path.home() / ".cache" / "huggingface" / "token"
     if token_file.is_file():
         return token_file.read_text(encoding="utf-8").strip()

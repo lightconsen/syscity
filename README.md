@@ -54,8 +54,21 @@ scorer. Model: **`deepseek-v4-flash`** throughout.
 
 | Benchmark | What it measures | Score |
 |---|---|---|
-| [BFCL](https://gorilla.cs.berkeley.edu/leaderboard.html) `bfcl-eval 2026.3.23` | the model plus the OpenAI-compatible wire (`raw` mode) | **80.12%** (673/840) over two runs (78.81% then 80.12%, a difference inside the noise floor) |
+| [BFCL](https://gorilla.cs.berkeley.edu/leaderboard.html) `bfcl-eval 2026.3.23` | the model plus the OpenAI-compatible wire (`raw` mode) — **not** the agent loop | **80.12%** (673/840) over two runs (78.81% then 80.12%, a difference inside the noise floor) |
 | [GAIA](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation Level 1 | syscity's own agent loop, end to end | **90.6%** (144/159 trials); 70.4% → 78.0% → 90.6% over three runs (the last bundles two changes — see the notes) |
+
+Two things these numbers are **not**:
+
+- **Not leaderboard submissions.** BFCL's board takes a pull request adding a
+  model handler, and only for a publicly reachable endpoint; GAIA closed its
+  validation board, so only a full test-split run (Levels 1–3, 301 questions)
+  is submittable, which we have not run. Read them as our own baselines for
+  detecting regressions, not as rankings.
+- **Not a like-for-like comparison with published rows.** BFCL `raw` mode
+  exercises `deepseek-v4-flash` and the wire format — syscity's contribution is
+  the wire, so the ability on show is the model's. GAIA scores are highly
+  sensitive to scaffolding (tool set, iteration cap, retries): a different
+  harness is a different number.
 
 Finer-grained tables, the method behind each number, the measured noise floor,
 reproduction steps and the failure breakdown are in
