@@ -51,7 +51,7 @@ export default function QuickStart() {
               <span className="h-3 w-3 rounded-full bg-[#ff5f57]" aria-hidden="true" />
               <span className="h-3 w-3 rounded-full bg-[#febc2e]" aria-hidden="true" />
               <span className="h-3 w-3 rounded-full bg-[#28c840]" aria-hidden="true" />
-              <span className="ml-3 inline-flex items-center gap-1.5 text-xs text-white/40">
+              <span className="ml-3 inline-flex items-center gap-1.5 text-xs text-white/55">
                 <Terminal className="h-3.5 w-3.5" />
                 syscity
               </span>
@@ -60,7 +60,7 @@ export default function QuickStart() {
               {LINES.map((l, i) => (
                 <div
                   key={i}
-                  className={`flex items-baseline gap-2 ${l.dim ? "text-white/45" : "text-white/90"}`}
+                  className={`flex items-baseline gap-2 ${l.dim ? "text-white/55" : "text-white/90"}`}
                 >
                   <span className={l.prompt === "$" ? "text-brand-400" : "text-primary-300"}>
                     {l.prompt}

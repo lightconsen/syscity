@@ -13,7 +13,11 @@
   /* Surfaces (light-first, WorkBuddy-style) */
   --color-ink: #191a23;
   --color-muted: #5a5a66;
-  --color-faint: #858699;
+  /* Was #858699 — 3.3:1 on the light surfaces, below the 4.5:1 that 12 px
+     text needs. This value clears it on every surface the site uses
+     (4.93 on #fff, 4.68 on alt, 4.57 on panel-2) while still reading
+     quieter than --color-muted. */
+  --color-faint: #6f6f80;
   --color-page: #ffffff;
   --color-panel: #ffffff;
   --color-panel-2: #f6f6f8;

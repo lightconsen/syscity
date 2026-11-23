@@ -8,8 +8,18 @@ const DESKTOP = [
   { name: "Linux", icon: `${base}assets/platforms/linux.svg`, url: "https://syscity.net/releases/syscity-desktop-linux-amd64.AppImage" },
 ];
 
+/**
+ * Mobile clients.
+ *
+ * iOS is deliberately absent: the app has no App Store listing yet, and the
+ * URL this card used (`apps.apple.com/app/syscity`, no numeric id) does not
+ * 404 — Apple answers it with a store landing page, at one point "Today".
+ * Shipping that link sends a visitor who wants Syscity somewhere else
+ * entirely. Restore the entry with the real `.../app/<slug>/id<digits>` URL
+ * once the listing is live; `lookup?bundleId=net.syscity` is how to confirm
+ * it.
+ */
 const MOBILE = [
-  { name: "iOS", icon: `${base}assets/platforms/ios.svg`, url: "https://apps.apple.com/app/syscity" },
   { name: "Android", icon: `${base}assets/platforms/android.svg`, url: "https://play.google.com/store/apps/details?id=net.syscity" },
 ];
 
@@ -54,8 +64,11 @@ export default function Download() {
           <p className="mx-auto mt-4 max-w-2xl text-muted">{t.download.lead}</p>
         </div>
 
-        {/* Desktop downloads */}
-        <div className="mb-8 flex justify-center gap-3">
+        {/* One row of platform cards. With iOS gone, desktop + Android is
+            four cards, which fits a phone at 48 px icons — so they share a
+            wrapping row instead of Android sitting alone on a line of its
+            own. It is still labelled "every device, one agent" above. */}
+        <div className="flex flex-wrap justify-center gap-3">
           {/* macOS: single icon, click to pick Apple Silicon / Intel */}
           <div ref={macRef} className="relative">
             <button
@@ -89,10 +102,7 @@ export default function Download() {
               <img src={p.icon} alt={p.name} className="h-12 w-12" loading="lazy" />
             </a>
           ))}
-        </div>
 
-        {/* Mobile app stores */}
-        <div className="mb-8 flex justify-center gap-3">
           {MOBILE.map((p) => (
             <a key={p.name} href={p.url} target="_blank" rel="noreferrer" title={p.name} className={cardCls}>
               <img src={p.icon} alt={p.name} className="h-12 w-12" loading="lazy" />
@@ -100,7 +110,7 @@ export default function Download() {
           ))}
         </div>
 
-        <p className="text-center text-sm text-muted">{t.download.cloudNote}</p>
+        <p className="mt-8 text-center text-sm text-muted">{t.download.cloudNote}</p>
       </div>
     </section>
   );

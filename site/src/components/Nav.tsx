@@ -1,4 +1,5 @@
-import { Star, Languages } from "lucide-react";
+import { useState } from "react";
+import { Star, Languages, Menu, X } from "lucide-react";
 import { cloudUrl, useLanguage } from "../i18n";
 
 import syscityLogo from "../assets/syscity.webp";
@@ -10,6 +11,10 @@ const LOGO_H = 172;
 
 export default function Nav() {
   const { lang, setLang, t } = useLanguage();
+  // Below `md` the section links used to be hidden with nothing in their
+  // place, so a phone visitor had no way to reach Download or Quick Start
+  // from the header. They open in a panel under the bar instead.
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const LINKS = [
     { href: "#features", label: t.nav.features },
@@ -66,8 +71,48 @@ export default function Nav() {
           >
             {t.nav.cloud}
           </a>
+          <button
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-expanded={menuOpen}
+            aria-controls="mobile-menu"
+            aria-label={menuOpen ? t.nav.closeMenu : t.nav.openMenu}
+            className="inline-flex items-center rounded-md border border-line bg-panel p-2 text-muted transition hover:border-brand-500/60 hover:text-brand-600 md:hidden"
+          >
+            {menuOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
+          </button>
         </div>
       </nav>
+
+      {menuOpen && (
+        <div
+          id="mobile-menu"
+          className="border-t border-line bg-page px-6 py-3 md:hidden"
+        >
+          <ul className="space-y-1 text-sm font-medium text-muted">
+            {LINKS.map((l) => (
+              <li key={l.href}>
+                <a
+                  href={l.href}
+                  onClick={() => setMenuOpen(false)}
+                  className="block rounded-md px-2 py-2.5 transition hover:bg-panel-2 hover:text-ink"
+                >
+                  {l.label}
+                </a>
+              </li>
+            ))}
+            <li>
+              <a
+                href={cloudUrl(lang)}
+                target="_blank"
+                rel="noreferrer"
+                className="block rounded-md px-2 py-2.5 text-brand-600 transition hover:bg-panel-2"
+              >
+                {t.nav.cloud}
+              </a>
+            </li>
+          </ul>
+        </div>
+      )}
     </header>
   );
 }

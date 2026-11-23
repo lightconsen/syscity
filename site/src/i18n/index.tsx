@@ -19,6 +19,8 @@ const en = {
     starShort: "Star",
     cloud: "Syscity Cloud",
     switchTo: "中文",
+    openMenu: "Open menu",
+    closeMenu: "Close menu",
   },
   hero: {
     badge: "Syscity · AI Agent System",
@@ -132,6 +134,8 @@ const en = {
     documentation: "Documentation",
     cloud: "Syscity Cloud",
     license: "Apache-2.0 Licensed · Open Source",
+    privacy: "Privacy",
+    terms: "Terms",
   },
 };
 
@@ -146,6 +150,8 @@ const zh: Dict = {
     starShort: "Star",
     cloud: "Syscity 云端",
     switchTo: "EN",
+    openMenu: "打开菜单",
+    closeMenu: "关闭菜单",
   },
   hero: {
     badge: "Syscity · AI 智能体系统",
@@ -259,6 +265,8 @@ const zh: Dict = {
     documentation: "文档",
     cloud: "Syscity 云端",
     license: "Apache-2.0 许可 · 开源",
+    privacy: "隐私",
+    terms: "条款",
   },
 };
 

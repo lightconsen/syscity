@@ -20,9 +20,13 @@ import iosLightWebp from "../assets/mobile-ios-light.webp";
 const DEMO_W = 1200;
 const DEMO_H = 566;
 
-/** The phone screenshots' encoded size. */
+/** The phone screenshots' encoded size. The Android capture is 26 px taller
+ * than the iOS one, so the two are declared separately — a shared height
+ * would reserve the wrong box for one of them and shift the layout when it
+ * decoded. */
 const SHOT_W = 480;
-const SHOT_H = 1040;
+const IOS_SHOT_H = 1040;
+const ANDROID_SHOT_H = 1066;
 
 /**
  * Whether the visitor prefers a dark interface.
@@ -141,8 +145,14 @@ export default function Demo() {
       {/* Mobile app screenshots (iOS + Android), below the demo animation.
           Each visitor downloads one theme's set: the dark sources are
           media-scoped, so a dark-mode browser never fetches the light pair. */}
-      <div className="mt-10 flex justify-center gap-4">
-        <figure className="flex flex-col items-center">
+      {/* Two 258 px-wide screenshots plus the gap need 532 px; a phone has
+          ~327. Left as a non-wrapping flex row the pair was shrunk to 148/163
+          px and `object-contain` letterboxed the capture inside a 560 px box
+          — the screenshots read as tiny and half-empty. Wrapping (and
+          refusing to shrink) puts them one above the other there, at full
+          size, and keeps the side-by-side row on anything wider. */}
+      <div className="mt-10 flex flex-wrap justify-center gap-4">
+        <figure className="flex shrink-0 flex-col items-center">
           <picture>
             <source media="(prefers-color-scheme: dark)" type="image/avif" srcSet={iosDarkAvif} />
             <source media="(prefers-color-scheme: dark)" type="image/webp" srcSet={iosDarkWebp} />
@@ -152,7 +162,7 @@ export default function Demo() {
               src={iosLightWebp}
               alt="Syscity on iOS"
               width={SHOT_W}
-              height={SHOT_H}
+              height={IOS_SHOT_H}
               className="card h-[560px] w-auto rounded-2xl object-contain"
               loading="lazy"
               decoding="async"
@@ -160,7 +170,7 @@ export default function Demo() {
           </picture>
           <figcaption className="mt-2 text-sm text-muted">{t.demo.iosCaption}</figcaption>
         </figure>
-        <figure className="flex flex-col items-center">
+        <figure className="flex shrink-0 flex-col items-center">
           <picture>
             <source
               media="(prefers-color-scheme: dark)"
@@ -174,7 +184,7 @@ export default function Demo() {
               src={androidLightWebp}
               alt="Syscity on Android"
               width={SHOT_W}
-              height={SHOT_H}
+              height={ANDROID_SHOT_H}
               className="card h-[560px] w-auto rounded-2xl object-contain"
               loading="lazy"
               decoding="async"

@@ -36,7 +36,7 @@ export default function Footer() {
             </p>
             <ul className="space-y-2 text-sm text-muted">
               <li><a href="#features" className="transition hover:text-ink">{t.footer.features}</a></li>
-              <li><a href="#platforms" className="transition hover:text-ink">{t.footer.platforms}</a></li>
+              <li><a href="#download" className="transition hover:text-ink">{t.footer.platforms}</a></li>
               <li><a href="#quickstart" className="transition hover:text-ink">{t.footer.quickstart}</a></li>
               <li>
                 <a
@@ -92,7 +92,15 @@ export default function Footer() {
 
         <div className="mt-12 flex flex-col items-center justify-between gap-3 border-t border-line pt-6 text-xs text-faint sm:flex-row">
           <p>© {new Date().getFullYear()} Syscity</p>
-          <p>{t.footer.license}</p>
+          <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
+            <a href={`${import.meta.env.BASE_URL}privacy.html`} className="transition hover:text-ink">
+              {t.footer.privacy}
+            </a>
+            <a href={`${import.meta.env.BASE_URL}terms.html`} className="transition hover:text-ink">
+              {t.footer.terms}
+            </a>
+            <p>{t.footer.license}</p>
+          </div>
         </div>
       </div>
     </footer>
