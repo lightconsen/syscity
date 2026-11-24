@@ -467,6 +467,14 @@ async fn a_three_step_run_streams_one_ordered_event_per_step_then_finished() {
             .unwrap_or_else(|| panic!("no computer.step for step {expected}"));
         assert_eq!(event["run_id"], run_id.as_str(), "{event}");
         assert_eq!(event["session_id"], sid.as_str(), "{event}");
+        // The goal travels with the steps, not only in the opening status: a
+        // panel that opens mid-run learns of the run from this event, and its
+        // header is the goal. Without it the panel showed "nothing is driving
+        // this desktop" above steps that were visibly driving it.
+        assert_eq!(
+            event["goal"], "click through Preferences",
+            "the stream must name what the run was asked for: {event}"
+        );
         let inner = &event["event"];
         assert_eq!(inner["kind"], "step", "{event}");
         assert_eq!(

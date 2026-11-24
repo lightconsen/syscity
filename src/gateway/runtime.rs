@@ -332,6 +332,14 @@ pub enum GatewayEvent {
     ComputerStep {
         session_id: Option<String>,
         run_id: String,
+        /// What the run was asked to do.
+        ///
+        /// The event says what happened, not what was asked, so a client that
+        /// first learns of a run from its steps would have no goal to show —
+        /// and a panel whose header is the goal ended up captioning a live run
+        /// with its own empty state. The goal is a property of the run, so it
+        /// travels with every one of its events.
+        goal: String,
         /// The event as the run's own vocabulary describes it
         /// (`run_executor::RunEvent`, tagged by `kind`).
         event: serde_json::Value,

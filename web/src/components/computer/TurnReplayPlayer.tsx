@@ -14,6 +14,7 @@ import type {
   TurnReplay,
   TurnReplayStep,
 } from "@/SyscityWebSocketTransport";
+import { previewResult } from "@/stores/computerStore";
 
 interface TurnReplayPlayerProps {
   transport: SyscityWebSocketTransport;
@@ -303,9 +304,13 @@ function ReplayStepRow({
         {step.action || step.result || "—"}
       </div>
       {/* What the adapter said happened, when it is more than the action
-          restated: a run step's `press 3` and its `typed 3` are two facts. */}
+          restated: a run step's `press 3` and its `typed 3` are two facts.
+          A UI-tree read's result is the tree — bounded to one line here, since
+          this strip is a caption and not a place to read JSON. */}
       {step.result && step.result !== step.action && (
-        <div className="text-[10px] text-secondary break-words mt-0.5">{step.result}</div>
+        <div className="text-[10px] text-secondary break-words mt-0.5">
+          {previewResult(step.result)}
+        </div>
       )}
     </button>
   );

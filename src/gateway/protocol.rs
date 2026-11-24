@@ -1114,11 +1114,20 @@ pub fn gateway_event_to_ws(event: &GatewayEvent) -> Option<(String, serde_json::
         // `step` or `finished`, and a client switches on it the same way the
         // run executor does. Reshaping it here would make two descriptions of
         // one event that could drift.
-        GatewayEvent::ComputerStep { session_id, run_id, event } => Some((
+        GatewayEvent::ComputerStep {
+            session_id,
+            run_id,
+            goal,
+            event,
+        } => Some((
             "computer.step".to_string(),
             serde_json::json!({
                 "session_id": session_id,
                 "run_id": run_id,
+                // What the run was asked for, so a client that first sees a
+                // run through its steps can name it rather than showing an
+                // unnamed entry with its own empty-state caption.
+                "goal": goal,
                 "event": event,
             }),
         )),
@@ -1530,6 +1539,34 @@ mod tests {
         assert_eq!(name, "ask.resolved");
         assert_eq!(payload["ask_id"], "ask-1");
         assert_eq!(payload["cancelled"], true);
+    }
+
+    /// A client can learn of a run from its step events alone — a panel opened
+    /// mid-run, or a viewer that subscribed after the run started. The event
+    /// must therefore say what the run is *for*, or the panel can only show an
+    /// unnamed entry (and its header, which is the goal, falls back to the
+    /// empty state while the run is visibly stepping).
+    #[test]
+    fn a_computer_step_event_names_the_run_it_belongs_to() {
+        let event = crate::gateway::GatewayEvent::ComputerStep {
+            session_id: Some("web:s1".into()),
+            run_id: "run-1".into(),
+            goal: "open a terminal and run uname -a".into(),
+            event: serde_json::json!({
+                "kind": "step",
+                "run_id": "run-1",
+                "step": 0,
+                "action": "click [s1:0.4]",
+            }),
+        };
+        let (name, payload) = gateway_event_to_ws(&event).expect("mapped event");
+        assert_eq!(name, "computer.step");
+        assert_eq!(payload["session_id"], "web:s1");
+        assert_eq!(payload["run_id"], "run-1");
+        assert_eq!(payload["goal"], "open a terminal and run uname -a");
+        // The run's own vocabulary still travels unreshaped beside it.
+        assert_eq!(payload["event"]["kind"], "step");
+        assert_eq!(payload["event"]["step"], 0);
     }
 
     #[test]

@@ -12,7 +12,14 @@ import {
   XCircle,
 } from "lucide-react";
 import type { SyscityWebSocketTransport } from "@/SyscityWebSocketTransport";
-import { useComputerStore, type ComputerRunEntry, type ComputerStepView } from "@/stores/computerStore";
+import {
+  isLongResult,
+  pickShown,
+  previewResult,
+  useComputerStore,
+  type ComputerRunEntry,
+  type ComputerStepView,
+} from "@/stores/computerStore";
 
 interface ComputerPanelProps {
   transport: SyscityWebSocketTransport;
@@ -108,10 +115,10 @@ export function ComputerPanel({ transport, sessionId, onClose }: ComputerPanelPr
   }, [load]);
 
   const ordered = order.map((id) => runs[id]).filter(Boolean) as ComputerRunEntry[];
-  const current =
-    (selectedRunId ? runs[selectedRunId] : undefined) ??
-    ordered[ordered.length - 1] ??
-    null;
+  // The chosen run, or — when the person has not chosen — the one that is
+  // actually moving the machine, falling back to the newest entry. See
+  // `pickShown` for why a finished run must not hold the panel.
+  const current = pickShown(selectedRunId, order, runs);
 
   return (
     <div
@@ -128,7 +135,12 @@ export function ComputerPanel({ transport, sessionId, onClose }: ComputerPanelPr
               {t("ComputerPanel.title")}
             </div>
             <div className="text-[10px] text-secondary truncate" title={current?.goal}>
-              {current?.goal || t("ComputerPanel.empty")}
+              {/* A live run announced by its step events has no goal yet — the
+                  event carries what happened, not what was asked. Falling back
+                  to the empty-state sentence here said "nothing is driving this
+                  desktop" above a list of the steps it was driving it with, so
+                  an unnamed run names itself instead. */}
+              {current?.goal || (current ? t("ComputerPanel.runOf", { id: current.runId.slice(0, 8) }) : t("ComputerPanel.empty"))}
             </div>
           </div>
         </div>
@@ -198,8 +210,7 @@ export function ComputerPanel({ transport, sessionId, onClose }: ComputerPanelPr
   );
 }
 
-function phaseIcon(phase: ComputerRunEntry["phase"]) {
-  switch (phase) {
+function phaseIcon(phase: ComputerRunEntry["phase"]) {  switch (phase) {
     case "running":
     case "stepping":
       return <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />;
@@ -305,6 +316,13 @@ function StepRow({
   const [open, setOpen] = useState(false);
 
   const hasFrame = Boolean(step.beforeRef || step.afterRef);
+  // A `read the UI tree` step's result *is* the tree: hundreds of nodes of
+  // JSON. Printed whole in a step row it both swamps the panel and hides the
+  // steps around it, so the row shows a flat preview and the full text is
+  // behind the same disclosure the frames use. This is presentation only —
+  // the model still reads the whole thing.
+  const longResult = isLongResult(step.result) && step.result !== step.action;
+  const expandable = hasFrame || longResult;
   const status =
     step.verified === true
       ? "yes"
@@ -328,11 +346,11 @@ function StepRow({
     <div className="border-b border-subtle last:border-b-0" data-testid="computer-step" data-step={step.step}>
       <button
         type="button"
-        onClick={() => hasFrame && setOpen((v) => !v)}
+        onClick={() => expandable && setOpen((v) => !v)}
         className="w-full flex items-start gap-2 px-4 py-2 text-left hover:bg-black/[0.03] dark:hover:bg-white/[0.03]"
       >
         <span className="shrink-0 w-4 text-[10px] text-secondary pt-0.5">
-          {hasFrame ? (
+          {expandable ? (
             open ? (
               <ChevronDown className="w-3.5 h-3.5" />
             ) : (
@@ -362,7 +380,7 @@ function StepRow({
           <span className="block text-xs text-primary break-words mt-0.5">{step.action}</span>
           {step.result && step.result !== step.action && (
             <span className="block text-[10px] text-secondary break-words mt-0.5">
-              {step.result}
+              {previewResult(step.result)}
             </span>
           )}
         </span>
@@ -379,6 +397,14 @@ function StepRow({
                 defaultValue: step.effect,
               })}
             </div>
+          )}
+          {longResult && step.result && (
+            <pre
+              className="text-[10px] text-secondary whitespace-pre-wrap break-all max-h-64 overflow-y-auto m-0"
+              data-testid="computer-step-full-result"
+            >
+              {step.result}
+            </pre>
           )}
           <FramePair
             transport={transport}

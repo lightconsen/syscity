@@ -453,6 +453,13 @@ async fn a_recorded_task_replays_with_a_different_name() {
         let inner = &event["event"];
         assert_eq!(inner["kind"], "step", "{event}");
         assert_eq!(inner["step"], expected, "replay steps are zero-based: {event}");
+        // A replay broadcasts on the same channel as a run, so it must carry
+        // the same identifying facts — a client watching `computer.step` has no
+        // other way to tell whose run this is or what it is for.
+        assert!(
+            event["goal"].as_str().is_some_and(|g| !g.is_empty()),
+            "a replay's events must name the run's goal: {event}"
+        );
     }
     let finished = client
         .wait_for_event("computer.step", 30)

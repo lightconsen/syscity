@@ -352,10 +352,12 @@ async fn launch(
     };
 
     let run_id = run.run_id.clone();
+    let run_goal = run.goal.clone();
     let observer: crate::computer::run_executor::RunObserver = {
         let tx = state.events.tx.clone();
         let session_id = session_id.clone();
         let run_id = run_id.clone();
+        let run_goal = run_goal.clone();
         Arc::new(move |event| {
             let payload = match serde_json::to_value(&event) {
                 Ok(value) => value,
@@ -367,6 +369,10 @@ async fn launch(
             let gateway_event = GatewayEvent::ComputerStep {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
+                // The goal travels with every event, not only the opening
+                // status: a panel can open mid-run and have no other way to
+                // learn what this run was asked for.
+                goal: run_goal.clone(),
                 event: payload,
             };
             if let Err(e) = tx.send(gateway_event) {
@@ -1246,6 +1252,9 @@ async fn spawn_play(
     let task_state = state.clone();
     let total = plan.steps.len();
     let plan_run_id = plan.run_id.clone();
+    // Cloned before the spawn: the task moves the run, and the goal is what
+    // every event it broadcasts must name.
+    let goal = run.goal.clone();
     let allow_apps = state.tools.computer_allow_apps.as_ref().clone();
     let conversation_id = plan.session_id.clone().unwrap_or_default();
 
@@ -1354,6 +1363,7 @@ async fn spawn_play(
                 &task_state,
                 &plan.session_id,
                 &plan.run_id,
+                &goal,
                 &crate::computer::run_executor::RunEvent::Step {
                     run_id: plan.run_id.clone(),
                     // Zero-based, like a run's own step events (they carry the
@@ -1424,6 +1434,7 @@ async fn spawn_play(
             &task_state,
             &plan.session_id,
             &plan.run_id,
+            &goal,
             &crate::computer::run_executor::RunEvent::Finished {
                 run_id: plan.run_id.clone(),
                 phase,
@@ -1446,6 +1457,7 @@ fn broadcast_step(
     state: &Arc<GatewayState>,
     session_id: &Option<String>,
     run_id: &str,
+    goal: &str,
     event: &crate::computer::run_executor::RunEvent,
 ) {
     let payload = match serde_json::to_value(event) {
@@ -1458,6 +1470,7 @@ fn broadcast_step(
     let gateway_event = GatewayEvent::ComputerStep {
         session_id: session_id.clone(),
         run_id: run_id.to_string(),
+        goal: goal.to_string(),
         event: payload,
     };
     if let Err(e) = state.events.tx.send(gateway_event) {

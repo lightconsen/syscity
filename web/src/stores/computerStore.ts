@@ -56,7 +56,9 @@ interface ComputerState {
   applyStepEvent: (
     sessionId: string | null,
     runId: string,
-    event: Record<string, unknown>
+    event: Record<string, unknown>,
+    /** What the run was asked to do, as the gateway sends it with each event. */
+    goal?: string | null
   ) => void;
 }
 
@@ -110,6 +112,92 @@ function withOrder(order: string[], runId: string): string[] {
   return order.includes(runId) ? order : [...order, runId];
 }
 
+/** Whether a phase means the run is still moving the machine. */
+function isActive(phase: ComputerRunPhase): boolean {
+  return phase === "running" || phase === "stepping";
+}
+
+/**
+ * Which run the panel should be showing.
+ *
+ * `selected` is the person's own pick and outranks everything: choosing a run
+ * to read must not be undone by a later event. Without one, a run that is
+ * still moving the machine is what the panel is for — the previous behaviour
+ * auto-selected the first run it ever saw and held it, so a panel opened after
+ * one finished showed "Done" above a desktop a second run was driving. Only
+ * when nothing is active does it fall back to the newest entry, which is what
+ * a reader returning to a quiet conversation wants.
+ */
+export function pickShown(
+  selected: string | null,
+  order: string[],
+  runs: Record<string, ComputerRunEntry>
+): ComputerRunEntry | null {
+  const explicit = selected ? runs[selected] : undefined;
+  if (explicit) return explicit;
+  const active = order
+    .map((id) => runs[id])
+    .filter((r): r is ComputerRunEntry => Boolean(r) && isActive(r.phase));
+  if (active.length > 0) return active[active.length - 1];
+  const newest = order.length > 0 ? runs[order[order.length - 1]] : undefined;
+  return newest ?? null;
+}
+
+/**
+ * A step result shortened for a one-line row.
+ *
+ * A `read the UI tree` step answers with the tree itself: hundreds of nodes of
+ * JSON in a field sized for a sentence. Truncating that mid-token still shows
+ * a wall of punctuation, so a JSON result is summarised as what it holds — the
+ * node count and the applications it walked — and the full text stays behind
+ * the row's disclosure. Presentation only; the model reads the whole result.
+ */
+export const RESULT_PREVIEW_LIMIT = 160;
+
+/** Node count and application names of a UI-tree result, when that is what it is. */
+function describeTree(result: string): string | null {
+  if (!result.startsWith("[") && !result.startsWith("{")) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result);
+  } catch {
+    // Not JSON — but it starts like it. Say nothing rather than guess.
+    return null;
+  }
+  const roots = Array.isArray(parsed) ? parsed : null;
+  if (!roots) return null;
+  let nodes = 0;
+  const apps: string[] = [];
+  const walk = (n: unknown, depth: number) => {
+    if (!n || typeof n !== "object") return;
+    nodes += 1;
+    const node = n as { role?: unknown; label?: unknown; value?: unknown; children?: unknown };
+    if (depth <= 1) {
+      const role = typeof node.role === "string" ? node.role : "";
+      const name =
+        (typeof node.label === "string" && node.label) ||
+        (typeof node.value === "string" && node.value) ||
+        "";
+      if (role === "application" && name) apps.push(name);
+    }
+    if (Array.isArray(node.children)) for (const c of node.children) walk(c, depth + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  const names = apps.length ? `: ${apps.slice(0, 4).join(", ")}${apps.length > 4 ? "…" : ""}` : "";
+  return `${nodes} elements${names}`;
+}
+
+export function previewResult(result: string, limit = RESULT_PREVIEW_LIMIT): string {
+  const tree = describeTree(result);
+  if (tree) return tree;
+  const flat = result.replace(/\s+/g, " ").trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+export function isLongResult(result: string | null | undefined, limit = RESULT_PREVIEW_LIMIT): boolean {
+  return Boolean(result && result.length > limit);
+}
+
 export const useComputerStore = create<ComputerState>((set) => ({
   runs: {},
   order: [],
@@ -151,13 +239,20 @@ export const useComputerStore = create<ComputerState>((set) => ({
             summary: view.summary ?? null,
             message: view.message ?? null,
             vision: view.vision ?? null,
+            // `paused` is the phase a run with no conclusion has, so it is also
+            // the only phase that is interrupted. A status answer for a run
+            // that has since reached `done` must not leave a chip behind that
+            // says it was cut off — the panel would show "Done" and
+            // "Interrupted" side by side.
+            interrupted: view.phase === "paused",
             live: true,
           },
         },
         order: withOrder(s.order, view.run_id),
-        // Keep an explicit selection; otherwise follow the newest run, which is
-        // what a person who just asked for one expects to be looking at.
-        selectedRunId: s.selectedRunId ?? view.run_id,
+        // No selection is made here. Which run to show is a question asked of
+        // the whole set (an active one outranks a finished one), and answering
+        // it by auto-selecting the first run seen is how the panel came to be
+        // pinned to a finished run while another was driving the desktop.
         sessionId: sessionId ?? s.sessionId,
       };
     }),
@@ -186,7 +281,10 @@ export const useComputerStore = create<ComputerState>((set) => ({
             goal: record.goal,
             phase,
             steps,
-            interrupted: record.interrupted,
+            // The same rule as the status merge: only a run with no conclusion
+            // is interrupted. Re-deriving it from the phase keeps a stale
+            // "interrupted" from a record read mid-run out of a finished tab.
+            interrupted: phase === "paused",
             // The cost of a run is the run's, not its conclusion's: an
             // interrupted run spent the same budget as one that stopped for a
             // reason, and showing no cost line for it would understate what a
@@ -206,11 +304,10 @@ export const useComputerStore = create<ComputerState>((set) => ({
           },
         },
         order: withOrder(s.order, record.run_id),
-        selectedRunId: s.selectedRunId ?? record.run_id,
       };
     }),
 
-  applyStepEvent: (sessionId, runId, event) =>
+  applyStepEvent: (sessionId, runId, event, goal) =>
     set((s) => {
       // The live stream broadcasts to every client on the gateway. A run that
       // belongs to another conversation must stay out of this panel for the
@@ -224,7 +321,7 @@ export const useComputerStore = create<ComputerState>((set) => ({
         const message = (event.message as string) ?? "";
         const existing = prev ?? {
           runId,
-          goal: "",
+          goal: goal ?? "",
           phase,
           steps: [],
         };
@@ -236,6 +333,14 @@ export const useComputerStore = create<ComputerState>((set) => ({
               phase,
               message,
               live: true,
+              // The event names the run; a reader that never saw an opening
+              // status gets its goal from whichever event arrives first.
+              goal: existing.goal || goal || "",
+              // A run that just announced its conclusion is not interrupted,
+              // whatever a disk read taken while it was still stepping said.
+              // The phase, not the event name, decides: one rule for all three
+              // merge paths.
+              interrupted: phase === "paused",
               summary: existing.summary
                 ? { ...existing.summary, stop_reason: String(event.stop_reason ?? "done") }
                 : null,
@@ -263,7 +368,7 @@ export const useComputerStore = create<ComputerState>((set) => ({
       };
       const existing = prev ?? {
         runId,
-        goal: "",
+        goal: goal ?? "",
         phase: "running" as ComputerRunPhase,
         steps: [],
       };
@@ -272,12 +377,12 @@ export const useComputerStore = create<ComputerState>((set) => ({
           ...s.runs,
           [runId]: {
             ...existing,
+            goal: existing.goal || goal || "",
             steps: upsertStep(existing.steps, step),
             live: true,
           },
         },
         order: withOrder(s.order, runId),
-        selectedRunId: s.selectedRunId ?? runId,
         sessionId: sessionId ?? s.sessionId,
       };
     }),

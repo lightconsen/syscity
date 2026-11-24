@@ -526,7 +526,12 @@ function ChatShell() {
         if (!runId || !runEvent) return;
         useComputerStore
           .getState()
-          .applyStepEvent((p.session_id as string) || null, runId, runEvent);
+          .applyStepEvent(
+            (p.session_id as string) || null,
+            runId,
+            runEvent,
+            (p.goal as string) || null
+          );
       }
       if (evt.event === "goal.progress") {
         const p = evt.payload as Record<string, unknown> | undefined;
