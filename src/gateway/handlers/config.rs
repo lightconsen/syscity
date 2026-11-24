@@ -61,7 +61,7 @@ async fn patched_document(
     let text = tokio::fs::read_to_string(config_path)
         .await
         .map_err(|e| format!("config file unreadable: {}", e))?;
-    let mut document: toml_edit::Document = text.parse().map_err(|e| format!("{e}"))?;
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
 
     let before = toml::Value::try_from(before).map_err(|e| format!("{e}"))?;
     let after = toml::Value::try_from(config).map_err(|e| format!("{e}"))?;
