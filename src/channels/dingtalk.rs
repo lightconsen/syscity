@@ -492,7 +492,7 @@ impl DingTalkChannel {
                         // sends; the platform answering it is what proves the
                         // socket is still there.
                         Err(_) => {
-                            write.send(Message::Ping(Vec::new())).await.map_err(|e| {
+                            write.send(Message::Ping(Vec::new().into())).await.map_err(|e| {
                                 self.failed(&format!("the keepalive failed: {}", e))
                             })?;
                         }

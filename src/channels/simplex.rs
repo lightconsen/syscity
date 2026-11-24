@@ -376,7 +376,7 @@ impl SimplexChannel {
                             // The daemon is application-silent by design, so this
                             // says nothing about whether it is alive — that is
                             // what the WebSocket's own ping is for.
-                            write.send(Message::Ping(Vec::new())).await.map_err(|e| {
+                            write.send(Message::Ping(Vec::new().into())).await.map_err(|e| {
                                 self.failed(&format!("the keepalive failed: {}", e))
                             })?;
                         }

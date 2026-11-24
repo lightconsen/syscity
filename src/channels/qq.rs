@@ -775,7 +775,7 @@ async fn qq_connect_and_listen(
     });
 
     write
-        .send(Message::Text(identify.to_string()))
+        .send(Message::Text(identify.to_string().into()))
         .await
         .map_err(|e| {
             crate::error::SyscityError::Internal(format!(
@@ -798,7 +798,7 @@ async fn qq_connect_and_listen(
                     "op": QQ_OP_HEARTBEAT,
                     "d": seq
                 });
-                if write.send(Message::Text(hb.to_string())).await.is_err() {
+                if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                     warn!("QQ WebSocket: heartbeat send failed");
                     break;
                 }

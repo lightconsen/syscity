@@ -209,7 +209,7 @@ impl WsClient {
 
         let text = serde_json::to_string(&request)?;
         self.write_tx
-            .send(Message::Text(text))
+            .send(Message::Text(text.into()))
             .map_err(|_| TuiError::WebSocket("send channel closed".to_string()))?;
 
         let response = match tokio::time::timeout(self.request_timeout, rx).await {
@@ -249,7 +249,7 @@ impl WsClient {
     /// Send a fire-and-forget text message.
     pub fn send_text(&self, text: String) -> Result<(), TuiError> {
         self.write_tx
-            .send(Message::Text(text))
+            .send(Message::Text(text.into()))
             .map_err(|_| TuiError::WebSocket("send channel closed".to_string()))
     }
 
