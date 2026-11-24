@@ -73,56 +73,9 @@ impl AtspiRead {
 /// is full of `{}` dict literals, which would have to be doubled to survive
 /// formatting.
 pub fn python_script(max_depth: u32) -> String {
-    r#"
-import json, sys
-try:
-    import pyatspi
-except ImportError:
-    print(json.dumps({"error": "pyatspi not installed"}), file=sys.stderr)
-    sys.exit(1)
-
-def export_element(acc, depth=0):
-    try:
-        name = acc.name or ""
-        role = acc.getRoleName() or "unknown"
-        state_set = acc.getState()
-        enabled = state_set.contains(pyatspi.STATE_ENABLED)
-        focused = state_set.contains(pyatspi.STATE_FOCUSED)
-        x, y, w, h = acc.extents
-    except Exception:
-        return None
-    try:
-        child_count = int(acc.childCount)
-    except Exception:
-        child_count = None
-    obj = {
-        "role": role,
-        "name": name,
-        "enabled": enabled,
-        "focused": focused,
-        "x": x, "y": y,
-        "width": w, "height": h,
-        "children_count": child_count,
-        "truncated": False,
-        "children": []
-    }
-    if depth < __MAX_DEPTH__:
-        try:
-            for i in range(acc.childCount):
-                child = acc.getChildAtIndex(i)
-                child_dict = export_element(child, depth + 1)
-                if child_dict:
-                    obj["children"].append(child_dict)
-        except Exception:
-            pass
-    else:
-        # Stopped at the depth limit with children still unread. The count is
-        # what makes that visible: the caller can tell "no children" from
-        # "children nobody looked at".
-        obj["truncated"] = bool(child_count)
-    return obj
-
-desktop = pyatspi.Registry.getDesktop(0)
+    script_for(
+        max_depth,
+        r#"
 active_app = None
 for i in range(desktop.childCount):
     app = desktop.getChildAtIndex(i)
@@ -141,8 +94,128 @@ if active_app:
     print(json.dumps(tree))
 else:
     print(json.dumps({"role": "desktop", "name": "", "children": []}))
-"#
-    .replace("__MAX_DEPTH__", &max_depth.to_string())
+"#,
+    )
+}
+
+/// The Python source that walks **every** application on the desktop.
+///
+/// The active-application read ([`python_script`]) is right for a local
+/// session, where the caller is looking at one window. It is the wrong shape
+/// for a remote desktop driven over SSH: nothing on that side has focus
+/// because the SSH session is not a desktop session, so "the active app" is
+/// whatever the accessibility bus happens to report — and on XFCE that can be
+/// the session manager, whose tree is empty while the terminal the goal needs
+/// is sitting right there.
+///
+/// The roots are one `desktop` node holding every application, which is what
+/// lets element ids name a control in *any* window and lets the caller prune
+/// the off-screen ones by geometry.
+pub fn desktop_python_script(max_depth: u32) -> String {
+    script_for(
+        max_depth,
+        r#"
+apps = []
+for i in range(desktop.childCount):
+    try:
+        app = desktop.getChildAtIndex(i)
+    except Exception:
+        continue
+    tree = export_element(app)
+    if tree:
+        apps.append(tree)
+print(json.dumps({
+    "role": "desktop",
+    "name": "",
+    "children_count": len(apps),
+    "truncated": False,
+    "children": apps,
+}))
+"#,
+    )
+}
+
+/// Wrap [`export_element`](python_script) and the walk's last line in one
+/// script.
+///
+/// The Python body is shared so the two readers cannot disagree about how an
+/// element is shaped — a second copy would drift, and the disagreement would
+/// show up as a tree one caller calls complete and the other calls truncated.
+fn script_for(max_depth: u32, roots: &str) -> String {
+    let body = r#"
+import json, sys
+try:
+    import pyatspi
+except ImportError:
+    print(json.dumps({"error": "pyatspi not installed"}), file=sys.stderr)
+    sys.exit(1)
+
+def geometry(acc):
+    # `Accessible.extents` is not an attribute on every version of pyatspi
+    # (application nodes on XFCE raise AttributeError), and treating that as
+    # "this element is unreadable" dropped whole applications from the tree.
+    # Geometry is optional; the element is not.
+    try:
+        ext = acc.extents
+        return int(ext.x), int(ext.y), int(ext.width), int(ext.height)
+    except Exception:
+        pass
+    try:
+        ext = acc.queryComponent().getExtents(0)
+        return int(ext.x), int(ext.y), int(ext.width), int(ext.height)
+    except Exception:
+        return None
+
+def export_element(acc, depth=0):
+    try:
+        name = acc.name or ""
+        role = acc.getRoleName() or "unknown"
+        state_set = acc.getState()
+        enabled = state_set.contains(pyatspi.STATE_ENABLED)
+        focused = state_set.contains(pyatspi.STATE_FOCUSED)
+    except Exception:
+        return None
+    try:
+        child_count = int(acc.childCount)
+    except Exception:
+        child_count = None
+    obj = {
+        "role": role,
+        "name": name,
+        "enabled": enabled,
+        "focused": focused,
+        "children_count": child_count,
+        "truncated": False,
+        "children": []
+    }
+    # Only publish a box when there is one. A made-up (0,0,0,0) is a point in
+    # the screen's corner that no control occupies, and a model that clicks it
+    # would be aimed at nothing.
+    box = geometry(acc)
+    if box is not None:
+        obj["x"], obj["y"], obj["width"], obj["height"] = box
+    if depth < __MAX_DEPTH__:
+        if child_count:
+            for i in range(child_count):
+                try:
+                    child = acc.getChildAtIndex(i)
+                except Exception:
+                    continue
+                child_dict = export_element(child, depth + 1)
+                if child_dict:
+                    obj["children"].append(child_dict)
+    else:
+        # Stopped at the depth limit with children still unread. The count is
+        # what makes that visible: the caller can tell "no children" from
+        # "children nobody looked at".
+        obj["truncated"] = bool(child_count)
+    return obj
+
+desktop = pyatspi.Registry.getDesktop(0)
+__ROOTS__
+"#;
+    body.replace("__ROOTS__", roots)
+        .replace("__MAX_DEPTH__", &max_depth.to_string())
 }
 
 /// Read the active application's tree over the AT-SPI2 bus.
@@ -318,6 +391,41 @@ mod tests {
         assert!(!read.ok);
         assert_eq!(read.error.as_deref(), Some("pyatspi not installed"));
         assert!(read.tree.is_none());
+    }
+
+    /// An application node on XFCE has no `.extents`, and the reader used to
+    /// treat that as an unreadable element — which dropped whole applications
+    /// from the tree and left the remote adapter with nothing to aim at.
+    #[test]
+    fn geometry_is_optional_but_the_element_is_not() {
+        let script = python_script(4);
+        assert!(script.contains("def geometry(acc):"), "{script}");
+        // The fallback is a real second attempt, not a default of (0,0,0,0).
+        assert!(script.contains("acc.queryComponent().getExtents(0)"), "{script}");
+        // A missing box omits the keys rather than claiming the screen corner.
+        assert!(script.contains("if box is not None:"), "{script}");
+    }
+
+    /// The desktop read must name *every* application: that is what makes an
+    /// element id resolvable in a window that is not the focused one, which an
+    /// SSH-driven session always has.
+    #[test]
+    fn the_desktop_read_walks_every_application() {
+        let script = desktop_python_script(6);
+        assert!(script.contains("apps.append(tree)"), "{script}");
+        assert!(script.contains(r#""children": apps,"#), "{script}");
+        assert!(script.contains("if depth < 6:"), "{script}");
+        // It shares the element shape with the active-app read.
+        assert!(script.contains("def export_element(acc, depth=0):"), "{script}");
+        assert!(script.contains(r#""children_count": child_count,"#), "{script}");
+    }
+
+    /// A `None` child (pyatspi hands one back when a node goes away mid-walk)
+    /// must not take the whole run down with an AttributeError.
+    #[test]
+    fn a_vanished_child_is_skipped_not_fatal() {
+        let script = python_script(3);
+        assert!(script.contains("except Exception:\n                    continue"), "{script}");
     }
 
     /// The fallback is X11-specific and must say so, not silently look like

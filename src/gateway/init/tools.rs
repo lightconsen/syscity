@@ -426,6 +426,10 @@ pub async fn init_tools(config: &GatewayConfig, deps: ToolSystemDeps) -> crate::
                 permissions,
                 browser_allow_private: config.security.browser_allow_private,
                 guardian: build_guardian(config, &model_router).await,
+                // `host` is the switch: with it set, every desktop action goes
+                // to that machine (see `init_computer_adapter`), so this host's
+                // GUI tool sets would drive the wrong computer.
+                remote_desktop: config.computer.remote_control.host.is_some(),
             },
         )
         .await?,

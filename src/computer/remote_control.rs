@@ -40,12 +40,22 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+use crate::computer::element_index::{parse_element_id, ActionTarget, ResolveError, SnapshotCache};
 use crate::computer::screenshot_encoder::maybe_encode_screenshot;
 use crate::computer::{
     ActionResult, ClickTarget, ComputerAdapter, ComputerError, DesktopAction, MouseButton, Point,
     Rect, Result, Screenshot, Tri, UiElement, WaitCondition,
 };
 // ── Configuration ──────────────────────────────────────────────────────────
+
+/// How deep the remote accessibility walk goes.
+///
+/// A terminal's text area sits six or seven levels under the application node
+/// (`frame` → `panel` → `scroll pane` → `viewport` → `terminal`), so a shallow
+/// depth stops one step above the control the goal needs and reports a tree
+/// that looks complete but has nothing to click. Eight is measured, not
+/// guessed: the container's XFCE terminal lands at depth 5.
+const UI_TREE_DEPTH: u32 = 8;
 
 /// Remote access protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +130,16 @@ impl RemoteOs {
             RemoteOs::Unknown
         }
     }
+
+    /// Lower-case name for error messages ("linux", "macos", …).
+    fn label(&self) -> &'static str {
+        match self {
+            RemoteOs::Linux => "linux",
+            RemoteOs::Macos => "macos",
+            RemoteOs::Windows => "windows",
+            RemoteOs::Unknown => "unknown",
+        }
+    }
 }
 
 // ── Adapter ────────────────────────────────────────────────────────────────
@@ -133,6 +153,11 @@ pub struct RemoteControlAdapter {
     remote_os: RemoteOs,
     /// Layout root the workspace staging directory resolves against.
     paths: std::sync::Arc<crate::dirs::SyscityPaths>,
+    /// Trees handed to callers, so an element id can be resolved back to the
+    /// element it named. Without this the ids in the outline are empty and the
+    /// only thing a caller can aim at is a coordinate — which is what made a
+    /// remote run cycle through activate/screenshot/look without ever acting.
+    snapshots: SnapshotCache,
 }
 
 impl std::fmt::Debug for RemoteControlAdapter {
@@ -378,6 +403,7 @@ impl RemoteControlAdapter {
             config,
             remote_os: RemoteOs::Unknown,
             paths,
+            snapshots: SnapshotCache::new(8),
         };
 
         adapter.detect_os().await?;
@@ -397,6 +423,7 @@ impl RemoteControlAdapter {
             config,
             remote_os: RemoteOs::Linux,
             paths,
+            snapshots: SnapshotCache::new(8),
         }
     }
 
@@ -495,6 +522,93 @@ impl RemoteControlAdapter {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Refuse a window action on a remote desktop that has no X11 window
+    /// manager to ask.
+    ///
+    /// The window actions below are `wmctrl`/`xdotool` calls. On a macOS or
+    /// Windows desktop those programs either do not exist or drive a different
+    /// window server, and a failure there would be reported as "the window was
+    /// not found" — a lie about the desktop rather than about this adapter.
+    fn require_x11_windows(&self, what: &str) -> Result<()> {
+        if matches!(self.remote_os, RemoteOs::Linux) {
+            return Ok(());
+        }
+        Err(ComputerError::UnsupportedPlatform(format!(
+            "cannot {what} on the remote {} desktop: window management over remote control \
+             is implemented for X11 only",
+            self.remote_os.label()
+        )))
+    }
+
+    /// Resolve a target against the cached remote snapshots.
+    ///
+    /// A tree that was read on a previous step is cached, so an id the model
+    /// was shown can be resolved without a round trip. A label or role query
+    /// needs a tree to search; with nothing cached, one read is what makes the
+    /// query answerable, and reading it is cheaper than telling the model its
+    /// own outline was unusable. A *path* id names a snapshot rather than a
+    /// control, so a stale one is reported instead of being re-aimed at
+    /// whatever now sits at that path.
+    ///
+    /// This is the same ladder the local Linux adapter uses — shared on
+    /// purpose, so a remote run and a local one disagree only about where the
+    /// tree came from, not about when to re-read it.
+    async fn resolve_remote_target(&self, target: &ClickTarget) -> Result<ActionTarget> {
+        if let ClickTarget::Coordinate(p) = target {
+            return Ok(ActionTarget::point(p.x, p.y));
+        }
+
+        let lazy = match target {
+            ClickTarget::ElementId(id) => parse_element_id(id).is_none(),
+            _ => true,
+        };
+
+        let mut resolution = self.snapshots.resolve(target).await;
+        if lazy
+            && matches!(resolution, Err(ResolveError::NotFound(_)) | Err(ResolveError::NoSnapshot))
+        {
+            self.read_ui_tree(None).await?;
+            resolution = self.snapshots.resolve(target).await;
+        }
+        resolution.map_err(|e| e.into_computer_error())
+    }
+
+    /// Resolve a target to a screen point.
+    ///
+    /// The resolved point is the element's centre as AT-SPI2/UIAutomation
+    /// reported it, which is the same mapping the local adapters use, so a
+    /// remote click lands where a local one would.
+    async fn resolve_remote_point(&self, target: &ClickTarget) -> Result<Point> {
+        self.resolve_remote_target(target).await?.coordinates()
+    }
+
+    /// Change a window's EWMH state (`wmctrl -r <name> -b <state>`).
+    async fn run_window_state(&self, state: &str, title_pattern: &str) -> Result<()> {
+        self.run_remote_text("wmctrl", &["-r", title_pattern, "-b", state])
+            .await
+            .map(|_| ())
+    }
+
+    /// Find the first X window whose title matches `pattern`, as an X id.
+    ///
+    /// `xdotool search` exits non-zero when nothing matches, so "no such
+    /// window" arrives as an error rather than an empty list; that is a fact
+    /// about the desktop, not a failed call, and the caller is told so
+    /// instead of the SSH layer's wording.
+    async fn find_remote_window(&self, pattern: &str) -> Result<Option<String>> {
+        match self
+            .run_remote_text("xdotool", &["search", "--name", pattern])
+            .await
+        {
+            Ok(out) => Ok(out
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)),
+            Err(_) => Ok(None),
+        }
     }
 
     // ── Screenshot helpers per OS ─────────────────────────────────────────
@@ -931,79 +1045,38 @@ public class SCMouse {{
 
     /// Read the UI tree of the remote Linux host via pyatspi (primary) or
     /// wmctrl (fallback).
+    ///
+    /// Returns the roots of a cached snapshot, not a loose list: the ids in
+    /// the outline are what a caller aims with, and an id nobody stored is an
+    /// id nobody can resolve. The tree is shaped the way the accessibility
+    /// reader's own JSON is shaped (`role`/`name`/`children`/`children_count`/
+    /// `truncated`), so it is parsed by the same code the local adapters use
+    /// rather than by a second dialect that could drift from it.
     async fn read_ui_tree_linux(&self, _app: Option<&str>) -> Result<Vec<UiElement>> {
-        // Strategy 1: Use python3 with pyatspi for a rich accessibility tree.
-        let py_script = r#"
-import sys
-try:
-    import pyatspi
-    desktop = pyatspi.Registry.getDesktop(0)
-    def dump(obj, depth=0):
-        if depth > 5:
-            return
-        name = obj.name or ''
-        role = obj.getRoleName() or ''
-        try:
-            ext = obj.queryComponent().getExtents(0)
-            x, y, w, h = ext.x, ext.y, ext.width, ext.height
-        except:
-            x, y, w, h = 0, 0, 0, 0
-        enabled = obj.getState().contains(pyatspi.STATE_ENABLED)
-        print(f'{x} {y} {w} {h}|{role}|{name}|{1 if enabled else 0}')
-        for i in range(obj.childCount):
-            dump(obj[i], depth + 1)
-    dump(desktop)
-except Exception as e:
-    print(f'PYATSPI_ERROR:{e}', file=sys.stderr)
-"#;
-        let output = self.run_remote("python3", &["-c", py_script]).await;
+        // Every application, not just the "active" one: an SSH session is not
+        // a desktop session, so the far side has no window the accessibility
+        // bus would call focused — asking for the active app returned the
+        // session manager and a tree with nothing on it while the terminal the
+        // goal needed sat right there. Walking the whole desktop, to a depth
+        // that reaches a terminal's text area, is what makes the ids in the
+        // outline name a control in *any* window. Sharing the script with the
+        // local readers means both sides report completeness identically.
+        let py_script = crate::computer::platform::atspi::desktop_python_script(UI_TREE_DEPTH);
+        let output = self.run_remote("python3", &["-c", &py_script]).await;
         if let Ok(out) = output {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                let mut elements = Vec::new();
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
+                if let Ok(tree) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                    let app = tree
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    if let Some(element) =
+                        crate::computer::ui_element_from_accessibility_json(&tree)
+                    {
+                        return Ok(self.snapshots.store(vec![element], app).await.roots);
                     }
-                    let parts: Vec<&str> = line.splitn(2, '|').collect();
-                    if parts.len() == 2 {
-                        let coords: Vec<i32> = parts[0]
-                            .split_whitespace()
-                            .filter_map(|s| s.parse().ok())
-                            .collect();
-                        let meta: Vec<&str> = parts[1].split('|').collect();
-                        if coords.len() == 4 && meta.len() == 3 {
-                            elements.push(UiElement {
-                                id: String::new(),
-                                role: meta[0].trim().to_string(),
-                                label: {
-                                    let l = meta[1].trim().to_string();
-                                    if l.is_empty() {
-                                        None
-                                    } else {
-                                        Some(l)
-                                    }
-                                },
-                                value: None,
-                                bounds: Some(Rect::new(
-                                    coords[0],
-                                    coords[1],
-                                    coords[2] as u32,
-                                    coords[3] as u32,
-                                )),
-                                enabled: Tri::Known(meta[2].trim() == "1"),
-                                focused: Tri::Unknown,
-                                actions: None,
-                                children: vec![],
-                                children_count: None,
-                                truncated: false,
-                            });
-                        }
-                    }
-                }
-                if !elements.is_empty() {
-                    return Ok(elements);
                 }
             }
         }
@@ -1020,7 +1093,7 @@ except Exception as e:
                 if parts.len() >= 4 {
                     let title = parts[3].trim();
                     elements.push(UiElement {
-                        id: parts[0].to_string(),
+                        id: String::new(),
                         role: "window".to_string(),
                         label: if title.is_empty() {
                             None
@@ -1039,7 +1112,11 @@ except Exception as e:
                 }
             }
             if !elements.is_empty() {
-                return Ok(elements);
+                // Window-level rows have no children, so the tree is complete
+                // as read — but it is a list of windows, not a list of
+                // controls, and saying so is what keeps it from being read as
+                // "the app has nothing on it".
+                return Ok(self.snapshots.store(elements, None).await.roots);
             }
         }
 
@@ -1128,7 +1205,10 @@ Dump-Tree $desktop 0
                     }
                 }
                 if !elements.is_empty() {
-                    return Ok(elements);
+                    // Cached like the Linux read, for the same reason: the ids
+                    // are the only thing a caller can aim an element at, and an
+                    // id the cache never stored resolves to nothing.
+                    return Ok(self.snapshots.store(elements, None).await.roots);
                 }
             }
         }
@@ -1147,6 +1227,18 @@ Dump-Tree $desktop 0
 
 #[async_trait::async_trait]
 impl ComputerAdapter for RemoteControlAdapter {
+    fn target_os(&self) -> Option<&'static str> {
+        match self.remote_os {
+            RemoteOs::Linux => Some("linux"),
+            RemoteOs::Macos => Some("macos"),
+            RemoteOs::Windows => Some("windows"),
+            // Unreachable host, or a uname this does not recognise. Saying
+            // nothing is right: a guess here becomes the model's belief about
+            // which applications exist.
+            RemoteOs::Unknown => None,
+        }
+    }
+
     async fn screenshot(&self, region: Option<Rect>) -> Result<Screenshot> {
         match self.remote_os {
             RemoteOs::Linux => self.screenshot_linux(region).await,
@@ -1160,10 +1252,77 @@ impl ComputerAdapter for RemoteControlAdapter {
     }
 
     async fn display_geometry(&self) -> Result<crate::computer::display::DisplayGeometry> {
+        use crate::computer::display;
         // The displays belong to the remote host; probing this machine would
-        // describe the wrong screen. Until the remote side reports its layout,
-        // the honest answer is "unknown" and callers must not convert.
-        Ok(crate::computer::display::DisplayGeometry::default())
+        // describe the wrong screen. Ask the remote side and parse with the
+        // same parsers the local probes use, so a remote desktop gets the same
+        // coordinate mapping a local one has — without it the pixel rung
+        // refuses every click that came from a screenshot.
+        match self.remote_os {
+            RemoteOs::Linux => {
+                if let Ok(out) = self.run_remote_text("xrandr", &["--query"]).await {
+                    let geometry = display::parse_xrandr_query(&out);
+                    if !geometry.is_empty() {
+                        return Ok(geometry);
+                    }
+                }
+                // Xvfb and minimal images ship xdpyinfo only.
+                let out = self.run_remote_text("xdpyinfo", &[]).await.map_err(|e| {
+                    ComputerError::Other(format!(
+                        "could not read the display geometry on {}: {e}",
+                        self.config.host
+                    ))
+                })?;
+                Ok(display::parse_xdpyinfo(&out))
+            }
+            RemoteOs::Macos => {
+                let out = self
+                    .run_remote_text(
+                        "osascript",
+                        &["-l", "JavaScript", "-e", display::MACOS_SCREEN_SCRIPT],
+                    )
+                    .await
+                    .map_err(|e| {
+                        ComputerError::Other(format!(
+                            "could not read the display geometry on {}: {e}",
+                            self.config.host
+                        ))
+                    })?;
+                Ok(display::parse_macos_screens(&out))
+            }
+            RemoteOs::Windows => {
+                let out = self
+                    .run_remote_text(
+                        "powershell",
+                        &[
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            display::WINDOWS_SCREEN_SCRIPT,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        ComputerError::Other(format!(
+                            "could not read the display geometry on {}: {e}",
+                            self.config.host
+                        ))
+                    })?;
+                Ok(display::parse_windows_screens(&out))
+            }
+            // Unknown OS: the honest answer is "unknown", and callers must not
+            // convert coordinates on a guess.
+            RemoteOs::Unknown => Ok(crate::computer::display::DisplayGeometry::default()),
+        }
+    }
+
+    async fn resolve_target(&self, target: &ClickTarget) -> Result<ActionTarget> {
+        // The session's rung ladder asks the adapter what a target names
+        // before it dispatches — for the accessibility rung, the occlusion
+        // check and the activation key. Without this the remote adapter fell
+        // back to the trait's "element targeting is not supported", every
+        // element-targeted step lost its pixel rung, and the run cycled.
+        self.resolve_remote_target(target).await
     }
 
     async fn read_ui_tree(&self, app: Option<&str>) -> Result<Vec<UiElement>> {
@@ -1191,25 +1350,11 @@ impl ComputerAdapter for RemoteControlAdapter {
                 Ok(ActionResult::success("screenshot captured").with_screenshot(ss))
             }
             DesktopAction::Click { target, button } => {
-                let point = match target {
-                    ClickTarget::Coordinate(p) => p,
-                    _ => {
-                        return Err(ComputerError::ElementNotFound(
-                            "Remote adapter only supports coordinate clicks".to_string(),
-                        ));
-                    }
-                };
+                let point = self.resolve_remote_point(&target).await?;
                 self.click_remote(point, button).await
             }
             DesktopAction::DoubleClick { target, button } => {
-                let point = match target {
-                    ClickTarget::Coordinate(p) => p,
-                    _ => {
-                        return Err(ComputerError::ElementNotFound(
-                            "Remote adapter only supports coordinate clicks".to_string(),
-                        ));
-                    }
-                };
+                let point = self.resolve_remote_point(&target).await?;
                 self.click_remote(point, button).await?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 self.click_remote(point, button).await
@@ -1217,14 +1362,7 @@ impl ComputerAdapter for RemoteControlAdapter {
             DesktopAction::Type { text, .. } => self.type_remote(&text).await,
             DesktopAction::KeyPress { keys } => self.keypress_remote(&keys).await,
             DesktopAction::Hover { target } => {
-                let point = match target {
-                    ClickTarget::Coordinate(p) => p,
-                    _ => {
-                        return Err(ComputerError::ElementNotFound(
-                            "Remote adapter only supports coordinate hovers".to_string(),
-                        ));
-                    }
-                };
+                let point = self.resolve_remote_point(&target).await?;
                 self.move_remote(point).await?;
                 Ok(ActionResult::success(
                     "the pointer is now over the target; the next capture shows whether the \
@@ -1316,18 +1454,42 @@ impl ComputerAdapter for RemoteControlAdapter {
                 Ok(ActionResult::success("clipboard set"))
             }
             DesktopAction::LaunchApp { name, args, wait_for_ready } => {
-                let mut cmd_args = vec![name];
-                cmd_args.extend(args);
-                let output = self
-                    .run_remote_text(
-                        &cmd_args[0],
-                        &cmd_args[1..].iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                    )
-                    .await?;
+                // A GUI app does not exit: waiting for the command to finish
+                // waits for the user to close the window, and the SSH call
+                // then times out with the app already running. Detach it
+                // (`nohup … &`, stdin from /dev/null) so the call returns as
+                // soon as the process is started.
+                let mut line = String::new();
+                if let Some(prefix) = remote_display_prefix(self.config.display.as_deref()) {
+                    line.push_str(&prefix);
+                    line.push(' ');
+                }
+                line.push_str("nohup");
+                line.push(' ');
+                line.push_str(&shell_word(&name));
+                for arg in &args {
+                    line.push(' ');
+                    line.push_str(&shell_word(arg));
+                }
+                line.push_str(" >/dev/null 2>&1 </dev/null &");
+
+                let output = self.ssh_cmd().arg(&line).output().await.map_err(|e| {
+                    ComputerError::Other(format!("SSH command failed on {}: {e}", self.config.host))
+                })?;
+                if !output.status.success() {
+                    return Err(ComputerError::ToolFailed(format!(
+                        "launching '{}' on {} failed: {}",
+                        name,
+                        self.config.host,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
                 if wait_for_ready {
+                    // Give the window manager time to map the window; the
+                    // caller's next observation is what actually confirms it.
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                Ok(ActionResult::success(output))
+                Ok(ActionResult::success(format!("Started {name}")))
             }
             DesktopAction::GetSystemStatus => {
                 let output = self.run_remote_text("uname", &["-a"]).await?;
@@ -1361,6 +1523,102 @@ impl ComputerAdapter for RemoteControlAdapter {
             DesktopAction::ReadUiTree { app } => {
                 let tree = self.read_ui_tree(app.as_deref()).await?;
                 Ok(ActionResult::success(serde_json::to_string(&tree).unwrap_or_default()))
+            }
+            // ── Window actions ────────────────────────────────────────────
+            // Every one of these is a short `wmctrl`/`xdotool` query on X11.
+            // A remote desktop is driven through the same window manager a
+            // local one is, so answering "not supported" here made the model
+            // fall back to clicking at coordinates it had no mapping for.
+            DesktopAction::ListWindows => {
+                self.require_x11_windows("list windows")?;
+                // Same shape the local X11 path answers with (`Windows:` plus
+                // the lines), because `window_list_note` carries that body into
+                // the next step's message instead of summarising it away.
+                let mut body = self.run_remote_text("wmctrl", &["-l", "-p"]).await?;
+                if body.trim().is_empty() {
+                    body = self
+                        .run_remote_text("xdotool", &["search", "--onlyvisible", ".*"])
+                        .await?;
+                }
+                Ok(ActionResult::success(format!("Windows:\n{}", body.trim())))
+            }
+            DesktopAction::GetWindowGeometry { title_pattern } => {
+                self.require_x11_windows("read a window's geometry")?;
+                let Some(id) = self.find_remote_window(&title_pattern).await? else {
+                    return Ok(ActionResult::error(format!("Window '{title_pattern}' not found")));
+                };
+                let geometry = self
+                    .run_remote_text("xdotool", &["getwindowgeometry", "--shell", &id])
+                    .await?;
+                Ok(ActionResult::success(geometry))
+            }
+            DesktopAction::ActivateWindow { title_pattern } => {
+                self.require_x11_windows("activate a window")?;
+                let output = self
+                    .run_remote_text("wmctrl", &["-a", &title_pattern])
+                    .await?;
+                Ok(ActionResult::success(if output.trim().is_empty() {
+                    format!("activated `{title_pattern}`")
+                } else {
+                    output
+                }))
+            }
+            DesktopAction::CloseWindow { title_pattern } => {
+                self.require_x11_windows("close a window")?;
+                let Some(id) = self.find_remote_window(&title_pattern).await? else {
+                    return Ok(ActionResult::error(format!("Window '{title_pattern}' not found")));
+                };
+                // `windowclose` asks the app to close (a WM_DELETE_WINDOW);
+                // `windowkill` destroys the window without letting the
+                // application react. A caller who says "close" means the
+                // former, and losing unsaved work to the latter is not
+                // recoverable.
+                self.run_remote_text("xdotool", &["windowclose", &id])
+                    .await?;
+                Ok(ActionResult::success(format!("Closed window '{title_pattern}' (id: {id})")))
+            }
+            DesktopAction::MoveWindow { title_pattern, x, y } => {
+                self.require_x11_windows("move a window")?;
+                let Some(id) = self.find_remote_window(&title_pattern).await? else {
+                    return Ok(ActionResult::error(format!("Window '{title_pattern}' not found")));
+                };
+                self.run_remote_text(
+                    "xdotool",
+                    &["windowmove", &id, &x.to_string(), &y.to_string()],
+                )
+                .await?;
+                Ok(ActionResult::success(format!("Moved window '{title_pattern}' to ({x}, {y})")))
+            }
+            DesktopAction::ResizeWindow { title_pattern, width, height } => {
+                self.require_x11_windows("resize a window")?;
+                let Some(id) = self.find_remote_window(&title_pattern).await? else {
+                    return Ok(ActionResult::error(format!("Window '{title_pattern}' not found")));
+                };
+                self.run_remote_text(
+                    "xdotool",
+                    &["windowsize", &id, &width.to_string(), &height.to_string()],
+                )
+                .await?;
+                Ok(ActionResult::success(format!(
+                    "Resized window '{title_pattern}' to {width}x{height}"
+                )))
+            }
+            DesktopAction::MinimizeWindow { title_pattern } => {
+                self.require_x11_windows("minimise a window")?;
+                let Some(id) = self.find_remote_window(&title_pattern).await? else {
+                    return Ok(ActionResult::error(format!("Window '{title_pattern}' not found")));
+                };
+                self.run_remote_text("xdotool", &["windowminimize", &id])
+                    .await?;
+                Ok(ActionResult::success(format!("Minimized window '{title_pattern}'")))
+            }
+            DesktopAction::MaximizeWindow { title_pattern } => {
+                self.require_x11_windows("maximise a window")?;
+                // wmctrl toggles the EWMH state by window name; xdotool has no
+                // maximize verb that works across window managers.
+                self.run_window_state("toggle,maximized_vert,maximized_horz", &title_pattern)
+                    .await?;
+                Ok(ActionResult::success(format!("Maximize toggled for '{title_pattern}'")))
             }
             _ => {
                 warn!("Remote adapter received unsupported action: {:?}", action);
@@ -1714,5 +1972,111 @@ mod tests {
         // A zero-sized frame describes no screen at all.
         let empty = image::DynamicImage::ImageRgb8(image::RgbImage::new(0, 0));
         assert!(is_blank_frame(&empty));
+    }
+
+    // ── Element addressing ─────────────────────────────────────────────────
+    //
+    // The remote adapter is the one adapter that cannot assume a local
+    // accessibility tool: every tree it hands out came back over SSH, so the
+    // ids in that outline have to resolve here or the caller has nothing but
+    // coordinates. These tests pin the resolution half — the reading half
+    // needs a remote host and is covered by the e2e journeys.
+
+    fn ui_element(role: &str, label: &str, x: i32, y: i32, w: u32, h: u32) -> UiElement {
+        UiElement {
+            id: String::new(),
+            role: role.to_string(),
+            label: Some(label.to_string()),
+            value: None,
+            bounds: Some(Rect::new(x, y, w, h)),
+            enabled: Tri::Known(true),
+            focused: Tri::Known(false),
+            actions: None,
+            children: vec![],
+            children_count: None,
+            truncated: false,
+        }
+    }
+
+    fn adapter() -> RemoteControlAdapter {
+        RemoteControlAdapter::new_unchecked(RemoteControlConfig::default(), crate::dirs::paths())
+    }
+
+    /// A stored snapshot's path id resolves to the element it named, with the
+    /// centre the platform reported — this is what the pixel rung clicks.
+    #[tokio::test]
+    async fn a_cached_snapshot_id_resolves_to_its_element() {
+        let adapter = adapter();
+        let snapshot = adapter
+            .snapshots
+            .store(
+                vec![ui_element("frame", "Terminal", 0, 27, 800, 500)],
+                Some("xfce4-terminal".to_string()),
+            )
+            .await;
+        let id = snapshot.roots[0].id.clone();
+        assert!(!id.is_empty(), "the store must assign ids");
+
+        let resolved = adapter
+            .resolve_target(&ClickTarget::ElementId(id))
+            .await
+            .expect("a cached id must resolve");
+        let point = resolved.coordinates().expect("the element has a box");
+        assert_eq!((point.x, point.y), (400, 277));
+        assert_eq!(resolved.app.as_deref(), Some("xfce4-terminal"));
+    }
+
+    /// A label query is answerable against the snapshot that was stored, even
+    /// though nothing re-read the remote tree.
+    #[tokio::test]
+    async fn a_label_query_uses_the_latest_snapshot_without_a_reread() {
+        let adapter = adapter();
+        adapter
+            .snapshots
+            .store(
+                vec![
+                    ui_element("menu", "File", 10, 10, 40, 20),
+                    ui_element("terminal", "Terminal", 100, 200, 400, 300),
+                ],
+                None,
+            )
+            .await;
+
+        let resolved = adapter
+            .resolve_target(&ClickTarget::ElementLabel("Terminal".to_string()))
+            .await
+            .expect("the label is in the stored tree");
+        let point = resolved.coordinates().expect("the element has a box");
+        assert_eq!((point.x, point.y), (300, 350));
+    }
+
+    /// A path id from a snapshot this cache does not hold is *stale*, not
+    /// "not found": re-reading would produce a new tree whose paths mean
+    /// different controls, so the id is refused rather than re-aimed. A
+    /// re-read here would be a remote round trip that answers the wrong
+    /// question, and the test has no remote host to serve it.
+    #[tokio::test]
+    async fn an_id_from_an_evicted_snapshot_is_reported_stale() {
+        let adapter = adapter();
+        let snapshot = adapter
+            .snapshots
+            .store(vec![ui_element("frame", "Terminal", 0, 0, 10, 10)], None)
+            .await;
+        let id = snapshot.roots[0].id.clone();
+
+        // Evict it by filling a cache of capacity 8 past the brim.
+        for _ in 0..9 {
+            adapter
+                .snapshots
+                .store(vec![ui_element("frame", "Other", 0, 0, 10, 10)], None)
+                .await;
+        }
+
+        match adapter.resolve_target(&ClickTarget::ElementId(id)).await {
+            Err(ComputerError::StaleElement(message)) => {
+                assert!(message.contains("re-read"), "{message}");
+            }
+            other => panic!("expected a stale-id refusal, got {other:?}"),
+        }
     }
 }

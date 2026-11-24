@@ -307,32 +307,66 @@ pub fn all_known_toolsets() -> Vec<Box<dyn PlatformToolSet>> {
 /// Build a human-readable summary of the current host environment
 /// and which capability sets are available.
 pub fn host_environment_summary() -> String {
+    host_environment_summary_for(None)
+}
+
+/// The same summary, told which machine the desktop tools actually act on.
+///
+/// When `desktop_os` names a machine other than this one, the line says so and
+/// the host's own capability sets are left out: they are not what the agent can
+/// use. Without that, a gateway on macOS reaching a Linux container over SSH
+/// tells the model "Host: macos", and the model asks for `Terminal` — an
+/// application the Linux box does not have. The summary is the model's only
+/// statement about which programs exist, so it must describe the computer the
+/// tools reach, not the one the gateway runs on.
+pub fn host_environment_summary_for(desktop_os: Option<&str>) -> String {
     use std::fmt::Write;
 
     let mut buf = String::new();
-    let _ = writeln!(&mut buf, "Host: {} ({})", std::env::consts::OS, std::env::consts::ARCH);
+    let local_os = std::env::consts::OS;
+    let _ = writeln!(&mut buf, "Host: {local_os} ({})", std::env::consts::ARCH);
 
-    let sets = all_known_toolsets();
-    if sets.is_empty() {
-        let _ = writeln!(&mut buf, "No OS-specific platform tool sets compiled.");
+    let remote = desktop_os.filter(|os| *os != local_os);
+    let Some(remote_os) = remote else {
+        // Desktop and host are the same machine: list what is available as
+        // before.
+        let sets = all_known_toolsets();
+        if sets.is_empty() {
+            let _ = writeln!(&mut buf, "No OS-specific platform tool sets compiled.");
+            return buf;
+        }
+
+        let mut available = Vec::new();
+
+        for set in sets {
+            if set.is_available() {
+                available.push(capability_row(set.id(), set.name(), set.tool_groups()));
+            }
+        }
+
+        if !available.is_empty() {
+            let _ = writeln!(&mut buf, "Available capabilities:");
+            for row in &available {
+                let _ = write!(&mut buf, "{row}");
+            }
+        }
+
         return buf;
-    }
+    };
 
-    let mut available = Vec::new();
-
-    for set in sets {
-        if set.is_available() {
-            available.push(capability_row(set.id(), set.name(), set.tool_groups()));
-        }
-    }
-
-    if !available.is_empty() {
-        let _ = writeln!(&mut buf, "Available capabilities:");
-        for row in &available {
-            let _ = write!(&mut buf, "{row}");
-        }
-    }
-
+    // A remote desktop: name it, and say plainly that the host's own
+    // application names do not apply.
+    let _ = writeln!(
+        &mut buf,
+        "Desktop: {remote_os} on a remote host, reached over SSH from this {local_os} \
+         machine."
+    );
+    let _ = writeln!(
+        &mut buf,
+        "All desktop actions (`computer`, `computer_run`, `screen_state`) operate on that \
+         {remote_os} machine. Its programs, paths and window manager are {remote_os} ones: do \
+         not name {local_os} applications or use {local_os} paths."
+    );
     buf
 }
 
@@ -385,5 +419,38 @@ mod tests {
         let row = capability_row("ios", "iOS Device Bridge", &[]);
         assert_eq!(row.lines().count(), 1, "{row}");
         assert!(!row.contains("list_capabilities"), "{row}");
+    }
+
+    #[test]
+    fn a_remote_desktop_of_another_os_is_named_instead_of_the_host() {
+        // A macOS gateway driving a Linux container told the model "Host:
+        // macos", and the model asked to launch `Terminal` — a program the
+        // Linux box does not have. The summary must describe the computer the
+        // tools reach.
+        let local = std::env::consts::OS;
+        let other = if local == "linux" { "macos" } else { "linux" };
+
+        let summary = host_environment_summary_for(Some(other));
+        assert!(summary.contains(other), "{summary}");
+        assert!(
+            summary.contains("remote"),
+            "the summary must say the desktop is remote:\n{summary}"
+        );
+        assert!(
+            !summary.contains("Available capabilities:"),
+            "the host's own sets are not what the agent can use:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn a_desktop_on_this_host_lists_capabilities_as_before() {
+        let local = std::env::consts::OS;
+        // Naming this host is the same as naming nothing: same machine, so the
+        // ordinary capability list is right.
+        for desktop_os in [None, Some(local)] {
+            let summary = host_environment_summary_for(desktop_os);
+            assert!(summary.starts_with("Host: "), "{summary}");
+            assert!(!summary.contains("remote"), "{summary}");
+        }
     }
 }

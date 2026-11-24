@@ -392,6 +392,19 @@ pub trait ComputerAdapter: Send + Sync {
         })
         .await
     }
+
+    /// The operating system this adapter acts on, in the words the system
+    /// prompt uses for a host (`linux`, `macos`, `windows`).
+    ///
+    /// It is not always the same as the machine the gateway runs on: a remote
+    /// adapter drives a different computer, and a model told it is on macOS
+    /// while the desktop is Linux names macOS applications — it asks for
+    /// `Terminal` and the Linux box has no such program. Returning `None`
+    /// means "this adapter does not know", and callers then say nothing rather
+    /// than guessing wrong.
+    fn target_os(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Create the appropriate adapter for the current platform.

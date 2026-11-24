@@ -57,6 +57,29 @@ impl PlatformCapabilityRegistry {
         self.disabled.contains(set_id)
     }
 
+    /// Disable every set that needs a GUI on *this* machine, returning the ids
+    /// it disabled.
+    ///
+    /// Used when the desktop the agent should act on is somewhere else: these
+    /// sets are bound to the local display — AppleScript runs on this host,
+    /// `*_desktop_control` takes over the local pointer — so leaving them
+    /// offered does not give the model a second way to reach the task, it gives
+    /// it a wrong one that looks right. Sets that need no GUI (a server's
+    /// processes, a phone over adb) are unaffected: they do not act on the host
+    /// display, so a remote desktop is no reason to withhold them.
+    pub fn disable_gui_sets(&mut self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .sets
+            .iter()
+            .filter(|s| s.constraints().requires_gui)
+            .map(|s| s.id().to_string())
+            .collect();
+        for id in &ids {
+            self.disabled.insert(id.clone());
+        }
+        ids
+    }
+
     /// All registered sets (regardless of availability).
     pub fn all_sets(&self) -> Vec<&dyn PlatformToolSet> {
         self.sets.iter().map(|s| s.as_ref()).collect()
@@ -150,5 +173,69 @@ impl PlatformCapabilityRegistry {
             cache.insert(id.to_string(), available);
         }
         available
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::computer::platform::{PlatformConstraints, PlatformToolSet};
+
+    /// A set whose only interesting property is whether it needs a GUI.
+    struct StubSet {
+        id: &'static str,
+        gui: bool,
+    }
+
+    impl PlatformToolSet for StubSet {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn name(&self) -> &str {
+            self.id
+        }
+
+        fn description(&self) -> &str {
+            "test stub"
+        }
+
+        fn constraints(&self) -> &PlatformConstraints {
+            // Leak a tiny boxed value per stub: tests only, and `constraints`
+            // has to hand back a reference that outlives the call.
+            Box::leak(Box::new(PlatformConstraints {
+                requires_gui: self.gui,
+                ..Default::default()
+            }))
+        }
+
+        fn tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
+            Vec::new()
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn disable_gui_sets_withholds_only_gui_sets() {
+        let mut reg = PlatformCapabilityRegistry::new();
+        reg.register(Box::new(StubSet { id: "x11", gui: true }));
+        reg.register(Box::new(StubSet { id: "macos", gui: true }));
+        reg.register(Box::new(StubSet { id: "linux", gui: false }));
+
+        let mut disabled = reg.disable_gui_sets();
+        disabled.sort();
+
+        assert_eq!(disabled, vec!["macos".to_string(), "x11".to_string()]);
+        assert!(reg.is_disabled("x11"));
+        assert!(reg.is_disabled("macos"));
+        // A server set acts on processes, not the display; a remote desktop is
+        // no reason to take it away.
+        assert!(!reg.is_disabled("linux"));
+
+        let names: Vec<&str> = reg.available_sets().iter().map(|s| s.id()).collect();
+        assert_eq!(names, vec!["linux"]);
     }
 }

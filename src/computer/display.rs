@@ -372,7 +372,7 @@ async fn run_probe(program: &str, args: &[&str]) -> Option<String> {
 /// bottom-left-origin global space into the top-left-origin space that
 /// CGEvent clicks and accessibility bounds use.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const MACOS_SCREEN_SCRIPT: &str = r#"
+pub(crate) const MACOS_SCREEN_SCRIPT: &str = r#"
 ObjC.import('AppKit');
 var screens = $.NSScreen.screens.js;
 if (screens.length === 0) throw new Error('no screens');
@@ -403,7 +403,7 @@ async fn probe_macos() -> DisplayGeometry {
 /// Only the caller is cfg-gated, so the tests below can cover the parser on
 /// any host.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn parse_macos_screens(output: &str) -> DisplayGeometry {
+pub(crate) fn parse_macos_screens(output: &str) -> DisplayGeometry {
     let mut displays = Vec::new();
     for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
@@ -435,7 +435,7 @@ fn display_from_json(value: &serde_json::Value) -> Option<DisplayInfo> {
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const WINDOWS_SCREEN_SCRIPT: &str = r#"
+pub(crate) const WINDOWS_SCREEN_SCRIPT: &str = r#"
 Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Screen]::AllScreens | ForEach-Object {
   '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.Bounds.X, $_.Bounds.Y, $_.Bounds.Width, $_.Bounds.Height, $_.Primary, $_.DeviceName
@@ -462,7 +462,7 @@ async fn probe_windows() -> DisplayGeometry {
 
 /// Parse `x|y|w|h|primary|name` lines from `System.Windows.Forms.Screen`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn parse_windows_screens(output: &str) -> DisplayGeometry {
+pub(crate) fn parse_windows_screens(output: &str) -> DisplayGeometry {
     let mut displays = Vec::new();
     for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let fields: Vec<&str> = line.split('|').collect();
@@ -506,7 +506,7 @@ async fn probe_linux() -> DisplayGeometry {
 
 /// Parse `xrandr --query` output: connected outputs with a `WxH+X+Y` geometry.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_xrandr_query(output: &str) -> DisplayGeometry {
+pub(crate) fn parse_xrandr_query(output: &str) -> DisplayGeometry {
     let mut displays = Vec::new();
     for line in output.lines() {
         let mut fields = line.split_whitespace();
@@ -548,7 +548,7 @@ fn parse_x11_geometry(text: &str) -> Option<DisplayInfo> {
 
 /// Parse the single `dimensions: WxH pixels` line from `xdpyinfo`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_xdpyinfo(output: &str) -> DisplayGeometry {
+pub(crate) fn parse_xdpyinfo(output: &str) -> DisplayGeometry {
     for line in output.lines() {
         if let Some(rest) = line.trim().strip_prefix("dimensions:") {
             if let Some(token) = rest.split_whitespace().next() {

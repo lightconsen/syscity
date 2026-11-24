@@ -1026,6 +1026,11 @@ pub(crate) struct ToolRegistryArgs {
     pub permissions: Arc<crate::tools::PermissionsRuntime>,
     /// Layout root shared with the gateway.
     pub paths: Arc<crate::dirs::SyscityPaths>,
+    /// Whether `[computer.remote_control] host` names a machine other than
+    /// this one. When it does, this host's GUI tool sets act on the wrong
+    /// computer and must not be offered — see the filter in
+    /// `create_default_tool_registry`.
+    pub remote_desktop: bool,
 }
 
 /// Create default tool registry with all built-in tools
@@ -1059,6 +1064,7 @@ pub(crate) async fn create_default_tool_registry(
         permissions,
         browser_allow_private,
         guardian,
+        remote_desktop,
     } = args;
 
     let mut registry = ToolRegistry::new()
@@ -1349,6 +1355,18 @@ pub(crate) async fn create_default_tool_registry(
         // Apply explicit disabled_sets filter
         for id in &disabled_sets {
             tool_reg.disable(id);
+        }
+
+        // A session whose desktop is a remote machine must not be offered this
+        // host's GUI tool sets — they would drive the wrong computer. The
+        // remote desktop is reached through the `computer` tool, which holds
+        // the remote adapter and stays available.
+        if remote_desktop {
+            let disabled = tool_reg.disable_gui_sets();
+            info!(
+                "Remote desktop configured — disabled this host's GUI tool sets: {}",
+                disabled.join(", ")
+            );
         }
 
         // Log detected capabilities before exporting

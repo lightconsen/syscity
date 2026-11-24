@@ -198,6 +198,21 @@ impl AgentConfig {
     /// is present, a structured "Agent Profile" section is injected before
     /// the free-form body.
     pub async fn full_system_prompt_with_personality(&self) -> String {
+        self.full_system_prompt_with_personality_for_desktop(None)
+            .await
+    }
+
+    /// As [`full_system_prompt_with_personality`](Self::full_system_prompt_with_personality),
+    /// but told which OS the desktop tools act on when that is not this host.
+    ///
+    /// `desktop_os` is `None` when the desktop is this machine (or no adapter
+    /// is attached). A remote desktop that is a different OS changes what the
+    /// model should believe about available programs, so the Host Environment
+    /// section is built from it rather than from `std::env::consts::OS`.
+    pub async fn full_system_prompt_with_personality_for_desktop(
+        &self,
+        desktop_os: Option<&str>,
+    ) -> String {
         let base_prompt = self.full_system_prompt();
 
         // Load personality memory
@@ -257,7 +272,7 @@ impl AgentConfig {
         // prefix on every fresh thread and go stale in long-lived ones);
         // `Context::to_messages` appends it as a per-request user snapshot
         // instead.
-        let host_env = crate::computer::platform::host_environment_summary();
+        let host_env = crate::computer::platform::host_environment_summary_for(desktop_os);
         format!("{}\n\n## Host Environment\n\n{}", result, host_env)
     }
 }

@@ -616,8 +616,13 @@ impl Agent {
         let tool_defs = self.tools.get_available(&tool_context);
         prompt_ctx.available_tools = tool_defs;
 
-        // Get base prompt
-        let base_prompt = cfg.full_system_prompt_with_personality().await;
+        // Get base prompt. The desktop tools may act on another machine (a
+        // remote adapter), and the prompt's Host Environment section is the
+        // model's only statement about which programs exist there.
+        let desktop_os = self.computer_adapter.as_ref().and_then(|a| a.target_os());
+        let base_prompt = cfg
+            .full_system_prompt_with_personality_for_desktop(desktop_os)
+            .await;
 
         // Derive KB collection from agent_id (e.g. "kb-sre")
         let kb_collection = cfg.agent_id.as_ref().map(|id| format!("kb-{}", id));
