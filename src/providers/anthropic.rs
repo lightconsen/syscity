@@ -56,6 +56,18 @@ struct AnthropicMessage {
 }
 
 /// Content block (text, image, or tool use)
+///
+/// `Thinking` and `Unknown` exist to keep the *response* parse from failing on
+/// block types this client does not model. A non-streaming reply is parsed as
+/// all-or-nothing, so one unrecognised block used to fail the whole request —
+/// and extended-thinking endpoints hit that immediately: with a small
+/// `max_tokens` the reply can be *only* a `thinking` block, which is exactly
+/// what the 1-token health probe produces. Every probe then read as a failure
+/// and the circuit breaker opened on a provider that was answering fine.
+///
+/// The streaming path never had this problem because it ignores unknown event
+/// and delta types. `Unknown` (serde's catch-all) keeps that tolerance for
+/// block types that are added upstream later.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
@@ -76,6 +88,19 @@ enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        /// Anthropic returns an opaque signature that must be echoed back when
+        /// a thinking block is replayed in a later turn. Kept so the block
+        /// round-trips; nothing here sends it yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// A block type this client does not model. Dropped rather than fatal —
+    /// see the note above.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Anthropic image source format
@@ -412,12 +437,16 @@ impl AnthropicProvider {
     /// Convert Anthropic response to internal format
     fn from_anthropic_response(response: AnthropicResponse) -> CompletionResponse {
         let mut text_content = String::new();
+        let mut reasoning_content = String::new();
         let mut tool_calls = Vec::new();
 
         for block in &response.content {
             match block {
                 ContentBlock::Text { text } => {
                     text_content.push_str(text);
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    reasoning_content.push_str(thinking);
                 }
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ToolCall {
@@ -440,7 +469,11 @@ impl AnthropicProvider {
                 role: Role::Assistant,
                 content: text_content,
                 content_blocks: None,
-                reasoning_content: None,
+                reasoning_content: if reasoning_content.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_content)
+                },
                 name: None,
                 tool_calls: if tool_calls.is_empty() {
                     None
@@ -841,6 +874,87 @@ mod tests {
         let provider = AnthropicProvider::new("test-key").unwrap();
         assert_eq!(provider.name(), "anthropic");
         assert!(provider.supports_tools());
+    }
+
+    /// A reply made only of a `thinking` block must still parse.
+    ///
+    /// This is the health-probe shape: `max_tokens: 1` on an
+    /// extended-thinking model spends the whole budget thinking, so the reply
+    /// carries no text block at all. Before `ContentBlock::Thinking` existed
+    /// the parse failed, `health_check` reported `Ok(false)`, and five probes
+    /// opened the circuit breaker on a provider that was answering normally.
+    #[test]
+    fn thinking_only_response_parses() {
+        let body = r#"{
+            "id": "msg_probe",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4.1-flash",
+            "content": [
+                {"type": "thinking", "thinking": "We", "signature": ""}
+            ],
+            "stop_reason": "max_tokens",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 31, "output_tokens": 1}
+        }"#;
+
+        let parsed: AnthropicResponse =
+            serde_json::from_str(body).expect("a thinking-only reply must parse");
+
+        let response = AnthropicProvider::from_anthropic_response(parsed);
+        assert_eq!(response.message.content, "");
+        assert_eq!(response.message.reasoning_content.as_deref(), Some("We"));
+        assert_eq!(response.finish_reason.as_deref(), Some("max_tokens"));
+    }
+
+    /// A block type this client does not model is dropped, not fatal.
+    ///
+    /// Vendor-compatible endpoints add block types ahead of this client; one
+    /// unknown type must not fail a reply whose text is perfectly usable.
+    #[test]
+    fn unknown_content_block_is_dropped() {
+        let body = r#"{
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "hello"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+
+        let parsed: AnthropicResponse =
+            serde_json::from_str(body).expect("an unknown block must not fail the parse");
+
+        let response = AnthropicProvider::from_anthropic_response(parsed);
+        assert_eq!(response.message.content, "hello");
+        assert!(response.message.reasoning_content.is_none());
+    }
+
+    /// Text and thinking in one reply keep their separation.
+    #[test]
+    fn thinking_and_text_are_split() {
+        let body = r#"{
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {"type": "thinking", "thinking": "let me think"},
+                {"type": "text", "text": "the answer"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        }"#;
+
+        let parsed: AnthropicResponse = serde_json::from_str(body).expect("parse");
+        let response = AnthropicProvider::from_anthropic_response(parsed);
+
+        assert_eq!(response.message.content, "the answer");
+        assert_eq!(response.message.reasoning_content.as_deref(), Some("let me think"));
     }
 
     #[test]
