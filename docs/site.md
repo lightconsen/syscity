@@ -17,7 +17,7 @@ this repo.
 | `site/src/` | React source (components, i18n) |
 | `site/public/` | Copied verbatim into `dist/` — favicons, `og-image.png`, `robots.txt`, `sitemap.xml`, `site.webmanifest`, the legal and 404 pages |
 | `site/scripts/postbuild.mjs` | Prerenders the app into `dist/index.html`, inlines the single stylesheet, injects the analytics beacon |
-| `site/scripts/optimize-assets.sh` | Regenerates the WebP/AVIF screenshots and MP4/WebM demo from sources |
+| `site/scripts/optimize-assets.sh` | Regenerates the WebP/AVIF screenshots from sources. It does **not** touch the demo clip — `src/assets/demo-desktop.*` is a hand-cut composite that must not be regenerated |
 | `.github/workflows/site-pages.yml` | Build + deploy; also bakes `scripts/install.sh` and `install.ps1` into the artifact |
 
 ## Build and check locally

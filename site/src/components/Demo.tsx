@@ -1,12 +1,9 @@
 import { useEffect, useState } from "react";
 import { useLanguage } from "../i18n";
 
-import demoDarkMp4 from "../assets/demo-dark.mp4";
-import demoDarkPoster from "../assets/demo-dark-poster.webp";
-import demoDarkWebm from "../assets/demo-dark.webm";
-import demoLightMp4 from "../assets/demo-light.mp4";
-import demoLightPoster from "../assets/demo-light-poster.webp";
-import demoLightWebm from "../assets/demo-light.webm";
+import demoMp4 from "../assets/demo-desktop.mp4";
+import demoPoster from "../assets/demo-desktop-poster.webp";
+import demoWebm from "../assets/demo-desktop.webm";
 import androidDarkAvif from "../assets/mobile-android-dark.avif";
 import androidDarkWebp from "../assets/mobile-android-dark.webp";
 import androidLightAvif from "../assets/mobile-android-light.avif";
@@ -16,9 +13,13 @@ import iosDarkWebp from "../assets/mobile-ios-dark.webp";
 import iosLightAvif from "../assets/mobile-ios-light.avif";
 import iosLightWebp from "../assets/mobile-ios-light.webp";
 
-/** The demo animation's encoded size (1200×567 rounded to even height). */
-const DEMO_W = 1200;
-const DEMO_H = 566;
+/** The demo clip's encoded size. It is a composite: the app and the Linux
+ * desktop it drove, side by side, with a caption band along the bottom, so the
+ * frame is wider and taller than a plain 1200×566 screen recording. `Demo.tsx`
+ * reserves exactly this box before the clip decodes, so the poster and the
+ * video are the same shape. */
+const DEMO_W = 1600;
+const DEMO_H = 662;
 
 /** The phone screenshots' encoded size. The Android capture is 26 px taller
  * than the iOS one, so the two are declared separately — a shared height
@@ -29,40 +30,13 @@ const IOS_SHOT_H = 1040;
 const ANDROID_SHOT_H = 1066;
 
 /**
- * Whether the visitor prefers a dark interface.
- *
- * `<picture>` picks between the two screenshot sets by itself — but a
- * `<video>` cannot: its `<source media>` attribute is not honoured, so the
- * choice has to come from script. Set once on mount and kept in step with the
- * OS setting.
- */
-function usePrefersDark(): boolean {
-  // Starts `false` rather than reading the query during render, for the same
-  // reason the language does: the HTML is prerendered light, and a first
-  // client render that claimed dark would disagree with it — React answers
-  // that by discarding the prerendered subtree. Resolved in the effect below,
-  // so a dark visitor gets the dark clip one frame later.
-  const [dark, setDark] = useState(false);
-
-  useEffect(() => {
-    const query = window.matchMedia("(prefers-color-scheme: dark)");
-    setDark(query.matches);
-    const onChange = (event: MediaQueryListEvent) => setDark(event.matches);
-    query.addEventListener("change", onChange);
-    return () => query.removeEventListener("change", onChange);
-  }, []);
-
-  return dark;
-}
-
-/**
  * Play `video` once it scrolls into view, and never for a visitor who asked
  * for reduced motion.
  *
  * With `autoPlay` the browser fetches the whole clip on page load even though
- * the demo sits below the fold — 73 KB for something most visitors have not
+ * the demo sits below the fold — 386 KB for something most visitors have not
  * scrolled to. Waiting for the element to be seen means a visitor who never
- * scrolls never pays for it, and the poster (already loaded, 22 KB) is what
+ * scrolls never pays for it, and the poster (already loaded, 50 KB) is what
  * they see instead; the poster also carries the reserved box, so starting
  * playback moves nothing. The margin is zero on purpose: any prefetch margin
  * just moves the line at which the download starts, and this clip is not worth
@@ -94,11 +68,6 @@ function usePlayInView(video: HTMLVideoElement | null) {
 
 export default function Demo() {
   const { t } = useLanguage();
-  const dark = usePrefersDark();
-  // The element lands in state (not a ref) because the `<video>` is remounted
-  // with a new `key` when the theme resolves — remounting is what makes the
-  // browser re-read the `<source>` children, and the observer has to follow
-  // the new element.
   const [video, setVideo] = useState<HTMLVideoElement | null>(null);
   usePlayInView(video);
 
@@ -115,26 +84,31 @@ export default function Demo() {
           The demo used to be a 195 KB GIF — 87% of the page's weight, and the
           largest single cause of the layout shift. A video codec expresses
           inter-frame change the way a screen recording actually changes, so
-          the same clip costs a third of the bytes; the poster fills the frame
-          before playback, and width/height reserve the space so nothing moves
-          underneath it. Muted because the clip has no audio and browsers only
-          autoplay muted video.
+          the same clip costs a fraction of the bytes; the poster fills the
+          frame before playback, and width/height reserve the space so nothing
+          moves underneath it. Muted because the clip has no audio and browsers
+          only autoplay muted video.
+
+          One clip for both themes. It is a screen recording of the app doing
+          real work on a Linux desktop, and re-staging it in dark mode would
+          mean a second run on a metered model — the frames are evidence, not
+          decoration. The surrounding page still follows the visitor's theme;
+          only this window stays light, the way a screenshot would.
         */}
         <video
-          key={dark ? "dark" : "light"}
           ref={setVideo}
           className="w-full"
           width={DEMO_W}
           height={DEMO_H}
-          poster={dark ? demoDarkPoster : demoLightPoster}
+          poster={demoPoster}
           loop
           muted
           playsInline
           preload="none"
           aria-label={t.demo.alt}
         >
-          <source src={dark ? demoDarkWebm : demoLightWebm} type="video/webm" />
-          <source src={dark ? demoDarkMp4 : demoLightMp4} type="video/mp4" />
+          <source src={demoWebm} type="video/webm" />
+          <source src={demoMp4} type="video/mp4" />
         </video>
       </div>
       <p className="mt-4 text-center text-sm text-muted">

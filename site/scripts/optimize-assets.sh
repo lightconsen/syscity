@@ -35,36 +35,13 @@ done
 # One WebP is enough; it lands under 5 KB.
 cwebp -quiet -q 88 -m 6 -alpha_q 100 "$SRC/../syscity.png" -o "$OUT/syscity.webp"
 
-# ── Demo animation: GIF → MP4 (H.264) + WebM (VP9) ────────────────────────
-# A GIF cannot express inter-frame compression for screen recordings the way a
-# video codec can; these land around a quarter of the GIF's bytes. The GIF has
-# no audio track, so the videos carry none either (which is also what lets the
-# page autoplay them muted).
-for name in demo-light demo-dark; do
-  # The source is 1200×567 and H.264's yuv420p needs even dimensions, so the
-  # filter rounds both down (losing at most one row/column of the last line).
-  SCALE="scale=trunc(iw/2)*2:trunc(ih/2)*2"
-  ffmpeg -loglevel error -y -i "$SRC/$name.gif" -vf "$SCALE" \
-    -c:v libx264 -preset veryslow -crf 30 -pix_fmt yuv420p \
-    -movflags +faststart -an "$OUT/$name.mp4"
-  # The GIF carries an alpha channel, which decodes to `gbrap` — a pixel
-  # format VP9 refuses. `yuva420p` is the alpha-capable format it wants, and
-  # VP9 only honours alpha with alternate reference frames off.
-  ffmpeg -loglevel error -y -i "$SRC/$name.gif" -vf "$SCALE" \
-    -c:v libvpx-vp9 -crf 36 -b:v 0 -row-mt 1 -pix_fmt yuva420p -auto-alt-ref 0 \
-    -an "$OUT/$name.webm"
-done
-
-# ── Poster frames ─────────────────────────────────────────────────────────
-# A `<video>` needs a poster so the layout is filled before playback starts
-# (and for the first paint, which is what keeps CLS at zero).
-# ffmpeg's build here has no WebP encoder, so the frame is extracted as PNG
-# and encoded by cwebp (the same tool the screenshots use).
-for name in demo-light demo-dark; do
-  ffmpeg -loglevel error -y -i "$SRC/$name.gif" -frames:v 1 "$OUT/$name-poster.png"
-  cwebp -quiet -q 80 -m 6 "$OUT/$name-poster.png" -o "$OUT/$name-poster.webp"
-  rm -f "$OUT/$name-poster.png"
-done
+# ── Demo clip ───────────────────────────────────────────────────────────────
+# NOT generated here. The landing page's demo is a composite screen recording —
+# the app next to the Linux desktop it drove, with captions burned in — that is
+# cut by hand from a real run, not derived from a checked-in GIF. The previous
+# per-theme `demo-light`/`demo-dark` pair came from `public/assets/*.gif` and no
+# longer exists; `src/assets/demo-desktop.mp4|webm|-poster.webp` is authored, so
+# re-running this script must not overwrite or recreate the old pair.
 
 echo "Generated:"
 ls -la "$OUT" | awk 'NF>3 && $9 !~ /^\.\.?$/ {printf "  %-32s %7.0f KB\n", $9, $5/1024}'
