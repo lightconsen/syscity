@@ -1148,7 +1148,17 @@ function ChatShell() {
                 >
                   <ComputerPanel
                     transport={transport}
-                    sessionId={transport.getSessionId() || null}
+                    sessionId={
+                      // A freshly armed New Session page has no conversation
+                      // yet — `armNewSession` deliberately leaves `sessionId`
+                      // on the previous one so its history is not reloaded.
+                      // Passing that id here made the panel keep showing the
+                      // *previous* conversation's desktop run above an empty
+                      // "How can I help today?" — a run from someone else's
+                      // context, which is the confusion the panel exists to
+                      // end. No conversation means no runs to show.
+                      transport.isPendingNewSession() ? null : transport.getSessionId() || null
+                    }
                     onClose={() => setComputerPanelOpen(false)}
                   />
                 </ErrorBoundary>
