@@ -105,8 +105,12 @@ depth. Add it to `public/sitemap.xml` too.
 
 The legal pages are plain HTML with the shared shell inlined; if the shell
 changes, change it in both `privacy.html` and `terms.html`. The contact
-addresses are placeholders (`privacy@example.com`, `legal@example.com`) and
-must be replaced before the pages are considered final.
+addresses are `privacy@lightconsen.com` and `legal@lightconsen.com`, and the
+same domain carries `security@` (SECURITY.md) and `syscity-conduct@`
+(CODE_OF_CONDUCT.md). `lightconsen.com` publishes Cloudflare MX records, so
+these receive mail — but a mailbox that is never read is worse than none:
+confirm the four addresses are routed somewhere a person checks before the
+launch posts go out.
 
 ## Things that are deliberately absent
 

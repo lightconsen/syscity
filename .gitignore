@@ -31,6 +31,10 @@ logs/
 # Test artifacts
 tts_*.aiff
 
+# Screen recordings kept while cutting a demo; hundreds of MB of AV1 that the
+# repo has no use for once the clip is published.
+.demo-capture/
+
 # ONNX model files
 /models/
 

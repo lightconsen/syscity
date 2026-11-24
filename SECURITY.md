@@ -2,6 +2,10 @@
 
 This document outlines the security model, known vulnerabilities, and security practices for Syscity.
 
+> **Reporting a vulnerability:** email **security@lightconsen.com**. Please do not
+> open a public issue. We aim to respond within 48 hours. Details and what to
+> include are under [Reporting Security Issues](#reporting-security-issues).
+
 ## Security Model
 
 ### Defense in Depth
@@ -201,8 +205,8 @@ Before deploying Syscity:
 
 If you discover a security vulnerability:
 
-1. **DO NOT** open a public issue
-2. Email security concerns to: security@example.com
+1. **DO NOT** open a public issue.
+2. Email security concerns to: **security@lightconsen.com**
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
