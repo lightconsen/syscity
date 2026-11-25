@@ -29,13 +29,9 @@ Traditional AI lives inside a browser tab. Syscity lives inside your machine.
 
 **For developers** who want to build LLM-powered automation. **For power users** who want AI to control their desktop, not just chat.
 
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/demo.gif" />
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/demo-dark.gif" />
-  <img src="docs/assets/demo.gif" alt="Syscity Demo — Agent generates a report and shows it in the preview panel" width="800" />
-</picture>
+<img src="docs/assets/demo-desktop.gif" alt="Syscity demo — an agent opens a terminal on a real Linux desktop, runs a command, and shows each step in the run panel" width="800" />
 <br/>
-<p align="center"><em>Agent generates a markdown report via <code>write_report</code>, then previews it in a split-panel view.</em></p>
+<p align="center"><em>An autonomous desktop run opens a terminal on a real Linux desktop, runs <code>uname -a</code>, and lands every step on the panel as it happens.</em></p>
 
 ## Install
 
