@@ -367,6 +367,10 @@ False，所以本地 pass rate 不是 GAIA 分数，不能进 ledger。官方 sc
 Space 的官方 harness；本仓库的 `--split test` 只用于**生成题目与下载附件**（跑完再看轨迹），
 不会给出可比分数。导入器对 test split 的输出里已注明这一点。
 
+提交规则、账号门槛（`john-lightconsen` 于 2026-10-26 创建，Space 要求满 60 天，
+**2026-12-25 起可交**）、以及到期前的待办，见
+[`gaia-leaderboard.md`](gaia-leaderboard.md)。
+
 **基线（2026-10-26，`deepseek-v4-flash`，内置 Agent 循环，53 条 × 3 trials = 159）**：
 
 | 指标 | 数值 |
