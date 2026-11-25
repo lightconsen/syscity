@@ -1045,7 +1045,7 @@ mod tests {
 
         let handler = CanvasWebSocketHandler::new(canvas_id, event_tx, update_rx);
 
-        let msg = Message::Text(r#"{"event":"button_click","component_id":"btn1"}"#.to_string());
+        let msg = Message::Text(r#"{"event":"button_click","component_id":"btn1"}"#.into());
         let result = handler.handle_message(msg).await;
 
         assert!(result.is_some());
@@ -1064,7 +1064,7 @@ mod tests {
 
         let handler = CanvasWebSocketHandler::new(canvas_id, event_tx, update_rx);
 
-        let msg = Message::Binary(vec![1, 2, 3]);
+        let msg = Message::Binary(vec![1, 2, 3].into());
         let result = handler.handle_message(msg).await;
         assert!(result.is_none());
     }

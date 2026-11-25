@@ -189,7 +189,7 @@ impl TestGateway {
         let frame = json!({ "type": "event", "event": event, "payload": payload, "seq": 1 });
         // Nobody listening is not an error: a test may push before the client
         // has connected, or between connections.
-        let _ = self.events.send(Message::Text(frame.to_string()));
+        let _ = self.events.send(Message::Text(frame.to_string().into()));
     }
 
     /// Drop the connection, the way a gateway restart would.
@@ -279,7 +279,7 @@ async fn serve(stream: tokio::net::TcpStream, shared: Shared, mut close_rx: ones
                             .unwrap_or_else(|| payload_for(&method, &params, &shared.history)),
                     }),
                 };
-                if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
                     break;
                 }
             }

@@ -796,7 +796,7 @@ async fn handle_socket_mode_message(
     if let Some(eid) = envelope_id {
         let ack = serde_json::json!({ "envelope_id": eid });
         if let Err(e) = write
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(ack.to_string()))
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(ack.to_string().into()))
             .await
         {
             warn!("Slack Socket Mode: failed to send ACK: {}", e);

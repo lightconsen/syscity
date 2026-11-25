@@ -109,7 +109,7 @@ impl DaemonClient {
             let frame = json!({ "type": "req", "id": id, "method": method, "params": params });
             let text = serde_json::to_string(&frame)
                 .map_err(|e| crate::error::SyscityError::Internal(format!("JSON error: {}", e)))?;
-            futures::SinkExt::send(write, Message::Text(text))
+            futures::SinkExt::send(write, Message::Text(text.into()))
                 .await
                 .map_err(|e| {
                     crate::error::SyscityError::Internal(format!("WebSocket send failed: {}", e))
