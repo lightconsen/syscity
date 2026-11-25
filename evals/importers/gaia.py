@@ -460,18 +460,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         levels = tuple(sorted(SPLITS[split]))
 
-    slug_prefix = args.slug or (
-        "gaia_l1"
-        if split == "validation" and levels == (1,)
-        else f"gaia_{split[0]}" + "".join(map(str, levels))
-    )
-    # Task ids keep the level list (`gaia_t123_…`) so a badcase id says exactly
-    # which files and levels it came from; the file names stay readable.
+    # One name for the suite, its files, and its task ids. `gaia_l1` is the
+    # committed M2 baseline and keeps the id its ledger records; every other
+    # combination is `gaia_<split>_l<levels>` (`gaia_test_l123`), so a badcase
+    # id says exactly which split and levels it came from.
     file_stem = (
         "gaia_l1"
         if split == "validation" and levels == (1,)
         else f"gaia_{split}_l" + "".join(map(str, levels))
     )
+    slug_prefix = args.slug or file_stem
     out = args.out or REPO_ROOT / "evals" / "capability" / f"{file_stem}.yaml"
     answers_out = args.answers_out or (
         REPO_ROOT / "evals" / "capability" / f"{file_stem}_answers.json"
@@ -519,24 +517,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     with_files = sum(1 for r in answers.values() if r["has_attachment"])
-    # The suite id the committed manifest uses: `gaia_l1` for the validation
-    # Level-1 baseline, `gaia_<split>` for a whole-split import.
-    suite = "gaia_l1" if split == "validation" and levels == (1,) else f"gaia_{split}"
     print(f"wrote {len(tasks)} tasks -> {out}")
     print(f"  {with_files} with attachments, cached under {cache / 'files'}")
     print(f"wrote ground truth -> {answers_out}")
     print()
-    print("Run the baseline with:")
-    if suite == "gaia_l1":
-        print(f"  syscity eval run {suite} --full --trials 3")
+    if split == "test":
+        print("The test split cannot be scored locally (answers are private). Generate")
+        print("it only to inspect the agent's traces; submit the answers to the GAIA")
+        print("leaderboard Space for a score.")
+        return 0
+    print("Run it with:")
+    if file_stem == "gaia_l1":
+        print(f"  syscity eval run {file_stem} --full --trials 3")
     else:
-        print(f"  syscity eval run {suite} --full")
-        if split == "test":
-            print(
-                "  NOTE: the test split's answers are private. Local scoring is "
-                "not possible\n  — submit the run to the GAIA leaderboard — so a "
-                "local pass rate is not\n  a GAIA score."
-            )
+        print(f"  syscity eval run {file_stem} --full")
     return 0
 
 
