@@ -356,6 +356,17 @@ syscity eval run gaia_l1 --full --trials 3
 打印授权地址，不会静默产出空套件。token 只经环境变量传入，本机的凭据文件在仓库根
 （`hf.secret`，被 `*.secret` 规则 gitignore），不入仓。
 
+**测试集的答案不公开。** 排行榜只收 test split（Levels 1–3，301 题 = 93 + 159 + 49），
+而它的 `Final answer` 列**全部是 `?`**——官方把答案留作私有（数据集卡片原文：
+"a test set with private answers and metadata"）。本地跑只能拿到 agent 的作答轨迹，
+**无法判分**：`question_scorer('任何答案', '?')` 只有作答本身是 `?` 时才为真，别的都是
+False，所以本地 pass rate 不是 GAIA 分数，不能进 ledger。官方 scorer 判定真值 `?` 的语义
+就是"该题答案不唯一/不应作为唯一解"，测试集里 301 条全是这个占位值。
+
+因此 `syscity eval run` 只能给 validation 出分。要提交测试集，得走 GAIA leaderboard
+Space 的官方 harness；本仓库的 `--split test` 只用于**生成题目与下载附件**（跑完再看轨迹），
+不会给出可比分数。导入器对 test split 的输出里已注明这一点。
+
 **基线（2026-10-26，`deepseek-v4-flash`，内置 Agent 循环，53 条 × 3 trials = 159）**：
 
 | 指标 | 数值 |

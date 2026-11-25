@@ -423,6 +423,9 @@ GAIA Level 1 的生成步骤和判分口径见 [`../docs/benchmark.md`](../docs/
 `syscity eval run gaia_l1 --full --trials 3`。当前基线 144/159 = 90.6%
 （3 次全过 43/53），见 `ledger.md` 的"外部基准"一节。
 
+GAIA 的 **test split 本地不能判分**：它的答案在元数据里全是 `?`（官方留作私有），
+`--split test` 只用来生成题目、下载附件、看轨迹，不产出可比分数。别把它当成 GAIA 分数。
+
 `evals/suites/gaia_l1.yaml` 里写着 `generated_tasks: true`：清单入仓、任务文件不入仓，
 所以没跑过生成器的机器上 `tests/eval_suites_validate.rs` 会跳过它而不是判失败；要跑套件
 本身仍需先跑生成器，否则 `eval run` 会报错并提示这一步。
