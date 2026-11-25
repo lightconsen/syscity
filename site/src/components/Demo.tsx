@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Maximize2, Minimize2 } from "lucide-react";
 import { useLanguage } from "../i18n";
 
 import demoMp4 from "../assets/demo-desktop.mp4";
@@ -66,19 +67,121 @@ function usePlayInView(video: HTMLVideoElement | null) {
   }, [video]);
 }
 
+/**
+ * Keep `isFullscreen` in sync with the browser, not with the click.
+ *
+ * The Fullscreen API can be left without our button: Escape, the browser's own
+ * overlay, or the page navigating away. Driving the icon from
+ * `fullscreenchange` means the button never claims a state the element is not
+ * in — and `document.fullscreenElement` is also what decides whether the next
+ * click should ask to enter or to leave.
+ */
+function useFullscreenState(
+  element: React.RefObject<HTMLDivElement | null>,
+  setActive: (active: boolean) => void,
+) {
+  useEffect(() => {
+    const onChange = () => setActive(document.fullscreenElement === element.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, [element, setActive]);
+}
+
+/**
+ * Enter/leave fullscreen for the demo frame.
+ *
+ * A rejected request is left silent on purpose: browsers refuse without a user
+ * gesture (and iOS refuses on a non-`<video>` element), and the clip stays
+ * playable in place. The button is hidden where the API does not exist so it
+ * cannot present a control that does nothing.
+ *
+ * `aria-pressed` is the state; the label says what the button will do, so it
+ * changes with the state rather than staying "fullscreen" while already full.
+ */
+function FullscreenButton({
+  isFullscreen,
+  frameRef,
+}: {
+  isFullscreen: boolean;
+  frameRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const { t } = useLanguage();
+  const [supported, setSupported] = useState(false);
+
+  // Prerendering runs without a document, so this cannot be a render-time
+  // check — and a button that appears after hydration is better than one that
+  // throws during the build.
+  useEffect(() => {
+    const el = frameRef.current;
+    setSupported(Boolean(el && (el.requestFullscreen || (el as FullscreenCapable).webkitRequestFullscreen)));
+  }, [frameRef]);
+
+  if (!supported) return null;
+
+  const toggle = () => {
+    const el = frameRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      void document.exitFullscreen().catch(() => {});
+    } else {
+      const req =
+        el.requestFullscreen?.bind(el) ??
+        (el as FullscreenCapable).webkitRequestFullscreen?.bind(el);
+      if (req) void Promise.resolve(req()).catch(() => {});
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={toggle}
+      aria-pressed={isFullscreen}
+      aria-label={isFullscreen ? t.demo.exitFullscreen : t.demo.fullscreen}
+      title={isFullscreen ? t.demo.exitFullscreen : t.demo.fullscreen}
+      className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-line bg-panel px-2.5 py-1.5 text-xs font-semibold text-muted transition hover:border-brand-500/60 hover:text-brand-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
+    >
+      {isFullscreen ? (
+        <Minimize2 className="h-3.5 w-3.5" aria-hidden="true" />
+      ) : (
+        <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
+      )}
+      <span className="hidden sm:inline">
+        {isFullscreen ? t.demo.exitFullscreen : t.demo.fullscreen}
+      </span>
+    </button>
+  );
+}
+
+/** Safari exposes the Fullscreen API under the `webkit` prefix. */
+type FullscreenCapable = {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+};
+
 export default function Demo() {
   const { t } = useLanguage();
   const [video, setVideo] = useState<HTMLVideoElement | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   usePlayInView(video);
+  useFullscreenState(frameRef, setIsFullscreen);
 
   return (
     <section className="mx-auto max-w-5xl px-6 pb-24">
-      <div className="card overflow-hidden rounded-2xl shadow-[0_24px_64px_rgba(25,26,35,0.10)]">
-        <div className="flex items-center gap-2 border-b border-line bg-panel-2 px-4 py-3">
+      {/* The frame, not the <video>, is what goes fullscreen: the window bar
+          and the control belong to the same box, so the clip does not end up
+          letterboxed inside a bare fullscreen video element with the title bar
+          missing. It also keeps the captured element identical to the one the
+          layout already reserves space for. */}
+      <div
+        ref={frameRef}
+        className="card demo-frame group relative overflow-hidden rounded-2xl shadow-[0_24px_64px_rgba(25,26,35,0.10)]"
+      >
+        <div className="demo-bar flex items-center gap-2 border-b border-line bg-panel-2 px-4 py-3">
           <span className="h-3 w-3 rounded-full bg-[#ff5f57]" aria-hidden="true" />
           <span className="h-3 w-3 rounded-full bg-[#febc2e]" aria-hidden="true" />
           <span className="h-3 w-3 rounded-full bg-[#28c840]" aria-hidden="true" />
           <span className="ml-3 text-xs text-faint">{t.demo.chromeTitle}</span>
+          <FullscreenButton isFullscreen={isFullscreen} frameRef={frameRef} />
         </div>
         {/*
           The demo used to be a 195 KB GIF — 87% of the page's weight, and the

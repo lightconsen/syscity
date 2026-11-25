@@ -41,6 +41,8 @@ const en = {
     captionAfter: ", and lands every step on the panel as it happens.",
     iosCaption: "Chat, voice, camera & device tools on iOS",
     androidCaption: "Chat, voice, camera & device tools on Android",
+    fullscreen: "Fullscreen",
+    exitFullscreen: "Exit fullscreen",
   },
   features: {
     eyebrow: "Features",
@@ -172,6 +174,8 @@ const zh: Dict = {
     captionAfter: "，每一步都实时落在面板上。",
     iosCaption: "iOS 上的聊天、语音、相机与设备工具",
     androidCaption: "Android 上的聊天、语音、相机与设备工具",
+    fullscreen: "全屏",
+    exitFullscreen: "退出全屏",
   },
   features: {
     eyebrow: "功能",
