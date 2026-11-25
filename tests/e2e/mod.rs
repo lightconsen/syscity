@@ -731,11 +731,12 @@ impl FrontendSimulator {
 
     /// Connect with an explicit `auth` payload in the handshake frame.
     async fn connect_url_with_auth(url: String, auth: serde_json::Value) -> Self {
-        let config = WebSocketConfig {
-            max_frame_size: Some(128 << 20), // 128 MB — large enough for screenshot base64
-            max_message_size: Some(128 << 20),
-            ..Default::default()
-        };
+        // 0.30 made `WebSocketConfig` non-exhaustive, so it can only be built
+        // through these setters rather than a struct literal. Both sizes are
+        // 128 MB — large enough for a screenshot's base64 in one message.
+        let config = WebSocketConfig::default()
+            .max_frame_size(Some(128 << 20))
+            .max_message_size(Some(128 << 20));
         let (ws_stream, _) = connect_async_with_config(&url, Some(config), false)
             .await
             .expect("Failed to connect to WebSocket");
@@ -752,7 +753,7 @@ impl FrontendSimulator {
             }
         });
         write
-            .send(Message::Text(connect_req.to_string()))
+            .send(Message::Text(connect_req.to_string().into()))
             .await
             .unwrap();
 
@@ -775,7 +776,10 @@ impl FrontendSimulator {
     /// Send a frame without waiting for its response — for tests that need a
     /// burst rather than a round trip.
     pub async fn send_raw_frame(&mut self, frame: &str) {
-        let _ = self.write.send(Message::Text(frame.to_string())).await;
+        let _ = self
+            .write
+            .send(Message::Text(frame.to_string().into()))
+            .await;
     }
 
     /// Read the next `res` frame, or `None` when the connection ends.
@@ -805,7 +809,7 @@ impl FrontendSimulator {
     /// a frame it cannot parse.
     pub async fn send_raw_and_read_response(&mut self, frame: &str) -> serde_json::Value {
         self.write
-            .send(Message::Text(frame.to_string()))
+            .send(Message::Text(frame.to_string().into()))
             .await
             .unwrap();
         timeout(Duration::from_secs(10), async {
@@ -833,7 +837,7 @@ impl FrontendSimulator {
             "params": params,
         });
         self.write
-            .send(Message::Text(req.to_string()))
+            .send(Message::Text(req.to_string().into()))
             .await
             .unwrap();
 

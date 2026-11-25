@@ -124,7 +124,8 @@ async fn token_auth_accepts_a_valid_token_and_completes_a_turn() {
                     "auth": { "token": TOKEN }
                 }
             })
-            .to_string(),
+            .to_string()
+            .into(),
         ))
         .await
         .expect("send connect");
