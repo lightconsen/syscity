@@ -203,6 +203,14 @@ pub struct HelloOkPayload {
     pub features: Vec<String>,
     /// Scopes granted to this connection
     pub scopes_granted: Vec<String>,
+    /// The one agent this connection may use, when it authenticated with an
+    /// agent access token; absent otherwise.
+    ///
+    /// Told to the client rather than kept server-side only: a Desktop
+    /// configured with one agent's token should show *that* agent, not a
+    /// sidebar full of agents it will be refused for every time it asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bound_agent: Option<String>,
     /// Server info
     pub server: ServerInfo,
 }
@@ -652,6 +660,13 @@ pub struct ProtocolConnection {
     pub scopes: Vec<String>,
     /// User ID if authenticated
     pub user_id: Option<UserId>,
+    /// The one agent this connection may use, when it authenticated with an
+    /// agent access token. `None` is every other credential and means "no
+    /// per-agent restriction".
+    ///
+    /// Enforced in the dispatcher (`ws::bound`), not here: this is the fact,
+    /// the refusal lives where the methods are dispatched.
+    pub bound_agent: Option<String>,
     /// Client info
     pub client: Option<ClientInfo>,
     /// Subscribed session IDs (empty = all)
@@ -670,6 +685,7 @@ impl ProtocolConnection {
             handshaked: false,
             scopes: DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
             user_id: None,
+            bound_agent: None,
             client: None,
             subscriptions: Vec::new(),
             seq: 0,

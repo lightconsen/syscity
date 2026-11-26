@@ -4,6 +4,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
+    Extension,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -31,6 +32,7 @@ pub async fn openai_chat_completions_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ModelOverrideQuery>,
     headers: axum::http::HeaderMap,
+    auth: Option<Extension<crate::gateway::middleware::RestAuthContext>>,
     Json(mut req): Json<OpenAiChatRequest>,
 ) -> axum::response::Response {
     // Request-level model override: header X-Model takes precedence,
@@ -41,9 +43,15 @@ pub async fn openai_chat_completions_handler(
         req.model = query_model;
     }
 
+    // An agent access token narrows the whole credential to one agent. This
+    // route is `mode: "agent"` by default and used to hardcode the literal
+    // `"default"`, so the one REST surface that reaches the agent loop was the
+    // one place a bound credential could still reach somebody else's agent.
+    let bound_agent = auth.and_then(|Extension(ctx)| ctx.bound_agent);
+
     match req.effective_mode() {
         OpenAiMode::Raw => raw_completion(state, req).await,
-        OpenAiMode::Agent => agent_completion(state, req).await,
+        OpenAiMode::Agent => agent_completion(state, req, bound_agent).await,
     }
 }
 
@@ -287,10 +295,15 @@ fn to_openai_tool_calls(calls: Vec<ToolCall>) -> Vec<OpenAiToolCall> {
 }
 
 /// The built-in agent path (`mode: "agent"`, the default).
+///
+/// `bound_agent` is the agent an agent access token is bound to, if the caller
+/// presented one. A bound credential talks to *its* agent; every other
+/// credential talks to the `default` agent, unchanged.
 #[allow(unused_assignments)]
 async fn agent_completion(
     state: Arc<GatewayState>,
     req: OpenAiChatRequest,
+    bound_agent: Option<String>,
 ) -> axum::response::Response {
     use axum::response::sse::{Event as SseEvt, KeepAlive, Sse};
 
@@ -311,16 +324,18 @@ async fn agent_completion(
         );
     }
 
-    // Grab the default agent handle.
+    // Grab the agent handle: the bound agent for an agent access token, the
+    // `default` agent otherwise.
+    let agent_id = bound_agent.as_deref().unwrap_or("default");
     let handle = {
         let agents = state.agents.agents.read().await;
-        match agents.get("default").cloned() {
+        match agents.get(agent_id).cloned() {
             Some(h) => h,
             None => {
                 return error_body(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "server_error",
-                    "No agent available",
+                    format!("No agent '{agent_id}' available"),
                 )
             }
         }
@@ -548,6 +563,7 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             req("gpt-4o", vec![], false),
         )
         .await;
@@ -564,13 +580,14 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             req("gpt-4o", vec![user_msg("hello")], false),
         )
         .await;
         let (status, json) = body_json(resp).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["error"]["type"], "server_error");
-        assert_eq!(json["error"]["message"], "No agent available");
+        assert_eq!(json["error"]["message"], "No agent 'default' available");
     }
 
     #[tokio::test]
@@ -582,13 +599,39 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             raw_req("syscity-agent", vec![user_msg("hello")]),
         )
         .await;
         let (status, json) = body_json(resp).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(json["error"]["type"], "upstream_error");
-        assert_ne!(json["error"]["message"], "No agent available");
+        assert_ne!(json["error"]["message"], "No agent 'default' available");
+    }
+
+    /// The one REST surface that reaches the agent loop must not be the hole
+    /// in a per-agent credential: a bound token talks to its own agent, and the
+    /// error names that agent so the caller can tell why.
+    #[tokio::test]
+    async fn a_bound_credential_asks_for_its_own_agent_not_default() {
+        let state = state().await;
+        let ctx = crate::gateway::middleware::RestAuthContext {
+            user_id: "alice".to_string(),
+            scopes: vec!["chat".to_string(), "read".to_string()],
+            bound_agent: Some("secretary".to_string()),
+            agent_token_label: Some("alice".to_string()),
+        };
+        let resp = openai_chat_completions_handler(
+            State(state),
+            Query(ModelOverrideQuery { model: None }),
+            HeaderMap::new(),
+            Some(Extension(ctx)),
+            req("gpt-4o", vec![user_msg("hello")], false),
+        )
+        .await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["message"], "No agent 'secretary' available");
     }
 
     #[tokio::test]
@@ -600,6 +643,7 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             body,
         )
         .await;
@@ -617,6 +661,7 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             body,
         )
         .await;
@@ -642,6 +687,7 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             raw_req("syscity-agent", vec![message]),
         )
         .await;
@@ -708,6 +754,7 @@ mod tests {
             State(state),
             Query(ModelOverrideQuery { model: None }),
             HeaderMap::new(),
+            None,
             Json(body),
         )
         .await;

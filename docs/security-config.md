@@ -131,6 +131,49 @@ Notes:
   use device or Tailscale mode if you need to distinguish users.
 - Token mode **also** accepts already-issued session tokens (e.g. from OAuth
   login), validated via the session store.
+- Token mode **also** accepts agent access tokens — see below.
+
+### Agent access tokens
+
+A `[security.agent_tokens.<label>]` entry is one credential bound to one
+`(principal, agent_id)`. It authenticates as a real user id rather than
+`"shared"`, and the connection is confined to that one agent:
+
+```toml
+[security]
+auth_mode = "token"
+
+[security.agent_tokens.alice]
+agent_id = "secretary"
+principal = ""          # empty = the table label ("alice")
+# scopes default to ["chat", "read"]
+
+[agent_overrides.secretary]
+allowed_users = ["alice"]
+```
+
+- The token itself is best supplied as `SYSCITY_AGENT_TOKEN_ALICE` (the label,
+  upper-cased; `_` may stand for `-`) so it never lands in a file. A `token`
+  key works too.
+- `auth_mode = "none"` with `agent_tokens` present is a startup error: nothing
+  checks a token there, so the table would restrict nobody. An entry with an
+  empty token or `agent_id` is refused for the same reason.
+- Enforcement is two-layered: a **closed** method allow-list
+  (`src/gateway/ws/bound.rs`) — a method not listed is refused, so a newly
+  added WS method does not silently become reachable — and a parameter check
+  refusing any `agent_id` / `id` / `session_id` / `session_ids` that names
+  another agent or another agent's conversation. `agents.list`,
+  `sessions.list`, `workspace.*` and the agent registry are narrowed to the
+  bound agent rather than refused, since a client serving one agent has a use
+  for "its" entries.
+- `shared_token` remains the operator credential: it sees every agent. An agent
+  token is what you hand somebody whose Desktop should only use their own
+  agent.
+- Over WebSocket the `connect` handshake answers `bound_agent`, and the ticket
+  exchange (`/api/v1/ws-ticket`) carries the binding, so a ticket is never
+  wider than the token that minted it. The OpenAI-compatible
+  `/v1/chat/completions` (agent mode) likewise answers with the bound agent
+  instead of `default`.
 
 ### Device mode
 
@@ -297,6 +340,7 @@ Relevant variables (applied in `src/daemon.rs`):
 | Variable | Sets |
 |----------|------|
 | `SYSCITY_SECURITY_SHARED_TOKEN` | `security.shared_token` |
+| `SYSCITY_AGENT_TOKEN_<LABEL>` | `security.agent_tokens.<label>.token` — one variable per entry, so no agent credential needs to live in the file |
 | `SYSCITY_API_KEY` + `SYSCITY_BASE_URL` | LLM provider credentials |
 
 For other secrets, config values support `SecretRef` resolution via `env`,

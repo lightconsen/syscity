@@ -19,6 +19,13 @@ interface ConnectionConfig {
   mode: "local" | "remote";
   host: string;
   port: number;
+  /** Talk to the remote gateway over TLS (`https://` / `wss://`). */
+  tls?: boolean;
+  /**
+   * The gateway credential: its shared token, or one of its
+   * `[security.agent_tokens.<label>]` entries. An agent token narrows this
+   * client to that one agent, and the gateway — not this app — decides.
+   */
   token?: string | null;
 }
 
@@ -117,6 +124,7 @@ function TauriConnectionSettings() {
   const [config, setConfig] = useState<ConnectionConfig | null>(null);
   const [host, setHost] = useState("127.0.0.1");
   const [port, setPort] = useState(18080);
+  const [tls, setTls] = useState(false);
   const [token, setToken] = useState("");
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -132,6 +140,7 @@ function TauriConnectionSettings() {
         setConfig(c);
         setHost(c.host);
         setPort(c.port);
+        setTls(c.tls ?? false);
         setToken(c.token ?? "");
       } catch {
         // Command unavailable — leave defaults.
@@ -150,6 +159,7 @@ function TauriConnectionSettings() {
       const res = await invoke<string>("test_remote_gateway", {
         host,
         port,
+        tls,
         token: token.trim() || null,
       });
       setMsg({ ok: true, text: res });
@@ -158,7 +168,7 @@ function TauriConnectionSettings() {
     } finally {
       setTesting(false);
     }
-  }, [host, port, token]);
+  }, [host, port, tls, token]);
 
   const save = useCallback(async () => {
     setSaving(true);
@@ -170,6 +180,7 @@ function TauriConnectionSettings() {
           mode: config?.mode ?? "local",
           host,
           port,
+          tls,
           token: token.trim() || null,
         },
       });
@@ -179,7 +190,7 @@ function TauriConnectionSettings() {
     } finally {
       setSaving(false);
     }
-  }, [config, host, port, token]);
+  }, [config, host, port, tls, token]);
 
   if (!config) return null;
 
@@ -230,6 +241,14 @@ function TauriConnectionSettings() {
                 onChange={(e) => setPort(Number(e.target.value))}
               />
             </div>
+            <label className="flex items-center gap-2 text-sm mb-2">
+              <input
+                type="checkbox"
+                checked={tls}
+                onChange={(e) => setTls(e.target.checked)}
+              />
+              {t("ConnectionSettings.tlsLabel")}
+            </label>
             <div>
               <label className="text-xs text-secondary block mb-1">
                 {t("ConnectionSettings.remoteTokenLabel")}

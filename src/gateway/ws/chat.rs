@@ -124,6 +124,26 @@ pub(crate) async fn handle_chat_send(
     }
 
     if let Some(agent_id) = params.agent_id {
+        // A connection bound to one agent may not name another. The dispatcher
+        // refuses this too; checked here as well because `chat.send` also binds
+        // the session, and a binding written now would outlive a refusal.
+        if !ctx.may_use_agent(&agent_id) {
+            warn!(
+                "Refusing chat.send for session {} naming agent '{}': this connection is bound \
+                 to '{}'",
+                session_id,
+                agent_id,
+                ctx.bound_agent().unwrap_or_default()
+            );
+            return WsResponse::err(
+                &req.id,
+                "FORBIDDEN",
+                format!(
+                    "This connection may only talk to agent '{}'.",
+                    ctx.bound_agent().unwrap_or_default()
+                ),
+            );
+        }
         // The same gate the router applies, checked here as well: a binding
         // written now would otherwise outlive a denial and pin this session to
         // an agent the caller may not use.
@@ -164,6 +184,27 @@ pub(crate) async fn handle_chat_send(
             if !name.is_empty() {
                 if let Some((personality, _matched_alias)) = registry.find_by_alias(name) {
                     let agent_id = personality.id.clone();
+                    // A bound connection talks to one agent. Its own name
+                    // prefix is just a greeting to strip; anyone else's is a
+                    // request to reach an agent it does not have.
+                    if !ctx.may_use_agent(&agent_id) {
+                        warn!(
+                            "Refusing name-routed agent '{}' for user {} in session {}: \
+                             connection is bound to '{}'",
+                            agent_id,
+                            user_id,
+                            session_id,
+                            ctx.bound_agent().unwrap_or_default()
+                        );
+                        return WsResponse::err(
+                            &req.id,
+                            "FORBIDDEN",
+                            format!(
+                                "This connection may only talk to agent '{}'.",
+                                ctx.bound_agent().unwrap_or_default()
+                            ),
+                        );
+                    }
                     info!(
                         "Smart-routing session {} to agent '{}' (matched name: '{}' in message)",
                         session_id, agent_id, name
@@ -196,6 +237,21 @@ pub(crate) async fn handle_chat_send(
                 }
             }
         }
+    }
+
+    // A connection bound to one agent always talks to that agent. Binding the
+    // session here — before the message is enqueued — is what makes it so: the
+    // router checks the session binding first, so without this a fresh session
+    // would fall through to the global default, which for a one-agent client
+    // is very likely an agent it does not hold.
+    if let Some(bound) = ctx.bound_agent() {
+        let route = crate::inbound::RouteResult {
+            agent_id: bound.to_string(),
+            workspace_id: None,
+            persisted_binding: true,
+            is_fallback: false,
+        };
+        state.agents.router.bind_session(&session_id, &route).await;
     }
 
     let mut incoming =

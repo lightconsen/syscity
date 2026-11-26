@@ -39,6 +39,28 @@ pub(super) async fn handle_connect(
             (Some(pre_validated_auth.user_id.clone()), scopes)
         }
         crate::gateway::protocol::AuthMode::Token => {
+            // An agent token at the upgrade is the binding: it is the
+            // credential, and re-deriving identity from the connect frame
+            // alone cannot see it (the client may have a ticket, not a token).
+            // Checked before `resolve_token_auth` so the frame cannot name a
+            // *different* agent — a bound connection's agent is not the
+            // client's to choose.
+            if let Some(bound) = pre_validated_auth.bound_agent.clone() {
+                let scopes = crate::gateway::protocol::resolve_scopes(
+                    &pre_validated_auth.scopes,
+                    &params.scopes,
+                );
+                return finalize_hello_ok_bound(
+                    req,
+                    conn,
+                    &params,
+                    Some(pre_validated_auth.user_id.clone()),
+                    scopes,
+                    Some(bound),
+                    pre_validated_auth.agent_token_label.clone(),
+                )
+                .await;
+            }
             let from_frame = resolve_token_auth(req, state, &params, conn).await;
             if from_frame.0.is_some() {
                 from_frame
@@ -83,6 +105,20 @@ async fn finalize_hello_ok(
     user_id: Option<UserId>,
     granted_scopes: Vec<String>,
 ) -> WsResponse {
+    // Every call site without an agent binding goes through here; the bound
+    // path calls `finalize_hello_ok_bound` instead.
+    finalize_hello_ok_bound(req, conn, params, user_id, granted_scopes, None, None).await
+}
+
+async fn finalize_hello_ok_bound(
+    req: &WsRequest,
+    conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+    params: &ConnectParams,
+    user_id: Option<UserId>,
+    granted_scopes: Vec<String>,
+    bound_agent: Option<String>,
+    agent_token_label: Option<String>,
+) -> WsResponse {
     let conn_id = {
         let mut cg = conn.write().await;
         if let Some(ref client) = params.client {
@@ -90,6 +126,7 @@ async fn finalize_hello_ok(
         }
         cg.user_id = user_id.clone();
         cg.scopes = granted_scopes.clone();
+        cg.bound_agent = bound_agent.clone();
         cg.handshaked = true;
         cg.conn_id.clone()
     };
@@ -119,6 +156,7 @@ async fn finalize_hello_ok(
             "connectors".to_string(),
         ],
         scopes_granted: granted_scopes,
+        bound_agent: bound_agent.clone(),
         server: ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             conn_id: conn_id.clone(),
@@ -126,7 +164,13 @@ async fn finalize_hello_ok(
     };
 
     let scopes = conn.read().await.scopes.clone();
-    info!("[{}] Handshake complete: user={:?} scopes={:?}", conn_id, user_id, scopes);
+    match (&bound_agent, &agent_token_label) {
+        (Some(agent), Some(label)) => info!(
+            "[{}] Handshake complete: user={:?} agent-token='{}' bound to agent='{}' scopes={:?}",
+            conn_id, user_id, label, agent, scopes
+        ),
+        _ => info!("[{}] Handshake complete: user={:?} scopes={:?}", conn_id, user_id, scopes),
+    }
 
     WsResponse::ok(&req.id, payload)
 }
@@ -381,6 +425,8 @@ mod tests {
         WsAuthResult {
             user_id: UserId::new("u1"),
             scopes: vec!["chat".to_string()],
+            bound_agent: None,
+            agent_token_label: None,
         }
     }
 
@@ -546,6 +592,8 @@ mod tests {
                 "write".to_string(),
                 "admin".to_string(),
             ],
+            bound_agent: None,
+            agent_token_label: None,
         };
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCommand>(1);
         let resp = handle_connect(
@@ -688,6 +736,8 @@ mod tests {
         let no_upgrade = WsAuthResult {
             user_id: UserId::new("anonymous"),
             scopes: Vec::new(),
+            bound_agent: None,
+            agent_token_label: None,
         };
         let resp = dispatch_connect_pre(
             &conn,

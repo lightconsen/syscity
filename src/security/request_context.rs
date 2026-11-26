@@ -80,6 +80,7 @@ pub struct RequestContext {
     device_id: Option<Arc<str>>,
     session_id: Option<Arc<str>>,
     auth_source: AuthSource,
+    bound_agent: Option<Arc<str>>,
 }
 
 impl RequestContext {
@@ -90,6 +91,7 @@ impl RequestContext {
             device_id: None,
             session_id: None,
             auth_source,
+            bound_agent: None,
         }
     }
 
@@ -129,6 +131,17 @@ impl RequestContext {
         self
     }
 
+    /// Attach the single agent this request's credential is bound to, when the
+    /// credential was an agent access token.
+    ///
+    /// Carried here rather than re-read off the connection so that a handler
+    /// deep in the call graph can enforce it without another lock: this is the
+    /// same identity carrier that already answers "who is this?".
+    pub fn with_bound_agent(mut self, agent_id: Option<impl Into<Arc<str>>>) -> Self {
+        self.bound_agent = agent_id.map(Into::into);
+        self
+    }
+
     /// The authenticated user id.
     pub fn user_id(&self) -> &str {
         &self.user_id
@@ -147,6 +160,29 @@ impl RequestContext {
     /// How the request's identity was established.
     pub fn auth_source(&self) -> AuthSource {
         self.auth_source
+    }
+
+    /// The one agent this request may use, when it authenticated with an agent
+    /// access token.
+    ///
+    /// `None` is every ordinary credential and means "no per-agent
+    /// restriction" — the caller is limited only by scopes and the router's
+    /// own `allowed_users` gate.
+    pub fn bound_agent(&self) -> Option<&str> {
+        self.bound_agent.as_deref()
+    }
+
+    /// Whether this request may act on `agent_id`.
+    ///
+    /// An unbound request may act on anything its scopes allow; a bound one may
+    /// act only on the agent it is bound to. This is the single predicate every
+    /// agent-selecting surface uses, so "bound" cannot be enforced in one place
+    /// and forgotten in another.
+    pub fn may_use_agent(&self, agent_id: &str) -> bool {
+        match self.bound_agent() {
+            Some(bound) => bound == agent_id,
+            None => true,
+        }
     }
 
     /// The actor string to record in audit entries.
@@ -282,5 +318,39 @@ mod tests {
         let bare = RequestContext::anonymous();
         assert_eq!(bare.session_id(), None);
         assert_eq!(bare.device_id(), None);
+    }
+
+    /// An unbound context permits every agent, so threading this field through
+    /// changed nothing for the credentials that existed before it.
+    #[test]
+    fn an_unbound_context_may_use_any_agent() {
+        let ctx = RequestContext::new("shared", AuthSource::SharedToken);
+        assert_eq!(ctx.bound_agent(), None);
+        assert!(ctx.may_use_agent("default"));
+        assert!(ctx.may_use_agent("secretary-alice"));
+    }
+
+    /// A bound context permits exactly its one agent — the property the whole
+    /// agent-token feature rests on.
+    #[test]
+    fn a_bound_context_may_use_only_its_agent() {
+        let ctx = RequestContext::new("alice", AuthSource::SharedToken)
+            .with_bound_agent(Some("secretary-alice"));
+        assert_eq!(ctx.bound_agent(), Some("secretary-alice"));
+        assert!(ctx.may_use_agent("secretary-alice"));
+        assert!(!ctx.may_use_agent("default"));
+        assert!(!ctx.may_use_agent("secretary-bob"));
+        // The empty string is not a wildcard.
+        assert!(!ctx.may_use_agent(""));
+    }
+
+    /// `with_bound_agent(None)` is the unbound case rather than a binding to an
+    /// empty name, so a caller can pass a `None` through unconditionally.
+    #[test]
+    fn with_bound_agent_none_stays_unbound() {
+        let ctx =
+            RequestContext::new("shared", AuthSource::SharedToken).with_bound_agent(None::<&str>);
+        assert_eq!(ctx.bound_agent(), None);
+        assert!(ctx.may_use_agent("anything"));
     }
 }

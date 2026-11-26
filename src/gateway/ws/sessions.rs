@@ -3,7 +3,16 @@
 use chrono::Utc;
 
 use super::*;
-pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(super) async fn handle_sessions_list(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
+    // A connection bound to one agent lists only that agent's conversations.
+    // Filtering on the store's own `agent_id` column (rather than after the
+    // fact) means the row count and the paging stay right; a post-filter would
+    // silently return short pages.
+    let agent_filter = ctx.bound_agent();
     // The mode a session actually runs in: a per-session override when one was
     // set (see `sessions.set_mode`), otherwise the configured default. The
     // composer's mode picker reads it from here so a client that just
@@ -21,7 +30,7 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
     // record. A client that reloaded mid-turn has nothing local to go on.
     let running = state.agents.running_sessions().await;
     let sessions: Vec<serde_json::Value> = if let Some(ref store) = state.agents.store {
-        match store.find_sessions(None, None, None, false).await {
+        match store.find_sessions(agent_filter, None, None, false).await {
             Ok(rows) => rows
                 .into_iter()
                 .map(|meta| {
@@ -55,10 +64,22 @@ pub(super) async fn handle_sessions_list(req: &WsRequest, state: &Arc<GatewaySta
             }
         }
     } else {
+        // With no store there is no `agent_id` column to filter on, so the
+        // router's binding is consulted instead — the same authority
+        // `session_belongs` uses. Ids are compared as bindings, never as
+        // substrings: an agent named `alice` must not match `ws:alice-other`.
+        let bindings = match agent_filter {
+            Some(_) => state.agents.router.list_bindings().await,
+            None => Default::default(),
+        };
         let mgr = state.agents.manager.read().await;
         mgr.list_sessions()
             .await
             .into_iter()
+            .filter(|id| match agent_filter {
+                Some(agent) => bindings.get(id).is_some_and(|(bound, _)| bound == agent),
+                None => true,
+            })
             .map(|id| {
                 let permission_mode = mode_of(&id);
                 serde_json::json!({
@@ -163,6 +184,16 @@ pub(super) async fn handle_sessions_create(
         .session_id
         .unwrap_or_else(|| format!("{}:{}", channel, user));
 
+    // A connection bound to one agent creates sessions for *that* agent. An
+    // explicit `agent_id` that contradicts the binding was refused already; an
+    // omitted one defaults here rather than falling through to the router's
+    // global default, which would put an agent the caller may not use at the
+    // top of their session list.
+    let requested_agent = params
+        .agent_id
+        .clone()
+        .or_else(|| ctx.bound_agent().map(str::to_string));
+
     {
         let mut mgr = state.agents.manager.write().await;
         mgr.create_session(session_id.clone());
@@ -170,11 +201,11 @@ pub(super) async fn handle_sessions_create(
 
     let mut metadata = crate::agent::session_store::SessionMetadata::new(
         &session_id,
-        params.agent_id.as_deref().unwrap_or(""),
+        requested_agent.as_deref().unwrap_or(""),
         &channel,
         &user,
     );
-    metadata.bound_agent_id = params.agent_id.clone();
+    metadata.bound_agent_id = requested_agent.clone();
 
     if let Some(ref store) = state.agents.store {
         if let Err(e) = store.save_session(&session_id, &metadata, "{}").await {
@@ -186,7 +217,7 @@ pub(super) async fn handle_sessions_create(
     // Checked against this caller first: a session bound to an agent they may
     // not use would sit in their list and accept their messages until the
     // router refused them one at a time.
-    if let Some(agent_id) = params.agent_id {
+    if let Some(agent_id) = requested_agent {
         if !agent_id.is_empty() {
             if !state.agents.router.allows_principal(&agent_id, &user).await {
                 warn!(
@@ -1508,8 +1539,12 @@ mod tests {
         }
 
         // sessions.list surfaces the pin.
-        let res =
-            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         let sessions = res
             .payload
             .and_then(|p| p.get("sessions").cloned())
@@ -1537,8 +1572,12 @@ mod tests {
             Ok(GatewayEvent::SessionModelChanged { model, .. }) => assert_eq!(model, None),
             other => panic!("expected SessionModelChanged event, got {:?}", other.is_ok()),
         }
-        let res =
-            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         let sessions = res
             .payload
             .and_then(|p| p.get("sessions").cloned())
@@ -1688,8 +1727,12 @@ mod tests {
             other => panic!("expected SessionPinned event, got {:?}", other.is_ok()),
         }
 
-        let res =
-            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         let sessions = res
             .payload
             .and_then(|p| p.get("sessions").cloned())
@@ -1700,6 +1743,53 @@ mod tests {
             .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some("s1"))
             .unwrap();
         assert_eq!(s1.get("pinned").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    /// With no session store the binding has to come from the router, and it
+    /// has to be compared as a binding, not as a substring: an agent named
+    /// `alice` must not match a session id that merely contains "alice".
+    #[tokio::test]
+    async fn sessions_list_without_a_store_narrows_to_the_router_binding() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        assert!(state.agents.store.is_none(), "this test is about the no-store path");
+        {
+            let mut mgr = state.agents.manager.write().await;
+            mgr.create_session("ws:alice".to_string());
+            mgr.create_session("ws:alice-other".to_string());
+            mgr.create_session("ws:bob".to_string());
+        }
+        for (session, agent) in [("ws:alice", "alice"), ("ws:bob", "bob")] {
+            let route = crate::inbound::RouteResult {
+                agent_id: agent.to_string(),
+                workspace_id: None,
+                persisted_binding: true,
+                is_fallback: false,
+            };
+            state.agents.router.bind_session(session, &route).await;
+        }
+
+        let ctx = make_test_ctx().with_bound_agent(Some("alice"));
+        let res =
+            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state, &ctx)
+                .await;
+        let mut listed: Vec<String> = res
+            .payload
+            .and_then(|p| p.get("sessions").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| {
+                s.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec!["ws:alice".to_string()],
+            "the bound agent sees its own binding and nothing a substring match would catch"
+        );
     }
 
     #[tokio::test]
@@ -1741,8 +1831,12 @@ mod tests {
         // No store wired: the handler falls back to the in-memory session
         // manager and returns an empty list rather than erroring.
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
-        let res =
-            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(res.ok);
         let sessions = res
             .payload
@@ -1815,8 +1909,12 @@ mod tests {
         .await;
         assert!(res.ok, "set_mode must succeed: {:?}", res.error);
 
-        let res =
-            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         let sessions = res
             .payload
             .and_then(|p| p.get("sessions").cloned())
@@ -1968,8 +2066,12 @@ mod tests {
         }
         state.agents.mark_turn_started("s1").await;
 
-        let res =
-            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state).await;
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         let sessions = res
             .payload
             .and_then(|p| p.get("sessions").cloned())

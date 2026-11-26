@@ -15,6 +15,7 @@
 //!
 //! Layout:
 //!   core.rs      connection lifecycle, auth middleware, dispatcher
+//!   bound.rs     what an agent-bound connection may call, and on which agent
 //!   handshake.rs connect / hello / device-auth / ping / session titles
 //!   chat.rs      chat.send / chat.history / chat.abort
 //!   sessions.rs  session CRUD + subscribe / unsubscribe
@@ -89,6 +90,30 @@ enum WsCommand {
 pub struct WsAuthResult {
     pub user_id: UserId,
     pub scopes: Vec<String>,
+    /// The one agent this connection may use, when the credential was an
+    /// agent access token ([`crate::gateway::config::SecurityConfig::agent_tokens`]).
+    ///
+    /// `None` for every other credential, which is "no per-agent restriction"
+    /// and preserves the existing behaviour exactly. `Some(agent)` makes the
+    /// connection agent-scoped: the handshake rejects a `bound_agent` that
+    /// contradicts it, and the dispatcher refuses any method outside the
+    /// single-agent surface (`crate::gateway::ws::bound`).
+    pub bound_agent: Option<String>,
+    /// The label of the agent-token entry that authenticated this connection,
+    /// for log lines and audit. `None` for every other credential.
+    pub agent_token_label: Option<String>,
+}
+
+impl WsAuthResult {
+    /// A result for a credential with no per-agent restriction.
+    pub fn unrestricted(user_id: UserId, scopes: Vec<String>) -> Self {
+        Self {
+            user_id,
+            scopes,
+            bound_agent: None,
+            agent_token_label: None,
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -176,6 +201,7 @@ mod acp;
 mod admin_ws;
 mod agents;
 mod ask;
+pub(crate) mod bound;
 pub(crate) mod chat;
 mod config_ws;
 pub(crate) mod connectors_ws;

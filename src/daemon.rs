@@ -326,10 +326,69 @@ fn apply_env_security_overrides(config: &mut crate::gateway::GatewayConfig) {
         }
     }
 
-    // Enable an auth mode via env. config.toml is not reliably parsed by the
-    // gateway (the [server]/[model] template does not match GatewayConfig's
-    // top-level fields — see the config-parse bug), so the env path is the
-    // dependable way to secure a remote listener.
+    // Per-agent tokens from the environment: `SYSCITY_AGENT_TOKEN_<LABEL>`
+    // supplies the token for the `[security.agent_tokens.<label>]` entry of the
+    // same (lowercased) name. This is how a deployment hands each person their
+    // own credential without writing any of them into a file that ends up in a
+    // backup. The rest of the entry — which agent, which principal — stays in
+    // the config, so an env var alone cannot invent an agent binding.
+    // `vars_os`, not `vars`: the latter panics on an environment variable that
+    // is not valid Unicode, and inheriting one from somebody's shell must not
+    // take the gateway down at startup.
+    for (name, value) in std::env::vars_os() {
+        let Some(label) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("SYSCITY_AGENT_TOKEN_"))
+        else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        // A token that is not valid Unicode cannot be one a client sent as a
+        // header anyway, and substituting replacement characters would quietly
+        // install a credential that is not the one the operator meant.
+        let Some(value) = value.to_str().map(str::to_string) else {
+            tracing::warn!("Ignoring {name}: its value is not valid Unicode");
+            continue;
+        };
+        if label.is_empty() {
+            tracing::warn!("Ignoring {name}: the label after SYSCITY_AGENT_TOKEN_ is empty");
+            continue;
+        }
+        // The label is the table key verbatim; the conventional spelling is
+        // upper case (env names cannot carry every character a TOML key can),
+        // so try the exact form, then the lowercased one, then a `_`→`-` fold.
+        let candidates = [
+            label.to_string(),
+            label.to_ascii_lowercase(),
+            label.to_ascii_lowercase().replace('_', "-"),
+        ];
+        let found = candidates
+            .iter()
+            .find(|c| config.security.agent_tokens.contains_key(*c))
+            .cloned();
+        match found {
+            Some(key) => {
+                if let Some(entry) = config.security.agent_tokens.get_mut(&key) {
+                    if entry.token.is_empty() || precedence == CredentialPrecedence::EnvFirst {
+                        entry.token = value;
+                    }
+                }
+            }
+            None => {
+                // Not an error: the entry may be defined in a config that is
+                // loaded later, and a typo should be visible rather than
+                // silently create a half-entry with no agent.
+                tracing::warn!(
+                    "Ignoring {name}: no [security.agent_tokens.{label}] entry to supply a token for"
+                );
+            }
+        }
+    }
+
+    // Enable an auth mode via env, for the case where the credential lives in
+    // the environment rather than the file. config.toml *is* parsed (only
+    // `host`/`port` are overridden by the CLI's own defaults), so this is a
+    // convenience, not the dependable path.
     if let Ok(mode) = std::env::var("SYSCITY_SECURITY_AUTH_MODE") {
         let parsed = match mode.trim().to_ascii_lowercase().as_str() {
             "none" => Some(crate::gateway::protocol::AuthMode::None),
@@ -1221,6 +1280,61 @@ mod tests {
 
         assert_eq!(config.security.shared_token.as_deref(), Some("env-token"));
         std::env::remove_var("SYSCITY_SECURITY_SHARED_TOKEN");
+    }
+
+    /// `SYSCITY_AGENT_TOKEN_<LABEL>` fills a `[security.agent_tokens.<label>]`
+    /// entry's token. Nothing else about the entry is supplied from the
+    /// environment — the agent binding is the operator's to make.
+    #[test]
+    #[serial]
+    fn test_agent_token_from_env() {
+        use crate::gateway::config::AgentTokenEntry;
+        use crate::gateway::{CredentialPrecedence, GatewayConfig};
+
+        std::env::set_var("SYSCITY_AGENT_TOKEN_ALICE", "env-agent-token");
+        let mut config = GatewayConfig::default();
+        config.security.credential_precedence = CredentialPrecedence::EnvFirst;
+        config.security.agent_tokens.insert(
+            "alice".to_string(),
+            AgentTokenEntry {
+                token: String::new(),
+                principal: String::new(),
+                agent_id: "secretary".to_string(),
+                scopes: crate::gateway::config::default_agent_token_scopes(),
+            },
+        );
+
+        apply_env_security_overrides(&mut config);
+
+        let entry = config
+            .security
+            .agent_tokens
+            .get("alice")
+            .expect("the entry survives");
+        assert_eq!(entry.token, "env-agent-token");
+        assert_eq!(entry.agent_id, "secretary", "the binding is not from the env");
+        std::env::remove_var("SYSCITY_AGENT_TOKEN_ALICE");
+    }
+
+    /// A `SYSCITY_AGENT_TOKEN_*` with no matching table entry warns and does
+    /// nothing: creating the entry from the environment would let a typo'd
+    /// variable silently mint a credential bound to an agent nobody declared.
+    #[test]
+    #[serial]
+    fn test_agent_token_without_an_entry_is_ignored() {
+        use crate::gateway::{CredentialPrecedence, GatewayConfig};
+
+        std::env::set_var("SYSCITY_AGENT_TOKEN_BOB", "env-agent-token");
+        let mut config = GatewayConfig::default();
+        config.security.credential_precedence = CredentialPrecedence::EnvFirst;
+
+        apply_env_security_overrides(&mut config);
+
+        assert!(
+            config.security.agent_tokens.is_empty(),
+            "an env var alone must not create a credential"
+        );
+        std::env::remove_var("SYSCITY_AGENT_TOKEN_BOB");
     }
 
     #[test]

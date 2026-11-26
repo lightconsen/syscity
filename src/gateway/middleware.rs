@@ -490,6 +490,24 @@ pub struct RestAuthContext {
     pub user_id: String,
     /// What it was entitled to.
     pub scopes: Vec<String>,
+    /// The one agent this credential may use, when it was an agent access
+    /// token. Threaded into the ticket so the resulting WebSocket connection is
+    /// exactly as narrow as the credential, not wider.
+    pub bound_agent: Option<String>,
+    /// The agent-token label, for log lines. Opaque to consumers.
+    pub agent_token_label: Option<String>,
+}
+
+impl RestAuthContext {
+    /// A context for a credential with no per-agent restriction.
+    pub fn unrestricted(user_id: impl Into<String>, scopes: Vec<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            scopes,
+            bound_agent: None,
+            agent_token_label: None,
+        }
+    }
 }
 
 /// Middleware: Authentication check
@@ -556,9 +574,37 @@ pub async fn auth_middleware(
                         } else {
                             session.scopes.clone()
                         };
-                        req.extensions_mut().insert(RestAuthContext {
-                            user_id: session.user_id.to_string(),
+                        req.extensions_mut().insert(RestAuthContext::unrestricted(
+                            session.user_id.to_string(),
                             scopes,
+                        ));
+                        return Ok(next.run(req).await);
+                    }
+                    // An agent access token, before the shared token: it is the
+                    // narrower credential, and the ticket it mints must carry
+                    // its agent binding or the WS connection would be wider
+                    // than the HTTP credential that opened it.
+                    let agent_token = {
+                        let config = state.config.read().await;
+                        config
+                            .security
+                            .agent_token_match(token)
+                            .map(|(label, entry)| {
+                                (
+                                    label.to_string(),
+                                    entry.principal_or_label(label),
+                                    entry.agent_id.clone(),
+                                    entry.scopes.clone(),
+                                )
+                            })
+                    };
+                    if let Some((label, principal, agent_id, scopes)) = agent_token {
+                        debug!("Valid agent token '{}' (agent '{}')", label, agent_id);
+                        req.extensions_mut().insert(RestAuthContext {
+                            user_id: principal,
+                            scopes,
+                            bound_agent: Some(agent_id),
+                            agent_token_label: Some(label),
                         });
                         return Ok(next.run(req).await);
                     }
@@ -578,10 +624,8 @@ pub async fn auth_middleware(
                             let config = state.config.read().await;
                             config.security.shared_token_scopes.clone()
                         };
-                        req.extensions_mut().insert(RestAuthContext {
-                            user_id: "shared".to_string(),
-                            scopes,
-                        });
+                        req.extensions_mut()
+                            .insert(RestAuthContext::unrestricted("shared", scopes));
                         return Ok(next.run(req).await);
                     }
                     warn!("Invalid or expired auth token");

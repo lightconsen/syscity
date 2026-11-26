@@ -100,3 +100,69 @@ fn validate_auth_passes_when_token_mode_explicit() {
     // Token mode explicitly set — should pass
     assert!(super::validate_auth_config(&config).is_ok());
 }
+
+// ── Agent access tokens ──
+
+use crate::gateway::config::AgentTokenEntry;
+
+fn agent_entry(agent_id: &str) -> AgentTokenEntry {
+    AgentTokenEntry {
+        token: "tok".into(),
+        principal: String::new(),
+        agent_id: agent_id.into(),
+        scopes: crate::gateway::config::default_agent_token_scopes(),
+    }
+}
+
+/// `auth_mode = "none"` checks no token at all, so an agent token there is a
+/// credential that authenticates nobody while reading, in the file, as if it
+/// restricted who reaches which agent. Refused, not warned.
+#[test]
+fn validate_auth_refuses_agent_tokens_without_auth() {
+    let mut config = GatewayConfig::default();
+    config
+        .security
+        .agent_tokens
+        .insert("alice".into(), agent_entry("alpha"));
+    let err = super::validate_auth_config(&config).expect_err("must refuse");
+    assert!(err.to_string().contains("agent_tokens"), "{err}");
+    assert!(err.to_string().contains("auth_mode"), "{err}");
+}
+
+/// With a token-checking auth mode the same table is accepted.
+#[test]
+fn validate_auth_allows_agent_tokens_with_token_mode() {
+    let mut config = GatewayConfig::default();
+    config.security.auth_mode = AuthMode::Token;
+    config
+        .security
+        .agent_tokens
+        .insert("alice".into(), agent_entry("alpha"));
+    assert!(super::validate_auth_config(&config).is_ok());
+}
+
+/// An entry with no token would authenticate nobody — a config error, since
+/// the shape is almost certainly one field left unwritten.
+#[test]
+fn validate_auth_refuses_an_agent_token_without_a_token() {
+    let mut config = GatewayConfig::default();
+    config.security.auth_mode = AuthMode::Token;
+    let mut entry = agent_entry("alpha");
+    entry.token.clear();
+    config.security.agent_tokens.insert("alice".into(), entry);
+    let err = super::validate_auth_config(&config).expect_err("must refuse");
+    assert!(err.to_string().contains("has no token"), "{err}");
+}
+
+/// An entry with no `agent_id` would bind to a nonexistent agent and be
+/// refused everywhere with no clue why.
+#[test]
+fn validate_auth_refuses_an_agent_token_without_an_agent() {
+    let mut config = GatewayConfig::default();
+    config.security.auth_mode = AuthMode::Token;
+    let mut entry = agent_entry("");
+    entry.token = "tok".into();
+    config.security.agent_tokens.insert("alice".into(), entry);
+    let err = super::validate_auth_config(&config).expect_err("must refuse");
+    assert!(err.to_string().contains("has no agent_id"), "{err}");
+}

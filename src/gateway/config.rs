@@ -1424,6 +1424,30 @@ pub struct SecurityConfig {
     /// Shared secret token for simple authentication
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_token: Option<String>,
+    /// Tokens that reach exactly one agent, keyed by an operator-chosen label.
+    ///
+    /// A `shared_token` says "you may use this gateway" and resolves to the
+    /// literal principal `"shared"`, so every holder is the same person. An
+    /// entry here says "you are *this person*, and you may use *this agent*":
+    /// the token authenticates as `principal`, the connection carries a
+    /// `bound_agent` that every agent-selecting surface enforces, and the
+    /// method surface narrows to what a single-agent client needs
+    /// ([`crate::gateway::ws::bound`]).
+    ///
+    /// This is what lets a Desktop app on someone's own machine be configured
+    /// with a remote gateway and one agent's credential, and be unable to reach
+    /// anything else — including the operator's config, plugins and other
+    /// agents.
+    ///
+    /// ```toml
+    /// [security.agent_tokens.alice]
+    /// token = "…"
+    /// principal = "alice"
+    /// agent_id = "secretary-alice"
+    /// scopes = ["chat", "read"]            # the default
+    /// ```
+    #[serde(default)]
+    pub agent_tokens: HashMap<String, AgentTokenEntry>,
 
     // ── Scope entitlements ───────────────────────────────────────────────
     //
@@ -1616,6 +1640,70 @@ fn default_tailscale_ttl() -> u64 {
     300
 }
 
+/// One agent-scoped credential, declared under `[security.agent_tokens.<label>]`.
+///
+/// The label is only for the operator's own bookkeeping and for log lines; what
+/// the credential is worth comes entirely from these fields. See
+/// [`SecurityConfig::agent_tokens`] for what an entry does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentTokenEntry {
+    /// The credential itself.
+    ///
+    /// Not `Option`: an entry with no token would authenticate nobody and is
+    /// almost certainly one field left unwritten, so a missing token is a
+    /// config error the loader reports rather than a silently inert entry.
+    /// Prefer `SYSCITY_AGENT_TOKEN_<LABEL>` over writing it here — a token in a
+    /// file is a token in every backup and every `git add -A`.
+    pub token: String,
+    /// The principal this credential *is* — the name the router compares
+    /// against `[agent_overrides.<agent>] allowed_users`.
+    ///
+    /// Empty means "use the label", which is the common case: the table key is
+    /// already the person's name.
+    #[serde(default)]
+    pub principal: String,
+    /// The one agent this credential may reach.
+    ///
+    /// Required. An empty agent would make the credential a weaker
+    /// `shared_token` — authenticated, scoped, and free to reach every agent —
+    /// which is not what an operator writing this table means.
+    pub agent_id: String,
+    /// What the credential is worth, subject to the same narrowing as every
+    /// other credential (`protocol::resolve_scopes`).
+    ///
+    /// Defaults to [`default_agent_token_scopes`]: no `admin`, no `pairing`,
+    /// and no `write` — a person's own Desktop needs to chat, read their
+    /// conversations and create sessions, and writing there changes *their*
+    /// agent's config, not the deployment's. An operator who wants more says so
+    /// explicitly.
+    #[serde(default = "default_agent_token_scopes")]
+    pub scopes: Vec<String>,
+}
+
+impl Default for AgentTokenEntry {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            principal: String::new(),
+            agent_id: String::new(),
+            scopes: default_agent_token_scopes(),
+        }
+    }
+}
+
+impl AgentTokenEntry {
+    /// The principal name to authenticate as: the declared one, or the table
+    /// label when it was left empty.
+    pub fn principal_or_label(&self, label: &str) -> String {
+        if self.principal.trim().is_empty() {
+            label.to_string()
+        } else {
+            self.principal.trim().to_string()
+        }
+    }
+}
+
 /// Rate limiting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // A partial table in the config file must fill the rest from the defaults
@@ -1722,6 +1810,22 @@ pub fn default_device_scopes() -> Vec<String> {
     default_local_scopes()
 }
 
+/// Scopes an agent token is worth when its entry names none.
+///
+/// `chat` and `read` are what a conversation needs. `write` is deliberately
+/// absent even though a normal desktop client holds it: `write` is the scope
+/// that reaches `config.set`, `agents.update`, `plugins.*` and
+/// `computer.run`, and an agent token's whole point is that its holder is not
+/// the operator. A client that genuinely needs to open sessions gets
+/// `sessions.create` through the agent-bound method surface, not through a
+/// widened entitlement.
+pub fn default_agent_token_scopes() -> Vec<String> {
+    vec![
+        crate::gateway::protocol::SCOPE_CHAT.to_string(),
+        crate::gateway::protocol::SCOPE_READ.to_string(),
+    ]
+}
+
 /// Default cap on simultaneous WebSocket connections.
 pub fn default_max_ws_connections() -> usize {
     256
@@ -1735,6 +1839,7 @@ impl Default for SecurityConfig {
             pairing_required: false,
             auth_mode: crate::gateway::protocol::AuthMode::None,
             shared_token: None,
+            agent_tokens: HashMap::new(),
             local_scopes: default_local_scopes(),
             shared_token_scopes: default_shared_token_scopes(),
             device_scopes: default_device_scopes(),
@@ -1761,6 +1866,43 @@ impl Default for SecurityConfig {
             guardian: false,
             guardian_model: None,
         }
+    }
+}
+
+impl SecurityConfig {
+    /// The agent token entry `presented` matches, if any.
+    ///
+    /// Compared in constant time per entry, like
+    /// [`crate::gateway::middleware::shared_token_matches`] — a token compare
+    /// that returns early on the first differing byte leaks the length of the
+    /// shared prefix to anyone who can time the handshake.
+    ///
+    /// The scan is over the whole table regardless of where the match is, so
+    /// the number of entries compared does not depend on which one matched. An
+    /// empty configured token never matches: that shape is a config mistake,
+    /// and treating `"" == ""` as a credential would hand the agent to anyone
+    /// who sends an empty token.
+    pub fn agent_token_match(&self, presented: &str) -> Option<(&str, &AgentTokenEntry)> {
+        use subtle::ConstantTimeEq;
+        if presented.is_empty() {
+            return None;
+        }
+        let candidate = presented.as_bytes();
+        let mut found: Option<(&str, &AgentTokenEntry)> = None;
+        for (label, entry) in &self.agent_tokens {
+            if entry.token.is_empty() {
+                continue;
+            }
+            // Lengths are fixed by the token itself and are not secret; the
+            // comparison over the bytes is what is constant-time.
+            let matches: bool = entry.token.as_bytes().ct_eq(candidate).into();
+            if matches {
+                // No early return on a match: the work done must not depend on
+                // which entry matched.
+                found = Some((label.as_str(), entry));
+            }
+        }
+        found
     }
 }
 
@@ -3131,5 +3273,85 @@ shared_token = "abc"
         let config = GatewayConfig::default();
         let value = serde_json::to_value(&config).unwrap();
         assert_eq!(config_revision(&config), config_json_hash(&value));
+    }
+
+    /// `[security.agent_tokens.<label>]` parses, and the three ways a token can
+    /// be wrong (empty presented, empty configured, absent) all yield no
+    /// credential — an empty token must never be treated as a match, or the
+    /// agent would be open to anyone who sends nothing.
+    #[test]
+    fn agent_token_match_finds_the_entry_and_nothing_else() {
+        let mut config = GatewayConfig::default();
+        config.security.agent_tokens.insert(
+            "alice".into(),
+            AgentTokenEntry {
+                token: "tok-alice".into(),
+                principal: String::new(),
+                agent_id: "alpha".into(),
+                scopes: default_agent_token_scopes(),
+            },
+        );
+        config.security.agent_tokens.insert(
+            "bob".into(),
+            AgentTokenEntry {
+                token: String::new(),
+                principal: "robert".into(),
+                agent_id: "beta".into(),
+                scopes: default_agent_token_scopes(),
+            },
+        );
+
+        let (label, entry) = config
+            .security
+            .agent_token_match("tok-alice")
+            .expect("the configured token matches");
+        assert_eq!(label, "alice");
+        assert_eq!(entry.agent_id, "alpha");
+        assert_eq!(entry.principal_or_label(label), "alice", "an empty principal is the label");
+
+        assert!(
+            config.security.agent_token_match("tok-bob").is_none(),
+            "an entry with an empty configured token authenticates nobody"
+        );
+        assert!(
+            config.security.agent_token_match("").is_none(),
+            "an empty presented token never matches, even against an empty entry"
+        );
+        assert!(config.security.agent_token_match("tok-alice ").is_none(), "no trimming");
+        assert!(config.security.agent_token_match("tok-ali").is_none(), "no prefix match");
+    }
+
+    /// A sparse `[security.agent_tokens.<label>]` table must fill `principal`
+    /// and `scopes` from their defaults, and an entry must round-trip through
+    /// TOML — the operator writes this table by hand.
+    #[test]
+    fn agent_token_entry_parses_sparse_and_round_trips() {
+        let parsed: GatewayConfig = toml::from_str(
+            r#"
+[security]
+auth_mode = "token"
+
+[security.agent_tokens.alice]
+token = "tok"
+agent_id = "alpha"
+"#,
+        )
+        .expect("a sparse agent token table must deserialize");
+
+        let entry = parsed
+            .security
+            .agent_tokens
+            .get("alice")
+            .expect("the entry is present");
+        assert_eq!(entry.token, "tok");
+        assert_eq!(entry.agent_id, "alpha");
+        assert_eq!(entry.principal, "", "principal defaults to empty = use the label");
+        assert_eq!(entry.scopes, default_agent_token_scopes());
+        assert!(!entry
+            .scopes
+            .contains(&crate::gateway::protocol::SCOPE_WRITE.to_string()));
+        assert!(!entry
+            .scopes
+            .contains(&crate::gateway::protocol::SCOPE_ADMIN.to_string()));
     }
 }

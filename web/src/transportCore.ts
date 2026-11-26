@@ -125,7 +125,22 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
   private messagesListeners: Set<MessagesCallback> = new Set();
   private sessionListeners: Set<SessionCallback> = new Set();
   private runListeners: Set<(running: boolean) => void> = new Set();
-  private serverInfo: { version?: string; conn_id?: string; features?: string[]; scopes_granted?: string[] } = {};
+  /**
+   * What the `connect` handshake answered.
+   *
+   * `bound_agent` is set when the credential this client presented is an
+   * agent access token: the gateway has narrowed the whole connection to that
+   * one agent, so the UI must stop offering an agent switcher (an attempt to
+   * address another agent is refused server-side, and showing the choice
+   * anyway would be a dead control).
+   */
+  private serverInfo: {
+    version?: string;
+    conn_id?: string;
+    features?: string[];
+    scopes_granted?: string[];
+    bound_agent?: string | null;
+  } = {};
   private gatewayUrl: string = "";
   /** Per-install gateway auth token (mobile Tauri builds only). */
   private gatewayToken: string | null = null;
@@ -616,6 +631,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
               conn_id: msg.payload.server?.conn_id,
               features: msg.payload.features,
               scopes_granted: msg.payload.scopes_granted,
+              bound_agent: (msg.payload.bound_agent as string | null | undefined) ?? null,
             };
             if (this.subscribedSessions.length > 0) {
               this.sendRequest("sessions.subscribe", {
@@ -1505,7 +1521,13 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
   /** List + consume prompts sent via the AskSyscity AppIntent (§4.6). */
 
   /* ── In-memory message state for UI ── */
-  getServerInfo(): { version?: string; conn_id?: string; features?: string[]; scopes_granted?: string[] } {
+  getServerInfo(): {
+    version?: string;
+    conn_id?: string;
+    features?: string[];
+    scopes_granted?: string[];
+    bound_agent?: string | null;
+  } {
     return this.serverInfo;
   }
 

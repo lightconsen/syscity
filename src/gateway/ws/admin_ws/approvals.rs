@@ -6,31 +6,80 @@ use serde::Deserialize;
 
 use super::super::{parse_params, WsRequest, WsResponse};
 use crate::gateway::GatewayState;
+use crate::security::request_context::RequestContext;
 use tracing::warn;
 
 // ── Approvals (human-in-the-loop tool approval) ─────────────────────────
+
+/// The approvals this caller may see, as summaries.
+///
+/// An unbound caller sees every pending approval. A connection bound to one
+/// agent sees only those raised in that agent's conversations: an approval is
+/// a decision about someone's work, and a one-agent client has no business
+/// approving another agent's tool call.
+async fn visible_approvals(
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> Vec<crate::tools::approval::PendingApprovalSummary> {
+    let all = state
+        .tools
+        .approval_queue
+        .list_pending(crate::tools::approval::ApprovalFilter::default())
+        .await;
+    let Some(bound) = ctx.bound_agent() else {
+        return all;
+    };
+    let mut visible = Vec::with_capacity(all.len());
+    for approval in all {
+        if crate::gateway::ws::bound::approval_visible(state, bound, approval.session_id.as_deref())
+            .await
+        {
+            visible.push(approval);
+        }
+    }
+    visible
+}
 
 /// `approvals.list` — pending tool-call approval requests.
 pub(crate) async fn handle_approvals_list(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
-    let approvals = state
-        .tools
-        .approval_queue
-        .list_pending(crate::tools::approval::ApprovalFilter::default())
-        .await;
+    let approvals = visible_approvals(state, ctx).await;
     WsResponse::ok(&req.id, serde_json::json!({ "approvals": approvals, "count": approvals.len() }))
 }
 
 /// `approvals.get` — a single pending approval (`{ id }`).
-pub(crate) async fn handle_approvals_get(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_approvals_get(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     let id = match super::required_str_param(req, "id") {
         Ok(v) => v,
         Err(res) => return res,
     };
     match state.tools.approval_queue.get(&id).await {
         Some(approval) => {
+            if let Some(bound) = ctx.bound_agent() {
+                if !crate::gateway::ws::bound::approval_visible(
+                    state,
+                    bound,
+                    approval.session_id.as_deref(),
+                )
+                .await
+                {
+                    // Reported as not-found: the caller may not know the
+                    // approval exists, and distinguishing "not yours" from
+                    // "not there" would leak the inventory.
+                    return WsResponse::err(
+                        &req.id,
+                        "NOT_FOUND",
+                        format!("Approval '{}' not found", id),
+                    );
+                }
+            }
             WsResponse::ok(&req.id, serde_json::to_value(&approval).unwrap_or_default())
         }
         None => WsResponse::err(&req.id, "NOT_FOUND", format!("Approval '{}' not found", id)),
@@ -46,6 +95,7 @@ pub(crate) async fn handle_approvals_get(req: &WsRequest, state: &Arc<GatewaySta
 pub(crate) async fn handle_approvals_approve(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Deserialize)]
     struct Params {
@@ -57,6 +107,18 @@ pub(crate) async fn handle_approvals_approve(
         Ok(p) => p,
         Err(res) => return res,
     };
+
+    if let Some(bound) = ctx.bound_agent() {
+        let session = state
+            .tools
+            .approval_queue
+            .get(&p.id)
+            .await
+            .and_then(|a| a.session_id);
+        if !crate::gateway::ws::bound::approval_visible(state, bound, session.as_deref()).await {
+            return WsResponse::err(&req.id, "NOT_FOUND", format!("Approval '{}' not found", p.id));
+        }
+    }
 
     // Capture the call identity before resolution removes the request.
     let remember_rules = if p.remember {
@@ -143,6 +205,7 @@ async fn remember_allow_rules(
 pub(crate) async fn handle_approvals_deny(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Deserialize)]
     struct Params {
@@ -154,6 +217,18 @@ pub(crate) async fn handle_approvals_deny(
         Ok(p) => p,
         Err(res) => return res,
     };
+
+    if let Some(bound) = ctx.bound_agent() {
+        let session = state
+            .tools
+            .approval_queue
+            .get(&p.id)
+            .await
+            .and_then(|a| a.session_id);
+        if !crate::gateway::ws::bound::approval_visible(state, bound, session.as_deref()).await {
+            return WsResponse::err(&req.id, "NOT_FOUND", format!("Approval '{}' not found", p.id));
+        }
+    }
     let reason = p.reason.unwrap_or_else(|| "Denied by operator".to_string());
     if state
         .tools

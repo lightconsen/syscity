@@ -114,15 +114,39 @@ async fn resolve_within(root: &Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
+/// The agent whose workspace a request addresses.
+///
+/// An explicit `agent_id` wins, but a connection bound to one agent may not
+/// name another, and one that names none is asking about *its* agent's
+/// workspace — not the shared default's, which is a workspace it has no
+/// business in.
+fn workspace_agent(conn: Option<&str>, requested: Option<&str>) -> Result<Option<String>, String> {
+    let requested = requested.filter(|s| !s.is_empty());
+    if let Some(agent) = requested {
+        if let Some(bound) = conn {
+            if bound != agent {
+                return Err(format!("This connection may only use agent '{bound}'."));
+            }
+        }
+        return Ok(Some(agent.to_string()));
+    }
+    Ok(conn.map(str::to_string))
+}
+
 pub(super) async fn handle_workspace_list(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     let params: ListParams = match parse_params(req) {
         Ok(p) => p,
         Err(res) => return res,
     };
-    let root = match resolve_workspace_root(state, params.agent_id.as_deref()).await {
+    let agent = match workspace_agent(ctx.bound_agent(), params.agent_id.as_deref()) {
+        Ok(a) => a,
+        Err(message) => return WsResponse::err(&req.id, "FORBIDDEN", message),
+    };
+    let root = match resolve_workspace_root(state, agent.as_deref()).await {
         Some(r) => r,
         None => return error_agent_not_found(&req.id),
     };
@@ -218,12 +242,17 @@ pub(super) async fn handle_workspace_list(
 pub(super) async fn handle_workspace_read(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     let params: ReadParams = match parse_params(req) {
         Ok(p) => p,
         Err(res) => return res,
     };
-    let root = match resolve_workspace_root(state, params.agent_id.as_deref()).await {
+    let agent = match workspace_agent(ctx.bound_agent(), params.agent_id.as_deref()) {
+        Ok(a) => a,
+        Err(message) => return WsResponse::err(&req.id, "FORBIDDEN", message),
+    };
+    let root = match resolve_workspace_root(state, agent.as_deref()).await {
         Some(r) => r,
         None => return error_agent_not_found(&req.id),
     };
@@ -298,7 +327,7 @@ pub(super) async fn handle_workspace_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::state_tests::make_test_state;
+    use crate::gateway::state_tests::{make_test_ctx, make_test_state};
     use crate::gateway::GatewayConfig;
 
     fn req(id: &str, params: Option<serde_json::Value>) -> WsRequest {
@@ -391,7 +420,12 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = handle_workspace_list(&req("r1", Some(serde_json::json!({}))), &state).await;
+        let resp = handle_workspace_list(
+            &req("r1", Some(serde_json::json!({}))),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(resp.ok);
         let payload = resp.payload.unwrap();
         let entries = payload["entries"].as_array().unwrap();
@@ -401,9 +435,12 @@ mod tests {
         assert_eq!(entries[1]["name"], "a.md");
         assert_eq!(entries[1]["kind"], "file");
 
-        let resp =
-            handle_workspace_list(&req("r2", Some(serde_json::json!({ "path": "sub" }))), &state)
-                .await;
+        let resp = handle_workspace_list(
+            &req("r2", Some(serde_json::json!({ "path": "sub" }))),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(resp.ok);
         let entries = resp.payload.unwrap()["entries"].as_array().unwrap().clone();
         assert_eq!(entries.len(), 1);
@@ -420,7 +457,12 @@ mod tests {
             let config = Arc::make_mut(&mut guard);
             config.default_agent.workspace_dir = Some(PathBuf::from("/nonexistent/ws/xyz"));
         }
-        let resp = handle_workspace_list(&req("r1", Some(serde_json::json!({}))), &state).await;
+        let resp = handle_workspace_list(
+            &req("r1", Some(serde_json::json!({}))),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(resp.ok);
         assert!(resp.payload.unwrap()["entries"]
             .as_array()
@@ -432,9 +474,12 @@ mod tests {
     async fn list_rejects_traversal() {
         let (state, dir) = state_with_tmp_workspace().await;
         for bad in ["../escape", "/etc/passwd", "a/../b"] {
-            let resp =
-                handle_workspace_list(&req("r1", Some(serde_json::json!({ "path": bad }))), &state)
-                    .await;
+            let resp = handle_workspace_list(
+                &req("r1", Some(serde_json::json!({ "path": bad }))),
+                &state,
+                &make_test_ctx(),
+            )
+            .await;
             assert!(!resp.ok, "should reject {bad:?}");
             assert_eq!(resp.error.as_ref().unwrap().code, "PATH_FORBIDDEN");
         }
@@ -446,18 +491,24 @@ mod tests {
         let (state, dir) = state_with_tmp_workspace().await;
         tokio::fs::write(dir.join("a.md"), "# hello").await.unwrap();
 
-        let resp =
-            handle_workspace_read(&req("r1", Some(serde_json::json!({ "path": "a.md" }))), &state)
-                .await;
+        let resp = handle_workspace_read(
+            &req("r1", Some(serde_json::json!({ "path": "a.md" }))),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(resp.ok);
         let payload = resp.payload.unwrap();
         assert_eq!(payload["content"], "# hello");
         assert_eq!(payload["binary"], false);
         assert_eq!(payload["truncated"], false);
 
-        let resp =
-            handle_workspace_read(&req("r2", Some(serde_json::json!({ "path": "." }))), &state)
-                .await;
+        let resp = handle_workspace_read(
+            &req("r2", Some(serde_json::json!({ "path": "." }))),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(!resp.ok); // "." fails segment validation
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -475,6 +526,7 @@ mod tests {
         let resp = handle_workspace_read(
             &req("r1", Some(serde_json::json!({ "path": "big.txt" }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(resp.ok);
@@ -485,6 +537,7 @@ mod tests {
         let resp = handle_workspace_read(
             &req("r2", Some(serde_json::json!({ "path": "bin.dat" }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(resp.ok);

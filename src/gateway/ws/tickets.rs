@@ -42,6 +42,13 @@ pub struct TicketGrant {
     pub user_id: String,
     /// What that credential was entitled to.
     pub scopes: Vec<String>,
+    /// The one agent the minting credential may use, if it was an agent access
+    /// token. Carried through unchanged, so a ticket is exactly as narrow as
+    /// the credential behind it — a ticket cannot widen access, and it must not
+    /// silently widen this either.
+    pub bound_agent: Option<String>,
+    /// The agent-token label, for log lines. Opaque to the ticket store.
+    pub agent_token_label: Option<String>,
     /// When the ticket stops being usable.
     expires_at: Instant,
 }
@@ -63,6 +70,21 @@ impl WsTickets {
     /// The expiry is the store's to decide, so callers cannot mint a long-lived
     /// one by mistake.
     pub async fn issue(&self, user_id: impl Into<String>, scopes: Vec<String>) -> String {
+        self.issue_scoped(user_id, scopes, None, None).await
+    }
+
+    /// Mint a ticket that also carries an agent binding.
+    ///
+    /// Separate from [`Self::issue`] rather than more arguments to it, because
+    /// the two call sites differ in kind: the unbound one is every credential,
+    /// and the bound one only exists for an agent access token.
+    pub async fn issue_scoped(
+        &self,
+        user_id: impl Into<String>,
+        scopes: Vec<String>,
+        bound_agent: Option<String>,
+        agent_token_label: Option<String>,
+    ) -> String {
         let mut issued = self.issued.lock().await;
         issued.retain(|_, t| t.expires_at > Instant::now());
         if issued.len() >= MAX_TICKETS {
@@ -83,6 +105,8 @@ impl WsTickets {
             TicketGrant {
                 user_id: user_id.into(),
                 scopes,
+                bound_agent,
+                agent_token_label,
                 expires_at: Instant::now() + TICKET_TTL,
             },
         );

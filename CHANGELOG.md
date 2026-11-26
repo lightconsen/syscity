@@ -91,6 +91,42 @@ if no section matches, the release falls back to auto-generated notes.
   stamps a real platform user id. An agent absent from the list is unrestricted,
   so existing deployments are unchanged. Settable at runtime via
   `config.set agent_overrides.<id>.allowed_users`.
+- **Agent access tokens — a Desktop on someone's own machine can be limited to
+  a single agent.** A `[security.agent_tokens.<label>]` entry binds one
+  credential to one `(principal, agent_id)`:
+
+  ```toml
+  [security.agent_tokens.alice]
+  agent_id = "secretary"
+  # token from SYSCITY_AGENT_TOKEN_ALICE (recommended) or `token = "…"`
+  ```
+
+  Where `shared_token` resolves every caller to `UserId("shared")`, an agent
+  token authenticates as a real principal — which is also what makes
+  `[agent_overrides.<id>] allowed_users` mean something over WebSocket. The
+  binding is enforced twice: a **closed** method allow-list (`ws::bound`, so a
+  future WS method is unreachable from a bound connection until someone
+  explicitly adds it, rather than reachable by omission), and a parameter check
+  refusing any `agent_id` / `id` / `session_id` / `session_ids` that names
+  another agent or another agent's conversation. Refusal, not silent narrowing:
+  a client asking for the wrong agent is told, not quietly served the right one.
+  Default scopes are `chat` + `read` — no `write` — because an agent token's
+  holder is not the operator. A ticket minted from an agent token carries the
+  binding through (`bound_agent`) so the handover cannot widen it, and the
+  `connect` handshake answers `bound_agent` so the client hides its agent
+  switcher. `auth_mode = "none"` with `agent_tokens` set is a startup error, and
+  so is an entry with no token or no `agent_id`. Tokens can be supplied as
+  `SYSCITY_AGENT_TOKEN_<LABEL>` so none needs to sit in a file. The
+  OpenAI-compatible `/v1/chat/completions` honours it too: the agent mode used
+  to hardcode the literal `default`, so that one REST surface was the hole in
+  the binding.
+- **Desktop can reach a remote gateway over TLS.** `~/.syscity/client.toml`
+  gains `tls`, and the Connection settings a "Use TLS" toggle, so remote mode
+  connects `https://` / `wss://`. The gateway itself has no TLS listener — this
+  is for a reverse proxy in front of it. The `/live` and WS-upgrade probes that
+  decide "is the remote gateway usable?" now speak TLS too (native root store,
+  no client auth), instead of failing against any gateway behind a proxy; the
+  Tauri CSP admits `https://*` / `wss://*` so the WebView may connect.
 
 ### Fixed
 

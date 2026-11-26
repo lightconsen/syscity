@@ -7,7 +7,7 @@ use crate::gateway::GatewayState;
 
 use super::debug::{debug_enabled, invoke_platform_tool_with};
 use super::*;
-use crate::gateway::state_tests::make_test_state;
+use crate::gateway::state_tests::{make_test_ctx, make_test_state};
 use crate::gateway::GatewayConfig;
 
 fn req(id: &str, method: &str, params: Option<serde_json::Value>) -> WsRequest {
@@ -166,7 +166,8 @@ async fn device_pairing_setup_invalid_code_errors() {
 #[tokio::test]
 async fn approvals_list_empty() {
     let state = state().await;
-    let resp = handle_approvals_list(&req("r1", "approvals.list", None), &state).await;
+    let resp =
+        handle_approvals_list(&req("r1", "approvals.list", None), &state, &make_test_ctx()).await;
     assert!(resp.ok);
     assert_eq!(resp.payload.as_ref().unwrap()["count"], 0);
 }
@@ -177,6 +178,7 @@ async fn approvals_approve_unknown_not_found() {
     let resp = handle_approvals_approve(
         &req("r1", "approvals.approve", Some(serde_json::json!({ "id": "missing" }))),
         &state,
+        &make_test_ctx(),
     )
     .await;
     assert!(!resp.ok);
@@ -199,7 +201,8 @@ async fn approvals_submit_then_deny_with_reason() {
     .with_response_tx(tx);
     state.tools.approval_queue.submit(pa).await;
 
-    let resp = handle_approvals_list(&req("r1", "approvals.list", None), &state).await;
+    let resp =
+        handle_approvals_list(&req("r1", "approvals.list", None), &state, &make_test_ctx()).await;
     assert!(resp.ok);
     assert_eq!(resp.payload.as_ref().unwrap()["count"], 1);
 
@@ -210,6 +213,7 @@ async fn approvals_submit_then_deny_with_reason() {
             Some(serde_json::json!({ "id": "app-1", "reason": "Not authorized" })),
         ),
         &state,
+        &make_test_ctx(),
     )
     .await;
     assert!(resp.ok, "deny failed: {:?}", resp.error);
@@ -242,6 +246,7 @@ async fn approvals_approve_with_remember_appends_one_rule() {
             Some(serde_json::json!({ "id": "app-1", "remember": true })),
         ),
         &state,
+        &make_test_ctx(),
     )
     .await;
     assert!(resp.ok, "approve failed: {:?}", resp.error);
@@ -278,6 +283,7 @@ async fn approvals_approve_with_remember_appends_one_rule() {
             Some(serde_json::json!({ "id": "app-2", "remember": true })),
         ),
         &state,
+        &make_test_ctx(),
     )
     .await;
     assert!(resp.ok);
@@ -306,6 +312,7 @@ async fn approvals_approve_without_remember_writes_no_rule() {
     let resp = handle_approvals_approve(
         &req("r1", "approvals.approve", Some(serde_json::json!({ "id": "app-1" }))),
         &state,
+        &make_test_ctx(),
     )
     .await;
     assert!(resp.ok);

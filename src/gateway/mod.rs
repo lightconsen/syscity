@@ -976,6 +976,40 @@ impl Gateway {
 /// Called on the gateway startup path as well as from the auth CLI: a
 /// misconfiguration that leaves the gateway open used to be silent.
 pub(crate) fn validate_auth_config(config: &GatewayConfig) -> crate::Result<()> {
+    // An agent access token is only checked when something checks tokens at
+    // all. Under `auth_mode = "none"` the middleware short-circuits before any
+    // token, so an entry there would authenticate nobody while looking, in the
+    // config, like it restricts who reaches which agent. Refuse it rather than
+    // leave that contradiction on disk.
+    if config.security.auth_mode == crate::gateway::protocol::AuthMode::None {
+        if !config.security.agent_tokens.is_empty() {
+            return Err(crate::error::SyscityError::Validation(
+                "security.agent_tokens is configured but auth_mode is 'none', so no token is \
+                 ever checked and every client reaches every agent. Set auth_mode = \"token\" \
+                 (or \"device\") for agent tokens to mean anything."
+                    .into(),
+            ));
+        }
+    } else {
+        // A malformed entry is a config error, not a credential that silently
+        // never matches: an empty token authenticates nobody, and an entry with
+        // no `agent_id` would bind a connection to an agent that does not
+        // exist — its holder would be refused everywhere with no clue why.
+        for (label, entry) in &config.security.agent_tokens {
+            if entry.token.trim().is_empty() {
+                return Err(crate::error::SyscityError::Validation(format!(
+                    "security.agent_tokens.{label} has no token. Set one, or remove the entry."
+                )));
+            }
+            if entry.agent_id.trim().is_empty() {
+                return Err(crate::error::SyscityError::Validation(format!(
+                    "security.agent_tokens.{label} has no agent_id. An agent token must name the \
+                     one agent it reaches."
+                )));
+            }
+        }
+    }
+
     // Anonymous mode is loud, whatever else is configured: it is the difference
     // between "nobody has to authenticate" and "anyone who reaches this port
     // controls the machine's runtime".

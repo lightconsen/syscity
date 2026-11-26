@@ -1,11 +1,31 @@
 //! Agent list/get/registry, health, system presence.
 
 use super::*;
-pub(super) async fn handle_agents_list(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+
+/// Filter a list of agent ids to what the caller may see.
+///
+/// An unbound caller sees every agent (unchanged behaviour). A connection bound
+/// to one agent sees only that one: the client is configured with a single
+/// agent's credential, so a sidebar offering the others is a list of refusals
+/// waiting to happen. The bound agent is kept even if it is not currently
+/// spawned, because the client must still be able to name its own agent.
+fn restrict_agents(ids: impl IntoIterator<Item = String>, ctx: &RequestContext) -> Vec<String> {
+    match ctx.bound_agent() {
+        Some(bound) => ids.into_iter().filter(|id| id == bound).collect(),
+        None => ids.into_iter().collect(),
+    }
+}
+
+pub(super) async fn handle_agents_list(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     let agents = {
         let agents = state.agents.agents.read().await;
         agents.keys().cloned().collect::<Vec<_>>()
     };
+    let agents = restrict_agents(agents, ctx);
 
     WsResponse::ok(&req.id, serde_json::json!({ "agents": agents }))
 }
@@ -107,6 +127,7 @@ pub(super) async fn handle_agents_get(req: &WsRequest, state: &Arc<GatewayState>
 pub(super) async fn handle_agents_registry(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     let registry = state.agents.registry.read().await;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -114,6 +135,9 @@ pub(super) async fn handle_agents_registry(
 
     // 1. Registry-discovered agents from disk
     for id in registry.list() {
+        if !ctx.may_use_agent(&id) {
+            continue;
+        }
         if let Some(p) = registry.get(&id) {
             seen.insert(id.clone());
             entries.push(serde_json::json!({
@@ -130,15 +154,16 @@ pub(super) async fn handle_agents_registry(
     {
         let agents = state.agents.agents.read().await;
         for id in agents.keys() {
-            if !seen.contains(id) {
-                entries.push(serde_json::json!({
-                    "id": id,
-                    "display_name": id.as_str(),
-                    "emoji": "🤖",
-                    "is_valid": true,
-                    "has_heartbeat": false,
-                }));
+            if seen.contains(id) || !ctx.may_use_agent(id) {
+                continue;
             }
+            entries.push(serde_json::json!({
+                "id": id,
+                "display_name": id.as_str(),
+                "emoji": "🤖",
+                "is_valid": true,
+                "has_heartbeat": false,
+            }));
         }
     }
 
@@ -420,7 +445,7 @@ pub(crate) async fn handle_agents_import(req: &WsRequest, state: &Arc<GatewaySta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::state_tests::make_test_state;
+    use crate::gateway::state_tests::{make_test_ctx, make_test_state};
     use crate::gateway::GatewayConfig;
 
     fn req(id: &str, params: Option<serde_json::Value>) -> WsRequest {
@@ -439,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn agents_list_empty_ok() {
         let state = state().await;
-        let resp = handle_agents_list(&req("r1", None), &state).await;
+        let resp = handle_agents_list(&req("r1", None), &state, &make_test_ctx()).await;
         assert!(resp.ok);
         let agents = resp.payload.as_ref().unwrap()["agents"].as_array().unwrap();
         assert!(agents.is_empty(), "fresh state has no agents");
@@ -565,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn agents_registry_empty_ok() {
         let state = state().await;
-        let resp = handle_agents_registry(&req("r1", None), &state).await;
+        let resp = handle_agents_registry(&req("r1", None), &state, &make_test_ctx()).await;
         assert!(resp.ok);
         let payload = resp.payload.as_ref().unwrap();
         assert_eq!(payload["count"], 0);

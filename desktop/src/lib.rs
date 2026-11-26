@@ -232,19 +232,24 @@ async fn test_remote_gateway(
     host: String,
     port: u16,
     token: Option<String>,
+    tls: Option<bool>,
 ) -> Result<String, String> {
+    let tls = tls.unwrap_or(false);
+    let scheme = if tls { "https" } else { "http" };
     // 1. Liveness (no auth needed — /live is in the public tier).
-    if !gateway_healthy(&host, port).await {
+    if !gateway_healthy(&host, port, tls).await {
         return Err(format!(
-            "Cannot reach gateway at {}:{} — is it running and bound to a reachable address?",
-            host, port
+            "Cannot reach gateway at {scheme}://{host}:{port} — is it running, bound to a \
+             reachable address, and is the TLS setting right?"
         ));
     }
     // 2. WS upgrade with the token: 101 = authenticated, 401 = bad token.
-    let probe = ws_upgrade_probe(&host, port, token.as_deref()).await;
+    let probe = ws_upgrade_probe(&host, port, token.as_deref(), tls).await;
     match probe.as_str() {
-        "ok" => Ok(format!("Gateway reachable and authenticated at {}:{}", host, port)),
-        "unauthorized" => Err("Gateway reachable, but the token was rejected (401).".to_string()),
+        "ok" => Ok(format!("Gateway reachable and authenticated at {scheme}://{host}:{port}")),
+        "unauthorized" => {
+            Err("Gateway reachable, but the credential was rejected (401).".to_string())
+        }
         _ => Err(format!("Gateway reachable, but the WebSocket handshake failed: {}", probe)),
     }
 }
@@ -530,18 +535,18 @@ pub fn run() {
                     // Remote mode: connect to the configured gateway.
                     let base = connection::remote_base(&conn);
                     eprintln!("Connecting to remote Syscity Gateway at {}", base);
-                    if !gateway_healthy(&conn.host, conn.port).await {
+                    if !gateway_healthy(&conn.host, conn.port, conn.tls).await {
                         eprintln!("Remote gateway {} is not reachable (is it running?)", base);
                     }
                     let mut s = state.lock().await;
                     s.gateway_port = conn.port;
                     s.gateway_base = base.clone();
-                    // The remote gateway requires its shared token at the WS
+                    // The remote gateway requires its credential at the WS
                     // handshake and as an HTTP Bearer — expose it to the
                     // frontend (get_gateway_token).
                     s.gateway_token = conn.token.clone();
                     drop(s);
-                    announce_gateway_ready(&handle, &conn.host, conn.port).await;
+                    announce_gateway_ready(&handle, &base).await;
                     watch_remote_gateway(handle, conn).await;
                 }
                 ConnectionMode::Local => {
@@ -582,8 +587,8 @@ pub fn run() {
                         // refused and the window shows a permanent spinner.
                         // Probe the upgrade itself before adopting it.
                         let configured = configured_gateway_port().await;
-                        let reusable = gateway_healthy("127.0.0.1", configured).await
-                            && ws_upgrade_probe("127.0.0.1", configured, None).await == "ok";
+                        let reusable = gateway_healthy("127.0.0.1", configured, false).await
+                            && ws_upgrade_probe("127.0.0.1", configured, None, false).await == "ok";
                         if reusable {
                             eprintln!(
                                 "Reusing existing Syscity Gateway on http://127.0.0.1:{}",
@@ -593,7 +598,11 @@ pub fn run() {
                             s.gateway_port = configured;
                             s.gateway_base = format!("http://127.0.0.1:{}", configured);
                             drop(s);
-                            announce_gateway_ready(&handle, "127.0.0.1", configured).await;
+                            announce_gateway_ready(
+                                &handle,
+                                &format!("http://127.0.0.1:{}", configured),
+                            )
+                            .await;
                             watch_reused_gateway(handle, state, configured, device_bridge).await;
                         } else {
                             match find_available_port("127.0.0.1", configured, 100).await {
@@ -710,14 +719,62 @@ async fn configured_gateway_port() -> u16 {
     18080
 }
 
+/// A stream to the gateway, TLS-wrapped when the connection asked for it.
+///
+/// The two probes below speak HTTP by hand rather than through a client
+/// library, so that a cold start does not pull a full HTTP stack (and its TLS
+/// provider) into the window-open path. A `Box<dyn>` keeps that one shape for
+/// both cases.
+trait GatewayIo: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite> GatewayIo for T {}
+type GatewayStream = Box<dyn GatewayIo + Unpin + Send>;
+
+/// Connect to `host:port`, wrapping the socket in TLS when `tls` is set.
+///
+/// The connector is rebuilt per call rather than cached: probes run at most
+/// every few seconds, and a cached trust store would go stale exactly when it
+/// matters — a rotated root or a newly installed corporate CA.
+async fn dial_gateway(host: &str, port: u16, tls: bool) -> Result<GatewayStream, String> {
+    let stream = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| format!("connecting to {host}:{port} failed: {e}"))?;
+    if !tls {
+        return Ok(Box::new(stream));
+    }
+
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    let mut loaded = 0usize;
+    for cert in rustls_native_certs::load_native_certs().certs {
+        // One certificate the platform store cannot read is not a reason to
+        // refuse every connection — but an empty store is.
+        if let Ok(()) = roots.add(cert) {
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        return Err("the platform trust store held no usable certificates".to_string());
+    }
+    let config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("{host} is not a name a certificate can cover: {e}"))?;
+    let stream = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| format!("the TLS handshake failed: {e}"))?;
+    Ok(Box::new(stream))
+}
+
 /// Probe `GET /live` on `host:port` to detect an already-running gateway.
 ///
 /// `/live` returns 200 whenever the process is up, unlike `/health` which is
 /// 503 until the gateway reports fully healthy — so this answers "is a gateway
 /// running here?" rather than "is it healthy?".
-async fn gateway_healthy(host: &str, port: u16) -> bool {
+async fn gateway_healthy(host: &str, port: u16, tls: bool) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let Ok(mut stream) = tokio::net::TcpStream::connect((host, port)).await else {
+    let Ok(mut stream) = dial_gateway(host, port, tls).await else {
         return false;
     };
     let request = format!("GET /live HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", host);
@@ -737,10 +794,11 @@ async fn gateway_healthy(host: &str, port: u16) -> bool {
 /// Returns `"ok"` on a 101 (authenticated), `"unauthorized"` on a 401 (bad /
 /// missing token), or a short description of the failure otherwise. Used by
 /// the remote-connection "test" flow and the startup remote probe.
-async fn ws_upgrade_probe(host: &str, port: u16, token: Option<&str>) -> String {
+async fn ws_upgrade_probe(host: &str, port: u16, token: Option<&str>, tls: bool) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let Ok(mut stream) = tokio::net::TcpStream::connect((host, port)).await else {
-        return "unreachable".to_string();
+    let mut stream = match dial_gateway(host, port, tls).await {
+        Ok(stream) => stream,
+        Err(e) => return e,
     };
     let key = "x3JJHMbDL1EzLkh9GBhXDw=="; // fixed test key; the server does not validate it
     let mut request = format!(
@@ -770,13 +828,16 @@ async fn ws_upgrade_probe(host: &str, port: u16, token: Option<&str>) -> String 
 }
 
 /// Show the main window and notify the frontend that a gateway is ready.
-async fn announce_gateway_ready(handle: &tauri::AppHandle, host: &str, port: u16) {
+///
+/// `base` is the full URL the frontend should point at — loopback for the
+/// embedded/reused gateway, the remote one (and its scheme) in remote mode —
+/// so this never derives a URL of its own; a hardcoded `http://` here is
+/// exactly what made TLS remote gateways unreachable.
+async fn announce_gateway_ready(handle: &tauri::AppHandle, base: &str) {
     if let Some(window) = handle.get_webview_window("main") {
         window.show().unwrap();
     }
-    handle
-        .emit("gateway-ready", format!("http://{}:{}", host, port))
-        .ok();
+    handle.emit("gateway-ready", base.to_string()).ok();
 }
 
 /// Periodically probe a gateway we own (the embedded one) and emit
@@ -785,7 +846,7 @@ async fn monitor_owned_gateway(handle: tauri::AppHandle, port: u16) {
     let probe_interval = std::time::Duration::from_secs(10);
     loop {
         tokio::time::sleep(probe_interval).await;
-        if gateway_healthy("127.0.0.1", port).await {
+        if gateway_healthy("127.0.0.1", port, false).await {
             continue;
         }
         eprintln!("Embedded gateway on 127.0.0.1:{} stopped responding", port);
@@ -806,7 +867,7 @@ async fn watch_reused_gateway(
     let probe_interval = std::time::Duration::from_secs(5);
     loop {
         tokio::time::sleep(probe_interval).await;
-        if gateway_healthy("127.0.0.1", port).await {
+        if gateway_healthy("127.0.0.1", port, false).await {
             continue;
         }
         eprintln!(
@@ -846,7 +907,7 @@ async fn watch_remote_gateway(handle: tauri::AppHandle, conn: ConnectionConfig) 
     let base = connection::remote_base(&conn);
     loop {
         tokio::time::sleep(probe_interval).await;
-        if gateway_healthy(&conn.host, conn.port).await {
+        if gateway_healthy(&conn.host, conn.port, conn.tls).await {
             continue;
         }
         eprintln!("Remote gateway {} stopped responding", base);
@@ -854,7 +915,7 @@ async fn watch_remote_gateway(handle: tauri::AppHandle, conn: ConnectionConfig) 
         // Keep watching so the frontend recovers when the remote comes back.
         loop {
             tokio::time::sleep(probe_interval).await;
-            if gateway_healthy(&conn.host, conn.port).await {
+            if gateway_healthy(&conn.host, conn.port, conn.tls).await {
                 eprintln!("Remote gateway {} is back", base);
                 let _ = handle.emit("gateway-ready", base.clone());
                 break;
@@ -1012,7 +1073,11 @@ async fn start_gateway(
     .map_err(|e| format!("Failed to create gateway: {}", e))?;
 
     // Show the main window and notify the frontend now that the backend is ready.
-    announce_gateway_ready(&handle, &gateway_config.host, gateway_config.port).await;
+    announce_gateway_ready(
+        &handle,
+        &format!("http://{}:{}", gateway_config.host, gateway_config.port),
+    )
+    .await;
 
     // Blocks until the server shuts down.
     gateway

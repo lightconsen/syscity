@@ -111,10 +111,8 @@ pub async fn ws_auth_middleware(
             let config = state.config.read().await;
             config.security.local_scopes.clone()
         };
-        req.extensions_mut().insert(WsAuthResult {
-            user_id: UserId::new("anonymous"),
-            scopes: local_scopes,
-        });
+        req.extensions_mut()
+            .insert(WsAuthResult::unrestricted(UserId::new("anonymous"), local_scopes));
         return next.run(req).await;
     }
 
@@ -193,6 +191,8 @@ async fn validate_ws_upgrade_request(
             Some(grant) => Ok(WsAuthResult {
                 user_id: UserId::new(grant.user_id),
                 scopes: grant.scopes,
+                bound_agent: grant.bound_agent,
+                agent_token_label: grant.agent_token_label,
             }),
             None => {
                 warn!("WebSocket upgrade rejected: invalid or expired ticket");
@@ -215,33 +215,64 @@ async fn validate_ws_upgrade_request(
             } else {
                 session.scopes.clone()
             };
-            return Ok(WsAuthResult {
-                user_id: session.user_id,
-                scopes,
-            });
+            return Ok(WsAuthResult::unrestricted(session.user_id, scopes));
         }
     }
 
-    // 3. Check against shared_token in config
     let config = state.config.read().await;
+
+    // 2. An agent access token. Checked before `shared_token` because it is
+    //    the narrower credential — if the same string were somehow both, the
+    //    agent-scoped reading is the safe one.
+    //
+    //    The header first, then `?token=`: a browser cannot set headers on the
+    //    upgrade, and the desktop build is the primary holder of one of these.
+    //    The query fallback is not consulted when the header carried a
+    //    credential, so a stale URL cannot shadow it.
+    let agent_token = token_from_header
+        .as_deref()
+        .and_then(|tok| config.security.agent_token_match(tok).map(|m| (m, false)))
+        .or_else(|| {
+            if token_from_header.is_some() {
+                return None;
+            }
+            query_token.and_then(|tok| config.security.agent_token_match(tok).map(|m| (m, true)))
+        });
+    if let Some(((label, entry), came_from_query)) = agent_token {
+        if came_from_query {
+            warn_query_token_once();
+        }
+        info!(
+            "WebSocket upgrade authenticated with agent token '{}' (agent '{}')",
+            label, entry.agent_id
+        );
+        return Ok(WsAuthResult {
+            user_id: UserId::new(entry.principal_or_label(label)),
+            scopes: entry.scopes.clone(),
+            bound_agent: Some(entry.agent_id.clone()),
+            agent_token_label: Some(label.to_string()),
+        });
+    }
+
+    // 3. Check against shared_token in config
     if let Some(shared_token) = &config.security.shared_token {
         // Check Bearer header token
         if let Some(ref tok) = token_from_header {
             if tok == shared_token {
-                return Ok(WsAuthResult {
-                    user_id: UserId::new("shared"),
-                    scopes: config.security.shared_token_scopes.clone(),
-                });
+                return Ok(WsAuthResult::unrestricted(
+                    UserId::new("shared"),
+                    config.security.shared_token_scopes.clone(),
+                ));
             }
         }
         // Check query parameter token
         if let Some(qt) = query_token {
             if qt == shared_token {
                 warn_query_token_once();
-                return Ok(WsAuthResult {
-                    user_id: UserId::new("shared"),
-                    scopes: config.security.shared_token_scopes.clone(),
-                });
+                return Ok(WsAuthResult::unrestricted(
+                    UserId::new("shared"),
+                    config.security.shared_token_scopes.clone(),
+                ));
             }
         }
     }
@@ -898,12 +929,16 @@ async fn dispatch_method(
         // as such rather than making downstream code re-derive it off `conn`.
         // (There is no session id at dispatch time: it lives in the per-method
         // params, so callers that know it attach it via `with_session_id`.)
-        if source == AuthSource::Device {
+        let ctx = if source == AuthSource::Device {
             let device_id = ctx.user_id().to_string();
             ctx.with_device_id(device_id)
         } else {
             ctx
-        }
+        };
+        // An agent-bound connection carries its one agent for the whole
+        // request, so a handler can enforce the binding without re-reading the
+        // connection under another lock.
+        ctx.with_bound_agent(cg.bound_agent.as_deref())
     };
     if let Some(required) = method_scope(&req.method) {
         if !scopes_allow(&scopes, &req.method) {
@@ -915,6 +950,32 @@ async fn dispatch_method(
             // caller already receives the error and reports it itself.
             warn!("Rejected {} for user {}: missing scope {}", req.method, ctx.user_id(), required);
             return error_forbidden(&req.id, required);
+        }
+    }
+
+    // An agent-bound connection is constrained a second time, below scopes: its
+    // method surface is the single-agent one, and the agent or session it names
+    // must be its own. Both are refusals rather than silent narrowing — a
+    // client asking for the wrong agent needs to be told, not quietly served a
+    // different one.
+    if let Some(bound) = ctx.bound_agent() {
+        if !crate::gateway::ws::bound::method_allowed(&req.method) {
+            warn!(
+                "Rejected {} for user {}: outside the agent-bound surface (agent '{}')",
+                req.method,
+                ctx.user_id(),
+                bound
+            );
+            return crate::gateway::ws::bound::method_refusal(&req.id, &req.method, bound);
+        }
+        if let Some(refusal) = crate::gateway::ws::bound::check_params(req, &ctx, state).await {
+            warn!(
+                "Rejected {} for user {}: names an agent or session outside the binding '{}'",
+                req.method,
+                ctx.user_id(),
+                bound
+            );
+            return refusal;
         }
     }
 
@@ -930,7 +991,7 @@ async fn dispatch_method(
         "feedback.vote" => feedback::handle_feedback_vote(req, state).await,
         "feedback.ops" => feedback::handle_feedback_ops(req, state).await,
         "ask.respond" => ask::handle_ask_respond(req, state).await,
-        "sessions.list" => sessions::handle_sessions_list(req, state).await,
+        "sessions.list" => sessions::handle_sessions_list(req, state, &ctx).await,
         "sessions.create" => sessions::handle_sessions_create(req, conn, state, &ctx).await,
         "sessions.delete" => sessions::handle_sessions_delete(req, conn, state).await,
         "sessions.rename" => sessions::handle_sessions_rename(req, conn, state).await,
@@ -952,13 +1013,13 @@ async fn dispatch_method(
         "sessions.reset" => sessions::handle_sessions_reset(req, conn, state).await,
         "sessions.subscribe" => sessions::handle_sessions_subscribe(req, conn, cmd_tx).await,
         "sessions.unsubscribe" => sessions::handle_sessions_unsubscribe(req, conn, cmd_tx).await,
-        "agents.list" => agents::handle_agents_list(req, state).await,
+        "agents.list" => agents::handle_agents_list(req, state, &ctx).await,
         "agents.create" => admin_ws::handle_agents_create(req, state).await,
         "agents.delete" => admin_ws::handle_agents_delete(req, state).await,
         "agents.purge" => admin_ws::handle_agents_purge(req, state).await,
         "agents.rename" => admin_ws::handle_agents_rename(req, state).await,
         "agents.get" => agents::handle_agents_get(req, state).await,
-        "agents.registry" => agents::handle_agents_registry(req, state).await,
+        "agents.registry" => agents::handle_agents_registry(req, state, &ctx).await,
         "agents.get_config" => agents::handle_agents_get_config(req, state).await,
         "agents.update" => agents::handle_agents_update(req, state).await,
         "agents.default" => agents::handle_agents_default(req, state).await,
@@ -1041,8 +1102,8 @@ async fn dispatch_method(
         "connectors.updates" => connectors_ws::handle_connectors_updates(req, state).await,
         "logs.subscribe" => logs::handle_logs_subscribe(req, conn, state, cmd_tx).await,
         "logs.unsubscribe" => logs::handle_logs_unsubscribe(req, conn, state).await,
-        "workspace.list" => workspace::handle_workspace_list(req, state).await,
-        "workspace.read" => workspace::handle_workspace_read(req, state).await,
+        "workspace.list" => workspace::handle_workspace_list(req, state, &ctx).await,
+        "workspace.read" => workspace::handle_workspace_read(req, state, &ctx).await,
         "acp.list" => acp::handle_acp_list(req, state).await,
         "acp.spawn" => acp::handle_acp_spawn(req, state, &ctx).await,
         "acp.terminate" => acp::handle_acp_terminate(req, state, &ctx).await,
@@ -1148,10 +1209,10 @@ async fn dispatch_method(
         "status.get" => admin_ws::handle_status_get(req, state).await,
         "audit.recent" => admin_ws::handle_audit_recent(req, state).await,
         "audit.all" => admin_ws::handle_audit_all(req, state).await,
-        "approvals.list" => admin_ws::handle_approvals_list(req, state).await,
-        "approvals.get" => admin_ws::handle_approvals_get(req, state).await,
-        "approvals.approve" => admin_ws::handle_approvals_approve(req, state).await,
-        "approvals.deny" => admin_ws::handle_approvals_deny(req, state).await,
+        "approvals.list" => admin_ws::handle_approvals_list(req, state, &ctx).await,
+        "approvals.get" => admin_ws::handle_approvals_get(req, state, &ctx).await,
+        "approvals.approve" => admin_ws::handle_approvals_approve(req, state, &ctx).await,
+        "approvals.deny" => admin_ws::handle_approvals_deny(req, state, &ctx).await,
         "computer.run" => admin_ws::handle_computer_run(req, state).await,
         "computer.status" => admin_ws::handle_computer_status(req, state).await,
         "computer.control" => admin_ws::handle_computer_control(req, state).await,
@@ -1296,6 +1357,132 @@ mod tests {
         assert!(validate_ws_upgrade_request(&state, &headers, None, Some("wst_nope"))
             .await
             .is_err());
+    }
+
+    /// A ticket minted from an agent access token carries that binding through
+    /// the upgrade — a ticket hands over the minting credential's scopes, and
+    /// widening here would let a client trade a one-agent token for a
+    /// full-gateway connection.
+    #[tokio::test]
+    async fn a_ticket_carries_the_agent_binding() {
+        let state = state().await;
+        let ticket = state
+            .ws_tickets
+            .issue_scoped(
+                "alice",
+                vec!["chat".to_string(), "read".to_string()],
+                Some("alpha".to_string()),
+                Some("alice-label".to_string()),
+            )
+            .await;
+        let headers = axum::http::HeaderMap::new();
+
+        let grant = validate_ws_upgrade_request(&state, &headers, None, Some(&ticket))
+            .await
+            .expect("the ticket should authenticate the upgrade");
+        assert_eq!(grant.user_id.0, "alice");
+        assert_eq!(grant.bound_agent.as_deref(), Some("alpha"));
+        assert_eq!(grant.agent_token_label.as_deref(), Some("alice-label"));
+    }
+
+    /// The upgrade accepts an agent access token, from the Bearer header and
+    /// from `?token=`, and the resulting connection is bound to that entry's
+    /// agent — authenticated as the declared principal, not `"shared"`.
+    #[tokio::test]
+    async fn an_agent_token_authenticates_the_upgrade() {
+        let mut config = GatewayConfig::default();
+        config.security.auth_mode = AuthMode::Token;
+        config.security.agent_tokens.insert(
+            "alice".into(),
+            crate::gateway::config::AgentTokenEntry {
+                token: "agent-secret".into(),
+                principal: String::new(),
+                agent_id: "alpha".into(),
+                scopes: crate::gateway::config::default_agent_token_scopes(),
+            },
+        );
+        let state = Arc::new(make_test_state(config).await);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, "Bearer agent-secret".parse().unwrap());
+        let grant = validate_ws_upgrade_request(&state, &headers, None, None)
+            .await
+            .expect("the header agent token should authenticate");
+        assert_eq!(grant.user_id.0, "alice");
+        assert_eq!(grant.bound_agent.as_deref(), Some("alpha"));
+        assert_eq!(
+            grant.scopes,
+            crate::gateway::config::default_agent_token_scopes(),
+            "an agent token is worth exactly its entry's scopes"
+        );
+
+        let empty = axum::http::HeaderMap::new();
+        let grant = validate_ws_upgrade_request(&state, &empty, Some("agent-secret"), None)
+            .await
+            .expect("the query agent token should authenticate");
+        assert_eq!(grant.bound_agent.as_deref(), Some("alpha"));
+
+        // An unknown string is not a credential, and does not fall through to
+        // an unbound result.
+        assert!(validate_ws_upgrade_request(&state, &empty, Some("agent-wrong"), None)
+            .await
+            .is_err());
+    }
+
+    /// The dispatcher enforces the binding a second time: a method outside the
+    /// single-agent surface is refused even when the connection's scopes would
+    /// allow it.
+    #[tokio::test]
+    async fn a_bound_connection_refuses_operator_methods() {
+        let conn = make_test_conn(&["admin", "read", "write", "chat"]);
+        {
+            let mut cg = conn.write().await;
+            cg.bound_agent = Some("alpha".into());
+        }
+        let resp = dispatch(&conn, &req("r1", "config.set", None)).await;
+        assert!(!resp.ok);
+        let err = resp.error.as_ref().unwrap();
+        assert_eq!(err.code, "FORBIDDEN");
+        assert!(err.message.contains("alpha"), "{}", err.message);
+    }
+
+    /// …and a request that names another agent is refused rather than quietly
+    /// served the bound one.
+    #[tokio::test]
+    async fn a_bound_connection_refuses_another_agent() {
+        let conn = make_test_conn(&["admin", "read", "write", "chat"]);
+        {
+            let mut cg = conn.write().await;
+            cg.bound_agent = Some("alpha".into());
+        }
+        let resp = dispatch(
+            &conn,
+            &req(
+                "r1",
+                "chat.send",
+                Some(serde_json::json!({
+                    "session_id": "ws:alice",
+                    "message": "hi",
+                    "agent_id": "beta"
+                })),
+            ),
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN");
+    }
+
+    /// The single-agent surface itself is reachable: a bound connection is not
+    /// a dead one.
+    #[tokio::test]
+    async fn a_bound_connection_reaches_the_single_agent_surface() {
+        let conn = make_test_conn(&["admin", "read", "write", "chat"]);
+        {
+            let mut cg = conn.write().await;
+            cg.bound_agent = Some("alpha".into());
+        }
+        let resp = dispatch(&conn, &req("r1", "methods.list", None)).await;
+        assert!(resp.ok, "{:?}", resp.error);
     }
 
     async fn dispatch(

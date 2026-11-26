@@ -106,8 +106,11 @@ tower-http = { version = "0.6", features = ["fs", "cors", "limit"] }
 tokio-tungstenite = "0.30"
 
 # TLS for a raw TCP client (the IRC channel). Both are already in the tree
-# transitively, so these add no crate.
-tokio-rustls = "0.26"
+# transitively, so these add no crate. `aws-lc-rs` is the provider rather than
+# `ring` because the desktop's `test_remote_gateway` probe links `tokio-rustls`
+# as a workspace member too, and a feature unification between the two without
+# a chosen provider fails to build.
+tokio-rustls = { version = "0.26", features = ["aws-lc-rs"] }
 rustls-native-certs = "0.8"
 
 # JSON

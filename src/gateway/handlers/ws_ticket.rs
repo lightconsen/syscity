@@ -26,8 +26,8 @@ pub async fn ws_ticket_handler(
     State(state): State<Arc<GatewayState>>,
     auth: Option<Extension<RestAuthContext>>,
 ) -> impl IntoResponse {
-    let (user_id, scopes) = match auth {
-        Some(Extension(ctx)) => (ctx.user_id, ctx.scopes),
+    let (user_id, scopes, bound_agent, agent_token_label) = match auth {
+        Some(Extension(ctx)) => (ctx.user_id, ctx.scopes, ctx.bound_agent, ctx.agent_token_label),
         // No credential was required, so the caller is an anonymous local
         // client — and gets exactly what such a client gets on the WS path.
         None => {
@@ -35,11 +35,14 @@ pub async fn ws_ticket_handler(
                 let config = state.config.read().await;
                 config.security.local_scopes.clone()
             };
-            ("anonymous".to_string(), local_scopes)
+            ("anonymous".to_string(), local_scopes, None, None)
         }
     };
 
-    let ticket = state.ws_tickets.issue(user_id, scopes).await;
+    let ticket = state
+        .ws_tickets
+        .issue_scoped(user_id, scopes, bound_agent, agent_token_label)
+        .await;
 
     (
         StatusCode::OK,
@@ -92,10 +95,7 @@ mod tests {
     #[tokio::test]
     async fn a_ticket_carries_the_minting_credentials_scopes() {
         let state = state().await;
-        let ctx = RestAuthContext {
-            user_id: "read-only-session".to_string(),
-            scopes: vec!["read".to_string()],
-        };
+        let ctx = RestAuthContext::unrestricted("read-only-session", vec!["read".to_string()]);
 
         let ticket = ticket_from(
             ws_ticket_handler(State(state.clone()), Some(Extension(ctx)))

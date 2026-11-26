@@ -318,11 +318,18 @@ function ChatShell() {
   }, [transport]);
 
   // Load agents
+  //
+  // An agent-bound connection (the user signed in with one agent's token) sees
+  // exactly its own agent and nothing else. The gateway already refuses
+  // everything else, so filtering here is not a security boundary — it is so
+  // the sidebar does not render a switcher full of agents every entry of
+  // which would be a dead click.
   const refreshAgents = useCallback(async () => {
     const list = await transport.listAgentRegistry();
+    const bound = transport.getServerInfo().bound_agent ?? null;
     // Exclude the default agent and any invalid entries.
     const filtered = list.filter(
-      (a) => a.is_valid && a.id !== "default"
+      (a) => a.is_valid && a.id !== "default" && (!bound || a.id === bound)
     );
     // Assign unique emojis so each agent has a distinct icon.
     const emojiMap = assignUniqueEmojis(filtered);
