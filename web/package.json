@@ -47,7 +47,8 @@
       "browserslist": "^4.29.0",
       "baseline-browser-mapping": "^2.11.0",
       "source-map-js": "^1.2.2",
-      "serialize-javascript": "^7.1.2"
+      "serialize-javascript": "^7.1.2",
+      "glob@11": "^14.0.6"
     }
   }
 }
