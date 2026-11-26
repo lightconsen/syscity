@@ -11,6 +11,95 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-11-26
+
+### Added
+
+- **The landing-page demo now shows the agent driving a real Linux desktop.**
+  The clip used to be a screencast of a markdown report, which demonstrated a
+  tool and not the claim. The new one is a composite on a single clock: the app
+  on the left, the Linux desktop it actually drove on the right — the terminal
+  opening, `uname -a` being typed, its output arriving as the run panel fills in
+  beside them. One clip serves both themes; re-staging it in dark mode would
+  mean a second autonomous run on a metered model, and the frames are evidence,
+  not decoration.
+- **Fullscreen for the demo clip.** The frame (bar and video together) goes
+  fullscreen, not the bare `<video>`, so the window bar travels with it and the
+  clip letterboxes against the page colour instead of a black backdrop. The
+  icon and label follow `fullscreenchange` rather than the click, so leaving via
+  Escape does not leave the button claiming otherwise.
+- **A social card, a sitemap, a real 404 and legal pages** on the site. Shared
+  links rendered as bare text before: there were no `og:` tags, no sitemap, and
+  the footer had no privacy or terms page to point at. `public/` now carries
+  `og-image.png` (1200×630, drawn to match the hero), `privacy.html`,
+  `terms.html`, `404.html` with root-absolute links, `robots.txt`,
+  `sitemap.xml` and a legacy `favicon.ico`. Analytics is Cloudflare Web
+  Analytics — cookieless, which is why the site needs no banner.
+
+### Changed
+
+- **A remote desktop is now as usable as a local one.** Driving a Linux
+  container over SSH, a `computer_run` cycled through
+  activate/screenshot/look and never acted: the remote tree reader returned
+  elements with an empty `id`, so element-targeted steps had no address; it
+  read the "active" application, which under SSH is nobody, so it got the
+  session manager; `display_geometry` answered "unknown", so every screenshot-
+  derived click was refused; `launch` blocked until the GUI app exited; and
+  window actions were unsupported. All five are fixed — the remote reader now
+  stores the same snapshot a local one does, so remote ids resolve identically.
+  Two things the model is told changed with it: `ComputerAdapter::target_os`
+  means a macOS gateway driving Linux no longer claims to be on macOS and ask
+  for `Terminal`, and when `[computer.remote_control] host` is set, this host's
+  GUI tool sets (AppleScript, local desktop control) are disabled, because they
+  act on the wrong computer.
+- **The site is readable and honest.** Nine colour-contrast failures are gone
+  (`--color-faint` was 3.3:1 at 12 px; it is `#6f6f80` now, which clears 4.5:1
+  on every surface), the footer's `#platforms` link pointed at a section named
+  `download` and scrolled nowhere, and below `md` the section links were hidden
+  with nothing in their place. **The iOS download card is removed**: it pointed
+  at `apps.apple.com/app/syscity`, which carries no numeric id — Apple serves an
+  unrelated app rather than 404 — and `lookup?bundleId=net.syscity` returns
+  nothing, so there is no listing to link to yet. Lighthouse: accessibility
+  95 → 100.
+
+### Fixed
+
+- **A non-streaming Anthropic reply with a `thinking` block no longer fails
+  whole.** The parser knew only text, image, tool_use and tool_result, so a
+  `thinking` block rejected the entire response — and since an extended-thinking
+  model spends its budget thinking first, the reply can be *only* a thinking
+  block. That is exactly the shape of the one-token health probe: every probe
+  failed to parse, `health_check` reported `Ok(false)`, five of them opened the
+  circuit breaker on a provider answering normally, and every chat request then
+  died with "All providers failed". Restarting did not help; the probes
+  re-opened it.
+- **`models.list` no longer waits on the cloud.** A signed-in user with cloud
+  enabled had every startup model listing block on a cloud round trip bounded at
+  10 s — longer than the 5 s the web client waits. On a slow or unreachable
+  cloud the reply timed out client-side, `needsSetup` never resolved, and the app
+  sat on StartingScreen while the gateway was healthy and serving. The handler
+  now serves whatever the catalog cache holds and refreshes off the request
+  path: 10.002 s → 4 ms cold, 2 ms warm.
+- **The desktop-run panel shows the run that is actually driving the desktop.**
+  Three ways it showed the wrong thing, all in the client's folds: a live run
+  had no goal (the panel's header *is* the goal, so it captioned "nothing is
+  driving this desktop" above the steps driving it); a finished run held the
+  panel, because selection auto-picked the first run ever seen; and a finished
+  run could read as interrupted. Separately, clicking New Session left the
+  previous conversation's run sitting above an empty page.
+- **`clean.sh` covers every regenerable output.** It now reaches the repo-root
+  `dist/` (`web/vite.config.ts` sets `outDir: '../dist'`, so the previous script
+  cleaned a `web/dist/` that never existed), the wasm example `target/` dirs
+  that the root `cargo clean` does not, `lcov.info` and `.e2e-tmp/`. `-d` deletes
+  `.demo-capture/` and prints a warning first: the published clip is hand-cut
+  and nothing in the repo rebuilds it from those takes.
+- **GAIA scoring is per-split.** The generator never passed `--answers`, so the
+  wrapper fell back to the validation-Level-1 ground truth and a suite imported
+  from any other split scored against the wrong file — with its "no ground
+  truth" exit reported as a model miss. The test split is now refused rather
+  than imported: its `Final answer` column is `?` for all 301 rows, so a local
+  run can only score 0%, and that 0% would read as a failure.
+
 ## [0.3.22] - 2026-11-22
 
 ### Fixed
