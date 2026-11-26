@@ -680,6 +680,13 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
     // takes effect from their next turn instead of only on respawn.
     if let Some(agent_id) = push_override_agent {
         push_agent_param_update(state, &agent_id).await;
+        // A cost cap set over WS must reach the running guard, not only the
+        // config file: the agent it is meant to restrain is the running one.
+        let (daily, hourly) = state.config.read().await.agent_cost_limits(&agent_id);
+        state
+            .agents
+            .cost_guard
+            .set_agent_limits(&agent_id, daily, hourly);
     }
     if push_default_agent {
         push_default_agent_update(state).await;

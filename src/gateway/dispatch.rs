@@ -32,6 +32,9 @@ pub(crate) async fn process_inbound_entries(
                 break;
             }
             Some(incoming) = rx.recv() => {
+                if answer_pending_prompt(&state, &incoming).await {
+                    continue;
+                }
                 match state.pipelines.inbound.process(incoming).await {
                     Some(routed) => {
                         info!("Inbound message routed through pipeline: agent={}", routed.agent_id);
@@ -52,6 +55,126 @@ pub(crate) async fn process_inbound_entries(
         }
     }
     info!("Inbound entry worker stopped");
+}
+
+/// Apply a chat message as the answer to a prompt the agent is blocked on.
+///
+/// Returns `true` when the message was consumed — the caller must then *not*
+/// route it to an agent, because it is an answer, not a new request. Returns
+/// `false` for every other message, including one that is a plain remark while
+/// a prompt is outstanding: the prompt keeps waiting and the remark is handled
+/// normally.
+///
+/// This is the other half of `lifecycle::deliver_ask_to_channel` /
+/// `deliver_approval_to_channel`. The WS surfaces resolve these through
+/// `ask.respond` / `approvals.approve`; a channel user has no WebSocket, so the
+/// conversation itself is the answer channel.
+pub(crate) async fn answer_pending_prompt(
+    state: &Arc<GatewayState>,
+    incoming: &crate::channels::IncomingMessage,
+) -> bool {
+    use crate::gateway::channel_answers::Answer;
+
+    // Only a real external user answers prompts; internal/system traffic must
+    // not be able to resolve one. The table also checks that the message
+    // arrived on the channel the prompt was posted to.
+    let Some(channel) = incoming.channel_key() else {
+        return false;
+    };
+    if !incoming.provenance.is_external() {
+        return false;
+    }
+    // Keyed by the session, which is what the prompt was recorded under: on
+    // Telegram the reply address is the chat id, and in a group that is not the
+    // sender's user id — a `{channel}:{user}` key would never meet.
+    let key = incoming.conversation_id.0.clone();
+    let Some((prompt, answer)) = state
+        .channels
+        .channel_answers
+        .take(&key, channel, &incoming.content)
+        .await
+    else {
+        return false;
+    };
+
+    // Tell the person what happened, in the same conversation, before the
+    // agent's turn resumes and produces its own reply.
+    let confirmation = match (&answer, prompt.kind) {
+        (Answer::Approve, _) => format!("✅ Approved {}.", prompt.id),
+        (Answer::Deny, _) => format!("🚫 Denied {}.", prompt.id),
+        (Answer::Text(text), _) => format!("✅ Answer sent: {text}"),
+    };
+
+    let applied = match prompt.kind {
+        crate::gateway::channel_answers::PromptKind::Ask => {
+            let text = match &answer {
+                Answer::Text(t) => t.clone(),
+                Answer::Approve => "yes".to_string(),
+                Answer::Deny => "no".to_string(),
+            };
+            state.tools.ask_queue.resolve(&prompt.id, text).await
+        }
+        crate::gateway::channel_answers::PromptKind::Approval => {
+            let decision = match &answer {
+                Answer::Approve => crate::tools::approval::ApprovalDecision::Approve,
+                Answer::Deny => crate::tools::approval::ApprovalDecision::Deny {
+                    reason: "denied from chat".to_string(),
+                },
+                // Free text is not an approval answer; `interpret` never
+                // yields it for an approval, but stay honest if that changes.
+                Answer::Text(t) => {
+                    crate::tools::approval::ApprovalDecision::Deny { reason: t.clone() }
+                }
+            };
+            state
+                .tools
+                .approval_queue
+                .resolve(&prompt.id, decision)
+                .await
+        }
+    };
+
+    if !applied {
+        warn!(
+            "Channel answer for {} ({}) arrived after the prompt was already resolved",
+            prompt.id, incoming.user_id.0
+        );
+        return false;
+    }
+
+    // Echo the acknowledgment back out the channel that answered.
+    let reply_channel = channel.to_string();
+    let conversation_id = Some(incoming.conversation_id.0.clone());
+    send_prompt_reply(state, reply_channel, conversation_id, confirmation).await;
+    info!("Resolved prompt {} from a channel answer", prompt.id);
+    true
+}
+
+/// Post a short status line back to the channel a prompt was answered from.
+async fn send_prompt_reply(
+    state: &Arc<GatewayState>,
+    channel: String,
+    conversation_id: Option<String>,
+    text: String,
+) {
+    let (model_name, model_provider) = {
+        let cfg = state.config.read().await;
+        (Some(cfg.model.clone()), Some(cfg.model_provider.clone()))
+    };
+    let ctx = crate::outbound::OutboundContext {
+        session_id: String::new(),
+        conversation_id,
+        channel,
+        agent_id: String::new(),
+        raw_output: text,
+        tool_calls: vec![],
+        usage: None,
+        side_effects: vec![],
+        model_name,
+        model_provider,
+        reasoning_content: None,
+    };
+    state.pipelines.outbound.process(ctx).await;
 }
 
 /// Process routed messages from the inbound pipeline.
@@ -99,10 +222,15 @@ pub(crate) async fn dispatch_routed_message(
 
     let session_id = routed.incoming.conversation_id.0.clone();
     let agent_id = routed.agent_id.clone();
-    let channel = match &routed.incoming.provenance {
-        crate::channels::InputProvenance::ExternalUser { channel, .. } => channel.clone(),
-        _ => "unknown".to_string(),
-    };
+    // The configured instance, not the channel type: the reply dispatcher
+    // registers each `[channels.<name>]` section under its own name, so a
+    // second instance of the same type would otherwise have its reply sent to
+    // the first one's endpoint.
+    let channel = routed
+        .incoming
+        .channel_key()
+        .unwrap_or("unknown")
+        .to_string();
     // Channel-layer observation carried into the turn: not debounced here
     // (this is a direct dispatch), enriched when media was attached during
     // inbound processing, routed to the resolved agent.
@@ -1417,5 +1545,207 @@ mod tests {
         flush_session_buffer(&state, "default", "s1", None, None).await;
         let buffers = state.agents.message_buffer.read().await;
         assert!(buffers.is_empty());
+    }
+
+    // ── channel answers ──────────────────────────────────────────────────
+
+    /// A message a channel user sends must be able to resolve a tool approval
+    /// their agent is blocked on. Without this an agent whose human is on WeCom
+    /// stalls to the 300 s timeout the first time a gate fires.
+    fn channel_message(session: &str, user: &str, text: &str) -> crate::channels::IncomingMessage {
+        crate::channels::IncomingMessage::new(user, session, text)
+            .with_provenance(crate::channels::InputProvenance::ExternalUser {
+                channel: "wecom".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("wecom")
+    }
+
+    fn approval_prompt(id: &str) -> crate::gateway::channel_answers::PendingPrompt {
+        crate::gateway::channel_answers::PendingPrompt {
+            kind: crate::gateway::channel_answers::PromptKind::Approval,
+            id: id.into(),
+            options: vec![],
+            free_text: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_yes_resolves_a_pending_approval() {
+        use crate::tools::approval::{ApprovalDecision, PendingApproval};
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state
+            .tools
+            .approval_queue
+            .submit(
+                PendingApproval::new("ap-1", "shell", serde_json::json!({}), "alice")
+                    .with_response_tx(tx),
+            )
+            .await;
+        state
+            .channels
+            .channel_answers
+            .record("session-1", "wecom", approval_prompt("ap-1"))
+            .await;
+
+        let consumed =
+            answer_pending_prompt(&state, &channel_message("session-1", "alice", "yes")).await;
+        assert!(consumed, "an approval answer must not reach the model");
+        assert!(state.channels.channel_answers.is_empty().await);
+        // The decision reached the blocked tool, not just the queue table.
+        assert_eq!(rx.await.expect("decision delivered"), ApprovalDecision::Approve);
+    }
+
+    /// A `no` denies rather than approves.
+    #[tokio::test]
+    async fn channel_no_denies_a_pending_approval() {
+        use crate::tools::approval::{ApprovalDecision, PendingApproval};
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state
+            .tools
+            .approval_queue
+            .submit(
+                PendingApproval::new("ap-5", "shell", serde_json::json!({}), "alice")
+                    .with_response_tx(tx),
+            )
+            .await;
+        state
+            .channels
+            .channel_answers
+            .record("session-1", "wecom", approval_prompt("ap-5"))
+            .await;
+
+        assert!(answer_pending_prompt(&state, &channel_message("session-1", "alice", "no")).await);
+        assert!(matches!(rx.await.expect("decision delivered"), ApprovalDecision::Deny { .. }));
+    }
+
+    /// An unrelated remark mid-prompt is an ordinary message: the prompt must
+    /// survive it, or a person loses the question by saying anything else.
+    #[tokio::test]
+    async fn unrelated_channel_text_leaves_the_prompt_pending() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        state
+            .channels
+            .channel_answers
+            .record("session-1", "wecom", approval_prompt("ap-2"))
+            .await;
+
+        let consumed =
+            answer_pending_prompt(&state, &channel_message("session-1", "alice", "what's up?"))
+                .await;
+        assert!(!consumed);
+        assert_eq!(state.channels.channel_answers.len().await, 1);
+    }
+
+    /// A prompt recorded for one session must not be answerable from another —
+    /// two people (or two bots) asking concurrently must not settle each
+    /// other's questions.
+    #[tokio::test]
+    async fn prompts_are_scoped_to_their_session() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        state
+            .channels
+            .channel_answers
+            .record("session-alice", "wecom", approval_prompt("ap-3"))
+            .await;
+
+        let consumed =
+            answer_pending_prompt(&state, &channel_message("session-bob", "bob", "yes")).await;
+        assert!(!consumed);
+        assert_eq!(state.channels.channel_answers.len().await, 1);
+    }
+
+    /// An answer arriving on a different channel must not resolve the prompt:
+    /// the same session key can exist on two bridges (a proxy deployment, a
+    /// test), and only the channel the question was posted to may answer it.
+    #[tokio::test]
+    async fn an_answer_from_another_channel_does_not_resolve_the_prompt() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        state
+            .channels
+            .channel_answers
+            .record("session-1", "wecom", approval_prompt("ap-6"))
+            .await;
+
+        let elsewhere = crate::channels::IncomingMessage::new("alice", "session-1", "yes")
+            .with_provenance(crate::channels::InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("telegram");
+        assert!(!answer_pending_prompt(&state, &elsewhere).await);
+        assert_eq!(state.channels.channel_answers.len().await, 1);
+    }
+
+    /// A free-text `ask` takes the reply verbatim.
+    #[tokio::test]
+    async fn free_text_ask_answer_is_applied() {
+        use crate::gateway::channel_answers::{PendingPrompt, PromptKind};
+        use crate::tools::ask_user::{AskRequest, PendingQuestion};
+
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state
+            .tools
+            .ask_queue
+            .submit(PendingQuestion {
+                request: AskRequest {
+                    id: "ask-9".into(),
+                    conversation_id: "session-1".into(),
+                    question: "Which city?".into(),
+                    options: vec![],
+                    required: true,
+                    default: None,
+                },
+                response_tx: Some(tx),
+            })
+            .await;
+        state
+            .channels
+            .channel_answers
+            .record(
+                "session-1",
+                "wecom",
+                PendingPrompt {
+                    kind: PromptKind::Ask,
+                    id: "ask-9".into(),
+                    options: vec![],
+                    free_text: true,
+                },
+            )
+            .await;
+
+        let consumed =
+            answer_pending_prompt(&state, &channel_message("session-1", "alice", "Berlin")).await;
+        assert!(consumed);
+        assert!(state.channels.channel_answers.is_empty().await);
+        assert_eq!(rx.await.expect("answer delivered"), "Berlin");
+    }
+
+    /// Internal traffic has no channel identity, so it can never answer a
+    /// prompt — even one recorded for the very same session.
+    #[tokio::test]
+    async fn internal_traffic_cannot_answer_a_prompt() {
+        let state = Arc::new(make_test_state(GatewayConfig::default()).await);
+        state
+            .channels
+            .channel_answers
+            .record("session-1", "wecom", approval_prompt("ap-4"))
+            .await;
+
+        // Spelled out rather than left to `Default`: the default provenance is
+        // an external user, so a message that merely forgot to say it was
+        // internal would pass this gate. That fail-open is worth its own
+        // investigation, but it must not hide here.
+        let internal = crate::channels::IncomingMessage::new("alice", "session-1", "yes")
+            .with_provenance(crate::channels::InputProvenance::InternalSystem {
+                source: "cron".to_string(),
+            });
+        assert!(!answer_pending_prompt(&state, &internal).await);
+        assert_eq!(state.channels.channel_answers.len().await, 1);
     }
 }

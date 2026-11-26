@@ -379,6 +379,10 @@ impl AgentPersonality {
             agent_id: None,
             mobile: crate::config::MobileControlConfig::default(),
             reflection_config: None,
+            // Narrowed per agent at spawn from `[agent_overrides.<id>]`, if
+            // the deployment says so; otherwise the registry gate decides.
+            allowed_tools: None,
+            permissions: None,
         }
     }
 

@@ -317,6 +317,67 @@ enabled = true
 check_interval_seconds = 60
 ```
 
+## `[agent_overrides]` — Per-Agent Parameters
+
+Overlay a single agent's parameters without editing its personality files. Each
+`None` field inherits the base value; setting one overrides only that field.
+
+```toml
+[agent_overrides."agent-zhangsan"]
+temperature = 0.3
+max_tokens = 4096
+workspace_only = true
+
+# Restrict this agent's tool surface. Omit to inherit the registry's ordinary
+# gates (the gateway-wide permission engine, capability profile, trust level).
+# When set, the list is enforced twice: the tools are hidden from the
+# advertised toolset *and* a call naming one anyway is refused. This is what
+# keeps one employee's agent out of another employee's workspace and tools.
+allowed_tools = ["file_read", "file_write", "web_search", "memory"]
+
+# This agent's own share of the budget. The gateway-wide `[cost_guard]` is the
+# operator's absolute stop (when it trips, *everyone* pauses); these cap one
+# agent on top of it, so a single person's runaway loop cannot exhaust the
+# shared budget and leave the rest of the deployment refused. Both are
+# cents/actions, and `0` (or omitting them) means no per-agent cap.
+daily_limit_cents = 500       # 5.00 per day
+hourly_action_limit = 60     # 60 provider calls per hour
+
+# Narrow the gateway `[permissions]` posture for this agent only. Narrow-only:
+# `mode` may tighten (never loosen) the gateway/session mode, and `deny`/`ask`
+# add rules on top of the gateway ones. There is no per-agent `allow` — an
+# agent's own file must not be able to grant itself a tool the operator's rules
+# ask about.
+[agent_overrides."agent-zhangsan".permissions]
+mode = "plan"                 # plan, default, accept_edits, bypass
+deny = ["shell:rm -rf*"]
+ask = ["web_fetch"]
+```
+
+`allowed_tools` is an allowlist, not a deny list: an agent whose list omits
+`shell` cannot run shell commands however the model phrases the call. A
+delegated child inherits its parent's narrowing through the tool context it is
+handed. An empty list or `null` clears the field (an empty list is almost
+always a caller clearing it, not an intentional full lockout).
+
+The two cost fields are a fair share, not a replacement: the gateway-wide
+`[cost_guard]` still applies on top, and a per-agent limit only ever refuses
+the agent it names. Both window counters reset on the same hour/day rollover as
+the global ones, and `cost.reset` starts every agent's window over without
+removing the caps.
+
+`permissions` composes by **strictness**: the effective mode is the stricter of
+the gateway/session mode and this one, so an agent configured `bypass` cannot
+undo the operator's `plan`, and one configured `default` cannot ride on a
+gateway `bypass` to skip asking. An agent's `deny` or `ask` rule is consulted
+ahead of the gateway `allow` rules, so it can refuse or force-ask a call the
+gateway had pre-approved. This is the same per-seat direction as
+`allowed_tools`: it can only take surface away.
+
+Changes take effect on a running agent (`config.set agent_overrides.<id>.<field>`
+pushes the recomputed effective config and the per-agent cost limits are applied
+to the live guard) and survive restarts.
+
 ## `[hot_reload]` — Runtime Config Changes
 
 ```toml

@@ -625,6 +625,43 @@ pub struct AgentOverrides {
     pub system_prompt: Option<String>,
     /// Maximum context window size (in tokens).
     pub max_context_tokens: Option<usize>,
+    /// Tools this agent may use, when the deployment narrows them.
+    ///
+    /// See [`AgentConfig::allowed_tools`]: `None` leaves the registry's
+    /// ordinary gates in charge, `Some` is an allowlist enforced both at
+    /// schema time and per call. Set this per agent so one employee's agent
+    /// cannot reach another's tools:
+    ///
+    /// ```toml
+    /// [agent_overrides."agent-zhangsan"]
+    /// allowed_tools = ["file_read", "file_write", "web_search", "memory"]
+    /// ```
+    pub allowed_tools: Option<Vec<String>>,
+    /// This agent's own daily LLM spend cap, in cents.
+    ///
+    /// The gateway-wide `[cost_guard]` is one budget for the whole process: on
+    /// a server hosting one agent per employee, one person's runaway loop
+    /// exhausts it and *every* agent is refused. This is that person's fair
+    /// share instead. `0` (or unset) means "no per-agent cap — the gateway-wide
+    /// one still applies".
+    pub daily_limit_cents: Option<u64>,
+    /// This agent's own provider-calls-per-hour cap.
+    ///
+    /// See [`AgentOverrides::daily_limit_cents`]. `0` (or unset) means no
+    /// per-agent cap.
+    pub hourly_action_limit: Option<u64>,
+    /// This agent's own narrowing of the gateway `[permissions]` posture.
+    ///
+    /// See [`AgentConfig::permissions`](crate::agent::AgentConfig): a stricter
+    /// mode plus extra `deny`/`ask` rules. Narrow-only — no `allow` — so an
+    /// agent's own config cannot loosen what the operator set.
+    ///
+    /// ```toml
+    /// [agent_overrides."agent-zhangsan".permissions]
+    /// mode = "plan"
+    /// deny = ["shell:rm -rf*"]
+    /// ```
+    pub permissions: Option<crate::tools::AgentPermissions>,
 }
 
 impl AgentOverrides {
@@ -637,6 +674,10 @@ impl AgentOverrides {
             && self.workspace_only.is_none()
             && self.system_prompt.is_none()
             && self.max_context_tokens.is_none()
+            && self.allowed_tools.is_none()
+            && self.daily_limit_cents.is_none()
+            && self.hourly_action_limit.is_none()
+            && self.permissions.is_none()
     }
 
     /// Overlay every non-`None` field onto a base `AgentConfig`.
@@ -662,6 +703,12 @@ impl AgentOverrides {
         if let Some(v) = self.max_context_tokens {
             cfg.max_context_tokens = v;
         }
+        if let Some(v) = &self.allowed_tools {
+            cfg.allowed_tools = Some(v.clone());
+        }
+        if let Some(v) = &self.permissions {
+            cfg.permissions = Some(v.clone());
+        }
     }
 }
 
@@ -682,6 +729,47 @@ impl Default for KnowledgeBaseConfig {
             max_concurrent_ingests: 2,
         }
     }
+}
+
+/// Parse a `config.set agent_overrides.<id>.permissions` value.
+///
+/// Shape: `{ "mode": "plan", "deny": ["shell:rm*"], "ask": ["web_fetch"] }`,
+/// every key optional. Kept apart from the big match arm so it is unit-testable
+/// on its own — this is the one arm whose whole job is refusing a bad value
+/// (a misparsed narrowing would silently widen an agent's surface).
+fn parse_agent_permissions(
+    value: &serde_json::Value,
+) -> std::result::Result<crate::tools::AgentPermissions, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "permissions must be an object".to_string())?;
+    let string_list = |key: &str| -> std::result::Result<Vec<String>, String> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("permissions.{key} must be an array of strings"))
+                })
+                .collect(),
+            Some(_) => Err(format!("permissions.{key} must be an array of strings")),
+        }
+    };
+    let mode = match obj.get("mode") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(
+            crate::tools::PermissionMode::parse(s)
+                .ok_or_else(|| format!("unknown permissions.mode: '{s}'"))?,
+        ),
+        Some(_) => return Err("permissions.mode must be a string".to_string()),
+    };
+    Ok(crate::tools::AgentPermissions {
+        mode,
+        deny: string_list("deny")?,
+        ask: string_list("ask")?,
+    })
 }
 
 /// Default search provider name
@@ -1806,6 +1894,25 @@ pub struct ChannelConfig {
     pub block_from: Vec<String>,
     /// Agent ID to route to (None = default)
     pub agent_id: Option<String>,
+    /// Per-user agent assignments for this channel instance.
+    ///
+    /// This is what makes one bot serve several people, each with their own
+    /// agent:
+    ///
+    /// ```toml
+    /// [channels.company_wecom]
+    /// channel_type = "wecom"
+    /// [channels.company_wecom.users]
+    /// "zhangsan" = "agent-zhangsan"
+    /// "lisi"     = "agent-lisi"
+    /// ```
+    ///
+    /// A user not listed here falls back to `agent_id`, then to the global
+    /// default. Bindings are seeded into the router at startup and the router
+    /// keeps any learned during the run, so a user who is moved here takes
+    /// effect on restart, which is when the config is re-read anyway.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub users: HashMap<String, String>,
 }
 
 /// Channels default to enabled, matching what `ChannelConfig::new` sets.
@@ -1825,6 +1932,7 @@ impl ChannelConfig {
             allow_from: Vec::new(),
             block_from: Vec::new(),
             agent_id: None,
+            users: HashMap::new(),
         }
     }
 
@@ -1940,6 +2048,37 @@ impl GatewayConfig {
         }
     }
 
+    /// `(daily_cents, hourly_actions)` per-agent caps for `agent_id`.
+    ///
+    /// `(0, 0)` when the agent has no entry or leaves both unset, which the
+    /// guard reads as "no per-agent cap". These do not live on
+    /// [`AgentConfig`]: the budget belongs to the process-wide guard, not to
+    /// the agent's own description, and an agent that never runs should not
+    /// carry a counter.
+    pub fn agent_cost_limits(&self, agent_id: &str) -> (u64, u64) {
+        match self.agent_overrides.get(agent_id) {
+            Some(o) => (o.daily_limit_cents.unwrap_or(0), o.hourly_action_limit.unwrap_or(0)),
+            None => (0, 0),
+        }
+    }
+
+    /// Every `agent_overrides` entry that sets a cost cap.
+    pub fn per_agent_cost_limits(&self) -> Vec<(String, u64, u64)> {
+        self.agent_overrides
+            .iter()
+            .filter_map(|(id, o)| {
+                if o.daily_limit_cents.is_none() && o.hourly_action_limit.is_none() {
+                    return None;
+                }
+                Some((
+                    id.clone(),
+                    o.daily_limit_cents.unwrap_or(0),
+                    o.hourly_action_limit.unwrap_or(0),
+                ))
+            })
+            .collect()
+    }
+
     /// Apply a single per-agent override field from a `config.set` JSON value.
     ///
     /// `field` is the final path segment (e.g. `"temperature"`). A `Null`
@@ -1956,6 +2095,17 @@ impl GatewayConfig {
         let invalid = |msg: String| ConfigError::InvalidValue {
             key: format!("agent_overrides.{}.{}", agent_id, field),
             message: msg,
+        };
+
+        // A `permissions` value is parsed *before* the override entry exists:
+        // the arm below is the one whose whole job is refusing a bad value, and
+        // a refusal must not leave a phantom empty agent behind. (The numeric
+        // fields reuse `entry().or_default()` for a cheap hot path and are
+        // dropped by the empty-entry cleanup at the end on their error path.)
+        let parsed_permissions = if field == "permissions" && !value.is_null() {
+            Some(parse_agent_permissions(value).map_err(invalid)?)
+        } else {
+            None
         };
 
         let overrides = self
@@ -2073,6 +2223,90 @@ impl GatewayConfig {
                         })?;
                     let c = overrides.max_context_tokens != Some(v);
                     overrides.max_context_tokens = Some(v);
+                    c
+                }
+            }
+            "allowed_tools" => {
+                // Null or `[]` clears the allowlist, restoring the registry's
+                // ordinary gates. An empty list is far likelier to be a caller
+                // clearing the field than an intentional full lockout.
+                if value.is_null() {
+                    let c = overrides.allowed_tools.is_some();
+                    overrides.allowed_tools = None;
+                    c
+                } else {
+                    let v: Vec<String> = value
+                        .as_array()
+                        .ok_or_else(|| invalid("allowed_tools must be an array of strings".into()))?
+                        .iter()
+                        .map(|item| {
+                            item.as_str().map(str::to_string).ok_or_else(|| {
+                                invalid("allowed_tools must be an array of strings".into())
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<String>, ConfigError>>()?;
+                    if v.is_empty() {
+                        let c = overrides.allowed_tools.is_some();
+                        overrides.allowed_tools = None;
+                        c
+                    } else {
+                        let c = overrides.allowed_tools.as_ref() != Some(&v);
+                        overrides.allowed_tools = Some(v);
+                        c
+                    }
+                }
+            }
+            "daily_limit_cents" => {
+                if value.is_null() {
+                    let c = overrides.daily_limit_cents.is_some();
+                    overrides.daily_limit_cents = None;
+                    c
+                } else {
+                    let v = value.as_u64().ok_or_else(|| {
+                        invalid("daily_limit_cents must be a non-negative integer".into())
+                    })?;
+                    let c = overrides.daily_limit_cents != Some(v);
+                    overrides.daily_limit_cents = Some(v);
+                    c
+                }
+            }
+            "hourly_action_limit" => {
+                if value.is_null() {
+                    let c = overrides.hourly_action_limit.is_some();
+                    overrides.hourly_action_limit = None;
+                    c
+                } else {
+                    let v = value.as_u64().ok_or_else(|| {
+                        invalid("hourly_action_limit must be a non-negative integer".into())
+                    })?;
+                    let c = overrides.hourly_action_limit != Some(v);
+                    overrides.hourly_action_limit = Some(v);
+                    c
+                }
+            }
+            "permissions" => {
+                // Null clears the narrowing and restores the gateway posture.
+                // A `mode` that fails to parse is refused rather than silently
+                // treated as "inherit" — a typo in a narrowing must not widen
+                // the agent's surface. Parsed up front, so a refusal never
+                // creates the entry.
+                if value.is_null() {
+                    let c = overrides.permissions.is_some();
+                    overrides.permissions = None;
+                    c
+                } else {
+                    let v = match parsed_permissions {
+                        Some(v) => v,
+                        // Unreachable: parsed up front for exactly this
+                        // non-null branch. Refused rather than panicked.
+                        None => {
+                            return Err(crate::SyscityError::Config(invalid(
+                                "permissions must be an object".into(),
+                            )))
+                        }
+                    };
+                    let c = overrides.permissions.as_ref() != Some(&v);
+                    overrides.permissions = Some(v);
                     c
                 }
             }
@@ -2454,6 +2688,51 @@ shared_token = "abc"
     }
 
     #[test]
+    fn allowed_tools_override_reaches_the_agent_config() {
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .apply_agent_override_field(
+                "zhangsan",
+                "allowed_tools",
+                &serde_json::json!(["file_read", "web_search"])
+            )
+            .unwrap());
+
+        let mut base = AgentConfig::default();
+        assert!(base.allowed_tools.is_none());
+        config.apply_agent_overrides("zhangsan", &mut base);
+        assert_eq!(
+            base.allowed_tools.as_deref(),
+            Some(&["file_read".to_string(), "web_search".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn allowed_tools_override_empty_or_null_clears() {
+        let mut config = GatewayConfig::default();
+        config
+            .apply_agent_override_field("zhangsan", "allowed_tools", &serde_json::json!(["a"]))
+            .unwrap();
+        assert!(config
+            .apply_agent_override_field("zhangsan", "allowed_tools", &serde_json::json!([]))
+            .unwrap());
+        // An empty list is a caller clearing the field, not an intentional
+        // lockout — and it drops the now-empty override entry.
+        assert!(!config.agent_overrides.contains_key("zhangsan"));
+    }
+
+    #[test]
+    fn allowed_tools_override_rejects_non_array() {
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .apply_agent_override_field("zhangsan", "allowed_tools", &serde_json::json!("shell"))
+            .is_err());
+        assert!(config
+            .apply_agent_override_field("zhangsan", "allowed_tools", &serde_json::json!([1]))
+            .is_err());
+    }
+
+    #[test]
     fn clear_agent_overrides_resets_whole_agent() {
         let mut config = GatewayConfig::default();
         config
@@ -2462,6 +2741,92 @@ shared_token = "abc"
         assert!(config.agent_overrides.contains_key("coder"));
         config.clear_agent_overrides("coder");
         assert!(!config.agent_overrides.contains_key("coder"));
+    }
+
+    // ── Per-agent permission narrowing ──────────────────────────────────────
+
+    #[test]
+    fn permissions_override_reaches_the_agent_config() {
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .apply_agent_override_field(
+                "zhangsan",
+                "permissions",
+                &serde_json::json!({ "mode": "plan", "deny": ["shell:rm -rf*"] })
+            )
+            .unwrap());
+
+        let mut base = AgentConfig::default();
+        assert!(base.permissions.is_none());
+        config.apply_agent_overrides("zhangsan", &mut base);
+        let perms = base.permissions.expect("the narrowing reached the agent");
+        assert_eq!(perms.mode, Some(crate::tools::PermissionMode::Plan));
+        assert_eq!(perms.deny, vec!["shell:rm -rf*".to_string()]);
+        assert!(perms.ask.is_empty());
+    }
+
+    /// A narrowing is narrow-only, so it must not be possible to write an
+    /// `allow` through this path — the field is not read, and a value that
+    /// carries one still produces no allow list.
+    #[test]
+    fn permissions_override_has_no_allow() {
+        let mut config = GatewayConfig::default();
+        config
+            .apply_agent_override_field(
+                "zhangsan",
+                "permissions",
+                &serde_json::json!({ "allow": ["shell:rm*"] }),
+            )
+            .unwrap();
+        let agent = config
+            .agent_overrides
+            .get("zhangsan")
+            .expect("stored")
+            .permissions
+            .clone()
+            .expect("parsed");
+        assert!(agent.is_empty(), "an allow-only value narrows nothing: {agent:?}");
+    }
+
+    #[test]
+    fn permissions_override_null_clears() {
+        let mut config = GatewayConfig::default();
+        config
+            .apply_agent_override_field(
+                "zhangsan",
+                "permissions",
+                &serde_json::json!({ "mode": "plan" }),
+            )
+            .unwrap();
+        assert!(config
+            .apply_agent_override_field("zhangsan", "permissions", &serde_json::json!(null))
+            .unwrap());
+        assert!(!config.agent_overrides.contains_key("zhangsan"));
+    }
+
+    /// A bad mode must be refused, not silently treated as "inherit": a typo in
+    /// a narrowing that widens the agent's surface is the failure this guards.
+    #[test]
+    fn permissions_override_rejects_junk() {
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .apply_agent_override_field(
+                "zhangsan",
+                "permissions",
+                &serde_json::json!({ "mode": "neon" })
+            )
+            .is_err());
+        assert!(config
+            .apply_agent_override_field(
+                "zhangsan",
+                "permissions",
+                &serde_json::json!({ "deny": "shell" })
+            )
+            .is_err());
+        assert!(config
+            .apply_agent_override_field("zhangsan", "permissions", &serde_json::json!("plan"))
+            .is_err());
+        assert!(config.agent_overrides.is_empty(), "nothing was stored");
     }
 
     #[test]

@@ -264,9 +264,11 @@ impl Agent {
             request.tools = Some(tools.clone());
         }
 
-        // Check live cost guard before calling provider
+        // Check live cost guard before calling provider. Scoped per agent, so
+        // one person's runaway loop cannot exhaust the shared hourly allowance
+        // and refuse everybody else.
         if let Some(ref guard) = self.cost_guard {
-            if guard.is_exceeded() {
+            if guard.is_exceeded_for(&self.agent_id) {
                 return Err(crate::error::SyscityError::Validation(
                     "Budget limit exceeded — refusing provider call. Adjust daily_limit_cents or \
                      hourly_action_limit in config."
@@ -346,10 +348,12 @@ impl Agent {
             }
         };
 
-        // Record token usage in cost guard
+        // Record token usage in cost guard — against this agent's own share as
+        // well as the gateway's, so the per-agent limit has something to read.
         if let Some(ref guard) = self.cost_guard {
             if let Some(ref usage) = response.usage {
-                guard.record_usage(
+                guard.record_usage_for(
+                    &self.agent_id,
                     usage.prompt_tokens as u64,
                     usage.completion_tokens as u64,
                     response.model.as_str(),
@@ -457,8 +461,14 @@ impl Agent {
         let max_tokens = context.max_context_tokens();
         let pressured = context.needs_pruning();
 
+        // Recorded per agent: the turn record is this agent's, and the
+        // gateway-wide figure would read as "spend 300c of 500c" on every one
+        // of a hundred agents.
         let (spend_cents, limit_cents) = match self.cost_guard.as_ref() {
-            Some(guard) => (guard.daily_spend_cents(), guard.daily_limit_cents),
+            Some(guard) => (
+                guard.agent_spend(&self.agent_id).daily_spend_cents,
+                guard.agent_daily_limit_cents(&self.agent_id),
+            ),
             None => (0, 0),
         };
         // The routing lever's state, so one record explains both.
@@ -680,9 +690,9 @@ impl Agent {
                 .await;
         }
 
-        // Check live cost guard before calling provider
+        // Check live cost guard before calling provider (this agent's share).
         if let Some(ref guard) = self.cost_guard {
-            if guard.is_exceeded() {
+            if guard.is_exceeded_for(&self.agent_id) {
                 return Err(crate::error::SyscityError::Validation(
                     "Budget limit exceeded — refusing provider call. Adjust daily_limit_cents or \
                      hourly_action_limit in config."
@@ -977,7 +987,12 @@ impl Agent {
                 .sum::<usize>() as u64;
             let completion_tokens =
                 (accumulated_text.len() + accumulated_reasoning.len()) as u64 / 4;
-            guard.record_usage(prompt_tokens, completion_tokens, response.model.as_str());
+            guard.record_usage_for(
+                &self.agent_id,
+                prompt_tokens,
+                completion_tokens,
+                response.model.as_str(),
+            );
         }
 
         // Report the round's usage to progress subscribers (the gateway turns

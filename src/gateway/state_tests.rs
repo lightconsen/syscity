@@ -167,6 +167,7 @@ pub async fn make_test_state_parts(
             acp_bridge: None,
             session_channels: Arc::new(RwLock::new(HashMap::new())),
             webhook_sessions: Arc::new(RwLock::new(HashMap::new())),
+            channel_answers: Arc::new(crate::gateway::channel_answers::PendingPrompts::new()),
             #[cfg(any(feature = "teams", feature = "googlechat"))]
             webhook_verifiers: Arc::new(RwLock::new(HashMap::new())),
         },

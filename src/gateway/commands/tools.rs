@@ -201,6 +201,9 @@ pub(super) async fn handle_approve(
     };
 
     if state.tools.approval_queue.resolve(id, decision).await {
+        // Release any chat-side entry for the same prompt so a person's next
+        // message is not read as an answer to a question already settled here.
+        state.channels.channel_answers.clear_prompt(id).await;
         WsResponse::ok(
             &req.id,
             serde_json::json!({ "text": format!("✅ Approval '{}' resolved.", id) }),

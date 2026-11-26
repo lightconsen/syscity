@@ -22,6 +22,7 @@ use crate::channels::ChannelAcpBridge;
 use crate::hooks::ShellHookBridge;
 
 pub mod auth;
+pub mod channel_answers;
 pub mod command_provider;
 pub mod commands;
 pub mod config;
@@ -496,10 +497,19 @@ impl Gateway {
                 store: session_store.clone(),
                 message_buffer: Arc::new(RwLock::new(HashMap::new())),
                 route_resolver: Arc::new(crate::agent::RouteResolver::new("default")),
-                cost_guard: crate::agent::CostGuard::new(
-                    config.cost_guard.daily_limit_cents,
-                    config.cost_guard.hourly_action_limit,
-                ),
+                cost_guard: {
+                    let guard = crate::agent::CostGuard::new(
+                        config.cost_guard.daily_limit_cents,
+                        config.cost_guard.hourly_action_limit,
+                    );
+                    // Per-agent caps are a fair share, not a replacement for the
+                    // gateway-wide one; seeding them here means the first
+                    // provider call of any agent already sees its own limit.
+                    for (id, daily, hourly) in config.per_agent_cost_limits() {
+                        guard.set_agent_limits(&id, daily, hourly);
+                    }
+                    guard
+                },
                 repair_state: Arc::new(RepairState::new()),
                 acp: acp.clone(),
                 goal_cancellers: Arc::new(RwLock::new(HashMap::new())),
@@ -514,6 +524,7 @@ impl Gateway {
                 acp_bridge: Some(Arc::new(ChannelAcpBridge::new(acp.command_tx()))),
                 session_channels: Arc::new(RwLock::new(HashMap::new())),
                 webhook_sessions: Arc::new(RwLock::new(HashMap::new())),
+                channel_answers: Arc::new(crate::gateway::channel_answers::PendingPrompts::new()),
                 #[cfg(any(feature = "teams", feature = "googlechat"))]
                 webhook_verifiers: Arc::new(RwLock::new(HashMap::new())),
             },

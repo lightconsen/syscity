@@ -170,6 +170,7 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             acp_bridge: None,
             session_channels: Arc::new(RwLock::new(HashMap::new())),
             webhook_sessions: Arc::new(RwLock::new(HashMap::new())),
+            channel_answers: Arc::new(syscity::gateway::channel_answers::PendingPrompts::new()),
             // Only exists when a bearer-token channel is compiled in, which is
             // why it matches the field's own gate.
             #[cfg(any(feature = "teams", feature = "googlechat"))]

@@ -60,6 +60,32 @@ impl PermissionMode {
             Self::Bypass => "bypass",
         }
     }
+
+    /// The stricter of two modes.
+    ///
+    /// The order is Plan (strictest) → Default → AcceptEdits → Bypass, so this
+    /// is a "narrow only" composition: a per-agent mode may tighten the
+    /// gateway-wide one and never loosen it. That is the whole safety argument
+    /// for letting an agent carry a mode at all — an agent configured `bypass`
+    /// cannot undo an operator's gateway-wide `plan`, and one configured
+    /// `default` cannot ride on a gateway `bypass` to skip asking.
+    pub fn stricter(self, other: Self) -> Self {
+        if self.strictness() <= other.strictness() {
+            self
+        } else {
+            other
+        }
+    }
+
+    /// How much this mode permits, smaller being stricter.
+    fn strictness(self) -> u8 {
+        match self {
+            Self::Plan => 0,
+            Self::Default => 1,
+            Self::AcceptEdits => 2,
+            Self::Bypass => 3,
+        }
+    }
 }
 
 /// The `[permissions]` block of the gateway config.
@@ -258,6 +284,42 @@ pub fn remember_rules(tool: &str, args: &Value) -> Vec<String> {
     }
 }
 
+/// A per-agent narrowing of the gateway-wide permission posture.
+///
+/// The gateway's `[permissions]` block is one posture for every agent in the
+/// process. On a deployment hosting one agent per person that is the wrong
+/// unit: an operator who set a gateway-wide `allow` for `shell:git status*`
+/// did so for the whole deployment, but one person's agent should still be
+/// able to carry its own `deny` list, its own `ask` list and a stricter mode.
+///
+/// Composition is deliberately **narrow-only**:
+///
+/// - the effective mode is the stricter of the gateway/session mode and this
+///   one, so an agent configured `bypass` cannot undo the operator's `plan`;
+/// - [`deny`](Self::deny) and [`ask`](Self::ask) add rules on top of the
+///   gateway ones;
+/// - there is no per-agent `allow`. An allow is the only rule kind that can
+///   *loosen* the gateway posture, and a config file an employee controls must
+///   not be able to grant itself a tool the operator's rules ask about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentPermissions {
+    /// A stricter mode than the gateway/session one, or `None` to inherit.
+    pub mode: Option<PermissionMode>,
+    /// Calls this agent's rules refuse, over and above the gateway rules.
+    pub deny: Vec<String>,
+    /// Calls forced through approval for this agent, over and above the
+    /// gateway rules.
+    pub ask: Vec<String>,
+}
+
+impl AgentPermissions {
+    /// True when this narrowing changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none() && self.deny.is_empty() && self.ask.is_empty()
+    }
+}
+
 /// What the gate consults: config defaults plus the per-session overrides.
 #[derive(Debug, Clone)]
 struct Snapshot {
@@ -388,6 +450,9 @@ impl PermissionsRuntime {
     /// The permission engine: rules + mode for one call, before any hook.
     /// The registry gate turns the decision into a `ToolPolicyDecision` and
     /// still runs the hooks afterwards.
+    ///
+    /// `agent` is this agent's own narrowing, if the deployment gave it one,
+    /// and can only tighten what the gateway posture decided.
     pub(crate) fn evaluate(
         &self,
         name: &str,
@@ -395,15 +460,23 @@ impl PermissionsRuntime {
         conversation_id: &str,
         read_only: bool,
         categories: &[String],
+        agent: Option<&AgentPermissions>,
     ) -> EngineDecision {
         let snapshot = self.snapshot();
-        evaluate(&snapshot, name, args, conversation_id, read_only, categories)
+        let agent_rules = agent.filter(|a| !a.is_empty());
+        evaluate(&snapshot, name, args, conversation_id, read_only, categories, agent_rules)
     }
 }
 
 /// Evaluate rules + mode for one call. This is the permission engine proper;
 /// the registry gate turns the decision into a [`ToolPolicyDecision`] and
 /// still runs the hooks afterwards.
+///
+/// `agent` narrows the outcome and never widens it: its deny/ask rules are
+/// consulted next to the gateway's (a deny or ask beats the gateway `allow`
+/// that would otherwise pre-approve the call), and its mode is composed with
+/// the gateway/session one by strictness. There is no per-agent allow for the
+/// same reason — see [`AgentPermissions`].
 fn evaluate(
     snapshot: &Snapshot,
     name: &str,
@@ -411,6 +484,7 @@ fn evaluate(
     conversation_id: &str,
     read_only: bool,
     categories: &[String],
+    agent: Option<&AgentPermissions>,
 ) -> EngineDecision {
     let mut mode = snapshot
         .per_session
@@ -423,12 +497,27 @@ fn evaluate(
         );
         mode = PermissionMode::Default;
     }
+    // An agent may only tighten the mode. Computed here, before the escalation
+    // check, so an agent that narrowed `bypass` away still asks.
+    if let Some(agent_mode) = agent.and_then(|a| a.mode) {
+        mode = mode.stricter(agent_mode);
+    }
 
     let primary = primary_invocation_arg(name, args);
 
     if rules_match_quantified(&snapshot.deny, name, primary.as_deref(), RuleQuantifier::AnySegment)
     {
         return EngineDecision::Deny(format!("denied by a [permissions].deny rule for '{name}'"));
+    }
+    // The agent's own deny list, ahead of every allow below: a rule an agent
+    // carries must not be talked past by a gateway `allow` for the same call.
+    if let Some(agent) = agent {
+        if rules_match_quantified(&agent.deny, name, primary.as_deref(), RuleQuantifier::AnySegment)
+        {
+            return EngineDecision::Deny(format!(
+                "denied by this agent's [agent_overrides].deny rule for '{name}'"
+            ));
+        }
     }
     // The call itself can say it needs to run outside the fence. That is an
     // ask by construction, and it lands before the rules so an `allow` rule
@@ -445,6 +534,14 @@ fn evaluate(
     }
     if rules_match_quantified(&snapshot.ask, name, primary.as_deref(), RuleQuantifier::AnySegment) {
         return EngineDecision::Ask(format!("matched a [permissions].ask rule for '{name}'"));
+    }
+    if let Some(agent) = agent {
+        if rules_match_quantified(&agent.ask, name, primary.as_deref(), RuleQuantifier::AnySegment)
+        {
+            return EngineDecision::Ask(format!(
+                "matched this agent's [agent_overrides].ask rule for '{name}'"
+            ));
+        }
     }
     if rules_match_quantified(
         &snapshot.allow,
@@ -862,12 +959,12 @@ mod tests {
             per_session: Arc::new(HashMap::new()),
         };
         assert!(matches!(
-            evaluate(&snapshot, "shell", &json!({"command": "rm -rf /"}), "s1", false, &[]),
+            evaluate(&snapshot, "shell", &json!({"command": "rm -rf /"}), "s1", false, &[], None),
             EngineDecision::Deny(_)
         ));
         // An allow rule does not rescue a denied tool.
         assert!(matches!(
-            evaluate(&snapshot, "shell", &json!({"command": "rm -rf /"}), "s1", false, &[]),
+            evaluate(&snapshot, "shell", &json!({"command": "rm -rf /"}), "s1", false, &[], None),
             EngineDecision::Deny(_)
         ));
     }
@@ -888,7 +985,7 @@ mod tests {
             "command": "git status",
             "permissions": { "require_escalated": true, "justification": "sees the host clock" }
         });
-        let decision = evaluate(&snapshot, "shell", &args, "s1", false, &[]);
+        let decision = evaluate(&snapshot, "shell", &args, "s1", false, &[], None);
         assert!(
             matches!(decision, EngineDecision::Ask(ref why) if why.contains("sees the host clock")),
             "got {decision:?}"
@@ -900,7 +997,7 @@ mod tests {
             ..snapshot.clone()
         };
         assert!(matches!(
-            evaluate(&denied, "shell", &args, "s1", false, &[]),
+            evaluate(&denied, "shell", &args, "s1", false, &[], None),
             EngineDecision::Deny(_)
         ));
 
@@ -909,7 +1006,10 @@ mod tests {
             default_mode: PermissionMode::Bypass,
             ..snapshot
         };
-        assert_eq!(evaluate(&bypass, "shell", &args, "s1", false, &[]), EngineDecision::AllowNow);
+        assert_eq!(
+            evaluate(&bypass, "shell", &args, "s1", false, &[], None),
+            EngineDecision::AllowNow
+        );
     }
 
     #[test]
@@ -923,7 +1023,7 @@ mod tests {
             per_session: Arc::new(HashMap::new()),
         };
         assert!(matches!(
-            evaluate(&snapshot, "web_fetch", &json!({"url": "https://x"}), "s1", true, &[]),
+            evaluate(&snapshot, "web_fetch", &json!({"url": "https://x"}), "s1", true, &[], None),
             EngineDecision::Ask(_)
         ));
     }
@@ -938,9 +1038,9 @@ mod tests {
             ask: Vec::new().into(),
             per_session: Arc::new(HashMap::new()),
         };
-        let deny = evaluate(&snapshot, "shell", &json!({"command": "ls"}), "s1", false, &[]);
+        let deny = evaluate(&snapshot, "shell", &json!({"command": "ls"}), "s1", false, &[], None);
         assert!(matches!(deny, EngineDecision::Deny(ref m) if m.contains("plan mode")));
-        let pass = evaluate(&snapshot, "grep", &json!({}), "s1", true, &[]);
+        let pass = evaluate(&snapshot, "grep", &json!({}), "s1", true, &[], None);
         assert_eq!(pass, EngineDecision::PassThrough);
     }
 
@@ -956,7 +1056,8 @@ mod tests {
         };
         // A tool that would need approval passes through to the fallback
         // instead of being pre-approved.
-        let decision = evaluate(&snapshot, "shell", &json!({"command": "ls"}), "s1", false, &[]);
+        let decision =
+            evaluate(&snapshot, "shell", &json!({"command": "ls"}), "s1", false, &[], None);
         assert_eq!(decision, EngineDecision::PassThrough);
     }
 
@@ -972,12 +1073,200 @@ mod tests {
         };
         let writer = ["file".to_string(), "write".to_string()];
         assert_eq!(
-            evaluate(&snapshot, "file_write", &json!({"path": "/tmp/a"}), "s1", false, &writer),
+            evaluate(
+                &snapshot,
+                "file_write",
+                &json!({"path": "/tmp/a"}),
+                "s1",
+                false,
+                &writer,
+                None
+            ),
             EngineDecision::AllowNow
         );
         let reader = ["file".to_string(), "read".to_string()];
         assert_eq!(
-            evaluate(&snapshot, "file_read", &json!({"path": "/tmp/a"}), "s1", true, &reader),
+            evaluate(&snapshot, "file_read", &json!({"path": "/tmp/a"}), "s1", true, &reader, None),
+            EngineDecision::PassThrough
+        );
+    }
+
+    // ── Per-agent narrowing ─────────────────────────────────────────────────
+
+    fn plain_snapshot() -> Snapshot {
+        Snapshot {
+            default_mode: PermissionMode::Default,
+            allow_bypass: true,
+            allow: Vec::new().into(),
+            deny: Vec::new().into(),
+            ask: Vec::new().into(),
+            per_session: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// An agent's own deny rule refuses a call the gateway separates from
+    /// nothing — that is the point: one person's agent carries refusals the
+    /// rest of the deployment does not.
+    #[test]
+    fn an_agents_deny_refuses_its_own_call() {
+        let snapshot = plain_snapshot();
+        let agent = AgentPermissions {
+            mode: None,
+            deny: vec!["shell:rm -rf*".to_string()],
+            ask: Vec::new(),
+        };
+        assert!(matches!(
+            evaluate(
+                &snapshot,
+                "shell",
+                &json!({"command": "rm -rf /"}),
+                "s1",
+                false,
+                &[],
+                Some(&agent)
+            ),
+            EngineDecision::Deny(_)
+        ));
+        // Another call by the same agent is untouched.
+        assert_eq!(
+            evaluate(&snapshot, "shell", &json!({"command": "ls"}), "s1", false, &[], Some(&agent)),
+            EngineDecision::PassThrough
+        );
+    }
+
+    /// The reason a per-agent `allow` does not exist: a gateway `allow` rule
+    /// must not be talked past by an agent whose own rules ask about the call.
+    #[test]
+    fn an_agents_ask_beats_a_gateway_allow_rule() {
+        let snapshot = Snapshot {
+            allow: vec!["web_fetch".to_string()].into(),
+            ..plain_snapshot()
+        };
+        let agent = AgentPermissions {
+            mode: None,
+            deny: Vec::new(),
+            ask: vec!["web_fetch".to_string()],
+        };
+        // Without the agent the gateway allow pre-approves the call.
+        assert_eq!(
+            evaluate(&snapshot, "web_fetch", &json!({"url": "https://x"}), "s1", true, &[], None),
+            EngineDecision::AllowNow
+        );
+        // With it, the call is asked — an agent tightening its own posture is
+        // exactly what the operator would want from "this agent must ask".
+        assert!(matches!(
+            evaluate(
+                &snapshot,
+                "web_fetch",
+                &json!({"url": "https://x"}),
+                "s1",
+                true,
+                &[],
+                Some(&agent)
+            ),
+            EngineDecision::Ask(_)
+        ));
+    }
+
+    /// An agent's deny beats a gateway allow for the same call.
+    #[test]
+    fn an_agents_deny_beats_a_gateway_allow_rule() {
+        let snapshot = Snapshot {
+            allow: vec!["shell:git status*".to_string()].into(),
+            ..plain_snapshot()
+        };
+        let agent = AgentPermissions {
+            mode: None,
+            deny: vec!["shell:git*".to_string()],
+            ask: Vec::new(),
+        };
+        assert!(matches!(
+            evaluate(
+                &snapshot,
+                "shell",
+                &json!({"command": "git status"}),
+                "s1",
+                false,
+                &[],
+                Some(&agent)
+            ),
+            EngineDecision::Deny(_)
+        ));
+    }
+
+    /// Modes compose by strictness, so a per-agent mode can only tighten.
+    #[test]
+    fn agent_mode_can_only_tighten_the_gateway_mode() {
+        // Gateway `bypass`, agent `plan` → plan wins: an employee's own config
+        // must not be able to widen the operator's posture, but it can narrow
+        // it, and a `plan` agent is read-only whatever the gateway allows.
+        let snapshot = Snapshot {
+            default_mode: PermissionMode::Bypass,
+            ..plain_snapshot()
+        };
+        let plan = AgentPermissions {
+            mode: Some(PermissionMode::Plan),
+            deny: Vec::new(),
+            ask: Vec::new(),
+        };
+        assert!(matches!(
+            evaluate(
+                &snapshot,
+                "file_write",
+                &json!({"path": "/tmp/a"}),
+                "s1",
+                false,
+                &[],
+                Some(&plan)
+            ),
+            EngineDecision::Deny(_)
+        ));
+
+        // Gateway `plan`, agent `bypass` → plan still wins: the agent cannot
+        // talk its way out of read-only mode.
+        let plan_snapshot = Snapshot {
+            default_mode: PermissionMode::Plan,
+            allow_bypass: true,
+            ..plain_snapshot()
+        };
+        let bypass = AgentPermissions {
+            mode: Some(PermissionMode::Bypass),
+            deny: Vec::new(),
+            ask: Vec::new(),
+        };
+        assert!(matches!(
+            evaluate(
+                &plan_snapshot,
+                "file_write",
+                &json!({"path": "/tmp/a"}),
+                "s1",
+                false,
+                &[],
+                Some(&bypass)
+            ),
+            EngineDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn stricter_is_the_order_the_docs_promise() {
+        use PermissionMode::*;
+        assert_eq!(Plan.stricter(Bypass), Plan);
+        assert_eq!(Bypass.stricter(Plan), Plan);
+        assert_eq!(Default.stricter(AcceptEdits), Default);
+        assert_eq!(AcceptEdits.stricter(Default), Default);
+        assert_eq!(Bypass.stricter(Bypass), Bypass);
+        // Default is not stricter than itself, nor looser.
+        assert_eq!(Default.stricter(Default), Default);
+    }
+
+    #[test]
+    fn an_empty_narrowing_changes_nothing() {
+        let agent = AgentPermissions::default();
+        assert!(agent.is_empty());
+        let snapshot = plain_snapshot();
+        assert_eq!(
+            evaluate(&snapshot, "shell", &json!({"command": "ls"}), "s1", false, &[], Some(&agent)),
             EngineDecision::PassThrough
         );
     }

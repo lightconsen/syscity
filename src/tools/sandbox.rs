@@ -339,6 +339,8 @@ mod tests {
             trace: None,
             tiering: None,
             desktop_grant: None,
+            allowed_tools: None,
+            agent_permissions: None,
         }
     }
 

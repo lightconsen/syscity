@@ -103,6 +103,80 @@ Per-channel credential keys:
 Secrets should be provided through the environment or the secret store;
 plaintext `credentials` entries remain for backward compatibility.
 
+### One bot per person, and per-user agent routing
+
+The `[channels.<name>]` section key is the channel's **instance name**. One
+channel *type* can be instantiated any number of times — one Telegram bot per
+employee, say — and each instance keeps its own credentials, access policy and
+default agent:
+
+```toml
+[channels.tg_alice]
+channel_type = "telegram"
+enabled = true
+agent_id = "alice"
+
+[channels.tg_bob]
+channel_type = "telegram"
+enabled = true
+agent_id = "bob"
+```
+
+Every message a bridge delivers is stamped with the instance it arrived on, and
+routing, outbound replies and access checks all key by that instance — never by
+the bare type. Without the stamp, two bots of one type would resolve to one
+agent.
+
+Inside a single instance you can route individual humans to their own agents
+without splitting the bot:
+
+```toml
+[channels.tg_support]
+channel_type = "telegram"
+agent_id = "support-default"        # everyone not listed below
+
+[channels.tg_support.users]
+"123456789" = "alice"               # Telegram user id → agent id
+"987654321" = "bob"
+```
+
+A `users` entry pins that sender for every conversation they open on the
+channel. The channel-level `agent_id` still applies to everyone else. The
+instance name in a section may differ from its `channel_type`; that is the
+normal case for a per-person deployment.
+
+## Human-in-the-loop over chat
+
+An agent sometimes has to stop and ask: `ask_user` needs a fact, or a tool call
+sits behind an approval gate. Both prompts are delivered to the channel the
+session belongs to, formatted as ordinary text, and both time out after 300 s
+if nobody answers.
+
+The person answers **in the same conversation**, with an ordinary message:
+
+| Prompt | Accepted reply |
+|---|---|
+| Tool approval | `yes` / `y` / `ok` / `approve` / `allow` / `1` to approve; `no` / `n` / `deny` / `reject` / `0` to deny |
+| `ask_user` with options | the option number (`1`…`n`), or free text when the question accepts it |
+| `ask_user`, free text | any text |
+
+A leading `/` is tolerated (`/approve`), so a platform's command style works.
+An answer is consumed before routing, so it never reaches the model as a new
+request; a confirmation is echoed back to the channel, and the agent's turn
+resumes. Anything that is not an answer is routed as a normal message and the
+pending prompt stays open.
+
+Answers are scoped to the **session** that received the prompt, not to the
+sender: on a group chat the reply address is the group, not the person who
+happened to ask, so keying by sender would mean a group question never meets
+its answer. A prompt outstanding in one conversation cannot be answered from
+another, and internal system traffic can never resolve one.
+
+If the prompt is resolved somewhere else — an operator clicking approve in the
+desktop UI, or `/approve <id>` in the CLI — the chat entry is dropped, so the
+person's next ordinary message is not swallowed as an answer to a question
+nobody is waiting on anymore.
+
 ## Webhook-based channels
 
 For webhook channels you must expose a **public HTTPS** endpoint that points at

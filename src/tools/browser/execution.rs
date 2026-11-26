@@ -4,6 +4,34 @@ use super::{BrowserAction, BrowserTool, ToolContext, ToolExecutionResult};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
+/// What the directory is called: unique per process and per launch, so two
+/// one-shot browsers — including ones in parallel tests — never contend for
+/// one profile.
+#[cfg(feature = "browser")]
+fn one_shot_profile_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "syscity-browser-one-shot-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Removes a one-shot browser's profile directory when the call ends.
+///
+/// Declared before the `Browser`, so it drops after Chrome has been killed;
+/// the removal is best-effort and a failure to unlink is not worth a warning.
+#[cfg(feature = "browser")]
+struct OneShotProfileDir(std::path::PathBuf);
+
+#[cfg(feature = "browser")]
+impl Drop for OneShotProfileDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Build response from action results
 #[cfg(feature = "browser")]
 fn build_result(
@@ -210,6 +238,20 @@ impl BrowserTool {
             builder = builder.chrome_executable(std::path::PathBuf::from(path));
         }
 
+        // A throwaway browser still needs its own profile directory. Left
+        // unset, chromiumoxide hands every launch the fixed
+        // `temp_dir()/chromiumoxide-runner`, and Chrome refuses to start a
+        // second instance on a profile another process holds — the refusal
+        // surfaces as "Failed to launch Chrome/Chromium. Is it installed?".
+        // One leftover Chrome is then enough to fail every call here and in
+        // the integration suite, which goes through this same path.
+        let profile_dir = one_shot_profile_dir();
+        if let Err(e) = std::fs::create_dir_all(&profile_dir) {
+            warn!("Failed to create one-shot browser profile dir: {}", e);
+        }
+        let _profile_dir_guard = OneShotProfileDir(profile_dir.clone());
+        builder = builder.user_data_dir(profile_dir);
+
         let config = builder
             .build()
             .map_err(|e| crate::error::SyscityError::ExternalService {
@@ -224,8 +266,7 @@ impl BrowserTool {
             }
         })?;
 
-        let browser = Arc::new(browser);
-        let _browser_clone = browser.clone();
+        let mut browser = Arc::new(browser);
         tokio::spawn(async move {
             while let Some(h) = handler.next().await {
                 if h.is_err() {
@@ -234,37 +275,56 @@ impl BrowserTool {
             }
         });
 
-        let page = browser.new_page("about:blank").await.map_err(|e| {
-            crate::error::SyscityError::ExternalService {
-                source: "Failed to create browser page".to_string(),
-                cause: Some(Box::new(e)),
+        let outcome = async {
+            let page = browser.new_page("about:blank").await.map_err(|e| {
+                crate::error::SyscityError::ExternalService {
+                    source: "Failed to create browser page".to_string(),
+                    cause: Some(Box::new(e)),
+                }
+            })?;
+
+            if let Err(e) = crate::browser::instrument::ensure_instrumented(&page).await {
+                warn!("Failed to instrument page: {}", e);
             }
-        })?;
+            if let Err(e) = crate::browser::network_log::start_capture(&page).await {
+                warn!("Failed to start network capture: {}", e);
+            }
 
-        if let Err(e) = crate::browser::instrument::ensure_instrumented(&page).await {
-            warn!("Failed to instrument page: {}", e);
+            let mut results = Vec::new();
+            let mut screenshot_data = None;
+
+            for action in actions {
+                debug!("Executing browser action (legacy): {:?}", action);
+                let result = Self::execute_single_action(
+                    action,
+                    &page,
+                    Some(browser.as_ref()),
+                    &mut screenshot_data,
+                    &self.navigation_policy,
+                )
+                .await;
+                results.push(result);
+            }
+
+            Ok::<_, crate::error::SyscityError>(build_result(results, screenshot_data))
         }
-        if let Err(e) = crate::browser::network_log::start_capture(&page).await {
-            warn!("Failed to start network capture: {}", e);
+        .await;
+
+        // Shut the throwaway browser down and let it exit before the profile
+        // guard unlinks the directory: Chrome holds files under it for as long
+        // as it lives, so removing it any earlier fails and leaves ~6 MB
+        // behind per call. `close` asks over CDP, `wait` collects the child.
+        if let Some(browser) = Arc::get_mut(&mut browser) {
+            if let Err(e) = browser.close().await {
+                warn!("Failed to close one-shot browser: {}", e);
+            }
+            if let Err(e) = browser.wait().await {
+                warn!("Failed to wait for one-shot browser exit: {}", e);
+            }
         }
+        drop(browser);
 
-        let mut results = Vec::new();
-        let mut screenshot_data = None;
-
-        for action in actions {
-            debug!("Executing browser action (legacy): {:?}", action);
-            let result = Self::execute_single_action(
-                action,
-                &page,
-                Some(browser.as_ref()),
-                &mut screenshot_data,
-                &self.navigation_policy,
-            )
-            .await;
-            results.push(result);
-        }
-
-        Ok(build_result(results, screenshot_data))
+        outcome
     }
 
     /// Execute browser actions

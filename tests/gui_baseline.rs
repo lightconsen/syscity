@@ -56,6 +56,10 @@ fn tool_context(conversation: &str) -> ToolContext {
         // The page rung works through the browser tool, not the desktop
         // adapter, so no desktop approval is carried.
         desktop_grant: None,
+        // Baseline runs are not narrowed to an allowlist.
+        allowed_tools: None,
+        // Nor by a per-agent permission posture.
+        agent_permissions: None,
     }
 }
 

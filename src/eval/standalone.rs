@@ -1390,6 +1390,7 @@ mod tests {
                 "eval",
                 false,
                 &[],
+                None,
             );
             assert!(
                 matches!(decision, crate::tools::EngineDecision::AllowNow),
@@ -1409,6 +1410,7 @@ mod tests {
             "eval",
             false,
             &[],
+            None,
         );
         assert!(
             !matches!(decision, crate::tools::EngineDecision::AllowNow),

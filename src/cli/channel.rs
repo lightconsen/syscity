@@ -305,6 +305,7 @@ async fn add_telegram_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -368,6 +369,7 @@ async fn add_discord_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -437,6 +439,7 @@ async fn add_slack_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("slack".to_string(), channel_config);
@@ -512,6 +515,7 @@ async fn add_whatsapp_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -586,6 +590,7 @@ async fn add_qq_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("qq".to_string(), channel_config);
@@ -674,6 +679,7 @@ async fn add_feishu_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("feishu".to_string(), channel_config);
@@ -722,6 +728,7 @@ async fn add_websocket_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -762,6 +769,7 @@ async fn add_signal_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("signal".to_string(), channel_config);
@@ -799,6 +807,7 @@ async fn add_imessage_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -837,6 +846,7 @@ async fn add_webchat_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -903,6 +913,7 @@ async fn add_wechatmp_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -975,6 +986,7 @@ async fn add_line_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("line".to_string(), channel_config);
@@ -1064,6 +1076,7 @@ async fn add_twilio_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("twilio".to_string(), channel_config);
@@ -1144,6 +1157,7 @@ async fn add_googlechat_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -1229,6 +1243,7 @@ async fn add_teams_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("teams".to_string(), channel_config);
@@ -1302,6 +1317,7 @@ async fn add_wecom_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("wecom".to_string(), channel_config);
@@ -1375,6 +1391,7 @@ async fn add_dingtalk_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config
@@ -1467,6 +1484,7 @@ async fn add_irc_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config.channels.insert("irc".to_string(), channel_config);
@@ -1530,6 +1548,7 @@ async fn add_simplex_channel(
         allow_from: vec![],
         block_from: vec![],
         agent_id: agent,
+        users: std::collections::HashMap::new(),
     };
 
     config

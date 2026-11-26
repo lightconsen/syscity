@@ -315,6 +315,29 @@ pub struct ToolContext {
     /// `None` everywhere else, including every entry point that has not
     /// approved anything yet.
     pub desktop_grant: Option<DesktopGrant>,
+    /// Tools this turn's agent may use, when the deployment narrowed them.
+    ///
+    /// `None` means "no per-agent narrowing" and the registry's ordinary gates
+    /// decide. `Some` is an allowlist enforced in two places: the advertised
+    /// toolset (`ToolRegistry::is_excluded`) and the per-call gate
+    /// (`ToolRegistry::run_gate`). Both are needed — hiding a schema stops the
+    /// model from choosing a tool, but a model that names one anyway must still
+    /// be refused.
+    ///
+    /// Set from [`AgentConfig::allowed_tools`](crate::agent::AgentConfig) when
+    /// the agent builds its tool context, so a delegated child inherits the
+    /// parent's narrowing through the context it is handed.
+    pub allowed_tools: Option<Arc<Vec<String>>>,
+    /// This agent's own narrowing of the gateway permission posture, when the
+    /// deployment gave it one.
+    ///
+    /// `None` means the gateway's `[permissions]` block decides alone. When
+    /// set it can only *tighten* the outcome: a stricter mode plus extra
+    /// `deny`/`ask` rules, never an `allow` — see
+    /// [`AgentPermissions`](crate::tools::AgentPermissions) for why. This is
+    /// the per-seat half of the permission surface, the counterpart of
+    /// `allowed_tools`.
+    pub agent_permissions: Option<Arc<crate::tools::AgentPermissions>>,
 }
 
 /// An approval to drive the desktop, inherited by the adapter's inner calls.
@@ -531,6 +554,45 @@ impl ToolContext {
     pub fn with_desktop_grant(mut self, grant: DesktopGrant) -> Self {
         self.desktop_grant = Some(grant);
         self
+    }
+
+    /// Narrow this call's tool surface to an allowlist.
+    ///
+    /// An empty list is stored as `None` — see
+    /// [`ToolContext::allowed_tools`] for why an empty list means "not
+    /// narrowed" rather than "nothing allowed".
+    pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
+        self.allowed_tools = if tools.is_empty() {
+            None
+        } else {
+            Some(Arc::new(tools))
+        };
+        self
+    }
+
+    /// Attach this agent's permission narrowing.
+    ///
+    /// An empty narrowing clears the field — same reasoning as
+    /// [`Self::with_allowed_tools`]: an empty posture is an unconfigured one,
+    /// not "deny nothing and ask nothing", which is already the default.
+    pub fn with_agent_permissions(mut self, perms: crate::tools::AgentPermissions) -> Self {
+        self.agent_permissions = if perms.is_empty() {
+            None
+        } else {
+            Some(Arc::new(perms))
+        };
+        self
+    }
+
+    /// Whether this context permits `name`, ignoring every other gate.
+    ///
+    /// The cheap half of the allowlist: `true` when nothing narrowed the
+    /// surface, or when `name` is on it.
+    pub fn permits_tool(&self, name: &str) -> bool {
+        match &self.allowed_tools {
+            None => true,
+            Some(allowed) => allowed.iter().any(|t| t == name),
+        }
     }
 
     /// Set the owning agent's own workspace (see [`ToolSandbox::agent_workspace`]).

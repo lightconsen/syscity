@@ -18,6 +18,13 @@ use crate::channels::{Channel, ChannelExtension, IncomingMessage, OutgoingMessag
 pub struct TelegramChannelExtension {
     channel: Arc<crate::channels::telegram::TelegramChannel>,
     session_channels: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// The `[channels.<name>]` section this extension was built for.
+    ///
+    /// The session→channel map and the router's channel defaults are keyed by
+    /// this name, not by the literal `"telegram"` type, so two Telegram bots
+    /// configured under different section names do not overwrite each other's
+    /// sessions or replies.
+    instance: String,
 }
 
 impl TelegramChannelExtension {
@@ -26,7 +33,25 @@ impl TelegramChannelExtension {
         channel: Arc<crate::channels::telegram::TelegramChannel>,
         session_channels: Arc<RwLock<HashMap<String, (String, String)>>>,
     ) -> Self {
-        Self { channel, session_channels }
+        Self {
+            channel,
+            session_channels,
+            instance: "telegram".to_string(),
+        }
+    }
+
+    /// As [`new`](Self::new), for a channel configured under a specific
+    /// `[channels.<name>]` section (see field docs on `instance`).
+    pub fn with_instance(
+        channel: Arc<crate::channels::telegram::TelegramChannel>,
+        session_channels: Arc<RwLock<HashMap<String, (String, String)>>>,
+        instance: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel,
+            session_channels,
+            instance: instance.into(),
+        }
     }
 }
 
@@ -45,6 +70,7 @@ impl ChannelExtension for TelegramChannelExtension {
         self.channel.set_message_sender(internal_tx).await;
 
         let session_channels = self.session_channels.clone();
+        let instance = self.instance.clone();
 
         // Bridge task: forward Telegram messages to the inbound pipeline,
         // storing session mapping for reply routing.
@@ -58,12 +84,17 @@ impl ChannelExtension for TelegramChannelExtension {
                     .and_then(|v| v.as_i64())
                     .unwrap_or_else(|| session_id.parse().unwrap_or(0));
 
-                // Store session -> (channel, chat_id) mapping for response routing.
+                // Store session -> (channel, chat_id) mapping for response
+                // routing. Keyed by the configured instance so two bots do not
+                // share a session table.
                 {
                     let mut sessions = session_channels.write().await;
-                    sessions.insert(session_id, ("telegram".to_string(), chat_id.to_string()));
+                    sessions.insert(session_id, (instance.clone(), chat_id.to_string()));
                 }
 
+                // Tell the router which instance this arrived on; the channel
+                // default is registered under the same name.
+                let msg = msg.with_channel_instance(instance.clone());
                 if inbound_tx.send(msg).await.is_err() {
                     break;
                 }

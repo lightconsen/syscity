@@ -476,6 +476,8 @@ mod tests {
             agent_id: None,
             mobile: crate::config::MobileControlConfig::default(),
             reflection_config: None,
+            allowed_tools: Some(vec!["file_read".to_string(), "web_search".to_string()]),
+            permissions: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -485,6 +487,13 @@ mod tests {
         assert_eq!(restored.max_concurrent_tools, 3);
         assert_eq!(restored.max_turns, Some(10));
         assert_eq!(restored.compaction_model, Some("claude-haiku".to_string()));
+
+        // The per-agent tool allowlist survives serialization — otherwise a
+        // restart would quietly hand the agent every tool back.
+        assert_eq!(
+            restored.allowed_tools.as_deref(),
+            Some(&["file_read".to_string(), "web_search".to_string()][..])
+        );
 
         // Verify heartbeat roundtrip
         let hb = restored.heartbeat.unwrap();

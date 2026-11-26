@@ -148,6 +148,14 @@ pub struct ChannelState {
     pub session_channels: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// Webhook session storage: platform_key -> session_uuid.
     pub webhook_sessions: Arc<RwLock<HashMap<String, String>>>,
+    /// Prompts delivered to a channel and awaiting an answer from that channel.
+    ///
+    /// An ask/approval is raised while the agent's turn is suspended. The
+    /// prompt is recorded under the **session** (`conversation_id`) it belongs
+    /// to, which is the one identifier the question and the reply share even in
+    /// a group chat. A plain `1` or `yes` in that conversation then resolves it
+    /// without the person having to paste an opaque id.
+    pub channel_answers: Arc<crate::gateway::channel_answers::PendingPrompts>,
     /// Bearer-token verifiers for the channels that authenticate with one
     /// (Teams, Google Chat), keyed by channel name.
     ///

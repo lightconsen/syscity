@@ -73,6 +73,10 @@ pub(crate) async fn handle_approvals_approve(
         .resolve(&p.id, crate::tools::approval::ApprovalDecision::Approve)
         .await
     {
+        // An operator may approve something that was also posted to a chat. The
+        // chat entry has to go with it, or the person's next ordinary message is
+        // read as an answer to a prompt nobody is waiting on.
+        state.channels.channel_answers.clear_prompt(&p.id).await;
         // Best-effort: an approval must not fail because a rule could not be
         // recorded. A compound command remembers one rule per segment, so the
         // list can be longer than one.
@@ -157,6 +161,7 @@ pub(crate) async fn handle_approvals_deny(
         .resolve(&p.id, crate::tools::approval::ApprovalDecision::Deny { reason: reason.clone() })
         .await
     {
+        state.channels.channel_answers.clear_prompt(&p.id).await;
         WsResponse::ok(
             &req.id,
             serde_json::json!({ "id": p.id, "status": "denied", "reason": reason }),

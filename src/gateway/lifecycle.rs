@@ -144,6 +144,159 @@ fn delegation_duration_ms(task: &crate::delegation::DelegationTask) -> Option<u6
     }
 }
 
+/// Where a session that came in over a messaging channel should be answered.
+///
+/// Returns `(channel_instance, conversation_id)` when the session belongs to a
+/// channel the gateway can reach, and `None` for the built-in surfaces (the WS
+/// UI's `web` sessions, cron, delegation), whose answer is the event bus and
+/// has no endpoint to post to.
+async fn channel_target_for_session(
+    state: &Arc<GatewayState>,
+    session_id: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    // 1. A session the channel bridges recorded: session -> (instance, address).
+    if let Some(session_id) = session_id {
+        let sessions = state.channels.session_channels.read().await;
+        if let Some((channel, conversation_id)) = sessions.get(session_id) {
+            return Some((channel.clone(), Some(conversation_id.clone())));
+        }
+    }
+    // 2. A session named `{channel}:{user_id}` by the router. The channel half
+    //    is an instance name because that is what the router was bound with;
+    //    only accept it if such a channel is actually registered, so a plain
+    //    conversation id that happens to contain a colon is not mistaken for
+    //    one.
+    let (channel, _user) = crate::inbound::AgentRouter::split_session_key(session_id?)?;
+    let channels = state.channels.reply_dispatcher.list_channels().await;
+    if channels.iter().any(|c| c == channel) {
+        // The address is the session id itself: the outbound dispatch stage
+        // falls back to it when no platform id is supplied, and for these
+        // channels the session *is* what the platform recognises.
+        return Some((channel.to_string(), None));
+    }
+    None
+}
+
+/// Post an agent's question to the channel its session came from.
+///
+/// Best-effort: a question that cannot be delivered still reaches the WS bus,
+/// and failing to deliver must not swallow the agent's turn.
+async fn deliver_ask_to_channel(
+    state: &Arc<GatewayState>,
+    event: &crate::tools::ask_user::AskRequiredEvent,
+) {
+    let Some((channel, conversation_id)) =
+        channel_target_for_session(state, Some(&event.session_id)).await
+    else {
+        return;
+    };
+
+    // Remember what the person is being asked, so their next plain message in
+    // this session can answer it instead of starting a new turn with the model.
+    // Keyed by the session: the person's reply arrives on the same conversation,
+    // whatever their user id resolves to on that platform.
+    if !event.session_id.is_empty() {
+        state
+            .channels
+            .channel_answers
+            .record(
+                event.session_id.clone(),
+                channel.clone(),
+                crate::gateway::channel_answers::PendingPrompt {
+                    kind: crate::gateway::channel_answers::PromptKind::Ask,
+                    id: event.ask_id.clone(),
+                    options: event.options.clone(),
+                    // `ask_user` free text is always accepted.
+                    free_text: true,
+                },
+            )
+            .await;
+    }
+
+    let mut text = format!("❓ {}\n\n", event.question);
+    if !event.options.is_empty() {
+        text.push_str("Reply with the number or the option:\n");
+        for (i, option) in event.options.iter().enumerate() {
+            text.push_str(&format!("  {}. {}\n", i + 1, option));
+        }
+    }
+    if let Some(default) = &event.default {
+        text.push_str(&format!("\nDefault: {default}\n"));
+    }
+    text.push_str(&format!("\nOr answer by id: /answer {} <text>", event.ask_id));
+
+    send_text_to_channel(state, channel, conversation_id, text, "ask").await;
+}
+
+/// Post a pending approval to the channel its session came from.
+async fn deliver_approval_to_channel(
+    state: &Arc<GatewayState>,
+    event: &crate::tools::approval::ApprovalRequiredEvent,
+) {
+    let Some((channel, conversation_id)) =
+        channel_target_for_session(state, event.session_id.as_deref()).await
+    else {
+        return;
+    };
+
+    // Recorded under the session for the same reason as `deliver_ask_to_channel`.
+    // An approval with no session cannot be attributed to a conversation, so
+    // there is nobody whose reply could be matched to it.
+    if let Some(session_id) = event.session_id.as_deref().filter(|s| !s.is_empty()) {
+        state
+            .channels
+            .channel_answers
+            .record(
+                session_id.to_string(),
+                channel.clone(),
+                crate::gateway::channel_answers::PendingPrompt {
+                    kind: crate::gateway::channel_answers::PromptKind::Approval,
+                    id: event.approval_id.clone(),
+                    options: vec![],
+                    free_text: false,
+                },
+            )
+            .await;
+    }
+
+    let text = format!(
+        "🔐 Approval needed: `{}` (risk: {:?})\n\n{}\n\nReply *yes* to approve or *no* to deny. \
+         \nOr by id: /approve {} · /deny {}",
+        event.tool_name, event.risk_level, event.message, event.approval_id, event.approval_id
+    );
+
+    send_text_to_channel(state, channel, conversation_id, text, "approval").await;
+}
+
+/// Hand one message to the outbound pipeline, addressed to a channel.
+async fn send_text_to_channel(
+    state: &Arc<GatewayState>,
+    channel: String,
+    conversation_id: Option<String>,
+    text: String,
+    kind: &str,
+) {
+    let (model_name, model_provider) = {
+        let cfg = state.config.read().await;
+        (Some(cfg.model.clone()), Some(cfg.model_provider.clone()))
+    };
+    let ctx = crate::outbound::OutboundContext {
+        session_id: String::new(),
+        conversation_id,
+        channel: channel.clone(),
+        agent_id: String::new(),
+        raw_output: text,
+        tool_calls: vec![],
+        usage: None,
+        side_effects: vec![],
+        model_name,
+        model_provider,
+        reasoning_content: None,
+    };
+    state.pipelines.outbound.process(ctx).await;
+    debug!("Delivered {} prompt to channel {}", kind, channel);
+}
+
 /// Start the gateway and all its subsystems.
 pub(crate) async fn start_gateway(
     state: Arc<GatewayState>,
@@ -709,6 +862,7 @@ pub(crate) async fn start_gateway(
         let mut approval_rx = state.tools.approval_queue.event_tx.subscribe();
         let event_tx = state.events.tx.clone();
         let shutdown_token = shutdown_token.clone();
+        let state_for_channels = state.clone();
         let approval_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -721,6 +875,10 @@ pub(crate) async fn start_gateway(
                             Ok(evt) => evt,
                             Err(_) => break,
                         };
+                        // Put the request in front of a remote human. Without
+                        // this, a tool call gated on approval from a channel
+                        // session waits out its timeout and fails.
+                        deliver_approval_to_channel(&state_for_channels, &evt).await;
                         if let Err(e) = event_tx.send(crate::gateway::GatewayEvent::ApprovalRequired {
                             approval_id: evt.approval_id,
                             tool_name: evt.tool_name,
@@ -772,10 +930,17 @@ pub(crate) async fn start_gateway(
     }
 
     // Forward ask_user events from the ask queue into the Gateway event bus.
+    //
+    // The event bus is the built-in UI's surface; it is not a channel. An
+    // agent that stops to ask a question while its human is on WeCom would
+    // otherwise stall until the 300 s timeout, because nothing ever put the
+    // question in front of them. `deliver_ask_to_channel` closes that gap for
+    // sessions that arrived over a messaging channel.
     {
         let mut ask_rx = state.tools.ask_queue.event_tx.subscribe();
         let event_tx = state.events.tx.clone();
         let shutdown_token = shutdown_token.clone();
+        let state_for_channels = state.clone();
         let ask_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -788,6 +953,23 @@ pub(crate) async fn start_gateway(
                             Ok(evt) => evt,
                             Err(_) => break,
                         };
+                        // Channel delivery first: it is the only surface a
+                        // remote human can see, and it must happen even if no
+                        // WS client is attached.
+                        if let crate::tools::ask_user::AskEvent::Required(ref e) = evt {
+                            deliver_ask_to_channel(&state_for_channels, e).await;
+                        }
+                        // A question resolved elsewhere — the desktop UI, a
+                        // timeout, a cancel — must release the chat entry too,
+                        // or the person's next ordinary message is swallowed as
+                        // an answer to something nobody is waiting on.
+                        if let crate::tools::ask_user::AskEvent::Resolved(ref e) = evt {
+                            state_for_channels
+                                .channels
+                                .channel_answers
+                                .clear_prompt(&e.ask_id)
+                                .await;
+                        }
                         let gateway_evt = match evt {
                             crate::tools::ask_user::AskEvent::Required(e) => {
                                 crate::gateway::GatewayEvent::AskRequired(e)

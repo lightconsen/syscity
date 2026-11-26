@@ -45,6 +45,9 @@ fn tool_context() -> ToolContext {
         // The browser tools need no desktop approval, so there is nothing to
         // inherit here; the field exists for tools that drive the desktop.
         desktop_grant: None,
+        // Not narrowed: these tests exercise the browser tools themselves.
+        allowed_tools: None,
+        agent_permissions: None,
     }
 }
 

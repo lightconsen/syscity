@@ -203,18 +203,48 @@ pub(crate) async fn dispatch_channel_message_to(
     text: &str,
     mention: crate::channels::MentionState,
 ) -> InboundDisposition {
+    dispatch_channel_message_on(state, channel, channel, user_id, conversation_id, text, mention)
+        .await
+}
+
+/// As [`dispatch_channel_message_to`], for a channel that knows both its
+/// configured **instance** name and its type.
+///
+/// `instance` is the `[channels.<name>]` section key, which is what the router
+/// keys channel defaults by and what access control reads its per-instance
+/// policy from; `channel_type` is what policy code reasons about. They are the
+/// same string for a single-instance deployment, and must not be conflated when
+/// one type is configured more than once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_channel_message_on(
+    state: &Arc<GatewayState>,
+    instance: &str,
+    channel_type: &str,
+    user_id: &str,
+    conversation_id: &str,
+    text: &str,
+    mention: crate::channels::MentionState,
+) -> InboundDisposition {
+    // Access policy is per instance: `[channels.tg_alice]` and
+    // `[channels.tg_bob]` can allowlist different people.
+    let instance = if instance.is_empty() {
+        channel_type
+    } else {
+        instance
+    };
+    let channel = channel_type;
     if state
-        .check_incoming_access(channel, user_id, text, &mention)
+        .check_incoming_access(instance, user_id, text, &mention)
         .await
         .is_err()
     {
         return InboundDisposition::Refused;
     }
 
-    let platform_key = format!("{}:{}", channel, user_id);
+    let platform_key = format!("{}:{}", instance, user_id);
     let session_id = if text.trim() == "/new" {
         let new_session = reset_session(&state.channels.webhook_sessions, &platform_key).await;
-        info!("🆕 New {} session started for {}: {}", channel, user_id, new_session);
+        info!("🆕 New {} session started for {}: {}", instance, user_id, new_session);
         new_session
     } else {
         get_or_create_session(&state.channels.webhook_sessions, &platform_key).await
@@ -222,23 +252,29 @@ pub(crate) async fn dispatch_channel_message_to(
 
     // Remember which channel owns this session, so the agent's reply can be
     // routed back out through it — addressed to `conversation_id`, which is the
-    // sender for every channel whose reply goes back to them.
+    // sender for every channel whose reply goes back to them. Keyed by the
+    // instance: that is the name registered with the reply dispatcher.
     {
         let mut sessions = state.channels.session_channels.write().await;
-        sessions.insert(session_id.clone(), (channel.to_string(), conversation_id.to_string()));
+        sessions.insert(session_id.clone(), (instance.to_string(), conversation_id.to_string()));
     }
 
-    let incoming = IncomingMessage::new(user_id, session_id, text)
+    let mut incoming = IncomingMessage::new(user_id, session_id, text)
         .with_provenance(InputProvenance::ExternalUser {
             channel: channel.to_string(),
             is_direct: matches!(mention, crate::channels::MentionState::DirectMessage),
         })
         .with_mention(mention);
 
+    // The type travels in provenance (policy reads it); the instance travels in
+    // metadata (routing and outbound key by it). Stamping the instance even
+    // when it equals the type keeps `channel_key()` unambiguous.
+    incoming = incoming.with_channel_instance(instance);
+
     match state.pipelines.inbound_entry.send(incoming).await {
         Ok(()) => InboundDisposition::Queued,
         Err(e) => {
-            warn!("Failed to enqueue {} webhook message: {}", channel, e);
+            warn!("Failed to enqueue {} webhook message: {}", instance, e);
             InboundDisposition::QueueFull
         }
     }

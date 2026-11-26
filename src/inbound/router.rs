@@ -376,7 +376,11 @@ impl AgentRouter {
             return result;
         }
 
-        // 2b. Check existing session binding by derived `{channel}:{user_id}` key
+        // 2b. Check existing session binding by derived `{channel}:{user_id}` key.
+        //
+        // Keyed by the channel *instance*, not the channel type: two people
+        // sharing one bot type (`[channels.tg_alice]` / `[channels.tg_bob]`)
+        // must not resolve to each other's agent.
         let channel_name = Self::resolve_channel_name(message);
         let user_id = message.user_id.0.as_str();
 
@@ -396,6 +400,11 @@ impl AgentRouter {
         // 3. Check channel-specific default
         if let Some(ch) = &channel_name {
             if let Some(result) = self.resolve_channel_default(ch, &session_id).await {
+                // Pin this user to the agent that just answered them. Without
+                // this the derived-key lookup in step 2b is a lookup nobody
+                // ever fills, and a second message from the same person in a
+                // new conversation cannot be attributed to their own agent.
+                self.bind_user(ch, user_id, &result.agent_id).await;
                 return result;
             }
         }
@@ -462,12 +471,16 @@ impl AgentRouter {
         })
     }
 
-    /// Extract the channel name from message provenance, if present.
+    /// The channel key a message routes by.
+    ///
+    /// This is the configured **instance** name when the bridge stamped one,
+    /// falling back to the channel type in provenance. The distinction
+    /// matters: `channel_defaults` is populated from the config section names
+    /// (`init_channels` iterates `config.channels`), so looking up the type
+    /// instead would miss every instance not named after its type and drop the
+    /// message through to the global default agent.
     fn resolve_channel_name(message: &IncomingMessage) -> Option<String> {
-        match &message.provenance {
-            crate::channels::InputProvenance::ExternalUser { channel, .. } => Some(channel.clone()),
-            _ => None,
-        }
+        message.channel_key().map(str::to_string)
     }
 
     /// Look up a channel-specific default agent binding and persist it.
@@ -590,6 +603,53 @@ impl AgentRouter {
         defaults.insert(workspace_id.to_string(), agent_id);
     }
 
+    /// Bind a user on a channel to an agent, for every session they open.
+    ///
+    /// This is what makes "one agent per human employee" hold in a deployment
+    /// where several people share one bot: the router's derived
+    /// `{channel}:{user_id}` lookup only matches if something writes that key.
+    /// Call this once per `(channel, user_id)` — [`Self::route`] does it on the
+    /// first message a user sends to a channel that has no explicit default.
+    ///
+    /// Idempotent and safe to call for a user who is already bound: the row is
+    /// rewritten with the same value. A no-op when the instance or user is
+    /// empty, so a half-configured channel cannot create a `":user"` binding
+    /// that silently swallows every channel.
+    pub async fn bind_user(&self, channel: &str, user_id: &str, agent_id: &str) {
+        if channel.is_empty() || user_id.is_empty() || agent_id.is_empty() {
+            return;
+        }
+        let key = Self::derive_session_key(channel, user_id);
+        let route = RouteResult {
+            agent_id: agent_id.to_string(),
+            workspace_id: None,
+            persisted_binding: true,
+            is_fallback: false,
+        };
+        self.bind_session(&key, &route).await;
+    }
+
+    /// Whether a derived `{channel}:{user_id}` binding already exists.
+    pub async fn has_user_binding(&self, channel: &str, user_id: &str) -> bool {
+        let key = Self::derive_session_key(channel, user_id);
+        self.session_bindings.read().await.contains_key(&key)
+    }
+
+    /// Reverse a derived key: `"{channel}:{user_id}"` → `(channel, user_id)`.
+    ///
+    /// Splits on the **first** colon, so a user id that itself contains one
+    /// (a fully-qualified Matrix/Teams id, say) round-trips intact. Only keys
+    /// [`derive_session_key`](Self::derive_session_key) produced are reversed;
+    /// a conversation-shaped session id has no channel prefix and returns
+    /// `None`.
+    pub fn split_session_key(key: &str) -> Option<(&str, &str)> {
+        let (channel, user_id) = key.split_once(':')?;
+        if channel.is_empty() || user_id.is_empty() {
+            return None;
+        }
+        Some((channel, user_id))
+    }
+
     /// List all active session bindings.
     pub async fn list_bindings(&self) -> HashMap<String, (String, Option<String>)> {
         let bindings = self.session_bindings.read().await;
@@ -655,6 +715,7 @@ impl AgentRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::InputProvenance;
 
     #[tokio::test]
     async fn test_default_route() {
@@ -804,5 +865,122 @@ mod tests {
         assert!(router.bind_session("s1", &route).await);
         let bindings = router.list_bindings().await;
         assert_eq!(bindings.get("s1"), Some(&("coder".to_string(), None)));
+    }
+
+    /// Two instances of the *same* channel type must route to the agents their
+    /// own config section names — the reason messages carry the instance.
+    #[tokio::test]
+    async fn test_channel_instance_routes_to_its_own_default() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_channel_default("tg_alice", "alice".to_string(), None)
+            .await;
+        router
+            .set_channel_default("tg_bob", "bob".to_string(), None)
+            .await;
+
+        let from_alice = IncomingMessage::new("u-alice", "s-alice", "hi")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_alice");
+        let from_bob = IncomingMessage::new("u-bob", "s-bob", "hi")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_bob");
+
+        assert_eq!(router.route(&from_alice, None).await.agent_id, "alice");
+        assert_eq!(router.route(&from_bob, None).await.agent_id, "bob");
+    }
+
+    /// Without an instance, the channel *type* is still the lookup key, so a
+    /// section named after its type keeps working.
+    #[tokio::test]
+    async fn test_channel_type_is_the_fallback_key() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_channel_default("telegram", "tg-agent".to_string(), None)
+            .await;
+
+        let msg =
+            IncomingMessage::new("u1", "s1", "hi").with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            });
+        assert_eq!(router.route(&msg, None).await.agent_id, "tg-agent");
+    }
+
+    /// The channel default pins the sender, so their *next* conversation on the
+    /// same channel resolves by the derived key instead of falling through.
+    #[tokio::test]
+    async fn test_channel_default_pins_the_user_for_later_sessions() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_channel_default("tg_alice", "alice".to_string(), None)
+            .await;
+
+        let first = IncomingMessage::new("u-alice", "s-1", "hi")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_alice");
+        assert_eq!(router.route(&first, None).await.agent_id, "alice");
+        assert!(router.has_user_binding("tg_alice", "u-alice").await);
+
+        let second = IncomingMessage::new("u-alice", "s-2", "again")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_alice");
+        // Derived-key hit: not a fallback, and still alice's agent.
+        let route = router.route(&second, None).await;
+        assert_eq!(route.agent_id, "alice");
+        assert!(!route.is_fallback);
+    }
+
+    /// `bind_user` is what makes the derived-key lookup reachable at all.
+    #[tokio::test]
+    async fn test_bind_user_reaches_derived_key() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router.bind_user("tg_bob", "u-bob", "bob").await;
+
+        let msg = IncomingMessage::new("u-bob", "s-fresh", "hi")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_bob");
+        let route = router.route(&msg, None).await;
+        assert_eq!(route.agent_id, "bob");
+        assert!(!route.is_fallback);
+    }
+
+    /// A half-configured channel must not create a `":user"` binding that would
+    /// swallow every other channel's traffic.
+    #[tokio::test]
+    async fn test_bind_user_ignores_empty_parts() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router.bind_user("", "u1", "alice").await;
+        router.bind_user("tg", "", "alice").await;
+        router.bind_user("tg", "u1", "").await;
+        assert!(router.list_bindings().await.is_empty());
+    }
+
+    #[test]
+    fn test_split_session_key() {
+        assert_eq!(AgentRouter::split_session_key("tg_alice:u1"), Some(("tg_alice", "u1")));
+        // A user id containing a colon survives: split on the first one only.
+        assert_eq!(
+            AgentRouter::split_session_key("matrix:@alice:example.org"),
+            Some(("matrix", "@alice:example.org"))
+        );
+        assert_eq!(AgentRouter::split_session_key("conversation-shaped"), None);
+        assert_eq!(AgentRouter::split_session_key(":u1"), None);
+        assert_eq!(AgentRouter::split_session_key("tg:"), None);
     }
 }

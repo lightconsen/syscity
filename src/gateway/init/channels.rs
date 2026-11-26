@@ -72,11 +72,39 @@ pub(crate) async fn init_channels(
         init_single_channel(state.clone(), config, name, channel_config).await?;
     }
 
+    // Seed per-user agent bindings from `[channels.<name>.users]`. The router's
+    // derived `{channel}:{user_id}` lookup is only a lookup until something
+    // writes the key; this is where a deployment says, up front, which human
+    // each agent belongs to. Learned bindings made during the run are not
+    // removed here — config wins on restart, which is when a changed
+    // assignment is meant to take effect.
+    seed_user_bindings(&state, config).await;
+
     // Discover and start WASM plugin channels
     #[cfg(feature = "plugins")]
     init_plugin_channels(state, config).await?;
 
     Ok(())
+}
+
+/// Bind every `[channels.<name>.users]` entry in the router.
+async fn seed_user_bindings(
+    state: &Arc<GatewayState>,
+    config: &crate::gateway::config::GatewayConfig,
+) {
+    let mut seeded = 0usize;
+    for (name, channel_config) in &config.channels {
+        if !channel_config.enabled {
+            continue;
+        }
+        for (user_id, agent_id) in &channel_config.users {
+            state.agents.router.bind_user(name, user_id, agent_id).await;
+            seeded += 1;
+        }
+    }
+    if seeded > 0 {
+        info!("Seeded {} per-user agent binding(s) from channel config", seeded);
+    }
 }
 
 /// Discover and start WASM plugin channels.
@@ -432,9 +460,10 @@ pub(crate) async fn init_telegram_channel(
             .await;
 
         // Create the channel extension
-        let ext = Arc::new(crate::channels::TelegramChannelExtension::new(
+        let ext = Arc::new(crate::channels::TelegramChannelExtension::with_instance(
             channel.clone(),
             state.channels.session_channels.clone(),
+            name,
         ));
 
         // Create inbound channel: extension -> inbound pipeline
@@ -514,10 +543,15 @@ pub(crate) async fn init_discord_channel(
 
         let channel = Arc::new(crate::channels::discord::DiscordChannel::new(discord_config));
 
-        // Bridge inbound messages into the unified entry channel
+        // Bridge inbound messages into the unified entry channel. The
+        // section name is stamped on every message: the router keys this
+        // instance's agent by it, and the reply dispatcher is registered
+        // under it.
         let state_clone = state.clone();
+        let instance = name.to_string();
         let bridge_handle = tokio::spawn(async move {
             while let Some(msg) = inbound_rx.recv().await {
+                let msg = msg.with_channel_instance(instance.clone());
                 if let Err(e) = state_clone.pipelines.inbound_entry.send(msg).await {
                     warn!("Failed to submit message to inbound entry: {}", e);
                 }
@@ -570,10 +604,15 @@ pub(crate) async fn init_slack_channel(
 
         let channel = Arc::new(crate::channels::slack::SlackChannel::new(slack_config));
 
-        // Bridge inbound messages into the unified entry channel
+        // Bridge inbound messages into the unified entry channel. The
+        // section name is stamped on every message: the router keys this
+        // instance's agent by it, and the reply dispatcher is registered
+        // under it.
         let state_clone = state.clone();
+        let instance = name.to_string();
         let bridge_handle = tokio::spawn(async move {
             while let Some(msg) = inbound_rx.recv().await {
+                let msg = msg.with_channel_instance(instance.clone());
                 if let Err(e) = state_clone.pipelines.inbound_entry.send(msg).await {
                     warn!("Failed to submit message to inbound entry: {}", e);
                 }
@@ -1095,9 +1134,10 @@ pub(crate) async fn init_wecom_channel(
             // tells the inbound stage whether an unmentioned group message
             // should be suppressed — and a group reported as a direct message
             // has its bot answer everything in it.
-            crate::gateway::webhooks::dispatch_channel_message_to(
+            crate::gateway::webhooks::dispatch_channel_message_on(
                 &state_for_bridge,
                 &channel_name,
+                "wecom",
                 &msg.user_id.0,
                 &msg.conversation_id.0,
                 &msg.content,
@@ -1178,9 +1218,10 @@ pub(crate) async fn init_dingtalk_channel(
     let channel_name = name.to_string();
     let bridge_handle = tokio::spawn(async move {
         while let Some(msg) = inbound_rx.recv().await {
-            crate::gateway::webhooks::dispatch_channel_message_to(
+            crate::gateway::webhooks::dispatch_channel_message_on(
                 &state_for_bridge,
                 &channel_name,
+                "dingtalk",
                 &msg.user_id.0,
                 &msg.conversation_id.0,
                 &msg.content,
@@ -1271,9 +1312,10 @@ pub(crate) async fn init_irc_channel(
     let name_for_bridge = name.to_string();
     let bridge_handle = tokio::spawn(async move {
         while let Some(msg) = inbound_rx.recv().await {
-            crate::gateway::webhooks::dispatch_channel_message_to(
+            crate::gateway::webhooks::dispatch_channel_message_on(
                 &state_for_bridge,
                 &name_for_bridge,
+                "irc",
                 &msg.user_id.0,
                 &msg.conversation_id.0,
                 &msg.content,
@@ -1344,9 +1386,10 @@ pub(crate) async fn init_simplex_channel(
     let name_for_bridge = name.to_string();
     let bridge_handle = tokio::spawn(async move {
         while let Some(msg) = inbound_rx.recv().await {
-            crate::gateway::webhooks::dispatch_channel_message_to(
+            crate::gateway::webhooks::dispatch_channel_message_on(
                 &state_for_bridge,
                 &name_for_bridge,
+                "simplex",
                 &msg.user_id.0,
                 &msg.conversation_id.0,
                 &msg.content,
@@ -1402,10 +1445,15 @@ pub(crate) async fn init_qq_channel(
 
         let channel = Arc::new(crate::channels::qq::QqChannel::new(qq_config));
 
-        // Bridge inbound messages into the unified entry channel
+        // Bridge inbound messages into the unified entry channel. The
+        // section name is stamped on every message: the router keys this
+        // instance's agent by it, and the reply dispatcher is registered
+        // under it.
         let state_clone = state.clone();
+        let instance = name.to_string();
         let bridge_handle = tokio::spawn(async move {
             while let Some(msg) = inbound_rx.recv().await {
+                let msg = msg.with_channel_instance(instance.clone());
                 if let Err(e) = state_clone.pipelines.inbound_entry.send(msg).await {
                     warn!("Failed to submit message to inbound entry: {}", e);
                 }

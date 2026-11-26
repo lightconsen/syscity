@@ -92,6 +92,42 @@ pub struct AgentConfig {
     /// decision about what an irreversible tap may do unattended.
     #[serde(default)]
     pub mobile: crate::config::MobileControlConfig,
+    /// Tools this agent may use, if the deployment narrows them.
+    ///
+    /// `None` (the default) means the ordinary registry gate decides — every
+    /// tool that is registered, not blocked, and allowed by permissions is
+    /// offered. `Some` is an **allowlist**: a tool not named here is neither
+    /// advertised to the model nor executable by it, whatever the global
+    /// capability profile says.
+    ///
+    /// This is the per-agent half of the tool surface. The gateway's
+    /// `[capabilities]` block is one profile for the whole process, which is
+    /// right for a single operator and wrong for a server hosting one agent per
+    /// employee: every agent would otherwise get the same tools, including
+    /// `shell`, and could read another's workspace.
+    ///
+    /// An empty list is treated as `None` (nothing narrowed) rather than "no
+    /// tools at all", because an empty list is far more likely to be an
+    /// unconfigured field than an intentional lockout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// This agent's own narrowing of the gateway permission posture.
+    ///
+    /// `None` (the default) means the gateway's `[permissions]` block decides
+    /// alone. When set it can only **tighten** the outcome: a stricter mode
+    /// plus extra `deny`/`ask` rules, never an `allow`. The gateway posture is
+    /// one block for the whole process — right for a single operator, wrong
+    /// for a server hosting one agent per employee, where one person's agent
+    /// should carry its own refusals without being able to grant itself a
+    /// tool the operator's rules ask about.
+    ///
+    /// Enforced in one place, [`PermissionsRuntime::evaluate`]
+    /// (crate::tools::permissions), and composed into the plan-mode filters by
+    /// `ToolRegistry::mode_for`.
+    ///
+    /// [`PermissionsRuntime::evaluate`]: crate::tools::PermissionsRuntime
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<crate::tools::AgentPermissions>,
 }
 
 /// Serde default: `true`.
@@ -163,6 +199,8 @@ Use rich formatting for lists, structured data, and technical content:
             agent_id: None,
             mobile: crate::config::MobileControlConfig::default(),
             reflection_config: None,
+            allowed_tools: None,
+            permissions: None,
         }
     }
 }

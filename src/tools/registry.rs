@@ -393,6 +393,12 @@ impl ToolRegistry {
         if self.is_degraded(name) {
             return true;
         }
+        // Per-agent allowlist: a tool this agent was not given is not
+        // advertised, whatever the gateway-wide capability profile says.
+        // `run_gate` refuses it as well, for a model that names it anyway.
+        if !context.permits_tool(name) {
+            return true;
+        }
         if context.model.skill_trust < SkillTrust::Trusted && self.is_privileged(name) {
             return true;
         }
@@ -406,12 +412,10 @@ impl ToolRegistry {
 
         // Plan mode hides non-read-only tools from the advertised toolset;
         // the per-call gate below is the backstop for anything that was
-        // advertised before the mode flipped mid-turn.
-        if self
-            .permissions
-            .effective_mode(&context.identity.conversation_id)
-            == PermissionMode::Plan
-            && !self.tool_capabilities(name).read_only
+        // advertised before the mode flipped mid-turn. An agent's own mode is
+        // composed in, so an agent narrowed to `plan` is not offered writers
+        // even while the gateway runs `default`.
+        if self.mode_for(context) == PermissionMode::Plan && !self.tool_capabilities(name).read_only
         {
             return true;
         }
@@ -1163,6 +1167,22 @@ impl ToolRegistry {
         }
     }
 
+    /// The mode one call runs under: the gateway/session mode, tightened by
+    /// the calling agent's own mode when it carries one.
+    ///
+    /// The one place that composition happens for the registry's two mode
+    /// reads (the advertised-toolset filter and the bypass downgrade), so the
+    /// two cannot disagree about whether an agent is in plan mode.
+    fn mode_for(&self, ctx: &ToolContext) -> PermissionMode {
+        let base = self
+            .permissions
+            .effective_mode(&ctx.identity.conversation_id);
+        match ctx.agent_permissions.as_deref().and_then(|a| a.mode) {
+            Some(agent_mode) => base.stricter(agent_mode),
+            None => base,
+        }
+    }
+
     /// The permission engine: rules + mode, evaluated before any hook.
     ///
     /// Reads the true (post-wrapper-fix) capabilities, so plan mode and the
@@ -1187,6 +1207,7 @@ impl ToolRegistry {
             &ctx.identity.conversation_id,
             caps.read_only,
             &caps.categories,
+            ctx.agent_permissions.as_deref(),
         )
     }
 
@@ -1203,6 +1224,19 @@ impl ToolRegistry {
     /// `requires_approval` fallback asks a present human and fails closed
     /// (deny) when there is nobody to ask.
     async fn run_gate(&self, name: &str, args: &Value, ctx: &ToolContext) -> ToolPolicyDecision {
+        // Per-agent allowlist, checked before any other gate: a deny rule for
+        // an unrelated agent would otherwise mask the real reason, and the
+        // model must not be able to reach a tool it was never given by naming
+        // it after the schema was hidden.
+        if !ctx.permits_tool(name) {
+            return ToolPolicyDecision::Deny {
+                reason: format!(
+                    "Tool '{name}' is outside this agent's tool allowlist \
+                     (see the agent's `allowed_tools`)"
+                ),
+            };
+        }
+
         let engine = self.evaluate_permissions(name, args, ctx);
 
         let decision = if let EngineDecision::Deny(reason) = engine {
@@ -1214,10 +1248,7 @@ impl ToolRegistry {
                 ToolPolicyDecision::Deny { reason } => ToolPolicyDecision::Deny { reason },
                 ToolPolicyDecision::NeedsApproval { .. }
                     if engine == EngineDecision::AllowNow
-                        && self
-                            .permissions
-                            .effective_mode(&ctx.identity.conversation_id)
-                            == PermissionMode::Bypass =>
+                        && self.mode_for(ctx) == PermissionMode::Bypass =>
                 {
                     // bypass skips approval prompts; an explicit hook ask is
                     // downgraded with it and audited below.
@@ -2518,6 +2549,64 @@ mod tests {
         }
     }
 
+    /// A per-agent allowlist hides the unreachable tools from the advertised
+    /// set *and* refuses a call that names one anyway. Hiding alone is not
+    /// enough: the model can still emit a tool call from its own priors.
+    #[tokio::test]
+    async fn an_agent_allowlist_hides_and_refuses_everything_else() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(spy("file_read", ran.clone()));
+        registry.register(spy("shell", ran.clone()));
+
+        let ctx = ToolContext::new("u", "conv1").with_allowed_tools(vec!["file_read".to_string()]);
+
+        let offered: Vec<String> = registry
+            .get_available(&ctx)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(offered.contains(&"file_read".to_string()), "got {offered:?}");
+        assert!(!offered.contains(&"shell".to_string()), "got {offered:?}");
+
+        let err = registry
+            .execute_call(&call("shell"), &ctx)
+            .await
+            .expect_err("a tool outside the allowlist must not run");
+        assert!(err.to_string().contains("tool allowlist"), "got {err}");
+
+        // The allowlisted tool is unaffected.
+        let result = registry
+            .execute_call(&call("file_read"), &ctx)
+            .await
+            .expect("an allowlisted tool runs");
+        assert!(result.success);
+    }
+
+    /// No allowlist means no narrowing — every registered tool stays reachable.
+    #[tokio::test]
+    async fn no_allowlist_leaves_the_toolset_whole() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(spy("shell", ran.clone()));
+
+        let ctx = ToolContext::new("u", "conv1");
+        assert!(ctx.permits_tool("shell"));
+        let result = registry
+            .execute_call(&call("shell"), &ctx)
+            .await
+            .expect("runs");
+        assert!(result.success);
+    }
+
+    /// An empty allowlist is an unconfigured field, not a lockout.
+    #[test]
+    fn an_empty_allowlist_means_not_narrowed() {
+        let ctx = ToolContext::new("u", "conv1").with_allowed_tools(vec![]);
+        assert!(ctx.allowed_tools.is_none());
+        assert!(ctx.permits_tool("anything"));
+    }
+
     #[tokio::test]
     async fn plan_mode_hides_and_refuses_everything_not_read_only() {
         let ran = Arc::new(AtomicBool::new(false));
@@ -2653,6 +2742,86 @@ mod tests {
             .await
             .expect("the session override exits plan mode for this session");
         assert!(result.success);
+    }
+
+    /// An agent narrowed to `plan` is refused writers even while the gateway
+    /// runs `default` — and they are not advertised either, because the
+    /// advertised-toolset filter composes the same mode.
+    #[tokio::test]
+    async fn an_agents_plan_mode_is_composed_into_the_gate_and_the_toolset() {
+        let mut registry =
+            ToolRegistry::new().with_permissions(perms(PermissionMode::Default, false));
+        registry.register(read_only_declared("reader"));
+        registry.register(Box::new(DeclaredTool {
+            name: "writer".into(),
+            caps: ToolCapabilities::default(),
+        }));
+
+        let plan = crate::tools::AgentPermissions {
+            mode: Some(PermissionMode::Plan),
+            deny: Vec::new(),
+            ask: Vec::new(),
+        };
+        let ctx = ToolContext::new("u", "conv1").with_agent_permissions(plan);
+
+        let advertised: Vec<String> = registry
+            .get_available(&ctx)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(advertised.contains(&"reader".to_string()));
+        assert!(
+            !advertised.contains(&"writer".to_string()),
+            "an agent in plan mode is not offered writers: {advertised:?}"
+        );
+
+        let err = registry
+            .execute_call(&call("writer"), &ctx)
+            .await
+            .expect_err("and naming it anyway is refused");
+        assert!(err.to_string().contains("plan mode"), "got {err}");
+
+        // The same agent outside plan mode gets the writer's call through the
+        // gate (no approval needed: this registry asks nobody), which proves
+        // the refusal above came from the agent's narrowing and not from the
+        // tool.
+        let plain = ToolContext::new("u", "conv1");
+        assert!(registry
+            .get_available(&plain)
+            .iter()
+            .any(|d| d.name == "writer"));
+    }
+
+    /// The same tool is advertised to a `default` agent and refused to a
+    /// `plan` one on the same registry — the per-agent half is per *context*,
+    /// not per process.
+    #[tokio::test]
+    async fn the_agent_narrowing_does_not_leak_into_another_agent() {
+        let registry = ToolRegistry::new().with_permissions(perms(PermissionMode::Default, false));
+        // (No tool bodies needed: `get_available` reads the registered set.)
+        let mut registry = registry;
+        registry.register(Box::new(DeclaredTool {
+            name: "writer".into(),
+            caps: ToolCapabilities::default(),
+        }));
+
+        let plan_ctx = ToolContext::new("alice", "conv-a").with_agent_permissions(
+            crate::tools::AgentPermissions {
+                mode: Some(PermissionMode::Plan),
+                deny: Vec::new(),
+                ask: Vec::new(),
+            },
+        );
+        let open_ctx = ToolContext::new("bob", "conv-b");
+
+        let has = |ctx: &ToolContext| {
+            registry
+                .get_available(ctx)
+                .iter()
+                .any(|d| d.name == "writer")
+        };
+        assert!(!has(&plan_ctx), "alice is read-only");
+        assert!(has(&open_ctx), "bob is untouched");
     }
 
     /// A `Deny` from a policy hook must block a buffered `execute_call`

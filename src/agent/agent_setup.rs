@@ -242,6 +242,22 @@ impl Agent {
             ctx = ctx.with_environment_var(key.clone(), value.clone());
         }
 
+        // This agent's own tool allowlist, if the deployment narrowed it. A
+        // delegated child is handed its parent's context below, so the ceiling
+        // follows the tree rather than resetting to "everything" one level
+        // down.
+        if let Some(allowed) = &cfg.allowed_tools {
+            ctx = ctx.with_allowed_tools(allowed.clone());
+        }
+
+        // This agent's own permission narrowing, if the deployment gave it one.
+        // Narrow-only (stricter mode, extra deny/ask), so a delegated child
+        // can only become more restricted by inheriting it — same direction as
+        // the allowlist above.
+        if let Some(perms) = &cfg.permissions {
+            ctx = ctx.with_agent_permissions(perms.clone());
+        }
+
         // A delegated child operates inside its delegation tree's shared
         // workspace: relative file paths resolve into this task's scratch dir,
         // while the whole tree plus the agent's own workspace stay reachable by

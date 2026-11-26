@@ -27,7 +27,9 @@ pub use ask_user::{
 // Re-export escalation helpers for convenience
 pub use escalation::{declared_escalation, escalate_and_rerun, fence_denial_reason};
 // Re-export permission types for convenience
-pub use permissions::{EngineDecision, PermissionMode, PermissionsConfig, PermissionsRuntime};
+pub use permissions::{
+    AgentPermissions, EngineDecision, PermissionMode, PermissionsConfig, PermissionsRuntime,
+};
 // Re-export tool metadata for convenience
 pub use metadata::ToolDescriptionMeta;
 

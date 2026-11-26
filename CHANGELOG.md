@@ -11,6 +11,81 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-user agent routing on a shared channel.** A `[channels.<name>.users]`
+  table maps a platform user id to an agent id, so one bot can serve a team and
+  each person still gets their own agent:
+
+  ```toml
+  [channels.tg_support]
+  channel_type = "telegram"
+  agent_id = "support-default"
+
+  [channels.tg_support.users]
+  "123456789" = "alice"
+  ```
+
+  The router already had a `{channel}:{user_id}` binding lookup, but nothing
+  ever wrote that key — it was dead code, so every message fell through to the
+  channel (or global) default. `init_channels` now seeds those bindings from
+  config, and the router pins a user to the agent that first answers them, so
+  their later conversations on that channel resolve by the derived key.
+- **Human-in-the-loop prompts reach chat, and can be answered there.** An agent
+  turn that hits an approval gate or calls `ask_user` used to stall to its
+  300 s timeout when its human was on a messaging channel: the prompt only ever
+  went out over the WebSocket event bus. Prompts are now also posted to the
+  channel the session belongs to, and the person's next message is checked for
+  an answer (`yes`/`1`/`/approve`, an option number, or free text) before it is
+  routed — so the answer resolves the suspended call instead of reaching the
+  model as a new request, and a confirmation is echoed back. Answers are scoped
+  to the **session** that received the prompt (the sender and the reply address
+  differ in a group chat, and the session is the one key both agree on);
+  internal traffic can never resolve one, and a prompt resolved outside chat
+  drops its entry so it cannot swallow the person's next message.
+- **Per-agent tool allowlist** — `[agent_overrides.<id>] allowed_tools`. `None`
+  leaves the registry's ordinary gates in charge; a list is enforced both at
+  schema time (the tools are not advertised) and per call (`run_gate` refuses
+  one named anyway). A delegated child inherits its parent's narrowing. This is
+  what keeps one employee's agent from reaching another's tools and workspace.
+  Settable at runtime via `config.set agent_overrides.<id>.allowed_tools`.
+- **Per-agent cost caps** — `[agent_overrides.<id>] daily_limit_cents` /
+  `hourly_action_limit`. The `[cost_guard]` budget was gateway-wide, so on a
+  per-seat deployment one person's runaway loop exhausted the shared budget and
+  refused *everybody* — the opposite of what a per-agent deployment pays for.
+  `CostGuard` now keeps a second set of counters per agent alongside the global
+  ones, checked in place of the global flag before each provider call. A
+  per-agent cap refuses only the agent it names; the gateway-wide latch is still
+  a process-wide stop. Both default to `0` (unlimited), so a single-operator
+  deployment is unchanged; the windows roll over on the same hour/day clocks,
+  `cost.reset` starts every agent's window over without removing the caps, and
+  `cost.get` reports each agent's spend and limits.
+- **Per-agent permission narrowing** — `[agent_overrides.<id>.permissions]`.
+  The `[permissions]` mode and its deny/ask rules were one block for the whole
+  process, so a deployment hosting one agent per person had no way to say "this
+  agent must ask about `web_fetch`" or "this one is read-only" without applying
+  it to everyone. `AgentPermissions` adds a per-agent narrowing that composes
+  by **strictness** — the effective mode is the stricter of the gateway/session
+  mode and the agent's own, so an agent's config can narrow the operator's
+  posture but never widen it — and whose `deny`/`ask` rules are consulted
+  ahead of the gateway `allow` rules. There is deliberately no per-agent
+  `allow`: an allow is the one rule kind that loosens the gate, and a config
+  file an employee controls must not be able to grant itself a tool the
+  operator's rules ask about. Settable at runtime via
+  `config.set agent_overrides.<id>.permissions`; a bad `mode` is refused rather
+  than read as "inherit".
+
+### Fixed
+
+- **Channel instance names now reach routing.** `init_channels` registers a
+  channel default under the config **section name**, but the router looked up
+  the hardcoded channel **type** baked into message provenance. Only a channel
+  section named after its type ever matched, so e.g. `[channels.tg_alice]`
+  silently routed every message to the global default agent. Messages now carry
+  their instance name, and routing, outbound reply dispatch, session ownership
+  and access checks all key by it. `IncomingMessage::channel_key()` is the one
+  accessor to use.
+
 ## [0.3.23] - 2026-11-26
 
 ### Added

@@ -527,7 +527,7 @@ mod tests {
         let permissions = bench_permissions(registry.list());
         for name in registry.list() {
             let decision =
-                permissions.evaluate(&name, &serde_json::json!({}), "bench-t", false, &[]);
+                permissions.evaluate(&name, &serde_json::json!({}), "bench-t", false, &[], None);
             assert!(
                 matches!(decision, crate::tools::EngineDecision::AllowNow),
                 "{name} should be pre-approved in a bench run, got {decision:?}"

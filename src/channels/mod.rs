@@ -181,6 +181,10 @@ pub use thread_binding::{
 // ── Input Provenance
 // ──────────────────────────────────────────────────────────
 
+/// `MessageMetadata::extra` key carrying the configured channel *instance*
+/// name a message arrived on (see [`IncomingMessage::with_channel_instance`]).
+pub const CHANNEL_INSTANCE_KEY: &str = "channel_instance";
+
 /// Describes the origin of an incoming message.
 ///
 /// Provenance lets the agent apply different trust levels and policies
@@ -538,6 +542,55 @@ impl IncomingMessage {
     pub fn with_mention(mut self, mention: MentionState) -> Self {
         self.mention = mention;
         self
+    }
+
+    /// Record which configured channel *instance* this message arrived on.
+    ///
+    /// One channel type can be instantiated several times:
+    ///
+    /// ```toml
+    /// [channels.tg_alice]
+    /// channel_type = "telegram"
+    /// agent_id = "alice"
+    ///
+    /// [channels.tg_bob]
+    /// channel_type = "telegram"
+    /// agent_id = "bob"
+    /// ```
+    ///
+    /// Both sections have `channel_type = "telegram"`, but the router's
+    /// channel defaults, the reply dispatcher and the per-user bindings are
+    /// keyed by the **section name**. `provenance.channel` holds the type
+    /// because that is what policy code reasons about, so the instance travels
+    /// here instead — a bridge that knows its own section name stamps it, and
+    /// the router prefers it (see `IncomingMessage::channel_instance`).
+    pub fn with_channel_instance(mut self, instance: impl Into<String>) -> Self {
+        self.metadata
+            .extra
+            .insert(CHANNEL_INSTANCE_KEY.to_string(), serde_json::Value::String(instance.into()));
+        self
+    }
+
+    /// The channel *instance* this message arrived on, if a bridge stamped one.
+    pub fn channel_instance(&self) -> Option<&str> {
+        self.metadata
+            .extra
+            .get(CHANNEL_INSTANCE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The key to look this message's channel up by: the configured instance
+    /// name when one was stamped, else the channel type from provenance.
+    ///
+    /// Every routing/outbound lookup that used to read `provenance.channel`
+    /// must use this instead — the type is shared by every instance of a
+    /// channel, so keying on it routes two people's bots to one agent.
+    pub fn channel_key(&self) -> Option<&str> {
+        self.channel_instance().or(match &self.provenance {
+            InputProvenance::ExternalUser { channel, .. } => Some(channel.as_str()),
+            _ => None,
+        })
     }
 
     /// Return `true` if this message should be processed given the channel's
