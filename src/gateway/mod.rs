@@ -309,6 +309,9 @@ impl Gateway {
         let (inbound_entry_tx, inbound_entry_rx) =
             mpsc::channel::<crate::channels::IncomingMessage>(1000);
         let (routed_tx, routed_rx) = mpsc::channel(1000);
+        // Refusals found on the debounced path have no caller holding the
+        // outcome; the pipeline hands them here and the reply worker answers.
+        let (denied_tx, denied_rx) = mpsc::channel::<crate::inbound::DeniedMessage>(256);
         let shutdown_token = CancellationToken::new();
 
         // Explicit layout root for this instance. Supplied via options (tests /
@@ -437,6 +440,7 @@ impl Gateway {
             sqlite_pool.as_ref(),
             model_router.clone(),
             routed_tx.clone(),
+            denied_tx,
         )
         .await?;
 
@@ -806,6 +810,15 @@ impl Gateway {
         state
             .task_registry
             .insert_join("message:routed", routed_handle)
+            .await;
+        let denied_handle = tokio::spawn(dispatch::process_denied_messages(
+            state.clone(),
+            denied_rx,
+            shutdown_token.clone(),
+        ));
+        state
+            .task_registry
+            .insert_join("message:denied", denied_handle)
             .await;
 
         Ok(Self { state, shutdown_token })

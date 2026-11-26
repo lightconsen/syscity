@@ -212,6 +212,15 @@ mod tests {
         router_config: AgentRouterConfig,
         debounce_ms: u64,
     ) -> PipelineHarness {
+        let router = AgentRouter::new(router_config);
+        build_pipeline_with_router(router, config, debounce_ms).await
+    }
+
+    async fn build_pipeline_with_router(
+        router: AgentRouter,
+        config: AutoReplyDispatchConfig,
+        debounce_ms: u64,
+    ) -> PipelineHarness {
         let (flush_tx, flush_rx) = mpsc::channel::<Vec<DebouncedItem>>(64);
         let debouncer = InboundDebouncer::new(
             InboundDebouncerConfig {
@@ -221,7 +230,6 @@ mod tests {
             flush_tx,
         );
         let dispatch = AutoReplyDispatch::new(config);
-        let router = AgentRouter::new(router_config);
         PipelineHarness::new(debouncer, flush_rx, dispatch, router, None).await
     }
 
@@ -417,6 +425,96 @@ mod tests {
             "commands should be routed immediately"
         );
         assert_eq!(channel.len(), 1);
+    }
+
+    /// A plain message is debounced, so the pipeline — not the caller — flushes
+    /// it. A refusal found there has to reach the gateway, or the sender's
+    /// message vanishes with no explanation: it goes to the denial sink.
+    #[tokio::test]
+    async fn an_unauthorized_sender_gets_a_denial_on_the_debounced_path() {
+        let router = AgentRouter::new(router_config_default_agent("default"));
+        router
+            .set_agent_principals("default", vec!["someone-else".to_string()])
+            .await;
+
+        let (flush_tx, flush_rx) = mpsc::channel::<Vec<DebouncedItem>>(64);
+        let debouncer = InboundDebouncer::new(
+            InboundDebouncerConfig {
+                debounce_ms: 50,
+                ..Default::default()
+            },
+            flush_tx,
+        );
+        let (routed_tx, mut routed_rx) = mpsc::channel::<RoutedMessage>(64);
+        let (denied_tx, mut denied_rx) = mpsc::channel(64);
+        let pipeline = Arc::new(
+            DefaultInboundPipeline::new(
+                debouncer,
+                MediaUnderstandingPipeline::new(),
+                AutoReplyDispatch::new(AutoReplyDispatchConfig::default()),
+                QueueModeResolver::new(),
+                Arc::new(router),
+                routed_tx,
+                flush_rx,
+            )
+            .with_denied_sink(denied_tx),
+        );
+        pipeline.clone().start();
+
+        let message = IncomingMessage::new("stranger", "conv-x", "hello")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".into(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_alice");
+        let outcome = pipeline.process_detailed(message).await;
+        assert!(
+            matches!(outcome, InboundProcessOutcome::Absorbed),
+            "a plain message is debounced"
+        );
+
+        let denied = tokio::time::timeout(Duration::from_secs(2), denied_rx.recv())
+            .await
+            .expect("the refusal should reach the sink")
+            .expect("the sink is still open");
+        assert_eq!(denied.agent_id, "default");
+        // The caller needs the message to reply in its conversation.
+        assert_eq!(denied.message.user_id.0, "stranger");
+        assert_eq!(denied.message.conversation_id.0, "conv-x");
+        assert_eq!(denied.message.channel_key(), Some("tg_alice"));
+        // Nothing reached the agent.
+        assert!(routed_rx.try_recv().is_err());
+    }
+
+    /// A message that bypasses the debouncer is routed inline, so its refusal
+    /// comes back as the outcome — the caller answers it directly.
+    #[tokio::test]
+    async fn an_unauthorized_sender_gets_a_denied_outcome_on_the_inline_path() {
+        let router = AgentRouter::new(router_config_default_agent("default"));
+        router
+            .set_agent_principals("default", vec!["someone-else".to_string()])
+            .await;
+
+        let pipeline =
+            build_pipeline_with_router(router, AutoReplyDispatchConfig::default(), 50).await;
+        // A command bypasses the debouncer, so its refusal is the outcome.
+        let message = IncomingMessage::new("stranger", "conv-x", "/help")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".into(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_alice");
+        let (outcome, channel) = pipeline.process_detailed(message).await;
+
+        match outcome {
+            InboundProcessOutcome::Denied { agent_id, message } => {
+                assert_eq!(agent_id, "default");
+                assert_eq!(message.user_id.0, "stranger");
+                assert_eq!(message.channel_key(), Some("tg_alice"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert!(channel.is_empty(), "nothing reached the agent");
     }
 
     #[tokio::test]

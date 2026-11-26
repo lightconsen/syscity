@@ -35,12 +35,15 @@ pub(crate) async fn process_inbound_entries(
                 if answer_pending_prompt(&state, &incoming).await {
                     continue;
                 }
-                match state.pipelines.inbound.process(incoming).await {
-                    Some(routed) => {
+                match state.pipelines.inbound.process_detailed(incoming).await {
+                    crate::inbound::InboundProcessOutcome::Routed(routed) => {
                         info!("Inbound message routed through pipeline: agent={}", routed.agent_id);
                     }
-                    None => {
-                        info!("Inbound message absorbed by pipeline (debounced or suppressed)");
+                    crate::inbound::InboundProcessOutcome::Denied { agent_id, message } => {
+                        announce_denied(&state, &agent_id, &message).await;
+                    }
+                    other => {
+                        debug!("Inbound message not routed: {other:?}");
                     }
                 }
             }
@@ -50,8 +53,15 @@ pub(crate) async fn process_inbound_entries(
     // Drain any in-flight messages with a bounded timeout.
     let drain_deadline = Duration::from_secs(5);
     while let Ok(Some(incoming)) = timeout(drain_deadline, rx.recv()).await {
-        if state.pipelines.inbound.process(incoming).await.is_none() {
-            warn!("Drain: inbound pipeline absorbed a message (routing returned None)");
+        match state.pipelines.inbound.process_detailed(incoming).await {
+            crate::inbound::InboundProcessOutcome::Routed(_)
+            | crate::inbound::InboundProcessOutcome::Absorbed => {}
+            crate::inbound::InboundProcessOutcome::Denied { agent_id, message } => {
+                announce_denied(&state, &agent_id, &message).await;
+            }
+            other => {
+                warn!("Drain: inbound pipeline did not route a message: {other:?}");
+            }
         }
     }
     info!("Inbound entry worker stopped");
@@ -148,6 +158,70 @@ pub(crate) async fn answer_pending_prompt(
     send_prompt_reply(state, reply_channel, conversation_id, confirmation).await;
     info!("Resolved prompt {} from a channel answer", prompt.id);
     true
+}
+
+/// Tell the sender that the agent they reached is not one they may use.
+///
+/// Shared by both inbound paths: a message that bypasses the debouncer comes
+/// back to `process_inbound_entries` as a `Denied` outcome, while a debounced
+/// one is flushed inside the pipeline and arrives through the denial channel.
+/// Both have to produce the same sentence.
+async fn announce_denied(
+    state: &Arc<GatewayState>,
+    agent_id: &str,
+    message: &crate::channels::IncomingMessage,
+) {
+    info!(
+        "Refused agent '{}' for user {} on channel {:?}",
+        agent_id,
+        message.user_id.0,
+        message.channel_key()
+    );
+    // Only a real external user can be told anything; an internal message that
+    // somehow reached here is simply dropped.
+    if !message.provenance.is_external() {
+        return;
+    }
+    let Some(channel) = message.channel_key().map(str::to_string) else {
+        return;
+    };
+    send_prompt_reply(
+        state,
+        channel,
+        Some(message.conversation_id.0.clone()),
+        format!("🔒 You're not authorized to use the agent \"{agent_id}\"."),
+    )
+    .await;
+}
+
+/// Worker that answers refusals the inbound pipeline found on the debounced
+/// path.
+///
+/// The pipeline flushes debounced batches itself, so the caller that enqueued
+/// the message never sees an outcome for it — without this worker a refusal
+/// there would be indistinguishable from the bot being broken.
+pub(crate) async fn process_denied_messages(
+    state: Arc<GatewayState>,
+    mut rx: mpsc::Receiver<crate::inbound::DeniedMessage>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Denied message worker received shutdown signal");
+                break;
+            }
+            Some(denied) = rx.recv() => {
+                announce_denied(&state, &denied.agent_id, &denied.message).await;
+            }
+        }
+    }
+
+    let drain_deadline = Duration::from_secs(5);
+    while let Ok(Some(denied)) = timeout(drain_deadline, rx.recv()).await {
+        announce_denied(&state, &denied.agent_id, &denied.message).await;
+    }
+    info!("Denied message worker stopped");
 }
 
 /// Post a short status line back to the channel a prompt was answered from.

@@ -183,8 +183,22 @@ pub(super) async fn handle_sessions_create(
     }
 
     // Bind the session to the requested agent so future messages route there.
+    // Checked against this caller first: a session bound to an agent they may
+    // not use would sit in their list and accept their messages until the
+    // router refused them one at a time.
     if let Some(agent_id) = params.agent_id {
         if !agent_id.is_empty() {
+            if !state.agents.router.allows_principal(&agent_id, &user).await {
+                warn!(
+                    "Refusing to create session {} bound to agent '{}' for user {}",
+                    session_id, agent_id, user
+                );
+                return WsResponse::err(
+                    &req.id,
+                    "FORBIDDEN",
+                    format!("Agent '{agent_id}' is not available to this user"),
+                );
+            }
             let route = crate::inbound::RouteResult {
                 agent_id,
                 workspace_id: None,

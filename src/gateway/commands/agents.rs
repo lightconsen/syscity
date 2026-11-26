@@ -879,6 +879,28 @@ pub(super) async fn handle_focus(
 
     let session_id = conn.read().await.subscriptions.first().cloned();
     if let Some(sid) = session_id {
+        // Binding is a router decision, so the router's principal check
+        // applies here too — otherwise `/focus` would be the one surface that
+        // hands a caller an agent they may not use.
+        let principal = conn
+            .read()
+            .await
+            .user_id
+            .as_ref()
+            .map(|u| u.0.clone())
+            .unwrap_or_default();
+        if !state
+            .agents
+            .router
+            .allows_principal(target, &principal)
+            .await
+        {
+            return WsResponse::err(
+                &req.id,
+                "FORBIDDEN",
+                format!("Agent '{target}' is not available to this user"),
+            );
+        }
         let result = crate::inbound::router::RouteResult {
             agent_id: target.to_string(),
             workspace_id: None,

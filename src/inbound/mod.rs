@@ -38,7 +38,7 @@ pub use dispatch::{AutoReplyDispatch, AutoReplyDispatchConfig, DispatchResult};
 pub use media::{MediaAttachmentCache, MediaUnderstandingPipeline, MediaUnderstandingResult};
 pub use queue::{QueueMode, QueueModeResolver};
 pub use router::{
-    AgentRouter, AgentRouterConfig, BindingStore, InMemoryBindingStore, RouteResult,
+    AgentRouter, AgentRouterConfig, BindingStore, InMemoryBindingStore, RouteOutcome, RouteResult,
     SqliteBindingStore,
 };
 
@@ -74,6 +74,22 @@ pub trait InboundPipeline: Send + Sync {
     /// (e.g., debounced, filtered, or queued for later).
     async fn process(&self, message: IncomingMessage) -> Option<RoutedMessage>;
 
+    /// Process a message, keeping the reason it did not produce a turn.
+    ///
+    /// `process` collapses every non-routing result into `None`, which is fine
+    /// for a caller that only wants the routed message. The dispatch worker
+    /// needs the difference: a message refused for its sender's principal has
+    /// to be answered, while a debounced one must stay quiet.
+    ///
+    /// The default keeps any implementation that cannot distinguish the cases
+    /// behaving exactly as `process` did.
+    async fn process_detailed(&self, message: IncomingMessage) -> InboundProcessOutcome {
+        match self.process(message).await {
+            Some(routed) => InboundProcessOutcome::Routed(Box::new(routed)),
+            None => InboundProcessOutcome::Absorbed,
+        }
+    }
+
     /// Flush all pending messages for a given key.
     ///
     /// Used at shutdown or when an explicit flush is needed.
@@ -103,6 +119,17 @@ pub enum InboundProcessOutcome {
         /// String representation of the error.
         error: String,
     },
+    /// The router refused the agent this message resolved to: the sender is
+    /// not an allowed principal for it.
+    ///
+    /// Distinct from [`Self::Suppressed`] because the sender must be told; a
+    /// silent drop would look like the bot being broken.
+    Denied {
+        /// The agent the message was refused.
+        agent_id: String,
+        /// The incoming message, so the caller can reply in place.
+        message: Box<IncomingMessage>,
+    },
 }
 
 impl InboundProcessOutcome {
@@ -117,6 +144,33 @@ impl InboundProcessOutcome {
             _ => None,
         }
     }
+}
+
+/// Build the outcome for a message the router refused.
+///
+/// The stage records which agent it refused; the incoming message travels with
+/// the outcome so the caller can answer the sender in the same conversation.
+fn denied_outcome(ctx: InboundContext) -> InboundProcessOutcome {
+    let InboundContext { message, denied_agent, .. } = ctx;
+    InboundProcessOutcome::Denied {
+        agent_id: denied_agent.unwrap_or_default(),
+        message: Box::new(message),
+    }
+}
+
+/// A message the router refused, surfaced from the debounced path.
+///
+/// A message that goes through the debouncer is flushed by the pipeline's own
+/// background loop, so there is no caller left holding an
+/// [`InboundProcessOutcome`] to inspect. The pipeline hands the refusal to the
+/// sink instead, and the gateway — which is the only layer that can reach a
+/// channel — answers the sender.
+#[derive(Debug, Clone)]
+pub struct DeniedMessage {
+    /// The agent the message resolved to and the sender may not use.
+    pub agent_id: String,
+    /// The message, so the reply can go back to the same conversation.
+    pub message: IncomingMessage,
 }
 
 /// Default inbound pipeline implementation.
@@ -150,6 +204,9 @@ pub struct DefaultInboundPipeline {
     /// pipeline is wrapped in an [`Arc`] and [`DefaultInboundPipeline::start`]
     /// (or [`DefaultInboundPipeline::start_if_configured`]) is called.
     auto_start: bool,
+    /// Where refusals from the debounced path go, so the gateway can answer
+    /// the sender. `None` when no sink is attached (tests, embedders).
+    denied_tx: Option<mpsc::Sender<DeniedMessage>>,
 }
 
 impl DefaultInboundPipeline {
@@ -190,7 +247,19 @@ impl DefaultInboundPipeline {
             post_stages,
             started: AtomicBool::new(false),
             auto_start: false,
+            denied_tx: None,
         }
+    }
+
+    /// Attach a sink for refusals that surface from the debounced path.
+    ///
+    /// Without it, a refusal on a debounced message has nobody to tell: the
+    /// outcome of the flush belongs to the pipeline's own background loop, not
+    /// to a caller. The gateway attaches a sink and answers the sender on the
+    /// channel the message came from.
+    pub fn with_denied_sink(mut self, tx: mpsc::Sender<DeniedMessage>) -> Self {
+        self.denied_tx = Some(tx);
+        self
     }
 
     /// Configure whether the pipeline should start its background flush loop
@@ -306,6 +375,9 @@ impl DefaultInboundPipeline {
                     .and_then(|d| d.suppress_reason.clone());
                 return InboundProcessOutcome::Suppressed { reason };
             }
+            Ok(InboundStageAction::Deny) => {
+                return denied_outcome(ctx);
+            }
             Ok(InboundStageAction::Debounce) => {
                 return InboundProcessOutcome::Absorbed;
             }
@@ -341,6 +413,7 @@ impl DefaultInboundPipeline {
                     .and_then(|d| d.suppress_reason.clone());
                 InboundProcessOutcome::Suppressed { reason }
             }
+            Ok(InboundStageAction::Deny) => denied_outcome(ctx),
             Ok(InboundStageAction::Debounce) => {
                 tracing::debug!(
                     "Post-debounce Debounce action is unexpected; treating as Absorbed"
@@ -362,6 +435,10 @@ impl DefaultInboundPipeline {
     ///
     /// This helper is shared between the background flush loop and explicit
     /// flushes so both paths use exactly the same routing logic.
+    ///
+    /// A refusal found here is reported to the denial sink rather than dropped:
+    /// on this path there is no caller holding an outcome, so the sink is the
+    /// only way the sender learns why their message went unanswered.
     async fn route_one(&self, message: IncomingMessage) -> Option<RoutedMessage> {
         let mut ctx = InboundContext::new(message);
         match run_inbound_stages(&self.post_stages, &mut ctx).await {
@@ -377,6 +454,12 @@ impl DefaultInboundPipeline {
                     None
                 }
             },
+            Ok(InboundStageAction::Deny) => {
+                if let InboundProcessOutcome::Denied { agent_id, message } = denied_outcome(ctx) {
+                    self.report_denied(agent_id, *message).await;
+                }
+                None
+            }
             Ok(action) => {
                 tracing::debug!(?action, "Routing terminal action");
                 None
@@ -385,6 +468,21 @@ impl DefaultInboundPipeline {
                 warn!(stage, error = %source, "Routing stage failed");
                 None
             }
+        }
+    }
+
+    /// Hand a refusal to the denial sink, if one is attached.
+    async fn report_denied(&self, agent_id: String, message: IncomingMessage) {
+        let Some(tx) = self.denied_tx.as_ref() else {
+            warn!(
+                agent = %agent_id,
+                user = %message.user_id.0,
+                "Refused agent with no denial sink attached; the sender was not told"
+            );
+            return;
+        };
+        if let Err(e) = tx.send(DeniedMessage { agent_id, message }).await {
+            warn!(error = %e, "Failed to hand a refused message to the denial sink");
         }
     }
 
@@ -402,6 +500,10 @@ impl DefaultInboundPipeline {
 impl InboundPipeline for DefaultInboundPipeline {
     async fn process(&self, message: IncomingMessage) -> Option<RoutedMessage> {
         self.process_detailed(message).await.into_option()
+    }
+
+    async fn process_detailed(&self, message: IncomingMessage) -> InboundProcessOutcome {
+        Self::process_detailed(self, message).await
     }
 
     async fn flush(&self, key: &str) -> Vec<RoutedMessage> {

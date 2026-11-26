@@ -352,6 +352,10 @@ hourly_action_limit = 60     # 60 provider calls per hour
 mode = "plan"                 # plan, default, accept_edits, bypass
 deny = ["shell:rm -rf*"]
 ask = ["web_fetch"]
+
+# Who may reach this agent at all. An entry is a sender principal — on a channel
+# that is the platform user id as the bridge stamps it (`IncomingMessage.user_id`).
+allowed_users = ["zhangsan", "1234567890"]
 ```
 
 `allowed_tools` is an allowlist, not a deny list: an agent whose list omits
@@ -377,6 +381,33 @@ gateway had pre-approved. This is the same per-seat direction as
 Changes take effect on a running agent (`config.set agent_overrides.<id>.<field>`
 pushes the recomputed effective config and the per-agent cost limits are applied
 to the live guard) and survive restarts.
+
+`allowed_users` is the *entrance* half of per-agent isolation, and it is
+deliberately narrow in what it promises:
+
+- It gates **which agent a message may reach**, not what that agent's caller can
+  then do. Once a sender is routed to an agent, the tool surface (`allowed_tools`),
+  the permission posture (`permissions`) and the budget (`daily_limit_cents`)
+  still apply exactly as above. Use the two together: `allowed_users` decides who
+  knocks, `allowed_tools`/`permissions` decide what happens once they are in.
+- The check runs on every resolution step in the agent router — an explicit
+  `@agent` mention, a session or per-user binding, a channel default, a workspace
+  default, and the global default fallback — and it is also applied when a
+  WebSocket client sends `chat.send` or `sessions.create` with an explicit
+  `agent_id`. A refusal reaches the sender as a short "not authorized" reply on
+  the channel they wrote from.
+- An agent **absent** from the map is unrestricted: this is opt-in, and every
+  existing deployment keeps its current behaviour. An empty list or `["*"]`
+  removes the restriction if it was previously set.
+- Principals are compared as the bridge stamps them. The bridge user id is the
+  platform's own id (a Telegram numeric id, a Matrix MXID), not a display name,
+  so list the id. Under `shared_token` every WebSocket caller is the same
+  principal (`"shared"`), which makes this meaningful on channels only — a
+  per-person WS restriction needs device pairing or the tailscale/trusted-proxy
+  auth modes, where the authenticated identity is per caller.
+- It does not gate reads or approvals. `sessions.list`, `chat.history`,
+  `approvals.*` and `ask.respond` are still reachable by any connection with the
+  matching token scope; those are a separate axis.
 
 ## `[hot_reload]` — Runtime Config Changes
 

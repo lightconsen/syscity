@@ -687,6 +687,21 @@ pub(super) async fn handle_config_set(req: &WsRequest, state: &Arc<GatewayState>
             .agents
             .cost_guard
             .set_agent_limits(&agent_id, daily, hourly);
+        // Same for who may use the agent: the router is the gate, and it reads
+        // its own copy rather than the config.
+        let allowed = state
+            .config
+            .read()
+            .await
+            .agent_overrides
+            .get(&agent_id)
+            .and_then(|o| o.allowed_users.clone())
+            .unwrap_or_default();
+        state
+            .agents
+            .router
+            .set_agent_principals(&agent_id, allowed)
+            .await;
     }
     if push_default_agent {
         push_default_agent_update(state).await;

@@ -74,8 +74,34 @@ if no section matches, the release falls back to auto-generated notes.
   operator's rules ask about. Settable at runtime via
   `config.set agent_overrides.<id>.permissions`; a bad `mode` is refused rather
   than read as "inherit".
+- **Per-agent entrance authorization** — `[agent_overrides.<id>] allowed_users`.
+  The other four per-agent axes decide what an agent may do; none of them
+  decided *who may reach it*. Channel routing resolves each message to an agent
+  from an `@mention`, a session or per-user binding, a channel default or the
+  global default, and every one of those steps handed the agent to whoever
+  asked. `AgentRouter` now carries a principal allowlist per agent and checks it
+  at **every** resolution step — including the global fallback, which in a
+  single-agent deployment is the only step there is — plus the two WebSocket
+  entry points that take an explicit `agent_id` (`chat.send`,
+  `sessions.create`) and the CLI `agents focus`. Two things this deliberately
+  does not do: it does not gate reads or approvals (`sessions.list`,
+  `chat.history`, `approvals.*`, `ask.respond` remain token-scoped only), and
+  under `shared_token` every WS caller is the same principal (`"shared"`), so a
+  per-person restriction there is meaningful on channels, where the bridge
+  stamps a real platform user id. An agent absent from the list is unrestricted,
+  so existing deployments are unchanged. Settable at runtime via
+  `config.set agent_overrides.<id>.allowed_users`.
 
 ### Fixed
+
+- **A refused debounced message used to vanish.** Debounce is the normal path
+  for a plain channel message, and the pipeline flushes those batches itself —
+  so the caller that enqueued the message never sees an outcome for it, and a
+  denial found there was dropped by `route_one`'s catch-all. Only the
+  bypass-the-debouncer path (commands, interrupts) could report a refusal. The
+  pipeline now hands refusals from the debounced path to a denial channel the
+  gateway drains, and both paths share one `announce_denied` reply, so the
+  sender is told either way.
 
 - **Channel instance names now reach routing.** `init_channels` registers a
   channel default under the config **section name**, but the router looked up

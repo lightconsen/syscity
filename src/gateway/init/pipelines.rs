@@ -34,10 +34,11 @@ pub struct PipelinesInit {
 /// Initialize inbound and outbound pipelines.
 #[allow(clippy::type_complexity)]
 pub async fn init_pipelines(
-    _config: &GatewayConfig,
+    config: &GatewayConfig,
     sqlite_pool: Option<&sqlx::SqlitePool>,
     model_router: Arc<ModelRouter>,
     routed_tx: mpsc::Sender<crate::inbound::RoutedMessage>,
+    denied_tx: mpsc::Sender<crate::inbound::DeniedMessage>,
 ) -> crate::Result<PipelinesInit> {
     let agent_router = if let Some(pool) = sqlite_pool {
         let binding_store = Arc::new(
@@ -58,19 +59,29 @@ pub async fn init_pipelines(
         Arc::new(AgentRouter::new(crate::inbound::AgentRouterConfig::default()))
     };
 
+    // Who may use which agent, from `agent_overrides.<id>.allowed_users`.
+    // Seeded here (not lazily on first message) so a configured restriction
+    // holds from the first turn, exactly like the per-agent cost caps.
+    for (id, users) in config.per_agent_allowed_users() {
+        agent_router.set_agent_principals(&id, users).await;
+    }
+
     let reply_dispatcher = Arc::new(ReplyDispatcher::new(ReplyDispatchConfig::default()));
     let (debounce_flush_tx, debounce_flush_rx) = mpsc::channel(256);
     let debouncer = InboundDebouncer::new(InboundDebouncerConfig::default(), debounce_flush_tx);
 
-    let inbound_concrete = Arc::new(DefaultInboundPipeline::new(
-        debouncer.clone(),
-        MediaUnderstandingPipeline::new().with_model_router(Arc::clone(&model_router)),
-        AutoReplyDispatch::new(AutoReplyDispatchConfig::default()),
-        QueueModeResolver::new(),
-        Arc::clone(&agent_router),
-        routed_tx.clone(),
-        debounce_flush_rx,
-    ));
+    let inbound_concrete = Arc::new(
+        DefaultInboundPipeline::new(
+            debouncer.clone(),
+            MediaUnderstandingPipeline::new().with_model_router(Arc::clone(&model_router)),
+            AutoReplyDispatch::new(AutoReplyDispatchConfig::default()),
+            QueueModeResolver::new(),
+            Arc::clone(&agent_router),
+            routed_tx.clone(),
+            debounce_flush_rx,
+        )
+        .with_denied_sink(denied_tx),
+    );
     inbound_concrete.clone().start();
     let inbound_pipeline: Arc<dyn crate::inbound::InboundPipeline> = inbound_concrete;
 

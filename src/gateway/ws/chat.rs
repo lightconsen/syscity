@@ -124,13 +124,33 @@ pub(crate) async fn handle_chat_send(
     }
 
     if let Some(agent_id) = params.agent_id {
-        let route = crate::inbound::RouteResult {
-            agent_id,
-            workspace_id: None,
-            persisted_binding: false,
-            is_fallback: false,
-        };
-        state.agents.router.bind_session(&session_id, &route).await;
+        // The same gate the router applies, checked here as well: a binding
+        // written now would otherwise outlive a denial and pin this session to
+        // an agent the caller may not use.
+        if state
+            .agents
+            .router
+            .allows_principal(&agent_id, &user_id)
+            .await
+        {
+            let route = crate::inbound::RouteResult {
+                agent_id,
+                workspace_id: None,
+                persisted_binding: false,
+                is_fallback: false,
+            };
+            state.agents.router.bind_session(&session_id, &route).await;
+        } else {
+            warn!(
+                "Refusing to bind session {} to agent '{}' for user {}",
+                session_id, agent_id, user_id
+            );
+            return WsResponse::err(
+                &req.id,
+                "FORBIDDEN",
+                format!("Agent '{agent_id}' is not available to this user"),
+            );
+        }
     }
 
     // ── Smart name-based routing: "小王，xxx" -> route to secretary-xiaowang ──
@@ -148,6 +168,22 @@ pub(crate) async fn handle_chat_send(
                         "Smart-routing session {} to agent '{}' (matched name: '{}' in message)",
                         session_id, agent_id, name
                     );
+                    if !state
+                        .agents
+                        .router
+                        .allows_principal(&agent_id, &user_id)
+                        .await
+                    {
+                        warn!(
+                            "Refusing name-routed agent '{}' for user {} in session {}",
+                            agent_id, user_id, session_id
+                        );
+                        return WsResponse::err(
+                            &req.id,
+                            "FORBIDDEN",
+                            format!("Agent '{agent_id}' is not available to this user"),
+                        );
+                    }
                     let route = crate::inbound::RouteResult {
                         agent_id: agent_id.clone(),
                         workspace_id: None,

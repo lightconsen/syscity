@@ -81,6 +81,9 @@ pub enum InboundStageAction {
     Continue,
     /// Drop the message entirely (used by dispatch suppress).
     Suppress,
+    /// Drop the message and tell the sender why: the agent they named is not
+    /// one they may use.
+    Deny,
     /// Absorb into the debouncer (message will be re-emitted later).
     Debounce,
 }
@@ -108,6 +111,12 @@ pub struct InboundContext {
     pub route_result: Option<RouteResult>,
     /// Session envelope context (populated by [`EnvelopeStage`]).
     pub envelope_context: Option<SessionEnvelopeContext>,
+    /// The agent the router refused to hand this message to, if any.
+    ///
+    /// Set by [`RouterStage`] when the sender is not an allowed principal for
+    /// the agent their message resolved to. The pipeline turns it into a
+    /// reply rather than dropping the message silently.
+    pub denied_agent: Option<String>,
 }
 
 impl InboundContext {
@@ -119,6 +128,7 @@ impl InboundContext {
             queue_mode: None,
             route_result: None,
             envelope_context: None,
+            denied_agent: None,
         }
     }
 }
@@ -468,9 +478,19 @@ impl InboundStage for RouterStage {
             .dispatch_result
             .as_ref()
             .and_then(|d| d.workspace_hint.as_deref());
-        let route = self.router.route(&ctx.message, workspace_hint).await;
-        ctx.route_result = Some(route);
-        Ok(InboundStageAction::Continue)
+        match self.router.route(&ctx.message, workspace_hint).await {
+            crate::inbound::RouteOutcome::Routed(route) => {
+                ctx.route_result = Some(route);
+                Ok(InboundStageAction::Continue)
+            }
+            crate::inbound::RouteOutcome::Denied { agent_id } => {
+                // A distinct outcome from `Suppress`: the person asked for an
+                // agent they may not use, and has to be told so rather than
+                // have their message vanish.
+                ctx.denied_agent = Some(agent_id);
+                Ok(InboundStageAction::Deny)
+            }
+        }
     }
 }
 
@@ -517,7 +537,9 @@ pub async fn run_inbound_stages(
     for stage in stages {
         match stage.process(ctx).await? {
             InboundStageAction::Continue => continue,
-            action @ (InboundStageAction::Suppress | InboundStageAction::Debounce) => {
+            action @ (InboundStageAction::Suppress
+            | InboundStageAction::Deny
+            | InboundStageAction::Debounce) => {
                 tracing::debug!(stage = stage.name(), ?action, "Inbound pipeline terminal action");
                 return Ok(action);
             }

@@ -39,6 +39,33 @@ pub struct RouteResult {
     pub is_fallback: bool,
 }
 
+/// What [`AgentRouter::route`] concluded.
+///
+/// A refusal is a first-class result rather than a borrow of `Suppress`: the
+/// pipeline already uses `Suppress` for "group chat without a mention, stay
+/// quiet", and a refusal must speak — the person has to be told why their
+/// message went unanswered.
+#[derive(Debug, Clone)]
+pub enum RouteOutcome {
+    /// An agent was chosen.
+    Routed(RouteResult),
+    /// The message named (or resolved to) an agent its sender may not use.
+    Denied {
+        /// The agent that was refused, for the log line and the reply.
+        agent_id: String,
+    },
+}
+
+impl RouteOutcome {
+    /// The routed result, when there is one.
+    pub fn routed(self) -> Option<RouteResult> {
+        match self {
+            Self::Routed(result) => Some(result),
+            Self::Denied { .. } => None,
+        }
+    }
+}
+
 /// Configuration for the agent router.
 #[derive(Debug, Clone)]
 pub struct AgentRouterConfig {
@@ -261,6 +288,9 @@ pub struct AgentRouter {
     channel_defaults: RwLock<HashMap<String, (String, Option<String>)>>,
     /// workspace_id -> default_agent_id
     workspace_defaults: RwLock<HashMap<String, String>>,
+    /// agent_id -> principals allowed to use it. An agent absent from the map
+    /// is unrestricted.
+    agent_principals: RwLock<HashMap<String, Vec<String>>>,
     /// Optional persistent binding store
     binding_store: Option<Arc<dyn BindingStore>>,
     /// Optional conversation resolver for supplementary routing fallback.
@@ -278,6 +308,7 @@ impl AgentRouter {
             session_bindings: RwLock::new(HashMap::new()),
             channel_defaults: RwLock::new(HashMap::new()),
             workspace_defaults: RwLock::new(HashMap::new()),
+            agent_principals: RwLock::new(HashMap::new()),
             binding_store: None,
             conversation_resolver: None,
             auto_create_binding,
@@ -295,12 +326,14 @@ impl AgentRouter {
         let session_bindings = self.session_bindings.read().await.clone();
         let channel_defaults = self.channel_defaults.read().await.clone();
         let workspace_defaults = self.workspace_defaults.read().await.clone();
+        let agent_principals = self.agent_principals.read().await.clone();
 
         Self {
             config: self.config.clone(),
             session_bindings: RwLock::new(session_bindings),
             channel_defaults: RwLock::new(channel_defaults),
             workspace_defaults: RwLock::new(workspace_defaults),
+            agent_principals: RwLock::new(agent_principals),
             binding_store: self.binding_store.clone(),
             conversation_resolver: None,
             auto_create_binding: AtomicBool::new(self.auto_create_binding.load(Ordering::Acquire)),
@@ -351,29 +384,54 @@ impl AgentRouter {
     /// 3. Existing session binding (by derived `{channel}:{user_id}` key)
     /// 4. Channel-specific default
     /// 5. Workspace-specific default
-    /// 6. Global default agent
+    /// 6. Supplementary conversation resolver
+    /// 7. Global default agent
+    ///
+    /// Every step that produces an agent is gated by
+    /// [`Self::allows_principal`]: routing chooses *which* agent, authorization
+    /// decides whether this sender may have it. A refusal at any step returns
+    /// [`RouteOutcome::Denied`].
     pub async fn route(
         &self,
         message: &IncomingMessage,
         workspace_hint: Option<&str>,
-    ) -> RouteResult {
+    ) -> RouteOutcome {
         let session_id = message.conversation_id.0.clone();
         let content = message.content.trim();
+        let caller = message.user_id.0.as_str();
 
         // 1. Check for explicit @agent_name mention
         if let Some(mentioned) = Self::extract_agent_mention(content) {
+            // An `@mention` beats every other route, so it has to be gated
+            // here too: without the check a person in a channel bound to their
+            // own agent could type `@someone_elses_agent …` and reach it. Any
+            // agent with no principal restriction stays mentionable by anyone.
+            if !self.allows_principal(&mentioned, caller).await {
+                info!(
+                    "Refusing mention of agent '{}' by '{}' in session {}",
+                    mentioned, caller, session_id
+                );
+                return RouteOutcome::Denied { agent_id: mentioned };
+            }
             info!("Explicit agent mention: {} for session {}", mentioned, session_id);
-            return RouteResult {
+            return RouteOutcome::Routed(RouteResult {
                 agent_id: mentioned,
                 workspace_id: workspace_hint.map(String::from),
                 persisted_binding: false,
                 is_fallback: false,
-            };
+            });
         }
 
         // 2. Check existing session binding (by conversation_id)
         if let Some(result) = self.resolve_session_binding(&session_id).await {
-            return result;
+            if !self.allows_principal(&result.agent_id, caller).await {
+                info!(
+                    "Refusing bound agent '{}' for session {}: '{}' is not an allowed principal",
+                    result.agent_id, session_id, caller
+                );
+                return RouteOutcome::Denied { agent_id: result.agent_id };
+            }
+            return RouteOutcome::Routed(result);
         }
 
         // 2b. Check existing session binding by derived `{channel}:{user_id}` key.
@@ -388,11 +446,18 @@ impl AgentRouter {
             let derived_key = Self::derive_session_key(ch, user_id);
             if derived_key != session_id {
                 if let Some(result) = self.resolve_session_binding(&derived_key).await {
+                    if !self.allows_principal(&result.agent_id, caller).await {
+                        info!(
+                            "Refusing bound agent '{}' for session {}: '{}' is not an allowed principal",
+                            result.agent_id, session_id, caller
+                        );
+                        return RouteOutcome::Denied { agent_id: result.agent_id };
+                    }
                     debug!(
                         "Session {} resolved via derived key {} to agent {}",
                         session_id, derived_key, result.agent_id
                     );
-                    return result;
+                    return RouteOutcome::Routed(result);
                 }
             }
         }
@@ -400,19 +465,33 @@ impl AgentRouter {
         // 3. Check channel-specific default
         if let Some(ch) = &channel_name {
             if let Some(result) = self.resolve_channel_default(ch, &session_id).await {
+                if !self.allows_principal(&result.agent_id, caller).await {
+                    info!(
+                        "Refusing channel default agent '{}' for session {}: '{}' is not an allowed principal",
+                        result.agent_id, session_id, caller
+                    );
+                    return RouteOutcome::Denied { agent_id: result.agent_id };
+                }
                 // Pin this user to the agent that just answered them. Without
                 // this the derived-key lookup in step 2b is a lookup nobody
                 // ever fills, and a second message from the same person in a
                 // new conversation cannot be attributed to their own agent.
                 self.bind_user(ch, user_id, &result.agent_id).await;
-                return result;
+                return RouteOutcome::Routed(result);
             }
         }
 
         // 4. Check workspace-specific default
         if let Some(ws) = workspace_hint {
             if let Some(result) = self.resolve_workspace_default(ws, &session_id).await {
-                return result;
+                if !self.allows_principal(&result.agent_id, caller).await {
+                    info!(
+                        "Refusing workspace default agent '{}' for session {}: '{}' is not an allowed principal",
+                        result.agent_id, session_id, caller
+                    );
+                    return RouteOutcome::Denied { agent_id: result.agent_id };
+                }
+                return RouteOutcome::Routed(result);
             }
         }
 
@@ -425,6 +504,13 @@ impl AgentRouter {
                 crate::channels::resolver::ResolutionSource::InboundFallback
             );
             if !is_fallback {
+                if !self.allows_principal(&resolution.agent_id, caller).await {
+                    info!(
+                        "Refusing resolver agent '{}' for session {}: '{}' is not an allowed principal",
+                        resolution.agent_id, session_id, caller
+                    );
+                    return RouteOutcome::Denied { agent_id: resolution.agent_id };
+                }
                 debug!(
                     session_id,
                     agent_id = %resolution.agent_id,
@@ -438,11 +524,29 @@ impl AgentRouter {
                     is_fallback: false,
                 };
                 result.persisted_binding = self.bind_session(&session_id, &result).await;
-                return result;
+                return RouteOutcome::Routed(result);
             }
         }
 
         // 5. Fall back to global default
+        //
+        // Gated like every other route. Falling through to the default is the
+        // *common* path in a single-agent deployment, so leaving it open would
+        // make `allowed_users` on the default agent decorative: any stranger
+        // whose message matched no binding (which is everyone, at first) would
+        // reach the very agent the restriction is meant to close.
+        if !self
+            .allows_principal(&self.config.default_agent_id, caller)
+            .await
+        {
+            info!(
+                "Refusing default agent '{}' for session {}: '{}' is not an allowed principal",
+                self.config.default_agent_id, session_id, caller
+            );
+            return RouteOutcome::Denied {
+                agent_id: self.config.default_agent_id.clone(),
+            };
+        }
         debug!(
             "No binding found for session {}, using default agent {}",
             session_id, self.config.default_agent_id
@@ -454,7 +558,7 @@ impl AgentRouter {
             is_fallback: true,
         };
         result.persisted_binding = self.bind_session(&session_id, &result).await;
-        result
+        RouteOutcome::Routed(result)
     }
 
     /// Look up a session binding by key (session_id or derived key).
@@ -603,6 +707,39 @@ impl AgentRouter {
         defaults.insert(workspace_id.to_string(), agent_id);
     }
 
+    /// Restrict an agent to a set of principals.
+    ///
+    /// This is **use** authorization, not authentication: the caller's id
+    /// comes from whatever the channel established (a Telegram user id, an
+    /// iMessage handle, or the gateway's single identity under a shared
+    /// token). An empty list removes the restriction — the agent is then
+    /// usable by anyone who can reach the gateway, exactly as before this
+    /// existed. `"*"` is the explicit spelling of the same thing.
+    pub async fn set_agent_principals(&self, agent_id: &str, principals: Vec<String>) {
+        let mut map = self.agent_principals.write().await;
+        if principals.is_empty() || principals.iter().any(|p| p == "*") {
+            map.remove(agent_id);
+        } else {
+            map.insert(agent_id.to_string(), principals);
+        }
+    }
+
+    /// Whether `principal` may use `agent_id`.
+    ///
+    /// An agent with no configured list is unrestricted, which is what keeps
+    /// every existing deployment working unchanged.
+    ///
+    /// Public so the WebSocket surfaces can ask before binding a session:
+    /// `route` refuses a disallowed caller, but a binding written ahead of that
+    /// would keep a denied caller pinned to someone else's agent.
+    pub async fn allows_principal(&self, agent_id: &str, principal: &str) -> bool {
+        let map = self.agent_principals.read().await;
+        match map.get(agent_id) {
+            None => true,
+            Some(allowed) => allowed.iter().any(|p| p == principal),
+        }
+    }
+
     /// Bind a user on a channel to an agent, for every session they open.
     ///
     /// This is what makes "one agent per human employee" hold in a deployment
@@ -721,7 +858,7 @@ mod tests {
     async fn test_default_route() {
         let router = AgentRouter::new(AgentRouterConfig::default());
         let msg = IncomingMessage::new("u1", "s1", "hello");
-        let route = router.route(&msg, None).await;
+        let route = router.route(&msg, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "default");
         assert!(route.persisted_binding);
         assert!(route.is_fallback);
@@ -731,7 +868,7 @@ mod tests {
     async fn test_explicit_mention() {
         let router = AgentRouter::new(AgentRouterConfig::default());
         let msg = IncomingMessage::new("u1", "s1", "@coder write some rust");
-        let route = router.route(&msg, None).await;
+        let route = router.route(&msg, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "coder");
         assert!(!route.persisted_binding);
     }
@@ -740,7 +877,7 @@ mod tests {
     async fn test_explicit_mention_not_at_start() {
         let router = AgentRouter::new(AgentRouterConfig::default());
         let msg = IncomingMessage::new("u1", "s1", "hi @coder can you help");
-        let route = router.route(&msg, None).await;
+        let route = router.route(&msg, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "coder");
         assert!(!route.persisted_binding);
     }
@@ -749,7 +886,7 @@ mod tests {
     async fn test_explicit_mention_with_punctuation() {
         let router = AgentRouter::new(AgentRouterConfig::default());
         let msg = IncomingMessage::new("u1", "s1", "@coder, please review");
-        let route = router.route(&msg, None).await;
+        let route = router.route(&msg, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "coder");
         assert!(!route.persisted_binding);
     }
@@ -760,12 +897,12 @@ mod tests {
         let msg = IncomingMessage::new("u1", "s1", "hello");
 
         // First message creates binding
-        let route1 = router.route(&msg, None).await;
+        let route1 = router.route(&msg, None).await.routed().expect("routed");
         assert!(route1.persisted_binding);
 
         // Second message uses existing binding
         let msg2 = IncomingMessage::new("u1", "s1", "again");
-        let route2 = router.route(&msg2, None).await;
+        let route2 = router.route(&msg2, None).await.routed().expect("routed");
         assert!(!route2.persisted_binding);
         assert!(!route2.is_fallback);
         assert_eq!(route2.agent_id, route1.agent_id);
@@ -779,7 +916,11 @@ mod tests {
             .await;
 
         let msg = IncomingMessage::new("u1", "s1", "hello");
-        let route = router.route(&msg, Some("dev")).await;
+        let route = router
+            .route(&msg, Some("dev"))
+            .await
+            .routed()
+            .expect("routed");
         assert_eq!(route.agent_id, "coder");
         assert_eq!(route.workspace_id, Some("dev".to_string()));
     }
@@ -789,11 +930,11 @@ mod tests {
         let router = AgentRouter::new(AgentRouterConfig::default());
         let msg = IncomingMessage::new("u1", "s1", "hello");
 
-        let _route1 = router.route(&msg, None).await;
+        let _route1 = router.route(&msg, None).await.routed().expect("routed");
         router.unbind_session("s1").await;
 
         let msg2 = IncomingMessage::new("u1", "s1", "again");
-        let route2 = router.route(&msg2, None).await;
+        let route2 = router.route(&msg2, None).await.routed().expect("routed");
         // After unbind, a new binding is created (may be different agent)
         assert!(route2.persisted_binding);
     }
@@ -806,7 +947,7 @@ mod tests {
         });
         let msg = IncomingMessage::new("u1", "s1", "hello");
 
-        let route = router.route(&msg, None).await;
+        let route = router.route(&msg, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "default");
         assert!(!route.persisted_binding);
         assert!(route.is_fallback);
@@ -892,8 +1033,24 @@ mod tests {
             })
             .with_channel_instance("tg_bob");
 
-        assert_eq!(router.route(&from_alice, None).await.agent_id, "alice");
-        assert_eq!(router.route(&from_bob, None).await.agent_id, "bob");
+        assert_eq!(
+            router
+                .route(&from_alice, None)
+                .await
+                .routed()
+                .expect("routed")
+                .agent_id,
+            "alice"
+        );
+        assert_eq!(
+            router
+                .route(&from_bob, None)
+                .await
+                .routed()
+                .expect("routed")
+                .agent_id,
+            "bob"
+        );
     }
 
     /// Without an instance, the channel *type* is still the lookup key, so a
@@ -910,7 +1067,15 @@ mod tests {
                 channel: "telegram".to_string(),
                 is_direct: true,
             });
-        assert_eq!(router.route(&msg, None).await.agent_id, "tg-agent");
+        assert_eq!(
+            router
+                .route(&msg, None)
+                .await
+                .routed()
+                .expect("routed")
+                .agent_id,
+            "tg-agent"
+        );
     }
 
     /// The channel default pins the sender, so their *next* conversation on the
@@ -928,7 +1093,15 @@ mod tests {
                 is_direct: true,
             })
             .with_channel_instance("tg_alice");
-        assert_eq!(router.route(&first, None).await.agent_id, "alice");
+        assert_eq!(
+            router
+                .route(&first, None)
+                .await
+                .routed()
+                .expect("routed")
+                .agent_id,
+            "alice"
+        );
         assert!(router.has_user_binding("tg_alice", "u-alice").await);
 
         let second = IncomingMessage::new("u-alice", "s-2", "again")
@@ -938,7 +1111,7 @@ mod tests {
             })
             .with_channel_instance("tg_alice");
         // Derived-key hit: not a fallback, and still alice's agent.
-        let route = router.route(&second, None).await;
+        let route = router.route(&second, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "alice");
         assert!(!route.is_fallback);
     }
@@ -955,7 +1128,7 @@ mod tests {
                 is_direct: true,
             })
             .with_channel_instance("tg_bob");
-        let route = router.route(&msg, None).await;
+        let route = router.route(&msg, None).await.routed().expect("routed");
         assert_eq!(route.agent_id, "bob");
         assert!(!route.is_fallback);
     }
@@ -982,5 +1155,192 @@ mod tests {
         assert_eq!(AgentRouter::split_session_key("conversation-shaped"), None);
         assert_eq!(AgentRouter::split_session_key(":u1"), None);
         assert_eq!(AgentRouter::split_session_key("tg:"), None);
+    }
+
+    // ── Who may use an agent ─────────────────────────────────────────────
+
+    /// The message that reaches a channel's default agent, from `user` on the
+    /// channel instance `channel`.
+    fn on_channel(user: &str, session: &str, channel: &str) -> IncomingMessage {
+        IncomingMessage::new(user, session, "hi")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance(channel)
+    }
+
+    /// An unconfigured agent is usable by anyone — the behaviour every
+    /// existing deployment relies on.
+    #[tokio::test]
+    async fn an_agent_with_no_principal_list_is_open() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_channel_default("tg_alice", "alice".to_string(), None)
+            .await;
+
+        let route = router
+            .route(&on_channel("whoever", "s1", "tg_alice"), None)
+            .await
+            .routed()
+            .expect("an unrestricted agent routes");
+        assert_eq!(route.agent_id, "alice");
+    }
+
+    /// The channel default is the first gate: a stranger on someone's channel
+    /// is refused rather than handed that person's agent.
+    #[tokio::test]
+    async fn a_stranger_is_refused_the_channel_default() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_channel_default("tg_alice", "alice".to_string(), None)
+            .await;
+        router
+            .set_agent_principals("alice", vec!["u-alice".to_string()])
+            .await;
+
+        assert!(matches!(
+            router.route(&on_channel("u-stranger", "s2", "tg_alice"), None).await,
+            RouteOutcome::Denied { ref agent_id } if agent_id == "alice"
+        ));
+
+        let route = router
+            .route(&on_channel("u-alice", "s1", "tg_alice"), None)
+            .await
+            .routed()
+            .expect("the allowed principal routes");
+        assert_eq!(route.agent_id, "alice");
+    }
+
+    /// The global fallback is a route like any other. In a single-agent
+    /// deployment it is the *only* route, so it must be gated: otherwise a
+    /// restriction on the default agent would be the one restriction no
+    /// stranger ever meets.
+    #[tokio::test]
+    async fn the_global_default_fallback_is_gated() {
+        let router = AgentRouter::new(AgentRouterConfig {
+            default_agent_id: "solo".into(),
+            ..Default::default()
+        });
+        router
+            .set_agent_principals("solo", vec!["u-owner".to_string()])
+            .await;
+
+        // No binding of any kind exists, so this falls all the way through.
+        assert!(matches!(
+            router.route(&on_channel("u-stranger", "s2", "tg_chan"), None).await,
+            RouteOutcome::Denied { ref agent_id } if agent_id == "solo"
+        ));
+
+        let route = router
+            .route(&on_channel("u-owner", "s1", "tg_chan"), None)
+            .await
+            .routed()
+            .expect("the owner routes");
+        assert_eq!(route.agent_id, "solo");
+    }
+
+    /// The `@mention` path beats every other route, so it needs the same gate:
+    /// without it a person in a channel bound to their own agent could type
+    /// `@someone_elses_agent …` and reach it.
+    #[tokio::test]
+    async fn an_agent_mention_is_gated_too() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_agent_principals("bob", vec!["u-bob".to_string()])
+            .await;
+
+        let intrusion = IncomingMessage::new("u-alice", "s1", "@bob please help")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_alice");
+        assert!(matches!(
+            router.route(&intrusion, None).await,
+            RouteOutcome::Denied { ref agent_id } if agent_id == "bob"
+        ));
+
+        let allowed = IncomingMessage::new("u-bob", "s2", "@bob please help")
+            .with_provenance(InputProvenance::ExternalUser {
+                channel: "telegram".to_string(),
+                is_direct: true,
+            })
+            .with_channel_instance("tg_bob");
+        assert_eq!(
+            router
+                .route(&allowed, None)
+                .await
+                .routed()
+                .expect("bob may reach bob")
+                .agent_id,
+            "bob"
+        );
+    }
+
+    /// A binding from an earlier, unrestricted configuration must not become a
+    /// permanent way in: the derived-key lookup is gated like the rest.
+    #[tokio::test]
+    async fn a_bound_agent_is_rechecked_against_the_caller() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router.bind_user("tg_alice", "u-alice", "alice").await;
+        router
+            .set_agent_principals("alice", vec!["u-alice".to_string()])
+            .await;
+
+        // Someone else on the same channel instance inherits the derived key
+        // only if the key is theirs; it is not, so they fall through to the
+        // global default rather than to alice's agent.
+        let other = router
+            .route(&on_channel("u-bob", "s9", "tg_alice"), None)
+            .await
+            .routed()
+            .expect("falls back to the global default");
+        assert_eq!(other.agent_id, AgentRouterConfig::default().default_agent_id);
+        assert!(other.is_fallback);
+
+        // The owner still resolves through the binding.
+        let owner = router
+            .route(&on_channel("u-alice", "s10", "tg_alice"), None)
+            .await
+            .routed()
+            .expect("the owner routes");
+        assert_eq!(owner.agent_id, "alice");
+    }
+
+    /// An empty list (or `"*"`) lifts the restriction rather than locking the
+    /// agent away from everyone.
+    #[tokio::test]
+    async fn an_empty_or_wildcard_list_removes_the_restriction() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_channel_default("tg_alice", "alice".to_string(), None)
+            .await;
+
+        router.set_agent_principals("alice", vec![]).await;
+        assert!(router.allows_principal("alice", "anyone").await);
+
+        router
+            .set_agent_principals("alice", vec!["u-alice".to_string()])
+            .await;
+        assert!(!router.allows_principal("alice", "anyone").await);
+
+        router
+            .set_agent_principals("alice", vec!["*".to_string()])
+            .await;
+        assert!(router.allows_principal("alice", "anyone").await);
+    }
+
+    /// A clone carries the restrictions, so a router copied for a test or a
+    /// secondary pipeline does not silently lose its gates.
+    #[tokio::test]
+    async fn a_clone_keeps_the_principal_restrictions() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router
+            .set_agent_principals("alice", vec!["u-alice".to_string()])
+            .await;
+        let clone = router.deep_clone().await;
+        assert!(clone.allows_principal("alice", "u-alice").await);
+        assert!(!clone.allows_principal("alice", "u-bob").await);
     }
 }

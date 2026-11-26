@@ -662,6 +662,24 @@ pub struct AgentOverrides {
     /// deny = ["shell:rm -rf*"]
     /// ```
     pub permissions: Option<crate::tools::AgentPermissions>,
+    /// Who may *use* this agent, by the user id their channel established.
+    ///
+    /// Use authorization, not authentication: it decides which messages reach
+    /// this agent, after the channel has already decided who the sender is.
+    /// Unset (or containing `"*"`) means anyone who can reach the gateway may
+    /// use the agent — the behaviour before this existed.
+    ///
+    /// ```toml
+    /// [agent_overrides."agent-zhangsan"]
+    /// allowed_users = ["zhangsan"]
+    /// ```
+    ///
+    /// The id must match what the channel reports: a Telegram numeric user id,
+    /// an iMessage handle, or `"shared"` / `"tailscale"` for the gateway's own
+    /// single-identity modes. Under `shared_token` every caller resolves to
+    /// `"shared"`, so a per-agent list there cannot distinguish people — use
+    /// device pairing or channel ids if that matters.
+    pub allowed_users: Option<Vec<String>>,
 }
 
 impl AgentOverrides {
@@ -678,6 +696,7 @@ impl AgentOverrides {
             && self.daily_limit_cents.is_none()
             && self.hourly_action_limit.is_none()
             && self.permissions.is_none()
+            && self.allowed_users.is_none()
     }
 
     /// Overlay every non-`None` field onto a base `AgentConfig`.
@@ -2079,6 +2098,20 @@ impl GatewayConfig {
             .collect()
     }
 
+    /// Every `agent_overrides` entry that restricts who may use the agent.
+    ///
+    /// Mirrors [`Self::per_agent_cost_limits`]: the router is seeded from this
+    /// at startup so a configured list holds before anyone has sent a message.
+    pub fn per_agent_allowed_users(&self) -> Vec<(String, Vec<String>)> {
+        self.agent_overrides
+            .iter()
+            .filter_map(|(id, o)| {
+                let list = o.allowed_users.as_ref().filter(|l| !l.is_empty())?;
+                Some((id.clone(), list.clone()))
+            })
+            .collect()
+    }
+
     /// Apply a single per-agent override field from a `config.set` JSON value.
     ///
     /// `field` is the final path segment (e.g. `"temperature"`). A `Null`
@@ -2104,6 +2137,26 @@ impl GatewayConfig {
         // dropped by the empty-entry cleanup at the end on their error path.)
         let parsed_permissions = if field == "permissions" && !value.is_null() {
             Some(parse_agent_permissions(value).map_err(invalid)?)
+        } else {
+            None
+        };
+
+        // `allowed_users` is parsed up front for the same reason: a refused
+        // value must not leave a phantom empty entry behind, and the `?` inside
+        // the arm below would return past the empty-entry cleanup.
+        let parsed_allowed_users = if field == "allowed_users" && !value.is_null() {
+            Some(
+                value
+                    .as_array()
+                    .ok_or_else(|| invalid("allowed_users must be an array of strings".into()))?
+                    .iter()
+                    .map(|item| {
+                        item.as_str().map(str::to_string).ok_or_else(|| {
+                            invalid("allowed_users must be an array of strings".into())
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<String>, ConfigError>>()?,
+            )
         } else {
             None
         };
@@ -2308,6 +2361,40 @@ impl GatewayConfig {
                     let c = overrides.permissions.as_ref() != Some(&v);
                     overrides.permissions = Some(v);
                     c
+                }
+            }
+            "allowed_users" => {
+                // Null or `[]` lifts the restriction — the agent becomes
+                // usable by anyone who can reach the gateway, as before this
+                // existed. `["*"]` says the same thing explicitly. An empty
+                // list is far likelier to be a caller clearing the field than
+                // an intentional lockout, and the two would be indistinguishable
+                // in `config.get`.
+                if value.is_null() {
+                    let c = overrides.allowed_users.is_some();
+                    overrides.allowed_users = None;
+                    c
+                } else {
+                    // Parsed and validated before the entry existed; this is
+                    // only the store step.
+                    let v = match parsed_allowed_users {
+                        Some(v) => v,
+                        // Unreachable: parsed up front for this branch.
+                        None => {
+                            return Err(crate::SyscityError::Config(invalid(
+                                "allowed_users must be an array of strings".into(),
+                            )))
+                        }
+                    };
+                    if v.is_empty() {
+                        let c = overrides.allowed_users.is_some();
+                        overrides.allowed_users = None;
+                        c
+                    } else {
+                        let c = overrides.allowed_users.as_ref() != Some(&v);
+                        overrides.allowed_users = Some(v);
+                        c
+                    }
                 }
             }
             other => {
@@ -2763,6 +2850,103 @@ shared_token = "abc"
         assert_eq!(perms.mode, Some(crate::tools::PermissionMode::Plan));
         assert_eq!(perms.deny, vec!["shell:rm -rf*".to_string()]);
         assert!(perms.ask.is_empty());
+    }
+
+    #[test]
+    fn allowed_users_override_round_trips_and_clears() {
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .apply_agent_override_field(
+                "zhangsan",
+                "allowed_users",
+                &serde_json::json!(["zhangsan", "u-42"])
+            )
+            .unwrap());
+        assert_eq!(
+            config
+                .agent_overrides
+                .get("zhangsan")
+                .unwrap()
+                .allowed_users,
+            Some(vec!["zhangsan".to_string(), "u-42".to_string()])
+        );
+        assert_eq!(
+            config.per_agent_allowed_users(),
+            vec![("zhangsan".to_string(), vec!["zhangsan".to_string(), "u-42".to_string()])]
+        );
+
+        // Same list again is no change; a different one is.
+        assert!(!config
+            .apply_agent_override_field(
+                "zhangsan",
+                "allowed_users",
+                &serde_json::json!(["zhangsan", "u-42"])
+            )
+            .unwrap());
+        assert!(config
+            .apply_agent_override_field("zhangsan", "allowed_users", &serde_json::json!(["u-42"]))
+            .unwrap());
+
+        // `[]` and null both lift the restriction, and the entry is dropped
+        // rather than lingering as an empty table.
+        assert!(config
+            .apply_agent_override_field("zhangsan", "allowed_users", &serde_json::json!([]))
+            .unwrap());
+        assert!(!config.agent_overrides.contains_key("zhangsan"));
+        assert!(config.per_agent_allowed_users().is_empty());
+
+        config
+            .apply_agent_override_field("lisi", "allowed_users", &serde_json::json!(["u-7"]))
+            .unwrap();
+        assert!(config
+            .apply_agent_override_field("lisi", "allowed_users", &serde_json::Value::Null)
+            .unwrap());
+        assert!(!config.agent_overrides.contains_key("lisi"));
+    }
+
+    /// A malformed list is refused, not silently treated as "unrestricted" —
+    /// a typo must not open an agent to everyone.
+    #[test]
+    fn allowed_users_override_rejects_junk() {
+        let mut config = GatewayConfig::default();
+        for bad in [
+            serde_json::json!("zhangsan"),
+            serde_json::json!(42),
+            serde_json::json!([1, 2]),
+            serde_json::json!({ "who": "zhangsan" }),
+        ] {
+            assert!(
+                config
+                    .apply_agent_override_field("zhangsan", "allowed_users", &bad)
+                    .is_err(),
+                "{bad} must be refused"
+            );
+            assert!(
+                !config.agent_overrides.contains_key("zhangsan"),
+                "a refused value must not leave an entry behind ({bad})"
+            );
+        }
+    }
+
+    /// An agent with no `allowed_users` never appears in the seed list, so the
+    /// router keeps treating it as unrestricted.
+    #[test]
+    fn per_agent_allowed_users_skips_unrestricted_and_empty_listings() {
+        let mut config = GatewayConfig::default();
+        config
+            .agent_overrides
+            .entry("free".to_string())
+            .or_default();
+        config
+            .apply_agent_override_field("empty", "allowed_users", &serde_json::json!(["x"]))
+            .unwrap();
+        config
+            .agent_overrides
+            .get_mut("empty")
+            .unwrap()
+            .allowed_users = Some(Vec::new());
+
+        assert!(config.per_agent_allowed_users().is_empty());
     }
 
     /// A narrowing is narrow-only, so it must not be possible to write an
