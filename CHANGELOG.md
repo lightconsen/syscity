@@ -11,6 +11,24 @@ if no section matches, the release falls back to auto-generated notes.
 
 ## [Unreleased]
 
+### Security
+
+- **`glob` 11 → 14 and `minimatch` 10 → 11 in the web workspace, past two
+  advisories.** `vite-plugin-pwa → workbox-build → glob@11.1.0` carried
+  GHSA-3g3m-2fjr-6pw4 (an `AbortSignal` cancellation bypass that lets a glob
+  keep walking the filesystem past its timeout, fixed in glob 14.0.2) and
+  GHSA-g3hv-75wg-m249 (globparts amplification in `minimatch`, fixed in 11.0.1).
+  `workbox-build` declares `glob: ^11`, so neither fix is reachable by a normal
+  update — the override moves `glob@11` to `^14.0.6`, which drags `minimatch` to
+  11 with it. Both are build-time only and run on our own tree, not an
+  attacker's, but the audit gate reported them on every run.
+  Verified behaviour-neutral before committing: `workbox-build` touches glob
+  only through `globSync(pattern, {cwd, follow, ignore})`, all of which glob 14
+  still accepts, and the built `dist/sw.js` is **byte-identical** under glob 11
+  and glob 14 — 348 precache entries, same URL and same revision for every one.
+  Drop the override when `workbox-build` accepts glob 14 (7.4.1 is the current
+  release, so this is upstream's move to make, not one to re-do here).
+
 ## [0.3.23] - 2026-11-26
 
 ### Added
