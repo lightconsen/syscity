@@ -13,6 +13,24 @@ pub(super) async fn handle_sessions_list(
     // fact) means the row count and the paging stay right; a post-filter would
     // silently return short pages.
     let agent_filter = ctx.bound_agent();
+    // An unbound caller sees only the conversations attributed to them. A
+    // surfaced list of someone else's session is worse than the agent case: the
+    // row carries their history, and every click on it would then be refused
+    // one session at a time. A single-identity deployment records no owner
+    // (`shared` / `anonymous` are not people), so nothing matches and the
+    // filter is skipped — its listing stays exactly what it was.
+    let has_personal_identity = {
+        let id = ctx.user_id();
+        !id.is_empty()
+            && !crate::memory::SHARED_IDENTITIES
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(id))
+    };
+    let user_filter = if agent_filter.is_none() && has_personal_identity {
+        Some(ctx.user_id())
+    } else {
+        None
+    };
     // The mode a session actually runs in: a per-session override when one was
     // set (see `sessions.set_mode`), otherwise the configured default. The
     // composer's mode picker reads it from here so a client that just
@@ -30,7 +48,10 @@ pub(super) async fn handle_sessions_list(
     // record. A client that reloaded mid-turn has nothing local to go on.
     let running = state.agents.running_sessions().await;
     let sessions: Vec<serde_json::Value> = if let Some(ref store) = state.agents.store {
-        match store.find_sessions(agent_filter, None, None, false).await {
+        match store
+            .find_sessions_for_user(agent_filter, None, None, false, user_filter)
+            .await
+        {
             Ok(rows) => rows
                 .into_iter()
                 .map(|meta| {
@@ -52,6 +73,7 @@ pub(super) async fn handle_sessions_list(
                         "is_active": meta.is_active,
                         "pinned": meta.pinned,
                         "model": meta.model,
+                        "user_id": meta.user_id,
                         "permission_mode": permission_mode,
                         "running": running.contains(&meta.session_id),
                         "created_at": meta.created_at.to_rfc3339(),
@@ -194,6 +216,23 @@ pub(super) async fn handle_sessions_create(
         .clone()
         .or_else(|| ctx.bound_agent().map(str::to_string));
 
+    // Authorize before anything is written. Refusing after the record exists
+    // leaves a session in the caller's list that the router will then reject
+    // on every message — and, worse, one they could see and try to use.
+    if let Some(agent_id) = requested_agent.as_deref() {
+        if !agent_id.is_empty() && !state.agents.router.allows_principal(agent_id, &user).await {
+            warn!(
+                "Refusing to create session {} bound to agent '{}' for user {}",
+                session_id, agent_id, user
+            );
+            return WsResponse::err(
+                &req.id,
+                "FORBIDDEN",
+                format!("Agent '{agent_id}' is not available to this user"),
+            );
+        }
+    }
+
     {
         let mut mgr = state.agents.manager.write().await;
         mgr.create_session(session_id.clone());
@@ -204,7 +243,8 @@ pub(super) async fn handle_sessions_create(
         requested_agent.as_deref().unwrap_or(""),
         &channel,
         &user,
-    );
+    )
+    .with_user_id(Some(&user));
     metadata.bound_agent_id = requested_agent.clone();
 
     if let Some(ref store) = state.agents.store {
@@ -214,22 +254,8 @@ pub(super) async fn handle_sessions_create(
     }
 
     // Bind the session to the requested agent so future messages route there.
-    // Checked against this caller first: a session bound to an agent they may
-    // not use would sit in their list and accept their messages until the
-    // router refused them one at a time.
     if let Some(agent_id) = requested_agent {
         if !agent_id.is_empty() {
-            if !state.agents.router.allows_principal(&agent_id, &user).await {
-                warn!(
-                    "Refusing to create session {} bound to agent '{}' for user {}",
-                    session_id, agent_id, user
-                );
-                return WsResponse::err(
-                    &req.id,
-                    "FORBIDDEN",
-                    format!("Agent '{agent_id}' is not available to this user"),
-                );
-            }
             let route = crate::inbound::RouteResult {
                 agent_id,
                 workspace_id: None,
@@ -1638,6 +1664,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_refused_for_another_persons_agent_leaves_nothing_behind() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        state
+            .agents
+            .router
+            .set_agent_principals("bob-bot", vec!["bob".to_string()])
+            .await;
+        let conn = make_test_conn(&["write"]);
+        let alice = crate::security::request_context::RequestContext::new(
+            "alice",
+            crate::security::request_context::AuthSource::Session,
+        );
+
+        let res = handle_sessions_create(
+            &req(
+                "c",
+                "sessions.create",
+                serde_json::json!({ "session_id": "hijack", "agent_id": "bob-bot" }),
+            ),
+            &conn,
+            &state,
+            &alice,
+        )
+        .await;
+        assert!(!res.ok, "creating on bob's agent must be refused: {res:?}");
+        assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("FORBIDDEN"));
+
+        // The refusal must come before the write: a session row left behind
+        // would sit in alice's list and refuse every message she sends to it.
+        let store = state.agents.store.as_ref().unwrap();
+        assert!(
+            store.load_session("hijack").await.unwrap().is_none(),
+            "a refused session must not be persisted"
+        );
+        assert!(
+            !state
+                .agents
+                .manager
+                .read()
+                .await
+                .get_session("hijack")
+                .is_some(),
+            "a refused session must not be registered with the session manager"
+        );
+    }
+
+    #[tokio::test]
     async fn create_without_id_derives_from_channel_and_user() {
         let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
         // Test conn has no client/user, so the id is "ws:anonymous".
@@ -1790,6 +1863,127 @@ mod tests {
             vec!["ws:alice".to_string()],
             "the bound agent sees its own binding and nothing a substring match would catch"
         );
+    }
+
+    /// A caller with a per-user identity sees only the conversations attributed
+    /// to them. A session belongs to the person whose history it carries, and
+    /// every click into someone else's is one refused action at a time.
+    #[tokio::test]
+    async fn sessions_list_filters_by_the_callers_user() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.agents.store.as_ref().unwrap();
+        for (session, owner) in [
+            ("alice-1", Some("alice")),
+            ("alice-2", Some("alice")),
+            ("bob-1", Some("bob")),
+            ("unowned", None),
+        ] {
+            let mut meta = crate::agent::session_store::SessionMetadata::new(
+                session,
+                "",
+                "ws",
+                owner.unwrap_or(""),
+            );
+            meta = meta.with_user_id(owner);
+            store.save_session(session, &meta, "{}").await.unwrap();
+        }
+
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &RequestContext::new("alice", crate::security::request_context::AuthSource::Session),
+        )
+        .await;
+        assert!(res.ok, "list failed: {:?}", res.error);
+        let listed: Vec<String> = res
+            .payload
+            .and_then(|p| p.get("sessions").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| {
+                s.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let mut listed = listed;
+        listed.sort();
+        assert_eq!(listed, vec!["alice-1", "alice-2"]);
+    }
+
+    /// A single-identity deployment records no owner (`shared` / `anonymous`
+    /// are not people), so listing must not suddenly hide everything from it.
+    /// Filtering is skipped for such a caller.
+    #[tokio::test]
+    async fn sessions_list_does_not_filter_for_a_shared_identity() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.agents.store.as_ref().unwrap();
+        for (session, owner) in [("one", Some("alice")), ("two", Some("bob"))] {
+            let meta =
+                crate::agent::session_store::SessionMetadata::new(session, "", "ws", "shared")
+                    .with_user_id(owner);
+            store.save_session(session, &meta, "{}").await.unwrap();
+        }
+
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
+        let listed = res
+            .payload
+            .and_then(|p| p.get("sessions").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default()
+            .len();
+        assert_eq!(listed, 2, "a shared identity sees the whole deployment's list");
+    }
+
+    /// A session created by a real principal is recorded with that owner, and
+    /// the same principal's later list finds it.
+    #[tokio::test]
+    async fn create_records_the_owner_and_list_finds_it() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let conn = make_test_conn(&["write"]);
+        let ctx =
+            RequestContext::new("alice", crate::security::request_context::AuthSource::Session);
+        let res = handle_sessions_create(
+            &req("c", "sessions.create", serde_json::json!({ "session_id": "mine" })),
+            &conn,
+            &state,
+            &ctx,
+        )
+        .await;
+        assert!(res.ok, "create failed: {:?}", res.error);
+
+        let store = state.agents.store.as_ref().unwrap();
+        assert_eq!(
+            store
+                .load_session("mine")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .user_id
+                .as_deref(),
+            Some("alice")
+        );
+
+        // And another person's list does not include it.
+        let res = handle_sessions_list(
+            &req("l", "sessions.list", serde_json::json!({})),
+            &state,
+            &RequestContext::new("bob", crate::security::request_context::AuthSource::Session),
+        )
+        .await;
+        let listed = res
+            .payload
+            .and_then(|p| p.get("sessions").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default();
+        assert!(listed.is_empty(), "bob must not see alice's session: {listed:?}");
     }
 
     #[tokio::test]

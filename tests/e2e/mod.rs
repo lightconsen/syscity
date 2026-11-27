@@ -1117,6 +1117,7 @@ mod harness_isolation_tests;
 mod health_tests;
 mod hooks_tests;
 mod http_tests;
+mod isolation_tests;
 mod learning_loop_tests;
 mod llm_chat_tests;
 mod mcp_chat_tests;

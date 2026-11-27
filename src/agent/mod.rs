@@ -473,6 +473,7 @@ mod tests {
             reflection_config: None,
             allowed_tools: Some(vec!["file_read".to_string(), "web_search".to_string()]),
             permissions: None,
+            owner: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: AgentConfig = serde_json::from_str(&json).unwrap();

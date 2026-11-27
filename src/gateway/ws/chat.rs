@@ -52,6 +52,16 @@ pub(crate) async fn handle_chat_send(
 
     let mut should_name = false;
     if let Some(ref store) = state.agents.store {
+        // Attribute the conversation before the first message lands. A session
+        // created implicitly by `chat.send` (no `sessions.create`) would
+        // otherwise have no owner at all, and `sessions.list` for a
+        // non-bound caller filters on it.
+        if let Err(e) = store
+            .ensure_session_row_owned(&session_id, Some(&user_id))
+            .await
+        {
+            tracing::warn!("Failed to attribute session {} to {}: {}", session_id, user_id, e);
+        }
         if let Err(e) = store
             .append_message(&AppendMessageParams {
                 session_id: &session_id,

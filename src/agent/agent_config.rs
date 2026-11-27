@@ -128,6 +128,20 @@ pub struct AgentConfig {
     /// [`PermissionsRuntime::evaluate`]: crate::tools::PermissionsRuntime
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<crate::tools::AgentPermissions>,
+    /// The user this agent belongs to, when it is one person's assistant.
+    ///
+    /// **Descriptive, not an authorization decision.** Who may *use* an agent
+    /// is decided by `[agent_overrides.<id>] allowed_users` and nothing else
+    /// (`AgentRouter::allows_principal`); a client that filtered on `owner`
+    /// instead would be a second, divergent gate.
+    ///
+    /// What this buys is the thing the deployment could not express before:
+    /// "these agents are mine, that one is the team's". `agents.list` and
+    /// `agents.registry` surface it so a sidebar can group by it, and
+    /// `agents.create` records the caller. `None` means a shared/team agent —
+    /// the default, so every existing agent keeps meaning what it meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Serde default: `true`.
@@ -201,6 +215,8 @@ Use rich formatting for lists, structured data, and technical content:
             reflection_config: None,
             allowed_tools: None,
             permissions: None,
+            // Shared/team agent: the behaviour every existing agent had.
+            owner: None,
         }
     }
 }
@@ -236,7 +252,7 @@ impl AgentConfig {
     /// is present, a structured "Agent Profile" section is injected before
     /// the free-form body.
     pub async fn full_system_prompt_with_personality(&self) -> String {
-        self.full_system_prompt_with_personality_for_desktop(None)
+        self.full_system_prompt_with_personality_for_desktop(None, None)
             .await
     }
 
@@ -247,14 +263,19 @@ impl AgentConfig {
     /// is attached). A remote desktop that is a different OS changes what the
     /// model should believe about available programs, so the Host Environment
     /// section is built from it rather than from `std::env::consts::OS`.
+    ///
+    /// `user_id` partitions the *personal* memory files (`USER.md`,
+    /// `MEMORY.md`, dated fragments) per person; the agent's own identity
+    /// files stay shared. `None` reads the single-operator layout unchanged.
     pub async fn full_system_prompt_with_personality_for_desktop(
         &self,
         desktop_os: Option<&str>,
+        user_id: Option<&str>,
     ) -> String {
         let base_prompt = self.full_system_prompt();
 
         // Load personality memory
-        let result = match crate::memory::PersonalityMemory::new().await {
+        let result = match crate::memory::PersonalityMemory::for_user(user_id).await {
             Ok(memory) => {
                 // Initialize default files if they don't exist
                 match memory.initialize_defaults().await {
@@ -312,5 +333,55 @@ impl AgentConfig {
         // instead.
         let host_env = crate::computer::platform::host_environment_summary_for(desktop_os);
         format!("{}\n\n## Host Environment\n\n{}", result, host_env)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `owner` is optional and omitted from the wire by default, so every
+    /// existing client payload keeps its exact shape. A config that does carry
+    /// one round-trips it.
+    #[test]
+    fn owner_is_omitted_unless_set_and_round_trips() {
+        let cfg = AgentConfig::default();
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            json.get("owner").is_none(),
+            "a shared agent must not serialize an owner key: {json}"
+        );
+
+        let owned = AgentConfig {
+            owner: Some("zhangsan".to_string()),
+            ..AgentConfig::default()
+        };
+        let json = serde_json::to_value(&owned).unwrap();
+        assert_eq!(json["owner"], "zhangsan");
+
+        let back: AgentConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.owner.as_deref(), Some("zhangsan"));
+
+        // A config written before this field existed deserializes with none.
+        let mut legacy = serde_json::to_value(AgentConfig::default()).unwrap();
+        let obj = legacy.as_object_mut().unwrap();
+        obj.remove("owner");
+        obj.insert("temperature".into(), serde_json::json!(0.3));
+        let legacy: AgentConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.owner, None);
+        assert_eq!(legacy.temperature, 0.3);
+    }
+
+    /// TOML is the other wire this type travels on (`agents.create` accepts a
+    /// whole `AgentConfig`); an explicit `owner = ...` and its absence must
+    /// both parse.
+    #[test]
+    fn owner_parses_from_toml() {
+        let base = toml::to_string(&AgentConfig::default()).unwrap();
+        // Prepended, not appended: the tail of the file is inside a sub-table.
+        let with: AgentConfig = toml::from_str(&format!("owner = \"zhangsan\"\n{base}")).unwrap();
+        assert_eq!(with.owner.as_deref(), Some("zhangsan"));
+        let without: AgentConfig = toml::from_str(&base).unwrap();
+        assert_eq!(without.owner, None);
     }
 }

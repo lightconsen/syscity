@@ -383,6 +383,11 @@ impl AgentPersonality {
             // the deployment says so; otherwise the registry gate decides.
             allowed_tools: None,
             permissions: None,
+            // Ownership is recorded by `agents.create`, not derived from the
+            // personality files: a personality on disk says nothing about who
+            // it belongs to, and guessing from the directory name would be
+            // wrong for every agent written before this field existed.
+            owner: None,
         }
     }
 

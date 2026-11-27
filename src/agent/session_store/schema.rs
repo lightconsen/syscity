@@ -115,7 +115,8 @@ impl SessionStore {
                 name TEXT,
                 bound_agent_id TEXT,
                 transcript_id TEXT,
-                model TEXT
+                model TEXT,
+                user_id TEXT
             )
             "#,
         )
@@ -175,6 +176,29 @@ impl SessionStore {
             if !e.to_string().contains("duplicate column name") {
                 warn!("Failed to add model column to sessions: {}", e);
             }
+        }
+
+        // Migrate: add user_id column if it doesn't exist. Existing rows are
+        // left NULL rather than backfilled from `channel_id`: the two agree
+        // only under the `ws:<user>` convention, and guessing would record an
+        // owner for rows the deployment never established one for.
+        if let Err(e) = sqlx::query("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+            .execute(&self.pool)
+            .await
+        {
+            if !e.to_string().contains("duplicate column name") {
+                warn!("Failed to add user_id column to sessions: {}", e);
+            }
+        }
+
+        // The per-user listing (`sessions.list` for a non-bound caller) filters
+        // on this column, so it must not be a table scan.
+        if let Err(e) =
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+                .execute(&self.pool)
+                .await
+        {
+            warn!("Failed to create sessions user_id index: {}", e);
         }
 
         // Session messages table - stores conversation history

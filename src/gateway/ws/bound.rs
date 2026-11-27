@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+use tracing::warn;
+
 use crate::gateway::protocol::{WsRequest, WsResponse};
 use crate::gateway::GatewayState;
 use crate::security::request_context::RequestContext;
@@ -259,6 +261,109 @@ pub async fn session_belongs(state: &Arc<GatewayState>, bound: &str, session_id:
     }
 }
 
+/// [`deny_session_not_owned`] for a caller that has no `RequestContext` — the
+/// WebSocket upgrade, which runs before any frame can be dispatched.
+///
+/// The upgrade URL only ever contributes a subscription to that session's live
+/// event stream, so what this has to answer is "may anyone without a proven
+/// identity listen in". An owned session says no; an unowned or unattributed
+/// one says yes, which is the same answer the method path gives a shared
+/// identity.
+pub async fn session_send_allowed(state: &Arc<GatewayState>, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return true;
+    }
+    let Some(store) = state.agents.store.as_ref() else {
+        return true;
+    };
+    match store.load_session(session_id).await {
+        Ok(Some(persisted)) => persisted.metadata.user_id.is_none(),
+        // Could not read the row: an unreadable session must not become a
+        // listenable one.
+        Err(_) => false,
+        Ok(None) => true,
+    }
+}
+
+/// Whether the caller's own identity owns the session, for the whole
+/// session-addressed surface.
+///
+/// `sessions.list` already narrows to the caller. Listing is not the promise,
+/// though: every one of the ~20 handlers that takes a `session_id` would
+/// otherwise act on *any* id it was given — rename, delete, undo, export and
+/// `chat.history` (the whole transcript) included — so a session id is a
+/// capability in a deployment where ids are guessable, and `{channel}:{user}`
+/// is often derivable outright.
+///
+/// Returns the refusal frame, or `None` to proceed. Three cases do not refuse:
+///
+/// - No store: nothing is attributed, so there is nothing to compare against.
+/// - A shared identity (`shared` / `anonymous` / `ws-user`): those mean "this
+///   deployment has no per-person identity", and refusing them would hide a
+///   single operator's own sessions from them.
+/// - A session id with no row yet: a brand-new conversation, or one created
+///   outside the WS path. The handler creates it, and a caller cannot reach
+///   another person's *existing* history through an id they invent.
+///
+/// An unowned row does **not** proceed for a named principal. It may have been
+/// created before ownership was recorded, and there is no honest way to tell
+/// "never had an owner" from "the owner was lost"; refusing a stale row is a
+/// visible, recoverable annoyance, while serving it is a leak.
+pub async fn deny_session_not_owned(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+    session_id: &str,
+) -> Option<WsResponse> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let caller = ctx.user_id();
+    if caller.is_empty()
+        || crate::memory::SHARED_IDENTITIES
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(caller))
+    {
+        return None;
+    }
+    let store = state.agents.store.as_ref()?;
+    let metadata = match store.load_session(session_id).await {
+        Ok(Some(persisted)) => persisted.metadata,
+        // No row: a new conversation. The handler is where it gets created,
+        // and it will record this caller as the owner.
+        Ok(None) => return None,
+        Err(e) => {
+            // Fail closed: an unreadable row must not become an open one.
+            warn!("Refusing {}: could not read session '{}': {}", req.method, session_id, e);
+            return Some(WsResponse::err(
+                &req.id,
+                "INTERNAL",
+                format!("Could not determine the owner of session '{session_id}'"),
+            ));
+        }
+    };
+    match metadata.user_id.as_deref() {
+        Some(owner) if owner.eq_ignore_ascii_case(caller) => None,
+        _ => {
+            warn!(
+                "Refused {} for user {}: session '{}' belongs to {}",
+                req.method,
+                caller,
+                session_id,
+                metadata
+                    .user_id
+                    .as_deref()
+                    .unwrap_or("this deployment (no recorded owner)")
+            );
+            Some(WsResponse::err(
+                &req.id,
+                "FORBIDDEN",
+                format!("Session '{session_id}' is not yours"),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +521,126 @@ mod tests {
         let ctx = bound_ctx("secretary-alice");
         let ping = req("r1", "ping", serde_json::json!({}));
         assert!(check_params(&ping, &ctx, &state).await.is_none());
+    }
+
+    // ── Session ownership ────────────────────────────────────────────────
+
+    /// A state whose session store holds one row per `(id, owner)` pair.
+    async fn state_with_sessions(rows: &[(&str, Option<&str>)]) -> Arc<GatewayState> {
+        let state = Arc::new(
+            crate::gateway::state_tests::make_test_state_with_store(GatewayConfig::default()).await,
+        );
+        let store = state.agents.store.as_ref().unwrap();
+        for (id, owner) in rows {
+            let mut meta = crate::agent::session_store::SessionMetadata::new(
+                *id,
+                "",
+                "ws",
+                owner.unwrap_or(""),
+            );
+            meta = meta.with_user_id(*owner);
+            store.save_session(id, &meta, "{}").await.unwrap();
+        }
+        state
+    }
+
+    fn user_ctx(who: &str) -> RequestContext {
+        RequestContext::new(who, AuthSource::Session)
+    }
+
+    /// The core case: alice's row is refused to bob, on every method, without
+    /// the handler having to remember to ask.
+    #[tokio::test]
+    async fn another_persons_session_is_refused() {
+        let state = state_with_sessions(&[("alice-1", Some("alice"))]).await;
+        for method in [
+            "chat.history",
+            "sessions.rename",
+            "sessions.delete",
+            "sessions.export",
+        ] {
+            let r = req("r1", method, serde_json::json!({ "session_id": "alice-1" }));
+            let refusal = deny_session_not_owned(&r, &state, &user_ctx("bob"), "alice-1")
+                .await
+                .unwrap_or_else(|| panic!("{method} must refuse alice's session to bob"));
+            assert_eq!(refusal.error.as_ref().unwrap().code, "FORBIDDEN", "{method}");
+        }
+        // …and is allowed to its owner.
+        let r = req("r1", "chat.history", serde_json::json!({ "session_id": "alice-1" }));
+        assert!(deny_session_not_owned(&r, &state, &user_ctx("alice"), "alice-1")
+            .await
+            .is_none());
+    }
+
+    /// A single-identity deployment records no owner, so the gate must not hide
+    /// its own sessions from it.
+    #[tokio::test]
+    async fn a_shared_identity_is_never_refused() {
+        let state = state_with_sessions(&[("one", Some("alice"))]).await;
+        let shared = RequestContext::new("shared", AuthSource::SharedToken);
+        let r = req("r1", "chat.history", serde_json::json!({ "session_id": "one" }));
+        assert!(deny_session_not_owned(&r, &state, &shared, "one")
+            .await
+            .is_none());
+
+        let anon = RequestContext::anonymous();
+        assert!(deny_session_not_owned(&r, &state, &anon, "one")
+            .await
+            .is_none());
+    }
+
+    /// A brand-new id has no row; the handler creates it and records the
+    /// caller, so refusing here would block every first message.
+    #[tokio::test]
+    async fn a_session_with_no_row_is_not_refused() {
+        let state = state_with_sessions(&[]).await;
+        let r = req("r1", "chat.send", serde_json::json!({ "session_id": "fresh" }));
+        assert!(deny_session_not_owned(&r, &state, &user_ctx("alice"), "fresh")
+            .await
+            .is_none());
+    }
+
+    /// A row with no owner is not a free-for-all: it might be one created
+    /// before ownership was recorded, and there is no way to tell that apart
+    /// from a lost owner. Refusing is visible and recoverable; serving it is a
+    /// leak.
+    #[tokio::test]
+    async fn an_ownerless_row_is_refused_to_a_named_principal() {
+        let state = state_with_sessions(&[("legacy", None)]).await;
+        let r = req("r1", "chat.history", serde_json::json!({ "session_id": "legacy" }));
+        assert!(deny_session_not_owned(&r, &state, &user_ctx("alice"), "legacy")
+            .await
+            .is_some());
+    }
+
+    /// No store means nothing is attributed, so there is nothing to compare —
+    /// and refusing everybody would break a deployment that never enabled one.
+    #[tokio::test]
+    async fn a_state_without_a_store_does_not_refuse() {
+        let state = state().await;
+        assert!(state.agents.store.is_none(), "fixture assumption");
+        let r = req("r1", "chat.history", serde_json::json!({ "session_id": "anything" }));
+        assert!(deny_session_not_owned(&r, &state, &user_ctx("alice"), "anything")
+            .await
+            .is_none());
+    }
+
+    /// The upgrade-URL subscription has no identity to compare against, so the
+    /// only safe answer for an owned session is no.
+    #[tokio::test]
+    async fn the_upgrade_url_cannot_subscribe_to_an_owned_session() {
+        let state = state_with_sessions(&[("alice-1", Some("alice")), ("legacy", None)]).await;
+        assert!(
+            !session_send_allowed(&state, "alice-1").await,
+            "an owned session must not be subscribable from a URL that carries no identity"
+        );
+        assert!(
+            session_send_allowed(&state, "legacy").await,
+            "an unowned session is what a single-identity deployment has"
+        );
+        assert!(
+            session_send_allowed(&state, "brand-new").await,
+            "a session with no row yet has nothing to protect"
+        );
     }
 }

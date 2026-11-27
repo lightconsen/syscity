@@ -127,6 +127,40 @@ if no section matches, the release falls back to auto-generated notes.
   decide "is the remote gateway usable?" now speak TLS too (native root store,
   no client auth), instead of failing against any gateway behind a proxy; the
   Tauri CSP admits `https://*` / `wss://*` so the WebView may connect.
+- **Per-user personality memory.** `USER.md`, `MEMORY.md` and the dated
+  `memory/*.md` fragments were one file per agent, so on a server hosting one
+  agent per person every user's notes accumulated in the same file and every
+  prompt was handed the lot. `PersonalityMemory` now takes a user scope: the
+  identity files (`SOUL.md`, `IDENTITY.md`, `BOOTSTRAP.md`, `AGENTS.md`,
+  `TOOLS.md`, `HEARTBEAT.md`) stay shared because they describe the agent, while
+  the personal files are read and written under `users/<component>/`. A
+  user-scoped instance reads its own copy or nothing — there is deliberately no
+  fallback to the shared file, because handing one person another's `MEMORY.md`
+  would be a leak wearing the mask of a default. Dated fragments are the one
+  exception: they *merge*, with a personal fragment shadowing the shared one of
+  the same name so a day still appears once. `shared` / `anonymous` / `ws-user`
+  mean "no per-user identity exists" and keep the flat layout, so a
+  single-operator upgrade does not strand existing memory behind a new
+  directory. User ids are escaped injectively, so a path-shaped id
+  (`../../etc`) cannot walk out of the memory root.
+- **Agents and sessions are partitioned by principal over WebSocket.** The
+  per-agent `allowed_users` gate refused a message but not a listing, so a
+  caller was shown agents every action would then reject — and could read
+  another person's agent config, export its personality files or clear its
+  memory by typing the id. `agents.list` / `agents.registry` now filter by the
+  same `allows_principal` the router applies, and every handler that names an
+  agent (`agents.get`, `agents.get_config`, `agents.update`,
+  `agents.memory.get` / `.clear`, `agents.export` / `import`, and the
+  destructive `agents.delete` / `purge` / `rename`) refuses one the caller may
+  not use — a hidden name that still answers when typed is not
+  isolation. Sessions gain an owner: `sessions.create` records the caller,
+  `sessions.list` narrows to them, and a background save with no user no longer
+  erases the recorded owner (the UPSERT coalesces it). `agents.create` records
+  the caller as the new agent's `owner`, which `agents.list` / `agents.registry`
+  surface so a client can group "my agents" — descriptive only, never an
+  authorization decision. Creating a session for an agent the router restricts
+  to someone else is refused *before* the row is written, so a refusal leaves no
+  ghost session behind.
 
 ### Fixed
 

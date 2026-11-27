@@ -4,16 +4,70 @@ use super::*;
 
 /// Filter a list of agent ids to what the caller may see.
 ///
-/// An unbound caller sees every agent (unchanged behaviour). A connection bound
-/// to one agent sees only that one: the client is configured with a single
-/// agent's credential, so a sidebar offering the others is a list of refusals
-/// waiting to happen. The bound agent is kept even if it is not currently
-/// spawned, because the client must still be able to name its own agent.
-fn restrict_agents(ids: impl IntoIterator<Item = String>, ctx: &RequestContext) -> Vec<String> {
-    match ctx.bound_agent() {
+/// Two gates, in order:
+///
+/// 1. An agent-bound connection sees only its one agent (unchanged): the client
+///    is configured with a single agent's credential, so a sidebar offering the
+///    others is a list of refusals waiting to happen.
+/// 2. Every remaining caller is filtered by the router's own authorization —
+///    the same `allows_principal` that `route()` applies. An agent the caller
+///    cannot use is not listed, because a list is a promise that the name can
+///    be acted on: `sessions.create` and `chat.send` both refuse it.
+///
+/// An unrestricted agent (no `allowed_users`) stays visible to everyone, so a
+/// single-operator deployment's list is unchanged.
+async fn restrict_agents(
+    ids: impl IntoIterator<Item = String>,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> Vec<String> {
+    let principal = ctx.user_id();
+    let ids: Vec<String> = match ctx.bound_agent() {
         Some(bound) => ids.into_iter().filter(|id| id == bound).collect(),
         None => ids.into_iter().collect(),
+    };
+    let mut visible = Vec::with_capacity(ids.len());
+    for id in ids {
+        if state.agents.router.allows_principal(&id, principal).await {
+            visible.push(id);
+        }
     }
+    visible
+}
+
+/// Refuse a request naming an agent the caller may not use.
+///
+/// `agents.list` and `agents.registry` leave an agent out of the listing when
+/// the router would refuse it; the handlers that take an agent id explicitly
+/// have to refuse it themselves, or the listing is only a suggestion — the id
+/// is still known, still typed, and still answers. Returns the refusal frame,
+/// or `None` when the caller may proceed (including every unrestricted agent,
+/// which has no `allowed_users` and is visible to everyone).
+pub(crate) async fn deny_agent(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+    agent_id: &str,
+) -> Option<WsResponse> {
+    if state
+        .agents
+        .router
+        .allows_principal(agent_id, ctx.user_id())
+        .await
+    {
+        return None;
+    }
+    warn!(
+        "Refused {} for user {}: agent '{}' is not available to them",
+        req.method,
+        ctx.user_id(),
+        agent_id
+    );
+    Some(WsResponse::err(
+        &req.id,
+        "FORBIDDEN",
+        format!("Agent '{agent_id}' is not available to this user"),
+    ))
 }
 
 pub(super) async fn handle_agents_list(
@@ -25,12 +79,28 @@ pub(super) async fn handle_agents_list(
         let agents = state.agents.agents.read().await;
         agents.keys().cloned().collect::<Vec<_>>()
     };
-    let agents = restrict_agents(agents, ctx);
+    let agents = restrict_agents(agents, state, ctx).await;
 
-    WsResponse::ok(&req.id, serde_json::json!({ "agents": agents }))
+    // `agents` stays a plain array of ids so every existing client keeps
+    // working; `owners` is the additive half — id → owner, for the ids the
+    // deployment recorded one for (`agents.create` does).
+    let mut owners = serde_json::Map::new();
+    {
+        let handles = state.agents.agents.read().await;
+        for id in &agents {
+            if let Some(owner) = handles.get(id).and_then(|h| h.config.owner.clone()) {
+                owners.insert(id.clone(), serde_json::Value::String(owner));
+            }
+        }
+    }
+    WsResponse::ok(&req.id, serde_json::json!({ "agents": agents, "owners": owners }))
 }
 
-pub(super) async fn handle_agents_get(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(super) async fn handle_agents_get(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct GetParams {
         agent_id: String,
@@ -40,6 +110,9 @@ pub(super) async fn handle_agents_get(req: &WsRequest, state: &Arc<GatewayState>
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
 
     let agent = {
         let agents = state.agents.agents.read().await;
@@ -129,13 +202,18 @@ pub(super) async fn handle_agents_registry(
     state: &Arc<GatewayState>,
     ctx: &RequestContext,
 ) -> WsResponse {
+    // The same authorization `agents.list` applies: a registry entry for an
+    // agent the caller may not use is a name the sidebar would offer and every
+    // action would then refuse.
+    let principal = ctx.user_id();
+    let may_use = |id: &str| ctx.may_use_agent(id);
     let registry = state.agents.registry.read().await;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
     // 1. Registry-discovered agents from disk
     for id in registry.list() {
-        if !ctx.may_use_agent(&id) {
+        if !may_use(&id) || !state.agents.router.allows_principal(&id, principal).await {
             continue;
         }
         if let Some(p) = registry.get(&id) {
@@ -153,17 +231,42 @@ pub(super) async fn handle_agents_registry(
     // 2. Runtime-spawned agents not in registry (e.g. default)
     {
         let agents = state.agents.agents.read().await;
-        for id in agents.keys() {
-            if seen.contains(id) || !ctx.may_use_agent(id) {
+        for (id, handle) in agents.iter() {
+            if seen.contains(id) || !may_use(id) {
                 continue;
             }
+            if !state.agents.router.allows_principal(id, principal).await {
+                continue;
+            }
+            let owner = handle.config.owner.clone();
             entries.push(serde_json::json!({
                 "id": id,
                 "display_name": id.as_str(),
                 "emoji": "🤖",
                 "is_valid": true,
                 "has_heartbeat": false,
+                "owner": owner,
             }));
+        }
+    }
+
+    // Ownership for the disk-discovered entries too: it lives on the running
+    // handle's config (stamped from `[agent_overrides]`), and a registry entry
+    // for an agent that has not been spawned yet has none.
+    {
+        let agents = state.agents.agents.read().await;
+        for entry in entries.iter_mut() {
+            let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if entry.get("owner").is_some() {
+                continue;
+            }
+            if let Some(owner) = agents.get(id).and_then(|h| h.config.owner.clone()) {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("owner".to_string(), serde_json::Value::String(owner));
+                }
+            }
         }
     }
 
@@ -200,6 +303,7 @@ pub(super) async fn handle_system_presence(req: &WsRequest) -> WsResponse {
 pub(crate) async fn handle_agents_get_config(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct GetParams {
@@ -209,6 +313,9 @@ pub(crate) async fn handle_agents_get_config(
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
     let agent = {
         let agents = state.agents.agents.read().await;
         agents.get(&params.agent_id).cloned()
@@ -225,7 +332,11 @@ pub(crate) async fn handle_agents_get_config(
 
 /// `agents.update` — replace an agent's runtime config (`{ agent_id, config }`).
 /// Only edits the running handle's `ConfigCell`; it does not persist to disk.
-pub(crate) async fn handle_agents_update(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_agents_update(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct UpdateParams {
         agent_id: String,
@@ -235,6 +346,9 @@ pub(crate) async fn handle_agents_update(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
     let agent = {
         let agents = state.agents.agents.read().await;
         agents.get(&params.agent_id).cloned()
@@ -311,6 +425,7 @@ pub(crate) async fn handle_agents_default(
 pub(crate) async fn handle_agents_memory_get(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
@@ -320,6 +435,9 @@ pub(crate) async fn handle_agents_memory_get(
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
     // `agent_id` comes from the caller and is about to become a path: refuse
     // anything that would walk out of the agents directory. Two of these four
     // handlers write (`memory.clear`, `import`).
@@ -336,6 +454,7 @@ pub(crate) async fn handle_agents_memory_get(
 pub(crate) async fn handle_agents_memory_clear(
     req: &WsRequest,
     state: &Arc<GatewayState>,
+    ctx: &RequestContext,
 ) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
@@ -345,6 +464,9 @@ pub(crate) async fn handle_agents_memory_clear(
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
     // `agent_id` comes from the caller and is about to become a path: refuse
     // anything that would walk out of the agents directory. Two of these four
     // handlers write (`memory.clear`, `import`).
@@ -373,7 +495,11 @@ pub(crate) async fn handle_agents_memory_clear(
 
 /// `agents.export` — the agent's on-disk personality files as JSON
 /// (`{ agent_id }` → `{ agent_id, files: { "SOUL.md": ... } }`).
-pub(crate) async fn handle_agents_export(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_agents_export(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
         agent_id: String,
@@ -382,6 +508,9 @@ pub(crate) async fn handle_agents_export(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
     // `agent_id` comes from the caller and is about to become a path: refuse
     // anything that would walk out of the agents directory. Two of these four
     // handlers write (`memory.clear`, `import`).
@@ -414,7 +543,11 @@ pub(crate) async fn handle_agents_export(req: &WsRequest, state: &Arc<GatewaySta
 
 /// `agents.import` — write an agent's personality files and rediscover it
 /// (`{ agent_id, files: { "SOUL.md": ... } }`).
-pub(crate) async fn handle_agents_import(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_agents_import(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct Params {
         agent_id: String,
@@ -424,6 +557,9 @@ pub(crate) async fn handle_agents_import(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
+    if let Some(refusal) = deny_agent(req, state, ctx, &params.agent_id).await {
+        return refusal;
+    }
     // `agent_id` comes from the caller and is about to become a path: refuse
     // anything that would walk out of the agents directory. Two of these four
     // handlers write (`memory.clear`, `import`).
@@ -498,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn agents_get_missing_params_errors() {
         let state = state().await;
-        let resp = handle_agents_get(&req("r1", None), &state).await;
+        let resp = handle_agents_get(&req("r1", None), &state, &make_test_ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
@@ -507,7 +643,7 @@ mod tests {
     async fn agents_get_unknown_agent_not_found() {
         let state = state().await;
         let params = Some(serde_json::json!({ "agent_id": "ghost" }));
-        let resp = handle_agents_get(&req("r1", params), &state).await;
+        let resp = handle_agents_get(&req("r1", params), &state, &make_test_ctx()).await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "AGENT_NOT_FOUND");
     }
@@ -532,7 +668,7 @@ mod tests {
 
         // Baseline: personality-derived temperature.
         let params = Some(serde_json::json!({ "agent_id": "alice" }));
-        let resp = handle_agents_get(&req("r1", params), &state).await;
+        let resp = handle_agents_get(&req("r1", params), &state, &make_test_ctx()).await;
         assert!(resp.ok);
         let payload = resp.payload.unwrap();
         assert_eq!(payload["status"], "stopped");
@@ -548,7 +684,7 @@ mod tests {
                 .unwrap();
         }
         let params = Some(serde_json::json!({ "agent_id": "alice" }));
-        let resp = handle_agents_get(&req("r2", params), &state).await;
+        let resp = handle_agents_get(&req("r2", params), &state, &make_test_ctx()).await;
         assert!(resp.ok);
         let payload = resp.payload.unwrap();
         let t = payload["config"]["temperature"].as_f64().unwrap();
@@ -564,6 +700,7 @@ mod tests {
             let resp = handle_agents_memory_get(
                 &req("r1", Some(serde_json::json!({ "agent_id": id }))),
                 &state,
+                &make_test_ctx(),
             )
             .await;
             assert!(!resp.ok, "agent_id {id:?} must be refused");
@@ -580,6 +717,7 @@ mod tests {
         let resp = handle_agents_memory_get(
             &req("r1", Some(serde_json::json!({ "agent_id": "default" }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(resp.ok, "the default agent must remain readable: {:?}", resp.error);
@@ -597,6 +735,7 @@ mod tests {
                 })),
             ),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(!resp.ok);
@@ -606,8 +745,12 @@ mod tests {
     #[tokio::test]
     async fn agents_get_invalid_params_errors() {
         let state = state().await;
-        let resp =
-            handle_agents_get(&req("r1", Some(serde_json::json!({ "nope": 1 }))), &state).await;
+        let resp = handle_agents_get(
+            &req("r1", Some(serde_json::json!({ "nope": 1 }))),
+            &state,
+            &make_test_ctx(),
+        )
+        .await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
     }
@@ -645,6 +788,7 @@ mod tests {
         let resp = handle_agents_get_config(
             &req("r1", Some(serde_json::json!({ "agent_id": "nope" }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(!resp.ok);
@@ -659,6 +803,7 @@ mod tests {
         let resp = handle_agents_update(
             &req("r1", Some(serde_json::json!({ "agent_id": "nope", "config": cfg }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(!resp.ok);
@@ -671,6 +816,7 @@ mod tests {
         let resp = handle_agents_update(
             &req("r1", Some(serde_json::json!({ "agent_id": "default" }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(!resp.ok);
@@ -759,6 +905,7 @@ mod tests {
         let resp = handle_agents_memory_get(
             &req("r1", Some(serde_json::json!({ "agent_id": "__no_such_agent__" }))),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(resp.ok, "memory.get failed: {:?}", resp.error);
@@ -777,9 +924,241 @@ mod tests {
                 })),
             ),
             &state,
+            &make_test_ctx(),
         )
         .await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
+    }
+
+    // ── Principal filtering ──────────────────────────────────────────────
+
+    fn ctx_for(user: &str) -> RequestContext {
+        RequestContext::new(user, crate::security::request_context::AuthSource::Session)
+    }
+
+    /// Seed the registry with a personality, which is what any disk-backed
+    /// agent looks like to `agents.list` / `agents.registry` without spawning
+    /// one.
+    async fn seed_personality(state: &Arc<GatewayState>, id: &str) {
+        state
+            .agents
+            .registry
+            .write()
+            .await
+            .insert_for_test(crate::agent::AgentPersonality {
+                id: id.into(),
+                identity: id.into(),
+                is_valid: true,
+                ..Default::default()
+            });
+    }
+
+    /// Insert a running handle. `agents.list` reads the runtime map, not the
+    /// registry, so a test about its filtering must put something there.
+    async fn seed_handle(state: &Arc<GatewayState>, id: &str, owner: Option<&str>) {
+        let provider: Arc<dyn crate::providers::Provider> =
+            Arc::new(crate::providers::mock::MockProvider::new());
+        let tools = Arc::new(crate::tools::ToolRegistry::new());
+        let mut cfg = crate::agent::AgentConfig::default();
+        cfg.owner = owner.map(str::to_string);
+        let agent = Arc::new(crate::agent::Agent::new(cfg.clone(), provider, tools));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (query_tx, _qrx) = tokio::sync::mpsc::channel(4);
+        state.agents.agents.write().await.insert(
+            id.to_string(),
+            crate::gateway::AgentHandle {
+                id: id.to_string(),
+                config: cfg.clone(),
+                base_config: cfg,
+                tx,
+                query_tx,
+                busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                agent,
+            },
+        );
+    }
+
+    async fn listed_ids(resp: &WsResponse) -> Vec<String> {
+        let mut ids: Vec<String> = resp.payload.as_ref().unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// An agent with `allowed_users` set is not listed for a caller outside
+    /// that list — a sidebar entry that every action then refuses is worse
+    /// than an absent one. An unrestricted agent stays visible to everyone.
+    #[tokio::test]
+    async fn agents_list_hides_agents_the_caller_may_not_use() {
+        let state = state().await;
+        for id in ["mine", "theirs", "team"] {
+            seed_handle(&state, id, None).await;
+        }
+        state
+            .agents
+            .router
+            .set_agent_principals("mine", vec!["alice".to_string()])
+            .await;
+        state
+            .agents
+            .router
+            .set_agent_principals("theirs", vec!["bob".to_string()])
+            .await;
+        // `team` has no list: unrestricted.
+
+        let alice = handle_agents_list(&req("r1", None), &state, &ctx_for("alice")).await;
+        assert_eq!(listed_ids(&alice).await, vec!["mine", "team"]);
+
+        let bob = handle_agents_list(&req("r2", None), &state, &ctx_for("bob")).await;
+        assert_eq!(listed_ids(&bob).await, vec!["team", "theirs"]);
+
+        // The unrestricted agent is the one both lists share, and an
+        // anonymous caller (no per-user identity) still sees it.
+        let anon = handle_agents_list(&req("r3", None), &state, &make_test_ctx()).await;
+        assert_eq!(listed_ids(&anon).await, vec!["team"]);
+    }
+
+    /// `agents.registry` applies the same gate, so the two surfaces cannot
+    /// disagree about which names exist.
+    #[tokio::test]
+    async fn agents_registry_hides_agents_the_caller_may_not_use() {
+        let state = state().await;
+        for id in ["mine", "theirs"] {
+            seed_personality(&state, id).await;
+        }
+        state
+            .agents
+            .router
+            .set_agent_principals("theirs", vec!["bob".to_string()])
+            .await;
+
+        let resp = handle_agents_registry(&req("r1", None), &state, &ctx_for("alice")).await;
+        assert!(resp.ok);
+        let mut ids: Vec<String> = resp.payload.as_ref().unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["mine"]);
+        assert_eq!(resp.payload.as_ref().unwrap()["count"], 1);
+    }
+
+    /// `agents.list` carries the recorded owner so a client can group "my
+    /// agents" — for the agents a owner was recorded for, and only those.
+    #[tokio::test]
+    async fn agents_list_reports_owners_for_agents_that_have_one() {
+        let state = state().await;
+        seed_handle(&state, "owned", Some("alice")).await;
+        seed_handle(&state, "team", None).await;
+
+        let resp = handle_agents_list(&req("r1", None), &state, &ctx_for("alice")).await;
+        assert_eq!(listed_ids(&resp).await, vec!["owned", "team"]);
+        let owners = &resp.payload.as_ref().unwrap()["owners"];
+        assert_eq!(owners["owned"], "alice");
+        assert!(owners.get("team").is_none(), "a shared agent has no owner key");
+    }
+
+    /// A connection bound to one agent sees only that agent, whatever the
+    /// router's lists say — the binding is the narrower gate.
+    #[tokio::test]
+    async fn agents_list_narrows_to_the_bound_agent() {
+        let state = state().await;
+        for id in ["alpha", "beta"] {
+            seed_handle(&state, id, None).await;
+        }
+        let ctx = ctx_for("alice").with_bound_agent(Some("beta"));
+        let resp = handle_agents_list(&req("r1", None), &state, &ctx).await;
+        assert_eq!(listed_ids(&resp).await, vec!["beta"]);
+    }
+
+    /// Leaving an agent out of the list is only half the promise: every
+    /// handler that takes an agent id must refuse the ones the list hides, or
+    /// the id a client remembers from before (or guesses) still answers.
+    #[tokio::test]
+    async fn the_agent_scoped_handlers_refuse_an_agent_the_caller_may_not_use() {
+        let state = state().await;
+        seed_handle(&state, "bob-bot", None).await;
+        state
+            .agents
+            .router
+            .set_agent_principals("bob-bot", vec!["bob".to_string()])
+            .await;
+        let alice = ctx_for("alice");
+        let params = || serde_json::json!({ "agent_id": "bob-bot" });
+
+        let refusals = [
+            handle_agents_get(&req("r1", Some(params())), &state, &alice).await,
+            handle_agents_get_config(&req("r2", Some(params())), &state, &alice).await,
+            handle_agents_memory_get(&req("r3", Some(params())), &state, &alice).await,
+            handle_agents_memory_clear(&req("r4", Some(params())), &state, &alice).await,
+            handle_agents_export(&req("r5", Some(params())), &state, &alice).await,
+            handle_agents_import(
+                &req(
+                    "r6",
+                    Some(serde_json::json!({ "agent_id": "bob-bot", "files": { "SOUL.md": "x" } })),
+                ),
+                &state,
+                &alice,
+            )
+            .await,
+            handle_agents_update(
+                &req(
+                    "r7",
+                    Some(serde_json::json!({
+                        "agent_id": "bob-bot",
+                        "config": crate::agent::AgentConfig::default(),
+                    })),
+                ),
+                &state,
+                &alice,
+            )
+            .await,
+        ];
+        for (i, resp) in refusals.iter().enumerate() {
+            assert!(!resp.ok, "call {i} must be refused: {resp:?}");
+            assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN", "call {i}");
+        }
+
+        // The refusal is a refusal, not a rename: bob's own calls still answer.
+        let bob = ctx_for("bob");
+        assert!(
+            handle_agents_get_config(&req("ok", Some(params())), &state, &bob)
+                .await
+                .ok,
+            "bob must still reach his own agent"
+        );
+    }
+
+    /// An unrestricted agent has no `allowed_users`, so the same handlers must
+    /// stay open to everyone — a single-operator deployment must not notice
+    /// this change.
+    #[tokio::test]
+    async fn an_unrestricted_agent_stays_readable_to_everyone() {
+        let state = state().await;
+        seed_handle(&state, "team", None).await;
+        let params = || serde_json::json!({ "agent_id": "team" });
+
+        for who in ["alice", "bob"] {
+            let ctx = ctx_for(who);
+            assert!(
+                handle_agents_get_config(&req("r1", Some(params())), &state, &ctx)
+                    .await
+                    .ok,
+                "{who} must reach the team agent"
+            );
+            assert!(
+                handle_agents_memory_get(&req("r2", Some(params())), &state, &ctx)
+                    .await
+                    .ok,
+                "{who} must read the team agent's memory"
+            );
+        }
     }
 }

@@ -83,4 +83,5 @@ pub enum ProgressEvent {
 - Complex task detection heuristic (`is_complex_task`)
 - Two-level model binding with dispatch-time resolution: session pin (SQLite, `sessions.set_model`) → per-agent binding (`agent_models` in config) → global default
 - Per-agent config overrides applied to running agents (`Agent.config` is a copy-on-clone `RwLock` cell snapshotted once per request build, so updates take effect from the next turn)
+- Per-agent ownership (`owner`) recorded by `agents.create` and surfaced by `agents.list` / `agents.registry` — descriptive only; who may *use* an agent is still decided solely by `[agent_overrides.<id>] allowed_users`
 

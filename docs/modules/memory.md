@@ -81,6 +81,7 @@ Started in `Gateway::start()` with `event_log` and `workspace_dir` wired in.
 - **Effectiveness** (`effectiveness.rs`) — Tracks recall hit rates to tune memory importance
 - **Session Search** (`session_search.rs`) — Search across conversation history
 - **Personality** (`personality.rs`) — Conversation pattern analysis and SOUL.md auto-generation
+- **Personality memory** (`personality.rs`, `PersonalityMemory`) — the agent's markdown identity and memory files. Two axes of isolation: identity files (`SOUL.md`, `IDENTITY.md`, `BOOTSTRAP.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`) belong to the agent and stay shared; personal files (`USER.md`, `MEMORY.md`, and the dated `memory/*.md` fragments) belong to one human and live under `users/<component>/`. A user-scoped instance reads its own copy or nothing — there is no fallback to the shared file, because silencing one person by handing them another's would be a leak with a friendly face. Dated fragments are the exception: they *merge*, with a personal fragment shadowing the shared one of the same name. `shared` / `anonymous` / `ws-user` mean "this deployment has no per-user identity", so they keep the flat layout an upgrade must not move files out from under.
 - **Soul** (`soul.rs`) — Soul/personality file management with `SoulConfig`
 - **Workspace State** (`workspace_state.rs`) — Workspace-level state persistence
 - **Flush** (`flush.rs`) — Memory flush decision logic for compaction
@@ -103,6 +104,7 @@ Started in `Gateway::start()` with `event_log` and `workspace_dir` wired in.
 - Multimodal file classification and storage
 - Session search across conversation history
 - Personality analysis and SOUL.md auto-generation
+- Per-user personality memory: identity files shared, `USER.md` / `MEMORY.md` / dated fragments partitioned by principal under `users/`
 - Dream review queue with human approval/rejection
 - Dream observability dashboard with metrics and Prometheus export
 - Memory export/import for migration (JSON/JSONL)

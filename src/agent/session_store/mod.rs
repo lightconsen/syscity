@@ -61,6 +61,16 @@ pub struct SessionMetadata {
     /// Model ID pinned to this session (per-session model binding)
     #[serde(default)]
     pub model: Option<String>,
+    /// The user this conversation belongs to, when the transport established
+    /// one.
+    ///
+    /// Before this existed a session's owner was implicit in `channel_id` and
+    /// the `ws:<user>` id convention — a naming habit, not something a query
+    /// could rely on. `None` means "not recorded": either a single-identity
+    /// deployment (`shared` / `anonymous`, where there is no owner to record)
+    /// or a row written before the column existed.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 impl SessionMetadata {
@@ -86,7 +96,28 @@ impl SessionMetadata {
             bound_agent_id: None,
             transcript_id: None,
             model: None,
+            user_id: None,
         }
+    }
+
+    /// Record who the conversation belongs to.
+    ///
+    /// [`SHARED_IDENTITIES`](crate::memory::SHARED_IDENTITIES) and an empty id
+    /// store `None` rather than the literal: `"shared"` is every caller under
+    /// `shared_token`, so writing it would claim a per-person owner for a
+    /// deployment that has none.
+    pub fn with_user_id(mut self, user_id: Option<&str>) -> Self {
+        let trimmed = user_id.map(str::trim).filter(|id| !id.is_empty());
+        let is_shared = trimmed.is_some_and(|id| {
+            crate::memory::SHARED_IDENTITIES
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(id))
+        });
+        self.user_id = match trimmed {
+            Some(id) if !is_shared => Some(id.to_string()),
+            _ => None,
+        };
+        self
     }
 
     /// Update last activity

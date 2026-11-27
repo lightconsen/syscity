@@ -7,6 +7,7 @@ use serde::Deserialize;
 use super::super::{parse_params, WsRequest, WsResponse};
 use crate::agent::{write_display_name, write_emoji};
 use crate::gateway::GatewayState;
+use crate::security::request_context::RequestContext;
 
 /// Longest accepted display name — keeps a rename from writing a whole
 /// paragraph into IDENTITY.md.
@@ -63,14 +64,48 @@ async fn unload_runtime_agent(state: &Arc<GatewayState>, id: &str) -> bool {
     true
 }
 
+/// Decide which owner to record for an agent this caller is creating.
+///
+/// An explicit `owner` in the request is kept — the caller said who it is for.
+/// Otherwise the caller becomes the owner, because they are the one person we
+/// know for certain is involved. `shared` / `anonymous` / `ws-user` mean "the
+/// deployment has no per-user identity", so recording one would claim an owner
+/// that names nobody; those leave the agent a shared/team agent.
+fn resolve_owner(explicit: Option<String>, ctx: &RequestContext) -> Option<String> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let principal = ctx.user_id().trim();
+    if principal.is_empty()
+        || crate::memory::SHARED_IDENTITIES
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(principal))
+    {
+        return None;
+    }
+    Some(principal.to_string())
+}
+
 // ── Agents ──────────────────────────────────────────────────────────────
 
 /// `agents.create` — create a new agent personality (`{ name, description, ... }`).
-pub(crate) async fn handle_agents_create(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
-    let config: crate::agent::AgentConfig = match parse_params(req) {
+///
+/// The caller becomes the agent's `owner`: they are the one person we know for
+/// certain is involved, and leaving it unset would make every agent created
+/// this way look like a team agent. Ownership is descriptive — `allowed_users`
+/// still decides who may *use* it — so recording it cannot widen or narrow
+/// anyone's access. An explicit `owner` in the config body is kept.
+pub(crate) async fn handle_agents_create(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
+    let mut config: crate::agent::AgentConfig = match parse_params(req) {
         Ok(c) => c,
         Err(res) => return res,
     };
+    config.owner = resolve_owner(config.owner.take(), ctx);
+    let owner = config.owner.clone();
     let agent_id = format!("agent-{}", uuid::Uuid::new_v4());
     match crate::gateway::agent_spawn::spawn_agent_inner(
         state.clone(),
@@ -84,6 +119,7 @@ pub(crate) async fn handle_agents_create(req: &WsRequest, state: &Arc<GatewaySta
             serde_json::json!({
                 "id": agent_id,
                 "status": "created",
+                "owner": owner,
                 "config": {
                     "max_context_tokens": config.max_context_tokens,
                     "max_concurrent_tools": config.max_concurrent_tools,
@@ -101,11 +137,21 @@ pub(crate) async fn handle_agents_create(req: &WsRequest, state: &Arc<GatewaySta
 /// This only stops the runtime instance: the personality on disk and its
 /// registry entry are left alone, so a disk-backed agent comes back on the
 /// next discovery. `agents.purge` is the one that removes it for good.
-pub(crate) async fn handle_agents_delete(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_agents_delete(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     let id = match super::required_str_param(req, "id") {
         Ok(v) => v,
         Err(res) => return res,
     };
+    // The same gate the read handlers apply. Unloading is not a read: stopping
+    // someone else's agent takes their assistant away, and it would come back
+    // only on a restart or a discovery.
+    if let Some(refusal) = super::super::agents::deny_agent(req, state, ctx, &id).await {
+        return refusal;
+    }
     if !unload_runtime_agent(state, &id).await {
         return WsResponse::err(&req.id, "NOT_FOUND", "agent not found");
     }
@@ -118,11 +164,21 @@ pub(crate) async fn handle_agents_delete(req: &WsRequest, state: &Arc<GatewaySta
 /// personality from the registry, clears the agent's `agent_models` /
 /// `agent_overrides` entries, and removes `agents/<id>/` — personality files,
 /// workspace, data and memory included. This is irreversible.
-pub(crate) async fn handle_agents_purge(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_agents_purge(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     let id = match super::required_str_param(req, "id") {
         Ok(v) => v,
         Err(res) => return res,
     };
+    // Before anything is read, persisted or removed: a purge is the one
+    // operation that cannot be undone, so it must not even begin for an agent
+    // the caller may not use.
+    if let Some(refusal) = super::super::agents::deny_agent(req, state, ctx, &id).await {
+        return refusal;
+    }
     if let Err(msg) = validate_mutable_agent_id(&id) {
         return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
     }
@@ -201,7 +257,11 @@ pub(crate) async fn handle_agents_purge(req: &WsRequest, state: &Arc<GatewayStat
 /// frontmatter, so this rewrites those files in place and re-runs discovery so
 /// the registry reports the new values back. A running instance keeps the
 /// system prompt it was spawned with — the rename lands on its next spawn.
-pub(crate) async fn handle_agents_rename(req: &WsRequest, state: &Arc<GatewayState>) -> WsResponse {
+pub(crate) async fn handle_agents_rename(
+    req: &WsRequest,
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+) -> WsResponse {
     #[derive(Debug, Deserialize)]
     struct RenameParams {
         agent_id: String,
@@ -215,6 +275,13 @@ pub(crate) async fn handle_agents_rename(req: &WsRequest, state: &Arc<GatewaySta
         Ok(p) => p,
         Err(res) => return res,
     };
+    // A rename rewrites the personality on disk; it is somebody else's file
+    // when the router restricts the agent, so it takes the same gate as the
+    // read handlers.
+    if let Some(refusal) = super::super::agents::deny_agent(req, state, ctx, &params.agent_id).await
+    {
+        return refusal;
+    }
     if let Err(msg) = validate_mutable_agent_id(&params.agent_id) {
         return WsResponse::err(&req.id, "INVALID_PARAMS", msg);
     }
@@ -380,9 +447,12 @@ mod tests {
                 .unwrap();
         }
 
-        let resp =
-            handle_agents_purge(&req("r1", Some(serde_json::json!({ "id": "doomed" }))), &state)
-                .await;
+        let resp = handle_agents_purge(
+            &req("r1", Some(serde_json::json!({ "id": "doomed" }))),
+            &state,
+            &ctx_for("shared"),
+        )
+        .await;
 
         assert!(resp.ok, "purge failed: {:?}", resp.error);
         assert_eq!(resp.payload.as_ref().unwrap()["status"], "purged");
@@ -397,9 +467,12 @@ mod tests {
     async fn purge_refuses_default_and_path_traversal() {
         let state = state().await;
         for id in ["default", "../escape", "a/b", ".hidden"] {
-            let resp =
-                handle_agents_purge(&req("r1", Some(serde_json::json!({ "id": id }))), &state)
-                    .await;
+            let resp = handle_agents_purge(
+                &req("r1", Some(serde_json::json!({ "id": id }))),
+                &state,
+                &ctx_for("shared"),
+            )
+            .await;
             assert!(!resp.ok, "id {id} must be refused");
             assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
         }
@@ -413,9 +486,12 @@ mod tests {
         seed_agent(&state, "doomed", "# Doomed\n\n## name\nDoomed\n", "soul\n").await;
         state.agents.router.set_default_agent("doomed").await;
 
-        let resp =
-            handle_agents_purge(&req("r1", Some(serde_json::json!({ "id": "doomed" }))), &state)
-                .await;
+        let resp = handle_agents_purge(
+            &req("r1", Some(serde_json::json!({ "id": "doomed" }))),
+            &state,
+            &ctx_for("shared"),
+        )
+        .await;
         assert!(resp.ok, "purge failed: {:?}", resp.error);
 
         // Unrouted messages must not be sent to an agent that no longer exists.
@@ -425,9 +501,12 @@ mod tests {
     #[tokio::test]
     async fn purge_unknown_agent_not_found() {
         let state = state().await;
-        let resp =
-            handle_agents_purge(&req("r1", Some(serde_json::json!({ "id": "ghost" }))), &state)
-                .await;
+        let resp = handle_agents_purge(
+            &req("r1", Some(serde_json::json!({ "id": "ghost" }))),
+            &state,
+            &ctx_for("shared"),
+        )
+        .await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "NOT_FOUND");
     }
@@ -439,9 +518,12 @@ mod tests {
         let state = state().await;
         seed_agent(&state, "on-disk", "# On Disk\n\n## name\nOn Disk\n", "soul\n").await;
 
-        let resp =
-            handle_agents_delete(&req("r1", Some(serde_json::json!({ "id": "on-disk" }))), &state)
-                .await;
+        let resp = handle_agents_delete(
+            &req("r1", Some(serde_json::json!({ "id": "on-disk" }))),
+            &state,
+            &ctx_for("shared"),
+        )
+        .await;
 
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "NOT_FOUND");
@@ -470,6 +552,7 @@ mod tests {
                 })),
             ),
             &state,
+            &ctx_for("shared"),
         )
         .await;
 
@@ -510,6 +593,7 @@ mod tests {
                     Some(serde_json::json!({ "agent_id": "renamable", "display_name": name })),
                 ),
                 &state,
+                &ctx_for("shared"),
             )
             .await;
             assert!(!resp.ok, "name {name:?} must be refused");
@@ -529,6 +613,7 @@ mod tests {
         let resp = handle_agents_rename(
             &req("r1", Some(serde_json::json!({ "agent_id": "ghost", "display_name": "X" }))),
             &state,
+            &ctx_for("shared"),
         )
         .await;
         assert!(!resp.ok);
@@ -538,9 +623,173 @@ mod tests {
         let resp = handle_agents_rename(
             &req("r1", Some(serde_json::json!({ "agent_id": "renamable" }))),
             &state,
+            &ctx_for("shared"),
         )
         .await;
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().code, "INVALID_PARAMS");
+    }
+
+    // ── Ownership at creation ────────────────────────────────────────────
+
+    fn ctx_for(user: &str) -> RequestContext {
+        RequestContext::new(user, crate::security::request_context::AuthSource::Session)
+    }
+
+    /// A caller with a real per-user identity becomes the owner of the agent
+    /// they create; that is the value both the response and the sidebar read.
+    #[tokio::test]
+    async fn create_records_the_caller_as_owner() {
+        let state = state().await;
+        // The spawn path needs *a* provider to build an agent; none of it is
+        // called, so a mock registry entry is enough to let creation proceed.
+        state
+            .infra
+            .model_router
+            .add_provider(
+                "openai",
+                crate::model_router::ProviderConfig {
+                    provider_type: crate::model_router::ProviderType::OpenAi,
+                    models: vec!["test-model".into()],
+                    default_model: "test-model".into(),
+                    api_key: "test-key".into(),
+                    api_keys: vec![],
+                    auth_profile: None,
+                    oauth: None,
+                    base_url: None,
+                    timeout: std::time::Duration::from_secs(30),
+                    max_retries: 1,
+                    retry_delay_ms: 10,
+                },
+            )
+            .await
+            .expect("register provider");
+
+        let req =
+            req("c", Some(serde_json::to_value(crate::agent::AgentConfig::default()).unwrap()));
+        let resp = handle_agents_create(&req, &state, &ctx_for("alice")).await;
+        assert!(resp.ok, "create failed: {:?}", resp.error);
+        let payload = resp.payload.unwrap();
+        assert_eq!(payload["owner"], "alice");
+        let id = payload["id"].as_str().unwrap();
+        let agents = state.agents.agents.read().await;
+        assert_eq!(
+            agents.get(id).unwrap().config.owner.as_deref(),
+            Some("alice"),
+            "the running agent carries the recorded owner"
+        );
+    }
+
+    /// A shared identity creates a shared agent — no owner is recorded.
+    #[tokio::test]
+    async fn create_from_a_shared_identity_leaves_no_owner() {
+        let state = state().await;
+        let resp = handle_agents_create(
+            &req("c", Some(serde_json::to_value(crate::agent::AgentConfig::default()).unwrap())),
+            &state,
+            &ctx_for("shared"),
+        )
+        .await;
+        if let Some(payload) = resp.payload {
+            assert!(
+                payload["owner"].is_null(),
+                "a shared identity must not become an owner: {payload}"
+            );
+        }
+    }
+
+    /// `resolve_owner` is the whole decision, so it is tested on its own — the
+    /// spawn path needs a configured provider and this does not.
+    #[test]
+    fn resolve_owner_prefers_an_explicit_owner() {
+        assert_eq!(
+            resolve_owner(Some("bob".into()), &ctx_for("alice")),
+            Some("bob".to_string()),
+            "an explicit owner is kept, even when it names someone else"
+        );
+    }
+
+    #[test]
+    fn resolve_owner_defaults_to_a_real_principal() {
+        assert_eq!(resolve_owner(None, &ctx_for("alice")), Some("alice".to_string()));
+        assert_eq!(
+            resolve_owner(None, &ctx_for("  zhangsan  ")),
+            Some("zhangsan".to_string()),
+            "the principal is trimmed"
+        );
+    }
+
+    /// The shared identities mean "no per-user identity exists", so recording
+    /// one as an owner would claim a person who is not one.
+    #[test]
+    fn resolve_owner_skips_shared_identities() {
+        for id in ["shared", "anonymous", "ws-user", "WS-USER", "", "   "] {
+            assert_eq!(resolve_owner(None, &ctx_for(id)), None, "{id:?} must not become an owner");
+        }
+    }
+
+    /// The destructive handlers are not a read surface, so they take the same
+    /// gate as `agents.get_config`: a caller who may not *use* an agent may not
+    /// unload, rename or purge it either. Purging someone else's agent is the
+    /// worst of the three — it is irreversible and takes their files with it.
+    #[tokio::test]
+    async fn destructive_handlers_refuse_another_persons_agent() {
+        let state = state().await;
+        seed_agent(&state, "bob-bot", "# Bob\n\n## name\nBob\n", "soul\n").await;
+        state
+            .agents
+            .router
+            .set_agent_principals("bob-bot", vec!["bob".to_string()])
+            .await;
+        let alice = ctx_for("alice");
+
+        let refusals = [
+            handle_agents_delete(
+                &req("r1", Some(serde_json::json!({ "id": "bob-bot" }))),
+                &state,
+                &alice,
+            )
+            .await,
+            handle_agents_purge(
+                &req("r2", Some(serde_json::json!({ "id": "bob-bot" }))),
+                &state,
+                &alice,
+            )
+            .await,
+            handle_agents_rename(
+                &req("r3", Some(serde_json::json!({ "agent_id": "bob-bot", "display_name": "X" }))),
+                &state,
+                &alice,
+            )
+            .await,
+        ];
+        for (i, resp) in refusals.iter().enumerate() {
+            assert!(!resp.ok, "call {i} must be refused: {resp:?}");
+            assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN", "call {i}");
+        }
+
+        // Refused before touching anything: the personality is untouched and
+        // still on disk.
+        let identity =
+            tokio::fs::read_to_string(state.paths.agents_dir().join("bob-bot/IDENTITY.md"))
+                .await
+                .expect("bob's personality must survive the refusals");
+        assert!(identity.contains("Bob"), "identity: {identity}");
+        assert!(state.agents.registry.read().await.has("bob-bot"));
+
+        // Bob may still act on his own agent.
+        assert!(
+            handle_agents_rename(
+                &req(
+                    "ok",
+                    Some(serde_json::json!({ "agent_id": "bob-bot", "display_name": "Bob 2" })),
+                ),
+                &state,
+                &ctx_for("bob"),
+            )
+            .await
+            .ok,
+            "bob must still be able to rename his own agent"
+        );
     }
 }

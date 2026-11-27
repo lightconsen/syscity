@@ -76,7 +76,7 @@ pub use multimodal::{
     MemoryMultimodalModality, MultimodalFileEntry, MultimodalStore, AUDIO_EXTENSIONS,
     DEFAULT_MEMORY_MULTIMODAL_MAX_FILE_BYTES, IMAGE_EXTENSIONS,
 };
-pub use personality::{MemoryContext, MemoryType, PersonalityMemory};
+pub use personality::{MemoryContext, MemoryType, PersonalityMemory, SHARED_IDENTITIES};
 pub use qmd::{QmdExecutor, QmdQueryResult, QmdScope};
 pub use session_search::{SearchResult, SessionSearch, SessionSearchQuery};
 pub use soul::{BehaviorConfig, PreferenceConfig, SoulConfig, SoulFile};

@@ -189,11 +189,106 @@ impl MemoryType {
     }
 }
 
+/// Identities that mean "the deployment has no per-user identity".
+///
+/// Under `shared_token` every caller resolves to `"shared"`; an unauthenticated
+/// connection is `"anonymous"`; some transports use `"ws-user"`. Partitioning
+/// on any of these would move a single-user deployment's files into a
+/// `users/shared/` directory for no isolation benefit — everyone who can reach
+/// the gateway is that same principal.
+pub const SHARED_IDENTITIES: &[&str] = &["shared", "anonymous", "ws-user"];
+
+/// Which human a [`PersonalityMemory`] is scoped to, if any.
+///
+/// This is the second axis of the isolation problem. `SOUL.md`, `IDENTITY.md`,
+/// `BOOTSTRAP.md`, `AGENTS.md`, `TOOLS.md` and `HEARTBEAT.md` describe *the
+/// agent*; `USER.md`, `MEMORY.md` and the dated `memory/*.md` fragments
+/// describe *what it knows about one person*. When several people share one
+/// agent (one bot, per-agent access tokens, a server hosting one agent per
+/// team), the first set must stay shared and the second must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UserScope {
+    /// Everything lives in `base_dir` — the single-operator deployment, and
+    /// what every read did before this existed.
+    Shared,
+    /// The personal files live in `<base_dir>/users/<component>`.
+    ///
+    /// `component` is [`safe_path_component`] of the user id, never the raw
+    /// id: a channel can report a user id containing `/`, `..` or an absolute
+    /// path, and these are path components.
+    User { component: String },
+}
+
+impl UserScope {
+    /// The scope for `user_id`, or [`UserScope::Shared`] when partitioning
+    /// would not separate anybody.
+    fn from_user_id(user_id: Option<&str>) -> Self {
+        let Some(raw) = user_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return Self::Shared;
+        };
+        if SHARED_IDENTITIES
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(raw))
+        {
+            return Self::Shared;
+        }
+        match safe_path_component(raw) {
+            // A user id that sanitises to nothing cannot be partitioned on: two
+            // different people would collide in the same directory.
+            Some(component) => Self::User { component },
+            None => {
+                warn!("User id '{}' has no path-safe form; keeping personality memory shared", raw);
+                Self::Shared
+            }
+        }
+    }
+
+    /// Whether `mem_type` is personal rather than part of the agent's identity.
+    fn scopes_type(&self, mem_type: MemoryType) -> bool {
+        matches!(self, Self::User { .. })
+            && matches!(mem_type, MemoryType::User | MemoryType::Memory)
+    }
+}
+
+/// A path-safe form of an arbitrary identity, or `None` when nothing usable
+/// remains.
+///
+/// Keeps `[A-Za-z0-9._-]` and hex-escapes everything else, so `zhangsan`,
+/// `+86 138-0000`, `@alice` and `alice@example.com` all get distinct
+/// directories.
+///
+/// A leading `.` is escaped too: as the first character it would make the
+/// directory a hidden one, and `.` / `..` are the two components that stop
+/// being "a name" once joined to a path. Escaping rather than refusing keeps
+/// the mapping injective — `..` and `.` must not collide with each other or
+/// with a literal `%U002E`.
+fn safe_path_component(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    for (idx, ch) in raw.chars().enumerate() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => out.push(ch),
+            '.' if idx > 0 => out.push('.'),
+            // Escape by code point rather than by byte: a CJK name should
+            // survive as one recognizable token, not three `%XX` triples.
+            _ => out.push_str(&format!("%U{:04X}", ch as u32)),
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 /// Personality memory storage manager
 #[derive(Debug, Clone)]
 pub struct PersonalityMemory {
     /// Base directory for memory files
     base_dir: PathBuf,
+    /// Which human the personal files belong to.
+    ///
+    /// [`UserScope::Shared`] puts everything in `base_dir`, which is what every
+    /// deployment did before this field existed.
+    user_scope: UserScope,
     /// Maximum size for each individual memory file (chars)
     max_size: usize,
     /// Maximum combined size across all files loaded into a prompt (chars)
@@ -215,6 +310,72 @@ impl PersonalityMemory {
     /// 3. User level: ~/.syscity/memory-files/ (fallback)
     pub async fn new() -> crate::Result<Self> {
         Self::new_with_override(std::env::var("SYSCITY_PERSONALITY_DIR").ok()).await
+    }
+
+    /// [`Self::new`], with the personal files partitioned per `user_id`.
+    ///
+    /// Same base directory as [`Self::new`], but `USER.md`, `MEMORY.md` and the
+    /// dated fragments live under `users/<id>/` instead of alongside the
+    /// agent's identity files. Two people sharing one agent therefore stop
+    /// reading each other's `USER.md` / `MEMORY.md`, while `SOUL.md` and the
+    /// rest — which describe the *agent* — stay shared.
+    ///
+    /// `user_id` is the principal the channel established. [`SHARED_IDENTITIES`]
+    /// and an empty id fall back to unpartitioned storage, so a single-user
+    /// deployment's files do not move on upgrade.
+    pub async fn for_user(user_id: Option<&str>) -> crate::Result<Self> {
+        let mut memory = Self::new().await?;
+        memory.user_scope = UserScope::from_user_id(user_id);
+        if let UserScope::User { .. } = memory.user_scope {
+            // Create the personal directory now, so the first read on a fresh
+            // profile is a miss rather than an I/O error.
+            let dir = memory.personal_dir();
+            fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| SyscityError::Storage {
+                    context: format!("Failed to create personal memory dir: {:?}", dir),
+                    details: e.to_string(),
+                })?;
+        }
+        Ok(memory)
+    }
+
+    /// [`Self::with_dir`], with the personal files partitioned per `user_id`.
+    ///
+    /// The testable counterpart to [`Self::for_user`]: the base directory is
+    /// given rather than resolved from the process environment.
+    pub async fn with_dir_for_user(
+        base_dir: PathBuf,
+        user_id: Option<&str>,
+    ) -> crate::Result<Self> {
+        let mut memory = Self::with_dir(base_dir).await?;
+        memory.user_scope = UserScope::from_user_id(user_id);
+        if let UserScope::User { .. } = memory.user_scope {
+            let dir = memory.personal_dir();
+            fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| SyscityError::Storage {
+                    context: format!("Failed to create personal memory dir: {:?}", dir),
+                    details: e.to_string(),
+                })?;
+        }
+        Ok(memory)
+    }
+
+    /// The directory holding this scope's personal files.
+    fn personal_dir(&self) -> PathBuf {
+        match &self.user_scope {
+            UserScope::Shared => self.base_dir.clone(),
+            UserScope::User { component } => self.base_dir.join("users").join(component),
+        }
+    }
+
+    /// The scope this instance reads and writes personal files under.
+    pub fn user_scope_component(&self) -> Option<&str> {
+        match &self.user_scope {
+            UserScope::Shared => None,
+            UserScope::User { component } => Some(component),
+        }
     }
 
     /// [`Self::new`] with the override passed in rather than read from the
@@ -295,6 +456,7 @@ impl PersonalityMemory {
 
         Ok(Self {
             base_dir,
+            user_scope: UserScope::Shared,
             max_size: DEFAULT_MAX_MEMORY_SIZE,
             total_max_size: DEFAULT_TOTAL_MAX_SIZE,
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -315,8 +477,17 @@ impl PersonalityMemory {
     }
 
     /// Get the path for a specific memory type
+    ///
+    /// Personal files (`USER.md`, `MEMORY.md`) go to the user's own directory
+    /// when this instance is user-scoped; everything else — the agent's
+    /// identity — stays in the shared base directory.
     fn memory_path(&self, mem_type: MemoryType) -> PathBuf {
-        self.base_dir.join(mem_type.filename())
+        let dir = if self.user_scope.scopes_type(mem_type) {
+            self.personal_dir()
+        } else {
+            self.base_dir.clone()
+        };
+        dir.join(mem_type.filename())
     }
 
     /// Read a file from `path`, using the in-process cache when the file is
@@ -419,6 +590,21 @@ impl PersonalityMemory {
     /// Write without security checks (internal use only).
     async fn write_unchecked(&self, mem_type: MemoryType, content: &str) -> crate::Result<()> {
         let path = self.memory_path(mem_type);
+
+        // A personal file's directory is created lazily here as well as in the
+        // constructors: a scope can be set on an instance whose user directory
+        // was never made (or was removed between two turns), and a write is the
+        // one operation that cannot degrade to "empty".
+        if self.user_scope.scopes_type(mem_type) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| SyscityError::Storage {
+                        context: format!("Failed to create personal memory dir: {:?}", parent),
+                        details: e.to_string(),
+                    })?;
+            }
+        }
 
         fs::write(&path, content)
             .await
@@ -618,30 +804,48 @@ impl PersonalityMemory {
     /// Load `memory/*.md` fragments from the memory directory, sorted
     /// chronologically by filename (YYYY-MM-DD.md files sort naturally).
     pub async fn load_memory_fragments(&self) -> Vec<(String, String)> {
-        let memory_dir = self.base_dir.join("memory");
-        if !memory_dir.exists() {
-            return vec![];
+        // Dated fragments are personal history, so a personal fragment is read
+        // *in addition to* the shared ones: files already in `base_dir/memory/`
+        // were the single-operator deployment's own diary, and hiding them from
+        // the person they belong to on upgrade would look like memory loss.
+        //
+        // Personal first, so a fragment of the same name shadows the shared one
+        // instead of appearing twice under one date.
+        let shared_dir = self.base_dir.join("memory");
+        let personal_dir = self.personal_dir().join("memory");
+        let mut dirs = Vec::with_capacity(2);
+        if personal_dir != shared_dir {
+            dirs.push(personal_dir);
         }
-
-        let mut entries = match fs::read_dir(&memory_dir).await {
-            Ok(e) => e,
-            Err(_) => return vec![],
-        };
+        dirs.push(shared_dir);
 
         let mut fragments: Vec<(String, String)> = vec![];
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                let content = self.read_with_cache(&path).await.unwrap_or_default();
-                if !content.is_empty() {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("memory")
-                        .to_string();
-                    // Apply per-file cap to each fragment.
-                    let content = truncate_with_head_tail(&content, self.max_size);
-                    fragments.push((name, content));
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for memory_dir in dirs {
+            if !memory_dir.exists() {
+                continue;
+            }
+            let Ok(mut entries) = fs::read_dir(&memory_dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    let content = self.read_with_cache(&path).await.unwrap_or_default();
+                    if !content.is_empty() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("memory")
+                            .to_string();
+                        // First writer wins: personal is scanned before shared.
+                        if !seen.insert(name.clone()) {
+                            continue;
+                        }
+                        // Apply per-file cap to each fragment.
+                        let content = truncate_with_head_tail(&content, self.max_size);
+                        fragments.push((name, content));
+                    }
                 }
             }
         }
@@ -779,6 +983,26 @@ impl PersonalityMemory {
     /// workspaces. Only creates files for brand-new workspaces (no state
     /// file, no user content).
     pub async fn initialize_defaults(&self) -> crate::Result<()> {
+        // Seeding is about the *workspace*, not about one person: these files
+        // are the agent's identity plus the first-run templates, and
+        // `WorkspaceManager` is keyed on `base_dir`. A user-scoped instance
+        // therefore seeds the shared baseline and leaves the personal files
+        // empty — which is the honest state of "we know nothing about this
+        // person yet", and avoids writing one user's template into a directory
+        // the next user would then find pre-filled with someone else's name.
+        let seed = PersonalityMemory {
+            base_dir: self.base_dir.clone(),
+            user_scope: UserScope::Shared,
+            max_size: self.max_size,
+            total_max_size: self.total_max_size,
+            cache: self.cache.clone(),
+            append_lock: self.append_lock.clone(),
+        };
+        seed.initialize_shared_defaults().await
+    }
+
+    /// Seed `base_dir` with the baseline personality files, if absent.
+    async fn initialize_shared_defaults(&self) -> crate::Result<()> {
         use crate::memory::workspace_state::WorkspaceManager;
 
         let workspace_manager = WorkspaceManager::new(self.base_dir.clone());
@@ -1675,5 +1899,168 @@ mod tests {
         // A second merge with the same analysis should not change anything.
         let changed = memory.update_soul_from_analysis(&analysis).await.unwrap();
         assert!(!changed);
+    }
+
+    // ── Per-user partitioning ────────────────────────────────────────────
+
+    /// The whole point: two people sharing one agent must not read each
+    /// other's `USER.md` / `MEMORY.md`, while the agent's own identity files
+    /// stay shared.
+    #[tokio::test]
+    async fn personal_files_are_partitioned_but_identity_stays_shared() {
+        let dir = std::env::temp_dir().join(format!("syscity_scope_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let alice = PersonalityMemory::with_dir_for_user(dir.clone(), Some("zhangsan"))
+            .await
+            .unwrap();
+        let bob = PersonalityMemory::with_dir_for_user(dir.clone(), Some("lisi"))
+            .await
+            .unwrap();
+
+        alice
+            .write(MemoryType::User, "Alice's profile")
+            .await
+            .unwrap();
+        bob.write(MemoryType::User, "Bob's profile").await.unwrap();
+        alice
+            .write(MemoryType::Memory, "Alice's notes")
+            .await
+            .unwrap();
+        bob.write(MemoryType::Memory, "Bob's notes").await.unwrap();
+
+        // Personal files are isolated in both directions.
+        assert_eq!(alice.read(MemoryType::User).await.unwrap(), "Alice's profile");
+        assert_eq!(bob.read(MemoryType::User).await.unwrap(), "Bob's profile");
+        assert_eq!(alice.read(MemoryType::Memory).await.unwrap(), "Alice's notes");
+        assert_eq!(bob.read(MemoryType::Memory).await.unwrap(), "Bob's notes");
+
+        // ...and land in separate directories.
+        assert_eq!(
+            alice.memory_path(MemoryType::User).parent().unwrap(),
+            dir.join("users/zhangsan")
+        );
+        assert_eq!(bob.memory_path(MemoryType::User).parent().unwrap(), dir.join("users/lisi"));
+
+        // Identity is the agent's, not the person's: one file, one value.
+        alice.write(MemoryType::Soul, "shared soul").await.unwrap();
+        assert_eq!(bob.read(MemoryType::Soul).await.unwrap(), "shared soul");
+        assert_eq!(alice.memory_path(MemoryType::Soul), dir.join("SOUL.md"));
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// A single-operator deployment must not move its files on upgrade.
+    #[tokio::test]
+    async fn shared_identities_keep_the_flat_layout() {
+        let dir = std::env::temp_dir().join(format!("syscity_shared_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        for principal in ["shared", "anonymous", "ws-user", "SHARED"] {
+            let memory = PersonalityMemory::with_dir_for_user(dir.clone(), Some(principal))
+                .await
+                .unwrap();
+            assert_eq!(
+                memory.memory_path(MemoryType::User),
+                dir.join("USER.md"),
+                "'{principal}' must not be partitioned"
+            );
+            assert_eq!(memory.user_scope_component(), None);
+        }
+
+        // And no user is the same as any of them.
+        let none = PersonalityMemory::with_dir_for_user(dir.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(none.memory_path(MemoryType::Memory), dir.join("MEMORY.md"));
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// A channel-reported id is untrusted input on its way to being a path.
+    #[test]
+    fn user_ids_sanitise_into_distinct_path_components() {
+        assert_eq!(safe_path_component("zhangsan").as_deref(), Some("zhangsan"));
+        // Distinct ids stay distinct — the escape is injective enough for the
+        // ids a channel actually reports.
+        let ids = ["../../etc", "a/b", "alice@example.com", "+86 138"];
+        let components: Vec<String> = ids
+            .iter()
+            .map(|id| safe_path_component(id).unwrap_or_default())
+            .collect();
+        for c in &components {
+            assert!(!c.contains('/'), "'{c}' must not contain a separator");
+            assert!(*c != "." && *c != "..", "'{c}' must not be a traversal");
+            assert!(!c.starts_with('.'), "'{c}' must not be hidden/dot-prefixed");
+        }
+        let unique: std::collections::HashSet<&String> = components.iter().collect();
+        assert_eq!(unique.len(), components.len(), "ids collided: {components:?}");
+
+        // Nothing usable remains only when the id is empty. `.` and `..` are
+        // escaped, not refused: refusing them would make the mapping
+        // non-injective (`..` and `%U002E%U002E` would collide), and escaping
+        // already yields a component that is neither `.` nor `..`.
+        assert!(safe_path_component("").is_none());
+        assert!(safe_path_component("..").is_some_and(|c| c != ".." && c != "."));
+        assert!(safe_path_component(".").is_some_and(|c| c != ".." && c != "."));
+    }
+
+    /// A personal fragment shadows the shared one of the same name instead of
+    /// being shown twice.
+    #[tokio::test]
+    async fn personal_fragments_shadow_shared_ones() {
+        let dir = std::env::temp_dir().join(format!("syscity_frag_{}", uuid::Uuid::new_v4()));
+        let shared_dir = dir.join("memory");
+        tokio::fs::create_dir_all(&shared_dir).await.unwrap();
+        tokio::fs::write(shared_dir.join("2026-01-01.md"), "shared day")
+            .await
+            .unwrap();
+        tokio::fs::write(shared_dir.join("2026-01-02.md"), "only shared")
+            .await
+            .unwrap();
+
+        let alice = PersonalityMemory::with_dir_for_user(dir.clone(), Some("zhangsan"))
+            .await
+            .unwrap();
+        let personal_dir = dir.join("users/zhangsan/memory");
+        tokio::fs::create_dir_all(&personal_dir).await.unwrap();
+        tokio::fs::write(personal_dir.join("2026-01-01.md"), "alice's day")
+            .await
+            .unwrap();
+
+        let fragments = alice.load_memory_fragments().await;
+        let day_one: Vec<&String> = fragments
+            .iter()
+            .filter(|(name, _)| name == "2026-01-01.md")
+            .map(|(_, content)| content)
+            .collect();
+        assert_eq!(day_one, vec!["alice's day"], "personal entry must win, once");
+        // A shared-only day is still visible: the shared diary is not hidden.
+        assert!(fragments.iter().any(|(n, _)| n == "2026-01-02.md"));
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// Seeding writes the shared baseline, never another person's directory.
+    #[tokio::test]
+    async fn seeding_leaves_personal_dirs_empty() {
+        let dir = std::env::temp_dir().join(format!("syscity_seed_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let alice = PersonalityMemory::with_dir_for_user(dir.clone(), Some("zhangsan"))
+            .await
+            .unwrap();
+
+        alice.initialize_defaults().await.unwrap();
+
+        // The agent's identity is seeded, in the shared root.
+        assert!(dir.join("SOUL.md").exists(), "SOUL.md must be seeded in the shared root");
+        // The first user's template is not written into their private dir as
+        // though it were the agent's own USER.md.
+        assert!(
+            !dir.join("users/zhangsan/USER.md").exists(),
+            "the private USER.md must start absent, not pre-filled"
+        );
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
     }
 }

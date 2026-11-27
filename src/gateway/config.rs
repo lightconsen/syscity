@@ -680,6 +680,20 @@ pub struct AgentOverrides {
     /// `"shared"`, so a per-agent list there cannot distinguish people — use
     /// device pairing or channel ids if that matters.
     pub allowed_users: Option<Vec<String>>,
+    /// The user this agent belongs to, when it is one person's assistant.
+    ///
+    /// Descriptive, not authoritative: `allowed_users` decides who may *use*
+    /// the agent, and this only records who it is *for*, so a client can group
+    /// "my agents" apart from the team's. Unset means a shared/team agent.
+    ///
+    /// ```toml
+    /// [agent_overrides."agent-zhangsan"]
+    /// owner = "zhangsan"
+    /// ```
+    ///
+    /// Set automatically by `agents.create` to the caller's principal; an
+    /// operator writing this by hand is doing the same thing expressly.
+    pub owner: Option<String>,
 }
 
 impl AgentOverrides {
@@ -697,6 +711,7 @@ impl AgentOverrides {
             && self.hourly_action_limit.is_none()
             && self.permissions.is_none()
             && self.allowed_users.is_none()
+            && self.owner.is_none()
     }
 
     /// Overlay every non-`None` field onto a base `AgentConfig`.
@@ -727,6 +742,9 @@ impl AgentOverrides {
         }
         if let Some(v) = &self.permissions {
             cfg.permissions = Some(v.clone());
+        }
+        if let Some(v) = &self.owner {
+            cfg.owner = Some(v.clone());
         }
     }
 }
@@ -2303,6 +2321,23 @@ impl GatewayConfig {
             None
         };
 
+        // `owner` is parsed up front for the same reason: a refused value must
+        // not leave a phantom empty entry behind, and the `?` inside the arm
+        // below would return past the empty-entry cleanup.
+        let parsed_owner = if field == "owner" && !value.is_null() {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| invalid("owner must be a string".into()))?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        } else {
+            None
+        };
+
         let overrides = self
             .agent_overrides
             .entry(agent_id.to_string())
@@ -2538,6 +2573,17 @@ impl GatewayConfig {
                         c
                     }
                 }
+            }
+            "owner" => {
+                // Null (or an empty/whitespace string) means "shared agent",
+                // which is what an absent owner already means. Storing the
+                // empty string instead would make `config.get` report an owner
+                // that matches no user id.
+                //
+                // Anything else that is not a string was refused up front.
+                let c = overrides.owner != parsed_owner;
+                overrides.owner = parsed_owner;
+                c
             }
             other => {
                 return Err(crate::SyscityError::Config(ConfigError::InvalidValue {
@@ -3089,6 +3135,100 @@ shared_token = "abc"
             .allowed_users = Some(Vec::new());
 
         assert!(config.per_agent_allowed_users().is_empty());
+    }
+
+    /// `owner` is stored, trimmed, and cleared like every other override — and
+    /// clearing it must drop the entry, so `config.get` cannot report a shared
+    /// agent as owned.
+    #[test]
+    fn owner_override_round_trips_and_clears() {
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .apply_agent_override_field("zhangsan", "owner", &serde_json::json!("zhangsan"))
+            .unwrap());
+        assert_eq!(
+            config
+                .agent_overrides
+                .get("zhangsan")
+                .unwrap()
+                .owner
+                .as_deref(),
+            Some("zhangsan")
+        );
+
+        // Same value → no change; whitespace is trimmed before comparison.
+        assert!(!config
+            .apply_agent_override_field("zhangsan", "owner", &serde_json::json!("zhangsan"))
+            .unwrap());
+        assert!(!config
+            .apply_agent_override_field("zhangsan", "owner", &serde_json::json!("  zhangsan  "))
+            .unwrap());
+
+        // Null and the empty/whitespace string all mean "shared agent", and
+        // they drop the entry rather than leaving an empty table behind.
+        for clear in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            config
+                .apply_agent_override_field("zhangsan", "owner", &serde_json::json!("zhangsan"))
+                .unwrap();
+            config
+                .apply_agent_override_field("zhangsan", "owner", &clear)
+                .unwrap();
+            assert!(
+                !config.agent_overrides.contains_key("zhangsan"),
+                "{clear} must clear the entry"
+            );
+        }
+    }
+
+    /// A non-string `owner` is refused outright. Quietly treating `42` as
+    /// "shared" would let a typo silently detach an agent from its owner.
+    #[test]
+    fn owner_override_rejects_non_strings() {
+        let mut config = GatewayConfig::default();
+        for bad in [
+            serde_json::json!(42),
+            serde_json::json!(["zhangsan"]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                config
+                    .apply_agent_override_field("zhangsan", "owner", &bad)
+                    .is_err(),
+                "{bad} must be refused"
+            );
+            assert!(!config.agent_overrides.contains_key("zhangsan"));
+        }
+    }
+
+    /// The override reaches the effective config through `apply_to`, which is
+    /// the only path from TOML to a running agent.
+    #[test]
+    fn owner_override_reaches_the_agent_config() {
+        let mut config = GatewayConfig::default();
+        config
+            .apply_agent_override_field("zhangsan", "owner", &serde_json::json!("zhangsan"))
+            .unwrap();
+        let mut cfg = AgentConfig::default();
+        assert_eq!(cfg.owner, None, "the base config has no owner");
+        config.apply_agent_overrides("zhangsan", &mut cfg);
+        assert_eq!(cfg.owner.as_deref(), Some("zhangsan"));
+    }
+
+    /// A `[agent_overrides.x]` table that sets only `owner` must survive
+    /// `is_empty()` — otherwise it would be dropped as an empty table and the
+    /// ownership would vanish on the next read.
+    #[test]
+    fn owner_alone_keeps_an_override_entry() {
+        let mut config = GatewayConfig::default();
+        config
+            .apply_agent_override_field("zhangsan", "owner", &serde_json::json!("zhangsan"))
+            .unwrap();
+        assert!(config.agent_overrides.contains_key("zhangsan"));
+        assert!(!config.agent_overrides.get("zhangsan").unwrap().is_empty());
     }
 
     /// A narrowing is narrow-only, so it must not be possible to write an

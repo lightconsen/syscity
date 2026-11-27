@@ -27,8 +27,8 @@ impl SessionStore {
 
         sqlx::query(
             r#"
-            INSERT INTO sessions (id, agent_id, channel, channel_id, created_at, last_activity, is_active, pinned, state_json, message_count, name, bound_agent_id, transcript_id, model)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, agent_id, channel, channel_id, created_at, last_activity, is_active, pinned, state_json, message_count, name, bound_agent_id, transcript_id, model, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 agent_id = excluded.agent_id,
                 channel = excluded.channel,
@@ -40,7 +40,11 @@ impl SessionStore {
                 name = excluded.name,
                 bound_agent_id = excluded.bound_agent_id,
                 transcript_id = excluded.transcript_id,
-                model = excluded.model
+                model = excluded.model,
+                -- Never clear a recorded owner: a later save that does not know
+                -- the user (a background write, a cron touch) must not erase
+                -- what the session's own transport established.
+                user_id = COALESCE(excluded.user_id, sessions.user_id)
             "#,
         )
         .bind(session_id)
@@ -57,6 +61,7 @@ impl SessionStore {
         .bind(&metadata.bound_agent_id)
         .bind(&metadata.transcript_id)
         .bind(&metadata.model)
+        .bind(&metadata.user_id)
         .execute(&self.pool)
         .await
         .map_err(|e| SyscityError::Storage { context: "Failed to save session".to_string(), details: e.to_string() })?;
@@ -76,16 +81,43 @@ impl SessionStore {
     /// are never clobbered. Safe to call from background tasks racing with the
     /// session-create handler.
     pub async fn ensure_session_row(&self, session_id: &str) -> Result<()> {
+        self.ensure_session_row_owned(session_id, None).await
+    }
+
+    /// [`ensure_session_row`](Self::ensure_session_row), recording the owner
+    /// when the transport knows one.
+    ///
+    /// A stub written by a background touch must not leave `user_id` NULL if
+    /// the conversation was already attributed, and a first write from the
+    /// chat path should record it — hence `COALESCE` on conflict.
+    pub async fn ensure_session_row_owned(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
+        let user_id = user_id.map(str::trim).filter(|id| !id.is_empty());
+        let is_shared = user_id.is_some_and(|id| {
+            crate::memory::SHARED_IDENTITIES
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(id))
+        });
+        let user_id = match user_id {
+            Some(id) if !is_shared => Some(id),
+            _ => None,
+        };
         sqlx::query(
             r#"
-            INSERT OR IGNORE INTO sessions (id, agent_id, channel, channel_id, created_at, last_activity, is_active, state_json, message_count)
-            VALUES (?, '', '', '', ?, ?, 1, '{}', 0)
+            INSERT INTO sessions (id, agent_id, channel, channel_id, created_at, last_activity, is_active, state_json, message_count, user_id)
+            VALUES (?, '', '', '', ?, ?, 1, '{}', 0, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                user_id = COALESCE(excluded.user_id, sessions.user_id)
             "#,
         )
         .bind(session_id)
         .bind(now)
         .bind(now)
+        .bind(user_id)
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -103,7 +135,7 @@ impl SessionStore {
     pub async fn load_session(&self, session_id: &str) -> Result<Option<PersistedSession>> {
         let row = sqlx::query(
             r#"
-            SELECT id, agent_id, channel, channel_id, created_at, last_activity, is_active, pinned, state_json, message_count, name, bound_agent_id, transcript_id, model
+            SELECT id, agent_id, channel, channel_id, created_at, last_activity, is_active, pinned, state_json, message_count, name, bound_agent_id, transcript_id, model, user_id
             FROM sessions
             WHERE id = ?
             "#,
@@ -133,6 +165,7 @@ impl SessionStore {
                     bound_agent_id: row.get("bound_agent_id"),
                     transcript_id: row.get("transcript_id"),
                     model: row.get("model"),
+                    user_id: row.get("user_id"),
                 };
 
                 let session = PersistedSession {
@@ -165,9 +198,30 @@ impl SessionStore {
         channel_id: Option<&str>,
         active_only: bool,
     ) -> Result<Vec<SessionMetadata>> {
+        self.find_sessions_for_user(agent_id, channel, channel_id, active_only, None)
+            .await
+    }
+
+    /// [`find_sessions`](Self::find_sessions), restricted to one owner.
+    ///
+    /// `user_id` is a *positive* filter: `Some` returns rows attributed to that
+    /// user, `None` applies no filter and returns everything, which is what
+    /// every existing caller wants (the agent and CLI surfaces are
+    /// single-identity or operator-scoped). Filtering for "unowned" rows is
+    /// deliberately not expressible — that is not a listing any surface needs,
+    /// and the two states would be easy to confuse at a call site.
+    pub async fn find_sessions_for_user(
+        &self,
+        agent_id: Option<&str>,
+        channel: Option<&str>,
+        channel_id: Option<&str>,
+        active_only: bool,
+        user_id: Option<&str>,
+    ) -> Result<Vec<SessionMetadata>> {
         let mut query = String::from(
             "SELECT id, agent_id, channel, channel_id, created_at, last_activity, is_active, \
-             pinned, message_count, name, bound_agent_id, transcript_id, model FROM sessions WHERE 1=1",
+             pinned, message_count, name, bound_agent_id, transcript_id, model, user_id \
+             FROM sessions WHERE 1=1",
         );
 
         if agent_id.is_some() {
@@ -178,6 +232,9 @@ impl SessionStore {
         }
         if channel_id.is_some() {
             query.push_str(" AND channel_id = ?");
+        }
+        if user_id.is_some() {
+            query.push_str(" AND user_id = ?");
         }
         if active_only {
             query.push_str(" AND is_active = 1");
@@ -201,6 +258,7 @@ impl SessionStore {
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                Option<String>,
             ),
         >(sqlx::AssertSqlSafe(query.as_str()));
 
@@ -212,6 +270,9 @@ impl SessionStore {
         }
         if let Some(ch_id) = channel_id {
             sql_query = sql_query.bind(ch_id);
+        }
+        if let Some(user) = user_id {
+            sql_query = sql_query.bind(user);
         }
 
         let rows = sql_query
@@ -239,6 +300,7 @@ impl SessionStore {
                     bound_agent_id,
                     transcript_id,
                     model,
+                    user_id,
                 )| {
                     SessionMetadata {
                         session_id: id,
@@ -256,6 +318,7 @@ impl SessionStore {
                         bound_agent_id,
                         transcript_id,
                         model,
+                        user_id,
                     }
                 },
             )
@@ -1052,5 +1115,106 @@ mod tests {
             "Throughput: {} sessions, {} ops in {:?} = {:.1} RPS",
             n_sessions, total_ops, elapsed, rps
         );
+    }
+
+    // ── Session ownership ────────────────────────────────────────────────
+
+    /// A session's owner survives a round trip, and the per-user listing
+    /// returns only that person's rows.
+    #[tokio::test]
+    async fn sessions_can_be_listed_by_owner() {
+        let store = create_test_store().await;
+
+        let alice = SessionMetadata::new("alice-s", "default", "web", "zhangsan")
+            .with_user_id(Some("zhangsan"));
+        let bob =
+            SessionMetadata::new("bob-s", "default", "web", "lisi").with_user_id(Some("lisi"));
+        store.save_session("alice-s", &alice, "{}").await.unwrap();
+        store.save_session("bob-s", &bob, "{}").await.unwrap();
+
+        let loaded = store.load_session("alice-s").await.unwrap().unwrap();
+        assert_eq!(loaded.metadata.user_id.as_deref(), Some("zhangsan"));
+
+        let alices = store
+            .find_sessions_for_user(None, None, None, false, Some("zhangsan"))
+            .await
+            .unwrap();
+        assert_eq!(alices.len(), 1);
+        assert_eq!(alices[0].session_id, "alice-s");
+
+        // No filter is unchanged behaviour: both rows.
+        assert_eq!(
+            store
+                .find_sessions(None, None, None, false)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A background touch that does not know the user must not erase the
+    /// owner recorded when the conversation started.
+    #[tokio::test]
+    async fn a_later_save_without_a_user_keeps_the_recorded_owner() {
+        let store = create_test_store().await;
+        let owned =
+            SessionMetadata::new("s1", "default", "web", "u").with_user_id(Some("zhangsan"));
+        store.save_session("s1", &owned, "{}").await.unwrap();
+
+        // A save from a path with no identity in hand.
+        let anonymous = SessionMetadata::new("s1", "default", "web", "u");
+        store.save_session("s1", &anonymous, "{}").await.unwrap();
+
+        let loaded = store.load_session("s1").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.metadata.user_id.as_deref(),
+            Some("zhangsan"),
+            "a user-less save must not clear the owner"
+        );
+    }
+
+    /// `shared` / `anonymous` are not people: recording them would claim an
+    /// owner a single-identity deployment does not have.
+    #[tokio::test]
+    async fn shared_identities_are_not_recorded_as_owners() {
+        let store = create_test_store().await;
+        for principal in ["shared", "anonymous", "WS-USER", "  "] {
+            let meta = SessionMetadata::new(&format!("s-{principal}"), "default", "web", "u")
+                .with_user_id(Some(principal));
+            assert_eq!(meta.user_id, None, "'{principal}' must not be an owner");
+        }
+        let unset = SessionMetadata::new("s-none", "default", "web", "u").with_user_id(None);
+        assert_eq!(unset.user_id, None);
+        let _ = store;
+    }
+
+    /// Attribution via `ensure_session_row_owned` also refuses a shared
+    /// identity, so an implicitly-created row is not mislabelled.
+    #[tokio::test]
+    async fn ensuring_a_row_records_only_a_real_owner() {
+        let store = create_test_store().await;
+
+        store
+            .ensure_session_row_owned("shared-row", Some("shared"))
+            .await
+            .unwrap();
+        let row = store.load_session("shared-row").await.unwrap().unwrap();
+        assert_eq!(row.metadata.user_id, None);
+
+        store
+            .ensure_session_row_owned("owned-row", Some("zhangsan"))
+            .await
+            .unwrap();
+        let row = store.load_session("owned-row").await.unwrap().unwrap();
+        assert_eq!(row.metadata.user_id.as_deref(), Some("zhangsan"));
+
+        // A shared touch after attribution must not clear it.
+        store
+            .ensure_session_row_owned("owned-row", Some("shared"))
+            .await
+            .unwrap();
+        let row = store.load_session("owned-row").await.unwrap().unwrap();
+        assert_eq!(row.metadata.user_id.as_deref(), Some("zhangsan"));
     }
 }

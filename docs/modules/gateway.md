@@ -154,4 +154,5 @@ pub struct GatewayConfig {
 - Secret masking on all config read surfaces (WS `config.get`, gateway tool `config.get` / `config.schema.lookup`, REST config handler) via `secrets::mask_json_value`
 - Config revision CAS: `config.get` returns a SHA-256 `revision`; `config.set` accepts `base_revision` and rejects stale writes with `REVISION_CONFLICT`
 - Human-in-the-loop `ask_user` flow: `ask.required` / `ask.resolved` events forwarded onto the WS bus, answered via `ask.respond`
+- Per-principal isolation over the WS surface: `agents.list` / `agents.registry` leave out agents the router's `allowed_users` would refuse, and every handler that names an agent (`agents.get`, `agents.get_config`, `agents.update`, `agents.memory.get` / `.clear`, `agents.export` / `import`, and the destructive `agents.delete` / `purge` / `rename`) refuses one the caller may not use — a hidden name that still answers when typed is not isolation. `sessions.list` filters by the recorded owner, and `sessions.create` authorizes the target agent *before* writing anything, so a refused session leaves no row behind
 

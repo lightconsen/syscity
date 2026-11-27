@@ -484,7 +484,19 @@ async fn handle_websocket(
 
     let mut proto_conn = ProtocolConnection::new(conn_id.clone());
     if let Some(sid) = query.session_id {
-        proto_conn.subscriptions.push(sid);
+        // The upgrade URL can name a subscription, and the URL is not the
+        // method surface: without this check a caller could follow their own
+        // ownership-gated `sessions.subscribe` with a reconnect that subscribes
+        // to somebody else's conversation by query string alone.
+        if crate::gateway::ws::bound::session_send_allowed(&state, &sid).await {
+            proto_conn.subscriptions.push(sid);
+        } else {
+            warn!(
+                "[{}] Ignoring ?session_id={} on the upgrade URL: that session has an owner \
+                 and the URL carries no identity to compare it against",
+                conn_id, sid
+            );
+        }
     }
     let conn = Arc::new(tokio::sync::RwLock::new(proto_conn));
 
@@ -979,6 +991,52 @@ async fn dispatch_method(
         }
     }
 
+    // A session belongs to the person whose history it carries. `sessions.list`
+    // narrows to the caller already, but listing is not the promise: every
+    // handler that takes a session id must refuse one that is somebody else's,
+    // or the id is a capability (and `{channel}:{user}` ids are derivable). This
+    // is the same check for the connected caller, in one place, right beside the
+    // bound-connection one because it is the same kind of refusal.
+    //
+    // Both spellings: most handlers take a single `session_id`, but the
+    // subscription pair takes `session_ids` — and that one is the live event
+    // stream, so a single-missed spelling would hand over every token of
+    // somebody else's turn.
+    {
+        let single = req
+            .params
+            .as_ref()
+            .and_then(|p| p.get("session_id"))
+            .and_then(|v| v.as_str());
+        if let Some(session_id) = single {
+            if let Some(refusal) =
+                crate::gateway::ws::bound::deny_session_not_owned(req, state, &ctx, session_id)
+                    .await
+            {
+                return refusal;
+            }
+        }
+        let many: Vec<String> = req
+            .params
+            .as_ref()
+            .and_then(|p| p.get("session_ids"))
+            .and_then(|v| v.as_array())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for session_id in many {
+            if let Some(refusal) =
+                crate::gateway::ws::bound::deny_session_not_owned(req, state, &ctx, &session_id)
+                    .await
+            {
+                return refusal;
+            }
+        }
+    }
+
     match req.method.as_str() {
         "ping" => handshake::handle_ping(req),
         "methods.list" => handshake::handle_methods_list(req),
@@ -1014,19 +1072,19 @@ async fn dispatch_method(
         "sessions.subscribe" => sessions::handle_sessions_subscribe(req, conn, cmd_tx).await,
         "sessions.unsubscribe" => sessions::handle_sessions_unsubscribe(req, conn, cmd_tx).await,
         "agents.list" => agents::handle_agents_list(req, state, &ctx).await,
-        "agents.create" => admin_ws::handle_agents_create(req, state).await,
-        "agents.delete" => admin_ws::handle_agents_delete(req, state).await,
-        "agents.purge" => admin_ws::handle_agents_purge(req, state).await,
-        "agents.rename" => admin_ws::handle_agents_rename(req, state).await,
-        "agents.get" => agents::handle_agents_get(req, state).await,
+        "agents.create" => admin_ws::handle_agents_create(req, state, &ctx).await,
+        "agents.delete" => admin_ws::handle_agents_delete(req, state, &ctx).await,
+        "agents.purge" => admin_ws::handle_agents_purge(req, state, &ctx).await,
+        "agents.rename" => admin_ws::handle_agents_rename(req, state, &ctx).await,
+        "agents.get" => agents::handle_agents_get(req, state, &ctx).await,
         "agents.registry" => agents::handle_agents_registry(req, state, &ctx).await,
-        "agents.get_config" => agents::handle_agents_get_config(req, state).await,
-        "agents.update" => agents::handle_agents_update(req, state).await,
+        "agents.get_config" => agents::handle_agents_get_config(req, state, &ctx).await,
+        "agents.update" => agents::handle_agents_update(req, state, &ctx).await,
         "agents.default" => agents::handle_agents_default(req, state).await,
-        "agents.memory.get" => agents::handle_agents_memory_get(req, state).await,
-        "agents.memory.clear" => agents::handle_agents_memory_clear(req, state).await,
-        "agents.export" => agents::handle_agents_export(req, state).await,
-        "agents.import" => agents::handle_agents_import(req, state).await,
+        "agents.memory.get" => agents::handle_agents_memory_get(req, state, &ctx).await,
+        "agents.memory.clear" => agents::handle_agents_memory_clear(req, state, &ctx).await,
+        "agents.export" => agents::handle_agents_export(req, state, &ctx).await,
+        "agents.import" => agents::handle_agents_import(req, state, &ctx).await,
         "health" => agents::handle_health(req, state).await,
         "system.presence" => agents::handle_system_presence(req).await,
         "commands.list" => {

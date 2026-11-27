@@ -62,6 +62,7 @@ mod memory_tests;
 mod message_tool_tests;
 mod network_tests;
 mod task_time_tests;
+mod user_isolation_tests;
 #[cfg(feature = "vision")]
 mod vision_tests;
 mod web_tests;

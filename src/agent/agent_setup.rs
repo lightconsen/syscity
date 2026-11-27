@@ -636,8 +636,11 @@ impl Agent {
         // remote adapter), and the prompt's Host Environment section is the
         // model's only statement about which programs exist there.
         let desktop_os = self.computer_adapter.as_ref().and_then(|a| a.target_os());
+        // `user_id` partitions the personal memory files (`USER.md`,
+        // `MEMORY.md`), so two people sharing one agent do not read each
+        // other's profile. The agent's own identity files stay shared.
         let base_prompt = cfg
-            .full_system_prompt_with_personality_for_desktop(desktop_os)
+            .full_system_prompt_with_personality_for_desktop(desktop_os, Some(user_id))
             .await;
 
         // Derive KB collection from agent_id (e.g. "kb-sre")
