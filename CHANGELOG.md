@@ -130,6 +130,18 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Fixed
 
+- **`syscity agent switch` now actually changes where messages go.** The
+  command returned success but routing was untouched: `agents.default` wrote
+  the switchable default into a `RouteResolver` that nothing on the routing
+  path ever read, so every unrouted conversation still fell back to `default`.
+  The switchable default now lives in `AgentRouter` itself — the authority
+  `route()` and `resolve_by_session()` consult — and the dead `RouteResolver`
+  module is gone. Sessions already bound to an agent keep it: a switch changes
+  where *new, unrouted* conversations land. An unknown agent name is refused
+  with `AGENT_NOT_FOUND` instead of being stored, since routing every
+  unmatched message to an agent that cannot exist looks exactly like the
+  gateway silently dropping them; `agents.purge` resets a default that pointed
+  at the purged agent.
 - **A refused debounced message used to vanish.** Debounce is the normal path
   for a plain channel message, and the pipeline flushes those batches itself —
   so the caller that enqueued the message never sees an outcome for it, and a

@@ -39,7 +39,7 @@ pub use media::{MediaAttachmentCache, MediaUnderstandingPipeline, MediaUnderstan
 pub use queue::{QueueMode, QueueModeResolver};
 pub use router::{
     AgentRouter, AgentRouterConfig, BindingStore, InMemoryBindingStore, RouteOutcome, RouteResult,
-    SqliteBindingStore,
+    SqliteBindingStore, DEFAULT_AGENT_ID,
 };
 
 /// A message that has been processed by the inbound pipeline and is ready

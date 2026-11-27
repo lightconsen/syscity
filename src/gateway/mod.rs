@@ -500,7 +500,6 @@ impl Gateway {
                 group_manager: Arc::new(RwLock::new(crate::agent::GroupSessionManager::new())),
                 store: session_store.clone(),
                 message_buffer: Arc::new(RwLock::new(HashMap::new())),
-                route_resolver: Arc::new(crate::agent::RouteResolver::new("default")),
                 cost_guard: {
                     let guard = crate::agent::CostGuard::new(
                         config.cost_guard.daily_limit_cents,

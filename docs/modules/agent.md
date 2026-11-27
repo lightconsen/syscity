@@ -4,7 +4,6 @@ The central orchestrator that handles conversations, manages context, calls tool
 
 ## Design
 
-- **`route_resolution.rs`** — Determines which agent or subagent handles an incoming message.
 - **`context.rs`** — Builds and maintains the conversation context sent to the LLM. Appends a transient `[state snapshot]` user message (calendar date / weekday / timezone offset) to the tail of every request — it lives only in the request, never in history, so persistence, compaction, and undo are unaffected, and the system-prompt prefix stays byte-stable across threads (provider KV-cache reuse). The exact current time is available via the `time` tool; time is no longer baked into the system prompt.
 - **`budget.rs`** / **`disk_budget.rs`** / **`cost_guard.rs`** — Tracks iteration count, token usage, and disk budget to prevent runaway loops.
 - **`compressor.rs`** — Compresses conversation history when approaching token limits. `compact_with_llm` and `summarize()` snap the cut so the kept tail never starts on a tool result and a `tool_call` is never orphaned from its results (strict providers reject unbalanced sequences).

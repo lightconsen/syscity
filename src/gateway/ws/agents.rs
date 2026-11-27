@@ -261,7 +261,17 @@ pub(crate) async fn handle_agents_update(req: &WsRequest, state: &Arc<GatewaySta
     }
 }
 
-/// `agents.default` — switch the default agent (`{ agent_id }`).
+/// `agents.default` — switch the global default agent (`{ agent_id }`).
+///
+/// The default is where messages go when nothing else matched them (no
+/// `@mention`, no session binding, no channel or workspace default), so it is
+/// the routing authority itself — [`AgentRouter::set_default_agent`] — that is
+/// changed here, not a cached copy. Sessions already bound to an agent keep
+/// it; this only decides where new, unrouted conversations land.
+///
+/// A name that is not a real agent is refused rather than stored: an unrouted
+/// message would then be routed to an agent that can never handle it, which
+/// looks identical to the gateway silently dropping messages.
 pub(crate) async fn handle_agents_default(
     req: &WsRequest,
     state: &Arc<GatewayState>,
@@ -274,10 +284,25 @@ pub(crate) async fn handle_agents_default(
         Ok(p) => p,
         Err(res) => return res,
     };
+    if params.agent_id.trim().is_empty() {
+        return WsResponse::err(&req.id, "INVALID_PARAMS", "agent_id must not be empty");
+    }
+
+    let exists = {
+        let agents = state.agents.agents.read().await;
+        agents.contains_key(&params.agent_id)
+    } || state.agents.registry.read().await.has(&params.agent_id);
+    // The built-in default is always a legitimate destination even when it is
+    // not currently spawned (a fresh gateway, or a test state) — it is the one
+    // name that cannot be purged.
+    if !exists && params.agent_id != crate::inbound::DEFAULT_AGENT_ID {
+        return error_agent_not_found(&req.id);
+    }
+
     state
         .agents
-        .route_resolver
-        .set_default_agent(&params.agent_id)
+        .router
+        .set_default_agent(params.agent_id.clone())
         .await;
     WsResponse::ok(&req.id, serde_json::json!({ "agent_id": params.agent_id, "default": true }))
 }
@@ -650,8 +675,74 @@ mod tests {
         .await;
         assert!(!resp.ok);
     }
+    /// Switching the default must change where a message actually goes, not
+    /// just what a getter reports: the value the client switches is the value
+    /// the router reads for its global fallback.
     #[tokio::test]
-    async fn agents_default_switches_resolver() {
+    async fn agents_default_switches_where_unrouted_messages_go() {
+        let state = state().await;
+        state
+            .agents
+            .registry
+            .write()
+            .await
+            .insert_for_test(crate::agent::AgentPersonality {
+                id: "secretary".into(),
+                identity: "Secretary".into(),
+                is_valid: true,
+                ..Default::default()
+            });
+
+        // Nothing is bound and no route matches, so this is the fallback.
+        let before = state
+            .agents
+            .router
+            .route(&crate::channels::IncomingMessage::new("u1", "s-under-test", "hi"), None)
+            .await
+            .routed()
+            .expect("routed");
+        assert_eq!(before.agent_id, crate::inbound::DEFAULT_AGENT_ID);
+
+        let resp = handle_agents_default(
+            &req("r1", Some(serde_json::json!({ "agent_id": "secretary" }))),
+            &state,
+        )
+        .await;
+        assert!(resp.ok, "default failed: {:?}", resp.error);
+        assert_eq!(state.agents.router.default_agent().await, "secretary");
+
+        let after = state
+            .agents
+            .router
+            .route(&crate::channels::IncomingMessage::new("u2", "s-fresh", "hi"), None)
+            .await
+            .routed()
+            .expect("routed");
+        assert_eq!(after.agent_id, "secretary");
+        assert!(after.is_fallback);
+    }
+
+    /// An unknown name is refused and leaves the previous default in place.
+    /// Storing it would route every unrouted message to an agent that can
+    /// never handle one — indistinguishable, from the outside, from the
+    /// gateway dropping the message.
+    #[tokio::test]
+    async fn agents_default_refuses_an_unknown_agent() {
+        let state = state().await;
+        let resp = handle_agents_default(
+            &req("r1", Some(serde_json::json!({ "agent_id": "ghost" }))),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().code, "AGENT_NOT_FOUND");
+        assert_eq!(state.agents.router.default_agent().await, crate::inbound::DEFAULT_AGENT_ID);
+    }
+
+    /// The built-in default is always a valid target, even in a state where it
+    /// is not spawned and has no personality on disk.
+    #[tokio::test]
+    async fn agents_default_accepts_the_built_in_default() {
         let state = state().await;
         let resp = handle_agents_default(
             &req("r1", Some(serde_json::json!({ "agent_id": "default" }))),
@@ -659,7 +750,7 @@ mod tests {
         )
         .await;
         assert!(resp.ok, "default failed: {:?}", resp.error);
-        assert_eq!(state.agents.route_resolver.default_agent().await, "default");
+        assert_eq!(state.agents.router.default_agent().await, "default");
     }
 
     #[tokio::test]

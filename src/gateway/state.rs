@@ -21,7 +21,7 @@ use crate::acp::AcpControlPlane;
 use crate::adapters::Storage;
 use crate::agent::{
     session_store::SessionStore, AgentRegistry, ArtifactStore, CostGuard, DiskBudgetManager,
-    GroupSessionManager, RouteResolver, SessionFileManager, SessionManager, TranscriptStore,
+    GroupSessionManager, SessionFileManager, SessionManager, TranscriptStore,
 };
 use crate::canvas::CanvasManager;
 use crate::channels::snapshot::AccountSnapshotStore;
@@ -80,13 +80,16 @@ pub struct AgentState {
     /// used so the guard can release the entry synchronously in Drop without
     /// spawning a detached cleanup task.
     pub pending_spawns: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// The routing authority: which agent a message goes to, including the
+    /// switchable global default (`agents.default`). There is deliberately no
+    /// second default-agent store — one authority means the value a client
+    /// switches is the value routing reads.
     pub router: Arc<AgentRouter>,
     pub registry: Arc<RwLock<AgentRegistry>>,
     pub manager: Arc<RwLock<SessionManager>>,
     pub group_manager: Arc<RwLock<GroupSessionManager>>,
     pub store: Option<Arc<SessionStore>>,
     pub message_buffer: Arc<RwLock<HashMap<String, Vec<crate::gateway::BufferedMessage>>>>,
-    pub route_resolver: Arc<RouteResolver>,
     pub cost_guard: Arc<CostGuard>,
     pub repair_state: Arc<RepairState>,
     pub acp: Arc<AcpControlPlane>,

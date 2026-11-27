@@ -66,10 +66,22 @@ impl RouteOutcome {
     }
 }
 
+/// The id of the built-in agent every gateway spawns at startup.
+///
+/// It is the router's default until `agents.default` says otherwise, and the
+/// one agent name that always exists: it cannot be renamed, deleted or
+/// purged, so switching the default back to it is always valid.
+pub const DEFAULT_AGENT_ID: &str = "default";
+
 /// Configuration for the agent router.
 #[derive(Debug, Clone)]
 pub struct AgentRouterConfig {
-    /// Default agent ID when no other route matches.
+    /// Agent ID when no other route matches, as of construction.
+    ///
+    /// This is only the *initial* value: [`AgentRouter::set_default_agent`]
+    /// changes the live default without rebuilding the router, because the
+    /// pipeline holds the router for the process lifetime and `agents.default`
+    /// must take effect on the next message.
     pub default_agent_id: String,
     /// Default workspace ID when no other route matches.
     pub default_workspace_id: Option<String>,
@@ -80,7 +92,7 @@ pub struct AgentRouterConfig {
 impl Default for AgentRouterConfig {
     fn default() -> Self {
         Self {
-            default_agent_id: "default".to_string(),
+            default_agent_id: DEFAULT_AGENT_ID.to_string(),
             default_workspace_id: None,
             auto_create_binding: true,
         }
@@ -298,11 +310,21 @@ pub struct AgentRouter {
     /// Tracks whether auto-create has been disabled via config, used for
     /// logging/observability only; the actual gate is in `bind_session`.
     auto_create_binding: AtomicBool,
+    /// The live global default agent.
+    ///
+    /// `config.default_agent_id` is the value the router was built with; this
+    /// is the one routing actually reads, because `agents.default` switches it
+    /// while the gateway is running. It lives here rather than in `config`
+    /// because the router is held by the inbound pipeline by `Arc` for the
+    /// process lifetime — a rebuild would lose every session binding — and
+    /// `AgentRouterConfig` is otherwise immutable by design.
+    default_agent_id: RwLock<String>,
 }
 
 impl AgentRouter {
     pub fn new(config: AgentRouterConfig) -> Self {
         let auto_create_binding = AtomicBool::new(config.auto_create_binding);
+        let default_agent_id = RwLock::new(config.default_agent_id.clone());
         Self {
             config,
             session_bindings: RwLock::new(HashMap::new()),
@@ -312,7 +334,28 @@ impl AgentRouter {
             binding_store: None,
             conversation_resolver: None,
             auto_create_binding,
+            default_agent_id,
         }
+    }
+
+    /// The agent messages fall back to when no route matches.
+    pub async fn default_agent(&self) -> String {
+        self.default_agent_id.read().await.clone()
+    }
+
+    /// Switch the global default agent (`agents.default`).
+    ///
+    /// Sessions that were already bound keep their agent: a switch changes
+    /// where *unrouted* conversations go, not where existing ones point. The
+    /// caller is responsible for deciding whether the new default is a real
+    /// agent.
+    pub async fn set_default_agent(&self, agent_id: impl Into<String>) {
+        let agent_id = agent_id.into();
+        let previous = {
+            let mut current = self.default_agent_id.write().await;
+            std::mem::replace(&mut *current, agent_id.clone())
+        };
+        info!("Global default agent switched from '{}' to '{}'", previous, agent_id);
     }
 
     /// Create a deep copy of this router, including all in-memory bindings and
@@ -337,6 +380,7 @@ impl AgentRouter {
             binding_store: self.binding_store.clone(),
             conversation_resolver: None,
             auto_create_binding: AtomicBool::new(self.auto_create_binding.load(Ordering::Acquire)),
+            default_agent_id: RwLock::new(self.default_agent_id.read().await.clone()),
         }
     }
 
@@ -535,24 +579,24 @@ impl AgentRouter {
         // make `allowed_users` on the default agent decorative: any stranger
         // whose message matched no binding (which is everyone, at first) would
         // reach the very agent the restriction is meant to close.
-        if !self
-            .allows_principal(&self.config.default_agent_id, caller)
-            .await
-        {
+        //
+        // Read once into a local: the default is switchable at runtime, and a
+        // route that read it twice could name one agent in the refusal and
+        // bind another.
+        let default_agent = self.default_agent().await;
+        if !self.allows_principal(&default_agent, caller).await {
             info!(
                 "Refusing default agent '{}' for session {}: '{}' is not an allowed principal",
-                self.config.default_agent_id, session_id, caller
+                default_agent, session_id, caller
             );
-            return RouteOutcome::Denied {
-                agent_id: self.config.default_agent_id.clone(),
-            };
+            return RouteOutcome::Denied { agent_id: default_agent };
         }
         debug!(
             "No binding found for session {}, using default agent {}",
-            session_id, self.config.default_agent_id
+            session_id, default_agent
         );
         let mut result = RouteResult {
-            agent_id: self.config.default_agent_id.clone(),
+            agent_id: default_agent,
             workspace_id: self.config.default_workspace_id.clone(),
             persisted_binding: true,
             is_fallback: true,
@@ -813,12 +857,13 @@ impl AgentRouter {
         }
 
         // 2. Fall back to global default
+        let default_agent = self.default_agent().await;
         debug!(
             "No binding found for session {}, using default agent {}",
-            session_id, self.config.default_agent_id
+            session_id, default_agent
         );
         let mut result = RouteResult {
-            agent_id: self.config.default_agent_id.clone(),
+            agent_id: default_agent,
             workspace_id: self.config.default_workspace_id.clone(),
             persisted_binding: true,
             is_fallback: true,
@@ -1342,5 +1387,92 @@ mod tests {
         let clone = router.deep_clone().await;
         assert!(clone.allows_principal("alice", "u-alice").await);
         assert!(!clone.allows_principal("alice", "u-bob").await);
+    }
+
+    /// `agents.default` must change routing, not just configuration: after the
+    /// switch, a message that matches nothing resolves to the new agent.
+    #[tokio::test]
+    async fn a_switched_default_takes_over_the_global_fallback() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        assert_eq!(router.default_agent().await, DEFAULT_AGENT_ID);
+
+        router.set_default_agent("secretary").await;
+
+        let route = router
+            .route(&IncomingMessage::new("u1", "s1", "hello"), None)
+            .await
+            .routed()
+            .expect("routed");
+        assert_eq!(route.agent_id, "secretary");
+        assert!(route.is_fallback);
+        assert!(route.persisted_binding, "the fallback binds the session");
+    }
+
+    /// The switch reaches the by-session path too — `chat.send` reports the
+    /// routing decision it just made from `resolve_by_session`.
+    #[tokio::test]
+    async fn a_switched_default_is_used_by_resolve_by_session() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router.set_default_agent("secretary").await;
+        let route = router.resolve_by_session("s-new").await;
+        assert_eq!(route.agent_id, "secretary");
+        assert!(route.is_fallback);
+    }
+
+    /// A switch does not relocate conversations that were already routed:
+    /// rebinding them would move a person's history out from under them.
+    #[tokio::test]
+    async fn a_switch_leaves_existing_bindings_alone() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        let first = router
+            .route(&IncomingMessage::new("u1", "s1", "hello"), None)
+            .await
+            .routed()
+            .expect("routed");
+        assert_eq!(first.agent_id, DEFAULT_AGENT_ID);
+
+        router.set_default_agent("secretary").await;
+
+        let again = router
+            .route(&IncomingMessage::new("u1", "s1", "again"), None)
+            .await
+            .routed()
+            .expect("routed");
+        assert_eq!(again.agent_id, DEFAULT_AGENT_ID);
+        assert!(!again.is_fallback, "served by the existing binding");
+    }
+
+    /// The switched default is still gated: a restriction on the new default
+    /// agent applies to the fallback like it does to every other route.
+    #[tokio::test]
+    async fn a_switched_default_is_still_gated() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router.set_default_agent("secretary").await;
+        router
+            .set_agent_principals("secretary", vec!["u-owner".to_string()])
+            .await;
+
+        assert!(matches!(
+            router
+                .route(&IncomingMessage::new("u-stranger", "s2", "hi"), None)
+                .await,
+            RouteOutcome::Denied { ref agent_id } if agent_id == "secretary"
+        ));
+        let route = router
+            .route(&IncomingMessage::new("u-owner", "s3", "hi"), None)
+            .await
+            .routed()
+            .expect("the owner routes");
+        assert_eq!(route.agent_id, "secretary");
+    }
+
+    /// A clone inherits the live default, so a router copied for a secondary
+    /// pipeline does not silently revert to the built-in agent.
+    #[tokio::test]
+    async fn a_clone_keeps_the_switched_default() {
+        let router = AgentRouter::new(AgentRouterConfig::default());
+        router.set_default_agent("secretary").await;
+        let clone = router.deep_clone().await;
+        assert_eq!(clone.default_agent().await, "secretary");
     }
 }

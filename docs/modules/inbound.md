@@ -15,7 +15,10 @@ Channel Extension -> Debounce -> Media Understanding -> Dispatch
 - **`media.rs`** — `MediaUnderstandingPipeline` for processing attachments (images, audio)
 - **`dispatch.rs`** — `AutoReplyDispatch` with send policy and plugin-owned binding checks
 - **`queue.rs`** — `QueueModeResolver` for determining queue mode (sync/async/batch)
-- **`router.rs`** — `AgentRouter` with binding store for agent selection
+- **`router.rs`** — `AgentRouter` with binding store for agent selection. Its
+  global default is the switchable one: `agents.default` calls
+  `AgentRouter::set_default_agent`, so a switch changes where unrouted messages
+  go on the next turn. Already-bound sessions keep their agent.
 
 ### Pipeline Stages
 

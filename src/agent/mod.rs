@@ -92,7 +92,6 @@ pub mod personality;
 pub mod planner;
 pub mod prompt_builder;
 pub mod reflection;
-pub mod route_resolution;
 pub mod session;
 pub mod session_files;
 pub mod session_store;
@@ -130,10 +129,6 @@ pub use personality::{
 pub use planner::PersistedPlan;
 pub use planner::{ActivePlan, ActivePlanView, PlanTaskView, TaskPlan, TaskPlanner};
 pub use prompt_builder::{ConversationPhase, PromptBuilder, PromptContext, TaskType};
-pub use route_resolution::{
-    BindingCache, BindingMode, ConversationScope, ResolvedBinding, RouteResolution, RouteResolver,
-    RouteRule,
-};
 pub use session::{
     AgentInstanceStatus, MultiAgentSession, SessionAgent, SessionManager, SessionMessage,
     SessionStatus, ThreadBinding,

@@ -151,7 +151,6 @@ pub async fn make_test_state_parts(
             group_manager: Arc::new(RwLock::new(crate::agent::GroupSessionManager::new())),
             store: None,
             message_buffer: Arc::new(RwLock::new(HashMap::new())),
-            route_resolver: Arc::new(crate::agent::RouteResolver::new("default")),
             cost_guard: crate::agent::CostGuard::new(0, 0),
             repair_state: Arc::new(RepairState::new()),
             acp: Arc::new(AcpControlPlane::new(50)),

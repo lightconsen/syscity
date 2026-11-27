@@ -154,7 +154,6 @@ async fn make_test_state(config: GatewayConfig) -> GatewayState {
             group_manager: Arc::new(RwLock::new(syscity::agent::GroupSessionManager::new())),
             store: None,
             message_buffer: Arc::new(RwLock::new(HashMap::new())),
-            route_resolver: Arc::new(syscity::agent::RouteResolver::new("default")),
             cost_guard: syscity::agent::CostGuard::new(0, 0),
             repair_state: Arc::new(syscity::gateway::RepairState::new()),
             acp: Arc::new(syscity::acp::AcpControlPlane::new(10)),

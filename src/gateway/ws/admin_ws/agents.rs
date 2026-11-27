@@ -168,12 +168,15 @@ pub(crate) async fn handle_agents_purge(req: &WsRequest, state: &Arc<GatewayStat
     unload_runtime_agent(state, &id).await;
     state.agents.registry.write().await.remove(&id);
     // Conversations routed to the purged agent fall back to the built-in
-    // default instead of resolving to an agent that no longer exists.
-    if state.agents.route_resolver.default_agent().await == id {
+    // default instead of resolving to an agent that no longer exists. The
+    // router's default is the routing authority; leaving it pointing at the
+    // purged id would send every unrouted message to an agent that cannot be
+    // spawned.
+    if state.agents.router.default_agent().await == id {
         state
             .agents
-            .route_resolver
-            .set_default_agent("default")
+            .router
+            .set_default_agent(crate::inbound::DEFAULT_AGENT_ID)
             .await;
     }
 
@@ -402,6 +405,21 @@ mod tests {
         }
         // Nothing was created above the agents dir.
         assert!(!state.paths.root().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn purge_resets_a_default_pointing_at_the_purged_agent() {
+        let state = state().await;
+        seed_agent(&state, "doomed", "# Doomed\n\n## name\nDoomed\n", "soul\n").await;
+        state.agents.router.set_default_agent("doomed").await;
+
+        let resp =
+            handle_agents_purge(&req("r1", Some(serde_json::json!({ "id": "doomed" }))), &state)
+                .await;
+        assert!(resp.ok, "purge failed: {:?}", resp.error);
+
+        // Unrouted messages must not be sent to an agent that no longer exists.
+        assert_eq!(state.agents.router.default_agent().await, crate::inbound::DEFAULT_AGENT_ID);
     }
 
     #[tokio::test]

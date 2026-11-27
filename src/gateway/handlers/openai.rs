@@ -298,7 +298,9 @@ fn to_openai_tool_calls(calls: Vec<ToolCall>) -> Vec<OpenAiToolCall> {
 ///
 /// `bound_agent` is the agent an agent access token is bound to, if the caller
 /// presented one. A bound credential talks to *its* agent; every other
-/// credential talks to the `default` agent, unchanged.
+/// credential talks to the gateway's current default agent — the one
+/// `agents.default` switches, so an OpenAI client follows a switched default
+/// like every other surface does.
 #[allow(unused_assignments)]
 async fn agent_completion(
     state: Arc<GatewayState>,
@@ -325,8 +327,11 @@ async fn agent_completion(
     }
 
     // Grab the agent handle: the bound agent for an agent access token, the
-    // `default` agent otherwise.
-    let agent_id = bound_agent.as_deref().unwrap_or("default");
+    // gateway's current default agent otherwise. The default is read from the
+    // router rather than hardcoded, so `syscity agent switch` reaches this
+    // surface too.
+    let default_agent = state.agents.router.default_agent().await;
+    let agent_id = bound_agent.as_deref().unwrap_or(&default_agent);
     let handle = {
         let agents = state.agents.agents.read().await;
         match agents.get(agent_id).cloned() {
@@ -588,6 +593,26 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["error"]["type"], "server_error");
         assert_eq!(json["error"]["message"], "No agent 'default' available");
+    }
+
+    /// An OpenAI client follows a switched default, like every other surface:
+    /// the agent mode reads the router's default rather than the literal
+    /// `"default"`, so the error names the agent that switch selected.
+    #[tokio::test]
+    async fn agent_mode_follows_a_switched_default() {
+        let state = state().await;
+        state.agents.router.set_default_agent("secretary").await;
+        let resp = openai_chat_completions_handler(
+            State(state),
+            Query(ModelOverrideQuery { model: None }),
+            HeaderMap::new(),
+            None,
+            req("gpt-4o", vec![user_msg("hello")], false),
+        )
+        .await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["message"], "No agent 'secretary' available");
     }
 
     #[tokio::test]
