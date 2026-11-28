@@ -128,6 +128,8 @@ function TauriConnectionSettings() {
   const [token, setToken] = useState("");
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
@@ -184,13 +186,36 @@ function TauriConnectionSettings() {
           token: token.trim() || null,
         },
       });
+      setSaved(true);
       setMsg({ ok: true, text: t("ConnectionSettings.savedRestart") });
     } catch (e) {
+      setSaved(false);
       setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
       setSaving(false);
     }
-  }, [config, host, port, tls, token]);
+  }, [config, host, port, tls, token, t]);
+
+  /**
+   * Restart so the saved connection takes effect.
+   *
+   * The backend replaces the process (`AppHandle::restart` never returns), so
+   * there is nothing to do after the invoke resolves. The button exists
+   * because the alternative — "quit and reopen" on a macOS app whose close
+   * button only hides the window — is a step people do not find.
+   */
+  const restart = useCallback(async () => {
+    setRestarting(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("relaunch_app");
+    } catch (e) {
+      // Only reachable if the restart request failed; the process is still
+      // here to say so.
+      setRestarting(false);
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    }
+  }, []);
 
   if (!config) return null;
 
@@ -224,8 +249,11 @@ function TauriConnectionSettings() {
         {config.mode === "remote" && (
           <div className="space-y-3 mb-4">
             <div>
-              <label className="text-xs text-secondary block mb-1">{t("ConnectionSettings.host")}</label>
+              <label className="text-xs text-secondary block mb-1" htmlFor="conn-host">
+                {t("ConnectionSettings.host")}
+              </label>
               <input
+                id="conn-host"
                 className={inputCls}
                 value={host}
                 onChange={(e) => setHost(e.target.value)}
@@ -233,8 +261,11 @@ function TauriConnectionSettings() {
               />
             </div>
             <div>
-              <label className="text-xs text-secondary block mb-1">{t("ConnectionSettings.port")}</label>
+              <label className="text-xs text-secondary block mb-1" htmlFor="conn-port">
+                {t("ConnectionSettings.port")}
+              </label>
               <input
+                id="conn-port"
                 className={inputCls}
                 type="number"
                 value={port}
@@ -250,10 +281,11 @@ function TauriConnectionSettings() {
               {t("ConnectionSettings.tlsLabel")}
             </label>
             <div>
-              <label className="text-xs text-secondary block mb-1">
+              <label className="text-xs text-secondary block mb-1" htmlFor="conn-token">
                 {t("ConnectionSettings.remoteTokenLabel")}
               </label>
               <input
+                id="conn-token"
                 className={inputCls}
                 type="password"
                 value={token}
@@ -283,13 +315,28 @@ function TauriConnectionSettings() {
           </p>
         )}
 
-        <button
-          onClick={save}
-          disabled={saving}
-          className="px-3 py-1.5 rounded-lg bg-primary-600 text-white text-sm transition hover:bg-primary-700 disabled:opacity-50"
-        >
-          {saving ? t("ConnectionSettings.saving") : t("ConnectionSettings.save")}
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={save}
+            disabled={saving || restarting}
+            className="px-3 py-1.5 rounded-lg bg-primary-600 text-white text-sm transition hover:bg-primary-700 disabled:opacity-50"
+          >
+            {saving ? t("ConnectionSettings.saving") : t("ConnectionSettings.save")}
+          </button>
+          {/* Offered only once something is saved — a restart that applies
+              nothing is just an interruption. */}
+          {saved && (
+            <button
+              onClick={restart}
+              disabled={restarting}
+              className="px-3 py-1.5 rounded-lg border border-subtle text-sm transition hover:bg-black/[0.03] dark:hover:bg-white/[0.04] disabled:opacity-50"
+            >
+              {restarting
+                ? t("ConnectionSettings.restarting")
+                : t("ConnectionSettings.saveRestart")}
+            </button>
+          )}
+        </div>
       </Section>
     </div>
   );

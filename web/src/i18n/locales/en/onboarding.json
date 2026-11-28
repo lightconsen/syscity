@@ -16,5 +16,10 @@
   "IdentityWizard.aboutYou": "About you",
   "IdentityWizard.aboutYouPlaceholder": "Anything useful for your assistant to know about you…",
   "IdentityWizard.saving": "Saving…",
-  "IdentityWizard.saveContinue": "Save & Continue"
+  "IdentityWizard.saveContinue": "Save & Continue",
+  "WelcomeScreen.wrongGateway": "Connecting to the wrong gateway?",
+  "WelcomeScreen.connectGateway": "Choose a gateway",
+  "ConnectGatewayDialog.title": "Gateway connection",
+  "ConnectGatewayDialog.subtitle": "Run a gateway on this machine, or connect to one on another host with its token.",
+  "ConnectGatewayDialog.close": "Close"
 }

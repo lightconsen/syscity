@@ -7,5 +7,6 @@
   "App.agentDeleteFailed": "Failed to delete the agent",
   "App.startingTitle": "Starting Syscity",
   "App.startingHint": "Connecting to the gateway…",
-  "App.startingHintSlow": "Still connecting — the gateway may be starting its agents and tools. This can take a few seconds."
+  "App.startingHintSlow": "Still connecting — the gateway may be starting its agents and tools. This can take a few seconds.",
+  "App.startingCheckConnection": "Check connection settings"
 }

@@ -16,5 +16,10 @@
   "IdentityWizard.aboutYou": "关于你",
   "IdentityWizard.aboutYouPlaceholder": "任何有助于助手了解你的信息…",
   "IdentityWizard.saving": "保存中…",
-  "IdentityWizard.saveContinue": "保存并继续"
+  "IdentityWizard.saveContinue": "保存并继续",
+  "WelcomeScreen.wrongGateway": "连错了网关？",
+  "WelcomeScreen.connectGateway": "选择网关",
+  "ConnectGatewayDialog.title": "网关连接",
+  "ConnectGatewayDialog.subtitle": "在这台机器上运行网关，或使用令牌连接其他主机上的网关。",
+  "ConnectGatewayDialog.close": "关闭"
 }

@@ -220,9 +220,33 @@ fn get_platform() -> String {
 }
 
 /// Tauri command: persist connection settings.
+///
+/// Applies on the next launch — the WebView's socket, base URL and credential
+/// are all captured at startup — so the UI pairs this with `relaunch_app`.
+/// A config that could never connect is refused here (see
+/// `connection::ConnectionConfig::validate`), which leaves the working one on
+/// disk instead of replacing it with a launch that cannot get in.
 #[tauri::command]
 fn save_connection(config: ConnectionConfig) -> Result<(), String> {
     connection::save_connection(&config)
+}
+
+/// Tauri command: restart the app, so a saved connection takes effect.
+///
+/// Without this the Connection tab's only advice was "restart the app", and
+/// the only way to do it was to quit and reopen by hand — on macOS `Cmd+Q`
+/// or the tray's Quit, because closing the window merely hides it.
+///
+/// `AppHandle::restart` never returns: the process is replaced. That is what
+/// the frontend wants (nothing after an `await` on this command can matter),
+/// and the command deliberately does not try to answer first — a resolved
+/// promise and a dead process race, and the loser leaves a dialog hanging.
+///
+/// Registered on mobile too: the same tab is there, and a mobile restart is a
+/// task relaunch (`tauri` maps it to the platform's own relaunch path).
+#[tauri::command]
+fn relaunch_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.restart()
 }
 
 /// Tauri command: probe a remote gateway — reachability via `/live` and
@@ -497,7 +521,8 @@ pub fn run() {
         get_connection,
         get_platform,
         save_connection,
-        test_remote_gateway
+        test_remote_gateway,
+        relaunch_app
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -507,7 +532,8 @@ pub fn run() {
         get_connection,
         get_platform,
         save_connection,
-        test_remote_gateway
+        test_remote_gateway,
+        relaunch_app
     ]);
 
     let builder = builder.setup(move |app| {

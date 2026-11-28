@@ -342,5 +342,7 @@
   "CloudSection.noUsage": "No usage yet.",
   "CloudSection.modelPickerHint": "Cloud models and search are available in the model picker.",
   "CloudSection.periodEnd": "Credits renew monthly, resets {{date}}",
-  "CloudSection.manageConsole": "Manage in console"
+  "CloudSection.manageConsole": "Manage in console",
+  "ConnectionSettings.saveRestart": "Save & restart",
+  "ConnectionSettings.restarting": "Restarting…"
 }

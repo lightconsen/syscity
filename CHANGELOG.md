@@ -162,6 +162,34 @@ if no section matches, the release falls back to auto-generated notes.
   to someone else is refused *before* the row is written, so a refusal leaves no
   ghost session behind.
 
+- **Syscity Desktop can connect to a remote gateway on first launch.** The
+  connection setting existed and persisted correctly, but it lived in Settings —
+  which renders *after* the launch gates, and both gates need a working
+  connection to answer. A fresh install pointed at a gateway that was down (or
+  at the wrong one) sat on the startup screen indefinitely, and a fresh install
+  with no model could not be told where its model was: editing
+  `~/.syscity/client.toml` by hand was the only way out. The first-launch
+  screens now reach the same Connection form:
+  - The **welcome screen** (no model configured) offers "Choose a gateway".
+  - The **startup screen** offers "Check connection settings" once waiting has
+    stopped looking like a normal start (after the same 6 s as the "still
+    connecting" hint). It is the only way back in when remote mode is pointed
+    at a gateway that is not answering, because remote mode has no local
+    fallback.
+  Both open the real `ConnectionSettings` component, not a copy, so a field
+  added there shows up on the first-launch path too.
+- **"Save & restart" applies a connection change immediately.** Saving used to
+  only write `client.toml` and tell the person to restart; there was no button
+  and no command, and on macOS closing the window only hides it. A new
+  `relaunch_app` Tauri command calls `AppHandle::restart`, and the Connection
+  form offers it once something is saved.
+- **An impossible remote config is refused before it is written.**
+  `ConnectionConfig::validate` rejects an empty host, a pasted
+  `http://…` / `https://…` in the host field, and port 0. This matters because
+  remote mode has no local fallback: a config like that would be saved
+  silently and the next launch could not get in. A refused save leaves the
+  previous, working `client.toml` untouched.
+
 ### Fixed
 
 - **`syscity agent switch` now actually changes where messages go.** The
@@ -194,6 +222,10 @@ if no section matches, the release falls back to auto-generated notes.
   and access checks all key by it. `IncomingMessage::channel_key()` is the one
   accessor to use.
 
+- **The desktop Connection form's fields were unlabelled.** The `<label>`
+  elements were adjacent to their inputs but never associated (no `htmlFor` /
+  `id`), so a screen reader announced three anonymous text boxes and the token
+  field — a credential — had no accessible name at all.
 - **UI tests inherited the developer's provider credentials.** The gateway
   fixture passed the whole environment through, and `apply_env_provider_overrides`
   inserts a provider from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` whenever the

@@ -7,9 +7,18 @@ import { cloudLogin, cloudStatus } from "@/lib/cloud";
 interface WelcomeScreenProps {
   transport: SyscityWebSocketTransport;
   onComplete: () => void;
+  /**
+   * Open the gateway-connection form. Absent in a browser, where the page is
+   * served by the gateway it talks to and there is nothing to choose.
+   */
+  onConnectGateway?: () => void;
 }
 
-export function WelcomeScreen({ transport, onComplete }: WelcomeScreenProps) {
+export function WelcomeScreen({
+  transport,
+  onComplete,
+  onConnectGateway,
+}: WelcomeScreenProps) {
   const { t } = useTranslation("onboarding");
   // Only surface the cloud sign-in when the backend was built with the cloud
   // feature AND has it enabled. In a default build the endpoint 404s and this
@@ -60,6 +69,25 @@ export function WelcomeScreen({ transport, onComplete }: WelcomeScreenProps) {
               {t("WelcomeScreen.cloudSignIn")}
             </button>
           </>
+        )}
+
+        {/* The model form writes to the gateway this app is already talking
+            to. A desktop pointed at the wrong gateway (or at no reachable one)
+            has to be able to change that *before* configuring a model, or the
+            first launch can never finish — the connection setting lives in
+            Settings, which is behind this screen. */}
+        {onConnectGateway && (
+          <p className="mt-6 text-center text-xs text-secondary">
+            {t("WelcomeScreen.wrongGateway")}{" "}
+            <button
+              type="button"
+              onClick={onConnectGateway}
+              data-testid="welcome-connect-gateway"
+              className="font-medium text-primary-600 underline-offset-2 hover:underline dark:text-primary-400"
+            >
+              {t("WelcomeScreen.connectGateway")}
+            </button>
+          </p>
         )}
       </div>
     </div>

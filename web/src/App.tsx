@@ -17,6 +17,7 @@ import { Sidebar, type AgentItem } from "@/components/chat/Sidebar";
 import { SettingsPanel } from "@/components/settings/SettingsPanel";
 import { WelcomeScreen } from "@/components/onboarding/WelcomeScreen";
 import { IdentityWizard } from "@/components/onboarding/IdentityWizard";
+import { ConnectGatewayDialog } from "@/components/onboarding/ConnectGatewayDialog";
 import { ChatContent } from "@/components/chat/ChatContent";
 import { useGoalStore } from "@/stores/goalStore";
 import { GoalPanel } from "@/components/chat/GoalPanel";
@@ -147,8 +148,20 @@ function ChatAppInner({ transport }: { transport: SyscityWebSocketTransport }) {
  * be shown — so it carries the product mark, says what is happening, and
  * grows a second line if the wait is not as quick as usual. A bare 24px
  * spinner gave no way to tell "starting" from "stuck".
+ *
+ * `onConnect` is the escape hatch, offered only once "still connecting" has
+ * been on screen long enough to stop being true: in remote mode the host has
+ * no local fallback, so a gateway that is down (or one this app is pointed at
+ * by mistake) parks here forever, and every other screen — including
+ * Settings, where the connection lives — is behind this gate.
  */
-function StartingScreen({ t }: { t: (key: string) => string }) {
+function StartingScreen({
+  t,
+  onConnect,
+}: {
+  t: (key: string) => string;
+  onConnect?: () => void;
+}) {
   const [slow, setSlow] = useState(false);
   useEffect(() => {
     const timer = window.setTimeout(() => setSlow(true), 6000);
@@ -175,6 +188,16 @@ function StartingScreen({ t }: { t: (key: string) => string }) {
         <div className="mt-1.5 text-sm text-secondary max-w-xs">
           {slow ? t("App.startingHintSlow") : t("App.startingHint")}
         </div>
+        {slow && onConnect && (
+          <button
+            type="button"
+            onClick={onConnect}
+            data-testid="starting-check-connection"
+            className="mt-5 rounded-lg border border-subtle px-3 py-1.5 text-xs text-secondary transition hover:border-primary-500 hover:text-primary-500"
+          >
+            {t("App.startingCheckConnection")}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -913,19 +936,68 @@ function ChatShell() {
     }
   }, [sessionItems, transport]);
 
+  // We are waiting on a gateway that may never answer: the startup screen
+  // offers a way into the connection form (see StartingScreen). Only the
+  // Tauri shell has anything to configure there; in a browser the page is
+  // served by the gateway it talks to.
+  const [connectDialogOpen, setConnectDialogOpen] = useState(false);
+  const canConfigureConnection =
+    typeof window !== "undefined" && "__TAURI__" in window;
+
   // Gate: until we have confirmed whether an LLM is configured, show the
   // startup screen (prevents flashing a chat that has nothing behind it).
-  if (needsSetup === null) return <StartingScreen t={t} />;
+  if (needsSetup === null) {
+    return (
+      <>
+        <StartingScreen
+          t={t}
+          onConnect={canConfigureConnection ? () => setConnectDialogOpen(true) : undefined}
+        />
+        {connectDialogOpen && (
+          <ConnectGatewayDialog onClose={() => setConnectDialogOpen(false)} />
+        )}
+      </>
+    );
+  }
 
   // No LLM configured yet — show the first-launch welcome screen.
   if (needsSetup) {
-    return <WelcomeScreen transport={transport} onComplete={checkModelConfig} />;
+    return (
+      <>
+        <WelcomeScreen
+          transport={transport}
+          onComplete={checkModelConfig}
+          onConnectGateway={
+            canConfigureConnection ? () => setConnectDialogOpen(true) : undefined
+          }
+        />
+        {connectDialogOpen && (
+          <ConnectGatewayDialog onClose={() => setConnectDialogOpen(false)} />
+        )}
+      </>
+    );
   }
 
   // LLM configured but the identity wizard state is still resolving.
-  if (onboardingDone === null) return <StartingScreen t={t} />;
+  if (onboardingDone === null) {
+    return (
+      <>
+        <StartingScreen
+          t={t}
+          onConnect={canConfigureConnection ? () => setConnectDialogOpen(true) : undefined}
+        />
+        {connectDialogOpen && (
+          <ConnectGatewayDialog onClose={() => setConnectDialogOpen(false)} />
+        )}
+      </>
+    );
+  }
 
   // LLM configured but identity not set yet — show the first-launch wizard.
+  //
+  // This one deliberately has no "switch gateway" entry point: the wizard
+  // exists because a gateway answered `onboarding.status`, so it is already
+  // talking to the right one.
   if (!onboardingDone) {
     return <IdentityWizard transport={transport} onComplete={checkOnboarding} />;
   }

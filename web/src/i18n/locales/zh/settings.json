@@ -339,5 +339,7 @@
   "CloudSection.noUsage": "暂无用量。",
   "CloudSection.modelPickerHint": "云端模型和搜索可在模型选择器中使用。",
   "CloudSection.periodEnd": "积分按月发放，{{date}} 重置",
-  "CloudSection.manageConsole": "在控制台管理"
+  "CloudSection.manageConsole": "在控制台管理",
+  "ConnectionSettings.saveRestart": "保存并重启",
+  "ConnectionSettings.restarting": "重启中…"
 }

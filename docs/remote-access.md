@@ -92,9 +92,18 @@ curl --noproxy "*" http://127.0.0.1:18080/live   # 200
 
 | 客户端 | 状态 |
 |---|---|
-| **Desktop** | 设置页「Connection」可选本地/远程（`~/.syscity/client.toml`）；远程模式连接远程并携带 token，支持 TLS 与 agent token |
-| **Mobile** | 与 Desktop 相同（设置页 Connection，配置存应用沙盒）；本地模式用内嵌 gateway + per-install token |
+| **Desktop** | 首次启动即可连远程（欢迎页「选择网关」，或启动页的「检查连接设置」）；设置页「Connection」同样可选本地/远程（`~/.syscity/client.toml`）；远程模式连接远程并携带 token，支持 TLS 与 agent token |
+| **Mobile** | 与 Desktop 相同（首次启动与设置页 Connection，配置存应用沙盒）；本地模式用内嵌 gateway + per-install token |
 | **Web（浏览器）** | 两种方式：直接打开远程 Gateway 的 UI（同源），或「Connection」设置里填远程 base URL + token（存 localStorage）作为独立客户端 |
+
+首次启动时连远程，走的是同一个 Connection 表单，两点区别值得知道：
+
+- **保存后需要重启**。连接（地址、凭据、端口）在启动时确定，改完表单点「保存并重启」；
+  只保存不重启，下一次启动才生效。
+- **远程模式不会回退到本地 gateway**。地址填错或网关没起来，界面会停在启动页——
+  所以启动页在等待超过 6 秒后会给出「检查连接设置」入口。表单本身不依赖网关
+  （数据来自 `get_connection` 命令），网关连不上也能改。无法连接的配置（空 host、
+  把 `http://` 粘进 host 字段、端口为 0）在保存时就被拒绝，不会写进 `client.toml`。
 
 Desktop 的 Connection 设置里勾选 **Use TLS** 后，会以 `https://` / `wss://` 连接——Gateway
 本身不带 TLS 监听，这个开关是给前置反向代理（Caddy / nginx / Cloudflare Tunnel 等）用的。
