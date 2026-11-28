@@ -15,6 +15,14 @@ import { plainText } from "./fixtures/scripts.mjs";
  */
 test.describe("sidebar nav stays put", () => {
   test("scrolling the session list does not move the fixed nav", async ({ ui }) => {
+    // Fourteen turns through the real gateway, one after another — each one a
+    // session create, a message, a streamed answer and a persisted row. That
+    // is a minute and a half of real work, so the suite's 60 s default cannot
+    // hold it; the failure it produces is a `composer-send` that "never
+    // appeared" on the last iteration, which reads like a hang and is really a
+    // budget. The number of sessions is what makes the list overflow, so the
+    // budget moves rather than the test.
+    test.setTimeout(180_000);
     const app = await ui.launch(plainText("ok"));
 
     // A history long enough to scroll: every turn becomes a session row.

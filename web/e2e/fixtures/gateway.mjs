@@ -235,6 +235,37 @@ async function websocketCall(port, method, params, timeoutMs) {
 const PLACEHOLDER_KEY = ["sk", "placeholder", "local", "fake", "key"].join("-");
 
 /**
+ * Provider credentials the machine already has, removed from a test gateway.
+ *
+ * `apply_env_provider_overrides` (src/daemon.rs) inserts a provider from
+ * `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / the `SYSCITY_*` pair whenever the
+ * config has none. On a developer's machine those are set — for the CLI and
+ * for Claude Code itself — so a gateway started *without* a provider still
+ * reported a full model list. That silently weakens every spec that relies on
+ * a fixed catalog (`models.list` gaining an unrelated `anthropic` section) and
+ * makes "no model configured" untestable at all.
+ *
+ * A UI test owns its gateway's configuration; the ambient shell must not be
+ * able to add a provider to it.
+ */
+function withoutAmbientCredentials(env) {
+  const clean = { ...env };
+  for (const name of [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "SYSCITY_API_KEY",
+    "SYSCITY_BASE_URL",
+    "SYSCITY_IS_ANTHROPIC",
+    "SYSCITY_MODEL_PROVIDER",
+  ]) {
+    delete clean[name];
+  }
+  return clean;
+}
+
+/**
  * Start a gateway against an isolated home.
  *
  * @param {object} opts
@@ -249,6 +280,11 @@ const PLACEHOLDER_KEY = ["sk", "placeholder", "local", "fake", "key"].join("-");
  * @param {boolean} [opts.skipOnboarding]
  *        Write the identity files up front; the UI then goes straight to the
  *        chat instead of the first-launch wizard.
+ * @param {boolean} [opts.skipModel]
+ *        Write no provider at all, so `models.list` is empty and the UI lands
+ *        on the first-launch Welcome screen. The default configures a model,
+ *        which skips that screen — the one case the welcome gate needs is a
+ *        gateway with nothing to offer.
  * @param {string} [opts.cloudApiBase]
  *        Point the gateway's `[cloud] api_base` here (typically the fake
  *        provider), so `cloud.token` verifies against it instead of the real
@@ -260,6 +296,7 @@ export async function startGateway({
   model = "fake-ui-model",
   binary = path.join(REPO_ROOT, "target/debug/syscity"),
   skipOnboarding = true,
+  skipModel = false,
   extraConfig = "",
   cloudApiBase = null,
 } = {}) {
@@ -320,13 +357,12 @@ export async function startGateway({
   const home = await mkdtemp(path.join(os.tmpdir(), "syscity-ui-"));
   const port = await freePort();
 
-  const config = `
-host = "127.0.0.1"
-port = ${port}
-model = "${model}"
-model_provider = "fakeui"
-workspace_only = false
-
+  // A gateway with no provider still has to start, so the provider block is
+  // dropped rather than replaced by a fake one: `models.list` then answers
+  // an empty list, which is exactly what puts the UI on the Welcome screen.
+  const providerBlock = skipModel
+    ? ""
+    : `
 [providers.fakeui]
 provider_type = "open_ai"
 models = ["${model}"]
@@ -340,6 +376,16 @@ retry_delay_ms = 100
 [providers.fakeui.timeout]
 secs = 30
 nanos = 0
+`;
+
+  const config = `
+host = "127.0.0.1"
+port = ${port}
+model = "${model}"
+model_provider = "fakeui"
+workspace_only = false
+
+${providerBlock}
 ${
   cloudApiBase
     ? `
@@ -382,7 +428,7 @@ ${extraConfig}
     // blank page. The repo root is where the built `dist/` lives.
     cwd: REPO_ROOT,
     env: {
-      ...process.env,
+      ...withoutAmbientCredentials(process.env),
       SYSCITY_HOME: home,
       // The gateway talks to 127.0.0.1 only; an inherited proxy would swallow
       // both the fake provider and the UI's own requests.

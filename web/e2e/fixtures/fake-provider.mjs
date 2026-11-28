@@ -11,9 +11,11 @@
 //
 // See `fixtures/scripts.mjs` for the shared scripts (plain text, a tool call,
 // an approval-bound shell call, an error) so the same scenario can be reused
-// across specs. Scripts advance one step per request: the first completion
-// returns step 1, the follow-up (after the tool result is fed back) returns
-// step 2, and the last step repeats.
+// across specs. Scripts advance one step per *streamed* request: the first
+// completion returns step 1, the follow-up (after the tool result is fed back)
+// returns step 2, and the last step repeats. A non-streaming request is the
+// engine talking to itself (the cache classifier), answered separately so it
+// cannot consume a scripted turn — see the `body.stream === false` branch.
 import http from "node:http";
 
 /**
@@ -86,6 +88,43 @@ export async function startFakeProvider({ script, port = 0, onRequest, user = nu
       }
       requests.push(body);
       onRequest?.(body);
+
+      // The agent's own turn is always streamed; a non-streaming call is one
+      // the engine made to itself. The response-cache classifier is the one a
+      // plain chat turn reliably makes (`agent_cache::should_use_cache_llm`),
+      // and it asks a question about the user's message — so handing it a
+      // scripted step sent the tool call to the classifier and left the actual
+      // turn with nothing to say. The transcript then showed a "thinking"
+      // bubble and no tool card, which looked exactly like a rendering bug.
+      //
+      // Side calls are answered here and never advance the script.
+      if (body.stream === false) {
+        const prompt = JSON.stringify(body.messages ?? []);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "chatcmpl-fake-side",
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: body.model || "fake-ui-model",
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  // "NOCACHE" for the classifier: a UI test wants the real
+                  // turn, and a cache hit would skip the very request it is
+                  // asserting on.
+                  content: /"CACHE" or "NOCACHE"/.test(prompt) ? "NOCACHE" : "",
+                },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        );
+        return;
+      }
 
       const step = script[Math.min(stepIndex, script.length - 1)];
       stepIndex += 1;

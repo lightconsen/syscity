@@ -194,6 +194,30 @@ if no section matches, the release falls back to auto-generated notes.
   and access checks all key by it. `IncomingMessage::channel_key()` is the one
   accessor to use.
 
+- **UI tests inherited the developer's provider credentials.** The gateway
+  fixture passed the whole environment through, and `apply_env_provider_overrides`
+  inserts a provider from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` whenever the
+  config has none. On a machine with those set, a test gateway started with *no*
+  provider still reported a full model list, so "no model configured" was
+  untestable and every spec's catalog silently grew an unrelated section. The
+  fixture now strips those variables; a UI test owns its gateway's config.
+- **The fake provider handed the cache classifier a scripted turn.** A plain
+  chat turn makes a non-streaming side call first — `should_use_cache_llm`, an
+  LLM yes/no about caching — to the same provider the turn uses. The fake
+  provider answered *every* completion from the script and advanced it, so the
+  classifier consumed step 0 (the tool call) and the real turn was left with
+  nothing; the transcript showed a "thinking" bubble and no tool card, which
+  reads exactly like a rendering bug. This was latent: on a machine with
+  `ANTHROPIC_API_KEY` set the classifier went to the ambient provider instead,
+  so `tools.spec.mjs` only failed where the credentials had been stripped. Side
+  calls are now answered separately and never advance the script.
+- **The sidebar scroll test needed more than the suite's default budget.**
+  Fourteen sequential turns through the real gateway is a minute and a half of
+  real work; at the 60 s default the last iteration timed out waiting for
+  `composer-send`, which reads like a hang. It sets its own 180 s timeout now —
+  the session count is what makes the list overflow, so the budget moves
+  rather than the premise.
+
 ## [0.3.23] - 2026-11-26
 
 ### Added
