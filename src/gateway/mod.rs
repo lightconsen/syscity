@@ -994,6 +994,17 @@ pub(crate) fn validate_auth_config(config: &GatewayConfig) -> crate::Result<()> 
         // never matches: an empty token authenticates nobody, and an entry with
         // no `agent_id` would bind a connection to an agent that does not
         // exist — its holder would be refused everywhere with no clue why.
+        //
+        // A token shared by two entries is the same kind of error with a
+        // nastier symptom. `agent_token_match` compares every entry (it must
+        // not return early — the scan time would then say where the match is)
+        // and keeps the *last* one that matched, so the binding a duplicated
+        // token produces depends on `HashMap` iteration order — which is
+        // randomized per process. The same Desktop would reach `alice`'s agent
+        // after one restart and `bob`'s after the next. Refuse the config and
+        // name both labels.
+        let mut seen: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::with_capacity(config.security.agent_tokens.len());
         for (label, entry) in &config.security.agent_tokens {
             if entry.token.trim().is_empty() {
                 return Err(crate::error::SyscityError::Validation(format!(
@@ -1004,6 +1015,17 @@ pub(crate) fn validate_auth_config(config: &GatewayConfig) -> crate::Result<()> 
                 return Err(crate::error::SyscityError::Validation(format!(
                     "security.agent_tokens.{label} has no agent_id. An agent token must name the \
                      one agent it reaches."
+                )));
+            }
+            // Compared exactly as `agent_token_match` compares them: that
+            // function does no trimming, so `"tok"` and `" tok"` are two
+            // different credentials and are not a duplicate.
+            if let Some(other) = seen.insert(entry.token.as_str(), label) {
+                return Err(crate::error::SyscityError::Validation(format!(
+                    "security.agent_tokens.{label} and security.agent_tokens.{other} share the \
+                     same token, so which agent it reaches would be undecidable (the last \
+                     match wins, and map order changes between runs). Give each entry its own \
+                     token."
                 )));
             }
         }

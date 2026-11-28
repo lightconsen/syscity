@@ -166,3 +166,39 @@ fn validate_auth_refuses_an_agent_token_without_an_agent() {
     let err = super::validate_auth_config(&config).expect_err("must refuse");
     assert!(err.to_string().contains("has no agent_id"), "{err}");
 }
+
+/// One token in two entries makes the binding depend on `HashMap` order, which
+/// is randomized per process: the same Desktop would reach `alpha` after one
+/// restart and `beta` after the next. Refused, naming both labels.
+#[test]
+fn validate_auth_refuses_a_token_shared_by_two_entries() {
+    let mut config = GatewayConfig::default();
+    config.security.auth_mode = AuthMode::Token;
+    let mut alice = agent_entry("alpha");
+    alice.token = "shared-token".into();
+    let mut bob = agent_entry("beta");
+    bob.token = "shared-token".into();
+    config.security.agent_tokens.insert("alice".into(), alice);
+    config.security.agent_tokens.insert("bob".into(), bob);
+    let err = super::validate_auth_config(&config).expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("share the same token"), "{msg}");
+    assert!(msg.contains("alice") && msg.contains("bob"), "{msg}");
+}
+
+/// The duplicate check compares tokens exactly as `agent_token_match` does —
+/// with no trimming — so `"tok-a"` and `" tok-a "` are two distinct credentials
+/// and must not be refused as a duplicate. Trimming here would reject a config
+/// that works.
+#[test]
+fn validate_auth_does_not_treat_a_padded_token_as_the_same_token() {
+    let mut config = GatewayConfig::default();
+    config.security.auth_mode = AuthMode::Token;
+    let mut alice = agent_entry("alpha");
+    alice.token = "tok-a".into();
+    let mut bob = agent_entry("beta");
+    bob.token = " tok-a ".into();
+    config.security.agent_tokens.insert("alice".into(), alice);
+    config.security.agent_tokens.insert("bob".into(), bob);
+    assert!(super::validate_auth_config(&config).is_ok());
+}

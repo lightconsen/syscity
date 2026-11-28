@@ -30,6 +30,12 @@ if no section matches, the release falls back to auto-generated notes.
   being re-bound away. A *personal* agent — `allowed_users`, or a token — stays
   out of another binding entirely, even when its principal appears in that
   list.
+- **Config validation refuses an agent token shared by two entries.**
+  `agent_token_match` compares every entry and keeps the last match, so a
+  duplicated token string would bind the same Desktop to whichever agent
+  `HashMap` order visited last — and that order is randomized per process, so
+  the binding would change between restarts. Startup and the auth CLI now
+  reject such a config and name both labels.
 - **Per-user agent routing on a shared channel.** A `[channels.<name>.users]`
   table maps a platform user id to an agent id, so one bot can serve a team and
   each person still gets their own agent:

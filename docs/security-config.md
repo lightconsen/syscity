@@ -157,7 +157,11 @@ allowed_users = ["alice"]
   key works too.
 - `auth_mode = "none"` with `agent_tokens` present is a startup error: nothing
   checks a token there, so the table would restrict nobody. An entry with an
-  empty token or `agent_id` is refused for the same reason.
+  empty token or `agent_id` is refused for the same reason. Two entries that
+  share a token are refused as well: the matcher compares every entry and
+  keeps the last match, so the binding such a token produces would depend on
+  `HashMap` order — which changes between runs — and the same Desktop would
+  reach a different agent after a restart.
 - The default scopes are `chat`, `read` and `write`. `write` is what
   `sessions.create` needs, so without it a token holder could not open a
   session at all; it is safe on this credential because `agent_id` is

@@ -62,7 +62,9 @@ agent_id = "secretary"
 要点：
 
 - **必须** `auth_mode = "token"`（或 `device`）。`auth_mode = "none"` 下不检查任何凭据，
-  `agent_tokens` 会让启动直接报错，而不是看起来"限制了"。
+  `agent_tokens` 会让启动直接报错，而不是看起来"限制了"。token 为空、`agent_id` 为空
+  同样报错；两个条目用同一个 token 也会报错——匹配时会保留最后一个命中项，而
+  `HashMap` 的遍历顺序每次启动都不同，那样同一个 Desktop 重启后可能连到不同的 agent。
 - token 放在环境变量 `SYSCITY_AGENT_TOKEN_<LABEL>`（标签大写、`_` 可代 `-`），
   不要写进会被备份 / `git add -A` 的文件。
 - 连接建立后 Gateway 在 `connect` 握手里返回 `bound_agent`，客户端据此隐藏 agent 切换器。
