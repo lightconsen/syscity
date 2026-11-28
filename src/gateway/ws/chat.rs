@@ -133,11 +133,18 @@ pub(crate) async fn handle_chat_send(
         }
     }
 
+    // Whether this request chose the agent the session should run as. An
+    // explicit `agent_id` or a name prefix naming a shared agent does; the
+    // unconditional re-bind below must not then overwrite it with the bound
+    // agent, or a one-agent client could never reach the team secretary.
+    let mut routed_by_request = false;
+
     if let Some(agent_id) = params.agent_id {
-        // A connection bound to one agent may not name another. The dispatcher
-        // refuses this too; checked here as well because `chat.send` also binds
-        // the session, and a binding written now would outlive a refusal.
-        if !ctx.may_use_agent(&agent_id) {
+        // A connection bound to one agent may not name a personal agent other
+        // than its own; a shared agent is allowed. The dispatcher refuses the
+        // rest too, but `chat.send` also binds the session, and a binding
+        // written now would outlive a refusal.
+        if !crate::gateway::ws::bound::agent_usable(state, ctx, &agent_id).await {
             warn!(
                 "Refusing chat.send for session {} naming agent '{}': this connection is bound \
                  to '{}'",
@@ -163,6 +170,9 @@ pub(crate) async fn handle_chat_send(
             .allows_principal(&agent_id, &user_id)
             .await
         {
+            if ctx.bound_agent().is_some_and(|bound| bound != agent_id) {
+                routed_by_request = true;
+            }
             let route = crate::inbound::RouteResult {
                 agent_id,
                 workspace_id: None,
@@ -194,10 +204,11 @@ pub(crate) async fn handle_chat_send(
             if !name.is_empty() {
                 if let Some((personality, _matched_alias)) = registry.find_by_alias(name) {
                     let agent_id = personality.id.clone();
-                    // A bound connection talks to one agent. Its own name
-                    // prefix is just a greeting to strip; anyone else's is a
-                    // request to reach an agent it does not have.
-                    if !ctx.may_use_agent(&agent_id) {
+                    // A bound connection may name its own agent (the prefix is
+                    // then just a greeting to strip) or a shared agent (a
+                    // request to talk to it, like an `@mention`). A personal
+                    // agent belonging to somebody else is refused.
+                    if !crate::gateway::ws::bound::agent_usable(state, ctx, &agent_id).await {
                         warn!(
                             "Refusing name-routed agent '{}' for user {} in session {}: \
                              connection is bound to '{}'",
@@ -235,6 +246,9 @@ pub(crate) async fn handle_chat_send(
                             format!("Agent '{agent_id}' is not available to this user"),
                         );
                     }
+                    if ctx.bound_agent().is_some_and(|bound| bound != agent_id) {
+                        routed_by_request = true;
+                    }
                     let route = crate::inbound::RouteResult {
                         agent_id: agent_id.clone(),
                         workspace_id: None,
@@ -249,19 +263,36 @@ pub(crate) async fn handle_chat_send(
         }
     }
 
-    // A connection bound to one agent always talks to that agent. Binding the
-    // session here — before the message is enqueued — is what makes it so: the
-    // router checks the session binding first, so without this a fresh session
-    // would fall through to the global default, which for a one-agent client
-    // is very likely an agent it does not hold.
-    if let Some(bound) = ctx.bound_agent() {
-        let route = crate::inbound::RouteResult {
-            agent_id: bound.to_string(),
-            workspace_id: None,
-            persisted_binding: true,
-            is_fallback: false,
+    // A connection bound to one agent talks to that agent unless the session
+    // already runs as one it may use — its own agent, or a shared agent opened
+    // deliberately (an explicit `agent_id`, a name prefix, or a
+    // `sessions.create` that recorded it). Binding the session here — before
+    // the message is enqueued — is what keeps a fresh session from falling
+    // through to the global default, which for a one-agent client is very
+    // likely an agent it does not hold.
+    if let Some(bound) = ctx.bound_agent().filter(|_| !routed_by_request) {
+        let current = state
+            .agents
+            .router
+            .list_bindings()
+            .await
+            .get(&session_id)
+            .map(|(agent, _)| agent.clone());
+        let already_usable = match current {
+            Some(agent) => {
+                agent == bound || !crate::gateway::ws::bound::is_personal_agent(state, &agent).await
+            }
+            None => false,
         };
-        state.agents.router.bind_session(&session_id, &route).await;
+        if !already_usable {
+            let route = crate::inbound::RouteResult {
+                agent_id: bound.to_string(),
+                workspace_id: None,
+                persisted_binding: true,
+                is_fallback: false,
+            };
+            state.agents.router.bind_session(&session_id, &route).await;
+        }
     }
 
     let mut incoming =
@@ -521,6 +552,138 @@ mod tests {
             .expect("mentions key");
         assert_eq!(mentions["skills"][0], "canvas-design");
         assert_eq!(mentions["agents"][0], "secretary-xiaowang");
+    }
+
+    // ── Bound connections and shared agents ──────────────────────────────
+
+    fn bound_to(agent: &str) -> RequestContext {
+        RequestContext::new("alice", crate::security::request_context::AuthSource::SharedToken)
+            .with_bound_agent(Some(agent))
+    }
+
+    fn agent_route(agent: &str) -> crate::inbound::RouteResult {
+        crate::inbound::RouteResult {
+            agent_id: agent.to_string(),
+            workspace_id: None,
+            persisted_binding: true,
+            is_fallback: false,
+        }
+    }
+
+    /// A bound connection that names a shared agent explicitly routes there,
+    /// and the unconditional re-bind must not drag the session back to its own
+    /// agent: the user asked for the secretary, and the next message has to
+    /// land in the same conversation.
+    #[tokio::test]
+    async fn chat_send_routes_a_bound_connection_to_a_shared_agent() {
+        let (state, mut entry_rx) = make_test_state_parts(GatewayConfig::default()).await;
+        let state = Arc::new(state);
+        let conn = make_test_conn(&[]);
+        let params = Some(serde_json::json!({
+            "message": "hello",
+            "session_id": "ws:alice",
+            "agent_id": "secretary",
+        }));
+        let resp =
+            handle_chat_send(&req("r1", params), &conn, &state, &bound_to("secretary-alice")).await;
+        assert!(resp.ok, "expected ok, got {:?}", resp.error);
+        entry_rx.recv().await.expect("enqueued message");
+
+        let bindings = state.agents.router.list_bindings().await;
+        assert_eq!(
+            bindings.get("ws:alice").map(|(a, _)| a.as_str()),
+            Some("secretary"),
+            "the shared agent the caller asked for must keep the session"
+        );
+    }
+
+    /// Naming a personal agent from a bound connection is refused before any
+    /// binding is written: a binding now would outlive the refusal.
+    #[tokio::test]
+    async fn chat_send_refuses_a_personal_agent_for_a_bound_connection() {
+        let (state, _entry_rx) = make_test_state_parts(GatewayConfig::default()).await;
+        let state = Arc::new(state);
+        state
+            .agents
+            .router
+            .set_agent_principals("secretary-bob", vec!["bob".to_string()])
+            .await;
+        let conn = make_test_conn(&[]);
+        let params = Some(serde_json::json!({
+            "message": "hello",
+            "session_id": "ws:alice",
+            "agent_id": "secretary-bob",
+        }));
+        let resp =
+            handle_chat_send(&req("r1", params), &conn, &state, &bound_to("secretary-alice")).await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN");
+        assert!(
+            !state
+                .agents
+                .router
+                .list_bindings()
+                .await
+                .contains_key("ws:alice"),
+            "a refused request must not leave a binding behind"
+        );
+    }
+
+    /// A session already running as a shared agent is left alone when the bound
+    /// connection sends to it without naming an agent — otherwise switching
+    /// back into the secretary's conversation would silently re-bind it to the
+    /// caller's own agent.
+    #[tokio::test]
+    async fn chat_send_keeps_a_session_already_bound_to_a_shared_agent() {
+        let (state, mut entry_rx) = make_test_state_parts(GatewayConfig::default()).await;
+        let state = Arc::new(state);
+        state
+            .agents
+            .router
+            .bind_session("ws:alice", &agent_route("secretary"))
+            .await;
+        let conn = make_test_conn(&[]);
+        let params = Some(serde_json::json!({ "message": "hello", "session_id": "ws:alice" }));
+        let resp =
+            handle_chat_send(&req("r1", params), &conn, &state, &bound_to("secretary-alice")).await;
+        assert!(resp.ok, "expected ok, got {:?}", resp.error);
+        entry_rx.recv().await.expect("enqueued message");
+
+        assert_eq!(
+            state
+                .agents
+                .router
+                .list_bindings()
+                .await
+                .get("ws:alice")
+                .map(|(a, _)| a.as_str()),
+            Some("secretary")
+        );
+    }
+
+    /// A fresh session with no binding still goes to the bound agent — the
+    /// fall-through the unconditional re-bind exists to prevent.
+    #[tokio::test]
+    async fn chat_send_binds_a_fresh_session_to_the_bound_agent() {
+        let (state, mut entry_rx) = make_test_state_parts(GatewayConfig::default()).await;
+        let state = Arc::new(state);
+        let conn = make_test_conn(&[]);
+        let params = Some(serde_json::json!({ "message": "hello", "session_id": "ws:alice" }));
+        let resp =
+            handle_chat_send(&req("r1", params), &conn, &state, &bound_to("secretary-alice")).await;
+        assert!(resp.ok, "expected ok, got {:?}", resp.error);
+        entry_rx.recv().await.expect("enqueued message");
+
+        assert_eq!(
+            state
+                .agents
+                .router
+                .list_bindings()
+                .await
+                .get("ws:alice")
+                .map(|(a, _)| a.as_str()),
+            Some("secretary-alice")
+        );
     }
 
     #[tokio::test]

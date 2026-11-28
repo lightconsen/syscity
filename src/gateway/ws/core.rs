@@ -1504,10 +1504,46 @@ mod tests {
         assert!(err.message.contains("alpha"), "{}", err.message);
     }
 
-    /// …and a request that names another agent is refused rather than quietly
-    /// served the bound one.
+    /// …and a request that names a *personal* agent other than its own is
+    /// refused rather than quietly served the bound one. (`beta` here is
+    /// restricted to bob; an unrestricted agent would be shared and reachable,
+    /// which `a_bound_connection_reaches_a_shared_agent` covers.)
     #[tokio::test]
     async fn a_bound_connection_refuses_another_agent() {
+        let state = state().await;
+        state
+            .agents
+            .router
+            .set_agent_principals("beta", vec!["bob".to_string()])
+            .await;
+        let conn = make_test_conn(&["admin", "read", "write", "chat"]);
+        {
+            let mut cg = conn.write().await;
+            cg.bound_agent = Some("alpha".into());
+        }
+        let resp = dispatch_with(
+            &conn,
+            &req(
+                "r1",
+                "chat.send",
+                Some(serde_json::json!({
+                    "session_id": "ws:alice",
+                    "message": "hi",
+                    "agent_id": "beta"
+                })),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN");
+    }
+
+    /// A shared agent (no `allowed_users`) is reachable from a bound
+    /// connection: the dispatcher does not refuse it, and the handler routes
+    /// the session there. This is the team-secretary case.
+    #[tokio::test]
+    async fn a_bound_connection_reaches_a_shared_agent() {
         let conn = make_test_conn(&["admin", "read", "write", "chat"]);
         {
             let mut cg = conn.write().await;
@@ -1521,13 +1557,17 @@ mod tests {
                 Some(serde_json::json!({
                     "session_id": "ws:alice",
                     "message": "hi",
-                    "agent_id": "beta"
+                    "agent_id": "secretary"
                 })),
             ),
         )
         .await;
-        assert!(!resp.ok);
-        assert_eq!(resp.error.as_ref().unwrap().code, "FORBIDDEN");
+        assert_ne!(
+            resp.error.as_ref().map(|e| e.code.as_str()),
+            Some("FORBIDDEN"),
+            "a shared agent must not be refused: {:?}",
+            resp.error
+        );
     }
 
     /// The single-agent surface itself is reachable: a bound connection is not
@@ -1548,8 +1588,16 @@ mod tests {
         r: &WsRequest,
     ) -> WsResponse {
         let state = state().await;
+        dispatch_with(conn, r, &state).await
+    }
+
+    async fn dispatch_with(
+        conn: &Arc<tokio::sync::RwLock<ProtocolConnection>>,
+        r: &WsRequest,
+        state: &Arc<GatewayState>,
+    ) -> WsResponse {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCommand>(1);
-        dispatch_method(r, conn, &state, &cmd_tx, &crate::gateway::protocol::AuthMode::None).await
+        dispatch_method(r, conn, state, &cmd_tx, &crate::gateway::protocol::AuthMode::None).await
     }
 
     // ── dispatch_method ──────────────────────────────────────────────────────

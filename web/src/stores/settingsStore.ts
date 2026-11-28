@@ -40,6 +40,8 @@ export interface AgentRegistryItem {
   display_name: string;
   is_valid: boolean;
   has_heartbeat: boolean;
+  /** True for an agent this connection may use but not reconfigure. */
+  read_only?: boolean;
 }
 
 export interface McpServer {

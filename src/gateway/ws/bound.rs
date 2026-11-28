@@ -32,15 +32,17 @@ use crate::security::request_context::RequestContext;
 ///
 /// - **Talking to its agent**: `chat.send`, `chat.history`, `chat.abort`.
 /// - **Its own conversations**: the `sessions.*` family. Which sessions it can
-///   actually touch is decided by [`session_belongs`], not by this list — the
+///   actually touch is decided by [`session_usable`], not by this list — the
 ///   list only says the *kind* of call is in scope.
 /// - **Answering its agent**: `ask.respond`, `approvals.*`. Same story: the
-///   approval belongs to a session, and [`session_belongs`] decides whether
+///   approval belongs to a session, and [`session_usable`] decides whether
 ///   that session is this client's.
 /// - **Describing itself**: `agents.list`, `agents.get`, `agents.registry` and
-///   `agents.get_config`, whose payloads are narrowed to the bound agent so the
-///   client shows one agent rather than a refused sidebar of them.
-/// - **Its workspace**: `workspace.list`, `workspace.read`, likewise narrowed.
+///   `agents.get_config`, whose payloads are narrowed to the bound agent plus
+///   the shared agents — the ones this client may also open a conversation
+///   with — rather than a refused sidebar of everything.
+/// - **Its workspace**: `workspace.list`, `workspace.read`, narrowed the same
+///   way.
 /// - **Liveness**: `ping`, `methods.list`, `health`, `system.presence`.
 /// - **The model picker**: `models.list`, `models.presets`, `models.default`,
 ///   which only list what the user could already be running.
@@ -129,17 +131,112 @@ pub fn method_refusal(id: impl Into<String>, method: &str, bound: &str) -> WsRes
     )
 }
 
+/// Whether `agent_id` is private to somebody — not a shared agent.
+///
+/// An agent is *personal* when either the deployment restricted it with
+/// `allowed_users`, or an agent token names it (`agent_id` on a
+/// `[security.agent_tokens.<label>]` entry). Both are ways of saying "this
+/// agent belongs to a person": a token is what binds one person's client to
+/// it, and `allowed_users` is what the router checks when a message arrives.
+/// Either alone is enough; the two are usually configured together, but an
+/// agent with only one of them is still not shared.
+///
+/// Everything else — an agent with neither — is shared: open to every caller,
+/// bound or not, exactly as an unrestricted agent always was.
+pub async fn is_personal_agent(state: &Arc<GatewayState>, agent_id: &str) -> bool {
+    if !state.agents.router.is_unrestricted(agent_id).await {
+        return true;
+    }
+    let config = state.config.read().await;
+    config
+        .security
+        .agent_tokens
+        .values()
+        .any(|entry| entry.agent_id == agent_id)
+}
+
+/// The agents [`is_personal_agent`] answers true for, as one snapshot.
+///
+/// A caller that must decide per row (a session listing walks many ids) reads
+/// this once rather than awaiting a router map lock and a config lock per row.
+pub async fn personal_agents(state: &Arc<GatewayState>) -> std::collections::HashSet<String> {
+    let mut personal = state.agents.router.restricted_agents().await;
+    let config = state.config.read().await;
+    for entry in config.security.agent_tokens.values() {
+        if !entry.agent_id.is_empty() {
+            personal.insert(entry.agent_id.clone());
+        }
+    }
+    personal
+}
+
+/// Whether a request that may be bound to one agent may act on `agent_id`.
+///
+/// Unbound requests answer `true` here — their real gate is scopes plus the
+/// router's `allowed_users`, and those are applied elsewhere. A bound request
+/// may act on:
+///
+/// - the agent it is bound to, always; and
+/// - a **shared** agent — one no token and no `allowed_users` claims (see
+///   [`is_personal_agent`]).
+///
+/// The second case is what lets a team member's Desktop reach the shared
+/// secretary (and every other open agent) while the binding still confines it:
+/// a personal agent belongs to its one token holder, so an unbound
+/// credential's reach is not widened by it. Deliberately narrower than "any
+/// agent this caller is allowed to use": an agent restricted to `["alice"]` is
+/// alice's, not a shared one, even when another caller's principal happens to
+/// appear in that list.
+pub async fn agent_usable(state: &Arc<GatewayState>, ctx: &RequestContext, agent_id: &str) -> bool {
+    match ctx.bound_agent() {
+        None => true,
+        Some(bound) => agent_id == bound || !is_personal_agent(state, agent_id).await,
+    }
+}
+
+/// Whether a session is this caller's to touch, binding included.
+///
+/// The session's own binding is what decides, not the parameter: this resolves
+/// it the same way the dispatcher does, then asks whether the session's agent
+/// is one [`agent_usable`] accepts. A conversation with a
+/// shared agent is as much this client's as one with its own agent; a personal
+/// agent's conversation is not.
+pub async fn session_usable(
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+    session_id: &str,
+) -> bool {
+    if session_id.is_empty() {
+        return true;
+    }
+    let Some(bound) = ctx.bound_agent() else {
+        return true;
+    };
+    let binding = state.agents.router.list_bindings().await;
+    match binding.get(session_id) {
+        Some((agent_id, _)) => agent_id == bound || !is_personal_agent(state, agent_id).await,
+        // No binding: a brand-new session, about to be bound by this request.
+        None => true,
+    }
+}
+
 /// Check the agent-selecting parameters of a request against the binding.
 ///
 /// Two kinds of parameter name an agent:
 ///
 /// - `agent_id`, on `sessions.create`, `agents.get`, `workspace.*` and
-///   `sessions.list`. A different one is refused.
+///   `sessions.list`. A different one is refused unless it is a shared agent.
 /// - `session_id`, on almost every `sessions.*` and on `chat.*`. The session
 ///   is checked against the router's binding rather than the parameter
 ///   directly: naming someone else's session by id is the same act as naming
 ///   their agent, and an existing session's agent is not the caller's to choose
 ///   either.
+///
+/// A shared agent (neither `allowed_users` nor a token) is accepted wherever
+/// its own agent is: a one-agent client's Desktop may open a conversation with
+/// the team secretary, and that conversation is then addressed by its own id
+/// like any other. A personal agent restricted to somebody else — or to this caller
+/// alone — is not shared and is refused.
 ///
 /// A session with no binding yet (a fresh `ws:alice` before its first message)
 /// is accepted: it is about to be bound to this connection's agent by
@@ -160,7 +257,7 @@ pub async fn check_params(
     };
 
     if let Some(agent_id) = params.get("agent_id").and_then(|v| v.as_str()) {
-        if !agent_id.is_empty() && agent_id != bound {
+        if !agent_id.is_empty() && !agent_usable(state, ctx, agent_id).await {
             return Some(agent_refusal(&req.id, bound, agent_id));
         }
     }
@@ -170,14 +267,14 @@ pub async fn check_params(
     // is exactly how a check gets bypassed.
     if matches!(req.method.as_str(), "agents.get" | "agents.get_config") {
         if let Some(agent_id) = params.get("id").and_then(|v| v.as_str()) {
-            if !agent_id.is_empty() && agent_id != bound {
+            if !agent_id.is_empty() && !agent_usable(state, ctx, agent_id).await {
                 return Some(agent_refusal(&req.id, bound, agent_id));
             }
         }
     }
 
     if let Some(session_id) = params.get("session_id").and_then(|v| v.as_str()) {
-        if !session_belongs(state, bound, session_id).await {
+        if !session_usable(state, ctx, session_id).await {
             return Some(WsResponse::err(
                 &req.id,
                 "FORBIDDEN",
@@ -192,7 +289,7 @@ pub async fn check_params(
     // `sessions.subscribe`/`unsubscribe` take a list.
     if let Some(ids) = params.get("session_ids").and_then(|v| v.as_array()) {
         for id in ids.iter().filter_map(|v| v.as_str()) {
-            if !session_belongs(state, bound, id).await {
+            if !session_usable(state, ctx, id).await {
                 return Some(WsResponse::err(
                     &req.id,
                     "FORBIDDEN",
@@ -216,48 +313,27 @@ fn agent_refusal(id: &str, bound: &str, requested: &str) -> WsResponse {
     )
 }
 
-/// Whether an approval is part of this agent's work.
+/// Whether an approval is part of this caller's work.
 ///
 /// An approval is raised by a tool call inside a conversation, so the
 /// conversation is what says whose it is. Two cases are refused for a bound
 /// connection:
 ///
-/// - A session that belongs to another agent.
+/// - A session belonging to a personal agent other than this one.
 /// - No session at all. Such an approval comes from an operator-level call
 ///   (`computer.run` from the settings page, a run with no conversation), which
 ///   a one-agent client has no surface for in the first place.
+///
+/// A conversation with a shared agent is visible: this client may open one, so
+/// it may answer what it is asked in it.
 pub async fn approval_visible(
     state: &Arc<GatewayState>,
-    bound: &str,
+    ctx: &RequestContext,
     session_id: Option<&str>,
 ) -> bool {
     match session_id {
-        Some(session_id) => session_belongs(state, bound, session_id).await,
+        Some(session_id) => session_usable(state, ctx, session_id).await,
         None => false,
-    }
-}
-
-/// Whether a session is this agent's to touch.
-///
-/// The router is the authority on which agent a session runs as: it is the thing
-/// that decides at message time, and its binding is what `chat.send` consults.
-/// Asking the same question here keeps the two from disagreeing.
-///
-/// A session that does not exist yet, or has no binding, resolves to the global
-/// default. That is *not* this connection's agent in general — a bound client
-/// whose session has not been bound yet is about to have it bound, so the
-/// decision belongs to the caller; this function says "no opinion" (`true`) for
-/// an unbound session rather than guessing.
-pub async fn session_belongs(state: &Arc<GatewayState>, bound: &str, session_id: &str) -> bool {
-    if session_id.is_empty() {
-        return true;
-    }
-    let binding = state.agents.router.list_bindings().await;
-    match binding.get(session_id) {
-        Some((agent_id, _)) => agent_id == bound,
-        // No binding: either brand new or created outside the WS path. Do not
-        // invent an owner.
-        None => true,
     }
 }
 
@@ -425,8 +501,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_different_agent_id_is_refused() {
+    async fn a_different_agents_personal_agent_id_is_refused() {
         let state = state().await;
+        state
+            .agents
+            .router
+            .set_agent_principals("secretary-bob", vec!["bob".to_string()])
+            .await;
         let ctx = bound_ctx("secretary-alice");
         let create =
             req("r1", "sessions.create", serde_json::json!({ "agent_id": "secretary-bob" }));
@@ -448,8 +529,13 @@ mod tests {
     /// `agents.get` names the agent under `id`; a check that only looked at
     /// `agent_id` would leave the whole agent directory readable.
     #[tokio::test]
-    async fn agents_get_for_another_agent_is_refused() {
+    async fn agents_get_for_a_personal_agent_is_refused() {
         let state = state().await;
+        state
+            .agents
+            .router
+            .set_agent_principals("secretary-bob", vec!["bob".to_string()])
+            .await;
         let ctx = bound_ctx("secretary-alice");
         let other = req("r1", "agents.get", serde_json::json!({ "id": "secretary-bob" }));
         assert!(check_params(&other, &ctx, &state).await.is_some());
@@ -458,11 +544,116 @@ mod tests {
         assert!(check_params(&own, &ctx, &state).await.is_none());
     }
 
+    // ── Shared agents ────────────────────────────────────────────────────
+
+    /// A bound connection may also use a **shared** agent — one with no
+    /// `allowed_users` — so the team secretary stays reachable from every
+    /// member's Desktop. A client that could not name one would have a
+    /// sidebar the gateway itself disagrees with.
+    #[tokio::test]
+    async fn a_shared_agent_id_is_accepted() {
+        let state = state().await;
+        let ctx = bound_ctx("secretary-alice");
+        let create = req("r1", "sessions.create", serde_json::json!({ "agent_id": "secretary" }));
+        assert!(
+            check_params(&create, &ctx, &state).await.is_none(),
+            "an unrestricted agent is shared and must be reachable"
+        );
+
+        let get = req("r2", "agents.get", serde_json::json!({ "id": "secretary" }));
+        assert!(check_params(&get, &ctx, &state).await.is_none());
+    }
+
+    /// A personal agent — restricted to named principals — is not shared, even
+    /// when this caller's principal is in that list. The binding is the
+    /// narrower gate, and its whole point is that no `allowed_users` entry can
+    /// widen it.
+    #[tokio::test]
+    async fn a_personal_agent_is_refused_even_when_the_caller_is_allowed_to_use_it() {
+        let state = state().await;
+        state
+            .agents
+            .router
+            .set_agent_principals("secretary-carol", vec!["alice".to_string()])
+            .await;
+        let ctx = bound_ctx("secretary-alice");
+        let create =
+            req("r1", "sessions.create", serde_json::json!({ "agent_id": "secretary-carol" }));
+        assert!(check_params(&create, &ctx, &state).await.is_some());
+    }
+
+    /// "Shared" is the *absence* of both claims on an agent: no `allowed_users`
+    /// and no agent token naming it. An agent that carries a token but no
+    /// `allowed_users` still belongs to the person that token was issued to, so
+    /// it must not be treated as shared.
+    #[tokio::test]
+    async fn an_agent_named_by_a_token_is_personal_even_without_allowed_users() {
+        let mut config = GatewayConfig::default();
+        config.security.agent_tokens.insert(
+            "carol".into(),
+            crate::gateway::config::AgentTokenEntry {
+                token: "tok-carol".into(),
+                principal: String::new(),
+                agent_id: "secretary-carol".into(),
+                scopes: crate::gateway::config::default_agent_token_scopes(),
+            },
+        );
+        let state = Arc::new(make_test_state(config).await);
+        assert!(
+            is_personal_agent(&state, "secretary-carol").await,
+            "a token naming the agent makes it personal"
+        );
+        assert!(
+            !is_personal_agent(&state, "secretary").await,
+            "an agent with neither a token nor allowed_users is shared"
+        );
+
+        let ctx = bound_ctx("secretary-alice");
+        let create =
+            req("r1", "sessions.create", serde_json::json!({ "agent_id": "secretary-carol" }));
+        assert!(
+            check_params(&create, &ctx, &state).await.is_some(),
+            "a token-bound personal agent must not be reachable from another binding"
+        );
+    }
+
+    /// A conversation with a shared agent is this client's to address — it may
+    /// open one, so it may list, rename or send to it afterwards.
+    #[tokio::test]
+    async fn a_shared_agents_session_is_accepted() {
+        let state = state().await;
+        state
+            .agents
+            .router
+            .bind_session(
+                "ws:alice-secretary",
+                &crate::inbound::RouteResult {
+                    agent_id: "secretary".into(),
+                    workspace_id: None,
+                    persisted_binding: false,
+                    is_fallback: false,
+                },
+            )
+            .await;
+        let ctx = bound_ctx("secretary-alice");
+        let hist =
+            req("r1", "chat.history", serde_json::json!({ "session_id": "ws:alice-secretary" }));
+        assert!(check_params(&hist, &ctx, &state).await.is_none());
+
+        // …and its approvals are visible, since this client may answer them.
+        assert!(approval_visible(&state, &ctx, Some("ws:alice-secretary")).await);
+    }
+
     /// A session bound to another agent is not this client's to name, whether
     /// it is addressed directly or through a subscribe list.
     #[tokio::test]
     async fn another_agents_session_is_refused() {
         let state = state().await;
+        state
+            .agents
+            .router
+            .set_agent_principals("secretary-bob", vec!["bob".to_string()])
+            .await;
         state
             .agents
             .router

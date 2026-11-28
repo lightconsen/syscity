@@ -55,7 +55,8 @@ auth_mode = "token"
 # token 建议走环境变量：SYSCITY_AGENT_TOKEN_ALICE=...
 agent_id = "secretary"
 # principal 留空 = 使用表标签（alice），对应 [agent_overrides.secretary] allowed_users
-# scopes 默认 ["chat", "read"]——这是刻意的：agent token 的持有人不是运维本人
+# scopes 默认 ["chat", "read", "write"]——write 是 sessions.create 需要的；运维级写入
+# 由下面那条"单 agent 方法集"挡掉，跟 scope 无关
 ```
 
 要点：
@@ -67,7 +68,11 @@ agent_id = "secretary"
 - 连接建立后 Gateway 在 `connect` 握手里返回 `bound_agent`，客户端据此隐藏 agent 切换器。
 - 被绑定的连接能调用的是"单 agent"方法集（聊天、会话、审批、模型选择等），
   `config.set` / `agents.update` / `computer.run` 等运维方法一律 `FORBIDDEN`；
-  请求里出现别的 `agent_id` / `session_id` 也会被拒绝。
+  请求里出现**别人的私有** `agent_id` / `session_id`（即带 `allowed_users` 限制、
+  且不是自己那个的）也会被拒绝。
+- 既没有 `allowed_users` 限制、也没有 agent token 指向的 agent 是"共享 agent"，被绑定的连接同样可以连它
+  （比如团队公用的秘书 agent），也能在 `sessions.list` 里看到自己跟它的会话；
+  `agents.registry` 里这类条目会带 `read_only: true`，客户端据此不显示改名/删除菜单。
 
 > 更多鉴权模式（Device 配对、Tailscale）见 `docs/security-config.md`。
 

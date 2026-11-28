@@ -26,12 +26,12 @@ async fn visible_approvals(
         .approval_queue
         .list_pending(crate::tools::approval::ApprovalFilter::default())
         .await;
-    let Some(bound) = ctx.bound_agent() else {
+    if ctx.bound_agent().is_none() {
         return all;
-    };
+    }
     let mut visible = Vec::with_capacity(all.len());
     for approval in all {
-        if crate::gateway::ws::bound::approval_visible(state, bound, approval.session_id.as_deref())
+        if crate::gateway::ws::bound::approval_visible(state, ctx, approval.session_id.as_deref())
             .await
         {
             visible.push(approval);
@@ -62,23 +62,22 @@ pub(crate) async fn handle_approvals_get(
     };
     match state.tools.approval_queue.get(&id).await {
         Some(approval) => {
-            if let Some(bound) = ctx.bound_agent() {
-                if !crate::gateway::ws::bound::approval_visible(
+            if ctx.bound_agent().is_some()
+                && !crate::gateway::ws::bound::approval_visible(
                     state,
-                    bound,
+                    ctx,
                     approval.session_id.as_deref(),
                 )
                 .await
-                {
-                    // Reported as not-found: the caller may not know the
-                    // approval exists, and distinguishing "not yours" from
-                    // "not there" would leak the inventory.
-                    return WsResponse::err(
-                        &req.id,
-                        "NOT_FOUND",
-                        format!("Approval '{}' not found", id),
-                    );
-                }
+            {
+                // Reported as not-found: the caller may not know the
+                // approval exists, and distinguishing "not yours" from
+                // "not there" would leak the inventory.
+                return WsResponse::err(
+                    &req.id,
+                    "NOT_FOUND",
+                    format!("Approval '{}' not found", id),
+                );
             }
             WsResponse::ok(&req.id, serde_json::to_value(&approval).unwrap_or_default())
         }
@@ -108,14 +107,14 @@ pub(crate) async fn handle_approvals_approve(
         Err(res) => return res,
     };
 
-    if let Some(bound) = ctx.bound_agent() {
+    if ctx.bound_agent().is_some() {
         let session = state
             .tools
             .approval_queue
             .get(&p.id)
             .await
             .and_then(|a| a.session_id);
-        if !crate::gateway::ws::bound::approval_visible(state, bound, session.as_deref()).await {
+        if !crate::gateway::ws::bound::approval_visible(state, ctx, session.as_deref()).await {
             return WsResponse::err(&req.id, "NOT_FOUND", format!("Approval '{}' not found", p.id));
         }
     }
@@ -218,14 +217,14 @@ pub(crate) async fn handle_approvals_deny(
         Err(res) => return res,
     };
 
-    if let Some(bound) = ctx.bound_agent() {
+    if ctx.bound_agent().is_some() {
         let session = state
             .tools
             .approval_queue
             .get(&p.id)
             .await
             .and_then(|a| a.session_id);
-        if !crate::gateway::ws::bound::approval_visible(state, bound, session.as_deref()).await {
+        if !crate::gateway::ws::bound::approval_visible(state, ctx, session.as_deref()).await {
             return WsResponse::err(&req.id, "NOT_FOUND", format!("Approval '{}' not found", p.id));
         }
     }

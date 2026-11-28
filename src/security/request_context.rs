@@ -172,12 +172,14 @@ impl RequestContext {
         self.bound_agent.as_deref()
     }
 
-    /// Whether this request may act on `agent_id`.
+    /// Whether this request is bound to `agent_id`.
     ///
-    /// An unbound request may act on anything its scopes allow; a bound one may
-    /// act only on the agent it is bound to. This is the single predicate every
-    /// agent-selecting surface uses, so "bound" cannot be enforced in one place
-    /// and forgotten in another.
+    /// An unbound request answers `true` for anything; a bound one answers only
+    /// for the agent it is bound to. This is the *binding* half alone — the
+    /// surfaces that select an agent use
+    /// [`ws::bound::agent_usable`](crate::gateway::ws::bound::agent_usable),
+    /// which adds the one widening this predicate cannot express without the
+    /// router: a **shared** agent (no `allowed_users`) is also reachable.
     pub fn may_use_agent(&self, agent_id: &str) -> bool {
         match self.bound_agent() {
             Some(bound) => bound == agent_id,

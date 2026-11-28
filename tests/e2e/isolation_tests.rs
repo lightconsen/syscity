@@ -17,14 +17,21 @@ use super::*;
 use syscity::gateway::protocol::AuthMode;
 use syscity::security::UserId;
 
+/// The agent token `alice` is also given, bound to `alice-bot`. Held alongside
+/// her session token so a test can connect as the *bound* shape of client.
+const ALICE_AGENT_TOKEN: &str = "journey-agent-token-alice";
+
 /// Start a token-mode gateway with two registered people, one disk-backed
-/// agent each plus a shared one, and return a session token per person.
+/// agent each plus a shared one, and return a session token per person plus
+/// alice's agent access token.
 ///
-/// Agent access tokens would be the other way to name a principal, but they
-/// bind the connection to one agent — and `agents.list` narrows to a bound
-/// agent before it ever consults `allowed_users`. A session token leaves the
-/// connection unbound, which is the case the principal filter exists for.
-async fn start_isolation_gateway(port: u16) -> (String, String) {
+/// The session tokens name a principal and carry no agent binding, so the
+/// connection's identity — not a per-agent credential — is what the listings
+/// are filtered by: that is the case the principal filter exists for. The
+/// agent token is the other shape: it binds the connection to one agent, and
+/// what it may reach beyond that (the shared agents) is what the bound
+/// journeys check.
+async fn start_isolation_gateway(port: u16) -> (String, String, String) {
     let mut config = test_config(port, false);
     config.model_provider = "mock".to_string();
     config.model = "mock-model".to_string();
@@ -50,6 +57,19 @@ async fn start_isolation_gateway(port: u16) -> (String, String) {
         syscity::gateway::config::AgentOverrides {
             allowed_users: Some(vec!["bob".to_string()]),
             ..Default::default()
+        },
+    );
+
+    // Alice also holds an agent token for `alice-bot`. It is the same
+    // `(principal, agent)` pair her `allowed_users` entry names, so the two
+    // credentials reach the same agent; the difference is the binding.
+    config.security.agent_tokens.insert(
+        "alice".to_string(),
+        syscity::gateway::config::AgentTokenEntry {
+            token: ALICE_AGENT_TOKEN.to_string(),
+            principal: String::new(),
+            agent_id: "alice-bot".to_string(),
+            scopes: syscity::gateway::config::default_agent_token_scopes(),
         },
     );
 
@@ -141,7 +161,7 @@ async fn start_isolation_gateway(port: u16) -> (String, String) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    (tokens[0].clone(), tokens[1].clone())
+    (tokens[0].clone(), tokens[1].clone(), ALICE_AGENT_TOKEN.to_string())
 }
 
 /// Connect as the holder of `session_token`: mint an upgrade ticket over HTTP
@@ -160,6 +180,97 @@ async fn connect_as(port: u16, session_token: &str) -> FrontendSimulator {
     FrontendSimulator::connect_with_ticket(port, ticket).await
 }
 
+/// Connect with an agent access token: mint a ticket over HTTP with it, then
+/// upgrade with the ticket. The resulting connection is bound to that agent
+/// (the ticket carries the binding, so the upgrade cannot widen it).
+async fn connect_as_agent(port: u16, agent_token: &str) -> FrontendSimulator {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/api/v1/ws-ticket"))
+        .bearer_auth(agent_token)
+        .send()
+        .await
+        .expect("ticket request");
+    assert!(resp.status().is_success(), "ticket mint failed: {}", resp.status());
+    let body: serde_json::Value = resp.json().await.expect("ticket body");
+    let ticket = body["ticket"].as_str().expect("ticket in body");
+    FrontendSimulator::connect_with_ticket(port, ticket).await
+}
+
+/// Case 0 — an agent token's connection is bound to its one agent for private
+/// agents, but the deployment's **shared** agents stay reachable: a team
+/// member's Desktop must be able to talk to the team secretary. A *personal*
+/// agent belonging to somebody else stays out.
+#[tokio::test]
+#[serial]
+async fn a_bound_connection_sees_its_own_agent_and_the_shared_ones() {
+    let port = free_port();
+    let (_, _, alice_agent_token) = start_isolation_gateway(port).await;
+
+    let mut bound = connect_as_agent(port, &alice_agent_token).await;
+
+    // The handshake says which agent this is.
+    let info = bound.request("ping", json!({})).await;
+    assert_eq!(info["ok"], true, "{info}");
+
+    let listed = bound.request("agents.list", json!({})).await;
+    assert_eq!(listed["ok"], true, "{listed}");
+    let mut ids: Vec<String> = listed["payload"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["alice-bot", "default", "team"],
+        "bound to alice-bot: its own agent plus the shared ones, never bob's: {listed}"
+    );
+
+    // `agents.registry` is the surface the sidebar reads; the shared entries
+    // must be there, marked read-only so the client does not offer a refused
+    // rename.
+    let registry = bound.request("agents.registry", json!({})).await;
+    assert_eq!(registry["ok"], true, "{registry}");
+    let entries = registry["payload"]["agents"].as_array().unwrap().clone();
+    let by_id: std::collections::HashMap<String, &serde_json::Value> = entries
+        .iter()
+        .map(|e| (e["id"].as_str().unwrap_or_default().to_string(), e))
+        .collect();
+    assert!(by_id.contains_key("team"), "the shared agent must be listed: {registry}");
+    assert_eq!(
+        by_id["team"]["read_only"], true,
+        "a shared agent is not this client's to reconfigure: {registry}"
+    );
+    assert!(
+        by_id["alice-bot"].get("read_only").is_none(),
+        "its own agent is the one it may reconfigure: {registry}"
+    );
+
+    // A shared agent's workspace is readable, and its conversation can be
+    // opened — the two things a sidebar entry implies.
+    let opened = bound
+        .request("sessions.create", json!({ "session_id": "shared-bot", "agent_id": "team" }))
+        .await;
+    assert_eq!(opened["ok"], true, "a shared agent must accept a session: {opened}");
+    let shared_ws = bound
+        .request("workspace.list", json!({ "agent_id": "team" }))
+        .await;
+    assert_eq!(shared_ws["ok"], true, "a shared workspace must be readable: {shared_ws}");
+
+    // Bob's private agent stays out of both the listing and reach.
+    let personal = bound
+        .request("agents.get", json!({ "id": "bob-bot" }))
+        .await;
+    assert_eq!(personal["ok"], false, "bob's agent must refuse: {personal}");
+    assert_eq!(personal["error"]["code"], "FORBIDDEN", "{personal}");
+    let hijack = bound
+        .request("sessions.create", json!({ "session_id": "hijack", "agent_id": "bob-bot" }))
+        .await;
+    assert_eq!(hijack["ok"], false, "bob's agent must refuse a session: {hijack}");
+}
+
 /// Case 1 — two principals see different agent lists over the same gateway,
 /// and the shared agents are in both.
 ///
@@ -169,7 +280,7 @@ async fn connect_as(port: u16, session_token: &str) -> FrontendSimulator {
 #[serial]
 async fn two_principals_see_different_agent_lists() {
     let port = free_port();
-    let (alice_token, bob_token) = start_isolation_gateway(port).await;
+    let (alice_token, bob_token, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
     let alice_frame = alice.request("agents.list", json!({})).await;
@@ -211,7 +322,7 @@ async fn two_principals_see_different_agent_lists() {
 #[serial]
 async fn registry_and_list_agree_on_what_a_principal_may_see() {
     let port = free_port();
-    let (alice_token, _) = start_isolation_gateway(port).await;
+    let (alice_token, _, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
     let listed = alice.request("agents.list", json!({})).await;
@@ -245,7 +356,7 @@ async fn registry_and_list_agree_on_what_a_principal_may_see() {
 #[serial]
 async fn a_session_is_visible_only_to_its_owner() {
     let port = free_port();
-    let (alice_token, bob_token) = start_isolation_gateway(port).await;
+    let (alice_token, bob_token, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
     let created = alice
@@ -336,7 +447,7 @@ async fn a_session_is_visible_only_to_its_owner() {
 #[serial]
 async fn a_hidden_agent_is_refused_by_name_too() {
     let port = free_port();
-    let (alice_token, _) = start_isolation_gateway(port).await;
+    let (alice_token, _, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
 
@@ -376,7 +487,7 @@ async fn a_hidden_agent_is_refused_by_name_too() {
 #[serial]
 async fn a_write_handler_refuses_before_touching_bob_s_agent() {
     let port = free_port();
-    let (alice_token, _) = start_isolation_gateway(port).await;
+    let (alice_token, _, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
     let frame = alice
@@ -394,7 +505,7 @@ async fn a_write_handler_refuses_before_touching_bob_s_agent() {
 #[serial]
 async fn the_destructive_handlers_refuse_bob_s_agent() {
     let port = free_port();
-    let (alice_token, bob_token) = start_isolation_gateway(port).await;
+    let (alice_token, bob_token, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
     // `agents.rename` names the agent `agent_id`; the other two use `id`.
@@ -438,7 +549,7 @@ async fn the_destructive_handlers_refuse_bob_s_agent() {
 #[serial]
 async fn a_session_cannot_be_created_for_another_persons_agent() {
     let port = free_port();
-    let (alice_token, _) = start_isolation_gateway(port).await;
+    let (alice_token, _, _) = start_isolation_gateway(port).await;
 
     let mut alice = connect_as(port, &alice_token).await;
     let refused = alice

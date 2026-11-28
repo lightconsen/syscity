@@ -784,6 +784,27 @@ impl AgentRouter {
         }
     }
 
+    /// Whether `agent_id` has no `allowed_users` at all.
+    ///
+    /// Distinct from [`allows_principal`](Self::allows_principal), which is
+    /// also true for a restricted agent that happens to name this caller. A
+    /// *shared* agent — one the deployment left open to everyone — is what a
+    /// one-agent credential may reach beside its own agent; a personal agent
+    /// restricted to somebody else is not, and neither is one restricted to
+    /// this caller alone (that is still a private agent, not a shared one).
+    pub async fn is_unrestricted(&self, agent_id: &str) -> bool {
+        !self.agent_principals.read().await.contains_key(agent_id)
+    }
+
+    /// The agents that carry an `allowed_users` restriction.
+    ///
+    /// The complement of [`is_unrestricted`](Self::is_unrestricted), as one
+    /// snapshot: a caller that must decide per row (a session listing walks
+    /// many ids) should read this once rather than await a map lock per row.
+    pub async fn restricted_agents(&self) -> std::collections::HashSet<String> {
+        self.agent_principals.read().await.keys().cloned().collect()
+    }
+
     /// Bind a user on a channel to an agent, for every session they open.
     ///
     /// This is what makes "one agent per human employee" hold in a deployment

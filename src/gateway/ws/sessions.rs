@@ -8,17 +8,22 @@ pub(super) async fn handle_sessions_list(
     state: &Arc<GatewayState>,
     ctx: &RequestContext,
 ) -> WsResponse {
-    // A connection bound to one agent lists only that agent's conversations.
-    // Filtering on the store's own `agent_id` column (rather than after the
-    // fact) means the row count and the paging stay right; a post-filter would
-    // silently return short pages.
-    let agent_filter = ctx.bound_agent();
+    // A connection bound to one agent lists its own agent's conversations plus
+    // any it opened with a shared agent (one with no `allowed_users`). Which
+    // rows those are is decided below, against the router's binding — the same
+    // authority every other session handler consults — rather than by a single
+    // `agent_id` equality.
+    let bound = ctx.bound_agent().map(str::to_string);
     // An unbound caller sees only the conversations attributed to them. A
     // surfaced list of someone else's session is worse than the agent case: the
     // row carries their history, and every click on it would then be refused
     // one session at a time. A single-identity deployment records no owner
     // (`shared` / `anonymous` are not people), so nothing matches and the
     // filter is skipped — its listing stays exactly what it was.
+    //
+    // A bound caller is a real principal too: two token holders talking to the
+    // same shared agent must not see each other's conversations in it, so the
+    // owner filter applies to them as well.
     let has_personal_identity = {
         let id = ctx.user_id();
         !id.is_empty()
@@ -26,10 +31,40 @@ pub(super) async fn handle_sessions_list(
                 .iter()
                 .any(|s| s.eq_ignore_ascii_case(id))
     };
-    let user_filter = if agent_filter.is_none() && has_personal_identity {
+    let user_filter = if has_personal_identity {
         Some(ctx.user_id())
     } else {
         None
+    };
+    // The bindings, when a bound caller needs them for the agent half of the
+    // filter. Read once; a listing is one snapshot either way.
+    let bindings = match &bound {
+        Some(_) => state.agents.router.list_bindings().await,
+        None => Default::default(),
+    };
+    // The personal agents (restricted by `allowed_users`, or named by an agent
+    // token), read once: a bound caller keeps its own agent's rows and any row
+    // whose agent is *not* in this set.
+    let personal = if bound.is_some() {
+        crate::gateway::ws::bound::personal_agents(state).await
+    } else {
+        Default::default()
+    };
+    // Whether a row belongs to an agent this caller may use. Unbound callers
+    // see everything the store query returned (their gate is the owner
+    // filter). A bound caller keeps its own agent's rows and any row whose
+    // agent is shared (not personal); a row with no binding falls back to the
+    // stored `agent_id`, and a row with neither is not this client's.
+    let row_visible = |session_id: &str, stored_agent: &str| -> bool {
+        let Some(bound) = bound.as_deref() else {
+            return true;
+        };
+        let agent = bindings
+            .get(session_id)
+            .map(|(a, _)| a.as_str())
+            .filter(|a| !a.is_empty())
+            .unwrap_or(stored_agent);
+        !agent.is_empty() && (agent == bound || !personal.contains(agent))
     };
     // The mode a session actually runs in: a per-session override when one was
     // set (see `sessions.set_mode`), otherwise the configured default. The
@@ -49,11 +84,12 @@ pub(super) async fn handle_sessions_list(
     let running = state.agents.running_sessions().await;
     let sessions: Vec<serde_json::Value> = if let Some(ref store) = state.agents.store {
         match store
-            .find_sessions_for_user(agent_filter, None, None, false, user_filter)
+            .find_sessions_for_user(None, None, None, false, user_filter)
             .await
         {
             Ok(rows) => rows
                 .into_iter()
+                .filter(|meta| row_visible(&meta.session_id, &meta.agent_id))
                 .map(|meta| {
                     let name = meta.name.unwrap_or_else(|| {
                         if meta.message_count == 0 {
@@ -88,20 +124,13 @@ pub(super) async fn handle_sessions_list(
     } else {
         // With no store there is no `agent_id` column to filter on, so the
         // router's binding is consulted instead — the same authority
-        // `session_belongs` uses. Ids are compared as bindings, never as
+        // `session_usable` uses. Ids are compared as bindings, never as
         // substrings: an agent named `alice` must not match `ws:alice-other`.
-        let bindings = match agent_filter {
-            Some(_) => state.agents.router.list_bindings().await,
-            None => Default::default(),
-        };
         let mgr = state.agents.manager.read().await;
         mgr.list_sessions()
             .await
             .into_iter()
-            .filter(|id| match agent_filter {
-                Some(agent) => bindings.get(id).is_some_and(|(bound, _)| bound == agent),
-                None => true,
-            })
+            .filter(|id| row_visible(id, ""))
             .map(|id| {
                 let permission_mode = mode_of(&id);
                 serde_json::json!({
@@ -1445,6 +1474,27 @@ mod tests {
         }
     }
 
+    /// The `session_id`s of a `sessions.list` payload, sorted.
+    fn listed_session_ids(res: &WsResponse) -> Vec<String> {
+        let mut ids: Vec<String> = res
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("sessions"))
+            .and_then(|s| s.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|s| {
+                        s.get("session_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
     async fn register_model(state: &GatewayState, model_id: &str) {
         let config = ProviderConfig {
             provider_type: ProviderType::OpenAi,
@@ -1820,7 +1870,9 @@ mod tests {
 
     /// With no session store the binding has to come from the router, and it
     /// has to be compared as a binding, not as a substring: an agent named
-    /// `alice` must not match a session id that merely contains "alice".
+    /// `alice` must not match a session id that merely contains "alice". A
+    /// session with no binding is not this client's either — there is no agent
+    /// to vouch for it.
     #[tokio::test]
     async fn sessions_list_without_a_store_narrows_to_the_router_binding() {
         let state = Arc::new(make_test_state(GatewayConfig::default()).await);
@@ -1829,9 +1881,45 @@ mod tests {
             let mut mgr = state.agents.manager.write().await;
             mgr.create_session("ws:alice".to_string());
             mgr.create_session("ws:alice-other".to_string());
-            mgr.create_session("ws:bob".to_string());
         }
-        for (session, agent) in [("ws:alice", "alice"), ("ws:bob", "bob")] {
+        let route = crate::inbound::RouteResult {
+            agent_id: "alice".to_string(),
+            workspace_id: None,
+            persisted_binding: true,
+            is_fallback: false,
+        };
+        state.agents.router.bind_session("ws:alice", &route).await;
+
+        let ctx = make_test_ctx().with_bound_agent(Some("alice"));
+        let res =
+            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state, &ctx)
+                .await;
+        let listed = listed_session_ids(&res);
+        assert_eq!(
+            listed,
+            vec!["ws:alice".to_string()],
+            "the bound agent sees its own binding and nothing a substring match would catch"
+        );
+    }
+
+    /// The listing has to agree with what `check_params` accepts. A bound
+    /// connection may open a conversation with a shared agent (no
+    /// `allowed_users`), so that conversation must appear in its list —
+    /// otherwise the user creates a session, sends a message, and the sidebar
+    /// pretends it does not exist.
+    #[tokio::test]
+    async fn sessions_list_shows_shared_agent_conversations_to_a_bound_caller() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.agents.store.as_ref().unwrap();
+        for (session, agent) in [
+            ("own-1", "secretary-alice"),
+            ("shared-1", "secretary"),
+            ("personal-1", "secretary-bob"),
+        ] {
+            let meta =
+                crate::agent::session_store::SessionMetadata::new(session, agent, "ws", "alice")
+                    .with_user_id(Some("alice"));
+            store.save_session(session, &meta, "{}").await.unwrap();
             let route = crate::inbound::RouteResult {
                 agent_id: agent.to_string(),
                 workspace_id: None,
@@ -1840,29 +1928,53 @@ mod tests {
             };
             state.agents.router.bind_session(session, &route).await;
         }
+        // `secretary-bob` is personal to bob; `secretary` and
+        // `secretary-alice` are not restricted at all.
+        state
+            .agents
+            .router
+            .set_agent_principals("secretary-bob", vec!["bob".to_string()])
+            .await;
 
-        let ctx = make_test_ctx().with_bound_agent(Some("alice"));
+        let ctx =
+            RequestContext::new("alice", crate::security::request_context::AuthSource::Session)
+                .with_bound_agent(Some("secretary-alice"));
         let res =
             handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state, &ctx)
                 .await;
-        let mut listed: Vec<String> = res
-            .payload
-            .and_then(|p| p.get("sessions").cloned())
-            .and_then(|s| s.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|s| {
-                s.get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .collect();
-        listed.sort();
+        assert!(res.ok, "list failed: {:?}", res.error);
         assert_eq!(
-            listed,
-            vec!["ws:alice".to_string()],
-            "the bound agent sees its own binding and nothing a substring match would catch"
+            listed_session_ids(&res),
+            vec!["own-1", "shared-1"],
+            "own agent + shared agent; a personal agent's conversation stays out"
         );
+    }
+
+    /// Two token holders sharing the same secretary must not see each other's
+    /// conversations in it: the owner filter applies to a bound caller too.
+    #[tokio::test]
+    async fn sessions_list_hides_another_users_shared_agent_conversation() {
+        let state = Arc::new(make_test_state_with_store(GatewayConfig::default()).await);
+        let store = state.agents.store.as_ref().unwrap();
+        for (session, owner) in [("alice-sec", "alice"), ("bob-sec", "bob")] {
+            let meta = crate::agent::session_store::SessionMetadata::new(
+                session,
+                "secretary",
+                "ws",
+                owner,
+            )
+            .with_user_id(Some(owner));
+            store.save_session(session, &meta, "{}").await.unwrap();
+        }
+
+        let ctx =
+            RequestContext::new("alice", crate::security::request_context::AuthSource::Session)
+                .with_bound_agent(Some("secretary-alice"));
+        let res =
+            handle_sessions_list(&req("l", "sessions.list", serde_json::json!({})), &state, &ctx)
+                .await;
+        assert!(res.ok, "list failed: {:?}", res.error);
+        assert_eq!(listed_session_ids(&res), vec!["alice-sec"]);
     }
 
     /// A caller with a per-user identity sees only the conversations attributed

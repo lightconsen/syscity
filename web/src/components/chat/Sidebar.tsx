@@ -23,6 +23,10 @@ export interface AgentItem {
   emoji: string;
   is_valid: boolean;
   has_heartbeat: boolean;
+  /** True for an agent this connection may use but not reconfigure — a shared
+   *  agent seen from an agent-bound connection. Its row offers only "new
+   *  session". */
+  read_only?: boolean;
 }
 
 interface SessionItem {
@@ -472,19 +476,21 @@ export function Sidebar({
                       {agent.display_name}
                     </span>
                   </button>
-                  <button
-                    data-agent-menu
-                    onClick={(e) => toggleAgentMenu(agent, e)}
-                    className={`p-1 mr-0.5 rounded-md text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5 transition group-hover:opacity-100 focus:opacity-100 ${
-                      agentMenu?.agent.id === agent.id ? "opacity-100" : "opacity-0"
-                    }`}
-                    title={t("Sidebar.agentActions")}
-                    aria-label={t("Sidebar.agentActions")}
-                    aria-haspopup="menu"
-                    aria-expanded={agentMenu?.agent.id === agent.id}
-                  >
-                    <MoreHorizontal className="w-4 h-4" />
-                  </button>
+                  {!agent.read_only && (
+                    <button
+                      data-agent-menu
+                      onClick={(e) => toggleAgentMenu(agent, e)}
+                      className={`p-1 mr-0.5 rounded-md text-secondary hover:text-primary hover:bg-black/5 dark:hover:bg-white/5 transition group-hover:opacity-100 focus:opacity-100 ${
+                        agentMenu?.agent.id === agent.id ? "opacity-100" : "opacity-0"
+                      }`}
+                      title={t("Sidebar.agentActions")}
+                      aria-label={t("Sidebar.agentActions")}
+                      aria-haspopup="menu"
+                      aria-expanded={agentMenu?.agent.id === agent.id}
+                    >
+                      <MoreHorizontal className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               )
             )}

@@ -117,20 +117,27 @@ async fn resolve_within(root: &Path, rel: &str) -> Option<PathBuf> {
 /// The agent whose workspace a request addresses.
 ///
 /// An explicit `agent_id` wins, but a connection bound to one agent may not
-/// name another, and one that names none is asking about *its* agent's
-/// workspace — not the shared default's, which is a workspace it has no
-/// business in.
-fn workspace_agent(conn: Option<&str>, requested: Option<&str>) -> Result<Option<String>, String> {
+/// name a *personal* agent other than its own (a shared agent — no
+/// `allowed_users` — is allowed, the same rule the agent handlers apply), and
+/// one that names none is asking about *its* agent's workspace — not the
+/// shared default's, which it may or may not hold, and which the router's
+/// `allows_principal` would refuse on a message anyway.
+async fn workspace_agent(
+    state: &Arc<GatewayState>,
+    ctx: &RequestContext,
+    requested: Option<&str>,
+) -> Result<Option<String>, String> {
     let requested = requested.filter(|s| !s.is_empty());
     if let Some(agent) = requested {
-        if let Some(bound) = conn {
-            if bound != agent {
-                return Err(format!("This connection may only use agent '{bound}'."));
-            }
+        if !crate::gateway::ws::bound::agent_usable(state, ctx, agent).await {
+            return Err(format!(
+                "This connection may only use agent '{}'.",
+                ctx.bound_agent().unwrap_or_default()
+            ));
         }
         return Ok(Some(agent.to_string()));
     }
-    Ok(conn.map(str::to_string))
+    Ok(ctx.bound_agent().map(str::to_string))
 }
 
 pub(super) async fn handle_workspace_list(
@@ -142,7 +149,7 @@ pub(super) async fn handle_workspace_list(
         Ok(p) => p,
         Err(res) => return res,
     };
-    let agent = match workspace_agent(ctx.bound_agent(), params.agent_id.as_deref()) {
+    let agent = match workspace_agent(state, ctx, params.agent_id.as_deref()).await {
         Ok(a) => a,
         Err(message) => return WsResponse::err(&req.id, "FORBIDDEN", message),
     };
@@ -248,7 +255,7 @@ pub(super) async fn handle_workspace_read(
         Ok(p) => p,
         Err(res) => return res,
     };
-    let agent = match workspace_agent(ctx.bound_agent(), params.agent_id.as_deref()) {
+    let agent = match workspace_agent(state, ctx, params.agent_id.as_deref()).await {
         Ok(a) => a,
         Err(message) => return WsResponse::err(&req.id, "FORBIDDEN", message),
     };

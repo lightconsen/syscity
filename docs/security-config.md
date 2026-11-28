@@ -146,7 +146,7 @@ auth_mode = "token"
 [security.agent_tokens.alice]
 agent_id = "secretary"
 principal = ""          # empty = the table label ("alice")
-# scopes default to ["chat", "read"]
+# scopes default to ["chat", "read", "write"]
 
 [agent_overrides.secretary]
 allowed_users = ["alice"]
@@ -158,17 +158,37 @@ allowed_users = ["alice"]
 - `auth_mode = "none"` with `agent_tokens` present is a startup error: nothing
   checks a token there, so the table would restrict nobody. An entry with an
   empty token or `agent_id` is refused for the same reason.
+- The default scopes are `chat`, `read` and `write`. `write` is what
+  `sessions.create` needs, so without it a token holder could not open a
+  session at all; it is safe on this credential because `agent_id` is
+  mandatory and the closed method surface below refuses every deployment-wide
+  write (`config.set`, `agents.update`, `plugins.*`, `computer.run`) before a
+  scope is consulted. Narrow it with `scopes = ["chat", "read"]` if you want
+  a read-and-talk-only token.
 - Enforcement is two-layered: a **closed** method allow-list
   (`src/gateway/ws/bound.rs`) — a method not listed is refused, so a newly
   added WS method does not silently become reachable — and a parameter check
-  refusing any `agent_id` / `id` / `session_id` / `session_ids` that names
-  another agent or another agent's conversation. `agents.list`,
-  `sessions.list`, `workspace.*` and the agent registry are narrowed to the
-  bound agent rather than refused, since a client serving one agent has a use
-  for "its" entries.
-- `shared_token` remains the operator credential: it sees every agent. An agent
+  refusing any `agent_id` / `id` / `session_id` / `session_ids` that names a
+  *personal* agent (one with `allowed_users`) other than its own, or a
+  personal agent's conversation.
+- **Shared agents are reachable.** A *shared* agent is one that neither
+  `allowed_users` nor an agent token claims. Such an agent is open to every
+  bound connection, the same way it is open to everyone else:
+  a team member's Desktop may talk to the shared secretary, open a session
+  with it, and see that session in its list. This is deliberately narrower
+  than "any agent the principal may use" — an agent restricted to
+  `["alice"]` is alice's personal agent, not a shared one, and stays out of
+  a bound connection's sidebar even when its principal is in the list.
+  `agents.list`, `agents.registry`, `workspace.*` and `sessions.list` are
+  narrowed to the bound agent **plus the shared agents** rather than refused,
+  since a client serving one agent still has a use for "its" entries and the
+  ones it may visit. Registry entries other than its own carry
+  `read_only: true`; the shared agent cannot be reconfigured from this
+  connection.
+- `shared_token` remains the operator credential: it sees and drives every
+  agent, and its `default` agent may also use any tokenless agent. An agent
   token is what you hand somebody whose Desktop should only use their own
-  agent.
+  agent (and the shared ones).
 - Over WebSocket the `connect` handshake answers `bound_agent`, and the ticket
   exchange (`/api/v1/ws-ticket`) carries the binding, so a ticket is never
   wider than the token that minted it. The OpenAI-compatible

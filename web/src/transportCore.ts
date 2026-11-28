@@ -798,6 +798,9 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
       emoji: string;
       is_valid: boolean;
       has_heartbeat: boolean;
+      /** Set by the gateway for an agent this connection may talk to but not
+       *  reconfigure (a shared agent seen from an agent-bound connection). */
+      read_only?: boolean;
     }>
   > {
     try {
@@ -810,6 +813,7 @@ export class SyscityWebSocketTransport implements ChatModelAdapter {
               emoji?: string;
               is_valid: boolean;
               has_heartbeat: boolean;
+              read_only?: boolean;
             }>;
             count?: number;
           }

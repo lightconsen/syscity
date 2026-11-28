@@ -6,28 +6,30 @@ use super::*;
 ///
 /// Two gates, in order:
 ///
-/// 1. An agent-bound connection sees only its one agent (unchanged): the client
-///    is configured with a single agent's credential, so a sidebar offering the
-///    others is a list of refusals waiting to happen.
-/// 2. Every remaining caller is filtered by the router's own authorization —
-///    the same `allows_principal` that `route()` applies. An agent the caller
-///    cannot use is not listed, because a list is a promise that the name can
-///    be acted on: `sessions.create` and `chat.send` both refuse it.
+/// 1. An agent-bound connection sees its own agent plus every **shared** agent
+///    (one no token and no `allowed_users` claims). Its own agent is what it
+///    was configured for; a shared agent is one it may also open a
+///    conversation with, and leaving those out would make the sidebar disagree
+///    with what the gateway will actually accept. A personal agent stays
+///    hidden.
+/// 2. Every remaining caller — and every entry surviving gate 1 — is filtered
+///    by the router's own authorization, the same `allows_principal` that
+///    `route()` applies. An agent the caller cannot use is not listed, because
+///    a list is a promise that the name can be acted on.
 ///
-/// An unrestricted agent (no `allowed_users`) stays visible to everyone, so a
-/// single-operator deployment's list is unchanged.
+/// An unrestricted agent stays visible to everyone, so a single-operator
+/// deployment's list is unchanged.
 async fn restrict_agents(
     ids: impl IntoIterator<Item = String>,
     state: &Arc<GatewayState>,
     ctx: &RequestContext,
 ) -> Vec<String> {
     let principal = ctx.user_id();
-    let ids: Vec<String> = match ctx.bound_agent() {
-        Some(bound) => ids.into_iter().filter(|id| id == bound).collect(),
-        None => ids.into_iter().collect(),
-    };
-    let mut visible = Vec::with_capacity(ids.len());
+    let mut visible = Vec::new();
     for id in ids {
+        if !crate::gateway::ws::bound::agent_usable(state, ctx, &id).await {
+            continue;
+        }
         if state.agents.router.allows_principal(&id, principal).await {
             visible.push(id);
         }
@@ -41,14 +43,33 @@ async fn restrict_agents(
 /// the router would refuse it; the handlers that take an agent id explicitly
 /// have to refuse it themselves, or the listing is only a suggestion — the id
 /// is still known, still typed, and still answers. Returns the refusal frame,
-/// or `None` when the caller may proceed (including every unrestricted agent,
-/// which has no `allowed_users` and is visible to everyone).
+/// or `None` when the caller may proceed: every shared agent is open to
+/// everyone, and a bound caller additionally gets its own agent and any
+/// shared agent, which is exactly what its sidebar shows.
 pub(crate) async fn deny_agent(
     req: &WsRequest,
     state: &Arc<GatewayState>,
     ctx: &RequestContext,
     agent_id: &str,
 ) -> Option<WsResponse> {
+    // The binding first: a one-agent client may not reach a personal agent,
+    // even one whose `allowed_users` happens to name this principal.
+    if !crate::gateway::ws::bound::agent_usable(state, ctx, agent_id).await {
+        warn!(
+            "Refused {} for user {}: agent '{}' is outside the connection's binding",
+            req.method,
+            ctx.user_id(),
+            agent_id
+        );
+        return Some(WsResponse::err(
+            &req.id,
+            "FORBIDDEN",
+            format!(
+                "This connection is bound to agent '{}' and may not use agent '{agent_id}'.",
+                ctx.bound_agent().unwrap_or_default()
+            ),
+        ));
+    }
     if state
         .agents
         .router
@@ -206,14 +227,16 @@ pub(super) async fn handle_agents_registry(
     // agent the caller may not use is a name the sidebar would offer and every
     // action would then refuse.
     let principal = ctx.user_id();
-    let may_use = |id: &str| ctx.may_use_agent(id);
     let registry = state.agents.registry.read().await;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
     // 1. Registry-discovered agents from disk
     for id in registry.list() {
-        if !may_use(&id) || !state.agents.router.allows_principal(&id, principal).await {
+        if !crate::gateway::ws::bound::agent_usable(state, ctx, &id).await {
+            continue;
+        }
+        if !state.agents.router.allows_principal(&id, principal).await {
             continue;
         }
         if let Some(p) = registry.get(&id) {
@@ -232,7 +255,10 @@ pub(super) async fn handle_agents_registry(
     {
         let agents = state.agents.agents.read().await;
         for (id, handle) in agents.iter() {
-            if seen.contains(id) || !may_use(id) {
+            if seen.contains(id) {
+                continue;
+            }
+            if !crate::gateway::ws::bound::agent_usable(state, ctx, id).await {
                 continue;
             }
             if !state.agents.router.allows_principal(id, principal).await {
@@ -265,6 +291,22 @@ pub(super) async fn handle_agents_registry(
             if let Some(owner) = agents.get(id).and_then(|h| h.config.owner.clone()) {
                 if let Some(obj) = entry.as_object_mut() {
                     obj.insert("owner".to_string(), serde_json::Value::String(owner));
+                }
+            }
+        }
+    }
+
+    // Additive `read_only`: for a bound connection, every entry but its own
+    // agent is one it may talk to but not reconfigure (`agents.update`,
+    // `agents.rename`, `agents.delete` are outside its surface). The UI uses
+    // this to hide the per-agent menu on a shared agent rather than offering a
+    // click the gateway will refuse.
+    if let Some(bound) = ctx.bound_agent() {
+        for entry in entries.iter_mut() {
+            let is_own = entry.get("id").and_then(|v| v.as_str()) == Some(bound);
+            if !is_own {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("read_only".to_string(), serde_json::Value::Bool(true));
                 }
             }
         }
@@ -1065,17 +1107,66 @@ mod tests {
         assert!(owners.get("team").is_none(), "a shared agent has no owner key");
     }
 
-    /// A connection bound to one agent sees only that agent, whatever the
-    /// router's lists say — the binding is the narrower gate.
+    /// A connection bound to one agent sees that agent **plus every shared
+    /// agent** (one with no `allowed_users`). The list has to agree with what
+    /// `check_params` will accept: offering only the bound agent would hide the
+    /// team secretary the gateway is perfectly willing to open a conversation
+    /// with.
     #[tokio::test]
-    async fn agents_list_narrows_to_the_bound_agent() {
+    async fn agents_list_shows_the_bound_agent_and_shared_agents() {
         let state = state().await;
         for id in ["alpha", "beta"] {
             seed_handle(&state, id, None).await;
         }
         let ctx = ctx_for("alice").with_bound_agent(Some("beta"));
         let resp = handle_agents_list(&req("r1", None), &state, &ctx).await;
+        assert_eq!(listed_ids(&resp).await, vec!["alpha", "beta"]);
+    }
+
+    /// A *personal* agent — restricted to named principals — is not shared, so
+    /// a bound connection does not see it even when its own principal appears
+    /// in that restriction. The binding is the narrower gate.
+    #[tokio::test]
+    async fn agents_list_hides_a_personal_agent_from_a_bound_connection() {
+        let state = state().await;
+        seed_handle(&state, "beta", None).await;
+        seed_handle(&state, "alice-private", None).await;
+        state
+            .agents
+            .router
+            .set_agent_principals("alice-private", vec!["alice".to_string()])
+            .await;
+        let ctx = ctx_for("alice").with_bound_agent(Some("beta"));
+        let resp = handle_agents_list(&req("r1", None), &state, &ctx).await;
         assert_eq!(listed_ids(&resp).await, vec!["beta"]);
+    }
+
+    /// `agents.registry` follows the same rule and marks the shared entries
+    /// read-only, so a client knows not to offer `agents.update` on them.
+    #[tokio::test]
+    async fn agents_registry_lists_shared_agents_read_only() {
+        let state = state().await;
+        for id in ["alpha", "beta"] {
+            seed_handle(&state, id, None).await;
+        }
+        let ctx = ctx_for("alice").with_bound_agent(Some("beta"));
+        let resp = handle_agents_registry(&req("r1", None), &state, &ctx).await;
+        assert!(resp.ok);
+        let entries = resp.payload.as_ref().unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let by_id: std::collections::HashMap<&str, &serde_json::Value> = entries
+            .iter()
+            .map(|e| (e["id"].as_str().unwrap(), e))
+            .collect();
+        assert_eq!(by_id.len(), 2, "the shared agent must be listed: {entries:?}");
+        assert!(by_id.contains_key("alpha"), "shared alpha must be listed");
+        assert_eq!(by_id["alpha"]["read_only"], true);
+        assert!(
+            by_id["beta"].get("read_only").is_none(),
+            "the bound agent is the one this client may reconfigure"
+        );
     }
 
     /// Leaving an agent out of the list is only half the promise: every

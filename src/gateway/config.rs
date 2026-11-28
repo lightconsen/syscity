@@ -1690,11 +1690,12 @@ pub struct AgentTokenEntry {
     /// What the credential is worth, subject to the same narrowing as every
     /// other credential (`protocol::resolve_scopes`).
     ///
-    /// Defaults to [`default_agent_token_scopes`]: no `admin`, no `pairing`,
-    /// and no `write` — a person's own Desktop needs to chat, read their
-    /// conversations and create sessions, and writing there changes *their*
-    /// agent's config, not the deployment's. An operator who wants more says so
-    /// explicitly.
+    /// Defaults to [`default_agent_token_scopes`] — `chat`, `read` and
+    /// `write`: no `admin`, no `pairing`. A person's Desktop needs to open and
+    /// manage its own sessions, and the agent-bound method surface refuses
+    /// every deployment-wide write regardless of scope, so `write` here means
+    /// "the caller's own conversations". An operator who wants less says so
+    /// explicitly (`scopes = ["chat", "read"]`).
     #[serde(default = "default_agent_token_scopes")]
     pub scopes: Vec<String>,
 }
@@ -1830,17 +1831,24 @@ pub fn default_device_scopes() -> Vec<String> {
 
 /// Scopes an agent token is worth when its entry names none.
 ///
-/// `chat` and `read` are what a conversation needs. `write` is deliberately
-/// absent even though a normal desktop client holds it: `write` is the scope
-/// that reaches `config.set`, `agents.update`, `plugins.*` and
-/// `computer.run`, and an agent token's whole point is that its holder is not
-/// the operator. A client that genuinely needs to open sessions gets
-/// `sessions.create` through the agent-bound method surface, not through a
-/// widened entitlement.
+/// `chat` and `read` are what a conversation needs; `write` is what opening a
+/// session and managing it needs, and the runtime supports none of them
+/// without it. `write` looks dangerous on a token whose holder is not the
+/// operator — and on an *unbound* credential it would be, since it reaches
+/// `config.set`, `agents.update`, `plugins.*` and `computer.run`. An agent
+/// token cannot be unbound (`agent_id` is required), and the agent-bound
+/// method surface (`ws::bound::ALLOWED`) refuses every one of those methods
+/// before a scope is consulted for it. The only write-scoped methods left are
+/// the caller's own conversations, which is exactly what a person's Desktop
+/// is for.
+///
+/// The scope still narrows: an operator who wants a token that can read and
+/// talk but not open or change sessions writes `scopes = ["chat", "read"]`.
 pub fn default_agent_token_scopes() -> Vec<String> {
     vec![
         crate::gateway::protocol::SCOPE_CHAT.to_string(),
         crate::gateway::protocol::SCOPE_READ.to_string(),
+        crate::gateway::protocol::SCOPE_WRITE.to_string(),
     ]
 }
 
@@ -3487,11 +3495,18 @@ agent_id = "alpha"
         assert_eq!(entry.agent_id, "alpha");
         assert_eq!(entry.principal, "", "principal defaults to empty = use the label");
         assert_eq!(entry.scopes, default_agent_token_scopes());
-        assert!(!entry
-            .scopes
-            .contains(&crate::gateway::protocol::SCOPE_WRITE.to_string()));
+        assert!(
+            entry
+                .scopes
+                .contains(&crate::gateway::protocol::SCOPE_WRITE.to_string()),
+            "sessions.create is write-scoped; without write a token holder could not \
+             open a session at all"
+        );
         assert!(!entry
             .scopes
             .contains(&crate::gateway::protocol::SCOPE_ADMIN.to_string()));
+        assert!(!entry
+            .scopes
+            .contains(&crate::gateway::protocol::SCOPE_PAIRING.to_string()));
     }
 }

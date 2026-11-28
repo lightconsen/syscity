@@ -13,6 +13,23 @@ if no section matches, the release falls back to auto-generated notes.
 
 ### Added
 
+- **A team member's agent token can reach shared agents, and open sessions.**
+  Agent tokens defaulted to `chat` + `read`, but `sessions.create` is
+  write-scoped — so a token holder could never open a session, and the
+  "New Session" button was a guaranteed refusal. The default now includes
+  `write` (safe: `agent_id` is mandatory and the bound method surface refuses
+  every deployment-wide write before a scope is consulted), and an operator who
+  wants a read-and-talk-only token says `scopes = ["chat", "read"]`.
+
+  The binding also used to collapse a connection to exactly one agent. Agents
+  that belong to nobody — no `allowed_users` and no agent token naming them —
+  are now reachable from a bound connection too, so a member's Desktop can talk
+  to the team secretary: `agents.list` / `agents.registry` list them (marked
+  `read_only`), `sessions.list` shows the conversations opened with them,
+  `workspace.*` reads their workspace, and `chat.send` routes to them without
+  being re-bound away. A *personal* agent — `allowed_users`, or a token — stays
+  out of another binding entirely, even when its principal appears in that
+  list.
 - **Per-user agent routing on a shared channel.** A `[channels.<name>.users]`
   table maps a platform user id to an agent id, so one bot can serve a team and
   each person still gets their own agent:
